@@ -16,14 +16,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Put it into .env (local) or Railway Variables.")
 
-# Optionally control demo signal market (SPOT/FUTURES) via env BINANCE_MARKET
-DEMO_MARKET = os.getenv("BINANCE_MARKET", "FUTURES").strip().upper()
-
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 backend = Backend()
 
-# Demo signal (replace with real signal generator later)
+# Demo signal (replace with your real signals later)
 DEMO_SIGNAL = Signal(
     signal_id=1,
     symbol="BTCUSDT",
@@ -32,7 +29,6 @@ DEMO_SIGNAL = Signal(
     sl=42900,
     tp1=41500,
     tp2=40800,
-    market=DEMO_MARKET,
 )
 
 @dp.message(Command("start"))
@@ -52,8 +48,7 @@ async def send_signal(message: types.Message) -> None:
     await message.answer(
         "🔴 FUTURES SIGNAL\n\n"
         f"🪙 {DEMO_SIGNAL.symbol}\n"
-        f"📉 {DEMO_SIGNAL.direction}\n"
-        f"Market: {DEMO_SIGNAL.market}\n\n"
+        f"📉 {DEMO_SIGNAL.direction}\n\n"
         f"Entry: {DEMO_SIGNAL.entry}\n"
         f"SL: {DEMO_SIGNAL.sl}\n"
         f"TP1: {DEMO_SIGNAL.tp1}\n"
