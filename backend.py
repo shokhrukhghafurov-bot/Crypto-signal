@@ -6,7 +6,7 @@ import json
 import os
 import random
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import websockets
 
@@ -28,18 +28,17 @@ def _env_bool(name: str, default: bool = False) -> bool:
 TP1_PARTIAL_CLOSE_PCT = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT", 50)))
 TRACK_INTERVAL_SECONDS = max(1, _env_int("TRACK_INTERVAL_SECONDS", 3))
 USE_REAL_PRICE = _env_bool("USE_REAL_PRICE", False)
-BINANCE_MARKET = os.getenv("BINANCE_MARKET", "FUTURES").strip().upper()  # FUTURES/SPOT
 
-@dataclass
+@dataclass(frozen=True)
 class Signal:
     signal_id: int
+    market: str      # SPOT / FUTURES
     symbol: str
-    direction: str  # LONG / SHORT
+    direction: str   # LONG / SHORT
     entry: float
     sl: float
     tp1: float
     tp2: float
-    market: str = "FUTURES"  # FUTURES/SPOT (for price source)
 
 @dataclass
 class UserTrade:
@@ -50,34 +49,33 @@ class UserTrade:
     active: bool = True
 
 class PriceFeed:
-    \"\"\"Provides latest price for a symbol.
-    - If USE_REAL_PRICE=1 -> Binance WebSocket trade stream
-    - else -> mock random walk
+    \"\"\"Latest price by (market, symbol).
+    If USE_REAL_PRICE=1 -> Binance WebSocket trade stream.
+    Else -> mock random walk.
     \"\"\"
 
     def __init__(self) -> None:
-        self._prices: Dict[str, float] = {}
-        self._tasks: Dict[str, asyncio.Task] = {}
+        self._prices: Dict[Tuple[str, str], float] = {}
+        self._tasks: Dict[Tuple[str, str], asyncio.Task] = {}
 
-    def _key(self, symbol: str, market: str) -> str:
-        return f\"{market}:{symbol.upper()}\"
+    def get_latest(self, market: str, symbol: str) -> Optional[float]:
+        return self._prices.get((market.upper(), symbol.upper()))
 
-    def get_latest(self, symbol: str, market: str) -> Optional[float]:
-        return self._prices.get(self._key(symbol, market))
+    def _set_latest(self, market: str, symbol: str, price: float) -> None:
+        self._prices[(market.upper(), symbol.upper())] = float(price)
 
-    def _set_latest(self, symbol: str, market: str, price: float) -> None:
-        self._prices[self._key(symbol, market)] = float(price)
-
-    async def ensure_stream(self, symbol: str, market: str) -> None:
-        key = self._key(symbol, market)
-        if key in self._tasks and not self._tasks[key].done():
+    async def ensure_stream(self, market: str, symbol: str) -> None:
+        key = (market.upper(), symbol.upper())
+        t = self._tasks.get(key)
+        if t and not t.done():
             return
-        self._tasks[key] = asyncio.create_task(self._run_stream(symbol, market))
+        self._tasks[key] = asyncio.create_task(self._run_stream(market, symbol))
 
-    async def _run_stream(self, symbol: str, market: str) -> None:
+    async def _run_stream(self, market: str, symbol: str) -> None:
+        m = market.upper()
         sym = symbol.lower()
-        market = market.upper()
-        if market == "SPOT":
+
+        if m == "SPOT":
             url = f"wss://stream.binance.com:9443/ws/{sym}@trade"
         else:
             url = f"wss://fstream.binance.com/ws/{sym}@trade"
@@ -89,45 +87,42 @@ class PriceFeed:
                     backoff = 1
                     async for msg in ws:
                         data = json.loads(msg)
-                        # trade price: "p" (spot) and also "p" for futures trade stream
                         p = data.get("p")
                         if p is None:
                             continue
-                        self._set_latest(symbol, market, float(p))
+                        self._set_latest(m, symbol, float(p))
             except Exception:
-                # reconnect with backoff
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
 
-    # Mock (used when USE_REAL_PRICE=0)
-    def mock_price(self, symbol: str) -> float:
-        symbol = symbol.upper()
-        price = self._prices.get(self._key(symbol, "MOCK"), random.uniform(100, 50000))
+    def mock_price(self, market: str, symbol: str) -> float:
+        key = ("MOCK:" + market.upper(), symbol.upper())
+        price = self._prices.get(key, random.uniform(100, 50000))
         price *= random.uniform(0.996, 1.004)
-        self._prices[self._key(symbol, "MOCK")] = price
+        self._prices[key] = price
         return price
 
 class Backend:
     def __init__(self) -> None:
-        self.trades: Dict[int, UserTrade] = {}
+        # key: (user_id, signal_id)
+        self.trades: Dict[Tuple[int, int], UserTrade] = {}
         self.feed = PriceFeed()
 
     def open_trade(self, user_id: int, signal: Signal) -> None:
-        self.trades[user_id] = UserTrade(user_id=user_id, signal=signal)
+        self.trades[(user_id, signal.signal_id)] = UserTrade(user_id=user_id, signal=signal)
 
     async def _get_price(self, signal: Signal) -> float:
+        market = (signal.market or "FUTURES").upper()
         if not USE_REAL_PRICE:
-            return self.feed.mock_price(signal.symbol)
+            return self.feed.mock_price(market, signal.symbol)
 
-        market = (signal.market or BINANCE_MARKET or "FUTURES").upper()
-        await self.feed.ensure_stream(signal.symbol, market)
-        latest = self.feed.get_latest(signal.symbol, market)
-        # if stream not ready yet -> fallback to mock once
-        return latest if latest is not None else self.feed.mock_price(signal.symbol)
+        await self.feed.ensure_stream(market, signal.symbol)
+        latest = self.feed.get_latest(market, signal.symbol)
+        return latest if latest is not None else self.feed.mock_price(market, signal.symbol)
 
     async def track_loop(self, bot) -> None:
         while True:
-            for trade in list(self.trades.values()):
+            for key, trade in list(self.trades.items()):
                 if not trade.active:
                     continue
 
@@ -147,7 +142,7 @@ class Backend:
                         chat_id=trade.user_id,
                         text=(
                             "❌ SIGNAL AUTO CLOSED — STOP LOSS\\n\\n"
-                            f"🪙 {s.symbol}\\n"
+                            f"🪙 {s.symbol} ({s.market})\\n"
                             f"Price: {price:.6f}\\n"
                             "Status: LOSS 🔴"
                         ),
@@ -162,7 +157,7 @@ class Backend:
                         chat_id=trade.user_id,
                         text=(
                             "🟡 TP1 HIT\\n\\n"
-                            f"🪙 {s.symbol}\\n"
+                            f"🪙 {s.symbol} ({s.market})\\n"
                             f"Price: {price:.6f}\\n"
                             f"Closed: {TP1_PARTIAL_CLOSE_PCT}%\\n"
                             "SL moved to Entry (BE)"
@@ -177,7 +172,7 @@ class Backend:
                         chat_id=trade.user_id,
                         text=(
                             "⚪ SIGNAL AUTO CLOSED — BREAK EVEN\\n\\n"
-                            f"🪙 {s.symbol}\\n"
+                            f"🪙 {s.symbol} ({s.market})\\n"
                             f"Price: {price:.6f}\\n"
                             "Status: SAFE ⚪"
                         ),
@@ -191,7 +186,7 @@ class Backend:
                         chat_id=trade.user_id,
                         text=(
                             "✅ SIGNAL AUTO CLOSED — TP2 HIT\\n\\n"
-                            f"🪙 {s.symbol}\\n"
+                            f"🪙 {s.symbol} ({s.market})\\n"
                             f"Price: {price:.6f}\\n"
                             "Status: WIN 🟢"
                         ),
