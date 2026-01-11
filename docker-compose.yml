@@ -1,6 +1,0 @@
-services:
-  vip_bot:
-    build: .
-    env_file:
-      - .env
-    restart: unless-stopped
