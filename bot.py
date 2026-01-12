@@ -76,15 +76,18 @@ def set_lang(uid: int, lang: str) -> None:
 
 I18N = {
     "ru": {
+        "val_paused": "ПАУЗА",
+        "val_block": "ЗАПРЕЩЕНО",
+        "val_allow": "РАЗРЕШЕНО",
         "lbl_trades": "Сделки",
         "lbl_wins": "Плюс",
         "lbl_losses": "Минус",
         "lbl_be": "BE",
         "lbl_tp1": "TP1",
-        "lbl_winrate": "Винрейт",
+        "lbl_winrate": "Процент побед",
         "lbl_pnl": "PnL",
-        "lbl_spot": "SPOT",
-        "lbl_futures": "FUTURES",
+        "lbl_spot": "СПОТ",
+        "lbl_futures": "ФЬЮЧЕРСЫ",
         "lbl_blackout": "Блэкаут",
         "lbl_in": "через",
         "lbl_none": "нет",
@@ -113,12 +116,16 @@ I18N = {
         "tip_closed": "Подсказка: статистика появляется только после закрытия сделки (TP2 / SL / BE / вручную).",
     },
     "en": {
+        "trade_last_price": "Last price",
+        "trade_status": "Status",
+        "mytrades_of": "of",
+        "mytrades_showing": "showing",
         "lbl_trades": "Trades",
         "lbl_wins": "Wins",
         "lbl_losses": "Losses",
         "lbl_be": "BE",
         "lbl_tp1": "TP1",
-        "lbl_winrate": "Winrate",
+        "lbl_winrate": "Win rate",
         "lbl_pnl": "PnL",
         "lbl_spot": "SPOT",
         "lbl_futures": "FUTURES",
@@ -154,6 +161,17 @@ I18N = {
 def tr(uid: int, key: str) -> str:
     lang = get_lang(uid)
     return I18N.get(lang, I18N["en"]).get(key, I18N["en"].get(key, key))
+
+
+def _val(uid: int, v: str) -> str:
+    vv = (v or '').strip().upper()
+    if vv == 'ALLOW':
+        return tr(uid, 'val_allow')
+    if vv in ('BLOCK', 'DENY', 'DISALLOW'):
+        return tr(uid, 'val_block')
+    if vv in ('PAUSE_ALL', 'PAUSED', 'FUTURES_OFF'):
+        return tr(uid, 'val_paused')
+    return v
 
 def load_users() -> None:
     global USERS
@@ -329,8 +347,8 @@ def _build_status_text(uid: int = 0) -> str:
         macro_line = f"{next_prefix} {tr(uid, 'next_macro').format(v=ev.name)} | {tr(uid, 'lbl_blackout')} {_fmt_hhmm(w0)}–{_fmt_hhmm(w1)} | {tr(uid, 'lbl_in')} {_fmt_countdown(secs)}"
 
     scan_line = tr(uid, "scanner_run")
-    news_line = tr(uid, "news_action").format(v=backend.last_news_action)
-    macro_line2 = tr(uid, "macro_action").format(v=macro_action)
+    news_line = tr(uid, "news_action").format(v=_val(uid, backend.last_news_action))
+    macro_line2 = tr(uid, "macro_action").format(v=_val(uid, macro_action))
 
     txt = "\n".join([scan_line, news_line, f"{macro_prefix} {macro_line2}", macro_line])
     return txt
@@ -362,39 +380,27 @@ def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     kb.adjust(2, 2)
     return kb.as_markup()
 
-def _signal_text(s: Signal) -> str:
-    header = "🟢 SPOT SIGNAL" if s.market == "SPOT" else "🔴 FUTURES SIGNAL"
-    arrow = "📈 LONG" if s.direction == "LONG" else "📉 SHORT"
-    risk_line = f"\n\n{s.risk_note}" if (s.risk_note or '').strip() else ""
-    return (
-        f"{header}\n\n"
-        f"🪙 {s.symbol}\n"
-        f"{arrow}\n"
-        f"⏱ TF: {s.timeframe}\n\n"
-        f"Entry: {s.entry:.6f}\n"
-        f"SL: {s.sl:.6f}\n"
-        f"TP1: {s.tp1:.6f}\n"
-        f"TP2: {s.tp2:.6f}\n\n"
-        f"RR: 1:{s.rr:.2f}\n"
-        f"Confidence: {s.confidence}/100\n"
-        f"Confirm: {s.confirmations}"
-        f"{risk_line}\n\n"
-        "Нажми кнопку ниже после того, как открыл сделку:"
-    )
-
-def _fmt_hhmm(ts_utc: float) -> str:
-    d = dt.datetime.fromtimestamp(ts_utc, tz=ZoneInfo("UTC")).astimezone(TZ)
-    return d.strftime("%H:%M")
-
-def _fmt_countdown(seconds: float) -> str:
-    if seconds < 0:
-        seconds = 0
-    m = int(seconds // 60)
-    h = m // 60
-    m = m % 60
-    if h > 0:
-        return f"{h}h {m}m"
-    return f"{m}m"
+def _signal_text(s: Signal, uid: int = 0) -> str:
+    header = tr(uid, "sig_spot_hdr") if s.market == "SPOT" else tr(uid, "sig_fut_hdr")
+    arrow = tr(uid, "sig_long") if s.direction == "LONG" else tr(uid, "sig_short")
+    parts = [
+        header,
+        "",
+        f"🪙 {s.symbol}",
+        arrow,
+        f"⏱ {tr(uid, 'lbl_tf')}: {s.timeframe}",
+        "",
+        f"{tr(uid, 'lbl_entry')}: {s.entry:.6f}",
+        f"{tr(uid, 'lbl_sl')}: {s.sl:.6f}",
+        f"{tr(uid, 'lbl_tp1')}: {s.tp1:.6f}",
+        f"{tr(uid, 'lbl_tp2')}: {s.tp2:.6f}",
+        "",
+        f"{tr(uid, 'lbl_rr')}: 1:{s.rr:.2f}",
+        f"{tr(uid, 'lbl_conf')}: {s.confidence}/100",
+    ]
+    if (s.risk_note or '').strip():
+        parts += ["", str(s.risk_note)]
+    return "\n".join(parts)
 
 def _trade_status_emoji(status: str) -> str:
     return {
@@ -409,13 +415,13 @@ def _trade_status_emoji(status: str) -> str:
 # ---------------- broadcasting ----------------
 async def broadcast_signal(sig: Signal) -> None:
     SIGNALS[sig.signal_id] = sig
-    ORIGINAL_SIGNAL_TEXT[sig.signal_id] = _signal_text(sig)
+    ORIGINAL_SIGNAL_TEXT[sig.signal_id] = _signal_text(sig, 0)
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ ОТКРЫЛ СДЕЛКУ", callback_data=f"open:{sig.signal_id}")
+    kb.button(text=tr(uid, "btn_open_trade"), callback_data=f"open:{sig.signal_id}")
 
     for uid in list(USERS):
         try:
-            await bot.send_message(uid, _signal_text(sig), reply_markup=kb.as_markup())
+            await bot.send_message(uid, _signal_text(sig, uid), reply_markup=kb.as_markup())
         except Exception:
             pass
 
@@ -588,8 +594,8 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             await _render_in_place(call, tr(uid, "no_live"), menu_kb(uid))
             return
         kb = InlineKeyboardBuilder()
-        kb.button(text="✅ ОТКРЫЛ СДЕЛКУ", callback_data=f"open:{sig.signal_id}")
-        await bot.send_message(call.from_user.id, _signal_text(sig), reply_markup=kb.as_markup())
+        kb.button(text=tr(uid, "btn_open_trade"), callback_data=f"open:{sig.signal_id}")
+        await bot.send_message(call.from_user.id, _signal_text(sig, uid), reply_markup=kb.as_markup())
         return
 
 # ---------------- trades list (with buttons) ----------------
@@ -623,44 +629,42 @@ async def trades_page(call: types.CallbackQuery) -> None:
 
     all_trades = backend.get_user_trades(call.from_user.id)
     if not all_trades:
-        await bot.send_message(call.from_user.id, "You have no opened trades yet. Open a signal first ✅", reply_markup=menu_kb(call.from_user.id))
+        await bot.send_message(call.from_user.id, tr(uid, "mytrades_empty"), reply_markup=menu_kb(uid))
         return
 
     page = all_trades[offset:offset+PAGE_SIZE]
-    txt = f"📂 My trades (showing {offset+1}-{min(offset+PAGE_SIZE, len(all_trades))} of {len(all_trades)})\nTap a trade to open details."
+    txt = (
+        f"{tr(uid, 'mytrades_title')} ({tr(uid, 'mytrades_showing')} {offset+1}-{min(offset+PAGE_SIZE, len(all_trades))} {tr(uid, 'mytrades_of')} {len(all_trades)})\n"
+        + tr(uid, "mytrades_tap")
+    )
     await bot.send_message(call.from_user.id, txt, reply_markup=_trades_page_kb(page, offset))
 
 # ---------------- trade card ----------------
-def _trade_card_text(t) -> str:
+def _trade_card_text(t, uid: int = 0) -> str:
     s = t.signal
     last_price = f"{t.last_price:.6f}" if getattr(t, "last_price", 0.0) else "-"
     parts = [
-        "📌 Trade",
+        tr(uid, "trade_title"),
         "",
         f"🪙 {s.symbol} | {s.market} | {s.direction}",
-        f"TF: {s.timeframe}",
+        f"{tr(uid, 'lbl_tf')}: {s.timeframe}",
         "",
-        f"Entry: {s.entry:.6f}",
-        f"SL: {s.sl:.6f}",
-        f"TP1: {s.tp1:.6f}",
-        f"TP2: {s.tp2:.6f}",
+        f"{tr(uid, 'lbl_entry')}: {s.entry:.6f}",
+        f"{tr(uid, 'lbl_sl')}: {s.sl:.6f}",
+        f"{tr(uid, 'lbl_tp1')}: {s.tp1:.6f}",
+        f"{tr(uid, 'lbl_tp2')}: {s.tp2:.6f}",
         "",
-        f"Status: {t.result} {_trade_status_emoji(t.result)}",
-        f"Last price: {last_price}",
-        "",
-        "Buttons:",
-        "• 🔄 Refresh",
-        "• 📌 Show original signal",
-        "• ✅ I CLOSED (remove)",
+        f"{tr(uid, 'trade_status')}: {t.result} {_trade_status_emoji(t.result)}",
+        f"{tr(uid, 'trade_last_price')}: {last_price}",
     ]
     return "\n".join(parts)
 
-def _trade_card_kb(signal_id: int, back_offset: int = 0) -> types.InlineKeyboardMarkup:
+def _trade_card_kb(signal_id: int, back_offset: int = 0, uid: int = 0) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="🔄 Refresh", callback_data=f"trade:refresh:{signal_id}:{back_offset}")
-    kb.button(text="📌 Show original signal", callback_data=f"trade:orig:{signal_id}:{back_offset}")
-    kb.button(text="✅ I CLOSED (remove)", callback_data=f"trade:close:{signal_id}:{back_offset}")
-    kb.button(text="⬅ Back", callback_data=f"trades:page:{back_offset}")
+    kb.button(text=tr(uid, "btn_refresh"), callback_data=f"trade:refresh:{signal_id}:{back_offset}")
+    kb.button(text=tr(uid, "btn_show_orig"), callback_data=f"trade:orig:{signal_id}:{back_offset}")
+    kb.button(text=tr(uid, "btn_close"), callback_data=f"trade:close:{signal_id}:{back_offset}")
+    kb.button(text=tr(uid, "btn_back"), callback_data=f"trades:page:{back_offset}")
     kb.adjust(2, 2)
     return kb.as_markup()
 
@@ -673,9 +677,9 @@ async def trade_view(call: types.CallbackQuery) -> None:
         return
     t = backend.get_trade(call.from_user.id, signal_id)
     if not t:
-        await bot.send_message(call.from_user.id, "Trade not found (maybe already closed).", reply_markup=menu_kb(call.from_user.id))
+        await bot.send_message(call.from_user.id, tr(uid, "trade_not_found"), reply_markup=menu_kb(uid))
         return
-    await bot.send_message(call.from_user.id, _trade_card_text(t), reply_markup=_trade_card_kb(signal_id, 0))
+    await bot.send_message(call.from_user.id, _trade_card_text(t, uid), reply_markup=_trade_card_kb(signal_id, 0, uid))
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:refresh:"))
 async def trade_refresh(call: types.CallbackQuery) -> None:
@@ -688,9 +692,9 @@ async def trade_refresh(call: types.CallbackQuery) -> None:
         return
     t = backend.get_trade(call.from_user.id, signal_id)
     if not t:
-        await bot.send_message(call.from_user.id, "Trade not found (maybe already closed).", reply_markup=menu_kb(call.from_user.id))
+        await bot.send_message(call.from_user.id, tr(uid, "trade_not_found"), reply_markup=menu_kb(uid))
         return
-    await bot.send_message(call.from_user.id, _trade_card_text(t), reply_markup=_trade_card_kb(signal_id, back_offset))
+    await bot.send_message(call.from_user.id, _trade_card_text(t, uid), reply_markup=_trade_card_kb(signal_id, back_offset, uid))
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:close:"))
 async def trade_close(call: types.CallbackQuery) -> None:
@@ -703,9 +707,9 @@ async def trade_close(call: types.CallbackQuery) -> None:
         return
     removed = backend.remove_trade(call.from_user.id, signal_id)
     if removed:
-        await bot.send_message(call.from_user.id, "✅ Removed from My trades.", reply_markup=menu_kb(call.from_user.id))
+        await bot.send_message(call.from_user.id, tr(uid, "trade_removed"), reply_markup=menu_kb(uid))
     else:
-        await bot.send_message(call.from_user.id, "Trade not found.", reply_markup=menu_kb(call.from_user.id))
+        await bot.send_message(call.from_user.id, tr(uid, "trade_not_found"), reply_markup=menu_kb(uid))
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:orig:"))
 async def trade_orig(call: types.CallbackQuery) -> None:
@@ -719,16 +723,16 @@ async def trade_orig(call: types.CallbackQuery) -> None:
 
     text = ORIGINAL_SIGNAL_TEXT.get(signal_id)
     if not text:
-        await bot.send_message(call.from_user.id, "Original signal is not available (maybe very old).", reply_markup=menu_kb(call.from_user.id))
+        await bot.send_message(call.from_user.id, tr(uid, "orig_not_available"), reply_markup=menu_kb(uid))
         return
 
     kb = InlineKeyboardBuilder()
-    kb.button(text="⬅ Back to trade", callback_data=f"trade:view:{signal_id}")
+    kb.button(text=tr(uid, "btn_back_to_trade"), callback_data=f"trade:view:{signal_id}")
     kb.button(text="📂 My trades", callback_data=f"trades:page:{back_offset}")
     kb.button(text="🏠 Menu", callback_data="menu:status")
     kb.adjust(1, 2)
 
-    await bot.send_message(call.from_user.id, "📌 Original signal (1:1)\n\n" + text, reply_markup=kb.as_markup())
+    await bot.send_message(call.from_user.id, tr(uid, "orig_title") + "\n\n" + text, reply_markup=kb.as_markup())
 
 # ---------------- open signal ----------------
 @dp.callback_query(lambda c: (c.data or "").startswith("open:"))
