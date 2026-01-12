@@ -1,61 +1,46 @@
-# VIP Signals Telegram Bot (2 files) — Real Binance Price (SPOT/FUTURES) + Railway ready
+# PRO Auto-Scanner Bot — Multi-Exchange 2/3 + News Risk Filter
+Timeframes: **15m + 1h + 4h**
 
-Minimal VIP-only signals bot:
-- Posts a signal with inline button **✅ ОТКРЫЛ СДЕЛКУ**
-- After user clicks, bot starts tracking and sends updates:
-  - **TP1 hit** → message (partial close) + move SL to BE (message)
-  - **TP2 hit** → AUTO CLOSED WIN
-  - **SL hit before TP1** → AUTO CLOSED LOSS
-  - **BE after TP1** → AUTO CLOSED SAFE
-
-✅ Uses **real-time Binance WebSocket price** (optional).  
-✅ Ready for **GitHub + Railway**.
+✅ Scans Binance + Bybit + OKX and emits signals only if confirmed by **>=2/3 exchanges**  
+✅ Indicators: EMA / RSI / MACD / ADX / ATR  
+✅ Calculates Entry/SL/TP1/TP2 + RR + Confidence  
+✅ Broadcasts to all users who pressed `/start`  
+✅ Button **✅ ОТКРЫЛ СДЕЛКУ** → tracking + AUTO CLOSED (TP1/TP2/BE/SL) via Binance WS  
+✅ **News risk filter** (optional): blocks signals during recent high-impact news
 
 ---
 
-## Local run
+## News filter (optional)
 
-```bash
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env
-python bot.py
-```
+This repo implements a **risk filter**, not "AI news prediction".
 
-Telegram:
-- `/start`
-- `/signal` — posts demo signal + button
+### Provider: CryptoPanic (recommended)
+- Set `CRYPTOPANIC_TOKEN` in Railway Variables (or `.env` locally)
+- Bot will check for **important** recent posts for the base coin (BTC, ETH, etc.)
+- If a fresh important post appears within `NEWS_LOOKBACK_MIN`, the bot will apply `NEWS_ACTION`.
+
+### Actions
+- `NEWS_ACTION=FUTURES_OFF` → do not publish FUTURES, allow only SPOT signals
+- `NEWS_ACTION=PAUSE_ALL` → do not publish any signals during the window
+
+Defaults are safe:
+- enabled only if `NEWS_FILTER=1` and `CRYPTOPANIC_TOKEN` is present.
 
 ---
 
-## Environment variables
-
+## Railway variables (minimum)
 Required:
 - `BOT_TOKEN`
 
 Optional:
-- `USE_REAL_PRICE=1` to enable Binance WebSocket price (default: 0 -> mock)
-- `BINANCE_MARKET=FUTURES` or `SPOT` (default: FUTURES)
-- `TRACK_INTERVAL_SECONDS=3`
-- `TP1_PARTIAL_CLOSE_PCT=50`
+- `ADMIN_IDS` for `/status`
+- Scanner tuning: `TOP_N`, `SCAN_INTERVAL_SECONDS`, `CONFIDENCE_MIN`, `COOLDOWN_MINUTES`
+- Tracking: `USE_REAL_PRICE=1`
 
----
+News filter:
+- `NEWS_FILTER=1`
+- `CRYPTOPANIC_TOKEN=...`
+- `NEWS_LOOKBACK_MIN=60`
+- `NEWS_ACTION=FUTURES_OFF` (or `PAUSE_ALL`)
 
-## Railway deploy
 
-1. Push to GitHub
-2. Railway → New Project → Deploy from GitHub repo
-3. Railway → Variables:
-   - `BOT_TOKEN` = your token
-   - `USE_REAL_PRICE` = 1
-   - `BINANCE_MARKET` = FUTURES (or SPOT)
-4. Deploy — Railway runs `python bot.py` (see `railway.json`)
-
----
-
-## Notes
-- Binance WS endpoints used:
-  - SPOT: `wss://stream.binance.com:9443/ws/<symbol>@trade`
-  - FUTURES: `wss://fstream.binance.com/ws/<symbol>@trade`
-- This bot **does not place orders**. It tracks levels and sends notifications.
