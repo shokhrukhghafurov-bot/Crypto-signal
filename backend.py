@@ -673,6 +673,8 @@ class Backend:
         self.scanned_symbols_last: int = 0
         self.last_news_action: str = "ALLOW"
         self.last_macro_action: str = "ALLOW"
+        self.scanner_running: bool = True
+        self.last_scan_ts: float = 0.0
         self.trade_stats: dict = {}
         self._load_trade_stats()
 
@@ -852,6 +854,7 @@ class Backend:
     async def scanner_loop(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         while True:
             start = time.time()
+            self.last_scan_ts = start
             try:
                 async with MultiExchangeData() as api:
                     await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
