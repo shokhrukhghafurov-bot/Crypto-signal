@@ -160,6 +160,17 @@ async def _send_long(chat_id: int, text: str, reply_markup=None) -> None:
     if cur:
         parts.append(cur)
 
+
+async def _render_in_place(call: types.CallbackQuery, txt: str, kb: types.InlineKeyboardMarkup) -> types.Message:
+    """Prefer editing the message that contains the pressed button."""
+    try:
+        if call.message:
+            await bot.edit_message_text(chat_id=call.from_user.id, message_id=call.message.message_id, text=txt, reply_markup=kb)
+            return call.message
+    except Exception:
+        pass
+    return await bot.send_message(call.from_user.id, txt, reply_markup=kb)
+
     for i, part in enumerate(parts):
         await bot.send_message(chat_id, part, reply_markup=reply_markup if i == len(parts)-1 else None)
 
@@ -341,15 +352,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             ls = backend.last_signal
             txt += f"\nLast signal: {ls.symbol} {ls.market} {ls.direction} conf={ls.confidence}"
 
-        # prefer editing the current menu message (better UX)
-        try:
-            if call.message:
-                await bot.edit_message_text(chat_id=call.from_user.id, message_id=call.message.message_id, text=txt, reply_markup=menu_kb())
-                msg = call.message
-            else:
-                msg = await bot.send_message(call.from_user.id, txt, reply_markup=menu_kb())
-        except Exception:
-            msg = await bot.send_message(call.from_user.id, txt, reply_markup=menu_kb())
+        msg = await _render_in_place(call, txt, menu_kb())
 
         # auto-refresh countdown for a short window
         task = asyncio.create_task(_status_autorefresh(uid, msg.chat.id, msg.message_id))
@@ -374,44 +377,43 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         except Exception:
             spot_daily, fut_daily, spot_weekly, fut_weekly = [], [], [], []
 
+        # hide empty (trades=0) rows to keep message short and editable
+        spot_daily_nz = [x for x in spot_daily if "trades=0" not in x]
+        fut_daily_nz = [x for x in fut_daily if "trades=0" not in x]
+        spot_weekly_nz = [x for x in spot_weekly if "trades=0" not in x]
+        fut_weekly_nz = [x for x in fut_weekly if "trades=0" not in x]
+
         parts = []
         parts.append("📈 Trading statistics")
         parts.append("")
         parts.append("📅 Daily (last 7d)")
         parts.append("🟢 SPOT:")
-        parts.append("\n".join(spot_daily) if spot_daily else "no data")
+        parts.append("\n".join(spot_daily_nz) if spot_daily_nz else "no closed trades")
         parts.append("")
         parts.append("🔴 FUTURES:")
-        parts.append("\n".join(fut_daily) if fut_daily else "no data")
+        parts.append("\n".join(fut_daily_nz) if fut_daily_nz else "no closed trades")
         parts.append("")
         parts.append("🗓️ Weekly (last 4w)")
         parts.append("🟢 SPOT:")
-        parts.append("\n".join(spot_weekly) if spot_weekly else "no data")
+        parts.append("\n".join(spot_weekly_nz) if spot_weekly_nz else "no closed trades")
         parts.append("")
         parts.append("🔴 FUTURES:")
-        parts.append("\n".join(fut_weekly) if fut_weekly else "no data")
+        parts.append("\n".join(fut_weekly_nz) if fut_weekly_nz else "no closed trades")
+        parts.append("")
+        parts.append("Tip: stats appear only after a trade is CLOSED (TP2 / SL / BE / manual).")
         txt = "\n".join(parts)
 
         kb = InlineKeyboardBuilder()
         kb.button(text="🔄 Refresh", callback_data="menu:stats")
         kb.button(text="📊 Status", callback_data="menu:status")
-        kb.button(text="🏠 Menu", callback_data="menu:status")
-        kb.adjust(2, 1)
-
-        # Prefer editing the same message (avoid duplicates)
-        try:
-            if call.message and len(txt) < 3800:
-                await bot.edit_message_text(chat_id=call.from_user.id, message_id=call.message.message_id, text=txt, reply_markup=kb.as_markup())
-            else:
-                await _send_long(call.from_user.id, txt, reply_markup=kb.as_markup())
-        except Exception:
-            await _send_long(call.from_user.id, txt, reply_markup=kb.as_markup())
+        kb.adjust(2)
+        msg = await _render_in_place(call, txt, kb.as_markup())
         return
 
     if action in ("spot", "futures"):
         sig = backend.last_spot_signal if action == "spot" else backend.last_futures_signal
         if not sig:
-            await bot.send_message(call.from_user.id, "No live signal yet. Wait for scanner.", reply_markup=menu_kb())
+            await _render_in_place(call, "No live signal yet. Wait for scanner.", menu_kb())
             return
         kb = InlineKeyboardBuilder()
         kb.button(text="✅ ОТКРЫЛ СДЕЛКУ", callback_data=f"open:{sig.signal_id}")
