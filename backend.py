@@ -102,6 +102,121 @@ class UserTrade:
     last_price: float = 0.0
     opened_ts: float = 0.0
 
+
+# ------------------ Trade performance stats (spot/futures) ------------------
+TRADE_STATS_FILE = Path("trade_stats.json")
+
+# structure:
+# {
+#   "spot": {"days": {"YYYY-MM-DD": {...}}, "weeks": {"YYYY-WNN": {...}}},
+#   "futures": {...}
+# }
+def _empty_bucket() -> Dict[str, float]:
+    return {
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "be": 0,
+        "tp1_hits": 0,
+        "sum_pnl_pct": 0.0,
+    }
+
+def _safe_pct(x: float) -> float:
+    if not math.isfinite(x):
+        return 0.0
+    return float(x)
+
+def _market_key(market: str) -> str:
+    m = (market or "FUTURES").strip().upper()
+    return "spot" if m == "SPOT" else "futures"
+
+def _day_key_tz(ts: float) -> str:
+    d = dt.datetime.fromtimestamp(ts, tz=ZoneInfo(TZ_NAME)).date()
+    return d.isoformat()
+
+def _week_key_tz(ts: float) -> str:
+    d = dt.datetime.fromtimestamp(ts, tz=ZoneInfo(TZ_NAME)).date()
+    y, w, _ = d.isocalendar()
+    return f"{y}-W{int(w):02d}"
+
+def _calc_effective_pnl_pct(trade: "UserTrade", close_price: float, close_reason: str) -> float:
+    s = trade.signal
+    entry = float(s.entry or 0.0)
+    if entry <= 0:
+        return 0.0
+
+    side = (s.direction or "LONG").upper()
+    def pnl_pct_for(price: float) -> float:
+        price = float(price)
+        if side == "SHORT":
+            return (entry - price) / entry * 100.0
+        return (price - entry) / entry * 100.0
+
+    # No TP1 hit => full position closes at close_price
+    if not trade.tp1_hit:
+        return _safe_pct(pnl_pct_for(close_price))
+
+    # TP1 hit => partial close at TP1, rest closes at BE or TP2 (or manual)
+    p = max(0.0, min(100.0, float(TP1_PARTIAL_CLOSE_PCT)))
+    a = p / 100.0
+    tp1_price = float(s.tp1 or close_price)
+
+    pnl_tp1 = pnl_pct_for(tp1_price) * a
+
+    # Remaining portion:
+    if close_reason == "WIN":
+        # rest closes at TP2 (if provided), else close_price
+        tp2_price = float(s.tp2 or close_price)
+        pnl_rest = pnl_pct_for(tp2_price) * (1.0 - a)
+    elif close_reason == "BE":
+        pnl_rest = 0.0
+    else:
+        # manual close / unknown: use close_price for remaining
+        pnl_rest = pnl_pct_for(close_price) * (1.0 - a)
+
+    return _safe_pct(pnl_tp1 + pnl_rest)
+
+def _bump_stats(store: dict, market: str, ts: float, close_reason: str, pnl_pct: float, tp1_hit: bool) -> None:
+    mk = _market_key(market)
+    dayk = _day_key_tz(ts)
+    weekk = _week_key_tz(ts)
+
+    mroot = store.setdefault(mk, {"days": {}, "weeks": {}})
+    days = mroot.setdefault("days", {})
+    weeks = mroot.setdefault("weeks", {})
+
+    def get_bucket(root: dict, k: str) -> dict:
+        b = root.get(k)
+        if not isinstance(b, dict):
+            b = _empty_bucket()
+            root[k] = b
+        # ensure keys
+        for kk, vv in _empty_bucket().items():
+            if kk not in b:
+                b[kk] = vv
+        return b
+
+    bd = get_bucket(days, dayk)
+    bw = get_bucket(weeks, weekk)
+
+    def apply(bucket: dict) -> None:
+        bucket["trades"] = int(bucket.get("trades", 0)) + 1
+        # wins/losses based on pnl sign (если WIN но ушёл в минус — засчитываем как LOSS)
+        if pnl_pct > 0:
+            bucket["wins"] = int(bucket.get("wins", 0)) + 1
+        elif pnl_pct < 0:
+            bucket["losses"] = int(bucket.get("losses", 0)) + 1
+        else:
+            bucket["be"] = int(bucket.get("be", 0)) + 1
+
+        if tp1_hit:
+            bucket["tp1_hits"] = int(bucket.get("tp1_hits", 0)) + 1
+
+        bucket["sum_pnl_pct"] = float(bucket.get("sum_pnl_pct", 0.0)) + float(pnl_pct)
+
+    apply(bd)
+    apply(bw)
+
 @dataclass(frozen=True)
 class MacroEvent:
     name: str
@@ -557,6 +672,9 @@ class Backend:
         self.scanned_symbols_last: int = 0
         self.last_news_action: str = "ALLOW"
         self.last_macro_action: str = "ALLOW"
+        self.trade_stats: dict = {}
+        self._load_trade_stats()
+
 
     def next_signal_id(self) -> int:
         sid = self._signal_seq
@@ -574,7 +692,95 @@ class Backend:
         self.trades[(user_id, signal.signal_id)] = UserTrade(user_id=user_id, signal=signal, opened_ts=time.time())
 
     def remove_trade(self, user_id: int, signal_id: int) -> bool:
-        return self.trades.pop((user_id, signal_id), None) is not None
+        t = self.trades.pop((user_id, signal_id), None)
+        if t is None:
+            return False
+        # manual close: record stats using last known price (or entry)
+        close_price = float(t.last_price or t.signal.entry or 0.0)
+        try:
+            self.record_trade_close(t, "CLOSED", close_price, time.time())
+        except Exception:
+            pass
+        return True
+
+    # ---------------- trade stats helpers ----------------
+    def _load_trade_stats(self) -> None:
+        self.trade_stats = {"spot": {"days": {}, "weeks": {}}, "futures": {"days": {}, "weeks": {}}}
+        if TRADE_STATS_FILE.exists():
+            try:
+                data = json.loads(TRADE_STATS_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self.trade_stats.update(data)
+            except Exception:
+                pass
+
+    def _save_trade_stats(self) -> None:
+        try:
+            TRADE_STATS_FILE.write_text(json.dumps(self.trade_stats, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        except Exception:
+            pass
+
+    def record_trade_close(self, trade: UserTrade, close_reason: str, close_price: float, close_ts: float | None = None) -> None:
+        ts = float(close_ts if close_ts is not None else time.time())
+        pnl_pct = _calc_effective_pnl_pct(trade, float(close_price), close_reason)
+        _bump_stats(self.trade_stats, trade.signal.market, ts, close_reason, pnl_pct, bool(trade.tp1_hit))
+        self._save_trade_stats()
+
+    def _bucket(self, market: str, period: str, key: str) -> dict:
+        mk = _market_key(market)
+        root = (self.trade_stats or {}).get(mk, {})
+        per = root.get(period, {}) if isinstance(root, dict) else {}
+        b = per.get(key, {}) if isinstance(per, dict) else {}
+        if not isinstance(b, dict):
+            b = _empty_bucket()
+        # normalize keys
+        base = _empty_bucket()
+        for k, v in base.items():
+            if k not in b:
+                b[k] = v
+        return b
+
+    def perf_today(self, market: str) -> dict:
+        key = _day_key_tz(time.time())
+        return self._bucket(market, "days", key)
+
+    def perf_week(self, market: str) -> dict:
+        key = _week_key_tz(time.time())
+        return self._bucket(market, "weeks", key)
+
+    def report_daily(self, market: str, days: int = 7) -> list[str]:
+        now = dt.datetime.now(tz=ZoneInfo(TZ_NAME)).date()
+        out: list[str] = []
+        for i in range(days - 1, -1, -1):
+            d = now - dt.timedelta(days=i)
+            k = d.isoformat()
+            b = self._bucket(market, "days", k)
+            trades = int(b.get("trades", 0))
+            wins = int(b.get("wins", 0))
+            losses = int(b.get("losses", 0))
+            pnl = float(b.get("sum_pnl_pct", 0.0))
+            wr = (wins / trades * 100.0) if trades else 0.0
+            out.append(f"{k}: trades={trades} winrate={wr:.1f}% pnl={pnl:+.2f}%")
+        return out
+
+    def report_weekly(self, market: str, weeks: int = 4) -> list[str]:
+        today = dt.datetime.now(tz=ZoneInfo(TZ_NAME)).date()
+        out: list[str] = []
+        seen = set()
+        for i in range(weeks - 1, -1, -1):
+            d = today - dt.timedelta(days=7 * i)
+            k = _week_key_tz(dt.datetime(d.year, d.month, d.day, tzinfo=ZoneInfo(TZ_NAME)).timestamp())
+            if k in seen:
+                continue
+            seen.add(k)
+            b = self._bucket(market, "weeks", k)
+            trades = int(b.get("trades", 0))
+            wins = int(b.get("wins", 0))
+            losses = int(b.get("losses", 0))
+            pnl = float(b.get("sum_pnl_pct", 0.0))
+            wr = (wins / trades * 100.0) if trades else 0.0
+            out.append(f"{k}: trades={trades} winrate={wr:.1f}% pnl={pnl:+.2f}%")
+        return out
 
     def get_trade(self, user_id: int, signal_id: int) -> Optional[UserTrade]:
         return self.trades.get((user_id, signal_id))
