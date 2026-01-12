@@ -143,6 +143,26 @@ def _weekly_report_lines(weeks: int = 4) -> list[str]:
 # Status auto-refresh (per user)
 STATUS_TASKS: Dict[int, asyncio.Task] = {}
 
+
+async def _send_long(chat_id: int, text: str, reply_markup=None) -> None:
+    # Telegram message limit ~4096 chars. Send in chunks if needed.
+    max_len = 3800
+    if len(text) <= max_len:
+        await bot.send_message(chat_id, text, reply_markup=reply_markup)
+        return
+    parts = []
+    cur = ""
+    for line in text.splitlines(True):
+        if len(cur) + len(line) > max_len and cur:
+            parts.append(cur)
+            cur = ""
+        cur += line
+    if cur:
+        parts.append(cur)
+
+    for i, part in enumerate(parts):
+        await bot.send_message(chat_id, part, reply_markup=reply_markup if i == len(parts)-1 else None)
+
 def _fmt_perf(b: dict) -> str:
     trades = int(b.get("trades", 0))
     wins = int(b.get("wins", 0))
@@ -332,26 +352,29 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             except Exception:
                 pass
 
-        spot_daily = backend.report_daily("SPOT", 7)
-        fut_daily = backend.report_daily("FUTURES", 7)
-        spot_weekly = backend.report_weekly("SPOT", 4)
-        fut_weekly = backend.report_weekly("FUTURES", 4)
+        try:
+            spot_daily = backend.report_daily("SPOT", 7)
+            fut_daily = backend.report_daily("FUTURES", 7)
+            spot_weekly = backend.report_weekly("SPOT", 4)
+            fut_weekly = backend.report_weekly("FUTURES", 4)
+        except Exception:
+            spot_daily, fut_daily, spot_weekly, fut_weekly = [], [], [], []
 
         txt = (
             "📈 Trading statistics\n\n"
             "📅 Daily (last 7d)\n"
-            "🟢 SPOT:\n" + "\n".join(spot_daily) + "\n\n"
-            "🔴 FUTURES:\n" + "\n".join(fut_daily) + "\n\n"
+            "🟢 SPOT:\n" + ("\n".join(spot_daily) if spot_daily else "no data") + "\n\n"
+            "🔴 FUTURES:\n" + ("\n".join(fut_daily) if fut_daily else "no data") + "\n\n"
             "🗓️ Weekly (last 4w)\n"
-            "🟢 SPOT:\n" + "\n".join(spot_weekly) + "\n\n"
-            "🔴 FUTURES:\n" + "\n".join(fut_weekly)
+            "🟢 SPOT:\n" + ("\n".join(spot_weekly) if spot_weekly else "no data") + "\n\n"
+            "🔴 FUTURES:\n" + ("\n".join(fut_weekly) if fut_weekly else "no data")
         )
 
         kb = InlineKeyboardBuilder()
         kb.button(text="🔄 Refresh", callback_data="menu:stats")
         kb.button(text="🏠 Menu", callback_data="menu:status")
         kb.adjust(2)
-        await bot.send_message(call.from_user.id, txt, reply_markup=kb.as_markup())
+        await _send_long(call.from_user.id, txt, reply_markup=kb.as_markup())
         return
 
     if action in ("spot", "futures"):
