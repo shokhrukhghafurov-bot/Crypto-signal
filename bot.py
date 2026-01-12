@@ -131,6 +131,10 @@ I18N = {
         "sig_entry": "Вход",
         "sig_status": "Статус",
         "sig_last": "Последняя цена",
+        "sig_exchanges": "Биржи",
+        "sig_rr": "RR",
+        "sig_confidence": "Уверенность",
+        "sig_confirm": "Подтверждение",
         "sig_buttons": "Кнопки:",
         "sig_btn_refresh": "🔄 Обновить",
         "sig_btn_orig": "📌 Показать оригинал сигнала",
@@ -203,6 +207,10 @@ I18N = {
         "sig_entry": "Entry",
         "sig_status": "Status",
         "sig_last": "Last price",
+        "sig_exchanges": "Exchanges",
+        "sig_rr": "RR",
+        "sig_confidence": "Confidence",
+        "sig_confirm": "Confirm",
         "sig_buttons": "Buttons:",
         "sig_btn_refresh": "🔄 Refresh",
         "sig_btn_orig": "📌 Show original signal",
@@ -450,6 +458,56 @@ def _signal_text(uid: int, s: Signal) -> str:
     header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
     # Direction (LONG/SHORT) is meaningful for futures. For SPOT we hide it to avoid confusion.
     arrow = tr(uid, 'sig_long') if s.direction == 'LONG' else tr(uid, 'sig_short')
+
+    def _fmt_exchanges(raw: str) -> str:
+        # confirmations contains exchanges like "BINANCE+BYBIT" or "BINANCE+OKX"
+        xs = [x.strip() for x in (raw or '').replace(',', '+').split('+') if x.strip()]
+        # prettify names
+        pretty = []
+        for x in xs:
+            u = x.upper()
+            if u == 'BINANCE':
+                pretty.append('Binance')
+            elif u == 'BYBIT':
+                pretty.append('Bybit')
+            elif u == 'OKX':
+                pretty.append('OKX')
+            else:
+                pretty.append(x)
+        # remove duplicates keeping order
+        out: List[str] = []
+        for p in pretty:
+            if p not in out:
+                out.append(p)
+        return ' • '.join(out)
+
+    def _tp_lines() -> List[str]:
+        # If code later adds `tps` list/tuple to Signal, support it without breaking.
+        tps_obj = getattr(s, 'tps', None)
+        if isinstance(tps_obj, (list, tuple)) and len(tps_obj) > 0:
+            lines: List[str] = []
+            for i, v in enumerate(tps_obj, start=1):
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if fv <= 0:
+                    continue
+                lines.append(f"TP{i}: {fv:.6f}")
+            if lines:
+                return lines
+
+        lines = []
+        # Always show TP1
+        lines.append(f"TP1: {s.tp1:.6f}")
+        # Show TP2 only if it exists and differs from TP1
+        try:
+            if float(s.tp2) > 0 and abs(float(s.tp2) - float(s.tp1)) > 1e-12:
+                lines.append(f"TP2: {s.tp2:.6f}")
+        except Exception:
+            pass
+        return lines
+
     parts = [
         header,
         '',
@@ -457,17 +515,21 @@ def _signal_text(uid: int, s: Signal) -> str:
     ]
     if s.market != 'SPOT':
         parts.append(arrow)
+
+    ex_line = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
+    if ex_line:
+        parts.append(f"{tr(uid, 'sig_exchanges')}: {ex_line}")
+
     parts += [
         f"{tr(uid, 'sig_tf')}: {s.timeframe}",
         '',
         f"{tr(uid, 'sig_entry')}: {s.entry:.6f}",
         f"SL: {s.sl:.6f}",
-        f"TP1: {s.tp1:.6f}",
-        f"TP2: {s.tp2:.6f}",
+        *_tp_lines(),
         '',
-        f"RR: 1:{s.rr:.2f}",
-        f"Confidence: {s.confidence}/100",
-        f"Confirm: {s.confirmations}",
+        f"{tr(uid, 'sig_rr')}: 1:{s.rr:.2f}",
+        f"{tr(uid, 'sig_confidence')}: {s.confidence}/100",
+        f"{tr(uid, 'sig_confirm')}: {s.confirmations}",
     ]
     if (s.risk_note or '').strip():
         parts += ['', s.risk_note]
@@ -736,16 +798,63 @@ def _trade_card_text(uid: int, t) -> str:
     # Direction is meaningful only for futures; hide for spot.
     if s.market != 'SPOT':
         head += f" | {s.direction}"
+
+    def _fmt_exchanges(raw: str) -> str:
+        xs = [x.strip() for x in (raw or '').replace(',', '+').split('+') if x.strip()]
+        pretty = []
+        for x in xs:
+            u = x.upper()
+            if u == 'BINANCE':
+                pretty.append('Binance')
+            elif u == 'BYBIT':
+                pretty.append('Bybit')
+            elif u == 'OKX':
+                pretty.append('OKX')
+            else:
+                pretty.append(x)
+        out: List[str] = []
+        for p in pretty:
+            if p not in out:
+                out.append(p)
+        return ' • '.join(out)
+
+    def _tp_lines() -> List[str]:
+        tps_obj = getattr(s, 'tps', None)
+        if isinstance(tps_obj, (list, tuple)) and len(tps_obj) > 0:
+            out: List[str] = []
+            for i, v in enumerate(tps_obj, start=1):
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if fv <= 0:
+                    continue
+                out.append(f"TP{i}: {fv:.6f}")
+            if out:
+                return out
+        out = [f"TP1: {s.tp1:.6f}"]
+        try:
+            if float(s.tp2) > 0 and abs(float(s.tp2) - float(s.tp1)) > 1e-12:
+                out.append(f"TP2: {s.tp2:.6f}")
+        except Exception:
+            pass
+        return out
     parts = [
         "📌 " + tr(uid, "m_trades"),
         "",
         head,
+    ]
+
+    ex_line = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
+    if ex_line:
+        parts.append(f"{tr(uid, 'sig_exchanges')}: {ex_line}")
+
+    parts += [
         f"{tr(uid, 'sig_tf')}: {s.timeframe}",
         "",
         f"{tr(uid, 'sig_entry')}: {s.entry:.6f}",
         f"SL: {s.sl:.6f}",
-        f"TP1: {s.tp1:.6f}",
-        f"TP2: {s.tp2:.6f}",
+        *_tp_lines(),
         "",
         f"{tr(uid, 'sig_status')}: {t.result} {_trade_status_emoji(t.result)}",
         f"{tr(uid, 'sig_last')}: {last_price}",
