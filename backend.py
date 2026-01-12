@@ -61,6 +61,13 @@ CRYPTOPANIC_TOKEN = os.getenv("CRYPTOPANIC_TOKEN", "").strip()
 NEWS_LOOKBACK_MIN = max(5, _env_int("NEWS_LOOKBACK_MIN", 60))
 NEWS_ACTION = os.getenv("NEWS_ACTION", "FUTURES_OFF").strip().upper()  # FUTURES_OFF / PAUSE_ALL
 
+# Macro filter
+MACRO_FILTER = _env_bool("MACRO_FILTER", False)
+MACRO_ACTION = os.getenv("MACRO_ACTION", "FUTURES_OFF").strip().upper()  # FUTURES_OFF / PAUSE_ALL
+BLACKOUT_BEFORE_MIN = max(0, _env_int("BLACKOUT_BEFORE_MIN", 30))
+BLACKOUT_AFTER_MIN = max(0, _env_int("BLACKOUT_AFTER_MIN", 45))
+MACRO_EVENTS_JSON = os.getenv("MACRO_EVENTS_JSON", "").strip()
+
 # ------------------ Models ------------------
 @dataclass(frozen=True)
 class Signal:
@@ -76,6 +83,7 @@ class Signal:
     rr: float
     confidence: int
     confirmations: str  # e.g. "BINANCE+BYBIT"
+    risk_note: str      # optional risk line for signal
     ts: float
 
 @dataclass
@@ -86,24 +94,24 @@ class UserTrade:
     sl_moved_to_be: bool = False
     active: bool = True
 
+@dataclass(frozen=True)
+class MacroEvent:
+    name: str
+    type: str   # CPI / FED / NFP
+    start_ts: float  # unix seconds UTC
+
 # ------------------ News risk filter (CryptoPanic) ------------------
 class NewsFilter:
-    \"\"\"Risk filter:
-    - checks recent IMPORTANT news for a base coin via CryptoPanic
-    - returns action: 'ALLOW', 'FUTURES_OFF', or 'PAUSE_ALL'
-    \"\"\"
-
     BASE_URL = "https://cryptopanic.com/api/v1/posts/"
 
     def __init__(self) -> None:
-        self._cache: Dict[str, Tuple[float, str]] = {}  # key -> (ts, action)
+        self._cache: Dict[str, Tuple[float, str]] = {}
         self._cache_ttl = 60  # seconds
 
     def enabled(self) -> bool:
         return NEWS_FILTER and bool(CRYPTOPANIC_TOKEN)
 
     def base_coin(self, symbol: str) -> str:
-        # BTCUSDT -> BTC
         s = symbol.upper()
         if s.endswith("USDT"):
             return s[:-4]
@@ -132,7 +140,6 @@ class NewsFilter:
             }
             async with session.get(self.BASE_URL, params=params) as r:
                 if r.status != 200:
-                    # fail-open
                     action = "ALLOW"
                 else:
                     data = await r.json()
@@ -140,12 +147,10 @@ class NewsFilter:
                     cutoff = now - (NEWS_LOOKBACK_MIN * 60)
                     recent = False
                     for p in posts[:20]:
-                        # published_at is ISO time
                         published_at = p.get("published_at") or p.get("created_at")
                         if not published_at:
                             continue
                         try:
-                            # parse iso manually without extra deps (YYYY-MM-DDTHH:MM:SSZ)
                             t = published_at.replace("Z", "+00:00")
                             ts = pd.to_datetime(t).timestamp()
                         except Exception:
@@ -160,6 +165,78 @@ class NewsFilter:
 
         self._cache[key] = (now, action)
         return action
+
+# ------------------ Macro calendar blackout ------------------
+class MacroCalendar:
+    def __init__(self) -> None:
+        self._events: List[MacroEvent] = []
+        self._notified: Dict[str, float] = {}  # event_key -> last_notify_ts
+        self._notify_cooldown = 6 * 60 * 60  # 6h
+
+        self.reload()
+
+    def enabled(self) -> bool:
+        return MACRO_FILTER
+
+    def reload(self) -> None:
+        self._events = []
+        if not MACRO_EVENTS_JSON:
+            return
+        try:
+            raw = json.loads(MACRO_EVENTS_JSON)
+            if not isinstance(raw, list):
+                return
+            for e in raw:
+                if not isinstance(e, dict):
+                    continue
+                name = str(e.get("name") or "").strip()
+                etype = str(e.get("type") or "").strip().upper()
+                start = str(e.get("start") or "").strip()
+                if not name or not start:
+                    continue
+                try:
+                    ts = pd.to_datetime(start.replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    continue
+                self._events.append(MacroEvent(name=name, type=etype or "MACRO", start_ts=float(ts)))
+            self._events.sort(key=lambda x: x.start_ts)
+        except Exception:
+            self._events = []
+
+    def blackout_window(self, ev: MacroEvent) -> Tuple[float, float]:
+        start = ev.start_ts - (BLACKOUT_BEFORE_MIN * 60)
+        end = ev.start_ts + (BLACKOUT_AFTER_MIN * 60)
+        return start, end
+
+    def current_action(self) -> Tuple[str, Optional[MacroEvent], Optional[Tuple[float, float]]]:
+        if not self.enabled():
+            return "ALLOW", None, None
+        now = time.time()
+        for ev in self._events:
+            w0, w1 = self.blackout_window(ev)
+            if w0 <= now <= w1:
+                act = MACRO_ACTION if MACRO_ACTION in ("FUTURES_OFF", "PAUSE_ALL") else "FUTURES_OFF"
+                return act, ev, (w0, w1)
+        return "ALLOW", None, None
+
+    def next_upcoming(self) -> Optional[Tuple[MacroEvent, Tuple[float, float]]]:
+        if not self.enabled():
+            return None
+        now = time.time()
+        for ev in self._events:
+            w0, w1 = self.blackout_window(ev)
+            if now < w0:
+                return ev, (w0, w1)
+        return None
+
+    def should_notify(self, ev: MacroEvent) -> bool:
+        key = f"{ev.type}:{ev.start_ts}"
+        now = time.time()
+        last = self._notified.get(key, 0.0)
+        if (now - last) >= self._notify_cooldown:
+            self._notified[key] = now
+            return True
+        return False
 
 # ------------------ Price feed (WS, Binance) ------------------
 class PriceFeed:
@@ -184,7 +261,6 @@ class PriceFeed:
         m = market.upper()
         sym = symbol.lower()
         url = f"wss://stream.binance.com:9443/ws/{sym}@trade" if m == "SPOT" else f"wss://fstream.binance.com/ws/{sym}@trade"
-
         backoff = 1
         while True:
             try:
@@ -439,11 +515,13 @@ def choose_market(adx1_max: float, atr_pct_max: float) -> str:
         return "FUTURES"
     return "SPOT"
 
-# ------------------ Backend (scanner + tracking) ------------------
+# ------------------ Backend ------------------
 class Backend:
     def __init__(self) -> None:
         self.feed = PriceFeed()
         self.news = NewsFilter()
+        self.macro = MacroCalendar()
+
         self.trades: Dict[Tuple[int, int], UserTrade] = {}
         self._last_signal_ts: Dict[str, float] = {}
         self._signal_seq = 1
@@ -452,6 +530,9 @@ class Backend:
         self.last_signal: Optional[Signal] = None
         self.scanned_symbols_last: int = 0
         self.last_news_action: str = "ALLOW"
+        self.last_macro_action: str = "ALLOW"
+        self.last_macro_event: Optional[MacroEvent] = None
+        self.last_macro_window: Optional[Tuple[float, float]] = None
 
     def next_signal_id(self) -> int:
         sid = self._signal_seq
@@ -515,7 +596,7 @@ class Backend:
 
             await asyncio.sleep(TRACK_INTERVAL_SECONDS)
 
-    async def scanner_loop(self, emit_signal_cb) -> None:
+    async def scanner_loop(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         while True:
             start = time.time()
             self.last_scan_ts = start
@@ -524,21 +605,34 @@ class Backend:
                     symbols = await api.get_top_usdt_symbols(TOP_N)
                     self.scanned_symbols_last = len(symbols)
 
+                    # Macro current action
+                    mac_act, mac_ev, mac_win = self.macro.current_action()
+                    self.last_macro_action = mac_act
+                    self.last_macro_event = mac_ev
+                    self.last_macro_window = mac_win
+
+                    if mac_act != "ALLOW" and mac_ev and mac_win and self.macro.should_notify(mac_ev):
+                        await emit_macro_alert_cb(mac_act, mac_ev, mac_win)
+
                     for sym in symbols:
                         if not self.can_emit(sym):
                             continue
 
-                        # News risk action (fail-open if disabled)
+                        # If macro is PAUSE_ALL, stop all signals
+                        if mac_act == "PAUSE_ALL":
+                            continue
+
+                        # News action
                         try:
                             if self.news.enabled():
-                                action = await self.news.action_for_symbol(api.session, sym)  # type: ignore[arg-type]
+                                news_act = await self.news.action_for_symbol(api.session, sym)  # type: ignore[arg-type]
                             else:
-                                action = "ALLOW"
+                                news_act = "ALLOW"
                         except Exception:
-                            action = "ALLOW"
-                        self.last_news_action = action
+                            news_act = "ALLOW"
+                        self.last_news_action = news_act
 
-                        if action == "PAUSE_ALL":
+                        if news_act == "PAUSE_ALL":
                             continue
 
                         async def fetch_exchange(name: str):
@@ -597,8 +691,17 @@ class Backend:
                             continue
 
                         market = choose_market(float(np.nanmax(adx1s)), float(np.nanmax(atrp)))
-                        if action == "FUTURES_OFF":
+
+                        risk_notes = []
+                        # Apply NEWS_ACTION
+                        if news_act == "FUTURES_OFF" and market == "FUTURES":
                             market = "SPOT"
+                            risk_notes.append("⚠️ Futures paused due to news")
+
+                        # Apply MACRO_ACTION
+                        if mac_act == "FUTURES_OFF" and market == "FUTURES":
+                            market = "SPOT"
+                            risk_notes.append("⚠️ Futures signals are temporarily disabled (macro)")
 
                         conf_names = "+".join(sorted([s[0] for s in supporters]))
 
@@ -616,6 +719,7 @@ class Backend:
                             rr=rr,
                             confidence=conf,
                             confirmations=conf_names,
+                            risk_note="\\n".join(risk_notes).strip(),
                             ts=time.time(),
                         )
 
