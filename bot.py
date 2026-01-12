@@ -197,25 +197,13 @@ def _build_status_text() -> str:
         next_prefix = "🟡" if macro_action == "ALLOW" else "🔴"
         macro_line = f"{next_prefix} Next macro: {ev.name} | Blackout {_fmt_hhmm(w0)}–{_fmt_hhmm(w1)} | in {_fmt_countdown(secs)}"
 
-    # performance (separate Spot / Futures)
-    spot_today = backend.perf_today("SPOT")
-    fut_today = backend.perf_today("FUTURES")
-    spot_week = backend.perf_week("SPOT")
-    fut_week = backend.perf_week("FUTURES")
-
     scan_line = "Scanner status: RUNNING 🟢"
 
     txt = (
         f"{scan_line}\n"
         f"News action: {backend.last_news_action}\n"
         f"{macro_prefix} Macro action: {macro_action}\n"
-        f"{macro_line}\n\n"
-        f"📊 Performance — Today\n"
-        f"🟢 SPOT\n{_fmt_perf(spot_today)}\n\n"
-        f"🔴 FUTURES\n{_fmt_perf(fut_today)}\n\n"
-        f"📊 Performance — This week\n"
-        f"🟢 SPOT\n{_fmt_perf(spot_week)}\n\n"
-        f"🔴 FUTURES\n{_fmt_perf(fut_week)}\n\n"
+        f"{macro_line}"
     )
     return txt
 
@@ -369,6 +357,12 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             except Exception:
                 pass
 
+        # performance (separate Spot / Futures)
+        spot_today = backend.perf_today("SPOT")
+        fut_today = backend.perf_today("FUTURES")
+        spot_week = backend.perf_week("SPOT")
+        fut_week = backend.perf_week("FUTURES")
+
         try:
             spot_daily = backend.report_daily("SPOT", 7)
             fut_daily = backend.report_daily("FUTURES", 7)
@@ -385,6 +379,20 @@ async def menu_handler(call: types.CallbackQuery) -> None:
 
         parts = []
         parts.append("📈 Trading statistics")
+        parts.append("")
+        parts.append("📊 Performance — Today")
+        parts.append("🟢 SPOT")
+        parts.append(_fmt_perf(spot_today))
+        parts.append("")
+        parts.append("🔴 FUTURES")
+        parts.append(_fmt_perf(fut_today))
+        parts.append("")
+        parts.append("📊 Performance — This week")
+        parts.append("🟢 SPOT")
+        parts.append(_fmt_perf(spot_week))
+        parts.append("")
+        parts.append("🔴 FUTURES")
+        parts.append(_fmt_perf(fut_week))
         parts.append("")
         parts.append("📅 Daily (last 7d)")
         parts.append("🟢 SPOT:")
