@@ -106,7 +106,7 @@ I18N = {
         "back": "⬅️ Back",
         "no_live": "No live signal yet. Wait for scanner.",
         "stats_title": "📈 Trading statistics",
-        "no_closed": tr(uid, "no_closed"),
+        "no_closed": "no closed trades",
         "tip_closed": "Tip: stats appear only after a trade is CLOSED (TP2 / SL / BE / manual).",
     }
 }
@@ -703,16 +703,13 @@ async def opened(call: types.CallbackQuery) -> None:
     await bot.send_message(call.from_user.id, f"✅ Trade opened: {sig.symbol} ({sig.market}). Check 📂 My trades.", reply_markup=menu_kb(call.from_user.id))
 
 async def main() -> None:
-    print('>>> BOT MAIN START <<<', flush=True)
     import time
     globals()["time"] = time
 
     load_users()
     load_langs()
     asyncio.create_task(backend.track_loop(bot))
-    print('>>> TRACK LOOP TASK CREATED <<<', flush=True)
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
-    print('>>> SCANNER TASK CREATED <<<', flush=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
