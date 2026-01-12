@@ -205,7 +205,6 @@ def _build_status_text() -> str:
         f"📊 Performance — This week\n"
         f"🟢 SPOT\n{_fmt_perf(spot_week)}\n\n"
         f"🔴 FUTURES\n{_fmt_perf(fut_week)}\n\n"
-        f"➡️ Open 📈 Stats for daily/weekly report"
     )
     return txt
 
@@ -375,20 +374,31 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         except Exception:
             spot_daily, fut_daily, spot_weekly, fut_weekly = [], [], [], []
 
-        txt = (
-            "📈 Trading statistics\n\n"
-            "📅 Daily (last 7d)\n"
-            "🟢 SPOT:\n" + ("\n".join(spot_daily) if spot_daily else "no data") + "\n\n"
-            "🔴 FUTURES:\n" + ("\n".join(fut_daily) if fut_daily else "no data") + "\n\n"
-            "🗓️ Weekly (last 4w)\n"
-            "🟢 SPOT:\n" + ("\n".join(spot_weekly) if spot_weekly else "no data") + "\n\n"
-            "🔴 FUTURES:\n" + ("\n".join(fut_weekly) if fut_weekly else "no data")
-        )
+        parts = []
+        parts.append("📈 Trading statistics")
+        parts.append("")
+        parts.append("📅 Daily (last 7d)")
+        parts.append("🟢 SPOT:")
+        parts.append("\n".join(spot_daily) if spot_daily else "no data")
+        parts.append("")
+        parts.append("🔴 FUTURES:")
+        parts.append("\n".join(fut_daily) if fut_daily else "no data")
+        parts.append("")
+        parts.append("🗓️ Weekly (last 4w)")
+        parts.append("🟢 SPOT:")
+        parts.append("\n".join(spot_weekly) if spot_weekly else "no data")
+        parts.append("")
+        parts.append("🔴 FUTURES:")
+        parts.append("\n".join(fut_weekly) if fut_weekly else "no data")
+        txt = "\n".join(parts)
 
         kb = InlineKeyboardBuilder()
         kb.button(text="🔄 Refresh", callback_data="menu:stats")
+        kb.button(text="📊 Status", callback_data="menu:status")
         kb.button(text="🏠 Menu", callback_data="menu:status")
-        kb.adjust(2)
+        kb.adjust(2, 1)
+
+        # Prefer editing the same message (avoid duplicates)
         try:
             if call.message and len(txt) < 3800:
                 await bot.edit_message_text(chat_id=call.from_user.id, message_id=call.message.message_id, text=txt, reply_markup=kb.as_markup())
