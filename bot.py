@@ -181,13 +181,9 @@ def _build_status_text() -> str:
         f"🔴 FUTURES\n{_fmt_perf(fut_today)}\n\n"
         f"📊 Performance — This week\n"
         f"🟢 SPOT\n{_fmt_perf(spot_week)}\n\n"
-        f"🔴 FUTURES\n{_fmt_perf(fut_week)}"
+        f"🔴 FUTURES\n{_fmt_perf(fut_week)}\n\n"
+        f"➡️ Open 📈 Stats for daily/weekly report"
     )
-
-    txt += "\n\n📅 Daily (last 7d) — SPOT:\n" + "\n".join(backend.report_daily("SPOT", 7))
-    txt += "\n\n📅 Daily (last 7d) — FUTURES:\n" + "\n".join(backend.report_daily("FUTURES", 7))
-    txt += "\n\n🗓️ Weekly (last 4w) — SPOT:\n" + "\n".join(backend.report_weekly("SPOT", 4))
-    txt += "\n\n🗓️ Weekly (last 4w) — FUTURES:\n" + "\n".join(backend.report_weekly("FUTURES", 4))
     return txt
 
 async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: int = 120, interval: int = 5) -> None:
@@ -209,6 +205,7 @@ async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: 
 def menu_kb() -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Status", callback_data="menu:status")
+    kb.button(text="📈 Stats", callback_data="menu:stats")
     kb.button(text="🟢 Spot live", callback_data="menu:spot")
     kb.button(text="🔴 Futures live", callback_data="menu:futures")
     kb.button(text="📂 My trades", callback_data="trades:page:0")
@@ -323,6 +320,38 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         # auto-refresh countdown for a short window
         task = asyncio.create_task(_status_autorefresh(uid, msg.chat.id, msg.message_id))
         STATUS_TASKS[uid] = task
+        return
+
+    if action == "stats":
+        # cancel previous auto-refresh task (if any)
+        uid = call.from_user.id if call.from_user else 0
+        t = STATUS_TASKS.pop(uid, None)
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+        spot_daily = backend.report_daily("SPOT", 7)
+        fut_daily = backend.report_daily("FUTURES", 7)
+        spot_weekly = backend.report_weekly("SPOT", 4)
+        fut_weekly = backend.report_weekly("FUTURES", 4)
+
+        txt = (
+            "📈 Trading statistics\n\n"
+            "📅 Daily (last 7d)\n"
+            "🟢 SPOT:\n" + "\n".join(spot_daily) + "\n\n"
+            "🔴 FUTURES:\n" + "\n".join(fut_daily) + "\n\n"
+            "🗓️ Weekly (last 4w)\n"
+            "🟢 SPOT:\n" + "\n".join(spot_weekly) + "\n\n"
+            "🔴 FUTURES:\n" + "\n".join(fut_weekly)
+        )
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔄 Refresh", callback_data="menu:stats")
+        kb.button(text="🏠 Menu", callback_data="menu:status")
+        kb.adjust(2)
+        await bot.send_message(call.from_user.id, txt, reply_markup=kb.as_markup())
         return
 
     if action in ("spot", "futures"):
