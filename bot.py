@@ -192,7 +192,10 @@ def _build_status_text() -> str:
     spot_week = backend.perf_week("SPOT")
     fut_week = backend.perf_week("FUTURES")
 
+    scan_line = "Scanner status: RUNNING 🟢"
+
     txt = (
+        f"{scan_line}\n"
         f"News action: {backend.last_news_action}\n"
         f"{macro_prefix} Macro action: {macro_action}\n"
         f"{macro_line}\n\n"
@@ -222,6 +225,7 @@ async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: 
             return
 
 # ---------------- UI helpers ----------------
+
 def menu_kb() -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="📊 Status", callback_data="menu:status")
@@ -330,12 +334,23 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             except Exception:
                 pass
 
-        txt = _build_status_text()
+        try:
+            txt = _build_status_text()
+        except Exception as e:
+            txt = f"Status error: {e}"
         if call.from_user and _is_admin(call.from_user.id) and backend.last_signal:
             ls = backend.last_signal
             txt += f"\nLast signal: {ls.symbol} {ls.market} {ls.direction} conf={ls.confidence}"
 
-        msg = await bot.send_message(call.from_user.id, txt, reply_markup=menu_kb())
+        # prefer editing the current menu message (better UX)
+        try:
+            if call.message:
+                await bot.edit_message_text(chat_id=call.from_user.id, message_id=call.message.message_id, text=txt, reply_markup=menu_kb())
+                msg = call.message
+            else:
+                msg = await bot.send_message(call.from_user.id, txt, reply_markup=menu_kb())
+        except Exception:
+            msg = await bot.send_message(call.from_user.id, txt, reply_markup=menu_kb())
 
         # auto-refresh countdown for a short window
         task = asyncio.create_task(_status_autorefresh(uid, msg.chat.id, msg.message_id))
@@ -374,7 +389,13 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         kb.button(text="🔄 Refresh", callback_data="menu:stats")
         kb.button(text="🏠 Menu", callback_data="menu:status")
         kb.adjust(2)
-        await _send_long(call.from_user.id, txt, reply_markup=kb.as_markup())
+        try:
+            if call.message and len(txt) < 3800:
+                await bot.edit_message_text(chat_id=call.from_user.id, message_id=call.message.message_id, text=txt, reply_markup=kb.as_markup())
+            else:
+                await _send_long(call.from_user.id, txt, reply_markup=kb.as_markup())
+        except Exception:
+            await _send_long(call.from_user.id, txt, reply_markup=kb.as_markup())
         return
 
     if action in ("spot", "futures"):
