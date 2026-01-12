@@ -76,23 +76,39 @@ def set_lang(uid: int, lang: str) -> None:
 
 I18N = {
     "ru": {
+        "scanner_run": "Сканер: работает 🟢",
+        "news_action": "Новости: {v}",
+        "macro_action": "Макро: {v}",
+        "next_macro": "Следующее макро: {v}",
+        "perf_today": "📊 Результаты — Сегодня",
+        "perf_week": "📊 Результаты — На этой неделе",
+        "daily_title": "📅 По дням (7д)",
+        "weekly_title": "🗓️ По неделям (4н)",
         "choose_lang": "🌐 Выбери язык / Choose language:",
         "btn_ru": "🇷🇺 Русский",
         "btn_en": "🇬🇧 English",
         "welcome": "PRO Auto-Scanner Bot\n\n✅ Ты подписан на сигналы.\nНажимай кнопки ниже:",
-        "m_status": "📊 Status",
-        "m_stats": "📈 Stats",
-        "m_spot": "🟢 Spot live",
-        "m_fut": "🔴 Futures live",
-        "m_trades": "📂 My trades",
-        "refresh": "🔄 Refresh",
-        "back": "⬅️ Back",
+        "m_status": "📊 Статус",
+        "m_stats": "📈 Статистика",
+        "m_spot": "🟢 Спот live",
+        "m_fut": "🔴 Фьючерсы live",
+        "m_trades": "📂 Мои сделки",
+        "refresh": "🔄 Обновить",
+        "back": "⬅️ Назад",
         "no_live": "Пока нет live-сигнала. Ждём сканер.",
         "stats_title": "📈 Торговая статистика",
         "no_closed": "нет закрытых сделок",
         "tip_closed": "Подсказка: статистика появляется только после закрытия сделки (TP2 / SL / BE / вручную).",
     },
     "en": {
+        "scanner_run": "Scanner status: RUNNING 🟢",
+        "news_action": "News action: {v}",
+        "macro_action": "Macro action: {v}",
+        "next_macro": "Next macro: {v}",
+        "perf_today": "📊 Performance — Today",
+        "perf_week": "📊 Performance — This week",
+        "daily_title": "📅 Daily (last 7d)",
+        "weekly_title": "🗓️ Weekly (last 4w)",
         "choose_lang": "🌐 Choose language:",
         "btn_ru": "🇷🇺 Русский",
         "btn_en": "🇬🇧 English",
@@ -266,27 +282,24 @@ def _fmt_perf(b: dict) -> str:
     wr = (wins / trades * 100.0) if trades else 0.0
     return f"Trades: {trades} | Wins: {wins} | Losses: {losses} | BE: {be} | TP1: {tp1}\nWinrate: {wr:.1f}%\nPnL: {pnl:+.2f}%"
 
-def _build_status_text() -> str:
+def _build_status_text(uid: int = 0) -> str:
     next_macro = backend.get_next_macro()
-    macro_line = "Next macro: none"
-
     macro_action = backend.last_macro_action
     macro_prefix = "🟢" if macro_action == "ALLOW" else "🔴"
 
+    macro_line = tr(uid, "next_macro").format(v="none")
     if next_macro:
         ev, (w0, w1) = next_macro
         secs = w0 - time.time()
         next_prefix = "🟡" if macro_action == "ALLOW" else "🔴"
-        macro_line = f"{next_prefix} Next macro: {ev.name} | Blackout {_fmt_hhmm(w0)}–{_fmt_hhmm(w1)} | in {_fmt_countdown(secs)}"
+        # keep event line mostly universal
+        macro_line = f"{next_prefix} {tr(uid, 'next_macro').format(v=ev.name)} | Blackout {_fmt_hhmm(w0)}–{_fmt_hhmm(w1)} | in {_fmt_countdown(secs)}"
 
-    scan_line = "Scanner status: RUNNING 🟢"
+    scan_line = tr(uid, "scanner_run")
+    news_line = tr(uid, "news_action").format(v=backend.last_news_action)
+    macro_line2 = tr(uid, "macro_action").format(v=macro_action)
 
-    txt = (
-        f"{scan_line}\n"
-        f"News action: {backend.last_news_action}\n"
-        f"{macro_prefix} Macro action: {macro_action}\n"
-        f"{macro_line}"
-    )
+    txt = "\n".join([scan_line, news_line, f"{macro_prefix} {macro_line2}", macro_line])
     return txt
 
 async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: int = 120, interval: int = 5) -> None:
@@ -296,7 +309,7 @@ async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: 
     while time.time() < end:
         await asyncio.sleep(interval)
         try:
-            txt = _build_status_text()
+            txt = _build_status_text(uid)
             if txt == last_txt:
                 continue
             await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=txt, reply_markup=menu_kb(uid))
@@ -444,7 +457,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 pass
 
         try:
-            txt = _build_status_text()
+            txt = _build_status_text(uid)
         except Exception as e:
             txt = f"Status error: {e}"
         if call.from_user and _is_admin(call.from_user.id) and backend.last_signal:
@@ -490,28 +503,28 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         parts = []
         parts.append(tr(uid, "stats_title"))
         parts.append("")
-        parts.append("📊 Performance — Today")
+        parts.append(tr(uid, "perf_today"))
         parts.append("🟢 SPOT")
         parts.append(_fmt_perf(spot_today))
         parts.append("")
         parts.append("🔴 FUTURES")
         parts.append(_fmt_perf(fut_today))
         parts.append("")
-        parts.append("📊 Performance — This week")
+        parts.append(tr(uid, "perf_week"))
         parts.append("🟢 SPOT")
         parts.append(_fmt_perf(spot_week))
         parts.append("")
         parts.append("🔴 FUTURES")
         parts.append(_fmt_perf(fut_week))
         parts.append("")
-        parts.append("📅 Daily (last 7d)")
+        parts.append(tr(uid, "daily_title"))
         parts.append("🟢 SPOT:")
         parts.append("\n".join(spot_daily_nz) if spot_daily_nz else tr(uid, "no_closed"))
         parts.append("")
         parts.append("🔴 FUTURES:")
         parts.append("\n".join(fut_daily_nz) if fut_daily_nz else tr(uid, "no_closed"))
         parts.append("")
-        parts.append("🗓️ Weekly (last 4w)")
+        parts.append(tr(uid, "weekly_title"))
         parts.append("🟢 SPOT:")
         parts.append("\n".join(spot_weekly_nz) if spot_weekly_nz else tr(uid, "no_closed"))
         parts.append("")
