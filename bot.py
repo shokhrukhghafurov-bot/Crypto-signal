@@ -622,22 +622,27 @@ def _trades_page_kb(trades: List, offset: int) -> types.InlineKeyboardMarkup:
 @dp.callback_query(lambda c: (c.data or "").startswith("trades:page:"))
 async def trades_page(call: types.CallbackQuery) -> None:
     await call.answer()
+    uid = call.from_user.id if call.from_user else 0
+
     try:
         offset = int((call.data or "").split(":")[-1])
     except Exception:
         offset = 0
 
-    all_trades = backend.get_user_trades(call.from_user.id)
+    all_trades = backend.get_user_trades(uid)
     if not all_trades:
-        await bot.send_message(call.from_user.id, tr(uid, "mytrades_empty"), reply_markup=menu_kb(uid))
+        await bot.send_message(uid, tr(uid, "mytrades_empty"), reply_markup=menu_kb(uid))
         return
 
     page = all_trades[offset:offset+PAGE_SIZE]
+
     txt = (
-        f"{tr(uid, 'mytrades_title')} ({tr(uid, 'mytrades_showing')} {offset+1}-{min(offset+PAGE_SIZE, len(all_trades))} {tr(uid, 'mytrades_of')} {len(all_trades)})\n"
+        f"{tr(uid, 'mytrades_title')} ("
+        f"{tr(uid, 'mytrades_showing')} {offset+1}-{min(offset+PAGE_SIZE, len(all_trades))} "
+        f"{tr(uid, 'mytrades_of')} {len(all_trades)})\n"
         + tr(uid, "mytrades_tap")
     )
-    await bot.send_message(call.from_user.id, txt, reply_markup=_trades_page_kb(page, offset))
+    await bot.send_message(uid, txt, reply_markup=_trades_page_kb(page, offset))
 
 # ---------------- trade card ----------------
 def _trade_card_text(t, uid: int = 0) -> str:
