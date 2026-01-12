@@ -854,8 +854,10 @@ class Backend:
             await asyncio.sleep(TRACK_INTERVAL_SECONDS)
 
     async def scanner_loop(self, emit_signal_cb, emit_macro_alert_cb) -> None:
+        print('>>> SCANNER LOOP STARTED <<<', flush=True)
         while True:
             start = time.time()
+            print(f'>>> SCAN TICK <<< ts={start:.0f}', flush=True)
             self.last_scan_ts = start
             try:
                 async with MultiExchangeData() as api:
