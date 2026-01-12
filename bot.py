@@ -76,9 +76,6 @@ def set_lang(uid: int, lang: str) -> None:
 
 I18N = {
     "ru": {
-        "val_paused": "ПАУЗА",
-        "val_block": "ЗАПРЕЩЕНО",
-        "val_allow": "РАЗРЕШЕНО",
         "lbl_trades": "Сделки",
         "lbl_wins": "Плюс",
         "lbl_losses": "Минус",
@@ -114,18 +111,49 @@ I18N = {
         "stats_title": "📈 Торговая статистика",
         "no_closed": "нет закрытых сделок",
         "tip_closed": "Подсказка: статистика появляется только после закрытия сделки (TP2 / SL / BE / вручную).",
+        "action_allow": "Разрешено",
+        "action_pause": "Пауза",
+        "m_menu": "🏠 Меню",
+        "btn_prev": "⬅ Назад",
+        "btn_next": "Вперёд ➡",
+        "my_trades_empty": "У тебя пока нет открытых сделок. Сначала открой сигнал ✅",
+        "my_trades_title": "📂 Мои сделки (показано {a}-{b} из {n})\nНажми на сделку, чтобы открыть детали.",
+        "trade_not_found": "Сделка не найдена (возможно уже закрыта).",
+        "trade_removed": "✅ Удалено из «Мои сделки».",
+        "trade_removed_fail": "Сделка не найдена.",
+        "trade_opened_toast": "✅ Открыто. Отслеживание началось.",
+        "trade_opened_msg": "✅ Сделка открыта: {sym} ({mkt}). Смотри 📂 Мои сделки.",
+        "sig_spot_header": "🟢 СПОТ СИГНАЛ",
+        "sig_fut_header": "🔴 ФЬЮЧЕРСЫ СИГНАЛ",
+        "sig_long": "📈 ЛОНГ",
+        "sig_short": "📉 ШОРТ",
+        "sig_tf": "⏱ ТФ",
+        "sig_entry": "Вход",
+        "sig_status": "Статус",
+        "sig_last": "Последняя цена",
+        "sig_buttons": "Кнопки:",
+        "sig_btn_refresh": "🔄 Обновить",
+        "sig_btn_orig": "📌 Показать оригинал сигнала",
+        "sig_btn_close": "✅ Я ЗАКРЫЛ (удалить)",
+        "sig_btn_back": "⬅ Назад",
+        "sig_btn_back_trade": "⬅ Назад к сделке",
+        "sig_btn_my_trades": "📂 Мои сделки",
+        "sig_orig_title": "📌 Оригинал сигнала (1:1)",
+        "sig_open_prompt": "Нажми кнопку ниже после того, как открыл сделку:",
+        "btn_opened": "✅ ОТКРЫЛ СДЕЛКУ",
+        "macro_title": "⚠️ Впереди макро-событие",
+        "macro_blackout": "Блэкаут",
+        "macro_tail_fut_off": "Фьючерсные сигналы временно отключены.",
+        "macro_tail_paused": "Сигналы временно на паузе."
+
     },
     "en": {
-        "trade_last_price": "Last price",
-        "trade_status": "Status",
-        "mytrades_of": "of",
-        "mytrades_showing": "showing",
         "lbl_trades": "Trades",
         "lbl_wins": "Wins",
         "lbl_losses": "Losses",
         "lbl_be": "BE",
         "lbl_tp1": "TP1",
-        "lbl_winrate": "Win rate",
+        "lbl_winrate": "Winrate",
         "lbl_pnl": "PnL",
         "lbl_spot": "SPOT",
         "lbl_futures": "FUTURES",
@@ -155,6 +183,41 @@ I18N = {
         "stats_title": "📈 Trading statistics",
         "no_closed": "no closed trades",
         "tip_closed": "Tip: stats appear only after a trade is CLOSED (TP2 / SL / BE / manual).",
+        "action_allow": "ALLOW",
+        "action_pause": "PAUSED",
+        "m_menu": "🏠 Menu",
+        "btn_prev": "⬅ Prev",
+        "btn_next": "Next ➡",
+        "my_trades_empty": "You have no opened trades yet. Open a signal first ✅",
+        "my_trades_title": "📂 My trades (showing {a}-{b} of {n})\nTap a trade to open details.",
+        "trade_not_found": "Trade not found (maybe already closed).",
+        "trade_removed": "✅ Removed from My trades.",
+        "trade_removed_fail": "Trade not found.",
+        "trade_opened_toast": "✅ Opened. Tracking started.",
+        "trade_opened_msg": "✅ Trade opened: {sym} ({mkt}). Check 📂 My trades.",
+        "sig_spot_header": "🟢 SPOT SIGNAL",
+        "sig_fut_header": "🔴 FUTURES SIGNAL",
+        "sig_long": "📈 LONG",
+        "sig_short": "📉 SHORT",
+        "sig_tf": "⏱ TF",
+        "sig_entry": "Entry",
+        "sig_status": "Status",
+        "sig_last": "Last price",
+        "sig_buttons": "Buttons:",
+        "sig_btn_refresh": "🔄 Refresh",
+        "sig_btn_orig": "📌 Show original signal",
+        "sig_btn_close": "✅ I CLOSED (remove)",
+        "sig_btn_back": "⬅ Back",
+        "sig_btn_back_trade": "⬅ Back to trade",
+        "sig_btn_my_trades": "📂 My trades",
+        "sig_orig_title": "📌 Original signal (1:1)",
+        "sig_open_prompt": "Tap the button below after you open the trade:",
+        "btn_opened": "✅ I OPENED",
+        "macro_title": "⚠️ Macro Event Ahead",
+        "macro_blackout": "Blackout",
+        "macro_tail_fut_off": "Futures signals are temporarily disabled.",
+        "macro_tail_paused": "Signals are temporarily paused."
+
     }
 }
 
@@ -163,15 +226,16 @@ def tr(uid: int, key: str) -> str:
     return I18N.get(lang, I18N["en"]).get(key, I18N["en"].get(key, key))
 
 
-def _val(uid: int, v: str) -> str:
-    vv = (v or '').strip().upper()
-    if vv == 'ALLOW':
-        return tr(uid, 'val_allow')
-    if vv in ('BLOCK', 'DENY', 'DISALLOW'):
-        return tr(uid, 'val_block')
-    if vv in ('PAUSE_ALL', 'PAUSED', 'FUTURES_OFF'):
-        return tr(uid, 'val_paused')
+def tr_action(uid: int, v: str) -> str:
+    vv = (v or "").upper().strip()
+    if vv == "ALLOW":
+        return tr(uid, "action_allow")
+    if vv in {"PAUSE", "PAUSED", "STOP", "BLOCK"}:
+        return tr(uid, "action_pause")
     return v
+
+def tr_market(uid: int, market: str) -> str:
+    return tr(uid, "lbl_spot") if (market or "").upper().strip() == "SPOT" else tr(uid, "lbl_futures")
 
 def load_users() -> None:
     global USERS
@@ -190,7 +254,7 @@ def save_users() -> None:
         pass
 
 SIGNALS: Dict[int, Signal] = {}
-ORIGINAL_SIGNAL_TEXT: Dict[int, str] = {}
+ORIGINAL_SIGNAL_TEXT: Dict[tuple[int,int], str] = {}  # (uid, signal_id) -> text
 
 # ---------------- signal stats (daily/weekly) ----------------
 STATS_FILE = Path("signal_stats.json")
@@ -347,8 +411,8 @@ def _build_status_text(uid: int = 0) -> str:
         macro_line = f"{next_prefix} {tr(uid, 'next_macro').format(v=ev.name)} | {tr(uid, 'lbl_blackout')} {_fmt_hhmm(w0)}–{_fmt_hhmm(w1)} | {tr(uid, 'lbl_in')} {_fmt_countdown(secs)}"
 
     scan_line = tr(uid, "scanner_run")
-    news_line = tr(uid, "news_action").format(v=_val(uid, backend.last_news_action))
-    macro_line2 = tr(uid, "macro_action").format(v=_val(uid, macro_action))
+    news_line = tr(uid, "news_action").format(v=tr_action(uid, backend.last_news_action))
+    macro_line2 = tr(uid, "macro_action").format(v=tr_action(uid, macro_action))
 
     txt = "\n".join([scan_line, news_line, f"{macro_prefix} {macro_line2}", macro_line])
     return txt
@@ -380,27 +444,46 @@ def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     kb.adjust(2, 2)
     return kb.as_markup()
 
-def _signal_text(s: Signal, uid: int = 0) -> str:
-    header = tr(uid, "sig_spot_hdr") if s.market == "SPOT" else tr(uid, "sig_fut_hdr")
-    arrow = tr(uid, "sig_long") if s.direction == "LONG" else tr(uid, "sig_short")
+
+
+def _signal_text(uid: int, s: Signal) -> str:
+    header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
+    arrow = tr(uid, 'sig_long') if s.direction == 'LONG' else tr(uid, 'sig_short')
     parts = [
         header,
-        "",
+        '',
         f"🪙 {s.symbol}",
         arrow,
-        f"⏱ {tr(uid, 'lbl_tf')}: {s.timeframe}",
-        "",
-        f"{tr(uid, 'lbl_entry')}: {s.entry:.6f}",
-        f"{tr(uid, 'lbl_sl')}: {s.sl:.6f}",
-        f"{tr(uid, 'lbl_tp1')}: {s.tp1:.6f}",
-        f"{tr(uid, 'lbl_tp2')}: {s.tp2:.6f}",
-        "",
-        f"{tr(uid, 'lbl_rr')}: 1:{s.rr:.2f}",
-        f"{tr(uid, 'lbl_conf')}: {s.confidence}/100",
+        f"{tr(uid, 'sig_tf')}: {s.timeframe}",
+        '',
+        f"{tr(uid, 'sig_entry')}: {s.entry:.6f}",
+        f"SL: {s.sl:.6f}",
+        f"TP1: {s.tp1:.6f}",
+        f"TP2: {s.tp2:.6f}",
+        '',
+        f"RR: 1:{s.rr:.2f}",
+        f"Confidence: {s.confidence}/100",
+        f"Confirm: {s.confirmations}",
     ]
     if (s.risk_note or '').strip():
-        parts += ["", str(s.risk_note)]
+        parts += ['', s.risk_note]
+    parts += ['', tr(uid, 'sig_open_prompt')]
     return "\n".join(parts)
+
+
+def _fmt_hhmm(ts_utc: float) -> str:
+    d = dt.datetime.fromtimestamp(ts_utc, tz=ZoneInfo("UTC")).astimezone(TZ)
+    return d.strftime("%H:%M")
+
+def _fmt_countdown(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0
+    m = int(seconds // 60)
+    h = m // 60
+    m = m % 60
+    if h > 0:
+        return f"{h}h {m}m"
+    return f"{m}m"
 
 def _trade_status_emoji(status: str) -> str:
     return {
@@ -415,25 +498,28 @@ def _trade_status_emoji(status: str) -> str:
 # ---------------- broadcasting ----------------
 async def broadcast_signal(sig: Signal) -> None:
     SIGNALS[sig.signal_id] = sig
-    ORIGINAL_SIGNAL_TEXT[sig.signal_id] = _signal_text(sig, 0)
+    ORIGINAL_SIGNAL_TEXT[(0, sig.signal_id)] = _signal_text(0, sig)
     kb = InlineKeyboardBuilder()
-    kb.button(text=tr(uid, "btn_open_trade"), callback_data=f"open:{sig.signal_id}")
+    kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
 
     for uid in list(USERS):
         try:
-            await bot.send_message(uid, _signal_text(sig, uid), reply_markup=kb.as_markup())
+            ORIGINAL_SIGNAL_TEXT[(uid, sig.signal_id)] = _signal_text(uid, sig)
+            kb_u = InlineKeyboardBuilder()
+            kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+            await bot.send_message(uid, _signal_text(uid, sig), reply_markup=kb_u.as_markup())
         except Exception:
             pass
 
+
 async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, float], tz_name: str) -> None:
     w0, w1 = win
-    title = "⚠️ Macro Event Ahead"
-    body = f"{ev.name}\nBlackout: {_fmt_hhmm(w0)} – {_fmt_hhmm(w1)}\n\n"
-    tail = "Futures signals are temporarily disabled." if action == "FUTURES_OFF" else "Signals are temporarily paused."
-    msg = f"{title}\n\n{body}{tail}"
     for uid in list(USERS):
         try:
-            await bot.send_message(uid, msg)
+            title = tr(uid, 'macro_title')
+            body = f"{ev.name}\n{tr(uid, 'macro_blackout')}: {_fmt_hhmm(w0)} – {_fmt_hhmm(w1)}\n\n"
+            tail = tr(uid, 'macro_tail_fut_off') if action == 'FUTURES_OFF' else tr(uid, 'macro_tail_paused')
+            await bot.send_message(uid, f"{title}\n\n{body}{tail}")
         except Exception:
             pass
 
@@ -594,8 +680,8 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             await _render_in_place(call, tr(uid, "no_live"), menu_kb(uid))
             return
         kb = InlineKeyboardBuilder()
-        kb.button(text=tr(uid, "btn_open_trade"), callback_data=f"open:{sig.signal_id}")
-        await bot.send_message(call.from_user.id, _signal_text(sig, uid), reply_markup=kb.as_markup())
+        kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+        await bot.send_message(call.from_user.id, _signal_text(sig), reply_markup=kb.as_markup())
         return
 
 # ---------------- trades list (with buttons) ----------------
@@ -605,71 +691,64 @@ def _trades_page_kb(trades: List, offset: int) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for t in trades:
         s = t.signal
-        label = f"{_trade_status_emoji(t.result)} {s.symbol} {s.market} ({t.result})"
+        label = f"{_trade_status_emoji(t.result)} {s.symbol} {tr_market(uid, s.market)} ({t.result})"
         kb.button(text=label, callback_data=f"trade:view:{s.signal_id}")
     # pagination
     nav = InlineKeyboardBuilder()
     if offset > 0:
-        nav.button(text="⬅ Prev", callback_data=f"trades:page:{max(0, offset-PAGE_SIZE)}")
+        nav.button(text=tr(uid, "btn_prev"), callback_data=f"trades:page:{max(0, offset-PAGE_SIZE)}")
     if len(trades) == PAGE_SIZE:
-        nav.button(text="Next ➡", callback_data=f"trades:page:{offset+PAGE_SIZE}")
+        nav.button(text=tr(uid, "btn_next"), callback_data=f"trades:page:{offset+PAGE_SIZE}")
     if nav.buttons:
         kb.adjust(1)
         kb.row(*[b for b in nav.buttons])
-    kb.row(types.InlineKeyboardButton(text="🏠 Menu", callback_data="menu:status"))
+    kb.row(types.InlineKeyboardButton(text=tr(uid, "m_menu"), callback_data="menu:status"))
     return kb.as_markup()
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trades:page:"))
 async def trades_page(call: types.CallbackQuery) -> None:
     await call.answer()
-    uid = call.from_user.id if call.from_user else 0
-
     try:
         offset = int((call.data or "").split(":")[-1])
     except Exception:
         offset = 0
 
-    all_trades = backend.get_user_trades(uid)
+    all_trades = backend.get_user_trades(call.from_user.id)
     if not all_trades:
-        await bot.send_message(uid, tr(uid, "mytrades_empty"), reply_markup=menu_kb(uid))
+        await bot.send_message(call.from_user.id, tr(call.from_user.id, "my_trades_empty"), reply_markup=menu_kb(call.from_user.id))
         return
 
     page = all_trades[offset:offset+PAGE_SIZE]
-
-    txt = (
-        f"{tr(uid, 'mytrades_title')} ("
-        f"{tr(uid, 'mytrades_showing')} {offset+1}-{min(offset+PAGE_SIZE, len(all_trades))} "
-        f"{tr(uid, 'mytrades_of')} {len(all_trades)})\n"
-        + tr(uid, "mytrades_tap")
-    )
-    await bot.send_message(uid, txt, reply_markup=_trades_page_kb(page, offset))
+    txt = tr(call.from_user.id, "my_trades_title").format(a=offset+1, b=min(offset+PAGE_SIZE, len(all_trades)), n=len(all_trades))
+    await bot.send_message(call.from_user.id, txt, reply_markup=_trades_page_kb(call.from_user.id, page, offset))
 
 # ---------------- trade card ----------------
-def _trade_card_text(t, uid: int = 0) -> str:
+
+def _trade_card_text(uid: int, t) -> str:
     s = t.signal
     last_price = f"{t.last_price:.6f}" if getattr(t, "last_price", 0.0) else "-"
     parts = [
-        tr(uid, "trade_title"),
+        "📌 " + tr(uid, "m_trades"),
         "",
-        f"🪙 {s.symbol} | {s.market} | {s.direction}",
-        f"{tr(uid, 'lbl_tf')}: {s.timeframe}",
+        f"🪙 {s.symbol} | {tr_market(uid, s.market)} | {s.direction}",
+        f"{tr(uid, 'sig_tf')}: {s.timeframe}",
         "",
-        f"{tr(uid, 'lbl_entry')}: {s.entry:.6f}",
-        f"{tr(uid, 'lbl_sl')}: {s.sl:.6f}",
-        f"{tr(uid, 'lbl_tp1')}: {s.tp1:.6f}",
-        f"{tr(uid, 'lbl_tp2')}: {s.tp2:.6f}",
+        f"{tr(uid, 'sig_entry')}: {s.entry:.6f}",
+        f"SL: {s.sl:.6f}",
+        f"TP1: {s.tp1:.6f}",
+        f"TP2: {s.tp2:.6f}",
         "",
-        f"{tr(uid, 'trade_status')}: {t.result} {_trade_status_emoji(t.result)}",
-        f"{tr(uid, 'trade_last_price')}: {last_price}",
+        f"{tr(uid, 'sig_status')}: {t.result} {_trade_status_emoji(t.result)}",
+        f"{tr(uid, 'sig_last')}: {last_price}",
     ]
     return "\n".join(parts)
 
-def _trade_card_kb(signal_id: int, back_offset: int = 0, uid: int = 0) -> types.InlineKeyboardMarkup:
+def _trade_card_kb(uid: int, signal_id: int, back_offset: int = 0) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text=tr(uid, "btn_refresh"), callback_data=f"trade:refresh:{signal_id}:{back_offset}")
-    kb.button(text=tr(uid, "btn_show_orig"), callback_data=f"trade:orig:{signal_id}:{back_offset}")
-    kb.button(text=tr(uid, "btn_close"), callback_data=f"trade:close:{signal_id}:{back_offset}")
-    kb.button(text=tr(uid, "btn_back"), callback_data=f"trades:page:{back_offset}")
+    kb.button(text=tr(uid, "sig_btn_refresh"), callback_data=f"trade:refresh:{signal_id}:{back_offset}")
+    kb.button(text=tr(uid, "sig_btn_orig"), callback_data=f"trade:orig:{signal_id}:{back_offset}")
+    kb.button(text=tr(uid, "sig_btn_close"), callback_data=f"trade:close:{signal_id}:{back_offset}")
+    kb.button(text=tr(uid, "sig_btn_back"), callback_data=f"trades:page:{back_offset}")
     kb.adjust(2, 2)
     return kb.as_markup()
 
@@ -682,9 +761,9 @@ async def trade_view(call: types.CallbackQuery) -> None:
         return
     t = backend.get_trade(call.from_user.id, signal_id)
     if not t:
-        await bot.send_message(call.from_user.id, tr(uid, "trade_not_found"), reply_markup=menu_kb(uid))
+        await bot.send_message(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
         return
-    await bot.send_message(call.from_user.id, _trade_card_text(t, uid), reply_markup=_trade_card_kb(signal_id, 0, uid))
+    await bot.send_message(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, signal_id, 0))
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:refresh:"))
 async def trade_refresh(call: types.CallbackQuery) -> None:
@@ -697,9 +776,9 @@ async def trade_refresh(call: types.CallbackQuery) -> None:
         return
     t = backend.get_trade(call.from_user.id, signal_id)
     if not t:
-        await bot.send_message(call.from_user.id, tr(uid, "trade_not_found"), reply_markup=menu_kb(uid))
+        await bot.send_message(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
         return
-    await bot.send_message(call.from_user.id, _trade_card_text(t, uid), reply_markup=_trade_card_kb(signal_id, back_offset, uid))
+    await bot.send_message(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, signal_id, back_offset))
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:close:"))
 async def trade_close(call: types.CallbackQuery) -> None:
@@ -712,9 +791,9 @@ async def trade_close(call: types.CallbackQuery) -> None:
         return
     removed = backend.remove_trade(call.from_user.id, signal_id)
     if removed:
-        await bot.send_message(call.from_user.id, tr(uid, "trade_removed"), reply_markup=menu_kb(uid))
+        await bot.send_message(call.from_user.id, tr(call.from_user.id, "trade_removed"), reply_markup=menu_kb(call.from_user.id))
     else:
-        await bot.send_message(call.from_user.id, tr(uid, "trade_not_found"), reply_markup=menu_kb(uid))
+        await bot.send_message(call.from_user.id, tr(call.from_user.id, "trade_removed_fail"), reply_markup=menu_kb(call.from_user.id))
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:orig:"))
 async def trade_orig(call: types.CallbackQuery) -> None:
@@ -726,18 +805,18 @@ async def trade_orig(call: types.CallbackQuery) -> None:
     except Exception:
         return
 
-    text = ORIGINAL_SIGNAL_TEXT.get(signal_id)
+    text = ORIGINAL_SIGNAL_TEXT.get((call.from_user.id, signal_id)) or ORIGINAL_SIGNAL_TEXT.get((0, signal_id))
     if not text:
-        await bot.send_message(call.from_user.id, tr(uid, "orig_not_available"), reply_markup=menu_kb(uid))
+        await bot.send_message(call.from_user.id, tr(call.from_user.id, "sig_orig_title") + ": " + tr(call.from_user.id, "lbl_none"), reply_markup=menu_kb(call.from_user.id))
         return
 
     kb = InlineKeyboardBuilder()
-    kb.button(text=tr(uid, "btn_back_to_trade"), callback_data=f"trade:view:{signal_id}")
-    kb.button(text="📂 My trades", callback_data=f"trades:page:{back_offset}")
-    kb.button(text="🏠 Menu", callback_data="menu:status")
+    kb.button(text=tr(call.from_user.id, "sig_btn_back_trade"), callback_data=f"trade:view:{signal_id}")
+    kb.button(text=tr(call.from_user.id, "sig_btn_my_trades"), callback_data=f"trades:page:{back_offset}")
+    kb.button(text=tr(call.from_user.id, "m_menu"), callback_data="menu:status")
     kb.adjust(1, 2)
 
-    await bot.send_message(call.from_user.id, tr(uid, "orig_title") + "\n\n" + text, reply_markup=kb.as_markup())
+    await bot.send_message(call.from_user.id, "📌 Original signal (1:1)\n\n" + text, reply_markup=kb.as_markup())
 
 # ---------------- open signal ----------------
 @dp.callback_query(lambda c: (c.data or "").startswith("open:"))
@@ -754,8 +833,8 @@ async def opened(call: types.CallbackQuery) -> None:
         return
 
     backend.open_trade(call.from_user.id, sig)
-    await call.answer("✅ Opened. Tracking started.")
-    await bot.send_message(call.from_user.id, f"✅ Trade opened: {sig.symbol} ({sig.market}). Check 📂 My trades.", reply_markup=menu_kb(call.from_user.id))
+    await call.answer(tr(call.from_user.id, "trade_opened_toast"))
+    await bot.send_message(call.from_user.id, tr(call.from_user.id, "trade_opened_msg").format(sym=sig.symbol, mkt=tr_market(call.from_user.id, sig.market)), reply_markup=menu_kb(call.from_user.id))
 
 async def main() -> None:
     import time
