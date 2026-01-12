@@ -10,6 +10,8 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
+import datetime as dt
 
 from backend import Backend, Signal, MacroEvent
 
@@ -62,7 +64,7 @@ SIGNALS: Dict[int, Signal] = {}
 def _signal_text(s: Signal) -> str:
     header = "🟢 SPOT SIGNAL" if s.market == "SPOT" else "🔴 FUTURES SIGNAL"
     arrow = "📈 LONG" if s.direction == "LONG" else "📉 SHORT"
-    risk_line = f"\n\n{s.risk_note}" if (s.risk_note or "").strip() else ""
+    risk_line = f"\n\n{s.risk_note}" if (s.risk_note or '').strip() else ""
     return (
         f"{header}\n\n"
         f"🪙 {s.symbol}\n"
@@ -79,10 +81,10 @@ def _signal_text(s: Signal) -> str:
         "Нажми кнопку ниже после того, как открыл сделку:"
     )
 
-def _fmt_hhmm(ts: float) -> str:
-    # format as HH:MM UTC
-    dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
-    return dt.strftime("%H:%M")
+def _fmt_hhmm(ts_utc: float, tz_name: str) -> str:
+    tz = ZoneInfo(tz_name)
+    d = dt.datetime.fromtimestamp(ts_utc, tz=ZoneInfo("UTC")).astimezone(tz)
+    return d.strftime("%H:%M")
 
 async def broadcast_signal(sig: Signal) -> None:
     SIGNALS[sig.signal_id] = sig
@@ -95,12 +97,10 @@ async def broadcast_signal(sig: Signal) -> None:
         except Exception:
             pass
 
-async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, float]) -> None:
-    # action: FUTURES_OFF / PAUSE_ALL
+async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, float], tz_name: str) -> None:
     w0, w1 = win
-    # Format message exactly as requested
     title = "⚠️ Macro Event Ahead"
-    body = f"{ev.name}\nBlackout: {_fmt_hhmm(w0)} – {_fmt_hhmm(w1)}\n\n"
+    body = f"{ev.name}\nBlackout: {_fmt_hhmm(w0, tz_name)} – {_fmt_hhmm(w1, tz_name)}\n\n"
     tail = "Futures signals are temporarily disabled." if action == "FUTURES_OFF" else "Signals are temporarily paused."
     msg = f"{title}\n\n{body}{tail}"
 
@@ -116,10 +116,9 @@ async def start(message: types.Message) -> None:
         USERS.add(message.from_user.id)
         save_users()
     await message.answer(
-        "PRO Auto-Scanner Bot (2/3 multi-exchange + news + macro)\n\n"
+        "PRO Auto-Scanner Bot (2/3 multi-exchange + news + macro AUTO)\n\n"
         "✅ Ты подписан на сигналы.\n"
-        "Я сканирую Binance+Bybit+OKX (15m/1h/4h) и присылаю только сильные сетапы.\n"
-        "Если новости/макро-события повышают риск — FUTURES могут быть отключены.\n\n"
+        "Я сканирую рынок 24/7 и фильтрую сигналы по теханализу + новости + макро-события.\n\n"
         "После кнопки ✅ ОТКРЫЛ СДЕЛКУ — сопровождение и авто-закрытие (TP1/TP2/BE/SL)."
     )
 
@@ -137,7 +136,7 @@ async def status(message: types.Message) -> None:
         f"Last signal: {ls.symbol if ls else 'none'}"
     )
 
-@dp.callback_query(lambda c: (c.data or "").startswith("open:"))
+@dp.callback_query(lambda c: (c.data or '').startswith('open:'))
 async def opened(call: types.CallbackQuery) -> None:
     try:
         signal_id = int((call.data or "").split(":", 1)[1])
@@ -158,9 +157,6 @@ async def opened(call: types.CallbackQuery) -> None:
         pass
 
 async def main() -> None:
-    import datetime  # needed for _fmt_hhmm
-    globals()["datetime"] = datetime  # ensure available inside helper
-
     load_users()
     asyncio.create_task(backend.track_loop(bot))
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
