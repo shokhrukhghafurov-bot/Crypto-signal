@@ -1,46 +1,19 @@
-# PRO Auto-Scanner Bot — Multi-Exchange 2/3 + News Risk Filter
-Timeframes: **15m + 1h + 4h**
+# PRO Auto-Scanner Bot — UI Buttons + My Trades + Multi-Exchange 2/3 + News + Macro AUTO
 
-✅ Scans Binance + Bybit + OKX and emits signals only if confirmed by **>=2/3 exchanges**  
-✅ Indicators: EMA / RSI / MACD / ADX / ATR  
-✅ Calculates Entry/SL/TP1/TP2 + RR + Confidence  
-✅ Broadcasts to all users who pressed `/start`  
-✅ Button **✅ ОТКРЫЛ СДЕЛКУ** → tracking + AUTO CLOSED (TP1/TP2/BE/SL) via Binance WS  
-✅ **News risk filter** (optional): blocks signals during recent high-impact news
+New features:
+- /start shows **menu buttons** (no need to type /status)
+- Buttons:
+  - 📊 Status
+  - 🟢 Spot Live Signal
+  - 🔴 Futures Live Signal
+  - 📂 My Opened Trades (shows status of trades you opened)
+- Auto scanner 24/7 (15m/1h/4h), multi-exchange 2/3 confirmation (Binance+Bybit+OKX)
+- News risk filter (CryptoPanic, optional) + macro blackout AUTO (BLS + Fed)
 
----
-
-## News filter (optional)
-
-This repo implements a **risk filter**, not "AI news prediction".
-
-### Provider: CryptoPanic (recommended)
-- Set `CRYPTOPANIC_TOKEN` in Railway Variables (or `.env` locally)
-- Bot will check for **important** recent posts for the base coin (BTC, ETH, etc.)
-- If a fresh important post appears within `NEWS_LOOKBACK_MIN`, the bot will apply `NEWS_ACTION`.
-
-### Actions
-- `NEWS_ACTION=FUTURES_OFF` → do not publish FUTURES, allow only SPOT signals
-- `NEWS_ACTION=PAUSE_ALL` → do not publish any signals during the window
-
-Defaults are safe:
-- enabled only if `NEWS_FILTER=1` and `CRYPTOPANIC_TOKEN` is present.
-
----
-
-## Railway variables (minimum)
-Required:
-- `BOT_TOKEN`
-
+Deploy on Railway:
+- Set `BOT_TOKEN`
 Optional:
-- `ADMIN_IDS` for `/status`
-- Scanner tuning: `TOP_N`, `SCAN_INTERVAL_SECONDS`, `CONFIDENCE_MIN`, `COOLDOWN_MINUTES`
-- Tracking: `USE_REAL_PRICE=1`
-
-News filter:
-- `NEWS_FILTER=1`
-- `CRYPTOPANIC_TOKEN=...`
-- `NEWS_LOOKBACK_MIN=60`
-- `NEWS_ACTION=FUTURES_OFF` (or `PAUSE_ALL`)
-
+- `ADMIN_IDS` (only admins see some extra scanner info)
+- News: `NEWS_FILTER=1`, `CRYPTOPANIC_TOKEN=...`
+- Macro: `MACRO_FILTER=1`, `MACRO_ACTION=FUTURES_OFF`, `BLACKOUT_BEFORE_MIN`, `BLACKOUT_AFTER_MIN`, `TZ_NAME`
 
