@@ -55,6 +55,12 @@ ATR_MULT_SL = max(0.5, _env_float("ATR_MULT_SL", 1.5))
 TP1_R = max(0.5, _env_float("TP1_R", 1.5))
 TP2_R = max(1.0, _env_float("TP2_R", 3.0))
 
+# News filter
+NEWS_FILTER = _env_bool("NEWS_FILTER", False)
+CRYPTOPANIC_TOKEN = os.getenv("CRYPTOPANIC_TOKEN", "").strip()
+NEWS_LOOKBACK_MIN = max(5, _env_int("NEWS_LOOKBACK_MIN", 60))
+NEWS_ACTION = os.getenv("NEWS_ACTION", "FUTURES_OFF").strip().upper()  # FUTURES_OFF / PAUSE_ALL
+
 # ------------------ Models ------------------
 @dataclass(frozen=True)
 class Signal:
@@ -79,6 +85,81 @@ class UserTrade:
     tp1_hit: bool = False
     sl_moved_to_be: bool = False
     active: bool = True
+
+# ------------------ News risk filter (CryptoPanic) ------------------
+class NewsFilter:
+    \"\"\"Risk filter:
+    - checks recent IMPORTANT news for a base coin via CryptoPanic
+    - returns action: 'ALLOW', 'FUTURES_OFF', or 'PAUSE_ALL'
+    \"\"\"
+
+    BASE_URL = "https://cryptopanic.com/api/v1/posts/"
+
+    def __init__(self) -> None:
+        self._cache: Dict[str, Tuple[float, str]] = {}  # key -> (ts, action)
+        self._cache_ttl = 60  # seconds
+
+    def enabled(self) -> bool:
+        return NEWS_FILTER and bool(CRYPTOPANIC_TOKEN)
+
+    def base_coin(self, symbol: str) -> str:
+        # BTCUSDT -> BTC
+        s = symbol.upper()
+        if s.endswith("USDT"):
+            return s[:-4]
+        if s.endswith("USD"):
+            return s[:-3]
+        return s[:3]
+
+    async def action_for_symbol(self, session: aiohttp.ClientSession, symbol: str) -> str:
+        if not self.enabled():
+            return "ALLOW"
+
+        coin = self.base_coin(symbol)
+        key = f"{coin}:{NEWS_ACTION}:{NEWS_LOOKBACK_MIN}"
+        now = time.time()
+        cached = self._cache.get(key)
+        if cached and (now - cached[0]) < self._cache_ttl:
+            return cached[1]
+
+        action = "ALLOW"
+        try:
+            params = {
+                "auth_token": CRYPTOPANIC_TOKEN,
+                "currencies": coin,
+                "filter": "important",
+                "public": "true",
+            }
+            async with session.get(self.BASE_URL, params=params) as r:
+                if r.status != 200:
+                    # fail-open
+                    action = "ALLOW"
+                else:
+                    data = await r.json()
+                    posts = (data or {}).get("results", []) or []
+                    cutoff = now - (NEWS_LOOKBACK_MIN * 60)
+                    recent = False
+                    for p in posts[:20]:
+                        # published_at is ISO time
+                        published_at = p.get("published_at") or p.get("created_at")
+                        if not published_at:
+                            continue
+                        try:
+                            # parse iso manually without extra deps (YYYY-MM-DDTHH:MM:SSZ)
+                            t = published_at.replace("Z", "+00:00")
+                            ts = pd.to_datetime(t).timestamp()
+                        except Exception:
+                            continue
+                        if ts >= cutoff:
+                            recent = True
+                            break
+                    if recent:
+                        action = NEWS_ACTION if NEWS_ACTION in ("FUTURES_OFF", "PAUSE_ALL") else "FUTURES_OFF"
+        except Exception:
+            action = "ALLOW"
+
+        self._cache[key] = (now, action)
+        return action
 
 # ------------------ Price feed (WS, Binance) ------------------
 class PriceFeed:
@@ -164,16 +245,13 @@ class MultiExchangeData:
         items.sort(reverse=True, key=lambda x: x[0])
         return [sym for _, sym in items[:n]]
 
-    async def _get_json(self, url: str) -> Any:
+    async def _get_json(self, url: str, params: Optional[Dict[str, str]] = None) -> Any:
         assert self.session is not None
-        async with self.session.get(url) as r:
+        async with self.session.get(url, params=params) as r:
             r.raise_for_status()
             return await r.json()
 
     def _df_from_ohlcv(self, rows: List[List[Any]], order: str) -> pd.DataFrame:
-        # order: "binance" => [open_time, open, high, low, close, ...]
-        # order: "bybit" => [start, open, high, low, close, volume, turnover]
-        # order: "okx" => [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
         if not rows:
             return pd.DataFrame()
 
@@ -190,7 +268,7 @@ class MultiExchangeData:
             df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="ms")
             for col in ("open","high","low","close","volume","turnover"):
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-        else:  # okx
+        else:
             df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","vol_ccy","vol_quote","confirm"])
             df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="ms")
             for col in ("open","high","low","close","volume","vol_ccy","vol_quote"):
@@ -200,23 +278,22 @@ class MultiExchangeData:
         return df
 
     async def klines_binance(self, symbol: str, interval: str, limit: int = 250) -> pd.DataFrame:
-        url = f"{self.BINANCE_SPOT}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        raw = await self._get_json(url)
+        url = f"{self.BINANCE_SPOT}/api/v3/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
+        raw = await self._get_json(url, params=params)
         return self._df_from_ohlcv(raw, "binance")
 
     async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        # Bybit v5: interval is minutes: 15, 60, 240
         interval_map = {"15m":"15", "1h":"60", "4h":"240"}
         itv = interval_map.get(interval, "15")
-        url = f"{self.BYBIT}/v5/market/kline?category=spot&symbol={symbol}&interval={itv}&limit={limit}"
-        data = await self._get_json(url)
-        rows = (data or {}).get("result", {}).get("list", [])
-        # bybit returns newest-first, reverse
+        url = f"{self.BYBIT}/v5/market/kline"
+        params = {"category": "spot", "symbol": symbol, "interval": itv, "limit": str(limit)}
+        data = await self._get_json(url, params=params)
+        rows = (data or {}).get("result", {}).get("list", []) or []
         rows = list(reversed(rows))
         return self._df_from_ohlcv(rows, "bybit")
 
     def okx_inst(self, symbol: str) -> str:
-        # BTCUSDT -> BTC-USDT (simple mapping)
         if symbol.endswith("USDT"):
             base = symbol[:-4]
             return f"{base}-USDT"
@@ -226,10 +303,10 @@ class MultiExchangeData:
         bar_map = {"15m":"15m", "1h":"1H", "4h":"4H"}
         bar = bar_map.get(interval, "15m")
         inst = self.okx_inst(symbol)
-        url = f"{self.OKX}/api/v5/market/candles?instId={inst}&bar={bar}&limit={limit}"
-        data = await self._get_json(url)
-        rows = (data or {}).get("data", [])
-        # okx returns newest-first, reverse
+        url = f"{self.OKX}/api/v5/market/candles"
+        params = {"instId": inst, "bar": bar, "limit": str(limit)}
+        data = await self._get_json(url, params=params)
+        rows = (data or {}).get("data", []) or []
         rows = list(reversed(rows))
         return self._df_from_ohlcv(rows, "okx")
 
@@ -294,11 +371,8 @@ def _build_levels(direction: str, entry: float, atr: float) -> Tuple[float, floa
 
 def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
     score = 0
-    # ADX 4h (0..25)
     score += 0 if np.isnan(adx4) else int(min(25, max(0, (adx4 - 15) * 1.25)))
-    # ADX 1h (0..25)
     score += 0 if np.isnan(adx1) else int(min(25, max(0, (adx1 - 15) * 1.25)))
-    # RSI zone (0..20)
     if not np.isnan(rsi15):
         if 40 <= rsi15 <= 60:
             score += 20
@@ -306,14 +380,12 @@ def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
             score += 15
         else:
             score += 8
-    # ATR% (0..20)
     if 0.3 <= atr_pct <= 3.0:
         score += 20
     elif 0.2 <= atr_pct <= 4.0:
         score += 14
     else:
         score += 8
-    # Base trend alignment bonus (10)
     score += 10
     return int(max(0, min(100, score)))
 
@@ -371,6 +443,7 @@ def choose_market(adx1_max: float, atr_pct_max: float) -> str:
 class Backend:
     def __init__(self) -> None:
         self.feed = PriceFeed()
+        self.news = NewsFilter()
         self.trades: Dict[Tuple[int, int], UserTrade] = {}
         self._last_signal_ts: Dict[str, float] = {}
         self._signal_seq = 1
@@ -378,6 +451,7 @@ class Backend:
         self.last_scan_ts: float = 0.0
         self.last_signal: Optional[Signal] = None
         self.scanned_symbols_last: int = 0
+        self.last_news_action: str = "ALLOW"
 
     def next_signal_id(self) -> int:
         sid = self._signal_seq
@@ -454,7 +528,19 @@ class Backend:
                         if not self.can_emit(sym):
                             continue
 
-                        # Fetch candles concurrently per exchange and timeframe
+                        # News risk action (fail-open if disabled)
+                        try:
+                            if self.news.enabled():
+                                action = await self.news.action_for_symbol(api.session, sym)  # type: ignore[arg-type]
+                            else:
+                                action = "ALLOW"
+                        except Exception:
+                            action = "ALLOW"
+                        self.last_news_action = action
+
+                        if action == "PAUSE_ALL":
+                            continue
+
                         async def fetch_exchange(name: str):
                             try:
                                 if name == "BINANCE":
@@ -465,7 +551,7 @@ class Backend:
                                     df15 = await api.klines_bybit(sym, "15m", 200)
                                     df1h = await api.klines_bybit(sym, "1h", 200)
                                     df4h = await api.klines_bybit(sym, "4h", 200)
-                                else:  # OKX
+                                else:
                                     df15 = await api.klines_okx(sym, "15m", 200)
                                     df1h = await api.klines_okx(sym, "1h", 200)
                                     df4h = await api.klines_okx(sym, "4h", 200)
@@ -474,23 +560,23 @@ class Backend:
                             except Exception:
                                 return name, None
 
-                        tasks = [fetch_exchange("BINANCE"), fetch_exchange("BYBIT"), fetch_exchange("OKX")]
-                        results = await asyncio.gather(*tasks)
+                        results = await asyncio.gather(
+                            fetch_exchange("BINANCE"),
+                            fetch_exchange("BYBIT"),
+                            fetch_exchange("OKX"),
+                        )
 
                         good = [(name, r) for (name, r) in results if r is not None]
                         if len(good) < 2:
                             continue
 
-                        # Need 2/3 confirmation of direction
-                        dirs = {}
+                        dirs: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
                         for name, r in good:
                             dirs.setdefault(r["direction"], []).append((name, r))
-                        # choose direction with max supporters
                         best_dir, supporters = max(dirs.items(), key=lambda kv: len(kv[1]))
                         if len(supporters) < 2:
                             continue
 
-                        # Build final signal from supporters: median entry and levels
                         entries = [s[1]["entry"] for s in supporters]
                         sls = [s[1]["sl"] for s in supporters]
                         tp1s = [s[1]["tp1"] for s in supporters]
@@ -511,6 +597,9 @@ class Backend:
                             continue
 
                         market = choose_market(float(np.nanmax(adx1s)), float(np.nanmax(atrp)))
+                        if action == "FUTURES_OFF":
+                            market = "SPOT"
+
                         conf_names = "+".join(sorted([s[0] for s in supporters]))
 
                         sid = self.next_signal_id()
