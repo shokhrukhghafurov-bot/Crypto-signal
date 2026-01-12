@@ -98,14 +98,14 @@ class UserTrade:
     tp1_hit: bool = False
     sl_moved_to_be: bool = False
     active: bool = True
-    result: str = "ACTIVE"  # ACTIVE / TP1 / WIN / LOSS / BE
+    result: str = "ACTIVE"  # ACTIVE / TP1 / WIN / LOSS / BE / CLOSED
     last_price: float = 0.0
-    closed_ts: Optional[float] = None
+    opened_ts: float = 0.0
 
 @dataclass(frozen=True)
 class MacroEvent:
     name: str
-    type: str  # CPI / NFP / FED
+    type: str
     start_ts_utc: float
 
 # ------------------ News risk filter (CryptoPanic) ------------------
@@ -453,7 +453,6 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     close = df["close"]
     high = df["high"]
     low = df["low"]
-
     df = df.copy()
     df["ema50"] = EMAIndicator(close, window=50).ema_indicator()
     df["ema200"] = EMAIndicator(close, window=200).ema_indicator()
@@ -513,36 +512,29 @@ def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
 def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     if df15.empty or df1h.empty or df4h.empty:
         return None
-
     df15i = _add_indicators(df15)
     df1hi = _add_indicators(df1h)
     df4hi = _add_indicators(df4h)
-
     dir4 = _trend_dir(df4hi)
     dir1 = _trend_dir(df1hi)
     if dir4 is None or dir1 is None or dir4 != dir1:
         return None
-
     adx4 = float(df4hi.iloc[-1]["adx"]) if not pd.isna(df4hi.iloc[-1]["adx"]) else np.nan
     adx1 = float(df1hi.iloc[-1]["adx"]) if not pd.isna(df1hi.iloc[-1]["adx"]) else np.nan
     if np.isnan(adx4) or adx4 < 20:
         return None
     if np.isnan(adx1) or adx1 < 18:
         return None
-
     if not _trigger_15m(dir1, df15i):
         return None
-
     last15 = df15i.iloc[-1]
     entry = float(last15["close"])
     atr = float(last15["atr"]) if not pd.isna(last15["atr"]) else 0.0
     if atr <= 0:
         return None
     atr_pct = (atr / entry) * 100.0 if entry > 0 else 0.0
-
     sl, tp1, tp2, rr = _build_levels(dir1, entry, atr)
     conf = _confidence(adx4, adx1, float(last15["rsi"]), atr_pct)
-
     return {"direction": dir1, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr": rr, "confidence": conf, "adx1": adx1, "atr_pct": atr_pct}
 
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
@@ -555,19 +547,16 @@ class Backend:
         self.news = NewsFilter()
         self.macro = MacroCalendar()
 
-        self.trades: Dict[Tuple[int, int], UserTrade] = {}  # (user_id, signal_id) -> trade
+        self.trades: Dict[Tuple[int, int], UserTrade] = {}
         self._last_signal_ts: Dict[str, float] = {}
         self._signal_seq = 1
 
-        self.last_scan_ts: float = 0.0
         self.last_signal: Optional[Signal] = None
         self.last_spot_signal: Optional[Signal] = None
         self.last_futures_signal: Optional[Signal] = None
         self.scanned_symbols_last: int = 0
         self.last_news_action: str = "ALLOW"
         self.last_macro_action: str = "ALLOW"
-        self.last_macro_event: Optional[MacroEvent] = None
-        self.last_macro_window: Optional[Tuple[float, float]] = None
 
     def next_signal_id(self) -> int:
         sid = self._signal_seq
@@ -582,10 +571,16 @@ class Backend:
         self._last_signal_ts[symbol.upper()] = time.time()
 
     def open_trade(self, user_id: int, signal: Signal) -> None:
-        self.trades[(user_id, signal.signal_id)] = UserTrade(user_id=user_id, signal=signal)
+        self.trades[(user_id, signal.signal_id)] = UserTrade(user_id=user_id, signal=signal, opened_ts=time.time())
+
+    def remove_trade(self, user_id: int, signal_id: int) -> bool:
+        return self.trades.pop((user_id, signal_id), None) is not None
+
+    def get_trade(self, user_id: int, signal_id: int) -> Optional[UserTrade]:
+        return self.trades.get((user_id, signal_id))
 
     def get_user_trades(self, user_id: int) -> List[UserTrade]:
-        return [t for (uid, _), t in self.trades.items() if uid == user_id]
+        return sorted([t for (uid, _), t in self.trades.items() if uid == user_id], key=lambda x: x.opened_ts, reverse=True)
 
     def get_next_macro(self) -> Optional[Tuple[MacroEvent, Tuple[float, float]]]:
         return self.macro.next_event()
@@ -600,7 +595,8 @@ class Backend:
 
     async def track_loop(self, bot) -> None:
         while True:
-            for trade in list(self.trades.values()):
+            # iterate over snapshot to allow removals
+            for key, trade in list(self.trades.items()):
                 if not trade.active:
                     continue
 
@@ -614,9 +610,10 @@ class Backend:
                 if not trade.tp1_hit and hit_sl(s.sl):
                     trade.active = False
                     trade.result = "LOSS"
-                    trade.closed_ts = time.time()
                     await bot.send_message(trade.user_id,
                         f"❌ SIGNAL AUTO CLOSED — STOP LOSS\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nStatus: LOSS 🔴")
+                    # auto-remove
+                    self.trades.pop(key, None)
                     continue
 
                 if not trade.tp1_hit and hit_tp(s.tp1):
@@ -630,17 +627,17 @@ class Backend:
                 if trade.tp1_hit and trade.sl_moved_to_be and hit_sl(s.entry):
                     trade.active = False
                     trade.result = "BE"
-                    trade.closed_ts = time.time()
                     await bot.send_message(trade.user_id,
                         f"⚪ SIGNAL AUTO CLOSED — BREAK EVEN\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nStatus: SAFE ⚪")
+                    self.trades.pop(key, None)
                     continue
 
                 if hit_tp(s.tp2):
                     trade.active = False
                     trade.result = "WIN"
-                    trade.closed_ts = time.time()
                     await bot.send_message(trade.user_id,
                         f"✅ SIGNAL AUTO CLOSED — TP2 HIT\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nStatus: WIN 🟢")
+                    self.trades.pop(key, None)
                     continue
 
             await asyncio.sleep(TRACK_INTERVAL_SECONDS)
@@ -648,7 +645,6 @@ class Backend:
     async def scanner_loop(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         while True:
             start = time.time()
-            self.last_scan_ts = start
             try:
                 async with MultiExchangeData() as api:
                     await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
@@ -658,8 +654,6 @@ class Backend:
 
                     mac_act, mac_ev, mac_win = self.macro.current_action()
                     self.last_macro_action = mac_act
-                    self.last_macro_event = mac_ev
-                    self.last_macro_window = mac_win
 
                     if mac_act != "ALLOW" and mac_ev and mac_win and self.macro.should_notify(mac_ev):
                         await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
@@ -729,7 +723,6 @@ class Backend:
                         if news_act == "FUTURES_OFF" and market == "FUTURES":
                             market = "SPOT"
                             risk_notes.append("⚠️ Futures paused due to news")
-
                         if mac_act == "FUTURES_OFF" and market == "FUTURES":
                             market = "SPOT"
                             risk_notes.append("⚠️ Futures signals are temporarily disabled (macro)")
