@@ -76,6 +76,18 @@ def set_lang(uid: int, lang: str) -> None:
 
 I18N = {
     "ru": {
+        "lbl_trades": "Сделки",
+        "lbl_wins": "Плюс",
+        "lbl_losses": "Минус",
+        "lbl_be": "BE",
+        "lbl_tp1": "TP1",
+        "lbl_winrate": "Винрейт",
+        "lbl_pnl": "PnL",
+        "lbl_spot": "SPOT",
+        "lbl_futures": "FUTURES",
+        "lbl_blackout": "Блэкаут",
+        "lbl_in": "через",
+        "lbl_none": "нет",
         "scanner_run": "Сканер: работает 🟢",
         "news_action": "Новости: {v}",
         "macro_action": "Макро: {v}",
@@ -101,6 +113,18 @@ I18N = {
         "tip_closed": "Подсказка: статистика появляется только после закрытия сделки (TP2 / SL / BE / вручную).",
     },
     "en": {
+        "lbl_trades": "Trades",
+        "lbl_wins": "Wins",
+        "lbl_losses": "Losses",
+        "lbl_be": "BE",
+        "lbl_tp1": "TP1",
+        "lbl_winrate": "Winrate",
+        "lbl_pnl": "PnL",
+        "lbl_spot": "SPOT",
+        "lbl_futures": "FUTURES",
+        "lbl_blackout": "Blackout",
+        "lbl_in": "in",
+        "lbl_none": "none",
         "scanner_run": "Scanner status: RUNNING 🟢",
         "news_action": "News action: {v}",
         "macro_action": "Macro action: {v}",
@@ -272,7 +296,7 @@ async def _render_in_place(call: types.CallbackQuery, txt: str, kb: types.Inline
     for i, part in enumerate(parts):
         await bot.send_message(chat_id, part, reply_markup=reply_markup if i == len(parts)-1 else None)
 
-def _fmt_perf(b: dict) -> str:
+def _fmt_perf(uid: int, b: dict) -> str:
     trades = int(b.get("trades", 0))
     wins = int(b.get("wins", 0))
     losses = int(b.get("losses", 0))
@@ -280,20 +304,29 @@ def _fmt_perf(b: dict) -> str:
     tp1 = int(b.get("tp1_hits", 0))
     pnl = float(b.get("sum_pnl_pct", 0.0))
     wr = (wins / trades * 100.0) if trades else 0.0
-    return f"Trades: {trades} | Wins: {wins} | Losses: {losses} | BE: {be} | TP1: {tp1}\nWinrate: {wr:.1f}%\nPnL: {pnl:+.2f}%"
+
+    return (
+        f"{tr(uid, 'lbl_trades')}: {trades} | "
+        f"{tr(uid, 'lbl_wins')}: {wins} | "
+        f"{tr(uid, 'lbl_losses')}: {losses} | "
+        f"{tr(uid, 'lbl_be')}: {be} | "
+        f"{tr(uid, 'lbl_tp1')}: {tp1}\n"
+        f"{tr(uid, 'lbl_winrate')}: {wr:.1f}%\n"
+        f"{tr(uid, 'lbl_pnl')}: {pnl:+.2f}%"
+    )
 
 def _build_status_text(uid: int = 0) -> str:
     next_macro = backend.get_next_macro()
     macro_action = backend.last_macro_action
     macro_prefix = "🟢" if macro_action == "ALLOW" else "🔴"
 
-    macro_line = tr(uid, "next_macro").format(v="none")
+    macro_line = tr(uid, "next_macro").format(v=tr(uid, "lbl_none"))
     if next_macro:
         ev, (w0, w1) = next_macro
         secs = w0 - time.time()
         next_prefix = "🟡" if macro_action == "ALLOW" else "🔴"
-        # keep event line mostly universal
-        macro_line = f"{next_prefix} {tr(uid, 'next_macro').format(v=ev.name)} | Blackout {_fmt_hhmm(w0)}–{_fmt_hhmm(w1)} | in {_fmt_countdown(secs)}"
+        # next macro + blackout + countdown
+        macro_line = f"{next_prefix} {tr(uid, 'next_macro').format(v=ev.name)} | {tr(uid, 'lbl_blackout')} {_fmt_hhmm(w0)}–{_fmt_hhmm(w1)} | {tr(uid, 'lbl_in')} {_fmt_countdown(secs)}"
 
     scan_line = tr(uid, "scanner_run")
     news_line = tr(uid, "news_action").format(v=backend.last_news_action)
@@ -504,31 +537,31 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         parts.append(tr(uid, "stats_title"))
         parts.append("")
         parts.append(tr(uid, "perf_today"))
-        parts.append("🟢 SPOT")
-        parts.append(_fmt_perf(spot_today))
+        parts.append("🟢 " + tr(uid, "lbl_spot"))
+        parts.append(_fmt_perf(uid, spot_today))
         parts.append("")
-        parts.append("🔴 FUTURES")
-        parts.append(_fmt_perf(fut_today))
+        parts.append("🔴 " + tr(uid, "lbl_futures"))
+        parts.append(_fmt_perf(uid, fut_today))
         parts.append("")
         parts.append(tr(uid, "perf_week"))
-        parts.append("🟢 SPOT")
-        parts.append(_fmt_perf(spot_week))
+        parts.append("🟢 " + tr(uid, "lbl_spot"))
+        parts.append(_fmt_perf(uid, spot_week))
         parts.append("")
-        parts.append("🔴 FUTURES")
-        parts.append(_fmt_perf(fut_week))
+        parts.append("🔴 " + tr(uid, "lbl_futures"))
+        parts.append(_fmt_perf(uid, fut_week))
         parts.append("")
         parts.append(tr(uid, "daily_title"))
-        parts.append("🟢 SPOT:")
+        parts.append("🟢 " + tr(uid, "lbl_spot") + ":")
         parts.append("\n".join(spot_daily_nz) if spot_daily_nz else tr(uid, "no_closed"))
         parts.append("")
-        parts.append("🔴 FUTURES:")
+        parts.append("🔴 " + tr(uid, "lbl_futures") + ":")
         parts.append("\n".join(fut_daily_nz) if fut_daily_nz else tr(uid, "no_closed"))
         parts.append("")
         parts.append(tr(uid, "weekly_title"))
-        parts.append("🟢 SPOT:")
+        parts.append("🟢 " + tr(uid, "lbl_spot") + ":")
         parts.append("\n".join(spot_weekly_nz) if spot_weekly_nz else tr(uid, "no_closed"))
         parts.append("")
-        parts.append("🔴 FUTURES:")
+        parts.append("🔴 " + tr(uid, "lbl_futures") + ":")
         parts.append("\n".join(fut_weekly_nz) if fut_weekly_nz else tr(uid, "no_closed"))
         parts.append("")
         parts.append(tr(uid, "tip_closed"))
