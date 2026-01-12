@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List, Any
@@ -16,6 +17,7 @@ import websockets
 from ta.trend import EMAIndicator, MACD, ADXIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
+from zoneinfo import ZoneInfo
 
 # ------------------ ENV helpers ------------------
 def _env_int(name: str, default: int) -> int:
@@ -66,24 +68,27 @@ MACRO_FILTER = _env_bool("MACRO_FILTER", False)
 MACRO_ACTION = os.getenv("MACRO_ACTION", "FUTURES_OFF").strip().upper()  # FUTURES_OFF / PAUSE_ALL
 BLACKOUT_BEFORE_MIN = max(0, _env_int("BLACKOUT_BEFORE_MIN", 30))
 BLACKOUT_AFTER_MIN = max(0, _env_int("BLACKOUT_AFTER_MIN", 45))
-MACRO_EVENTS_JSON = os.getenv("MACRO_EVENTS_JSON", "").strip()
+TZ_NAME = os.getenv("TZ_NAME", "Europe/Berlin").strip() or "Europe/Berlin"
+
+FOMC_DECISION_HOUR_ET = max(0, min(23, _env_int("FOMC_DECISION_HOUR_ET", 14)))
+FOMC_DECISION_MINUTE_ET = max(0, min(59, _env_int("FOMC_DECISION_MINUTE_ET", 0)))
 
 # ------------------ Models ------------------
 @dataclass(frozen=True)
 class Signal:
     signal_id: int
-    market: str      # SPOT / FUTURES
+    market: str
     symbol: str
-    direction: str   # LONG / SHORT
-    timeframe: str   # "15m/1h/4h"
+    direction: str
+    timeframe: str
     entry: float
     sl: float
     tp1: float
     tp2: float
     rr: float
     confidence: int
-    confirmations: str  # e.g. "BINANCE+BYBIT"
-    risk_note: str      # optional risk line for signal
+    confirmations: str
+    risk_note: str
     ts: float
 
 @dataclass
@@ -97,8 +102,8 @@ class UserTrade:
 @dataclass(frozen=True)
 class MacroEvent:
     name: str
-    type: str   # CPI / FED / NFP
-    start_ts: float  # unix seconds UTC
+    type: str  # CPI / NFP / FED
+    start_ts_utc: float
 
 # ------------------ News risk filter (CryptoPanic) ------------------
 class NewsFilter:
@@ -106,18 +111,14 @@ class NewsFilter:
 
     def __init__(self) -> None:
         self._cache: Dict[str, Tuple[float, str]] = {}
-        self._cache_ttl = 60  # seconds
+        self._cache_ttl = 60
 
     def enabled(self) -> bool:
         return NEWS_FILTER and bool(CRYPTOPANIC_TOKEN)
 
     def base_coin(self, symbol: str) -> str:
         s = symbol.upper()
-        if s.endswith("USDT"):
-            return s[:-4]
-        if s.endswith("USD"):
-            return s[:-3]
-        return s[:3]
+        return s[:-4] if s.endswith("USDT") else s[:3]
 
     async def action_for_symbol(self, session: aiohttp.ClientSession, symbol: str) -> str:
         if not self.enabled():
@@ -151,8 +152,7 @@ class NewsFilter:
                         if not published_at:
                             continue
                         try:
-                            t = published_at.replace("Z", "+00:00")
-                            ts = pd.to_datetime(t).timestamp()
+                            ts = pd.to_datetime(published_at.replace("Z", "+00:00")).timestamp()
                         except Exception:
                             continue
                         if ts >= cutoff:
@@ -166,46 +166,122 @@ class NewsFilter:
         self._cache[key] = (now, action)
         return action
 
-# ------------------ Macro calendar blackout ------------------
+# ------------------ Macro calendar (AUTO fetch) ------------------
 class MacroCalendar:
+    \"\"\"Auto-fetch macro events from:
+    - BLS schedule (CPI + Employment Situation)
+    - Fed FOMC meeting calendar (decision time assumed 2pm ET on 2nd day)
+    \"\"\"
+
+    BLS_URL = "https://www.bls.gov/schedule/news_release/current_year.asp"
+    FOMC_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+
     def __init__(self) -> None:
         self._events: List[MacroEvent] = []
-        self._notified: Dict[str, float] = {}  # event_key -> last_notify_ts
+        self._last_fetch_ts: float = 0.0
+        self._fetch_ttl: float = 6 * 60 * 60  # 6h
+        self._notified: Dict[str, float] = {}
         self._notify_cooldown = 6 * 60 * 60  # 6h
-
-        self.reload()
 
     def enabled(self) -> bool:
         return MACRO_FILTER
 
-    def reload(self) -> None:
-        self._events = []
-        if not MACRO_EVENTS_JSON:
+    async def ensure_loaded(self, session: aiohttp.ClientSession) -> None:
+        if not self.enabled():
+            self._events = []
             return
+        now = time.time()
+        if self._events and (now - self._last_fetch_ts) < self._fetch_ttl:
+            return
+        await self.fetch(session)
+
+    async def fetch(self, session: aiohttp.ClientSession) -> None:
+        events: List[MacroEvent] = []
+        # 1) BLS CPI and Employment Situation
         try:
-            raw = json.loads(MACRO_EVENTS_JSON)
-            if not isinstance(raw, list):
-                return
-            for e in raw:
-                if not isinstance(e, dict):
+            async with session.get(self.BLS_URL) as r:
+                r.raise_for_status()
+                html = await r.text()
+
+            tables = pd.read_html(html)
+            # find table with Release column
+            for t in tables:
+                cols = [c.strip().lower() for c in t.columns.astype(str).tolist()]
+                if not ("release" in cols and "date" in cols):
                     continue
-                name = str(e.get("name") or "").strip()
-                etype = str(e.get("type") or "").strip().upper()
-                start = str(e.get("start") or "").strip()
-                if not name or not start:
+                # normalize col names
+                t2 = t.copy()
+                t2.columns = cols
+                for _, row in t2.iterrows():
+                    release = str(row.get("release", "")).strip()
+                    date_str = str(row.get("date", "")).strip()
+                    time_str = str(row.get("time", "")).strip()
+                    if not release or not date_str:
+                        continue
+
+                    if "consumer price index" in release.lower():
+                        name = "CPI (US Inflation)"
+                        etype = "CPI"
+                    elif "employment situation" in release.lower():
+                        name = "NFP (US Jobs)"
+                        etype = "NFP"
+                    else:
+                        continue
+
+                    # BLS times are in ET (08:30 AM)
+                    try:
+                        dt_et = pd.to_datetime(f"{date_str} {time_str}", format="%A, %B %d, %Y %I:%M %p", errors="raise")
+                    except Exception:
+                        # try without weekday
+                        try:
+                            dt_et = pd.to_datetime(f"{date_str} {time_str}")
+                        except Exception:
+                            continue
+                    dt_et = dt_et.tz_localize(ZoneInfo("America/New_York"), ambiguous="NaT", nonexistent="shift_forward")
+                    dt_utc = dt_et.tz_convert(ZoneInfo("UTC")).timestamp()
+                    events.append(MacroEvent(name=name, type=etype, start_ts_utc=float(dt_utc)))
+                break
+        except Exception:
+            pass
+
+        # 2) FOMC meeting calendar (decision on 2nd day at 2pm ET by default)
+        try:
+            async with session.get(self.FOMC_URL) as r:
+                r.raise_for_status()
+                txt = await r.text()
+
+            # Parse lines like: "January 27-28" etc.
+            year = pd.Timestamp.utcnow().year
+            # restrict to the section containing "2026 FOMC Meetings" or current year+1 if needed
+            # We'll just parse month names + day ranges and create dates in current year if present in page.
+            months = ["January","February","March","April","May","June","July","August","September","October","November","December"]
+            for m in months:
+                # match "January 27-28" or "January 27-28" with whitespace/newlines
+                pattern = rf"{m}\\s*\\n\\s*(\\d{{1,2}})\\s*[-–]\\s*(\\d{{1,2}})"
+                m1 = re.search(pattern, txt, flags=re.IGNORECASE)
+                if not m1:
                     continue
+                d1 = int(m1.group(1))
+                d2 = int(m1.group(2))
+                # decision day is second day
                 try:
-                    ts = pd.to_datetime(start.replace("Z", "+00:00")).timestamp()
+                    dt_et = pd.Timestamp(year=year, month=months.index(m)+1, day=d2, hour=FOMC_DECISION_HOUR_ET, minute=FOMC_DECISION_MINUTE_ET, tz="America/New_York")
                 except Exception:
                     continue
-                self._events.append(MacroEvent(name=name, type=etype or "MACRO", start_ts=float(ts)))
-            self._events.sort(key=lambda x: x.start_ts)
+                events.append(MacroEvent(name="FOMC Rate Decision", type="FED", start_ts_utc=float(dt_et.tz_convert("UTC").timestamp())))
         except Exception:
-            self._events = []
+            pass
+
+        # keep only future-ish events (last 2 days + next 12 months)
+        now = time.time()
+        filtered = [e for e in events if (now - 2*24*3600) <= e.start_ts_utc <= (now + 370*24*3600)]
+        filtered.sort(key=lambda e: e.start_ts_utc)
+        self._events = filtered
+        self._last_fetch_ts = time.time()
 
     def blackout_window(self, ev: MacroEvent) -> Tuple[float, float]:
-        start = ev.start_ts - (BLACKOUT_BEFORE_MIN * 60)
-        end = ev.start_ts + (BLACKOUT_AFTER_MIN * 60)
+        start = ev.start_ts_utc - (BLACKOUT_BEFORE_MIN * 60)
+        end = ev.start_ts_utc + (BLACKOUT_AFTER_MIN * 60)
         return start, end
 
     def current_action(self) -> Tuple[str, Optional[MacroEvent], Optional[Tuple[float, float]]]:
@@ -219,18 +295,8 @@ class MacroCalendar:
                 return act, ev, (w0, w1)
         return "ALLOW", None, None
 
-    def next_upcoming(self) -> Optional[Tuple[MacroEvent, Tuple[float, float]]]:
-        if not self.enabled():
-            return None
-        now = time.time()
-        for ev in self._events:
-            w0, w1 = self.blackout_window(ev)
-            if now < w0:
-                return ev, (w0, w1)
-        return None
-
     def should_notify(self, ev: MacroEvent) -> bool:
-        key = f"{ev.type}:{ev.start_ts}"
+        key = f"{ev.type}:{ev.start_ts_utc}"
         now = time.time()
         last = self._notified.get(key, 0.0)
         if (now - last) >= self._notify_cooldown:
@@ -602,23 +668,24 @@ class Backend:
             self.last_scan_ts = start
             try:
                 async with MultiExchangeData() as api:
+                    # ensure macro schedule loaded (auto)
+                    await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
+
                     symbols = await api.get_top_usdt_symbols(TOP_N)
                     self.scanned_symbols_last = len(symbols)
 
-                    # Macro current action
                     mac_act, mac_ev, mac_win = self.macro.current_action()
                     self.last_macro_action = mac_act
                     self.last_macro_event = mac_ev
                     self.last_macro_window = mac_win
 
                     if mac_act != "ALLOW" and mac_ev and mac_win and self.macro.should_notify(mac_ev):
-                        await emit_macro_alert_cb(mac_act, mac_ev, mac_win)
+                        await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
 
                     for sym in symbols:
                         if not self.can_emit(sym):
                             continue
 
-                        # If macro is PAUSE_ALL, stop all signals
                         if mac_act == "PAUSE_ALL":
                             continue
 
@@ -693,12 +760,10 @@ class Backend:
                         market = choose_market(float(np.nanmax(adx1s)), float(np.nanmax(atrp)))
 
                         risk_notes = []
-                        # Apply NEWS_ACTION
                         if news_act == "FUTURES_OFF" and market == "FUTURES":
                             market = "SPOT"
                             risk_notes.append("⚠️ Futures paused due to news")
 
-                        # Apply MACRO_ACTION
                         if mac_act == "FUTURES_OFF" and market == "FUTURES":
                             market = "SPOT"
                             risk_notes.append("⚠️ Futures signals are temporarily disabled (macro)")
