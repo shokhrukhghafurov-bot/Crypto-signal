@@ -142,15 +142,20 @@ def _weekly_report_lines(weeks: int = 4) -> list[str]:
 
 # Status auto-refresh (per user)
 STATUS_TASKS: Dict[int, asyncio.Task] = {}
-LAST_VIEW: dict[int, str] = {}
 
-def _remember_view(user_id: int, view: str) -> None:
-    LAST_VIEW[user_id] = view
+CURRENT_VIEW: dict[int, str] = {}
 
-def _get_last_view(user_id: int, default: str = "status") -> str:
-    return LAST_VIEW.get(user_id, default)
+def _nav_enter(user_id: int, view: str) -> None:
+    prev = CURRENT_VIEW.get(user_id)
+    if view != "back":
+        if prev and prev != view:
+            PREV_VIEW[user_id] = prev
+        CURRENT_VIEW[user_id] = view
 
+def _nav_back(user_id: int, default: str = "status") -> str:
+    return PREV_VIEW.get(user_id) or default
 
+PREV_VIEW: dict[int, str] = {}
 
 async def _send_long(chat_id: int, text: str, reply_markup=None) -> None:
     # Telegram message limit ~4096 chars. Send in chunks if needed.
@@ -328,10 +333,14 @@ async def start(message: types.Message) -> None:
 @dp.callback_query(lambda c: (c.data or "").startswith("menu:"))
 async def menu_handler(call: types.CallbackQuery) -> None:
     action = (call.data or "").split(":", 1)[1]
+    uid = call.from_user.id if call.from_user else 0
+    _nav_enter(uid, action)
+    if action == "back":
+        action = _nav_back(uid, "status")
+
     await call.answer()
 
     if action == "status":
-        _remember_view(call.from_user.id, "status")
         # cancel previous auto-refresh task (if any)
         uid = call.from_user.id if call.from_user else 0
         t = STATUS_TASKS.pop(uid, None)
@@ -357,7 +366,6 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         return
 
     if action == "stats":
-        _remember_view(call.from_user.id, "stats")
         # cancel previous auto-refresh task (if any)
         uid = call.from_user.id if call.from_user else 0
         t = STATUS_TASKS.pop(uid, None)
