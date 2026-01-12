@@ -98,6 +98,9 @@ class UserTrade:
     tp1_hit: bool = False
     sl_moved_to_be: bool = False
     active: bool = True
+    result: str = "ACTIVE"  # ACTIVE / TP1 / WIN / LOSS / BE
+    last_price: float = 0.0
+    closed_ts: Optional[float] = None
 
 @dataclass(frozen=True)
 class MacroEvent:
@@ -168,20 +171,15 @@ class NewsFilter:
 
 # ------------------ Macro calendar (AUTO fetch) ------------------
 class MacroCalendar:
-    \"\"\"Auto-fetch macro events from:
-    - BLS schedule (CPI + Employment Situation)
-    - Fed FOMC meeting calendar (decision time assumed 2pm ET on 2nd day)
-    \"\"\"
-
     BLS_URL = "https://www.bls.gov/schedule/news_release/current_year.asp"
     FOMC_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
 
     def __init__(self) -> None:
         self._events: List[MacroEvent] = []
         self._last_fetch_ts: float = 0.0
-        self._fetch_ttl: float = 6 * 60 * 60  # 6h
+        self._fetch_ttl: float = 6 * 60 * 60
         self._notified: Dict[str, float] = {}
-        self._notify_cooldown = 6 * 60 * 60  # 6h
+        self._notify_cooldown = 6 * 60 * 60
 
     def enabled(self) -> bool:
         return MACRO_FILTER
@@ -197,46 +195,41 @@ class MacroCalendar:
 
     async def fetch(self, session: aiohttp.ClientSession) -> None:
         events: List[MacroEvent] = []
-        # 1) BLS CPI and Employment Situation
+
+        # BLS schedule
         try:
             async with session.get(self.BLS_URL) as r:
                 r.raise_for_status()
                 html = await r.text()
 
             tables = pd.read_html(html)
-            # find table with Release column
             for t in tables:
                 cols = [c.strip().lower() for c in t.columns.astype(str).tolist()]
                 if not ("release" in cols and "date" in cols):
                     continue
-                # normalize col names
                 t2 = t.copy()
                 t2.columns = cols
                 for _, row in t2.iterrows():
                     release = str(row.get("release", "")).strip()
                     date_str = str(row.get("date", "")).strip()
                     time_str = str(row.get("time", "")).strip()
-                    if not release or not date_str:
+                    if not release or not date_str or not time_str:
                         continue
 
-                    if "consumer price index" in release.lower():
+                    rel_l = release.lower()
+                    if "consumer price index" in rel_l:
                         name = "CPI (US Inflation)"
                         etype = "CPI"
-                    elif "employment situation" in release.lower():
+                    elif "employment situation" in rel_l:
                         name = "NFP (US Jobs)"
                         etype = "NFP"
                     else:
                         continue
 
-                    # BLS times are in ET (08:30 AM)
                     try:
-                        dt_et = pd.to_datetime(f"{date_str} {time_str}", format="%A, %B %d, %Y %I:%M %p", errors="raise")
+                        dt_et = pd.to_datetime(f"{date_str} {time_str}")
                     except Exception:
-                        # try without weekday
-                        try:
-                            dt_et = pd.to_datetime(f"{date_str} {time_str}")
-                        except Exception:
-                            continue
+                        continue
                     dt_et = dt_et.tz_localize(ZoneInfo("America/New_York"), ambiguous="NaT", nonexistent="shift_forward")
                     dt_utc = dt_et.tz_convert(ZoneInfo("UTC")).timestamp()
                     events.append(MacroEvent(name=name, type=etype, start_ts_utc=float(dt_utc)))
@@ -244,26 +237,20 @@ class MacroCalendar:
         except Exception:
             pass
 
-        # 2) FOMC meeting calendar (decision on 2nd day at 2pm ET by default)
+        # FOMC calendar (best-effort parse)
         try:
             async with session.get(self.FOMC_URL) as r:
                 r.raise_for_status()
                 txt = await r.text()
 
-            # Parse lines like: "January 27-28" etc.
             year = pd.Timestamp.utcnow().year
-            # restrict to the section containing "2026 FOMC Meetings" or current year+1 if needed
-            # We'll just parse month names + day ranges and create dates in current year if present in page.
             months = ["January","February","March","April","May","June","July","August","September","October","November","December"]
             for m in months:
-                # match "January 27-28" or "January 27-28" with whitespace/newlines
                 pattern = rf"{m}\\s*\\n\\s*(\\d{{1,2}})\\s*[-–]\\s*(\\d{{1,2}})"
                 m1 = re.search(pattern, txt, flags=re.IGNORECASE)
                 if not m1:
                     continue
-                d1 = int(m1.group(1))
                 d2 = int(m1.group(2))
-                # decision day is second day
                 try:
                     dt_et = pd.Timestamp(year=year, month=months.index(m)+1, day=d2, hour=FOMC_DECISION_HOUR_ET, minute=FOMC_DECISION_MINUTE_ET, tz="America/New_York")
                 except Exception:
@@ -272,7 +259,6 @@ class MacroCalendar:
         except Exception:
             pass
 
-        # keep only future-ish events (last 2 days + next 12 months)
         now = time.time()
         filtered = [e for e in events if (now - 2*24*3600) <= e.start_ts_utc <= (now + 370*24*3600)]
         filtered.sort(key=lambda e: e.start_ts_utc)
@@ -294,6 +280,16 @@ class MacroCalendar:
                 act = MACRO_ACTION if MACRO_ACTION in ("FUTURES_OFF", "PAUSE_ALL") else "FUTURES_OFF"
                 return act, ev, (w0, w1)
         return "ALLOW", None, None
+
+    def next_event(self) -> Optional[Tuple[MacroEvent, Tuple[float, float]]]:
+        if not self.enabled():
+            return None
+        now = time.time()
+        for ev in self._events:
+            w0, w1 = self.blackout_window(ev)
+            if now < w0:
+                return ev, (w0, w1)
+        return None
 
     def should_notify(self, ev: MacroEvent) -> bool:
         key = f"{ev.type}:{ev.start_ts_utc}"
@@ -475,11 +471,7 @@ def _trend_dir(df: pd.DataFrame) -> Optional[str]:
     row = df.iloc[-1]
     if pd.isna(row["ema50"]) or pd.isna(row["ema200"]):
         return None
-    if row["ema50"] > row["ema200"]:
-        return "LONG"
-    if row["ema50"] < row["ema200"]:
-        return "SHORT"
-    return None
+    return "LONG" if row["ema50"] > row["ema200"] else ("SHORT" if row["ema50"] < row["ema200"] else None)
 
 def _trigger_15m(direction: str, df15i: pd.DataFrame) -> bool:
     if len(df15i) < 5:
@@ -488,15 +480,12 @@ def _trigger_15m(direction: str, df15i: pd.DataFrame) -> bool:
     prev = df15i.iloc[-2]
     if any(pd.isna(last[x]) for x in ("rsi","macd","macd_signal","macd_hist")) or pd.isna(prev["macd_hist"]):
         return False
-
     macd_ok = (last["macd"] > last["macd_signal"] and last["macd_hist"] > prev["macd_hist"]) if direction == "LONG" else (last["macd"] < last["macd_signal"] and last["macd_hist"] < prev["macd_hist"])
     if not macd_ok:
         return False
-
     if direction == "LONG":
         return prev["rsi"] < 50 and last["rsi"] >= 50 and last["rsi"] <= 70
-    else:
-        return prev["rsi"] > 50 and last["rsi"] <= 50 and last["rsi"] >= 30
+    return prev["rsi"] > 50 and last["rsi"] <= 50 and last["rsi"] >= 30
 
 def _build_levels(direction: str, entry: float, atr: float) -> Tuple[float, float, float, float]:
     R = max(1e-9, ATR_MULT_SL * atr)
@@ -516,18 +505,8 @@ def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
     score += 0 if np.isnan(adx4) else int(min(25, max(0, (adx4 - 15) * 1.25)))
     score += 0 if np.isnan(adx1) else int(min(25, max(0, (adx1 - 15) * 1.25)))
     if not np.isnan(rsi15):
-        if 40 <= rsi15 <= 60:
-            score += 20
-        elif 35 <= rsi15 <= 65:
-            score += 15
-        else:
-            score += 8
-    if 0.3 <= atr_pct <= 3.0:
-        score += 20
-    elif 0.2 <= atr_pct <= 4.0:
-        score += 14
-    else:
-        score += 8
+        score += 20 if 40 <= rsi15 <= 60 else (15 if 35 <= rsi15 <= 65 else 8)
+    score += 20 if 0.3 <= atr_pct <= 3.0 else (14 if 0.2 <= atr_pct <= 4.0 else 8)
     score += 10
     return int(max(0, min(100, score)))
 
@@ -564,22 +543,10 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     sl, tp1, tp2, rr = _build_levels(dir1, entry, atr)
     conf = _confidence(adx4, adx1, float(last15["rsi"]), atr_pct)
 
-    return {
-        "direction": dir1,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "rr": rr,
-        "confidence": conf,
-        "adx1": adx1,
-        "atr_pct": atr_pct,
-    }
+    return {"direction": dir1, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr": rr, "confidence": conf, "adx1": adx1, "atr_pct": atr_pct}
 
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
-    if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8:
-        return "FUTURES"
-    return "SPOT"
+    return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
 
 # ------------------ Backend ------------------
 class Backend:
@@ -588,12 +555,14 @@ class Backend:
         self.news = NewsFilter()
         self.macro = MacroCalendar()
 
-        self.trades: Dict[Tuple[int, int], UserTrade] = {}
+        self.trades: Dict[Tuple[int, int], UserTrade] = {}  # (user_id, signal_id) -> trade
         self._last_signal_ts: Dict[str, float] = {}
         self._signal_seq = 1
 
         self.last_scan_ts: float = 0.0
         self.last_signal: Optional[Signal] = None
+        self.last_spot_signal: Optional[Signal] = None
+        self.last_futures_signal: Optional[Signal] = None
         self.scanned_symbols_last: int = 0
         self.last_news_action: str = "ALLOW"
         self.last_macro_action: str = "ALLOW"
@@ -615,6 +584,12 @@ class Backend:
     def open_trade(self, user_id: int, signal: Signal) -> None:
         self.trades[(user_id, signal.signal_id)] = UserTrade(user_id=user_id, signal=signal)
 
+    def get_user_trades(self, user_id: int) -> List[UserTrade]:
+        return [t for (uid, _), t in self.trades.items() if uid == user_id]
+
+    def get_next_macro(self) -> Optional[Tuple[MacroEvent, Tuple[float, float]]]:
+        return self.macro.next_event()
+
     async def _get_price(self, signal: Signal) -> float:
         market = (signal.market or "FUTURES").upper()
         if not USE_REAL_PRICE:
@@ -631,12 +606,15 @@ class Backend:
 
                 s = trade.signal
                 price = await self._get_price(s)
+                trade.last_price = float(price)
 
                 hit_tp = lambda lvl: price >= lvl if s.direction == "LONG" else price <= lvl
                 hit_sl = lambda lvl: price <= lvl if s.direction == "LONG" else price >= lvl
 
                 if not trade.tp1_hit and hit_sl(s.sl):
                     trade.active = False
+                    trade.result = "LOSS"
+                    trade.closed_ts = time.time()
                     await bot.send_message(trade.user_id,
                         f"❌ SIGNAL AUTO CLOSED — STOP LOSS\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nStatus: LOSS 🔴")
                     continue
@@ -644,18 +622,23 @@ class Backend:
                 if not trade.tp1_hit and hit_tp(s.tp1):
                     trade.tp1_hit = True
                     trade.sl_moved_to_be = True
+                    trade.result = "TP1"
                     await bot.send_message(trade.user_id,
                         f"🟡 TP1 HIT\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nClosed: {TP1_PARTIAL_CLOSE_PCT}%\\nSL moved to Entry (BE)")
                     continue
 
                 if trade.tp1_hit and trade.sl_moved_to_be and hit_sl(s.entry):
                     trade.active = False
+                    trade.result = "BE"
+                    trade.closed_ts = time.time()
                     await bot.send_message(trade.user_id,
                         f"⚪ SIGNAL AUTO CLOSED — BREAK EVEN\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nStatus: SAFE ⚪")
                     continue
 
                 if hit_tp(s.tp2):
                     trade.active = False
+                    trade.result = "WIN"
+                    trade.closed_ts = time.time()
                     await bot.send_message(trade.user_id,
                         f"✅ SIGNAL AUTO CLOSED — TP2 HIT\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nStatus: WIN 🟢")
                     continue
@@ -668,7 +651,6 @@ class Backend:
             self.last_scan_ts = start
             try:
                 async with MultiExchangeData() as api:
-                    # ensure macro schedule loaded (auto)
                     await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
 
                     symbols = await api.get_top_usdt_symbols(TOP_N)
@@ -685,7 +667,6 @@ class Backend:
                     for sym in symbols:
                         if not self.can_emit(sym):
                             continue
-
                         if mac_act == "PAUSE_ALL":
                             continue
 
@@ -698,7 +679,6 @@ class Backend:
                         except Exception:
                             news_act = "ALLOW"
                         self.last_news_action = news_act
-
                         if news_act == "PAUSE_ALL":
                             continue
 
@@ -721,12 +701,7 @@ class Backend:
                             except Exception:
                                 return name, None
 
-                        results = await asyncio.gather(
-                            fetch_exchange("BINANCE"),
-                            fetch_exchange("BYBIT"),
-                            fetch_exchange("OKX"),
-                        )
-
+                        results = await asyncio.gather(fetch_exchange("BINANCE"), fetch_exchange("BYBIT"), fetch_exchange("OKX"))
                         good = [(name, r) for (name, r) in results if r is not None]
                         if len(good) < 2:
                             continue
@@ -738,28 +713,19 @@ class Backend:
                         if len(supporters) < 2:
                             continue
 
-                        entries = [s[1]["entry"] for s in supporters]
-                        sls = [s[1]["sl"] for s in supporters]
-                        tp1s = [s[1]["tp1"] for s in supporters]
-                        tp2s = [s[1]["tp2"] for s in supporters]
-                        rrs = [s[1]["rr"] for s in supporters]
-                        confs = [s[1]["confidence"] for s in supporters]
-                        adx1s = [s[1]["adx1"] for s in supporters]
-                        atrp = [s[1]["atr_pct"] for s in supporters]
-
-                        entry = float(np.median(entries))
-                        sl = float(np.median(sls))
-                        tp1 = float(np.median(tp1s))
-                        tp2 = float(np.median(tp2s))
-                        rr = float(np.median(rrs))
-                        conf = int(np.median(confs))
+                        entry = float(np.median([s[1]["entry"] for s in supporters]))
+                        sl = float(np.median([s[1]["sl"] for s in supporters]))
+                        tp1 = float(np.median([s[1]["tp1"] for s in supporters]))
+                        tp2 = float(np.median([s[1]["tp2"] for s in supporters]))
+                        rr = float(np.median([s[1]["rr"] for s in supporters]))
+                        conf = int(np.median([s[1]["confidence"] for s in supporters]))
 
                         if conf < CONFIDENCE_MIN or rr < 2.0:
                             continue
 
-                        market = choose_market(float(np.nanmax(adx1s)), float(np.nanmax(atrp)))
-
+                        market = choose_market(float(np.nanmax([s[1]["adx1"] for s in supporters])), float(np.nanmax([s[1]["atr_pct"] for s in supporters])))
                         risk_notes = []
+
                         if news_act == "FUTURES_OFF" and market == "FUTURES":
                             market = "SPOT"
                             risk_notes.append("⚠️ Futures paused due to news")
@@ -790,6 +756,11 @@ class Backend:
 
                         self.mark_emitted(sym)
                         self.last_signal = sig
+                        if sig.market == "SPOT":
+                            self.last_spot_signal = sig
+                        else:
+                            self.last_futures_signal = sig
+
                         await emit_signal_cb(sig)
                         await asyncio.sleep(2)
 
