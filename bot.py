@@ -94,9 +94,10 @@ async def start(message: types.Message) -> None:
         USERS.add(message.from_user.id)
         save_users()
     await message.answer(
-        "PRO Auto-Scanner Bot (Multi-exchange 2/3)\n\n"
+        "PRO Auto-Scanner Bot (Multi-exchange 2/3 + News filter)\n\n"
         "✅ Ты подписан на сигналы.\n"
-        "Я сканирую Binance+Bybit+OKX (15m/1h/4h) и присылаю только подтверждённые сетапы.\n\n"
+        "Я сканирую Binance+Bybit+OKX (15m/1h/4h) и присылаю только подтверждённые сетапы.\n"
+        "Новости: если высокий риск — бот ограничит FUTURES или поставит паузу.\n\n"
         "После кнопки ✅ ОТКРЫЛ СДЕЛКУ — сопровождение и авто-закрытие (TP1/TP2/BE/SL)."
     )
 
@@ -109,6 +110,7 @@ async def status(message: types.Message) -> None:
         f"Users: {len(USERS)}\n"
         f"TopN: {os.getenv('TOP_N','50')}\n"
         f"Last scan symbols: {backend.scanned_symbols_last}\n"
+        f"News action: {backend.last_news_action}\n"
         f"Last signal: {ls.symbol if ls else 'none'}"
     )
 
