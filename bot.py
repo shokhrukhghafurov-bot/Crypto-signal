@@ -448,12 +448,16 @@ def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
 
 def _signal_text(uid: int, s: Signal) -> str:
     header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
+    # Direction (LONG/SHORT) is meaningful for futures. For SPOT we hide it to avoid confusion.
     arrow = tr(uid, 'sig_long') if s.direction == 'LONG' else tr(uid, 'sig_short')
     parts = [
         header,
         '',
         f"🪙 {s.symbol}",
-        arrow,
+    ]
+    if s.market != 'SPOT':
+        parts.append(arrow)
+    parts += [
         f"{tr(uid, 'sig_tf')}: {s.timeframe}",
         '',
         f"{tr(uid, 'sig_entry')}: {s.entry:.6f}",
@@ -587,7 +591,8 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             txt = f"Status error: {e}"
         if call.from_user and _is_admin(call.from_user.id) and backend.last_signal:
             ls = backend.last_signal
-            txt += f"\nLast signal: {ls.symbol} {ls.market} {ls.direction} conf={ls.confidence}"
+            extra_dir = f" {ls.direction}" if getattr(ls, 'market', '') != 'SPOT' else ""
+            txt += f"\nLast signal: {ls.symbol} {ls.market}{extra_dir} conf={ls.confidence}"
 
         msg = await _render_in_place(call, txt, menu_kb(call.from_user.id))
 
@@ -727,10 +732,14 @@ async def trades_page(call: types.CallbackQuery) -> None:
 def _trade_card_text(uid: int, t) -> str:
     s = t.signal
     last_price = f"{t.last_price:.6f}" if getattr(t, "last_price", 0.0) else "-"
+    head = f"🪙 {s.symbol} | {tr_market(uid, s.market)}"
+    # Direction is meaningful only for futures; hide for spot.
+    if s.market != 'SPOT':
+        head += f" | {s.direction}"
     parts = [
         "📌 " + tr(uid, "m_trades"),
         "",
-        f"🪙 {s.symbol} | {tr_market(uid, s.market)} | {s.direction}",
+        head,
         f"{tr(uid, 'sig_tf')}: {s.timeframe}",
         "",
         f"{tr(uid, 'sig_entry')}: {s.entry:.6f}",
