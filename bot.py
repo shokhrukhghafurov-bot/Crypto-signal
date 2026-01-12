@@ -142,6 +142,14 @@ def _weekly_report_lines(weeks: int = 4) -> list[str]:
 
 # Status auto-refresh (per user)
 STATUS_TASKS: Dict[int, asyncio.Task] = {}
+LAST_VIEW: dict[int, str] = {}
+
+def _remember_view(user_id: int, view: str) -> None:
+    LAST_VIEW[user_id] = view
+
+def _get_last_view(user_id: int, default: str = "status") -> str:
+    return LAST_VIEW.get(user_id, default)
+
 
 
 async def _send_long(chat_id: int, text: str, reply_markup=None) -> None:
@@ -323,6 +331,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
     await call.answer()
 
     if action == "status":
+        _remember_view(call.from_user.id, "status")
         # cancel previous auto-refresh task (if any)
         uid = call.from_user.id if call.from_user else 0
         t = STATUS_TASKS.pop(uid, None)
@@ -348,6 +357,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         return
 
     if action == "stats":
+        _remember_view(call.from_user.id, "stats")
         # cancel previous auto-refresh task (if any)
         uid = call.from_user.id if call.from_user else 0
         t = STATUS_TASKS.pop(uid, None)
@@ -371,7 +381,6 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         except Exception:
             spot_daily, fut_daily, spot_weekly, fut_weekly = [], [], [], []
 
-        # hide empty (trades=0) rows to keep message short and editable
         spot_daily_nz = [x for x in spot_daily if "trades=0" not in x]
         fut_daily_nz = [x for x in fut_daily if "trades=0" not in x]
         spot_weekly_nz = [x for x in spot_weekly if "trades=0" not in x]
@@ -413,10 +422,18 @@ async def menu_handler(call: types.CallbackQuery) -> None:
 
         kb = InlineKeyboardBuilder()
         kb.button(text="🔄 Refresh", callback_data="menu:stats")
-        kb.button(text="📊 Status", callback_data="menu:status")
+        kb.button(text="⬅️ Back", callback_data="menu:back")
         kb.adjust(2)
-        msg = await _render_in_place(call, txt, kb.as_markup())
+        await _render_in_place(call, txt, kb.as_markup())
         return
+
+    if action == "back":
+        prev = _get_last_view(call.from_user.id, "status")
+        # fallback to status
+        call.data = f"menu:{prev}"
+        await menu_handler(call)
+        return
+
 
     if action in ("spot", "futures"):
         sig = backend.last_spot_signal if action == "spot" else backend.last_futures_signal
