@@ -49,11 +49,6 @@ class UserTrade:
     active: bool = True
 
 class PriceFeed:
-    \"\"\"Latest price by (market, symbol).
-    If USE_REAL_PRICE=1 -> Binance WebSocket trade stream.
-    Else -> mock random walk.
-    \"\"\"
-
     def __init__(self) -> None:
         self._prices: Dict[Tuple[str, str], float] = {}
         self._tasks: Dict[Tuple[str, str], asyncio.Task] = {}
@@ -104,7 +99,6 @@ class PriceFeed:
 
 class Backend:
     def __init__(self) -> None:
-        # key: (user_id, signal_id)
         self.trades: Dict[Tuple[int, int], UserTrade] = {}
         self.feed = PriceFeed()
 
@@ -122,7 +116,7 @@ class Backend:
 
     async def track_loop(self, bot) -> None:
         while True:
-            for key, trade in list(self.trades.items()):
+            for trade in list(self.trades.values()):
                 if not trade.active:
                     continue
 
@@ -135,62 +129,29 @@ class Backend:
                 def hit_sl(level: float) -> bool:
                     return price <= level if s.direction == "LONG" else price >= level
 
-                # SL before TP1
                 if not trade.tp1_hit and hit_sl(s.sl):
                     trade.active = False
-                    await bot.send_message(
-                        chat_id=trade.user_id,
-                        text=(
-                            "❌ SIGNAL AUTO CLOSED — STOP LOSS\\n\\n"
-                            f"🪙 {s.symbol} ({s.market})\\n"
-                            f"Price: {price:.6f}\\n"
-                            "Status: LOSS 🔴"
-                        ),
-                    )
+                    await bot.send_message(trade.user_id,
+                        f"❌ SIGNAL AUTO CLOSED — STOP LOSS\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nStatus: LOSS 🔴")
                     continue
 
-                # TP1
                 if not trade.tp1_hit and hit_tp(s.tp1):
                     trade.tp1_hit = True
                     trade.sl_moved_to_be = True
-                    await bot.send_message(
-                        chat_id=trade.user_id,
-                        text=(
-                            "🟡 TP1 HIT\\n\\n"
-                            f"🪙 {s.symbol} ({s.market})\\n"
-                            f"Price: {price:.6f}\\n"
-                            f"Closed: {TP1_PARTIAL_CLOSE_PCT}%\\n"
-                            "SL moved to Entry (BE)"
-                        ),
-                    )
+                    await bot.send_message(trade.user_id,
+                        f"🟡 TP1 HIT\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nClosed: {TP1_PARTIAL_CLOSE_PCT}%\\nSL moved to Entry (BE)")
                     continue
 
-                # After TP1: return to Entry -> BE close
                 if trade.tp1_hit and trade.sl_moved_to_be and hit_sl(s.entry):
                     trade.active = False
-                    await bot.send_message(
-                        chat_id=trade.user_id,
-                        text=(
-                            "⚪ SIGNAL AUTO CLOSED — BREAK EVEN\\n\\n"
-                            f"🪙 {s.symbol} ({s.market})\\n"
-                            f"Price: {price:.6f}\\n"
-                            "Status: SAFE ⚪"
-                        ),
-                    )
+                    await bot.send_message(trade.user_id,
+                        f"⚪ SIGNAL AUTO CLOSED — BREAK EVEN\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nStatus: SAFE ⚪")
                     continue
 
-                # TP2
                 if hit_tp(s.tp2):
                     trade.active = False
-                    await bot.send_message(
-                        chat_id=trade.user_id,
-                        text=(
-                            "✅ SIGNAL AUTO CLOSED — TP2 HIT\\n\\n"
-                            f"🪙 {s.symbol} ({s.market})\\n"
-                            f"Price: {price:.6f}\\n"
-                            "Status: WIN 🟢"
-                        ),
-                    )
+                    await bot.send_message(trade.user_id,
+                        f"✅ SIGNAL AUTO CLOSED — TP2 HIT\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nStatus: WIN 🟢")
                     continue
 
             await asyncio.sleep(TRACK_INTERVAL_SECONDS)
