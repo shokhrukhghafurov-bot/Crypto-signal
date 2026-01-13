@@ -42,7 +42,8 @@ def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
 
 async def safe_send(bot, chat_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
-    return await safe_send(bot, chat_id, text, **kwargs)
+    # Never recurse. Send via bot API.
+    return await bot.send_message(chat_id, text, **kwargs)
 
 
 
