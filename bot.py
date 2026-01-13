@@ -900,7 +900,12 @@ def stats_text(uid: int) -> str:
         hint = "Подсказка: статистика появляется только после закрытия сделки (TP2 / SL / BE / вручную)."
         fmt_block = _fmt_stats_block_ru
 
-    parts = [header, "", today_hdr, fmt_block(spot_title, spot_today), "", fmt_block(fut_title, fut_today), "", week_hdr, fmt_block(spot_title, spot_week), "", fmt_block(fut_title, fut_week), ""]
+    parts = [header, "", today_hdr,
+             fmt_block(spot_title, spot_today), "",
+             fmt_block(fut_title, fut_today), "",
+             week_hdr,
+             fmt_block(spot_title, spot_week), "",
+             fmt_block(fut_title, fut_week), ""]
 
     # By days
     parts.append(by_days_hdr)
