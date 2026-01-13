@@ -26,6 +26,26 @@ import logging
 
 logger = logging.getLogger("crypto-signal")
 
+# --- i18n template safety guard (prevents leaking {placeholders} to users) ---
+_UNFILLED_RE = re.compile(r'(?<!\{)\{[a-zA-Z0-9_]+\}(?!\})')
+
+def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
+    if not text:
+        return text
+    hits = _UNFILLED_RE.findall(text)
+    if hits:
+        logger.error("Unfilled i18n placeholders for uid=%s ctx=%s hits=%s text=%r", uid, ctx, sorted(set(hits)), text)
+        text = _UNFILLED_RE.sub("", text)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+async def safe_send(bot, chat_id: int, text: str, *, ctx: str = "", **kwargs):
+    text = _sanitize_template_text(chat_id, text, ctx=ctx)
+    return await safe_send(bot, chat_id, text, **kwargs)
+
+
+
 # ------------------ ENV helpers ------------------
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name, "").strip()
@@ -127,6 +147,51 @@ def _trf(uid: int, key: str, **kwargs) -> str:
 def _market_label(uid: int, market: str) -> str:
     return _tr(uid, "lbl_spot") if str(market).upper() == "SPOT" else _tr(uid, "lbl_futures")
 # --- /i18n helpers ---
+
+
+# ------------------ backend-only metrics helpers ------------------
+
+def calc_profit_pct(entry: float, tp: float, direction: str) -> float:
+    """Estimated profit percent from entry to tp for LONG/SHORT."""
+    try:
+        entry = float(entry)
+        tp = float(tp)
+        if entry == 0:
+            return 0.0
+        side = str(direction or "LONG").upper().strip()
+        if side == "SHORT":
+            return (entry - tp) / entry * 100.0
+        return (tp - entry) / entry * 100.0
+    except Exception:
+        return 0.0
+
+def default_futures_leverage() -> str:
+    v = os.getenv("FUTURES_LEVERAGE_DEFAULT", "5").strip()
+    return v or "5"
+
+def open_metrics(sig: "Signal") -> dict:
+    """Return placeholders for OPEN templates, computed only here (backend-only)."""
+    side = (getattr(sig, "direction", "") or "LONG").upper().strip()
+    mkt = (getattr(sig, "market", "") or "FUTURES").upper().strip()
+    # prefer TP2 for estimate; fallback to TP1
+    tp = getattr(sig, "tp2", 0.0) or getattr(sig, "tp1", 0.0) or 0.0
+    entry = getattr(sig, "entry", 0.0) or 0.0
+    profit = calc_profit_pct(entry, tp, side)
+    return {
+        "side": side,
+        "market": mkt,
+        "profit": round(float(profit), 1),
+        "lev": default_futures_leverage(),
+        "rr": round(float(getattr(sig, "rr", 0.0) or 0.0), 1),
+    }
+
+def fmt_pnl_pct(p: float) -> str:
+    try:
+        p = float(p)
+        sign = "+" if p > 0 else ""
+        return f"{sign}{p:.1f}%"
+    except Exception:
+        return "0.0%"
 
 TOP_N = max(10, _env_int("TOP_N", 50))
 SCAN_INTERVAL_SECONDS = max(30, _env_int("SCAN_INTERVAL_SECONDS", 150))
@@ -959,10 +1024,9 @@ class Backend:
                     trade.active = False
                     trade.result = "LOSS"
                     uid = trade.user_id
-                    await bot.send_message(uid, _trf(uid, "msg_auto_loss",
+                    await safe_send(bot, uid, _trf(uid, "msg_auto_loss",
                         symbol=s.symbol,
-                        market=_market_label(uid, s.market),
-                        price=f"{price:.6f}",
+                        status=trade.result,
                     ))
                     try:
                         self.record_trade_close(trade, "LOSS", float(price), time.time())
@@ -978,11 +1042,11 @@ class Backend:
                     trade.result = "TP1"
                     trade.be_price = _be_exit_price(s.entry, s.direction, s.market)
                     uid = trade.user_id
-                    await bot.send_message(uid, _trf(uid, "msg_auto_tp1",
+                    await safe_send(bot, uid, _trf(uid, "msg_auto_tp1",
                         symbol=s.symbol,
-                        market=_market_label(uid, s.market),
                         closed_pct=int(_partial_close_pct(s.market)),
                         be_price=f"{float(trade.be_price):.6f}",
+                        status=trade.result,
                     ))
                     continue
 
@@ -992,11 +1056,10 @@ class Backend:
                     trade.result = "BE"
                     be_px = float(getattr(trade, "be_price", s.entry) or s.entry)
                     uid = trade.user_id
-                    await bot.send_message(uid, _trf(uid, "msg_auto_be",
+                    await safe_send(bot, uid, _trf(uid, "msg_auto_be",
                         symbol=s.symbol,
-                        market=_market_label(uid, s.market),
-                        price=f"{price:.6f}",
                         be_price=f"{be_px:.6f}",
+                        status=trade.result,
                     ))
                     try:
                         self.record_trade_close(trade, "BE", be_px, time.time())
@@ -1010,10 +1073,10 @@ class Backend:
                     trade.active = False
                     trade.result = "WIN"
                     uid = trade.user_id
-                    await bot.send_message(uid, _trf(uid, "msg_auto_win",
+                    await safe_send(bot, uid, _trf(uid, "msg_auto_win",
                         symbol=s.symbol,
-                        market=_market_label(uid, s.market),
-                        price=f"{price:.6f}",
+                        pnl_total=fmt_pnl_pct(calc_profit_pct(s.entry, s.tp2 or price, s.direction)),
+                        status=trade.result,
                     ))
                     try:
                         tp2_px = float(s.tp2 or price)
