@@ -491,8 +491,11 @@ def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
 
 def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text=tr(uid, "btn_notify_on"), callback_data="notify:set:on")
-    kb.button(text=tr(uid, "btn_notify_off"), callback_data="notify:set:off")
+    # Show only one toggle button to keep UI clean
+    if enabled:
+        kb.button(text=tr(uid, "btn_notify_off"), callback_data="notify:set:off")
+    else:
+        kb.button(text=tr(uid, "btn_notify_on"), callback_data="notify:set:on")
     kb.adjust(1)
     kb.button(text=tr(uid, "btn_back"), callback_data="notify:back")
     kb.adjust(1)
@@ -706,6 +709,51 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             await bot.send_message(uid, txt, reply_markup=notify_kb(uid, enabled))
         return
 
+
+# ---------------- notifications callbacks ----------------
+@dp.callback_query(lambda c: (c.data or "").startswith("notify:"))
+async def notify_handler(call: types.CallbackQuery) -> None:
+    """Handle inline buttons inside Notifications screen."""
+    await call.answer()
+    uid = call.from_user.id if call.from_user else 0
+    if not uid:
+        return
+
+    parts = (call.data or "").split(":")
+    # notify:set:on | notify:set:off | notify:back
+    try:
+        action = parts[1]
+    except Exception:
+        action = ""
+
+    # shared access check (same as menu)
+    access = await get_access_status(uid)
+    if access != "ok":
+        await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+        return
+
+    if action == "back":
+        # Return to main menu (do not delete messages)
+        await safe_edit(call.message, tr(uid, "welcome"), menu_kb(uid))
+        return
+
+    if action == "set":
+        # Explicit ON/OFF
+        value = (parts[2] if len(parts) > 2 else "").lower()
+        await ensure_user(uid)
+        if value == "on":
+            enabled = await set_notify_signals(uid, True)
+        elif value == "off":
+            enabled = await set_notify_signals(uid, False)
+        else:
+            enabled = await get_notify_signals(uid)
+
+        state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
+        desc = tr(uid, "notify_desc_on") if enabled else tr(uid, "notify_desc_off")
+        txt = trf(uid, "notify_screen", title=tr(uid, "notify_title"), state=state, desc=desc)
+        await safe_edit(call.message, txt, notify_kb(uid, enabled))
+        return
+
     if action == "status":
         # cancel previous auto-refresh task (if any)
         uid = call.from_user.id if call.from_user else 0
@@ -819,6 +867,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
         await bot.send_message(call.from_user.id, _signal_text(sig), reply_markup=kb.as_markup())
         return
+
 
 # ---------------- trades list (with buttons) ----------------
 PAGE_SIZE = 10
