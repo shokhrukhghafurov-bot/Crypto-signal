@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
@@ -16,7 +17,7 @@ import datetime as dt
 
 import asyncpg
 
-from backend import Backend, Signal, MacroEvent
+from backend import Backend, Signal, MacroEvent, open_metrics
 
 load_dotenv()
 
@@ -27,6 +28,31 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("bot")
+
+# --- i18n template safety guard (prevents leaking {placeholders} to users) ---
+_UNFILLED_RE = re.compile(r'(?<!\{)\{[a-zA-Z0-9_]+\}(?!\})')
+
+def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
+    """Guard against unfilled {placeholders} leaking to users."""
+    if not text:
+        return text
+    hits = _UNFILLED_RE.findall(text)
+    if hits:
+        logger.error("Unfilled i18n placeholders for uid=%s ctx=%s hits=%s text=%r", uid, ctx, sorted(set(hits)), text)
+        text = _UNFILLED_RE.sub("", text)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
+    text = _sanitize_template_text(chat_id, text, ctx=ctx)
+    return await safe_send(chat_id, text, **kwargs)
+
+async def safe_edit_text(chat_id: int, message_id: int, text: str, *, ctx: str = "", **kwargs):
+    text = _sanitize_template_text(chat_id, text, ctx=ctx)
+    return await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, **kwargs)
+
+
 # -----------------------------------------------
 
 
@@ -236,7 +262,7 @@ async def _send_long(chat_id: int, text: str, reply_markup=None) -> None:
     # Telegram message limit ~4096 chars. Send in chunks if needed.
     max_len = 3800
     if len(text) <= max_len:
-        await bot.send_message(chat_id, text, reply_markup=reply_markup)
+        await safe_send(chat_id, text, reply_markup=reply_markup)
         return
     parts = []
     cur = ""
@@ -267,7 +293,7 @@ async def safe_edit(message: types.Message | None, txt: str, kb: types.InlineKey
 
     try:
         if message:
-            await bot.send_message(message.chat.id, txt, reply_markup=kb)
+            await safe_send(message.chat.id, txt, reply_markup=kb)
     except Exception:
         pass
 
@@ -280,7 +306,7 @@ async def _render_in_place(call: types.CallbackQuery, txt: str, kb: types.Inline
             return call.message
     except Exception:
         pass
-    return await bot.send_message(call.from_user.id, txt, reply_markup=kb)
+    return await safe_send(call.from_user.id, txt, reply_markup=kb)
 
 
 async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKeyboardMarkup | None = None) -> None:
@@ -298,13 +324,13 @@ async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKe
     except Exception:
         # Fallback: try sending a new message to the chat
         try:
-            await bot.send_message(chat_id, text, reply_markup=kb)
+            await safe_send(chat_id, text, reply_markup=kb)
         except Exception:
             logger.exception("Failed to send message to uid=%s", uid)
 
 
     for i, part in enumerate(parts):
-        await bot.send_message(chat_id, part, reply_markup=reply_markup if i == len(parts)-1 else None)
+        await safe_send(chat_id, part, reply_markup=reply_markup if i == len(parts)-1 else None)
 
 def _fmt_perf(uid: int, b: dict) -> str:
     trades = int(b.get("trades", 0))
@@ -639,35 +665,34 @@ def _open_card_text(uid: int, sig: Signal) -> str:
     if not exchanges:
         exchanges = tr(uid, "lbl_none")
 
-    profit = _calc_profit_pct(sig)
+    # backend-only metrics (profit/leverage/rr computed in backend.py)
+    mx = open_metrics(sig)
+    profit = mx.get("profit", 0.0)
     hhmm = _fmt_hhmm(float(getattr(sig, "ts", 0.0) or 0.0))
 
-    side = (sig.direction or "LONG").upper().strip()
-    mkt = (sig.market or "FUTURES").upper().strip()
-
-    # futures leverage (default)
-    lev = os.getenv("FUTURES_LEVERAGE_DEFAULT", "5").strip() or "5"
+    side = mx.get("side", (sig.direction or "LONG")).upper().strip()
+    mkt = mx.get("market", (sig.market or "FUTURES")).upper().strip()
+    lev = str(mx.get("lev", "5"))
+    rr = mx.get("rr", getattr(sig, "rr", 0.0))
 
     if mkt == "SPOT":
-        key = "open_spot"
         return trf(
             uid,
-            key,
+            "open_spot",
             symbol=sym_disp,
             exchanges=exchanges,
             entry=f"{float(sig.entry):.5f}",
             tp1=f"{float(sig.tp1):.5f}",
             tp2=f"{float(sig.tp2):.5f}",
             sl=f"{float(sig.sl):.5f}",
-            profit=f"{profit:.1f}",
+            profit=f"{float(profit):.1f}",
             time=hhmm,
             tag=base,
         )
 
-    key = "open_futures"
     return trf(
         uid,
-        key,
+        "open_futures",
         symbol=sym_disp,
         exchanges=exchanges,
         side=side,
@@ -676,8 +701,8 @@ def _open_card_text(uid: int, sig: Signal) -> str:
         tp1=f"{float(sig.tp1):.5f}",
         tp2=f"{float(sig.tp2):.5f}",
         sl=f"{float(sig.sl):.5f}",
-        rr=f"{float(sig.rr):.1f}",
-        profit=f"{profit:.1f}",
+        rr=f"{float(rr):.1f}",
+        profit=f"{float(profit):.1f}",
         time=hhmm,
         tag=base,
     )
@@ -730,7 +755,7 @@ async def broadcast_signal(sig: Signal) -> None:
             ORIGINAL_SIGNAL_TEXT[(uid, sig.signal_id)] = _signal_text(uid, sig)
             kb_u = InlineKeyboardBuilder()
             kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
-            await bot.send_message(uid, _signal_text(uid, sig), reply_markup=kb_u.as_markup())
+            await safe_send(uid, _signal_text(uid, sig), reply_markup=kb_u.as_markup())
         except Exception:
             logger.exception("Failed to send message to uid=%s", uid)
 
@@ -743,7 +768,7 @@ async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, f
             title = tr(uid, 'macro_title')
             body = f"{ev.name}\n{tr(uid, 'macro_blackout')}: {_fmt_hhmm(w0)} – {_fmt_hhmm(w1)}\n\n"
             tail = tr(uid, 'macro_tail_fut_off') if action == 'FUTURES_OFF' else tr(uid, 'macro_tail_paused')
-            await bot.send_message(uid, f"{title}\n\n{body}{tail}")
+            await safe_send(uid, f"{title}\n\n{body}{tail}")
         except Exception:
             logger.exception("Failed to send message to uid=%s", uid)
 
@@ -787,7 +812,7 @@ async def lang_choose(call: types.CallbackQuery) -> None:
             return
     except Exception:
         pass
-    await bot.send_message(uid, tr(uid, "welcome"), reply_markup=menu_kb(uid))
+    await safe_send(uid, tr(uid, "welcome"), reply_markup=menu_kb(uid))
 
 # ---------------- menu callbacks ----------------
 @dp.callback_query(lambda c: (c.data or "").startswith("menu:"))
@@ -816,7 +841,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             desc = tr(uid, "notify_desc_on") if enabled else tr(uid, "notify_desc_off")
             txt = trf(uid, "notify_screen", title=tr(uid, "notify_title"), state=state, desc=desc)
             # send a separate message for clarity (do not overwrite main menu)
-            await bot.send_message(uid, txt, reply_markup=notify_kb(uid, enabled))
+            await safe_send(uid, txt, reply_markup=notify_kb(uid, enabled))
         return
 
 
@@ -975,7 +1000,7 @@ async def notify_handler(call: types.CallbackQuery) -> None:
             return
         kb = InlineKeyboardBuilder()
         kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
-        await bot.send_message(call.from_user.id, _signal_text(sig), reply_markup=kb.as_markup())
+        await safe_send(call.from_user.id, _signal_text(sig), reply_markup=kb.as_markup())
         return
 
 
@@ -1010,12 +1035,12 @@ async def trades_page(call: types.CallbackQuery) -> None:
 
     all_trades = backend.get_user_trades(call.from_user.id)
     if not all_trades:
-        await bot.send_message(call.from_user.id, tr(call.from_user.id, "my_trades_empty"), reply_markup=menu_kb(call.from_user.id))
+        await _render_in_place(call, tr(call.from_user.id, "my_trades_empty"), menu_kb(call.from_user.id))
         return
 
     page = all_trades[offset:offset+PAGE_SIZE]
     txt = tr(call.from_user.id, "my_trades_title").format(a=offset+1, b=min(offset+PAGE_SIZE, len(all_trades)), n=len(all_trades))
-    await bot.send_message(call.from_user.id, txt, reply_markup=_trades_page_kb(call.from_user.id, page, offset))
+    await _render_in_place(call, txt, _trades_page_kb(call.from_user.id, page, offset))
 
 # ---------------- trade card ----------------
 
@@ -1107,9 +1132,9 @@ async def trade_view(call: types.CallbackQuery) -> None:
         return
     t = backend.get_trade(call.from_user.id, signal_id)
     if not t:
-        await bot.send_message(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
+        await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
         return
-    await bot.send_message(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, signal_id, 0))
+    await safe_send(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, signal_id, 0))
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:refresh:"))
 async def trade_refresh(call: types.CallbackQuery) -> None:
@@ -1122,9 +1147,9 @@ async def trade_refresh(call: types.CallbackQuery) -> None:
         return
     t = backend.get_trade(call.from_user.id, signal_id)
     if not t:
-        await bot.send_message(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
+        await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
         return
-    await bot.send_message(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, signal_id, back_offset))
+    await safe_send(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, signal_id, back_offset))
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:close:"))
 async def trade_close(call: types.CallbackQuery) -> None:
@@ -1137,9 +1162,9 @@ async def trade_close(call: types.CallbackQuery) -> None:
         return
     removed = backend.remove_trade(call.from_user.id, signal_id)
     if removed:
-        await bot.send_message(call.from_user.id, tr(call.from_user.id, "trade_removed"), reply_markup=menu_kb(call.from_user.id))
+        await safe_send(call.from_user.id, tr(call.from_user.id, "trade_removed"), reply_markup=menu_kb(call.from_user.id))
     else:
-        await bot.send_message(call.from_user.id, tr(call.from_user.id, "trade_removed_fail"), reply_markup=menu_kb(call.from_user.id))
+        await safe_send(call.from_user.id, tr(call.from_user.id, "trade_removed_fail"), reply_markup=menu_kb(call.from_user.id))
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:orig:"))
 async def trade_orig(call: types.CallbackQuery) -> None:
@@ -1153,7 +1178,7 @@ async def trade_orig(call: types.CallbackQuery) -> None:
 
     text = ORIGINAL_SIGNAL_TEXT.get((call.from_user.id, signal_id)) or ORIGINAL_SIGNAL_TEXT.get((0, signal_id))
     if not text:
-        await bot.send_message(call.from_user.id, tr(call.from_user.id, "sig_orig_title") + ": " + tr(call.from_user.id, "lbl_none"), reply_markup=menu_kb(call.from_user.id))
+        await safe_send(call.from_user.id, tr(call.from_user.id, "sig_orig_title") + ": " + tr(call.from_user.id, "lbl_none"), reply_markup=menu_kb(call.from_user.id))
         return
 
     kb = InlineKeyboardBuilder()
@@ -1162,7 +1187,7 @@ async def trade_orig(call: types.CallbackQuery) -> None:
     kb.button(text=tr(call.from_user.id, "m_menu"), callback_data="menu:status")
     kb.adjust(1, 2)
 
-    await bot.send_message(call.from_user.id, "📌 Original signal (1:1)\n\n" + text, reply_markup=kb.as_markup())
+    await safe_send(call.from_user.id, "📌 Original signal (1:1)\n\n" + text, reply_markup=kb.as_markup())
 
 # ---------------- open signal ----------------
 @dp.callback_query(lambda c: (c.data or "").startswith("open:"))
@@ -1181,7 +1206,7 @@ async def opened(call: types.CallbackQuery) -> None:
     backend.open_trade(call.from_user.id, sig)
     await call.answer(tr(call.from_user.id, "trade_opened_toast"))
     # IMPORTANT: send OPEN card only after user pressed ✅ ОТКРЫЛ СДЕЛКУ
-    await bot.send_message(
+    await safe_send(
         call.from_user.id,
         _open_card_text(call.from_user.id, sig),
         reply_markup=menu_kb(call.from_user.id),
