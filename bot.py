@@ -522,12 +522,14 @@ def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
 
 def _signal_text(uid: int, s: Signal) -> str:
     header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
+    market_banner = tr(uid, 'sig_spot_new') if s.market == 'SPOT' else tr(uid, 'sig_fut_new')
 
     # Visual marker near symbol (kept simple to avoid hard-depending on any exchange)
     symbol_emoji = "🟢" if s.market == 'SPOT' else "🌕"
 
+    # Direction should be shown for both SPOT and FUTURES.
     arrow = tr(uid, 'sig_long') if s.direction == 'LONG' else tr(uid, 'sig_short')
-    direction_line = (arrow + "\\n") if s.market != 'SPOT' else ""
+    direction_line = arrow + "\n"
 
     def _fmt_exchanges(raw: str) -> str:
         xs = [x.strip() for x in (raw or '').replace(',', '+').split('+') if x.strip()]
@@ -573,19 +575,21 @@ def _signal_text(uid: int, s: Signal) -> str:
         return lines
 
     ex_line_raw = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
-    exchanges_line = f"{tr(uid, 'sig_exchanges')}: {ex_line_raw}\\n" if ex_line_raw else ""
+    exchanges_line = f"{tr(uid, 'sig_exchanges')}: {ex_line_raw}\n" if ex_line_raw else ""
+    # Keep TF on its own line; timeframe string already like 15m/1h/4h
     tf_line = f"{tr(uid, 'sig_tf')}: {s.timeframe}"
 
-    tp_lines = "\\n".join(_tp_lines())
+    tp_lines = "\n".join(_tp_lines())
 
     rr_line = f"{tr(uid, 'sig_rr')}: 1:{s.rr:.2f}"
     conf_line = f"{tr(uid, 'sig_confidence')}: {s.confidence}/100"
     confirm_line = f"{tr(uid, 'sig_confirm')}: {s.confirmations}"
 
     risk_note = (s.risk_note or '').strip()
-    risk_block = f"\\n\\n{risk_note}" if risk_note else ""
+    risk_block = f"\n\n{risk_note}" if risk_note else ""
 
     return trf(uid, "msg_open_card",
+        market_banner=market_banner,
         header=header,
         symbol_emoji=symbol_emoji,
         symbol=s.symbol,
@@ -1060,23 +1064,8 @@ async def trade_close(call: types.CallbackQuery) -> None:
         back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
-    # Capture trade info before removal to format a CLOSE message
-    t = backend.get_trade(call.from_user.id, signal_id)
-    close_price = float(getattr(t, "last_price", 0.0) or getattr(t.signal, "entry", 0.0) if t else 0.0)
-    pnl_total = backend.calc_effective_pnl_pct(t, close_price, "CLOSED") if t else 0.0
-
     removed = backend.remove_trade(call.from_user.id, signal_id)
     if removed:
-        if t:
-            await bot.send_message(
-                call.from_user.id,
-                trf(call.from_user.id, "msg_trade_close",
-                    market=_market_label(call.from_user.id, t.signal.market),
-                    symbol=t.signal.symbol,
-                    pnl_total=f"{pnl_total:+.2f}%",
-                    reason=("вручную" if get_lang(call.from_user.id) == "ru" else "manual"),
-                ),
-            )
         await bot.send_message(call.from_user.id, tr(call.from_user.id, "trade_removed"), reply_markup=menu_kb(call.from_user.id))
     else:
         await bot.send_message(call.from_user.id, tr(call.from_user.id, "trade_removed_fail"), reply_markup=menu_kb(call.from_user.id))
