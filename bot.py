@@ -309,25 +309,30 @@ def _fmt_perf(uid: int, b: dict) -> str:
         f"{tr(uid, 'lbl_pnl')}: {pnl:+.2f}%"
     )
 
-def _build_status_text(uid: int = 0) -> str:
+async def _build_status_text(uid: int = 0) -> str:
     next_macro = backend.get_next_macro()
-    macro_action = backend.last_macro_action
+    macro_action = (backend.last_macro_action or "ALLOW").upper()
     macro_prefix = "🟢" if macro_action == "ALLOW" else "🔴"
 
     macro_line = tr(uid, "next_macro").format(v=tr(uid, "lbl_none"))
     if next_macro:
         ev, (w0, w1) = next_macro
-        secs = w0 - time.time()
-        next_prefix = "🟡" if macro_action == "ALLOW" else "🔴"
-        # next macro + blackout + countdown
-        macro_line = f"{next_prefix} {tr(uid, 'next_macro').format(v=ev.name)} | {tr(uid, 'lbl_blackout')} {_fmt_hhmm(w0)}–{_fmt_hhmm(w1)} | {tr(uid, 'lbl_in')} {_fmt_countdown(secs)}"
+        secs = max(0, w0 - time.time())
+        macro_line = f"🟡 {ev}: {_fmt_hhmm(w0)}–{_fmt_hhmm(w1)} | {tr(uid, 'lbl_in')} {_fmt_countdown(secs)}"
 
     scan_line = tr(uid, "scanner_run")
     news_line = tr(uid, "news_action").format(v=tr_action(uid, backend.last_news_action))
     macro_line2 = tr(uid, "macro_action").format(v=tr_action(uid, macro_action))
 
-    txt = "\n".join([scan_line, news_line, f"{macro_prefix} {macro_line2}", macro_line])
-    return txt
+    enabled = True
+    try:
+        enabled = await get_notify_signals(uid) if uid else True
+    except Exception:
+        enabled = True
+    state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
+    notif_line = tr(uid, "status_notify").format(v=state)
+
+    return "\n".join([scan_line, news_line, f"{macro_prefix} {macro_line2}", macro_line, notif_line])
 
 async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: int = 120, interval: int = 5) -> None:
     # Refresh countdown + macro status for a short window to avoid spam/rate limits
@@ -336,7 +341,7 @@ async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: 
     while time.time() < end:
         await asyncio.sleep(interval)
         try:
-            txt = _build_status_text(uid)
+            txt = await _build_status_text(uid)
             if txt == last_txt:
                 continue
             await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=txt, reply_markup=menu_kb(uid))
@@ -435,6 +440,25 @@ async def toggle_notify_signals(user_id: int) -> bool:
             return True
         return bool(row["notify_signals"])
 
+
+async def set_notify_signals(user_id: int, value: bool) -> bool:
+    """Set notify_signals explicitly. Returns the saved value."""
+    if not pool or not user_id:
+        return True
+    await ensure_user(user_id)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE users
+                   SET notify_signals = $2
+                 WHERE telegram_id=$1
+             RETURNING notify_signals""",
+            user_id, bool(value)
+        )
+        if row is None:
+            # if user row didn't exist for some reason, ensure_user created it with TRUE
+            return bool(value)
+        return bool(row["notify_signals"])
+
 async def get_broadcast_user_ids() -> List[int]:
     """Users allowed to receive signals."""
     if not pool:
@@ -462,6 +486,16 @@ def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     kb.button(text=tr(uid, "m_trades"), callback_data="trades:page:0")
     kb.button(text=tr(uid, "m_notify"), callback_data="menu:notify")
     kb.adjust(2, 2, 1)
+    return kb.as_markup()
+
+
+def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "btn_notify_on"), callback_data="notify:set:on")
+    kb.button(text=tr(uid, "btn_notify_off"), callback_data="notify:set:off")
+    kb.adjust(1)
+    kb.button(text=tr(uid, "btn_back"), callback_data="notify:back")
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -661,14 +695,16 @@ async def menu_handler(call: types.CallbackQuery) -> None:
 
 
     if action == "notify":
-        # Toggle notifications for signals
+        # Show notifications screen (no toggle here)
         if uid:
             await ensure_user(uid)
-            new_val = await toggle_notify_signals(uid)
-            state = tr(uid, "notify_on") if new_val else tr(uid, "notify_off")
-            await safe_edit(call.message, tr(uid, "notify_state").format(state=state), menu_kb(uid))
+            enabled = await get_notify_signals(uid)
+            state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
+            desc = tr(uid, "notify_desc_on") if enabled else tr(uid, "notify_desc_off")
+            txt = trf(uid, "notify_screen", title=tr(uid, "notify_title"), state=state, desc=desc)
+            # send a separate message for clarity (do not overwrite main menu)
+            await bot.send_message(uid, txt, reply_markup=notify_kb(uid, enabled))
         return
-
 
     if action == "status":
         # cancel previous auto-refresh task (if any)
@@ -681,7 +717,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 pass
 
         try:
-            txt = _build_status_text(uid)
+            txt = await _build_status_text(uid)
         except Exception as e:
             txt = f"Status error: {e}"
         if call.from_user and _is_admin(call.from_user.id) and backend.last_signal:
