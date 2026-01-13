@@ -83,6 +83,9 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 backend = Backend()
 
+# Keep last broadcast signals for 'Spot live' / 'Futures live' buttons
+LAST_SIGNAL_BY_MARKET = {"SPOT": None, "FUTURES": None}
+
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 pool: asyncpg.Pool | None = None
 
@@ -744,6 +747,13 @@ async def broadcast_signal(sig: Signal) -> None:
         return
     _SENT_SIG_CACHE[sig_key] = now
 
+    # Save as last live signal for menu buttons
+    try:
+        LAST_SIGNAL_BY_MARKET["SPOT" if sig.market == "SPOT" else "FUTURES"] = sig
+    except Exception:
+        pass
+
+
     logger.info("Broadcast signal id=%s %s %s %s conf=%s rr=%.2f", sig.signal_id, sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr))
     SIGNALS[sig.signal_id] = sig
     ORIGINAL_SIGNAL_TEXT[(0, sig.signal_id)] = _signal_text(0, sig)
@@ -828,22 +838,101 @@ async def menu_handler(call: types.CallbackQuery) -> None:
 
     # Shared access control (Postgres)
     access = await get_access_status(uid) if uid else "no_user"
-    if action != "status" and action != "notify" and access != "ok":
+    if action not in ("status", "notify") and access != "ok":
         await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
         return
 
+    # ---- STATUS (main screen) ----
+    if action == "status":
+        t = STATUS_TASKS.pop(uid, None)
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
 
+        await ensure_user(uid)
+
+        # macro info (optional)
+        try:
+            macro = backend.get_next_macro()
+        except Exception:
+            macro = None
+
+        enabled = False
+        try:
+            enabled = await get_notify_signals(uid)
+        except Exception:
+            pass
+
+        macro_line = ""
+        if macro:
+            try:
+                macro_line = "\n" + trf(uid, "status_macro_line",
+                                        name=macro.get("name", "-"),
+                                        eta=macro.get("eta", "-"),
+                                        action=macro.get("action", "-"))
+            except Exception:
+                macro_line = ""
+
+        notify_line = ""
+        try:
+            notify_line = "\n" + (tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off"))
+        except Exception:
+            notify_line = ""
+
+        txt = tr(uid, "welcome") + macro_line + notify_line
+        await safe_edit(call.message, txt, menu_kb(uid))
+        return
+
+    # ---- STATS ----
+    if action == "stats":
+        t = STATUS_TASKS.pop(uid, None)
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+        spot_today = backend.perf_today("SPOT")
+        fut_today = backend.perf_today("FUTURES")
+        spot_week = backend.perf_week("SPOT")
+        fut_week = backend.perf_week("FUTURES")
+
+        txt = trf(uid, "stats_screen",
+                  spot_today=spot_today,
+                  fut_today=fut_today,
+                  spot_week=spot_week,
+                  fut_week=fut_week)
+        await safe_edit(call.message, txt, menu_kb(uid))
+        return
+
+    # ---- LIVE SIGNALS ----
+    if action in ("spot", "futures"):
+        market = "SPOT" if action == "spot" else "FUTURES"
+        sig = LAST_SIGNAL_BY_MARKET.get(market)
+        if not sig:
+            await safe_edit(call.message, tr(uid, "no_live_signals"), menu_kb(uid))
+            return
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+        await safe_send(uid, _signal_text(uid, sig), reply_markup=kb.as_markup())
+        return
+
+    # ---- NOTIFICATIONS ----
     if action == "notify":
-        # Show notifications screen (no toggle here)
         if uid:
             await ensure_user(uid)
             enabled = await get_notify_signals(uid)
             state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
             desc = tr(uid, "notify_desc_on") if enabled else tr(uid, "notify_desc_off")
             txt = trf(uid, "notify_screen", title=tr(uid, "notify_title"), state=state, desc=desc)
-            # send a separate message for clarity (do not overwrite main menu)
             await safe_send(uid, txt, reply_markup=notify_kb(uid, enabled))
         return
+
+    # fallback
+    await safe_edit(call.message, tr(uid, "welcome"), menu_kb(uid))
 
 
 # ---------------- notifications callbacks ----------------
