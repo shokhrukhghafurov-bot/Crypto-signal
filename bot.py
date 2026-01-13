@@ -46,7 +46,8 @@ def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
 
 async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
-    return await safe_send(chat_id, text, **kwargs)
+    # Never recurse. Send via bot API.
+    return await bot.send_message(chat_id, text, **kwargs)
 
 async def safe_edit_text(chat_id: int, message_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
@@ -1035,12 +1036,12 @@ async def trades_page(call: types.CallbackQuery) -> None:
 
     all_trades = backend.get_user_trades(call.from_user.id)
     if not all_trades:
-        await _render_in_place(call, tr(call.from_user.id, "my_trades_empty"), menu_kb(call.from_user.id))
+        await safe_send(call.from_user.id, tr(call.from_user.id, "my_trades_empty"), reply_markup=menu_kb(call.from_user.id))
         return
 
     page = all_trades[offset:offset+PAGE_SIZE]
     txt = tr(call.from_user.id, "my_trades_title").format(a=offset+1, b=min(offset+PAGE_SIZE, len(all_trades)), n=len(all_trades))
-    await _render_in_place(call, txt, _trades_page_kb(call.from_user.id, page, offset))
+    await safe_send(call.from_user.id, txt, reply_markup=_trades_page_kb(call.from_user.id, page, offset))
 
 # ---------------- trade card ----------------
 
