@@ -828,7 +828,8 @@ async def lang_choose(call: types.CallbackQuery) -> None:
 # ---------------- menu callbacks ----------------
 @dp.callback_query(lambda c: (c.data or "").startswith("menu:"))
 
-def _fmt_stats_block_ru(title: str, b: dict) -> str:
+def _fmt_stats_block_ru(title: str, b: dict | None = None) -> str:
+    b = b or {}
     trades = int(b.get("trades", 0))
     wins = int(b.get("wins", 0))
     losses = int(b.get("losses", 0))
@@ -843,7 +844,8 @@ def _fmt_stats_block_ru(title: str, b: dict) -> str:
         f"PnL: {pnl:+.2f}%"
     )
 
-def _fmt_stats_block_en(title: str, b: dict) -> str:
+def _fmt_stats_block_en(title: str, b: dict | None = None) -> str:
+    b = b or {}
     trades = int(b.get("trades", 0))
     wins = int(b.get("wins", 0))
     losses = int(b.get("losses", 0))
