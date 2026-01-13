@@ -826,8 +826,6 @@ async def lang_choose(call: types.CallbackQuery) -> None:
     await safe_send(uid, tr(uid, "welcome"), reply_markup=menu_kb(uid))
 
 # ---------------- menu callbacks ----------------
-@dp.callback_query(lambda c: (c.data or "").startswith("menu:"))
-
 def _fmt_stats_block_ru(title: str, b: dict | None = None) -> str:
     b = b or {}
     trades = int(b.get("trades", 0))
@@ -967,6 +965,7 @@ def stats_text(uid: int) -> str:
     return "\n".join(parts).strip()
 
 
+@dp.callback_query(lambda c: (c.data or "").startswith("menu:"))
 async def menu_handler(call: types.CallbackQuery) -> None:
     action = (call.data or "").split(":", 1)[1]
     uid = call.from_user.id if call.from_user else 0
