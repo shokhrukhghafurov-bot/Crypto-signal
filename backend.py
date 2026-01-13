@@ -47,6 +47,83 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return default
     return v in ("1", "true", "yes", "y", "on")
 
+
+# --- i18n helpers (loaded from i18n.json; no hardcoded auto-close texts) ---
+I18N_FILE = Path(__file__).with_name("i18n.json")
+LANG_FILE = Path("langs.json")
+
+_I18N_CACHE: dict = {}
+_I18N_MTIME: float = 0.0
+_LANG_CACHE: dict[int, str] = {}
+_LANG_CACHE_MTIME: float = 0.0
+
+def _load_i18n() -> dict:
+    global _I18N_CACHE, _I18N_MTIME
+    try:
+        if I18N_FILE.exists():
+            mt = I18N_FILE.stat().st_mtime
+            if _I18N_CACHE and mt == _I18N_MTIME:
+                return _I18N_CACHE
+            data = json.loads(I18N_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "ru" in data and "en" in data:
+                _I18N_CACHE = data
+                _I18N_MTIME = mt
+                return data
+    except Exception:
+        pass
+    if not _I18N_CACHE:
+        _I18N_CACHE = {"ru": {}, "en": {}}
+    return _I18N_CACHE
+
+def _load_langs_if_needed() -> None:
+    global _LANG_CACHE, _LANG_CACHE_MTIME
+    try:
+        if not LANG_FILE.exists():
+            _LANG_CACHE = {}
+            _LANG_CACHE_MTIME = 0.0
+            return
+        mt = LANG_FILE.stat().st_mtime
+        if mt == _LANG_CACHE_MTIME:
+            return
+        raw = json.loads(LANG_FILE.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            tmp: dict[int, str] = {}
+            for k, v in raw.items():
+                try:
+                    uid = int(k)
+                except Exception:
+                    continue
+                vv = (v or "").lower().strip()
+                tmp[uid] = "en" if vv == "en" else "ru"
+            _LANG_CACHE = tmp
+            _LANG_CACHE_MTIME = mt
+    except Exception:
+        pass
+
+def _get_lang(uid: int) -> str:
+    _load_langs_if_needed()
+    return _LANG_CACHE.get(int(uid), "ru")
+
+def _tr(uid: int, key: str) -> str:
+    lang = _get_lang(uid)
+    i18n = _load_i18n()
+    return i18n.get(lang, i18n.get("en", {})).get(key, key)
+
+class _SafeDict(dict):
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+def _trf(uid: int, key: str, **kwargs) -> str:
+    tmpl = _tr(uid, key)
+    try:
+        return str(tmpl).format_map(_SafeDict(**kwargs))
+    except Exception:
+        return str(tmpl)
+
+def _market_label(uid: int, market: str) -> str:
+    return _tr(uid, "lbl_spot") if str(market).upper() == "SPOT" else _tr(uid, "lbl_futures")
+# --- /i18n helpers ---
+
 TOP_N = max(10, _env_int("TOP_N", 50))
 SCAN_INTERVAL_SECONDS = max(30, _env_int("SCAN_INTERVAL_SECONDS", 150))
 CONFIDENCE_MIN = max(0, min(100, _env_int("CONFIDENCE_MIN", 80)))
@@ -76,6 +153,9 @@ TP2_R = max(1.0, _env_float("TP2_R", 3.0))
 # News filter
 NEWS_FILTER = _env_bool("NEWS_FILTER", False)
 CRYPTOPANIC_TOKEN = os.getenv("CRYPTOPANIC_TOKEN", "").strip()
+CRYPTOPANIC_PUBLIC = _env_bool("CRYPTOPANIC_PUBLIC", False)
+CRYPTOPANIC_REGIONS = os.getenv("CRYPTOPANIC_REGIONS", "en").strip() or "en"
+CRYPTOPANIC_KIND = os.getenv("CRYPTOPANIC_KIND", "news").strip() or "news"
 NEWS_LOOKBACK_MIN = max(5, _env_int("NEWS_LOOKBACK_MIN", 60))
 NEWS_ACTION = os.getenv("NEWS_ACTION", "FUTURES_OFF").strip().upper()  # FUTURES_OFF / PAUSE_ALL
 
@@ -268,18 +348,25 @@ class MacroEvent:
 
 # ------------------ News risk filter (CryptoPanic) ------------------
 class NewsFilter:
-    BASE_URL = "https://cryptopanic.com/api/v1/posts/"
+    # Use Developer v2 endpoint (matches API Reference in CryptoPanic Developers panel)
+    BASE_URL = "https://cryptopanic.com/api/developer/v2/posts/"
 
     def __init__(self) -> None:
         self._cache: Dict[str, Tuple[float, str]] = {}
         self._cache_ttl = 60
+        # prevent hanging network calls
+        self._timeout = aiohttp.ClientTimeout(total=8)
 
     def enabled(self) -> bool:
         return NEWS_FILTER and bool(CRYPTOPANIC_TOKEN)
 
     def base_coin(self, symbol: str) -> str:
-        s = symbol.upper()
-        return s[:-4] if s.endswith("USDT") else s[:3]
+        # Accept formats: BTCUSDT, BTC/USDT, BTC-USDT, etc.
+        s = str(symbol).upper().replace("/", "").replace("-", "").strip()
+        for q in ("USDT", "USDC", "BUSD", "USD", "FDUSD", "TUSD", "DAI", "EUR", "BTC", "ETH"):
+            if s.endswith(q) and len(s) > len(q):
+                return s[:-len(q)]
+        return s
 
     async def action_for_symbol(self, session: aiohttp.ClientSession, symbol: str) -> str:
         if not self.enabled():
@@ -298,9 +385,14 @@ class NewsFilter:
                 "auth_token": CRYPTOPANIC_TOKEN,
                 "currencies": coin,
                 "filter": "important",
-                "public": "true",
+                # reduce noise; can be overridden via env if desired
+                "kind": CRYPTOPANIC_KIND,
+                "regions": CRYPTOPANIC_REGIONS,
             }
-            async with session.get(self.BASE_URL, params=params) as r:
+            if CRYPTOPANIC_PUBLIC:
+                params["public"] = "true"
+
+            async with session.get(self.BASE_URL, params=params, timeout=self._timeout) as r:
                 if r.status != 200:
                     action = "ALLOW"
                 else:
@@ -844,75 +936,90 @@ class Backend:
         latest = self.feed.get_latest(market, signal.symbol)
         return latest if latest is not None else self.feed.mock_price(market, signal.symbol)
 
-    async def track_loop(self, bot) -> None:
-        while True:
-            # iterate over snapshot to allow removals
-            for key, trade in list(self.trades.items()):
-                if not trade.active:
-                    continue
+async def track_loop(self, bot) -> None:
+    while True:
+        # iterate over snapshot to allow removals
+        for key, trade in list(self.trades.items()):
+            if not getattr(trade, "active", False):
+                continue
 
-                s = trade.signal
-                price = await self._get_price(s)
-                trade.last_price = float(price)
+            s = trade.signal
+            price = await self._get_price(s)
+            trade.last_price = float(price)
 
-                hit_tp = lambda lvl: price >= lvl if s.direction == "LONG" else price <= lvl
-                hit_sl = lambda lvl: price <= lvl if s.direction == "LONG" else price >= lvl
+            hit_tp = lambda lvl: price >= lvl if s.direction == "LONG" else price <= lvl
+            hit_sl = lambda lvl: price <= lvl if s.direction == "LONG" else price >= lvl
 
-                if not trade.tp1_hit and hit_sl(s.sl):
-                    trade.active = False
-                    trade.result = "LOSS"
-                    await bot.send_message(trade.user_id,
-                        f"❌ SIGNAL AUTO CLOSED — STOP LOSS\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nStatus: LOSS 🔴")
-                    try:
-                        self.record_trade_close(trade, "LOSS", float(price), time.time())
-                    except Exception:
-                        pass
-                    # auto-remove
-                    self.trades.pop(key, None)
-                    continue
+            # 1) SL before TP1 -> LOSS
+            if not trade.tp1_hit and hit_sl(s.sl):
+                trade.active = False
+                trade.result = "LOSS"
+                uid = trade.user_id
+                await bot.send_message(uid, _trf(uid, "msg_auto_loss",
+                    symbol=s.symbol,
+                    market=_market_label(uid, s.market),
+                    price=f"{price:.6f}",
+                ))
+                try:
+                    self.record_trade_close(trade, "LOSS", float(price), time.time())
+                except Exception:
+                    pass
+                self.trades.pop(key, None)
+                continue
 
-                if not trade.tp1_hit and hit_tp(s.tp1):
-                    trade.tp1_hit = True
-                    trade.sl_moved_to_be = True
-                    trade.result = "TP1"
-                    trade.be_price = _be_exit_price(s.entry, s.direction, s.market)
-                    await bot.send_message(trade.user_id,
-                        f"🟡 TP1 HIT\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nClosed: {int(_tp1_partial_close_pct(s.market))}%\\nSL moved to BE: {trade.be_price:.6f}")
-                    continue
+            # 2) TP1 -> partial close + BE
+            if not trade.tp1_hit and hit_tp(s.tp1):
+                trade.tp1_hit = True
+                trade.sl_moved_to_be = True
+                trade.result = "TP1"
+                trade.be_price = _be_exit_price(s.entry, s.direction, s.market)
+                uid = trade.user_id
+                await bot.send_message(uid, _trf(uid, "msg_auto_tp1",
+                    symbol=s.symbol,
+                    market=_market_label(uid, s.market),
+                    closed_pct=int(_partial_close_pct(s.market)),
+                    be_price=f"{float(trade.be_price):.6f}",
+                ))
+                continue
 
-                if trade.tp1_hit and trade.sl_moved_to_be and _be_enabled(s.market) and hit_sl(getattr(trade, 'be_price', s.entry) or s.entry):
-                    trade.active = False
-                    trade.result = "BE"
-                    be_px = float(getattr(trade, 'be_price', s.entry) or s.entry)
-                    await bot.send_message(
-                        trade.user_id,
-                        f"⚪ SIGNAL AUTO CLOSED — BREAK EVEN\n\n"
-                        f"🪙 {s.symbol} ({s.market})\n"
-                        f"Price: {price:.6f}\n"
-                        f"BE exit: {be_px:.6f}\n"
-                        f"Status: SAFE ⚪"
-                    )
-                    try:
-                        self.record_trade_close(trade, "BE", be_px, time.time())
-                    except Exception:
-                        pass
-                    self.trades.pop(key, None)
-                    continue
+            # 3) After TP1: BE close (entry+fees)
+            if trade.tp1_hit and trade.sl_moved_to_be and _be_enabled(s.market) and hit_sl(float(getattr(trade, "be_price", s.entry) or s.entry)):
+                trade.active = False
+                trade.result = "BE"
+                be_px = float(getattr(trade, "be_price", s.entry) or s.entry)
+                uid = trade.user_id
+                await bot.send_message(uid, _trf(uid, "msg_auto_be",
+                    symbol=s.symbol,
+                    market=_market_label(uid, s.market),
+                    price=f"{price:.6f}",
+                    be_price=f"{be_px:.6f}",
+                ))
+                try:
+                    self.record_trade_close(trade, "BE", be_px, time.time())
+                except Exception:
+                    pass
+                self.trades.pop(key, None)
+                continue
 
-                if hit_tp(s.tp2):
-                    trade.active = False
-                    trade.result = "WIN"
-                    await bot.send_message(trade.user_id,
-                        f"✅ SIGNAL AUTO CLOSED — TP2 HIT\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nStatus: WIN 🟢")
-                    try:
-                        tp2_px = float(s.tp2 or price)
-                        self.record_trade_close(trade, "WIN", tp2_px, time.time())
-                    except Exception:
-                        pass
-                    self.trades.pop(key, None)
-                    continue
+            # 4) TP2 -> WIN
+            if hit_tp(s.tp2):
+                trade.active = False
+                trade.result = "WIN"
+                uid = trade.user_id
+                await bot.send_message(uid, _trf(uid, "msg_auto_win",
+                    symbol=s.symbol,
+                    market=_market_label(uid, s.market),
+                    price=f"{price:.6f}",
+                ))
+                try:
+                    tp2_px = float(s.tp2 or price)
+                    self.record_trade_close(trade, "WIN", tp2_px, time.time())
+                except Exception:
+                    pass
+                self.trades.pop(key, None)
+                continue
 
-            await asyncio.sleep(TRACK_INTERVAL_SECONDS)
+        await asyncio.sleep(TRACK_INTERVAL_SECONDS)
 
     async def scanner_loop(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         while True:
