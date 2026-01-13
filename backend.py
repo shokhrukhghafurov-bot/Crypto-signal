@@ -844,13 +844,6 @@ class Backend:
             pass
         return True
 
-    def calc_effective_pnl_pct(self, trade: "UserTrade", close_price: float, close_reason: str) -> float:
-        """Public helper for bot layer to format CLOSE messages consistently."""
-        try:
-            return float(_calc_effective_pnl_pct(trade, float(close_price), str(close_reason)))
-        except Exception:
-            return 0.0
-
     # ---------------- trade stats helpers ----------------
     def _load_trade_stats(self) -> None:
         self.trade_stats = {"spot": {"days": {}, "weeks": {}}, "futures": {"days": {}, "weeks": {}}}
@@ -966,13 +959,10 @@ class Backend:
                     trade.active = False
                     trade.result = "LOSS"
                     uid = trade.user_id
-                    pnl_total = _calc_effective_pnl_pct(trade, float(price), "LOSS")
                     await bot.send_message(uid, _trf(uid, "msg_auto_loss",
                         symbol=s.symbol,
                         market=_market_label(uid, s.market),
                         price=f"{price:.6f}",
-                        pnl_total=f"{pnl_total:+.2f}%",
-                        status="LOSS",
                     ))
                     try:
                         self.record_trade_close(trade, "LOSS", float(price), time.time())
@@ -993,7 +983,6 @@ class Backend:
                         market=_market_label(uid, s.market),
                         closed_pct=int(_partial_close_pct(s.market)),
                         be_price=f"{float(trade.be_price):.6f}",
-                        status="TP1",
                     ))
                     continue
 
@@ -1003,14 +992,11 @@ class Backend:
                     trade.result = "BE"
                     be_px = float(getattr(trade, "be_price", s.entry) or s.entry)
                     uid = trade.user_id
-                    pnl_total = _calc_effective_pnl_pct(trade, be_px, "BE")
                     await bot.send_message(uid, _trf(uid, "msg_auto_be",
                         symbol=s.symbol,
                         market=_market_label(uid, s.market),
                         price=f"{price:.6f}",
                         be_price=f"{be_px:.6f}",
-                        pnl_total=f"{pnl_total:+.2f}%",
-                        status="BE",
                     ))
                     try:
                         self.record_trade_close(trade, "BE", be_px, time.time())
@@ -1024,17 +1010,13 @@ class Backend:
                     trade.active = False
                     trade.result = "WIN"
                     uid = trade.user_id
-                    tp2_px = float(s.tp2 or price)
-                    pnl_total = _calc_effective_pnl_pct(trade, tp2_px, "WIN")
                     await bot.send_message(uid, _trf(uid, "msg_auto_win",
                         symbol=s.symbol,
                         market=_market_label(uid, s.market),
                         price=f"{price:.6f}",
-                        tp2=f"{tp2_px:.6f}",
-                        pnl_total=f"{pnl_total:+.2f}%",
-                        status="WIN",
                     ))
                     try:
+                        tp2_px = float(s.tp2 or price)
                         self.record_trade_close(trade, "WIN", tp2_px, time.time())
                     except Exception:
                         pass
