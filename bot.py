@@ -827,6 +827,139 @@ async def lang_choose(call: types.CallbackQuery) -> None:
 
 # ---------------- menu callbacks ----------------
 @dp.callback_query(lambda c: (c.data or "").startswith("menu:"))
+
+def _fmt_stats_block_ru(title: str, b: dict) -> str:
+    trades = int(b.get("trades", 0))
+    wins = int(b.get("wins", 0))
+    losses = int(b.get("losses", 0))
+    be = int(b.get("be", 0))
+    tp1 = int(b.get("tp1_hits", 0))
+    wr = (wins / trades * 100.0) if trades else 0.0
+    pnl = float(b.get("sum_pnl_pct", 0.0))
+    return (
+        f"{title}\n"
+        f"Сделки: {trades} | Плюс: {wins} | Минус: {losses} | BE: {be} | TP1: {tp1}\n"
+        f"Процент побед: {wr:.1f}%\n"
+        f"PnL: {pnl:+.2f}%"
+    )
+
+def _fmt_stats_block_en(title: str, b: dict) -> str:
+    trades = int(b.get("trades", 0))
+    wins = int(b.get("wins", 0))
+    losses = int(b.get("losses", 0))
+    be = int(b.get("be", 0))
+    tp1 = int(b.get("tp1_hits", 0))
+    wr = (wins / trades * 100.0) if trades else 0.0
+    pnl = float(b.get("sum_pnl_pct", 0.0))
+    return (
+        f"{title}\n"
+        f"Trades: {trades} | Wins: {wins} | Losses: {losses} | BE: {be} | TP1: {tp1}\n"
+        f"Win rate: {wr:.1f}%\n"
+        f"PnL: {pnl:+.2f}%"
+    )
+
+def _parse_report_lines(lines: list[str]) -> list[tuple[str,int,float,float]]:
+    # returns (key, trades, winrate, pnl)
+    out = []
+    rx = re.compile(r"^(?P<k>[^:]+):\s*trades=(?P<t>\d+)\s+winrate=(?P<wr>[\d\.]+)%\s+pnl=(?P<pnl>[\+\-]?[\d\.]+)%\s*$")
+    for ln in lines:
+        m = rx.match((ln or "").strip())
+        if not m:
+            continue
+        out.append((m.group("k"), int(m.group("t")), float(m.group("wr")), float(m.group("pnl"))))
+    return out
+
+def stats_text(uid: int) -> str:
+    lang = get_lang(uid)
+
+    spot_today = backend.perf_today("SPOT")
+    fut_today = backend.perf_today("FUTURES")
+    spot_week = backend.perf_week("SPOT")
+    fut_week = backend.perf_week("FUTURES")
+
+    if lang == "en":
+        header = "📈 Trading statistics"
+        today_hdr = "📊 Results — Today"
+        week_hdr = "📊 Results — This week"
+        by_days_hdr = "📅 By days (7d)"
+        by_weeks_hdr = "🗓️ By weeks (4w)"
+        spot_title = "🟢 SPOT"
+        fut_title = "🔴 FUTURES"
+        no_closed = "no closed trades"
+        hint = "Hint: statistics appear only after a trade is closed (TP2 / SL / BE / manual)."
+        fmt_block = _fmt_stats_block_en
+    else:
+        header = "📈 Торговая статистика"
+        today_hdr = "📊 Результаты — Сегодня"
+        week_hdr = "📊 Результаты — На этой неделе"
+        by_days_hdr = "📅 По дням (7д)"
+        by_weeks_hdr = "🗓️ По неделям (4н)"
+        spot_title = "🟢 СПОТ"
+        fut_title = "🔴 ФЬЮЧЕРСЫ"
+        no_closed = "нет закрытых сделок"
+        hint = "Подсказка: статистика появляется только после закрытия сделки (TP2 / SL / BE / вручную)."
+        fmt_block = _fmt_stats_block_ru
+
+    parts = [header, "", today_hdr, fmt_block(spot_title, spot_today), "", fmt_block(fut_title, fut_today), "", week_hdr, fmt_block(spot_title, spot_week), "", fmt_block(fut_title, fut_week), ""]
+
+    # By days
+    parts.append(by_days_hdr)
+    spot_days = _parse_report_lines(backend.report_daily("SPOT", days=7))
+    fut_days = _parse_report_lines(backend.report_daily("FUTURES", days=7))
+    if not spot_days:
+        parts.append(f"{spot_title}:\n{no_closed}")
+    else:
+        lines = []
+        for k,t,wr,pnl in spot_days:
+            if lang == "en":
+                lines.append(f"{k}: trades {t} | winrate {wr:.1f}% | pnl {pnl:+.2f}%")
+            else:
+                lines.append(f"{k}: Сделки {t} | Победы {wr:.1f}% | PnL {pnl:+.2f}%")
+        parts.append(f"{spot_title}:\n" + "\n".join(lines))
+    parts.append("")
+    if not fut_days:
+        parts.append(f"{fut_title}:\n{no_closed}")
+    else:
+        lines = []
+        for k,t,wr,pnl in fut_days:
+            if lang == "en":
+                lines.append(f"{k}: trades {t} | winrate {wr:.1f}% | pnl {pnl:+.2f}%")
+            else:
+                lines.append(f"{k}: Сделки {t} | Победы {wr:.1f}% | PnL {pnl:+.2f}%")
+        parts.append(f"{fut_title}:\n" + "\n".join(lines))
+    parts.append("")
+
+    # By weeks
+    parts.append(by_weeks_hdr)
+    spot_weeks = _parse_report_lines(backend.report_weekly("SPOT", weeks=4))
+    fut_weeks = _parse_report_lines(backend.report_weekly("FUTURES", weeks=4))
+    if not spot_weeks:
+        parts.append(f"{spot_title}:\n{no_closed}")
+    else:
+        lines = []
+        for k,t,wr,pnl in spot_weeks:
+            if lang == "en":
+                lines.append(f"{k}: trades {t} | winrate {wr:.1f}% | pnl {pnl:+.2f}%")
+            else:
+                lines.append(f"{k}: Сделки {t} | Победы {wr:.1f}% | PnL {pnl:+.2f}%")
+        parts.append(f"{spot_title}:\n" + "\n".join(lines))
+    parts.append("")
+    if not fut_weeks:
+        parts.append(f"{fut_title}:\n{no_closed}")
+    else:
+        lines = []
+        for k,t,wr,pnl in fut_weeks:
+            if lang == "en":
+                lines.append(f"{k}: trades {t} | winrate {wr:.1f}% | pnl {pnl:+.2f}%")
+            else:
+                lines.append(f"{k}: Сделки {t} | Победы {wr:.1f}% | PnL {pnl:+.2f}%")
+        parts.append(f"{fut_title}:\n" + "\n".join(lines))
+    parts.append("")
+    parts.append(hint)
+
+    return "\n".join(parts).strip()
+
+
 async def menu_handler(call: types.CallbackQuery) -> None:
     action = (call.data or "").split(":", 1)[1]
     uid = call.from_user.id if call.from_user else 0
@@ -894,16 +1027,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             except Exception:
                 pass
 
-        spot_today = backend.perf_today("SPOT")
-        fut_today = backend.perf_today("FUTURES")
-        spot_week = backend.perf_week("SPOT")
-        fut_week = backend.perf_week("FUTURES")
-
-        txt = trf(uid, "stats_screen",
-                  spot_today=spot_today,
-                  fut_today=fut_today,
-                  spot_week=spot_week,
-                  fut_week=fut_week)
+        txt = stats_text(uid)
         await safe_edit(call.message, txt, menu_kb(uid))
         return
 
