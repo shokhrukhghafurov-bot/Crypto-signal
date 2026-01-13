@@ -611,6 +611,77 @@ def _fmt_hhmm(ts_utc: float) -> str:
     d = dt.datetime.fromtimestamp(ts_utc, tz=ZoneInfo("UTC")).astimezone(TZ)
     return d.strftime("%H:%M")
 
+def _fmt_symbol(sym: str) -> str:
+    s = (sym or "").strip().upper()
+    if "/" in s:
+        a, b = s.split("/", 1)
+        return f"{a.strip()} / {b.strip()}"
+    return s
+
+def _calc_profit_pct(sig: Signal) -> float:
+    """Model expected profit % using TP2 if available, otherwise TP1."""
+    try:
+        entry = float(sig.entry)
+        tp = float(sig.tp2) if float(getattr(sig, "tp2", 0.0) or 0.0) > 0 else float(sig.tp1)
+        side = (sig.direction or "LONG").upper().strip()
+        if entry <= 0:
+            return 0.0
+        if side == "SHORT":
+            return (entry - tp) / entry * 100.0
+        return (tp - entry) / entry * 100.0
+    except Exception:
+        return 0.0
+
+def _open_card_text(uid: int, sig: Signal) -> str:
+    sym_disp = _fmt_symbol(sig.symbol)
+    base = sym_disp.split("/")[0].strip().replace(" ", "") if sym_disp else "SYMBOL"
+    exchanges = (getattr(sig, "confirmations", "") or "").replace("+", " • ")
+    if not exchanges:
+        exchanges = tr(uid, "lbl_none")
+
+    profit = _calc_profit_pct(sig)
+    hhmm = _fmt_hhmm(float(getattr(sig, "ts", 0.0) or 0.0))
+
+    side = (sig.direction or "LONG").upper().strip()
+    mkt = (sig.market or "FUTURES").upper().strip()
+
+    # futures leverage (default)
+    lev = os.getenv("FUTURES_LEVERAGE_DEFAULT", "5").strip() or "5"
+
+    if mkt == "SPOT":
+        key = "open_spot"
+        return trf(
+            uid,
+            key,
+            symbol=sym_disp,
+            exchanges=exchanges,
+            entry=f"{float(sig.entry):.5f}",
+            tp1=f"{float(sig.tp1):.5f}",
+            tp2=f"{float(sig.tp2):.5f}",
+            sl=f"{float(sig.sl):.5f}",
+            profit=f"{profit:.1f}",
+            time=hhmm,
+            tag=base,
+        )
+
+    key = "open_futures"
+    return trf(
+        uid,
+        key,
+        symbol=sym_disp,
+        exchanges=exchanges,
+        side=side,
+        lev=lev,
+        entry=f"{float(sig.entry):.5f}",
+        tp1=f"{float(sig.tp1):.5f}",
+        tp2=f"{float(sig.tp2):.5f}",
+        sl=f"{float(sig.sl):.5f}",
+        rr=f"{float(sig.rr):.1f}",
+        profit=f"{profit:.1f}",
+        time=hhmm,
+        tag=base,
+    )
+
 def _fmt_countdown(seconds: float) -> str:
     if seconds < 0:
         seconds = 0
@@ -1109,7 +1180,12 @@ async def opened(call: types.CallbackQuery) -> None:
 
     backend.open_trade(call.from_user.id, sig)
     await call.answer(tr(call.from_user.id, "trade_opened_toast"))
-    await bot.send_message(call.from_user.id, tr(call.from_user.id, "trade_opened_msg").format(sym=sig.symbol, mkt=tr_market(call.from_user.id, sig.market)), reply_markup=menu_kb(call.from_user.id))
+    # IMPORTANT: send OPEN card only after user pressed ✅ ОТКРЫЛ СДЕЛКУ
+    await bot.send_message(
+        call.from_user.id,
+        _open_card_text(call.from_user.id, sig),
+        reply_markup=menu_kb(call.from_user.id),
+    )
 
 async def main() -> None:
     import time
