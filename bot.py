@@ -97,6 +97,19 @@ def tr(uid: int, key: str) -> str:
     return I18N.get(lang, I18N["en"]).get(key, I18N["en"].get(key, key))
 
 
+
+
+class _SafeDict(dict):
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+def trf(uid: int, key: str, **kwargs) -> str:
+    tmpl = tr(uid, key)
+    try:
+        return str(tmpl).format_map(_SafeDict(**kwargs))
+    except Exception:
+        return str(tmpl)
+
 def tr_action(uid: int, v: str) -> str:
     vv = (v or "").upper().strip()
     if vv == "ALLOW":
@@ -453,15 +466,15 @@ def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
 
 
 
+
 def _signal_text(uid: int, s: Signal) -> str:
     header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
-    # Direction (LONG/SHORT) is meaningful for futures. For SPOT we hide it to avoid confusion.
+
     arrow = tr(uid, 'sig_long') if s.direction == 'LONG' else tr(uid, 'sig_short')
+    direction_line = (arrow + "\\n") if s.market != 'SPOT' else ""
 
     def _fmt_exchanges(raw: str) -> str:
-        # confirmations contains exchanges like "BINANCE+BYBIT" or "BINANCE+OKX"
         xs = [x.strip() for x in (raw or '').replace(',', '+').split('+') if x.strip()]
-        # prettify names
         pretty = []
         for x in xs:
             u = x.upper()
@@ -473,7 +486,6 @@ def _signal_text(uid: int, s: Signal) -> str:
                 pretty.append('OKX')
             else:
                 pretty.append(x)
-        # remove duplicates keeping order
         out: List[str] = []
         for p in pretty:
             if p not in out:
@@ -481,7 +493,6 @@ def _signal_text(uid: int, s: Signal) -> str:
         return ' • '.join(out)
 
     def _tp_lines() -> List[str]:
-        # If code later adds `tps` list/tuple to Signal, support it without breaking.
         tps_obj = getattr(s, 'tps', None)
         if isinstance(tps_obj, (list, tuple)) and len(tps_obj) > 0:
             lines: List[str] = []
@@ -496,10 +507,8 @@ def _signal_text(uid: int, s: Signal) -> str:
             if lines:
                 return lines
 
-        lines = []
-        # Always show TP1
+        lines: List[str] = []
         lines.append(f"TP1: {s.tp1:.6f}")
-        # Show TP2 only if it exists and differs from TP1
         try:
             if float(s.tp2) > 0 and abs(float(s.tp2) - float(s.tp1)) > 1e-12:
                 lines.append(f"TP2: {s.tp2:.6f}")
@@ -507,34 +516,35 @@ def _signal_text(uid: int, s: Signal) -> str:
             pass
         return lines
 
-    parts = [
-        header,
-        '',
-        f"🪙 {s.symbol}",
-    ]
-    if s.market != 'SPOT':
-        parts.append(arrow)
+    ex_line_raw = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
+    exchanges_line = f"{tr(uid, 'sig_exchanges')}: {ex_line_raw}\\n" if ex_line_raw else ""
+    tf_line = f"{tr(uid, 'sig_tf')}: {s.timeframe}"
 
-    ex_line = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
-    if ex_line:
-        parts.append(f"{tr(uid, 'sig_exchanges')}: {ex_line}")
+    tp_lines = "\\n".join(_tp_lines())
 
-    parts += [
-        f"{tr(uid, 'sig_tf')}: {s.timeframe}",
-        '',
-        f"{tr(uid, 'sig_entry')}: {s.entry:.6f}",
-        f"SL: {s.sl:.6f}",
-        *_tp_lines(),
-        '',
-        f"{tr(uid, 'sig_rr')}: 1:{s.rr:.2f}",
-        f"{tr(uid, 'sig_confidence')}: {s.confidence}/100",
-        f"{tr(uid, 'sig_confirm')}: {s.confirmations}",
-    ]
-    if (s.risk_note or '').strip():
-        parts += ['', s.risk_note]
-    parts += ['', tr(uid, 'sig_open_prompt')]
-    return "\n".join(parts)
+    rr_line = f"{tr(uid, 'sig_rr')}: 1:{s.rr:.2f}"
+    conf_line = f"{tr(uid, 'sig_confidence')}: {s.confidence}/100"
+    confirm_line = f"{tr(uid, 'sig_confirm')}: {s.confirmations}"
 
+    risk_note = (s.risk_note or '').strip()
+    risk_block = f"\\n\\n{risk_note}" if risk_note else ""
+
+    return trf(uid, "msg_open_card",
+        header=header,
+        symbol=s.symbol,
+        direction_line=direction_line,
+        exchanges_line=exchanges_line,
+        tf_line=tf_line,
+        entry_label=tr(uid, 'sig_entry'),
+        entry=f"{s.entry:.6f}",
+        sl=f"{s.sl:.6f}",
+        tp_lines=tp_lines,
+        rr_line=rr_line,
+        conf_line=conf_line,
+        confirm_line=confirm_line,
+        risk_block=risk_block,
+        open_prompt=tr(uid, 'sig_open_prompt')
+    )
 
 def _fmt_hhmm(ts_utc: float) -> str:
     d = dt.datetime.fromtimestamp(ts_utc, tz=ZoneInfo("UTC")).astimezone(TZ)
