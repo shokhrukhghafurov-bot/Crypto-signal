@@ -22,6 +22,10 @@ from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 from zoneinfo import ZoneInfo
 
+import logging
+
+logger = logging.getLogger("crypto-signal")
+
 # ------------------ ENV helpers ------------------
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name, "").strip()
@@ -849,7 +853,7 @@ class Backend:
                 if isinstance(data, dict):
                     self.trade_stats.update(data)
             except Exception:
-                pass
+                logger.exception("scanner_loop exception")
 
     def _save_trade_stats(self) -> None:
         try:
@@ -1024,6 +1028,8 @@ async def track_loop(self, bot) -> None:
     async def scanner_loop(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         while True:
             start = time.time()
+            logger.info("SCAN tick start top_n=%s interval=%ss news_filter=%s macro_filter=%s", TOP_N, SCAN_INTERVAL_SECONDS, bool(NEWS_FILTER and CRYPTOPANIC_TOKEN), bool(MACRO_FILTER))
+            logger.info("[scanner] tick start TOP_N=%s interval=%ss", TOP_N, SCAN_INTERVAL_SECONDS)
             self.last_scan_ts = start
             try:
                 async with MultiExchangeData() as api:
@@ -1031,11 +1037,15 @@ async def track_loop(self, bot) -> None:
 
                     symbols = await api.get_top_usdt_symbols(TOP_N)
                     self.scanned_symbols_last = len(symbols)
+                    logger.info("[scanner] symbols loaded: %s", self.scanned_symbols_last)
 
                     mac_act, mac_ev, mac_win = self.macro.current_action()
                     self.last_macro_action = mac_act
+                    if MACRO_FILTER:
+                        logger.info("[scanner] macro action=%s next=%s window=%s", mac_act, getattr(mac_ev, "name", None) if mac_ev else None, mac_win)
 
                     if mac_act != "ALLOW" and mac_ev and mac_win and self.macro.should_notify(mac_ev):
+                        logger.info("[macro] alert: action=%s event=%s window=%s", mac_act, getattr(mac_ev, "name", None), mac_win)
                         await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
 
                     for sym in symbols:
@@ -1134,11 +1144,15 @@ async def track_loop(self, bot) -> None:
                         else:
                             self.last_futures_signal = sig
 
+                        logger.info("[signal] emit %s %s %s conf=%s rr=%.2f notes=%s", sig.symbol, sig.market, sig.direction, sig.confidence, sig.rr, (sig.risk_note or "-")[:120])
+                        logger.info("SIGNAL %s %s %s conf=%s rr=%.2f notes=%s", sig.market, sig.symbol, sig.direction, sig.confidence, sig.rr, (sig.risk_note or "-"))
+                        logger.info("SIGNAL found %s %s %s conf=%s rr=%.2f exch=%s", sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr), sig.confirmations)
                         await emit_signal_cb(sig)
                         await asyncio.sleep(2)
 
             except Exception:
-                pass
+                logger.exception("scanner_loop error")
 
             elapsed = time.time() - start
+            logger.info("SCAN tick done scanned=%s elapsed=%.1fs last_news=%s last_macro=%s", int(getattr(self, "scanned_symbols_last", 0) or 0), elapsed, getattr(self, "last_news_action", "?"), getattr(self, "last_macro_action", "?"))
             await asyncio.sleep(max(5, SCAN_INTERVAL_SECONDS - elapsed))
