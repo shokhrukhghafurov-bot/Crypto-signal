@@ -54,8 +54,21 @@ COOLDOWN_MINUTES = max(1, _env_int("COOLDOWN_MINUTES", 180))
 
 USE_REAL_PRICE = _env_bool("USE_REAL_PRICE", True)
 TRACK_INTERVAL_SECONDS = max(1, _env_int("TRACK_INTERVAL_SECONDS", 3))
+# Backward-compatible default partial close percent (legacy)
 TP1_PARTIAL_CLOSE_PCT = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT", 50)))
 
+# New per-market settings
+TP1_PARTIAL_CLOSE_PCT_SPOT = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT_SPOT", TP1_PARTIAL_CLOSE_PCT)))
+TP1_PARTIAL_CLOSE_PCT_FUTURES = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT_FUTURES", TP1_PARTIAL_CLOSE_PCT)))
+
+BE_AFTER_TP1_SPOT = _env_bool("BE_AFTER_TP1_SPOT", True)
+BE_AFTER_TP1_FUTURES = _env_bool("BE_AFTER_TP1_FUTURES", True)
+
+# Fee-protected BE: exit remaining position at entry +/- fee buffer so BE is not negative after fees (model)
+BE_FEE_BUFFER = _env_bool("BE_FEE_BUFFER", True)
+FEE_RATE_SPOT = max(0.0, _env_float("FEE_RATE_SPOT", 0.001))        # e.g. 0.001 = 0.10%
+FEE_RATE_FUTURES = max(0.0, _env_float("FEE_RATE_FUTURES", 0.001))  # e.g. 0.001 = 0.10%
+FEE_BUFFER_MULTIPLIER = max(0.0, _env_float("FEE_BUFFER_MULTIPLIER", 2.0))  # 2 = entry+exit fees
 ATR_MULT_SL = max(0.5, _env_float("ATR_MULT_SL", 1.5))
 TP1_R = max(0.5, _env_float("TP1_R", 1.5))
 TP2_R = max(1.0, _env_float("TP2_R", 3.0))
@@ -100,6 +113,7 @@ class UserTrade:
     signal: Signal
     tp1_hit: bool = False
     sl_moved_to_be: bool = False
+    be_price: float = 0.0
     active: bool = True
     result: str = "ACTIVE"  # ACTIVE / TP1 / WIN / LOSS / BE / CLOSED
     last_price: float = 0.0
@@ -133,6 +147,32 @@ def _market_key(market: str) -> str:
     m = (market or "FUTURES").strip().upper()
     return "spot" if m == "SPOT" else "futures"
 
+
+def _tp1_partial_close_pct(market: str) -> float:
+    mk = _market_key(market)
+    return float(TP1_PARTIAL_CLOSE_PCT_SPOT if mk == "spot" else TP1_PARTIAL_CLOSE_PCT_FUTURES)
+
+def _be_after_tp1(market: str) -> bool:
+    mk = _market_key(market)
+    return bool(BE_AFTER_TP1_SPOT if mk == "spot" else BE_AFTER_TP1_FUTURES)
+
+def _fee_rate(market: str) -> float:
+    mk = _market_key(market)
+    return float(FEE_RATE_SPOT if mk == "spot" else FEE_RATE_FUTURES)
+
+def _be_exit_price(entry: float, side: str, market: str) -> float:
+    """Return modeled BE exit price that covers fees on remaining position."""
+    entry = float(entry)
+    if not BE_FEE_BUFFER:
+        return entry
+    fr = max(0.0, _fee_rate(market))
+    buf = max(0.0, float(FEE_BUFFER_MULTIPLIER)) * fr
+    side = (side or "LONG").upper()
+    if side == "SHORT":
+        return entry * (1.0 - buf)
+    return entry * (1.0 + buf)
+
+
 def _day_key_tz(ts: float) -> str:
     d = dt.datetime.fromtimestamp(ts, tz=ZoneInfo(TZ_NAME)).date()
     return d.isoformat()
@@ -160,7 +200,7 @@ def _calc_effective_pnl_pct(trade: "UserTrade", close_price: float, close_reason
         return _safe_pct(pnl_pct_for(close_price))
 
     # TP1 hit => partial close at TP1, rest closes at BE or TP2 (or manual)
-    p = max(0.0, min(100.0, float(TP1_PARTIAL_CLOSE_PCT)))
+    p = max(0.0, min(100.0, float(_tp1_partial_close_pct(s.market))))
     a = p / 100.0
     tp1_price = float(s.tp1 or close_price)
 
@@ -823,6 +863,10 @@ class Backend:
                     trade.result = "LOSS"
                     await bot.send_message(trade.user_id,
                         f"❌ SIGNAL AUTO CLOSED — STOP LOSS\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nStatus: LOSS 🔴")
+                    try:
+                        self.record_trade_close(trade, "LOSS", float(price), time.time())
+                    except Exception:
+                        pass
                     # auto-remove
                     self.trades.pop(key, None)
                     continue
@@ -831,15 +875,29 @@ class Backend:
                     trade.tp1_hit = True
                     trade.sl_moved_to_be = True
                     trade.result = "TP1"
+                    trade.be_price = _be_exit_price(s.entry, s.direction, s.market)
                     await bot.send_message(trade.user_id,
-                        f"🟡 TP1 HIT\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nClosed: {TP1_PARTIAL_CLOSE_PCT}%\\nSL moved to Entry (BE)")
+                        f"🟡 TP1 HIT\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nClosed: {int(_tp1_partial_close_pct(s.market))}%\\nSL moved to BE: {trade.be_price:.6f}")
                     continue
 
-                if trade.tp1_hit and trade.sl_moved_to_be and hit_sl(s.entry):
+                if trade.tp1_hit and trade.sl_moved_to_be and _be_enabled(s.market) and hit_sl(getattr(trade, 'be_price', s.entry) or s.entry):
                     trade.active = False
                     trade.result = "BE"
-                    await bot.send_message(trade.user_id,
-                        f"⚪ SIGNAL AUTO CLOSED — BREAK EVEN\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nStatus: SAFE ⚪")
+                    be_px = float(getattr(trade, 'be_price', s.entry) or s.entry)
+                    await bot.send_message(
+                        trade.user_id,
+                        f"⚪ SIGNAL AUTO CLOSED — BREAK EVEN
+
+🪙 {s.symbol} ({s.market})
+"
+                        f"Price: {price:.6f}
+BE exit: {be_px:.6f}
+Status: SAFE ⚪"
+                    )
+                    try:
+                        self.record_trade_close(trade, "BE", be_px, time.time())
+                    except Exception:
+                        pass
                     self.trades.pop(key, None)
                     continue
 
@@ -848,6 +906,11 @@ class Backend:
                     trade.result = "WIN"
                     await bot.send_message(trade.user_id,
                         f"✅ SIGNAL AUTO CLOSED — TP2 HIT\\n\\n🪙 {s.symbol} ({s.market})\\nPrice: {price:.6f}\\nStatus: WIN 🟢")
+                    try:
+                        tp2_px = float(s.tp2 or price)
+                        self.record_trade_close(trade, "WIN", tp2_px, time.time())
+                    except Exception:
+                        pass
                     self.trades.pop(key, None)
                     continue
 
