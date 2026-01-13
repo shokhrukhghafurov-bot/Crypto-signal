@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import logging
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
@@ -18,6 +19,16 @@ import asyncpg
 from backend import Backend, Signal, MacroEvent
 
 load_dotenv()
+
+# ---- logging to stdout (Railway Deploy Logs) ----
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("bot")
+# -----------------------------------------------
+
 
 def _must_env(name: str) -> str:
     v = os.getenv(name, "").strip()
@@ -123,6 +134,11 @@ def tr_market(uid: int, market: str) -> str:
 
 SIGNALS: Dict[int, Signal] = {}
 ORIGINAL_SIGNAL_TEXT: Dict[tuple[int,int], str] = {}  # (uid, signal_id) -> text
+
+# Anti-duplicate protection for broadcasted signals.
+# Some scanners can emit the same signal multiple times (sometimes with different IDs).
+_SENT_SIG_CACHE: Dict[str, float] = {}  # signature -> last_sent_ts
+_SENT_SIG_TTL_SEC = int(os.getenv("SENT_SIG_TTL_SEC", "600"))  # default 10 minutes
 
 # ---------------- signal stats (daily/weekly) ----------------
 STATS_FILE = Path("signal_stats.json")
@@ -284,7 +300,7 @@ async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKe
         try:
             await bot.send_message(chat_id, text, reply_markup=kb)
         except Exception:
-            pass
+            logger.exception("Failed to send message to uid=%s", uid)
 
 
     for i, part in enumerate(parts):
@@ -370,7 +386,7 @@ async def init_db() -> None:
         try:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
         except Exception:
-            pass
+            logger.exception("Failed to send message to uid=%s", uid)
 
 async def ensure_user(user_id: int) -> None:
     if not pool or not user_id:
@@ -507,6 +523,9 @@ def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
 def _signal_text(uid: int, s: Signal) -> str:
     header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
 
+    # Visual marker near symbol (kept simple to avoid hard-depending on any exchange)
+    symbol_emoji = "🟢" if s.market == 'SPOT' else "🌕"
+
     arrow = tr(uid, 'sig_long') if s.direction == 'LONG' else tr(uid, 'sig_short')
     direction_line = (arrow + "\\n") if s.market != 'SPOT' else ""
 
@@ -550,7 +569,7 @@ def _signal_text(uid: int, s: Signal) -> str:
             if float(s.tp2) > 0 and abs(float(s.tp2) - float(s.tp1)) > 1e-12:
                 lines.append(f"TP2: {s.tp2:.6f}")
         except Exception:
-            pass
+            logger.exception("Failed to send message to uid=%s", uid)
         return lines
 
     ex_line_raw = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
@@ -568,6 +587,7 @@ def _signal_text(uid: int, s: Signal) -> str:
 
     return trf(uid, "msg_open_card",
         header=header,
+        symbol_emoji=symbol_emoji,
         symbol=s.symbol,
         direction_line=direction_line,
         exchanges_line=exchanges_line,
@@ -609,6 +629,21 @@ def _trade_status_emoji(status: str) -> str:
 
 # ---------------- broadcasting ----------------
 async def broadcast_signal(sig: Signal) -> None:
+    # Deduplicate: avoid sending the same signal twice (common when scanner emits duplicates).
+    import time, hashlib
+    now = time.time()
+    for k, ts in list(_SENT_SIG_CACHE.items()):
+        if now - ts > _SENT_SIG_TTL_SEC:
+            _SENT_SIG_CACHE.pop(k, None)
+
+    sig_raw = f"{sig.market}|{sig.symbol}|{sig.direction}|{sig.timeframe}|{sig.entry}|{sig.sl}|{sig.tp1}|{sig.tp2}|{sig.confirmations}"
+    sig_key = hashlib.sha1(sig_raw.encode('utf-8')).hexdigest()
+    if sig_key in _SENT_SIG_CACHE:
+        logger.info("Skip duplicate signal %s %s %s (within ttl)", sig.market, sig.symbol, sig.direction)
+        return
+    _SENT_SIG_CACHE[sig_key] = now
+
+    logger.info("Broadcast signal id=%s %s %s %s conf=%s rr=%.2f", sig.signal_id, sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr))
     SIGNALS[sig.signal_id] = sig
     ORIGINAL_SIGNAL_TEXT[(0, sig.signal_id)] = _signal_text(0, sig)
     kb = InlineKeyboardBuilder()
@@ -622,7 +657,7 @@ async def broadcast_signal(sig: Signal) -> None:
             kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
             await bot.send_message(uid, _signal_text(uid, sig), reply_markup=kb_u.as_markup())
         except Exception:
-            pass
+            logger.exception("Failed to send message to uid=%s", uid)
 
 
 async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, float], tz_name: str) -> None:
@@ -635,7 +670,7 @@ async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, f
             tail = tr(uid, 'macro_tail_fut_off') if action == 'FUTURES_OFF' else tr(uid, 'macro_tail_paused')
             await bot.send_message(uid, f"{title}\n\n{body}{tail}")
         except Exception:
-            pass
+            logger.exception("Failed to send message to uid=%s", uid)
 
 # ---------------- commands ----------------
 @dp.message(Command("start"))
@@ -955,7 +990,7 @@ def _trade_card_text(uid: int, t) -> str:
             if float(s.tp2) > 0 and abs(float(s.tp2) - float(s.tp1)) > 1e-12:
                 out.append(f"TP2: {s.tp2:.6f}")
         except Exception:
-            pass
+            logger.exception("Failed to send message to uid=%s", uid)
         return out
     parts = [
         "📌 " + tr(uid, "m_trades"),
@@ -1076,9 +1111,12 @@ async def main() -> None:
     import time
     globals()["time"] = time
 
+    logger.info("Bot starting; TZ=%s", TZ_NAME)
     await init_db()
     load_langs()
+    logger.info("Starting track_loop")
     asyncio.create_task(backend.track_loop(bot))
+    logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
     await dp.start_polling(bot)
 
