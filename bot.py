@@ -374,6 +374,29 @@ async def _send_long(chat_id: int, text: str, reply_markup=None) -> None:
         parts.append(cur)
 
 
+
+async def safe_edit(message: types.Message | None, txt: str, kb: types.InlineKeyboardMarkup) -> None:
+    """Edit message text if possible; otherwise send a new message."""
+    try:
+        if message:
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                text=txt,
+                reply_markup=kb,
+            )
+            return
+    except Exception:
+        # message may be too old/not modified/etc. Fall back to send.
+        pass
+
+    try:
+        if message:
+            await bot.send_message(message.chat.id, txt, reply_markup=kb)
+    except Exception:
+        pass
+
+
 async def _render_in_place(call: types.CallbackQuery, txt: str, kb: types.InlineKeyboardMarkup) -> types.Message:
     """Prefer editing the message that contains the pressed button."""
     try:
@@ -383,6 +406,27 @@ async def _render_in_place(call: types.CallbackQuery, txt: str, kb: types.Inline
     except Exception:
         pass
     return await bot.send_message(call.from_user.id, txt, reply_markup=kb)
+
+
+async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKeyboardMarkup | None = None) -> None:
+    """Edit message text if possible, otherwise send a new message.
+
+    Used for menu actions (including Notifications toggle).
+    """
+    if not message:
+        return
+    chat_id = message.chat.id
+    msg_id = message.message_id
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=kb)
+        return
+    except Exception:
+        # Fallback: try sending a new message to the chat
+        try:
+            await bot.send_message(chat_id, text, reply_markup=kb)
+        except Exception:
+            pass
+
 
     for i, part in enumerate(parts):
         await bot.send_message(chat_id, part, reply_markup=reply_markup if i == len(parts)-1 else None)
