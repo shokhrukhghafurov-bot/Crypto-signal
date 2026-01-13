@@ -1060,8 +1060,23 @@ async def trade_close(call: types.CallbackQuery) -> None:
         back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
+    # Capture trade info before removal to format a CLOSE message
+    t = backend.get_trade(call.from_user.id, signal_id)
+    close_price = float(getattr(t, "last_price", 0.0) or getattr(t.signal, "entry", 0.0) if t else 0.0)
+    pnl_total = backend.calc_effective_pnl_pct(t, close_price, "CLOSED") if t else 0.0
+
     removed = backend.remove_trade(call.from_user.id, signal_id)
     if removed:
+        if t:
+            await bot.send_message(
+                call.from_user.id,
+                trf(call.from_user.id, "msg_trade_close",
+                    market=_market_label(call.from_user.id, t.signal.market),
+                    symbol=t.signal.symbol,
+                    pnl_total=f"{pnl_total:+.2f}%",
+                    reason=("вручную" if get_lang(call.from_user.id) == "ru" else "manual"),
+                ),
+            )
         await bot.send_message(call.from_user.id, tr(call.from_user.id, "trade_removed"), reply_markup=menu_kb(call.from_user.id))
     else:
         await bot.send_message(call.from_user.id, tr(call.from_user.id, "trade_removed_fail"), reply_markup=menu_kb(call.from_user.id))
