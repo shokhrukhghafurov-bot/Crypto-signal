@@ -940,90 +940,90 @@ class Backend:
         latest = self.feed.get_latest(market, signal.symbol)
         return latest if latest is not None else self.feed.mock_price(market, signal.symbol)
 
-async def track_loop(self, bot) -> None:
-    while True:
-        # iterate over snapshot to allow removals
-        for key, trade in list(self.trades.items()):
-            if not getattr(trade, "active", False):
-                continue
+    async def track_loop(self, bot) -> None:
+        while True:
+            # iterate over snapshot to allow removals
+            for key, trade in list(self.trades.items()):
+                if not getattr(trade, "active", False):
+                    continue
 
-            s = trade.signal
-            price = await self._get_price(s)
-            trade.last_price = float(price)
+                s = trade.signal
+                price = await self._get_price(s)
+                trade.last_price = float(price)
 
-            hit_tp = lambda lvl: price >= lvl if s.direction == "LONG" else price <= lvl
-            hit_sl = lambda lvl: price <= lvl if s.direction == "LONG" else price >= lvl
+                hit_tp = lambda lvl: price >= lvl if s.direction == "LONG" else price <= lvl
+                hit_sl = lambda lvl: price <= lvl if s.direction == "LONG" else price >= lvl
 
-            # 1) SL before TP1 -> LOSS
-            if not trade.tp1_hit and hit_sl(s.sl):
-                trade.active = False
-                trade.result = "LOSS"
-                uid = trade.user_id
-                await bot.send_message(uid, _trf(uid, "msg_auto_loss",
-                    symbol=s.symbol,
-                    market=_market_label(uid, s.market),
-                    price=f"{price:.6f}",
-                ))
-                try:
-                    self.record_trade_close(trade, "LOSS", float(price), time.time())
-                except Exception:
-                    pass
-                self.trades.pop(key, None)
-                continue
+                # 1) SL before TP1 -> LOSS
+                if not trade.tp1_hit and hit_sl(s.sl):
+                    trade.active = False
+                    trade.result = "LOSS"
+                    uid = trade.user_id
+                    await bot.send_message(uid, _trf(uid, "msg_auto_loss",
+                        symbol=s.symbol,
+                        market=_market_label(uid, s.market),
+                        price=f"{price:.6f}",
+                    ))
+                    try:
+                        self.record_trade_close(trade, "LOSS", float(price), time.time())
+                    except Exception:
+                        pass
+                    self.trades.pop(key, None)
+                    continue
 
-            # 2) TP1 -> partial close + BE
-            if not trade.tp1_hit and hit_tp(s.tp1):
-                trade.tp1_hit = True
-                trade.sl_moved_to_be = True
-                trade.result = "TP1"
-                trade.be_price = _be_exit_price(s.entry, s.direction, s.market)
-                uid = trade.user_id
-                await bot.send_message(uid, _trf(uid, "msg_auto_tp1",
-                    symbol=s.symbol,
-                    market=_market_label(uid, s.market),
-                    closed_pct=int(_partial_close_pct(s.market)),
-                    be_price=f"{float(trade.be_price):.6f}",
-                ))
-                continue
+                # 2) TP1 -> partial close + BE
+                if not trade.tp1_hit and hit_tp(s.tp1):
+                    trade.tp1_hit = True
+                    trade.sl_moved_to_be = True
+                    trade.result = "TP1"
+                    trade.be_price = _be_exit_price(s.entry, s.direction, s.market)
+                    uid = trade.user_id
+                    await bot.send_message(uid, _trf(uid, "msg_auto_tp1",
+                        symbol=s.symbol,
+                        market=_market_label(uid, s.market),
+                        closed_pct=int(_partial_close_pct(s.market)),
+                        be_price=f"{float(trade.be_price):.6f}",
+                    ))
+                    continue
 
-            # 3) After TP1: BE close (entry+fees)
-            if trade.tp1_hit and trade.sl_moved_to_be and _be_enabled(s.market) and hit_sl(float(getattr(trade, "be_price", s.entry) or s.entry)):
-                trade.active = False
-                trade.result = "BE"
-                be_px = float(getattr(trade, "be_price", s.entry) or s.entry)
-                uid = trade.user_id
-                await bot.send_message(uid, _trf(uid, "msg_auto_be",
-                    symbol=s.symbol,
-                    market=_market_label(uid, s.market),
-                    price=f"{price:.6f}",
-                    be_price=f"{be_px:.6f}",
-                ))
-                try:
-                    self.record_trade_close(trade, "BE", be_px, time.time())
-                except Exception:
-                    pass
-                self.trades.pop(key, None)
-                continue
+                # 3) After TP1: BE close (entry+fees)
+                if trade.tp1_hit and trade.sl_moved_to_be and _be_enabled(s.market) and hit_sl(float(getattr(trade, "be_price", s.entry) or s.entry)):
+                    trade.active = False
+                    trade.result = "BE"
+                    be_px = float(getattr(trade, "be_price", s.entry) or s.entry)
+                    uid = trade.user_id
+                    await bot.send_message(uid, _trf(uid, "msg_auto_be",
+                        symbol=s.symbol,
+                        market=_market_label(uid, s.market),
+                        price=f"{price:.6f}",
+                        be_price=f"{be_px:.6f}",
+                    ))
+                    try:
+                        self.record_trade_close(trade, "BE", be_px, time.time())
+                    except Exception:
+                        pass
+                    self.trades.pop(key, None)
+                    continue
 
-            # 4) TP2 -> WIN
-            if hit_tp(s.tp2):
-                trade.active = False
-                trade.result = "WIN"
-                uid = trade.user_id
-                await bot.send_message(uid, _trf(uid, "msg_auto_win",
-                    symbol=s.symbol,
-                    market=_market_label(uid, s.market),
-                    price=f"{price:.6f}",
-                ))
-                try:
-                    tp2_px = float(s.tp2 or price)
-                    self.record_trade_close(trade, "WIN", tp2_px, time.time())
-                except Exception:
-                    pass
-                self.trades.pop(key, None)
-                continue
+                # 4) TP2 -> WIN
+                if hit_tp(s.tp2):
+                    trade.active = False
+                    trade.result = "WIN"
+                    uid = trade.user_id
+                    await bot.send_message(uid, _trf(uid, "msg_auto_win",
+                        symbol=s.symbol,
+                        market=_market_label(uid, s.market),
+                        price=f"{price:.6f}",
+                    ))
+                    try:
+                        tp2_px = float(s.tp2 or price)
+                        self.record_trade_close(trade, "WIN", tp2_px, time.time())
+                    except Exception:
+                        pass
+                    self.trades.pop(key, None)
+                    continue
 
-        await asyncio.sleep(TRACK_INTERVAL_SECONDS)
+            await asyncio.sleep(TRACK_INTERVAL_SECONDS)
 
     async def scanner_loop(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         while True:
