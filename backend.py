@@ -886,13 +886,11 @@ class Backend:
                     be_px = float(getattr(trade, 'be_price', s.entry) or s.entry)
                     await bot.send_message(
                         trade.user_id,
-                        f"⚪ SIGNAL AUTO CLOSED — BREAK EVEN
-
-🪙 {s.symbol} ({s.market})
-"
-                        f"Price: {price:.6f}
-BE exit: {be_px:.6f}
-Status: SAFE ⚪"
+                        f"⚪ SIGNAL AUTO CLOSED — BREAK EVEN\n\n"
+                        f"🪙 {s.symbol} ({s.market})\n"
+                        f"Price: {price:.6f}\n"
+                        f"BE exit: {be_px:.6f}\n"
+                        f"Status: SAFE ⚪"
                     )
                     try:
                         self.record_trade_close(trade, "BE", be_px, time.time())
