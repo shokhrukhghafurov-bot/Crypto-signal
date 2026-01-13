@@ -93,7 +93,17 @@
     "trade_removed": "✅ Removed from My trades.",
     "trade_removed_fail": "Trade not found.",
     "weekly_title": "🗓️ Weekly (last 4w)",
-    "welcome": "PRO Auto-Scanner Bot\n\n✅ You are subscribed to signals.\nUse the buttons below:"
+    "welcome": "PRO Auto-Scanner Bot\n\n✅ You are subscribed to signals.\nUse the buttons below:",
+    "notify_title": "🔔 Notifications",
+    "notify_status_on": "✅ ON",
+    "notify_status_off": "❌ OFF",
+    "notify_desc_on": "You will receive notifications about new signals.",
+    "notify_desc_off": "Notifications about new signals are disabled.",
+    "btn_notify_on": "✅ Enable notifications",
+    "btn_notify_off": "❌ Disable notifications",
+    "btn_back": "⬅️ Back",
+    "notify_screen": "{title}\n\nStatus: {state}\n\n{desc}",
+    "status_notify": "Notifications: {v}"
   },
   "ru": {
     "access_blocked": "🚫 Доступ запрещён.",
@@ -189,6 +199,16 @@
     "trade_removed": "✅ Удалено из «Мои сделки».",
     "trade_removed_fail": "Сделка не найдена.",
     "weekly_title": "🗓️ По неделям (4н)",
-    "welcome": "PRO Auto-Scanner Bot\n\n✅ Ты подписан на сигналы.\nНажимай кнопки ниже:"
+    "welcome": "PRO Auto-Scanner Bot\n\n✅ Ты подписан на сигналы.\nНажимай кнопки ниже:",
+    "notify_title": "🔔 Уведомления",
+    "notify_status_on": "✅ ВКЛ",
+    "notify_status_off": "❌ ВЫКЛ",
+    "notify_desc_on": "Вы будете получать уведомления о новых сигналах.",
+    "notify_desc_off": "Уведомления о новых сигналах отключены.",
+    "btn_notify_on": "✅ Включить уведомления",
+    "btn_notify_off": "❌ Выключить уведомления",
+    "btn_back": "⬅️ Назад",
+    "notify_screen": "{title}\n\nСтатус: {state}\n\n{desc}",
+    "status_notify": "Уведомления: {v}"
   }
 }
