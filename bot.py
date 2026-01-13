@@ -13,6 +13,8 @@ from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 import datetime as dt
 
+import asyncpg
+
 from backend import Backend, Signal, MacroEvent
 
 load_dotenv()
@@ -43,9 +45,8 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 backend = Backend()
 
-USERS_FILE = Path("users.json")
-USERS: Set[int] = set()
-
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+pool: asyncpg.Pool | None = None
 
 LANG_FILE = Path("langs.json")
 LANG: Dict[int, str] = {}  # user_id -> "ru" | "en"
@@ -105,6 +106,14 @@ I18N = {
         "m_spot": "🟢 Спот live",
         "m_fut": "🔴 Фьючерсы live",
         "m_trades": "📂 Мои сделки",
+        "m_notify": "🔔 Уведомления",
+        "notify_state": "🔔 Уведомления: {state}",
+        "notify_on": "ВКЛ ✅",
+        "notify_off": "ВЫКЛ ❌",
+        "access_blocked": "🚫 Доступ запрещён.",
+        "access_expired": "⏳ Доступ истёк. Обратись к администратору.",
+        "access_no_user": "⏳ Нет доступа. Нажми /start.",
+        "access_unknown": "⏳ Нет доступа.",
         "refresh": "🔄 Обновить",
         "back": "⬅️ Назад",
         "no_live": "Пока нет live-сигнала. Ждём сканер.",
@@ -181,6 +190,14 @@ I18N = {
         "m_spot": "🟢 Spot live",
         "m_fut": "🔴 Futures live",
         "m_trades": "📂 My trades",
+        "m_notify": "🔔 Notifications",
+        "notify_state": "🔔 Notifications: {state}",
+        "notify_on": "ON ✅",
+        "notify_off": "OFF ❌",
+        "access_blocked": "🚫 Access denied.",
+        "access_expired": "⏳ Access expired. Contact admin.",
+        "access_no_user": "⏳ No access. Press /start.",
+        "access_unknown": "⏳ No access.",
         "refresh": "🔄 Refresh",
         "back": "⬅️ Back",
         "no_live": "No live signal yet. Wait for scanner.",
@@ -244,22 +261,6 @@ def tr_action(uid: int, v: str) -> str:
 
 def tr_market(uid: int, market: str) -> str:
     return tr(uid, "lbl_spot") if (market or "").upper().strip() == "SPOT" else tr(uid, "lbl_futures")
-
-def load_users() -> None:
-    global USERS
-    if USERS_FILE.exists():
-        try:
-            data = json.loads(USERS_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, list):
-                USERS = set(int(x) for x in data)
-        except Exception:
-            USERS = set()
-
-def save_users() -> None:
-    try:
-        USERS_FILE.write_text(json.dumps(sorted(USERS)), encoding="utf-8")
-    except Exception:
-        pass
 
 SIGNALS: Dict[int, Signal] = {}
 ORIGINAL_SIGNAL_TEXT: Dict[tuple[int,int], str] = {}  # (uid, signal_id) -> text
@@ -440,6 +441,113 @@ async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: 
         except Exception:
             return
 
+
+# ---------------- DB helpers ----------------
+
+async def init_db() -> None:
+    """Init Postgres pool and ensure required columns exist."""
+    global pool
+    if not DATABASE_URL:
+        # Allow running without Postgres locally, but notifications will be disabled.
+        pool = None
+        return
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with pool.acquire() as conn:
+        # notify_signals flag (shared access + per-bot notification toggle)
+        await conn.execute("""
+        ALTER TABLE users
+          ADD COLUMN IF NOT EXISTS notify_signals BOOLEAN NOT NULL DEFAULT TRUE;
+        """)
+        # safety indexes (if table already exists, IF NOT EXISTS works on PG 9.5+ for indexes)
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
+        except Exception:
+            pass
+
+async def ensure_user(user_id: int) -> None:
+    if not pool or not user_id:
+        return
+    async with pool.acquire() as conn:
+        # Create user row if missing. Do not change existing access fields.
+        await conn.execute(
+            """INSERT INTO users (telegram_id, notify_signals)
+                   VALUES ($1, TRUE)
+                   ON CONFLICT (telegram_id) DO NOTHING;""",
+            user_id,
+        )
+
+async def get_user_row(user_id: int):
+    if not pool or not user_id:
+        return None
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            """SELECT telegram_id, expires_at, is_blocked, notify_signals
+                 FROM users WHERE telegram_id=$1""",
+            user_id,
+        )
+
+def _access_status_from_row(row) -> str:
+    if row is None:
+        return "no_user"
+    try:
+        if bool(row.get("is_blocked")):
+            return "blocked"
+    except Exception:
+        pass
+    expires_at = row.get("expires_at") if row is not None else None
+    if expires_at is None:
+        return "expired"
+    try:
+        now = dt.datetime.now(dt.timezone.utc)
+        if expires_at < now:
+            return "expired"
+    except Exception:
+        return "expired"
+    return "ok"
+
+async def get_access_status(user_id: int) -> str:
+    row = await get_user_row(user_id)
+    return _access_status_from_row(row)
+
+async def get_notify_signals(user_id: int) -> bool:
+    row = await get_user_row(user_id)
+    if row is None:
+        return True
+    v = row.get("notify_signals")
+    return True if v is None else bool(v)
+
+async def toggle_notify_signals(user_id: int) -> bool:
+    if not pool or not user_id:
+        return True
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE users
+                   SET notify_signals = NOT COALESCE(notify_signals, TRUE)
+                 WHERE telegram_id=$1
+             RETURNING notify_signals""",
+            user_id,
+        )
+        if row is None:
+            await ensure_user(user_id)
+            return True
+        return bool(row["notify_signals"])
+
+async def get_broadcast_user_ids() -> List[int]:
+    """Users allowed to receive signals."""
+    if not pool:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT telegram_id
+                 FROM users
+                 WHERE COALESCE(is_blocked, FALSE) = FALSE
+                   AND expires_at IS NOT NULL
+                   AND expires_at > now()
+                   AND COALESCE(notify_signals, TRUE) = TRUE"""
+        )
+        return [int(r["telegram_id"]) for r in rows if r and r.get("telegram_id") is not None]
+
+
 # ---------------- UI helpers ----------------
 
 def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
@@ -449,7 +557,8 @@ def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     kb.button(text=tr(uid, "m_spot"), callback_data="menu:spot")
     kb.button(text=tr(uid, "m_fut"), callback_data="menu:futures")
     kb.button(text=tr(uid, "m_trades"), callback_data="trades:page:0")
-    kb.adjust(2, 2)
+    kb.button(text=tr(uid, "m_notify"), callback_data="menu:notify")
+    kb.adjust(2, 2, 1)
     return kb.as_markup()
 
 
@@ -568,7 +677,8 @@ async def broadcast_signal(sig: Signal) -> None:
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
 
-    for uid in list(USERS):
+    uids = await get_broadcast_user_ids()
+    for uid in uids:
         try:
             ORIGINAL_SIGNAL_TEXT[(uid, sig.signal_id)] = _signal_text(uid, sig)
             kb_u = InlineKeyboardBuilder()
@@ -580,7 +690,8 @@ async def broadcast_signal(sig: Signal) -> None:
 
 async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, float], tz_name: str) -> None:
     w0, w1 = win
-    for uid in list(USERS):
+    uids = await get_broadcast_user_ids()
+    for uid in uids:
         try:
             title = tr(uid, 'macro_title')
             body = f"{ev.name}\n{tr(uid, 'macro_blackout')}: {_fmt_hhmm(w0)} – {_fmt_hhmm(w1)}\n\n"
@@ -594,8 +705,7 @@ async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, f
 async def start(message: types.Message) -> None:
     uid = message.from_user.id if message.from_user else 0
     if uid:
-        USERS.add(uid)
-        save_users()
+        await ensure_user(uid)
 
     # If language not chosen yet, ask first
     if uid and uid not in LANG:
@@ -604,6 +714,12 @@ async def start(message: types.Message) -> None:
         kb.button(text=tr(uid, "btn_en"), callback_data="lang:en")
         kb.adjust(2)
         await message.answer(tr(uid, "choose_lang"), reply_markup=kb.as_markup())
+        return
+
+    # Shared access control (Postgres)
+    access = await get_access_status(uid) if uid else "no_user"
+    if access != "ok":
+        await message.answer(tr(uid, f"access_{access}"), reply_markup=menu_kb(uid))
         return
 
     await message.answer(tr(uid, "welcome"), reply_markup=menu_kb(uid))
@@ -636,6 +752,23 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         action = _nav_back(uid, "status")
 
     await call.answer()
+
+    # Shared access control (Postgres)
+    access = await get_access_status(uid) if uid else "no_user"
+    if action != "status" and action != "notify" and access != "ok":
+        await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+        return
+
+
+    if action == "notify":
+        # Toggle notifications for signals
+        if uid:
+            await ensure_user(uid)
+            new_val = await toggle_notify_signals(uid)
+            state = tr(uid, "notify_on") if new_val else tr(uid, "notify_off")
+            await safe_edit(call.message, tr(uid, "notify_state").format(state=state), menu_kb(uid))
+        return
+
 
     if action == "status":
         # cancel previous auto-refresh task (if any)
@@ -958,7 +1091,7 @@ async def main() -> None:
     import time
     globals()["time"] = time
 
-    load_users()
+    await init_db()
     load_langs()
     asyncio.create_task(backend.track_loop(bot))
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
