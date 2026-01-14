@@ -304,6 +304,10 @@ def _tp1_partial_close_pct(market: str) -> float:
     mk = _market_key(market)
     return float(TP1_PARTIAL_CLOSE_PCT_SPOT if mk == "spot" else TP1_PARTIAL_CLOSE_PCT_FUTURES)
 
+
+# Backward-compat alias (older code referenced _partial_close_pct)
+def _partial_close_pct(market: str) -> float:
+    return _tp1_partial_close_pct(market)
 def _be_after_tp1(market: str) -> bool:
     mk = _market_key(market)
     return bool(BE_AFTER_TP1_SPOT if mk == "spot" else BE_AFTER_TP1_FUTURES)
