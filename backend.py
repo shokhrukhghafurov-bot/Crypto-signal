@@ -485,6 +485,7 @@ class NewsFilter:
                     posts = (data or {}).get("results", []) or []
                     cutoff = now - (NEWS_LOOKBACK_MIN * 60)
                     recent = False
+                    recent_post = None
                     for p in posts[:20]:
                         published_at = p.get("published_at") or p.get("created_at")
                         if not published_at:
@@ -495,11 +496,32 @@ class NewsFilter:
                             continue
                         if ts >= cutoff:
                             recent = True
+                            recent_post = p
                             break
                     if recent:
                         action = NEWS_ACTION if NEWS_ACTION in ("FUTURES_OFF", "PAUSE_ALL") else "FUTURES_OFF"
-                        # remember last block for status
-                        self._last_block = (coin, now + NEWS_LOOKBACK_MIN * 60)
+                        # remember last block for status (reason, until_ts)
+                        reason = coin
+                        try:
+                            if recent_post:
+                                title = (recent_post.get("title") or recent_post.get("slug") or "").strip()
+                                src = None
+                                if isinstance(recent_post.get("source"), dict):
+                                    src = (recent_post["source"].get("title") or recent_post["source"].get("name"))
+                                if not src:
+                                    src = (recent_post.get("domain") or recent_post.get("source") or "")
+                                src = (src or "").strip()
+                                # CryptoPanic 'important' filter is used; keep it in text for clarity
+                                parts = []
+                                if src:
+                                    parts.append(src)
+                                parts.append("Important")
+                                if title:
+                                    parts.append(title)
+                                reason = "CryptoPanic — " + " / ".join(parts)
+                        except Exception:
+                            pass
+                        self._last_block = (reason, now + NEWS_LOOKBACK_MIN * 60)
         except Exception:
             action = "ALLOW"
 
@@ -509,7 +531,7 @@ class NewsFilter:
 # ------------------ Macro calendar (AUTO fetch) ------------------
 
     def last_block_info(self) -> tuple[str, float] | None:
-        """Return (coin, until_ts) for the last time news filter triggered."""
+        """Return (reason, until_ts) for the last time news filter triggered."""
         return self._last_block
 
 class MacroCalendar:
