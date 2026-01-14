@@ -11,6 +11,7 @@ from typing import Dict, List, Set, Tuple
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 import datetime as dt
@@ -49,7 +50,17 @@ def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
 async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
     # Never recurse. Send via bot API.
-    return await bot.send_message(chat_id, text, **kwargs)
+    try:
+        return await bot.send_message(chat_id, text, **kwargs)
+    except TelegramForbiddenError:
+        # User blocked the bot or cannot be contacted
+        await set_user_blocked(chat_id, blocked=True)
+        raise
+    except TelegramBadRequest as e:
+        if "chat not found" in str(e).lower():
+            # Chat does not exist / user never started the bot
+            await set_user_blocked(chat_id, blocked=True)
+        raise
 
 async def safe_edit_text(chat_id: int, message_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
@@ -466,6 +477,19 @@ async def init_db() -> None:
         # safety indexes (if table already exists, IF NOT EXISTS works on PG 9.5+ for indexes)
         try:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            # Do not spam stack traces for common delivery issues
+            msg = str(e).lower()
+            if "chat not found" in msg or "bot was blocked by the user" in msg:
+                logger.warning("Skip uid=%s: %s", uid, e)
+            else:
+                logger.exception("Failed to send message to uid=%s", uid)
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            msg = str(e).lower()
+            if "chat not found" in msg or "bot was blocked by the user" in msg:
+                logger.warning("Skip uid=%s: %s", uid, e)
+            else:
+                logger.exception("Failed to send message to uid=%s", uid)
         except Exception:
             logger.exception("Failed to send message to uid=%s", uid)
 
@@ -480,6 +504,29 @@ async def ensure_user(user_id: int) -> None:
                    ON CONFLICT (telegram_id) DO NOTHING;""",
             user_id,
         )
+
+
+async def set_user_blocked(user_id: int, blocked: bool = True) -> None:
+    """Disable broadcasts for users who blocked the bot / never started it (prevents spammy 'chat not found')."""
+    if not pool or not user_id:
+        return
+    async with pool.acquire() as conn:
+        if blocked:
+            await conn.execute(
+                """UPDATE users
+                      SET is_blocked = TRUE,
+                          notify_signals = FALSE
+                    WHERE telegram_id = $1;""",
+                user_id,
+            )
+        else:
+            await conn.execute(
+                """UPDATE users
+                      SET is_blocked = FALSE
+                    WHERE telegram_id = $1;""",
+                user_id,
+            )
+
 
 async def get_user_row(user_id: int):
     if not pool or not user_id:
@@ -651,6 +698,19 @@ def _signal_text(uid: int, s: Signal) -> str:
         try:
             if float(s.tp2) > 0 and abs(float(s.tp2) - float(s.tp1)) > 1e-12:
                 lines.append(f"TP2: {s.tp2:.6f}")
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            # Do not spam stack traces for common delivery issues
+            msg = str(e).lower()
+            if "chat not found" in msg or "bot was blocked by the user" in msg:
+                logger.warning("Skip uid=%s: %s", uid, e)
+            else:
+                logger.exception("Failed to send message to uid=%s", uid)
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            msg = str(e).lower()
+            if "chat not found" in msg or "bot was blocked by the user" in msg:
+                logger.warning("Skip uid=%s: %s", uid, e)
+            else:
+                logger.exception("Failed to send message to uid=%s", uid)
         except Exception:
             logger.exception("Failed to send message to uid=%s", uid)
         return lines
@@ -880,6 +940,19 @@ async def broadcast_signal(sig: Signal) -> None:
             kb_u = InlineKeyboardBuilder()
             kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
             await safe_send(uid, _signal_text(uid, sig), reply_markup=kb_u.as_markup())
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            # Do not spam stack traces for common delivery issues
+            msg = str(e).lower()
+            if "chat not found" in msg or "bot was blocked by the user" in msg:
+                logger.warning("Skip uid=%s: %s", uid, e)
+            else:
+                logger.exception("Failed to send message to uid=%s", uid)
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            msg = str(e).lower()
+            if "chat not found" in msg or "bot was blocked by the user" in msg:
+                logger.warning("Skip uid=%s: %s", uid, e)
+            else:
+                logger.exception("Failed to send message to uid=%s", uid)
         except Exception:
             logger.exception("Failed to send message to uid=%s", uid)
 
@@ -893,6 +966,19 @@ async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, f
             body = f"{ev.name}\n{tr(uid, 'macro_blackout')}: {_fmt_hhmm(w0)} – {_fmt_hhmm(w1)}\n\n"
             tail = tr(uid, 'macro_tail_fut_off') if action == 'FUTURES_OFF' else tr(uid, 'macro_tail_paused')
             await safe_send(uid, f"{title}\n\n{body}{tail}")
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            # Do not spam stack traces for common delivery issues
+            msg = str(e).lower()
+            if "chat not found" in msg or "bot was blocked by the user" in msg:
+                logger.warning("Skip uid=%s: %s", uid, e)
+            else:
+                logger.exception("Failed to send message to uid=%s", uid)
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            msg = str(e).lower()
+            if "chat not found" in msg or "bot was blocked by the user" in msg:
+                logger.warning("Skip uid=%s: %s", uid, e)
+            else:
+                logger.exception("Failed to send message to uid=%s", uid)
         except Exception:
             logger.exception("Failed to send message to uid=%s", uid)
 
@@ -902,6 +988,7 @@ async def start(message: types.Message) -> None:
     uid = message.from_user.id if message.from_user else 0
     if uid:
         await ensure_user(uid)
+        await set_user_blocked(uid, blocked=False)
 
     # If language not chosen yet, ask first
     if uid and uid not in LANG:
@@ -1101,6 +1188,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 pass
 
         await ensure_user(uid)
+        await set_user_blocked(uid, blocked=False)
 
         # macro info (optional)
         try:
@@ -1173,6 +1261,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
     if action == "notify":
         if uid:
             await ensure_user(uid)
+            await set_user_blocked(uid, blocked=False)
             enabled = await get_notify_signals(uid)
             state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
             desc = tr(uid, "notify_desc_on") if enabled else tr(uid, "notify_desc_off")
@@ -1215,6 +1304,7 @@ async def notify_handler(call: types.CallbackQuery) -> None:
         # Explicit ON/OFF
         value = (parts[2] if len(parts) > 2 else "").lower()
         await ensure_user(uid)
+        await set_user_blocked(uid, blocked=False)
         if value == "on":
             enabled = await set_notify_signals(uid, True)
         elif value == "off":
