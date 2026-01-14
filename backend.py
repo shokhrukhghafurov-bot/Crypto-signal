@@ -19,7 +19,8 @@ import pandas as pd
 import websockets
 from ta.trend import EMAIndicator, MACD, ADXIndicator
 from ta.momentum import RSIIndicator
-from ta.volatility import AverageTrueRange
+from ta.volatility import AverageTrueRange, BollingerBands
+from ta.volume import OnBalanceVolumeIndicator, MFIIndicator
 from zoneinfo import ZoneInfo
 
 import logging
@@ -233,6 +234,9 @@ NEWS_ACTION = os.getenv("NEWS_ACTION", "FUTURES_OFF").strip().upper()  # FUTURES
 
 # Macro filter
 MACRO_FILTER = _env_bool("MACRO_FILTER", False)
+
+# Orderbook filter (optional)
+ORDERBOOK_FILTER = _env_bool("ORDERBOOK_FILTER", False)
 MACRO_ACTION = os.getenv("MACRO_ACTION", "FUTURES_OFF").strip().upper()  # FUTURES_OFF / PAUSE_ALL
 BLACKOUT_BEFORE_MIN = max(0, _env_int("BLACKOUT_BEFORE_MIN", 30))
 BLACKOUT_AFTER_MIN = max(0, _env_int("BLACKOUT_AFTER_MIN", 45))
@@ -790,7 +794,19 @@ class MultiExchangeData:
         raw = await self._get_json(url, params=params)
         return self._df_from_ohlcv(raw, "binance")
 
-    async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+    
+    async def depth_binance(self, symbol: str, limit: int = 20) -> Optional[dict]:
+        """Fetch top-of-book depth from Binance Spot. Returns None on errors.
+        When ORDERBOOK_FILTER is enabled, you can use this to compute imbalance.
+        """
+        url = f"{self.BINANCE_SPOT}/api/v3/depth"
+        params = {"symbol": symbol, "limit": str(limit)}
+        try:
+            data = await self._get_json(url, params=params)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
         interval_map = {"15m":"15", "1h":"60", "4h":"240"}
         itv = interval_map.get(interval, "15")
         url = f"{self.BYBIT}/v5/market/kline"
@@ -823,6 +839,8 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     high = df["high"]
     low = df["low"]
     df = df.copy()
+
+    # Trend / momentum
     df["ema50"] = EMAIndicator(close, window=50).ema_indicator()
     df["ema200"] = EMAIndicator(close, window=200).ema_indicator()
     df["rsi"] = RSIIndicator(close, window=14).rsi()
@@ -831,8 +849,32 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["macd_signal"] = macd.macd_signal()
     df["macd_hist"] = macd.macd_diff()
     df["adx"] = ADXIndicator(high, low, close, window=14).adx()
+
+    # Volatility
     atr = AverageTrueRange(high, low, close, window=14)
     df["atr"] = atr.average_true_range()
+    bb = BollingerBands(close, window=20, window_dev=2)
+    df["bb_mavg"] = bb.bollinger_mavg()
+    df["bb_high"] = bb.bollinger_hband()
+    df["bb_low"] = bb.bollinger_lband()
+
+    # Volume (if present)
+    if "volume" in df.columns:
+        vol = df["volume"]
+        df["vol_sma20"] = vol.rolling(window=20, min_periods=5).mean()
+        try:
+            df["obv"] = OnBalanceVolumeIndicator(close, vol).on_balance_volume()
+        except Exception:
+            df["obv"] = np.nan
+        try:
+            df["mfi"] = MFIIndicator(high, low, close, vol, window=14).money_flow_index()
+        except Exception:
+            df["mfi"] = np.nan
+    else:
+        df["vol_sma20"] = np.nan
+        df["obv"] = np.nan
+        df["mfi"] = np.nan
+
     return df
 
 def _trend_dir(df: pd.DataFrame) -> Optional[str]:
@@ -842,18 +884,52 @@ def _trend_dir(df: pd.DataFrame) -> Optional[str]:
     return "LONG" if row["ema50"] > row["ema200"] else ("SHORT" if row["ema50"] < row["ema200"] else None)
 
 def _trigger_15m(direction: str, df15i: pd.DataFrame) -> bool:
-    if len(df15i) < 5:
+    if len(df15i) < 25:
         return False
     last = df15i.iloc[-1]
     prev = df15i.iloc[-2]
-    if any(pd.isna(last[x]) for x in ("rsi","macd","macd_signal","macd_hist")) or pd.isna(prev["macd_hist"]):
+
+    # Required indicators
+    req = ("rsi","macd","macd_signal","macd_hist","bb_mavg","bb_high","bb_low","vol_sma20","mfi")
+    if any(pd.isna(last.get(x, np.nan)) for x in req) or pd.isna(prev.get("macd_hist", np.nan)):
         return False
-    macd_ok = (last["macd"] > last["macd_signal"] and last["macd_hist"] > prev["macd_hist"]) if direction == "LONG" else (last["macd"] < last["macd_signal"] and last["macd_hist"] < prev["macd_hist"])
+
+    # MACD momentum confirmation
+    if direction == "LONG":
+        macd_ok = (last["macd"] > last["macd_signal"]) and (last["macd_hist"] > prev["macd_hist"])
+    else:
+        macd_ok = (last["macd"] < last["macd_signal"]) and (last["macd_hist"] < prev["macd_hist"])
     if not macd_ok:
         return False
+
+    # RSI cross 50 with guard rails
     if direction == "LONG":
-        return prev["rsi"] < 50 and last["rsi"] >= 50 and last["rsi"] <= 70
-    return prev["rsi"] > 50 and last["rsi"] <= 50 and last["rsi"] >= 30
+        rsi_ok = (prev["rsi"] < 50) and (last["rsi"] >= 50) and (last["rsi"] <= 70)
+    else:
+        rsi_ok = (prev["rsi"] > 50) and (last["rsi"] <= 50) and (last["rsi"] >= 30)
+    if not rsi_ok:
+        return False
+
+    # Bollinger filter: avoid extremes
+    close = float(last["close"])
+    if direction == "LONG":
+        if not (close > float(last["bb_mavg"]) and close < float(last["bb_high"])):
+            return False
+        if float(last["mfi"]) >= 80:
+            return False
+    else:
+        if not (close < float(last["bb_mavg"]) and close > float(last["bb_low"])):
+            return False
+        if float(last["mfi"]) <= 20:
+            return False
+
+    # Volume activity: require above-average volume
+    vol = float(last.get("volume", 0.0) or 0.0)
+    vol_sma = float(last["vol_sma20"])
+    if vol_sma > 0 and vol < vol_sma * 1.05:
+        return False
+
+    return True
 
 def _build_levels(direction: str, entry: float, atr: float) -> Tuple[float, float, float, float]:
     R = max(1e-9, ATR_MULT_SL * atr)
