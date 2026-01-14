@@ -989,7 +989,7 @@ class Backend:
         return await db_store.get_trade_by_user_signal(int(user_id), int(signal_id))
 
     async def get_user_trades(self, user_id: int) -> list[dict]:
-        return await db_store.list_user_trades(int(user_id), include_closed=True, limit=50)
+        return await db_store.list_user_trades(int(user_id), include_closed=False, limit=50)
 
     def get_next_macro(self) -> Optional[Tuple[MacroEvent, Tuple[float, float]]]:
         return self.macro.next_event()
