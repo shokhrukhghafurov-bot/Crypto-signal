@@ -1181,86 +1181,103 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         return
 
     # ---- STATUS (main screen) ----
-        if action == "status":
-            t = STATUS_TASKS.pop(uid, None)
-            if t:
-                try:
-                    t.cancel()
-                except Exception:
-                    pass
-
-            await ensure_user(uid)
-            await set_user_blocked(uid, blocked=False)
-
-            # Macro info (optional)
+    if action == "status":
+        t = STATUS_TASKS.pop(uid, None)
+        if t:
             try:
-                macro = backend.get_next_macro()
+                t.cancel()
             except Exception:
-                macro = None
+                pass
 
-            # Notifications toggle state (per user)
+        await ensure_user(uid)
+        await set_user_blocked(uid, blocked=False)
+
+        # Notifications toggle state (per user)
+        try:
+            enabled = await get_notify_signals(uid)
+        except Exception:
             enabled = False
-            try:
-                enabled = await get_notify_signals(uid)
-            except Exception:
-                enabled = False
 
-            # Scanner/news/macro state (global)
+        # Global states
+        try:
+            scanner_on = bool(getattr(backend, "scanner_running", True))
+        except Exception:
             scanner_on = True
-            try:
-                scanner_on = bool(getattr(backend, "scanner_running", True))
-            except Exception:
-                scanner_on = True
 
-            def _action_to_label(action: str) -> str:
-                a = (action or "").upper()
-                if a == "ALLOW":
-                    return tr(uid, "status_allow")
-                if a == "BLOCK":
-                    return tr(uid, "status_block")
-                return tr(uid, "status_unknown")
+        # News / Macro status with reason + timer
+        try:
+            news_stat = backend.get_news_status()
+        except Exception:
+            news_stat = {"action": "ALLOW", "reason": None, "until_ts": None}
 
-            news_action = ""
-            macro_action = ""
-            try:
-                news_action = getattr(backend, "last_news_action", "ALLOW")
-            except Exception:
-                news_action = "ALLOW"
-            try:
-                macro_action = getattr(backend, "last_macro_action", "ALLOW")
-            except Exception:
-                macro_action = "ALLOW"
+        try:
+            macro_stat = backend.get_macro_status()
+        except Exception:
+            macro_stat = {"action": "ALLOW", "reason": None, "until_ts": None, "event": None, "window": None}
 
-            scanner_state = tr(uid, "status_scanner_on") if scanner_on else tr(uid, "status_scanner_off")
-            news_state = _action_to_label(news_action)
-            macro_state = _action_to_label(macro_action)
-            macro_icon = "🟢" if (macro_action or "").upper() == "ALLOW" else "🔴"
-            notif_state = tr(uid, "status_notif_on") if enabled else tr(uid, "status_notif_off")
+        def _is_allow(action: str) -> bool:
+            return (action or "").upper() == "ALLOW"
 
-            next_macro = tr(uid, "status_next_macro_none")
-            if macro:
-                # show name or fallback
-                name = macro.get("name") or "-"
-                eta = macro.get("eta") or ""
-                # keep short: NAME (ETA) if available
-                next_macro = f"{name} ({eta})" if eta else f"{name}"
+        scanner_state = tr(uid, "status_scanner_on") if scanner_on else tr(uid, "status_scanner_off")
+        news_state = tr(uid, "status_allow") if _is_allow(news_stat.get("action")) else tr(uid, "status_block")
+        macro_action = (macro_stat.get("action") or "ALLOW").upper()
+        macro_state = tr(uid, "status_allow") if _is_allow(macro_action) else tr(uid, "status_block")
+        macro_icon = "🟢" if _is_allow(macro_action) else "🔴"
+        notif_state = tr(uid, "status_notif_on") if enabled else tr(uid, "status_notif_off")
 
-            txt = (
-                tr(uid, "status_title")
-                + "\n\n"
-                + trf(uid, "status_scanner", state=scanner_state)
-                + "\n"
-                + trf(uid, "status_news", state=news_state)
-                + "\n"
-                + trf(uid, "status_macro", icon=macro_icon, state=macro_state)
-                + "\n"
-                + trf(uid, "status_next_macro", next=next_macro)
-                + "\n"
-                + trf(uid, "status_notifications", state=notif_state)
-            )
-            await safe_edit(call.message, txt, menu_kb(uid))
-            return
-    # ---- STATS ----
+        # Next macro (if known)
+        next_macro = tr(uid, "status_next_macro_none")
+        try:
+            nm = backend.get_next_macro()
+        except Exception:
+            nm = None
+        if nm:
+            ev, (w0, w1) = nm
+            name = getattr(ev, "name", None) or getattr(ev, "type", None) or "-"
+            hhmm = _fmt_hhmm(getattr(ev, "start_ts_utc", time.time()))
+            next_macro = f"{name} {hhmm}"
+
+        lines = [
+            tr(uid, "status_title"),
+            "",
+            trf(uid, "status_scanner", state=scanner_state),
+            trf(uid, "status_news", state=news_state),
+        ]
+
+        # News details when blocked
+        if not _is_allow(news_stat.get("action")):
+            reason = news_stat.get("reason")
+            if reason:
+                lines.append(trf(uid, "status_news_reason", reason=reason))
+            until_ts = news_stat.get("until_ts")
+            if until_ts:
+                left = _fmt_countdown(float(until_ts) - time.time())
+                lines.append(trf(uid, "status_news_timer", left=left))
+
+        lines.append(trf(uid, "status_macro", icon=macro_icon, state=macro_state))
+
+        # Macro details when blocked
+        if not _is_allow(macro_action):
+            reason = macro_stat.get("reason")
+            if reason:
+                lines.append(trf(uid, "status_macro_reason", reason=reason))
+            win = macro_stat.get("window")
+            if win and isinstance(win, (tuple, list)) and len(win) == 2:
+                w0, w1 = float(win[0]), float(win[1])
+                lines.append(trf(uid, "status_macro_window", before=_fmt_hhmm(w0), after=_fmt_hhmm(w1)))
+            until_ts = macro_stat.get("until_ts")
+            if until_ts:
+                left = _fmt_countdown(float(until_ts) - time.time())
+                lines.append(trf(uid, "status_macro_timer", left=left))
+
+        lines.append(trf(uid, "status_next_macro", value=next_macro))
+        lines.append(trf(uid, "status_notifications", state=notif_state))
+
+        txt = "\n".join(lines)
+        await safe_edit(call.message, txt, menu_kb(uid))
+        return
+
+# ---- STATS ----
     if action == "stats":
         t = STATUS_TASKS.pop(uid, None)
         if t:
