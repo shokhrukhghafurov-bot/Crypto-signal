@@ -76,10 +76,13 @@ async def ensure_schema() -> None:
           END LOOP;
         END $$;
         """)
-await conn.execute("""
+
+        # Ensure the correct uniqueness: each user can open the same signal independently.
+        await conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_user_signal
         ON trades (user_id, signal_id);
         """)
+
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_trades_user_status
         ON trades (user_id, status);
