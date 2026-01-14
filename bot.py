@@ -1181,49 +1181,85 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         return
 
     # ---- STATUS (main screen) ----
-    if action == "status":
-        t = STATUS_TASKS.pop(uid, None)
-        if t:
+        if action == "status":
+            t = STATUS_TASKS.pop(uid, None)
+            if t:
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+
+            await ensure_user(uid)
+            await set_user_blocked(uid, blocked=False)
+
+            # Macro info (optional)
             try:
-                t.cancel()
+                macro = backend.get_next_macro()
             except Exception:
-                pass
+                macro = None
 
-        await ensure_user(uid)
-        await set_user_blocked(uid, blocked=False)
-
-        # macro info (optional)
-        try:
-            macro = backend.get_next_macro()
-        except Exception:
-            macro = None
-
-        enabled = False
-        try:
-            enabled = await get_notify_signals(uid)
-        except Exception:
-            pass
-
-        macro_line = ""
-        if macro:
+            # Notifications toggle state (per user)
+            enabled = False
             try:
-                macro_line = "\n" + trf(uid, "status_macro_line",
-                                        name=macro.get("name", "-"),
-                                        eta=macro.get("eta", "-"),
-                                        action=macro.get("action", "-"))
+                enabled = await get_notify_signals(uid)
             except Exception:
-                macro_line = ""
+                enabled = False
 
-        notify_line = ""
-        try:
-            notify_line = "\n" + (tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off"))
-        except Exception:
-            notify_line = ""
+            # Scanner/news/macro state (global)
+            scanner_on = True
+            try:
+                scanner_on = bool(getattr(backend, "scanner_running", True))
+            except Exception:
+                scanner_on = True
 
-        txt = tr(uid, "welcome") + macro_line + notify_line
-        await safe_edit(call.message, txt, menu_kb(uid))
-        return
+            def _action_to_label(action: str) -> str:
+                a = (action or "").upper()
+                if a == "ALLOW":
+                    return tr(uid, "status_allow")
+                if a == "BLOCK":
+                    return tr(uid, "status_block")
+                return tr(uid, "status_unknown")
 
+            news_action = ""
+            macro_action = ""
+            try:
+                news_action = getattr(backend, "last_news_action", "ALLOW")
+            except Exception:
+                news_action = "ALLOW"
+            try:
+                macro_action = getattr(backend, "last_macro_action", "ALLOW")
+            except Exception:
+                macro_action = "ALLOW"
+
+            scanner_state = tr(uid, "status_scanner_on") if scanner_on else tr(uid, "status_scanner_off")
+            news_state = _action_to_label(news_action)
+            macro_state = _action_to_label(macro_action)
+            macro_icon = "🟢" if (macro_action or "").upper() == "ALLOW" else "🔴"
+            notif_state = tr(uid, "status_notif_on") if enabled else tr(uid, "status_notif_off")
+
+            next_macro = tr(uid, "status_next_macro_none")
+            if macro:
+                # show name or fallback
+                name = macro.get("name") or "-"
+                eta = macro.get("eta") or ""
+                # keep short: NAME (ETA) if available
+                next_macro = f"{name} ({eta})" if eta else f"{name}"
+
+            txt = (
+                tr(uid, "status_title")
+                + "\n\n"
+                + trf(uid, "status_scanner", state=scanner_state)
+                + "\n"
+                + trf(uid, "status_news", state=news_state)
+                + "\n"
+                + trf(uid, "status_macro", icon=macro_icon, state=macro_state)
+                + "\n"
+                + trf(uid, "status_next_macro", next=next_macro)
+                + "\n"
+                + trf(uid, "status_notifications", state=notif_state)
+            )
+            await safe_edit(call.message, txt, menu_kb(uid))
+            return
     # ---- STATS ----
     if action == "stats":
         t = STATUS_TASKS.pop(uid, None)
