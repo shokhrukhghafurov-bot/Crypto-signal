@@ -424,6 +424,7 @@ def _bump_stats(store: dict, market: str, ts: float, close_reason: str, pnl_pct:
     apply(bw)
 
 @dataclass(frozen=True)
+
 class MacroEvent:
     name: str
     type: str
@@ -435,6 +436,7 @@ class NewsFilter:
     BASE_URL = "https://cryptopanic.com/api/developer/v2/posts/"
 
     def __init__(self) -> None:
+        self._last_block: tuple[str, float] | None = None
         self._cache: Dict[str, Tuple[float, str]] = {}
         self._cache_ttl = 60
         # prevent hanging network calls
@@ -496,6 +498,8 @@ class NewsFilter:
                             break
                     if recent:
                         action = NEWS_ACTION if NEWS_ACTION in ("FUTURES_OFF", "PAUSE_ALL") else "FUTURES_OFF"
+                        # remember last block for status
+                        self._last_block = (coin, now + NEWS_LOOKBACK_MIN * 60)
         except Exception:
             action = "ALLOW"
 
@@ -503,6 +507,11 @@ class NewsFilter:
         return action
 
 # ------------------ Macro calendar (AUTO fetch) ------------------
+
+    def last_block_info(self) -> tuple[str, float] | None:
+        """Return (coin, until_ts) for the last time news filter triggered."""
+        return self._last_block
+
 class MacroCalendar:
     BLS_URL = "https://www.bls.gov/schedule/news_release/current_year.asp"
     FOMC_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
@@ -613,6 +622,10 @@ class MacroCalendar:
                 act = MACRO_ACTION if MACRO_ACTION in ("FUTURES_OFF", "PAUSE_ALL") else "FUTURES_OFF"
                 return act, ev, (w0, w1)
         return "ALLOW", None, None
+
+    def status(self) -> tuple[str, MacroEvent | None, tuple[float, float] | None]:
+        """Return (action, event, (w0,w1)) for current moment."""
+        return self.current_action()
 
     def next_event(self) -> Optional[Tuple[MacroEvent, Tuple[float, float]]]:
         if not self.enabled():
@@ -1004,6 +1017,29 @@ class Backend:
 
     def get_next_macro(self) -> Optional[Tuple[MacroEvent, Tuple[float, float]]]:
         return self.macro.next_event()
+
+    def get_macro_status(self) -> dict:
+        act, ev, win = self.macro.status()
+        until_ts = None
+        reason = None
+        window = None
+        if act != "ALLOW" and ev and win:
+            w0, w1 = win
+            until_ts = w1
+            window = (w0, w1)
+            reason = getattr(ev, "name", None) or getattr(ev, "title", None) or getattr(ev, "type", None)
+        return {"action": act, "event": ev, "window": window, "until_ts": until_ts, "reason": reason}
+
+    def get_news_status(self) -> dict:
+        act = getattr(self, "last_news_action", "ALLOW")
+        info = self.news.last_block_info() if hasattr(self, "news") else None
+        reason = None
+        until_ts = None
+        if info:
+            coin, until = info
+            reason = coin
+            until_ts = until
+        return {"action": act, "reason": reason, "until_ts": until_ts}
 
     
     async def _fetch_rest_price(self, market: str, symbol: str) -> float | None:
