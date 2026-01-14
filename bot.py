@@ -1037,6 +1037,8 @@ async def stats_text(uid: int) -> str:
         parts.append(hint)
 
     return "\n".join(parts).strip()
+
+@dp.callback_query(lambda c: (c.data or "").startswith("menu:"))
 async def menu_handler(call: types.CallbackQuery) -> None:
     action = (call.data or "").split(":", 1)[1]
     uid = call.from_user.id if call.from_user else 0
