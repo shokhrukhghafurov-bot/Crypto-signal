@@ -945,102 +945,98 @@ def _parse_report_lines(lines: list[str]) -> list[tuple[str,int,float,float]]:
     return out
 
 async def stats_text(uid: int) -> str:
+    """Render trading statistics for the user from Postgres (backend-only)."""
     lang = get_lang(uid)
+    tz_name = os.getenv("TZ", "UTC")
 
-    spot_today = await backend.perf_today("SPOT")
-    fut_today = await backend.perf_today("FUTURES")
-    spot_week = await backend.perf_week("SPOT")
-    fut_week = await backend.perf_week("FUTURES")
+    # ---- buckets ----
+    spot_today = await backend.perf_today(uid, "SPOT")
+    fut_today = await backend.perf_today(uid, "FUTURES")
+    spot_week = await backend.perf_week(uid, "SPOT")
+    fut_week = await backend.perf_week(uid, "FUTURES")
 
-    if lang == "en":
-        header = "📈 Trading statistics"
-        today_hdr = "📊 Results — Today"
-        week_hdr = "📊 Results — This week"
-        by_days_hdr = "📅 By days (7d)"
-        by_weeks_hdr = "🗓️ By weeks (4w)"
-        spot_title = "🟢 SPOT"
-        fut_title = "🔴 FUTURES"
-        no_closed = "no closed trades"
-        hint = "Hint: statistics appear only after a trade is closed (TP2 / SL / BE / manual)."
-        fmt_block = _fmt_stats_block_en
-    else:
-        header = "📈 Торговая статистика"
-        today_hdr = "📊 Результаты — Сегодня"
-        week_hdr = "📊 Результаты — На этой неделе"
-        by_days_hdr = "📅 По дням (7д)"
-        by_weeks_hdr = "🗓️ По неделям (4н)"
-        spot_title = "🟢 СПОТ"
-        fut_title = "🔴 ФЬЮЧЕРСЫ"
-        no_closed = "нет закрытых сделок"
-        hint = "Подсказка: статистика появляется только после закрытия сделки (TP2 / SL / BE / вручную)."
-        fmt_block = _fmt_stats_block_ru
+    spot_days = await backend.report_daily(uid, "SPOT", 7, tz=tz_name)
+    fut_days = await backend.report_daily(uid, "FUTURES", 7, tz=tz_name)
 
-    parts = [header, "", today_hdr,
-             fmt_block(spot_title, spot_today), "",
-             fmt_block(fut_title, fut_today), "",
-             week_hdr,
-             fmt_block(spot_title, spot_week), "",
-             fmt_block(fut_title, fut_week), ""]
+    spot_weeks = await backend.report_weekly(uid, "SPOT", 4, tz=tz_name)
+    fut_weeks = await backend.report_weekly(uid, "FUTURES", 4, tz=tz_name)
 
-    # By days
-    parts.append(by_days_hdr)
-    spot_days = _parse_report_lines(backend.report_daily("SPOT", days=7))
-    fut_days = _parse_report_lines(backend.report_daily("FUTURES", days=7))
+    # ---- formatting helpers ----
+    def block_title(market: str) -> str:
+        if market == "SPOT":
+            return f"🟢 {tr(uid, 'lbl_spot')}"
+        return f"🔴 {tr(uid, 'lbl_futures')}"
+
+    def fmt_block(title: str, b: dict) -> str:
+        if lang == "en":
+            return _fmt_stats_block_en(title, b)
+        return _fmt_stats_block_ru(title, b)
+
+    def fmt_lines(rows: list[dict]) -> list[str]:
+        out: list[str] = []
+        for r in rows:
+            # day is date, week is text label
+            key = r.get("day")
+            if key is not None:
+                k = key.isoformat() if hasattr(key, "isoformat") else str(key)
+            else:
+                k = str(r.get("week"))
+            trades = int(r.get("trades", 0) or 0)
+            wins = int(r.get("wins", 0) or 0)
+            pnl = float(r.get("sum_pnl_pct", 0.0) or 0.0)
+            wr = (wins / trades * 100.0) if trades else 0.0
+            if lang == "en":
+                out.append(f"{k}: trades {trades} | winrate {wr:.1f}% | pnl {pnl:+.2f}%")
+            else:
+                out.append(f"{k}: Сделки {trades} | Победы {wr:.1f}% | PnL {pnl:+.2f}%")
+        return out
+
+    no_closed = tr(uid, "no_closed")
+
+    parts: list[str] = []
+    parts.append(tr(uid, "stats_title"))
+    parts.append("")
+    parts.append(tr(uid, "perf_today"))
+    parts.append(fmt_block(block_title("SPOT"), spot_today))
+    parts.append("")
+    parts.append(fmt_block(block_title("FUTURES"), fut_today))
+    parts.append("")
+    parts.append(tr(uid, "perf_week"))
+    parts.append(fmt_block(block_title("SPOT"), spot_week))
+    parts.append("")
+    parts.append(fmt_block(block_title("FUTURES"), fut_week))
+    parts.append("")
+    parts.append(tr(uid, "daily_title"))
+    parts.append(f"🟢 {tr(uid,'lbl_spot')}:")
     if not spot_days:
-        parts.append(f"{spot_title}:\n{no_closed}")
+        parts.append(no_closed)
     else:
-        lines = []
-        for k,t,wr,pnl in spot_days:
-            if lang == "en":
-                lines.append(f"{k}: trades {t} | winrate {wr:.1f}% | pnl {pnl:+.2f}%")
-            else:
-                lines.append(f"{k}: Сделки {t} | Победы {wr:.1f}% | PnL {pnl:+.2f}%")
-        parts.append(f"{spot_title}:\n" + "\n".join(lines))
+        parts.extend(fmt_lines(spot_days))
     parts.append("")
+    parts.append(f"🔴 {tr(uid,'lbl_futures')}:")
     if not fut_days:
-        parts.append(f"{fut_title}:\n{no_closed}")
+        parts.append(no_closed)
     else:
-        lines = []
-        for k,t,wr,pnl in fut_days:
-            if lang == "en":
-                lines.append(f"{k}: trades {t} | winrate {wr:.1f}% | pnl {pnl:+.2f}%")
-            else:
-                lines.append(f"{k}: Сделки {t} | Победы {wr:.1f}% | PnL {pnl:+.2f}%")
-        parts.append(f"{fut_title}:\n" + "\n".join(lines))
+        parts.extend(fmt_lines(fut_days))
     parts.append("")
-
-    # By weeks
-    parts.append(by_weeks_hdr)
-    spot_weeks = _parse_report_lines(backend.report_weekly("SPOT", weeks=4))
-    fut_weeks = _parse_report_lines(backend.report_weekly("FUTURES", weeks=4))
+    parts.append(tr(uid, "weekly_title"))
+    parts.append(f"🟢 {tr(uid,'lbl_spot')}:")
     if not spot_weeks:
-        parts.append(f"{spot_title}:\n{no_closed}")
+        parts.append(no_closed)
     else:
-        lines = []
-        for k,t,wr,pnl in spot_weeks:
-            if lang == "en":
-                lines.append(f"{k}: trades {t} | winrate {wr:.1f}% | pnl {pnl:+.2f}%")
-            else:
-                lines.append(f"{k}: Сделки {t} | Победы {wr:.1f}% | PnL {pnl:+.2f}%")
-        parts.append(f"{spot_title}:\n" + "\n".join(lines))
+        parts.extend(fmt_lines(spot_weeks))
     parts.append("")
+    parts.append(f"🔴 {tr(uid,'lbl_futures')}:")
     if not fut_weeks:
-        parts.append(f"{fut_title}:\n{no_closed}")
+        parts.append(no_closed)
     else:
-        lines = []
-        for k,t,wr,pnl in fut_weeks:
-            if lang == "en":
-                lines.append(f"{k}: trades {t} | winrate {wr:.1f}% | pnl {pnl:+.2f}%")
-            else:
-                lines.append(f"{k}: Сделки {t} | Победы {wr:.1f}% | PnL {pnl:+.2f}%")
-        parts.append(f"{fut_title}:\n" + "\n".join(lines))
+        parts.extend(fmt_lines(fut_weeks))
     parts.append("")
-    parts.append(hint)
+    hint = tr(uid, "stats_hint") if "stats_hint" in I18N.get(lang, {}) else ""
+    if hint:
+        parts.append(hint)
 
     return "\n".join(parts).strip()
-
-
-@dp.callback_query(lambda c: (c.data or "").startswith("menu:"))
 async def menu_handler(call: types.CallbackQuery) -> None:
     action = (call.data or "").split(":", 1)[1]
     uid = call.from_user.id if call.from_user else 0
