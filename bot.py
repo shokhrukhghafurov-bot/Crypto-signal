@@ -908,6 +908,13 @@ async def broadcast_signal(sig: Signal) -> None:
         return
     _SENT_SIG_CACHE[sig_key] = now
 
+    # Assign a globally unique signal_id from DB sequence (survives restarts).
+    # This prevents collisions that cause "already opened" for unrelated signals after container restart.
+    try:
+        sig.signal_id = await db_store.next_signal_id()
+    except Exception as e:
+        # Fallback to existing id if DB is unavailable; still log for visibility.
+        logger.error("Failed to allocate signal_id from DB sequence: %s", e)
     # Save as last live signal for menu buttons
     try:
         LAST_SIGNAL_BY_MARKET["SPOT" if sig.market == "SPOT" else "FUTURES"] = sig
