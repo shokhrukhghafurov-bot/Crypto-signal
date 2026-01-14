@@ -806,7 +806,7 @@ class MultiExchangeData:
             return data if isinstance(data, dict) else None
         except Exception:
             return None
-async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+    async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
         interval_map = {"15m":"15", "1h":"60", "4h":"240"}
         itv = interval_map.get(interval, "15")
         url = f"{self.BYBIT}/v5/market/kline"
@@ -835,47 +835,93 @@ async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd
 
 # ------------------ Indicators / engine ------------------
 def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
+    """
+    Add core indicators used by the engine.
+    Expected columns: open, high, low, close, (optional) volume.
+    """
     df = df.copy()
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
 
-    # Trend / momentum
-    df["ema50"] = EMAIndicator(close, window=50).ema_indicator()
-    df["ema200"] = EMAIndicator(close, window=200).ema_indicator()
-    df["rsi"] = RSIIndicator(close, window=14).rsi()
-    macd = MACD(close, window_slow=26, window_fast=12, window_sign=9)
-    df["macd"] = macd.macd()
-    df["macd_signal"] = macd.macd_signal()
-    df["macd_hist"] = macd.macd_diff()
-    df["adx"] = ADXIndicator(high, low, close, window=14).adx()
+    # Trend
+    try:
+        df["ema50"] = EMAIndicator(close, window=50).ema_indicator()
+        df["ema200"] = EMAIndicator(close, window=200).ema_indicator()
+    except Exception:
+        df["ema50"] = np.nan
+        df["ema200"] = np.nan
+
+    # Momentum
+    try:
+        df["rsi"] = RSIIndicator(close, window=14).rsi()
+    except Exception:
+        df["rsi"] = np.nan
+
+    try:
+        macd = MACD(close, window_slow=26, window_fast=12, window_sign=9)
+        df["macd"] = macd.macd()
+        df["macd_signal"] = macd.macd_signal()
+        df["macd_hist"] = macd.macd_diff()
+    except Exception:
+        df["macd"] = np.nan
+        df["macd_signal"] = np.nan
+        df["macd_hist"] = np.nan
+
+    # Trend strength
+    try:
+        df["adx"] = ADXIndicator(high, low, close, window=14).adx()
+    except Exception:
+        df["adx"] = np.nan
 
     # Volatility
-    atr = AverageTrueRange(high, low, close, window=14)
-    df["atr"] = atr.average_true_range()
-    bb = BollingerBands(close, window=20, window_dev=2)
-    df["bb_mavg"] = bb.bollinger_mavg()
-    df["bb_high"] = bb.bollinger_hband()
-    df["bb_low"] = bb.bollinger_lband()
+    try:
+        df["atr"] = AverageTrueRange(high, low, close, window=14).average_true_range()
+    except Exception:
+        df["atr"] = np.nan
 
-    # Volume (if present)
+    # Bollinger Bands
+    try:
+        bb = BollingerBands(close, window=20, window_dev=2)
+        df["bb_mavg"] = bb.bollinger_mavg()
+        df["bb_high"] = bb.bollinger_hband()
+        df["bb_low"] = bb.bollinger_lband()
+    except Exception:
+        df["bb_mavg"] = np.nan
+        df["bb_high"] = np.nan
+        df["bb_low"] = np.nan
+
+    # Volume-based (optional)
     if "volume" in df.columns:
-        vol = df["volume"]
+        vol = df["volume"].astype(float).fillna(0.0)
         df["vol_sma20"] = vol.rolling(window=20, min_periods=5).mean()
+
         try:
             df["obv"] = OnBalanceVolumeIndicator(close, vol).on_balance_volume()
         except Exception:
             df["obv"] = np.nan
+
         try:
             df["mfi"] = MFIIndicator(high, low, close, vol, window=14).money_flow_index()
         except Exception:
             df["mfi"] = np.nan
+
+        # VWAP (cumulative)
+        try:
+            tp = (high + low + close) / 3.0
+            pv = tp * vol
+            cum_vol = vol.cumsum().replace(0, np.nan)
+            df["vwap"] = pv.cumsum() / cum_vol
+        except Exception:
+            df["vwap"] = np.nan
     else:
         df["vol_sma20"] = np.nan
         df["obv"] = np.nan
         df["mfi"] = np.nan
+        df["vwap"] = np.nan
 
     return df
+
 
 def _trend_dir(df: pd.DataFrame) -> Optional[str]:
     row = df.iloc[-1]
@@ -979,8 +1025,138 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
         return None
     atr_pct = (atr / entry) * 100.0 if entry > 0 else 0.0
     sl, tp1, tp2, rr = _build_levels(dir1, entry, atr)
-    conf = _confidence(adx4, adx1, float(last15["rsi"]), atr_pct)
-    return {"direction": dir1, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "rr": rr, "confidence": conf, "adx1": adx1, "atr_pct": atr_pct}
+
+    # --- Advanced TA snapshot (for display + scoring) ---
+    rsi15 = float(last15.get("rsi", np.nan))
+    macd_hist15 = float(last15.get("macd_hist", np.nan))
+    bb_low = float(last15.get("bb_low", np.nan))
+    bb_mid = float(last15.get("bb_mavg", np.nan))
+    bb_high = float(last15.get("bb_high", np.nan))
+    vol = float(last15.get("volume", 0.0) or 0.0)
+    vol_sma = float(last15.get("vol_sma20", np.nan))
+    vol_rel = (vol / vol_sma) if (vol_sma and not np.isnan(vol_sma) and vol_sma > 0) else np.nan
+
+    pattern, pat_bias = _candle_pattern(df15i)
+    support, resistance = _nearest_levels(df1hi, lookback=180, swing=3)
+
+    vwap15 = float(last15.get("vwap", np.nan))
+    vwap_bias = "—"
+    try:
+        if not np.isnan(vwap15):
+            vwap_bias = "above" if entry >= vwap15 else "below"
+    except Exception:
+        pass
+
+    bb_pos = "—"
+    try:
+        if not (np.isnan(bb_low) or np.isnan(bb_mid) or np.isnan(bb_high)):
+            if entry >= bb_high:
+                bb_pos = "upper"
+            elif entry <= bb_low:
+                bb_pos = "lower"
+            else:
+                bb_pos = "mid"
+    except Exception:
+        pass
+
+    # --- Score (0..100) used as confidence ---
+    score = 50
+    # trend already aligned on 1h/4h, reward stronger trend
+    if not np.isnan(adx1) and adx1 >= 25:
+        score += 10
+    if not np.isnan(adx4) and adx4 >= 25:
+        score += 10
+
+    # momentum confirmation
+    if not np.isnan(macd_hist15):
+        if dir1 == "LONG" and macd_hist15 > 0:
+            score += 10
+        if dir1 == "SHORT" and macd_hist15 < 0:
+            score += 10
+
+    # RSI quality zone
+    if not np.isnan(rsi15):
+        if dir1 == "LONG" and (50 <= rsi15 <= 70):
+            score += 8
+        if dir1 == "SHORT" and (30 <= rsi15 <= 50):
+            score += 8
+
+    # Bollinger position (avoid extremes; mid/upper for long, mid/lower for short)
+    if bb_pos != "—":
+        if dir1 == "LONG" and bb_pos in ("mid", "upper"):
+            score += 4
+        if dir1 == "SHORT" and bb_pos in ("mid", "lower"):
+            score += 4
+
+    # volume activity
+    if not np.isnan(vol_rel):
+        if vol_rel >= 1.05:
+            score += 6
+        elif vol_rel >= 0.95:
+            score += 3
+
+    # candle pattern bias
+    if pat_bias != 0:
+        if dir1 == "LONG" and pat_bias > 0:
+            score += 6
+        if dir1 == "SHORT" and pat_bias < 0:
+            score += 6
+
+    # proximity to support/resistance (better R:R)
+    try:
+        if support and dir1 == "LONG":
+            dist = abs(entry - support) / max(1e-12, entry)
+            if dist <= 0.006:
+                score += 4
+        if resistance and dir1 == "SHORT":
+            dist = abs(resistance - entry) / max(1e-12, entry)
+            if dist <= 0.006:
+                score += 4
+    except Exception:
+        pass
+
+    # VWAP bias
+    if vwap_bias != "—":
+        if dir1 == "LONG" and vwap_bias == "above":
+            score += 2
+        if dir1 == "SHORT" and vwap_bias == "below":
+            score += 2
+
+    score = int(max(0, min(100, score)))
+
+    # Keep legacy confidence too (for logs/back-compat)
+    conf_legacy = _confidence(adx4, adx1, rsi15 if not np.isnan(rsi15) else 50.0, atr_pct)
+
+    ta = {
+        "trend": f"{dir4}/{dir1}",
+        "rsi15": rsi15,
+        "macd_hist15": macd_hist15,
+        "adx1": adx1,
+        "adx4": adx4,
+        "atr_pct": atr_pct,
+        "bb_pos": bb_pos,
+        "vol_rel": vol_rel,
+        "pattern": pattern,
+        "support": support,
+        "resistance": resistance,
+        "vwap_bias": vwap_bias,
+        "score": score,
+    }
+
+    return {
+        "direction": dir1,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "rr": rr,
+        "confidence": score,
+        "confidence_legacy": int(conf_legacy),
+        "adx1": adx1,
+        "atr_pct": atr_pct,
+        "ta": ta,
+        "ta_block": _fmt_ta_block(ta),
+    }
 
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
     return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
@@ -1414,6 +1590,16 @@ class Backend:
 
                         market = choose_market(float(np.nanmax([s[1]["adx1"] for s in supporters])), float(np.nanmax([s[1]["atr_pct"] for s in supporters])))
                         risk_notes = []
+
+                        # Add TA summary (real indicators) to the signal card
+                        try:
+                            best_supporter = max(supporters, key=lambda s: int(s[1].get("confidence", 0)))
+                            ta_block = str(best_supporter[1].get("ta_block", "") or "").strip()
+                            if ta_block:
+                                risk_notes.append(ta_block)
+                        except Exception:
+                            pass
+
 
                         if news_act == "FUTURES_OFF" and market == "FUTURES":
                             market = "SPOT"
