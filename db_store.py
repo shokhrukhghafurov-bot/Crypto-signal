@@ -22,6 +22,11 @@ async def ensure_schema() -> None:
     """
     pool = get_pool()
     async with pool.acquire() as conn:
+        # Persistent sequence for bot callback signal_id (survives restarts)
+        await conn.execute("""
+        CREATE SEQUENCE IF NOT EXISTS signal_seq START 1;
+        """)
+
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS trades (
           id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -106,6 +111,13 @@ async def ensure_schema() -> None:
         CREATE INDEX IF NOT EXISTS idx_trade_events_trade_time
         ON trade_events (trade_id, created_at DESC);
         """)
+
+async def next_signal_id() -> int:
+    """Return a globally unique signal_id for bot callbacks (Postgres sequence)."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        v = await conn.fetchval("SELECT nextval('signal_seq');")
+        return int(v) if v is not None else int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
 
 async def open_trade_once(
     *,
