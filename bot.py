@@ -1193,10 +1193,12 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         await set_user_blocked(uid, blocked=False)
 
         # Notifications toggle state (per user)
+        enabled = None
         try:
-            enabled = await get_notify_signals(uid)
+            import asyncio as _asyncio
+            enabled = await _asyncio.wait_for(get_notify_signals(uid), timeout=2.5)
         except Exception:
-            enabled = False
+            enabled = None
 
         # Global states
         try:
@@ -1223,7 +1225,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         macro_action = (macro_stat.get("action") or "ALLOW").upper()
         macro_state = tr(uid, "status_allow") if _is_allow(macro_action) else tr(uid, "status_block")
         macro_icon = "🟢" if _is_allow(macro_action) else "🔴"
-        notif_state = tr(uid, "status_notif_on") if enabled else tr(uid, "status_notif_off")
+        notif_state = (tr(uid, "status_notif_on") if enabled is True else (tr(uid, "status_notif_off") if enabled is False else tr(uid, "status_unknown")))
 
         # Next macro (if known)
         next_macro = tr(uid, "status_next_macro_none")
