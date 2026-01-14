@@ -112,7 +112,15 @@
     "open_futures_en": "📩 OPEN — trade opened\n\n🔴 FUTURES {side} | {symbol}\nExchanges: {exchanges}\nLeverage: x{lev}\n\n📈 Entry: {entry}\n🎯 TP1: {tp1}\n🎯 TP2: {tp2}\n🛑 SL: {sl}\n\n📊 Risk/Reward: 1:{rr}\n💰 Est. profit: ~{profit}%\n⏱ Time: {time}\n\n#{tag} #{side}",
     "no_live_signals": "No live signals yet. Wait for the next signal.",
     "stats_screen": "📈 Statistics\\n\\n🟢 SPOT today: {spot_today}\\n🔴 FUTURES today: {fut_today}\\n\\n🗓 SPOT week: {spot_week}\\n🗓 FUTURES week: {fut_week}",
-    "status_macro_line": "🕒 Next event: {name} — {eta} ({action})"
+    "status_macro_line": "🕒 Next event: {name} — {eta} ({action})",
+    "sig_too_late_toast": "⛔️ Too late",
+    "sig_too_late_reason_tp2": "TP2 already hit (signal completed)",
+    "sig_too_late_reason_tp1": "TP1 already hit (entry is no longer valid)",
+    "sig_too_late_reason_sl": "SL already hit (stop-loss)",
+    "sig_too_late_reason_time": "signal expired by time",
+    "sig_too_late_reason_error": "signal is no longer available",
+    "sig_too_late_body": "⛔️ Too late\n\n{market_emoji} {market} | {symbol}\n🕒 Signal: {time}\n\n📌 Reason: {reason}\n💱 Current price: {price}\n\nLevels: TP1 {tp1} • TP2 {tp2} • SL {sl}\n\nTip: wait for a new signal in Spot live / Futures live.",
+    "sig_expired_note": "⛔️ Too late — the signal has already played out.\nReason: {reason}\nCurrent price: {price}\nButton disabled."
   },
   "ru": {
     "access_blocked": "🚫 Доступ запрещён.",
@@ -227,6 +235,14 @@
     "open_futures_ru": "📩 OPEN — сигнал открыт\n\n🔴 FUTURES {side} | {symbol}\nБиржи: {exchanges}\nПлечо: x{lev}\n\n📈 Вход: {entry}\n🎯 TP1: {tp1}\n🎯 TP2: {tp2}\n🛑 SL: {sl}\n\n📊 Risk/Reward: 1:{rr}\n💰 Ожид. прибыль: ~{profit}%\n⏱ Время: {time}\n\n#{tag} #{side}",
     "no_live_signals": "Пока нет live-сигналов. Подожди следующий сигнал.",
     "stats_screen": "📈 Статистика\\n\\n🟢 SPOT сегодня: {spot_today}\\n🔴 FUTURES сегодня: {fut_today}\\n\\n🗓 SPOT неделя: {spot_week}\\n🗓 FUTURES неделя: {fut_week}",
-    "status_macro_line": "🕒 Следующее событие: {name} — {eta} ({action})"
+    "status_macro_line": "🕒 Следующее событие: {name} — {eta} ({action})",
+    "sig_too_late_toast": "⛔️ Уже поздно",
+    "sig_too_late_reason_tp2": "достигнут TP2 (сигнал уже отработал)",
+    "sig_too_late_reason_tp1": "достигнут TP1 (вход уже не актуален)",
+    "sig_too_late_reason_sl": "сработал SL (стоп‑лосс)",
+    "sig_too_late_reason_time": "сигнал устарел по времени",
+    "sig_too_late_reason_error": "сигнал больше не доступен",
+    "sig_too_late_body": "⛔️ Слишком поздно\n\n{market_emoji} {market} | {symbol}\n🕒 Сигнал: {time}\n\n📌 Причина: {reason}\n💱 Текущая цена: {price}\n\nУровни: TP1 {tp1} • TP2 {tp2} • SL {sl}\n\nПодсказка: дождись нового сигнала в «Spot live / Futures live».",
+    "sig_expired_note": "⛔️ Уже поздно — сигнал отработал.\nПричина: {reason}\nТекущая цена: {price}\nКнопка отключена."
   }
 }
