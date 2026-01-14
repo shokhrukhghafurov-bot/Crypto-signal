@@ -858,6 +858,9 @@ async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, f
         except Exception:
             logger.exception("Failed to ensure DB indexes")
 
+# Backward-compat alias
+broadcast_macro = broadcast_macro_alert
+
 # ---------------- commands ----------------
 @dp.message(Command("start"))
 async def start(message: types.Message) -> None:
@@ -1207,7 +1210,7 @@ async def main() -> None:
         logger.exception("DB init failed")
     # Start background loops
     asyncio.create_task(backend.track_loop(bot))
-    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro))
+    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
     # Polling
     await dp.start_polling(bot)
 
