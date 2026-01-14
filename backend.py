@@ -659,9 +659,10 @@ class PriceFeed:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
 
-    def mock_price(self, market: str, symbol: str) -> float:
+    def mock_price(self, market: str, symbol: str, base: float | None = None) -> float:
         key = ("MOCK:" + market.upper(), symbol.upper())
-        price = self._prices.get(key, random.uniform(100, 50000))
+        seed = (float(base) if base is not None and base > 0 else None)
+        price = self._prices.get(key, seed if seed is not None else random.uniform(100, 50000))
         price *= random.uniform(0.996, 1.004)
         self._prices[key] = price
         return price
@@ -993,13 +994,49 @@ class Backend:
     def get_next_macro(self) -> Optional[Tuple[MacroEvent, Tuple[float, float]]]:
         return self.macro.next_event()
 
-    async def _get_price(self, signal: Signal) -> float:
+    
+    async def _fetch_rest_price(self, market: str, symbol: str) -> float | None:
+        """REST fallback for price when websocket hasn't produced a tick yet."""
+        m = (market or "FUTURES").upper()
+        sym = (symbol or "").upper()
+        if not sym:
+            return None
+        url = "https://api.binance.com/api/v3/ticker/price" if m == "SPOT" else "https://fapi.binance.com/fapi/v1/ticker/price"
+        try:
+            timeout = aiohttp.ClientTimeout(total=6)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(url, params={"symbol": sym}) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json()
+            p = data.get("price")
+            return float(p) if p is not None else None
+        except Exception:
+            return None
+
+async def _get_price(self, signal: Signal) -> float:
         market = (signal.market or "FUTURES").upper()
+        base = float(getattr(signal, "entry", 0) or 0) or None
+
+        # Mock mode: keep prices around entry to avoid nonsense.
         if not USE_REAL_PRICE:
-            return self.feed.mock_price(market, signal.symbol)
+            return self.feed.mock_price(market, signal.symbol, base=base)
+
+        # Real mode: websocket first, REST fallback, then (last resort) base/ mock near base.
         await self.feed.ensure_stream(market, signal.symbol)
         latest = self.feed.get_latest(market, signal.symbol)
-        return latest if latest is not None else self.feed.mock_price(market, signal.symbol)
+        if latest is not None:
+            return float(latest)
+
+        rest = await self._fetch_rest_price(market, signal.symbol)
+        if rest is not None and rest > 0:
+            self.feed._set_latest(market, signal.symbol, float(rest))
+            return float(rest)
+
+        # Last resort: keep near entry (never random huge).
+        if base is not None and base > 0:
+            return self.feed.mock_price(market, signal.symbol, base=base)
+        return self.feed.mock_price(market, signal.symbol, base=None)
 
     async def check_signal_openable(self, signal: Signal) -> tuple[bool, str, float]:
         """Return (allowed, reason_code, current_price).
