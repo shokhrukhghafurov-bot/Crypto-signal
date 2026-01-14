@@ -24,6 +24,8 @@ from zoneinfo import ZoneInfo
 
 import logging
 
+import db_store
+
 logger = logging.getLogger("crypto-signal")
 
 # --- i18n template safety guard (prevents leaking {placeholders} to users) ---
@@ -866,8 +868,7 @@ class Backend:
         self.feed = PriceFeed()
         self.news = NewsFilter()
         self.macro = MacroCalendar()
-
-        self.trades: Dict[Tuple[int, int], UserTrade] = {}
+        # Trades are stored in PostgreSQL (db_store)
         self._last_signal_ts: Dict[str, float] = {}
         self._signal_seq = 1
 
@@ -895,20 +896,37 @@ class Backend:
     def mark_emitted(self, symbol: str) -> None:
         self._last_signal_ts[symbol.upper()] = time.time()
 
-    def open_trade(self, user_id: int, signal: Signal) -> None:
-        self.trades[(user_id, signal.signal_id)] = UserTrade(user_id=user_id, signal=signal, opened_ts=time.time())
+    async def open_trade(self, user_id: int, signal: Signal, orig_text: str) -> bool:
+        """Persist trade in Postgres. Returns False if already opened."""
+        inserted, _tid = await db_store.open_trade_once(
+            user_id=int(user_id),
+            signal_id=int(signal.signal_id),
+            market=(signal.market or "FUTURES").upper(),
+            symbol=signal.symbol,
+            side=(signal.direction or "LONG").upper(),
+            entry=float(signal.entry or 0.0),
+            tp1=float(signal.tp1) if signal.tp1 is not None else None,
+            tp2=float(signal.tp2) if signal.tp2 is not None else None,
+            sl=float(signal.sl) if signal.sl is not None else None,
+            orig_text=orig_text or "",
+        )
+        return bool(inserted)
 
-    def remove_trade(self, user_id: int, signal_id: int) -> bool:
-        t = self.trades.pop((user_id, signal_id), None)
-        if t is None:
+
+    async def remove_trade(self, user_id: int, signal_id: int) -> bool:
+        row = await db_store.get_trade_by_user_signal(int(user_id), int(signal_id))
+        if not row:
             return False
-        # manual close: record stats using last known price (or entry)
-        close_price = float(t.last_price or t.signal.entry or 0.0)
+        trade_id = int(row["id"])
+        # manual close (keep last known price if present)
+        close_price = float(row.get("entry") or 0.0)
         try:
-            self.record_trade_close(t, "CLOSED", close_price, time.time())
+            await db_store.close_trade(trade_id, status="CLOSED", price=close_price, pnl_total_pct=float(row.get("pnl_total_pct") or 0.0))
         except Exception:
-            pass
+            # best effort
+            await db_store.close_trade(trade_id, status="CLOSED")
         return True
+
 
     # ---------------- trade stats helpers ----------------
     def _load_trade_stats(self) -> None:
@@ -947,53 +965,58 @@ class Backend:
                 b[k] = v
         return b
 
-    def perf_today(self, market: str) -> dict:
-        key = _day_key_tz(time.time())
-        return self._bucket(market, "days", key)
+    async def perf_today(self, market: str) -> dict:
+        now = dt.datetime.now(dt.timezone.utc)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + dt.timedelta(days=1)
+        return await db_store.perf_bucket((market or "FUTURES").upper(), since=start, until=end)
 
-    def perf_week(self, market: str) -> dict:
-        key = _week_key_tz(time.time())
-        return self._bucket(market, "weeks", key)
+    async def perf_week(self, market: str) -> dict:
+        now = dt.datetime.now(dt.timezone.utc)
+        # ISO week start (Monday)
+        start = (now - dt.timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + dt.timedelta(days=7)
+        return await db_store.perf_bucket((market or "FUTURES").upper(), since=start, until=end)
 
-    def report_daily(self, market: str, days: int = 7) -> list[str]:
-        now = dt.datetime.now(tz=ZoneInfo(TZ_NAME)).date()
+    async def report_daily(self, market: str, days: int = 7) -> list[str]:
+        return await db_store.daily_report((market or "FUTURES").upper(), days=int(days))
+
+    async def report_weekly(self, market: str, weeks: int = 4) -> list[str]:
+        # Simple weekly aggregation can be added later; for now return last 4 weeks header lines from daily data.
+        # Keeping structure stable: bot will print 'нет закрытых сделок' if list is empty.
+        pool = db_store.get_pool()
+        mkt = (market or "FUTURES").upper()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                '''
+                SELECT to_char(date_trunc('week', closed_at), 'IYYY-"W"IW') AS wk,
+                       COUNT(*)::int AS trades,
+                       SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END)::int AS wins,
+                       COALESCE(SUM(CASE WHEN pnl_total_pct IS NULL THEN 0 ELSE pnl_total_pct END), 0)::float AS pnl
+                FROM trades
+                WHERE market=$1 AND status IN ('WIN','LOSS','BE','CLOSED')
+                  AND closed_at >= (NOW() - ($2::int || ' weeks')::interval)
+                GROUP BY wk
+                ORDER BY wk ASC;
+                ''',
+                mkt,
+                int(weeks),
+            )
         out: list[str] = []
-        for i in range(days - 1, -1, -1):
-            d = now - dt.timedelta(days=i)
-            k = d.isoformat()
-            b = self._bucket(market, "days", k)
-            trades = int(b.get("trades", 0))
-            wins = int(b.get("wins", 0))
-            losses = int(b.get("losses", 0))
-            pnl = float(b.get("sum_pnl_pct", 0.0))
+        for r in rows:
+            wk = r.get("wk")
+            trades = int(r.get("trades") or 0)
+            wins = int(r.get("wins") or 0)
+            pnl = float(r.get("pnl") or 0.0)
             wr = (wins / trades * 100.0) if trades else 0.0
-            out.append(f"{k}: trades={trades} winrate={wr:.1f}% pnl={pnl:+.2f}%")
+            out.append(f"{wk}: trades={trades} winrate={wr:.1f}% pnl={pnl:+.2f}%")
         return out
 
-    def report_weekly(self, market: str, weeks: int = 4) -> list[str]:
-        today = dt.datetime.now(tz=ZoneInfo(TZ_NAME)).date()
-        out: list[str] = []
-        seen = set()
-        for i in range(weeks - 1, -1, -1):
-            d = today - dt.timedelta(days=7 * i)
-            k = _week_key_tz(dt.datetime(d.year, d.month, d.day, tzinfo=ZoneInfo(TZ_NAME)).timestamp())
-            if k in seen:
-                continue
-            seen.add(k)
-            b = self._bucket(market, "weeks", k)
-            trades = int(b.get("trades", 0))
-            wins = int(b.get("wins", 0))
-            losses = int(b.get("losses", 0))
-            pnl = float(b.get("sum_pnl_pct", 0.0))
-            wr = (wins / trades * 100.0) if trades else 0.0
-            out.append(f"{k}: trades={trades} winrate={wr:.1f}% pnl={pnl:+.2f}%")
-        return out
+    async def get_trade(self, user_id: int, signal_id: int) -> Optional[dict]:
+        return await db_store.get_trade_by_user_signal(int(user_id), int(signal_id))
 
-    def get_trade(self, user_id: int, signal_id: int) -> Optional[UserTrade]:
-        return self.trades.get((user_id, signal_id))
-
-    def get_user_trades(self, user_id: int) -> List[UserTrade]:
-        return sorted([t for (uid, _), t in self.trades.items() if uid == user_id], key=lambda x: x.opened_ts, reverse=True)
+    async def get_user_trades(self, user_id: int) -> list[dict]:
+        return await db_store.list_user_trades(int(user_id), include_closed=True, limit=50)
 
     def get_next_macro(self) -> Optional[Tuple[MacroEvent, Tuple[float, float]]]:
         return self.macro.next_event()
@@ -1057,85 +1080,99 @@ class Backend:
             return False, "ERROR", price
 
     async def track_loop(self, bot) -> None:
+        """Main tracker loop. Reads ACTIVE/TP1 trades from PostgreSQL and updates their status."""
         while True:
-            # iterate over snapshot to allow removals
-            for key, trade in list(self.trades.items()):
-                if not getattr(trade, "active", False):
-                    continue
+            try:
+                rows = await db_store.list_active_trades(limit=500)
+            except Exception:
+                logger.exception("track_loop: failed to load active trades from DB")
+                rows = []
 
-                s = trade.signal
-                price = await self._get_price(s)
-                trade.last_price = float(price)
+            for row in rows:
+                try:
+                    trade_id = int(row["id"])
+                    uid = int(row["user_id"])
+                    market = (row.get("market") or "FUTURES").upper()
+                    symbol = str(row.get("symbol") or "")
+                    side = str(row.get("side") or "LONG").upper()
 
-                hit_tp = lambda lvl: price >= lvl if s.direction == "LONG" else price <= lvl
-                hit_sl = lambda lvl: price <= lvl if s.direction == "LONG" else price >= lvl
+                    s = Signal(
+                        signal_id=int(row.get("signal_id") or 0),
+                        market=market,
+                        symbol=symbol,
+                        direction=side,
+                        timeframe="",
+                        entry=float(row.get("entry") or 0.0),
+                        sl=float(row.get("sl") or 0.0),
+                        tp1=float(row.get("tp1") or 0.0),
+                        tp2=float(row.get("tp2") or 0.0),
+                        rr=0.0,
+                        confidence=0,
+                        confirmations="",
+                        risk_note="",
+                        ts=float(dt.datetime.now(dt.timezone.utc).timestamp()),
+                    )
 
-                # 1) SL before TP1 -> LOSS
-                if not trade.tp1_hit and hit_sl(s.sl):
-                    trade.active = False
-                    trade.result = "LOSS"
-                    uid = trade.user_id
-                    await safe_send(bot, uid, _trf(uid, "msg_auto_loss",
-                        symbol=s.symbol,
-                        status=trade.result,
-                    ))
-                    try:
-                        self.record_trade_close(trade, "LOSS", float(price), time.time())
-                    except Exception:
-                        pass
-                    self.trades.pop(key, None)
-                    continue
+                    price = await self._get_price(s)
+                    price_f = float(price)
 
-                # 2) TP1 -> partial close + BE
-                if not trade.tp1_hit and hit_tp(s.tp1):
-                    trade.tp1_hit = True
-                    trade.sl_moved_to_be = True
-                    trade.result = "TP1"
-                    trade.be_price = _be_exit_price(s.entry, s.direction, s.market)
-                    uid = trade.user_id
-                    await safe_send(bot, uid, _trf(uid, "msg_auto_tp1",
-                        symbol=s.symbol,
-                        closed_pct=int(_partial_close_pct(s.market)),
-                        be_price=f"{float(trade.be_price):.6f}",
-                        status=trade.result,
-                    ))
-                    continue
+                    def hit_tp(lvl: float) -> bool:
+                        return price_f >= lvl if side == "LONG" else price_f <= lvl
 
-                # 3) After TP1: BE close (entry+fees)
-                if trade.tp1_hit and trade.sl_moved_to_be and _be_enabled(s.market) and hit_sl(float(getattr(trade, "be_price", s.entry) or s.entry)):
-                    trade.active = False
-                    trade.result = "BE"
-                    be_px = float(getattr(trade, "be_price", s.entry) or s.entry)
-                    uid = trade.user_id
-                    await safe_send(bot, uid, _trf(uid, "msg_auto_be",
-                        symbol=s.symbol,
-                        be_price=f"{be_px:.6f}",
-                        status=trade.result,
-                    ))
-                    try:
-                        self.record_trade_close(trade, "BE", be_px, time.time())
-                    except Exception:
-                        pass
-                    self.trades.pop(key, None)
-                    continue
+                    def hit_sl(lvl: float) -> bool:
+                        return price_f <= lvl if side == "LONG" else price_f >= lvl
 
-                # 4) TP2 -> WIN
-                if hit_tp(s.tp2):
-                    trade.active = False
-                    trade.result = "WIN"
-                    uid = trade.user_id
-                    await safe_send(bot, uid, _trf(uid, "msg_auto_win",
-                        symbol=s.symbol,
-                        pnl_total=fmt_pnl_pct(calc_profit_pct(s.entry, s.tp2 or price, s.direction)),
-                        status=trade.result,
-                    ))
-                    try:
-                        tp2_px = float(s.tp2 or price)
-                        self.record_trade_close(trade, "WIN", tp2_px, time.time())
-                    except Exception:
-                        pass
-                    self.trades.pop(key, None)
-                    continue
+                    status = str(row.get("status") or "ACTIVE").upper()
+                    tp1_hit = bool(row.get("tp1_hit"))
+                    be_price = float(row.get("be_price") or 0.0) if row.get("be_price") is not None else 0.0
+
+                    # 1) SL before TP1 -> LOSS
+                    if not tp1_hit and s.sl and hit_sl(float(s.sl)):
+                        pnl = calc_profit_pct(s.entry, float(s.sl), side)
+                        await safe_send(bot, uid, _trf(uid, "msg_auto_loss",
+                            symbol=s.symbol,
+                            status="LOSS",
+                        ), ctx="msg_auto_loss")
+                        await db_store.close_trade(trade_id, status="LOSS", price=float(s.sl), pnl_total_pct=float(pnl))
+                        continue
+
+                    # 2) TP1 -> partial close + BE
+                    if not tp1_hit and s.tp1 and hit_tp(float(s.tp1)):
+                        be_px = _be_exit_price(s.entry, side, market)
+                        await safe_send(bot, uid, _trf(uid, "msg_auto_tp1",
+                            symbol=s.symbol,
+                            closed_pct=int(_partial_close_pct(market)),
+                            be_price=f"{float(be_px):.6f}",
+                            status="TP1",
+                        ), ctx="msg_auto_tp1")
+                        await db_store.set_tp1(trade_id, be_price=float(be_px), price=float(s.tp1), pnl_pct=float(calc_profit_pct(s.entry, float(s.tp1), side)))
+                        continue
+
+                    # 3) After TP1: BE close
+                    if tp1_hit and _be_enabled(market):
+                        be_lvl = be_price if be_price else _be_exit_price(s.entry, side, market)
+                        if hit_sl(float(be_lvl)):
+                            await safe_send(bot, uid, _trf(uid, "msg_auto_be",
+                                symbol=s.symbol,
+                                be_price=f"{float(be_lvl):.6f}",
+                                status="BE",
+                            ), ctx="msg_auto_be")
+                            await db_store.close_trade(trade_id, status="BE", price=float(be_lvl), pnl_total_pct=0.0)
+                            continue
+
+                    # 4) TP2 -> WIN
+                    if s.tp2 and hit_tp(float(s.tp2)):
+                        pnl = calc_profit_pct(s.entry, float(s.tp2), side)
+                        await safe_send(bot, uid, _trf(uid, "msg_auto_win",
+                            symbol=s.symbol,
+                            pnl_total=fmt_pnl_pct(float(pnl)),
+                            status="WIN",
+                        ), ctx="msg_auto_win")
+                        await db_store.close_trade(trade_id, status="WIN", price=float(s.tp2), pnl_total_pct=float(pnl))
+                        continue
+
+                except Exception:
+                    logger.exception("track_loop: error while tracking trade row=%r", row)
 
             await asyncio.sleep(TRACK_INTERVAL_SECONDS)
 
