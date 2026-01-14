@@ -84,9 +84,14 @@ async def ensure_schema() -> None:
 
         # Ensure the correct uniqueness: each user can open the same signal independently.
         await conn.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_user_signal
-        ON trades (user_id, signal_id);
-        """)
+        -- Drop legacy full unique index (prevents reopening after close)
+        DROP INDEX IF EXISTS uq_trades_user_signal;
+
+        -- Allow history: unique only for ACTIVE states (user can't have 2 active trades for same signal)
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_user_signal_active
+        ON trades (user_id, signal_id)
+        WHERE status IN ('ACTIVE','TP1');
+""")
 
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_trades_user_status
@@ -143,7 +148,7 @@ async def open_trade_once(
                 """
                 INSERT INTO trades (user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl, status, orig_text)
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'ACTIVE',$10)
-                ON CONFLICT (user_id, signal_id) DO NOTHING
+                ON CONFLICT (user_id, signal_id) WHERE status IN ('ACTIVE','TP1') DO NOTHING
                 RETURNING id;
                 """,
                 int(user_id), int(signal_id), market, symbol, side, float(entry),
