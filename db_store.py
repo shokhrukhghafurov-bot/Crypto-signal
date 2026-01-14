@@ -208,34 +208,54 @@ async def close_trade(trade_id: int, *, status: str, price: float | None = None,
 
 async def perf_bucket(user_id: int, market: str, *, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
     """
-    Aggregates CLOSED trades in [since, until).
+    Aggregates performance in [since, until) using trade_events.
+
+    Events-based stats are more robust than reading the final trades rows,
+    because TP1 should be counted even if a trade is later closed manually,
+    and close results are best represented by the final close event.
     """
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
+            WITH ev AS (
+              SELECT e.trade_id, e.event_type, e.pnl_pct
+              FROM trade_events e
+              JOIN trades t ON t.id = e.trade_id
+              WHERE t.user_id=$1 AND t.market=$2
+                AND e.created_at >= $3 AND e.created_at < $4
+            )
             SELECT
-              COUNT(*)::int AS trades,
-              SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END)::int AS wins,
-              SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END)::int AS losses,
-              SUM(CASE WHEN status='BE' THEN 1 ELSE 0 END)::int AS be,
-              SUM(CASE WHEN status='TP1' THEN 1 ELSE 0 END)::int AS tp1_hits,
-              COALESCE(SUM(CASE WHEN pnl_total_pct IS NULL THEN 0 ELSE pnl_total_pct END), 0)::float AS sum_pnl_pct
-            FROM trades
-            WHERE user_id=$1 AND market=$2
-              AND status IN ('WIN','LOSS','BE','CLOSED')
-              AND closed_at >= $3 AND closed_at < $4;
+              SUM(CASE WHEN event_type IN ('WIN','LOSS','BE','CLOSE') THEN 1 ELSE 0 END)::int AS trades,
+              SUM(CASE WHEN event_type='WIN' THEN 1 ELSE 0 END)::int AS wins,
+              SUM(CASE WHEN event_type='LOSS' THEN 1 ELSE 0 END)::int AS losses,
+              SUM(CASE WHEN event_type='BE' THEN 1 ELSE 0 END)::int AS be,
+              COUNT(DISTINCT CASE WHEN event_type='TP1' THEN trade_id END)::int AS tp1_hits,
+              COALESCE(SUM(CASE WHEN event_type IN ('WIN','LOSS','BE','CLOSE') THEN COALESCE(pnl_pct,0) ELSE 0 END), 0)::float AS sum_pnl_pct
+            FROM ev;
             """,
             int(user_id),
             market,
             since,
             until,
         )
-        return dict(row) if row else {"trades":0,"wins":0,"losses":0,"be":0,"tp1_hits":0,"sum_pnl_pct":0.0}
+        base = {"trades":0,"wins":0,"losses":0,"be":0,"tp1_hits":0,"sum_pnl_pct":0.0}
+        if not row:
+            return base
+        d = dict(row)
+        # asyncpg may return None for SUMs when no rows
+        return {
+            "trades": int(d.get("trades") or 0),
+            "wins": int(d.get("wins") or 0),
+            "losses": int(d.get("losses") or 0),
+            "be": int(d.get("be") or 0),
+            "tp1_hits": int(d.get("tp1_hits") or 0),
+            "sum_pnl_pct": float(d.get("sum_pnl_pct") or 0.0),
+        }
 
 async def daily_report(user_id: int, market: str, *, days: int, tz: str = "UTC") -> List[dict]:
     """
-    Returns per-day buckets (only days that have at least 1 closed trade).
+    Returns per-day buckets for the last N days using trade_events.
     Each item: {"day":"YYYY-MM-DD","trades":..,"wins":..,"losses":..,"be":..,"tp1_hits":..,"sum_pnl_pct":..}
     Day boundaries are computed in the given timezone.
     """
@@ -244,17 +264,17 @@ async def daily_report(user_id: int, market: str, *, days: int, tz: str = "UTC")
         rows = await conn.fetch(
             """
             SELECT
-              (closed_at AT TIME ZONE $4)::date AS day,
-              COUNT(*)::int AS trades,
-              SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END)::int AS wins,
-              SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END)::int AS losses,
-              SUM(CASE WHEN status='BE' THEN 1 ELSE 0 END)::int AS be,
-              SUM(CASE WHEN tp1_hit THEN 1 ELSE 0 END)::int AS tp1_hits,
-              COALESCE(SUM(CASE WHEN pnl_total_pct IS NULL THEN 0 ELSE pnl_total_pct END), 0)::float AS sum_pnl_pct
-            FROM trades
-            WHERE user_id=$1 AND market=$2
-              AND status IN ('WIN','LOSS','BE','CLOSED')
-              AND closed_at >= (NOW() - ($3::int || ' days')::interval)
+              (e.created_at AT TIME ZONE $4)::date AS day,
+              SUM(CASE WHEN e.event_type IN ('WIN','LOSS','BE','CLOSE') THEN 1 ELSE 0 END)::int AS trades,
+              SUM(CASE WHEN e.event_type='WIN' THEN 1 ELSE 0 END)::int AS wins,
+              SUM(CASE WHEN e.event_type='LOSS' THEN 1 ELSE 0 END)::int AS losses,
+              SUM(CASE WHEN e.event_type='BE' THEN 1 ELSE 0 END)::int AS be,
+              COUNT(DISTINCT CASE WHEN e.event_type='TP1' THEN e.trade_id END)::int AS tp1_hits,
+              COALESCE(SUM(CASE WHEN e.event_type IN ('WIN','LOSS','BE','CLOSE') THEN COALESCE(e.pnl_pct,0) ELSE 0 END), 0)::float AS sum_pnl_pct
+            FROM trade_events e
+            JOIN trades t ON t.id = e.trade_id
+            WHERE t.user_id=$1 AND t.market=$2
+              AND e.created_at >= (NOW() - ($3::int || ' days')::interval)
             GROUP BY day
             ORDER BY day ASC;
             """,
@@ -268,7 +288,7 @@ async def daily_report(user_id: int, market: str, *, days: int, tz: str = "UTC")
 
 async def weekly_report(user_id: int, market: str, *, weeks: int, tz: str = "UTC") -> List[dict]:
     """
-    Returns per-week buckets (ISO week label) for the last N weeks that have at least 1 closed trade.
+    Returns per-week buckets (ISO week label) for the last N weeks using trade_events.
     Each item: {"week":"2026-W03","trades":..,"wins":..,"losses":..,"be":..,"tp1_hits":..,"sum_pnl_pct":..}
     """
     pool = get_pool()
@@ -276,17 +296,17 @@ async def weekly_report(user_id: int, market: str, *, weeks: int, tz: str = "UTC
         rows = await conn.fetch(
             """
             SELECT
-              to_char(date_trunc('week', (closed_at AT TIME ZONE $4)), 'IYYY-"W"IW') AS week,
-              COUNT(*)::int AS trades,
-              SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END)::int AS wins,
-              SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END)::int AS losses,
-              SUM(CASE WHEN status='BE' THEN 1 ELSE 0 END)::int AS be,
-              SUM(CASE WHEN tp1_hit THEN 1 ELSE 0 END)::int AS tp1_hits,
-              COALESCE(SUM(CASE WHEN pnl_total_pct IS NULL THEN 0 ELSE pnl_total_pct END), 0)::float AS sum_pnl_pct
-            FROM trades
-            WHERE user_id=$1 AND market=$2
-              AND status IN ('WIN','LOSS','BE','CLOSED')
-              AND closed_at >= (NOW() - ($3::int || ' weeks')::interval)
+              to_char(date_trunc('week', (e.created_at AT TIME ZONE $4)), 'IYYY-"W"IW') AS week,
+              SUM(CASE WHEN e.event_type IN ('WIN','LOSS','BE','CLOSE') THEN 1 ELSE 0 END)::int AS trades,
+              SUM(CASE WHEN e.event_type='WIN' THEN 1 ELSE 0 END)::int AS wins,
+              SUM(CASE WHEN e.event_type='LOSS' THEN 1 ELSE 0 END)::int AS losses,
+              SUM(CASE WHEN e.event_type='BE' THEN 1 ELSE 0 END)::int AS be,
+              COUNT(DISTINCT CASE WHEN e.event_type='TP1' THEN e.trade_id END)::int AS tp1_hits,
+              COALESCE(SUM(CASE WHEN e.event_type IN ('WIN','LOSS','BE','CLOSE') THEN COALESCE(e.pnl_pct,0) ELSE 0 END), 0)::float AS sum_pnl_pct
+            FROM trade_events e
+            JOIN trades t ON t.id = e.trade_id
+            WHERE t.user_id=$1 AND t.market=$2
+              AND e.created_at >= (NOW() - ($3::int || ' weeks')::interval)
             GROUP BY week
             ORDER BY week ASC;
             """,
