@@ -324,27 +324,65 @@ async def _render_in_place(call: types.CallbackQuery, txt: str, kb: types.Inline
 
 
 async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKeyboardMarkup | None = None) -> None:
-    """Edit message text if possible, otherwise send a new message.
+    """Safely update an existing bot message.
 
-    Used for menu actions (including Notifications toggle).
+    Telegram has a 4096 char limit for message text. This helper:
+    - tries to edit the existing message (best UX)
+    - if edit fails (or text is too long), sends new message(s)
+
+    IMPORTANT: never raise from here; menu callbacks must not crash the bot.
     """
+
     if not message:
         return
+
     chat_id = message.chat.id
     msg_id = message.message_id
+
+    def _split_text(s: str, limit: int = 3900) -> list[str]:
+        s = s or ""
+        if len(s) <= limit:
+            return [s]
+        out: list[str] = []
+        buf: list[str] = []
+        cur = 0
+        for line in s.split("\n"):
+            piece = line + "\n"
+            if cur + len(piece) > limit and buf:
+                out.append("".join(buf).rstrip("\n"))
+                buf = [piece]
+                cur = len(piece)
+            else:
+                buf.append(piece)
+                cur += len(piece)
+        if buf:
+            out.append("".join(buf).rstrip("\n"))
+        return out
+
+    parts = _split_text(text)
+
+    # Try to edit with the first chunk
     try:
-        await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=kb)
-        return
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=parts[0],
+            reply_markup=kb if len(parts) == 1 else None,
+        )
     except Exception:
-        # Fallback: try sending a new message to the chat
+        # If we can't edit (old message, same text, etc.) - just send new
         try:
-            await safe_send(chat_id, text, reply_markup=kb)
+            await safe_send(chat_id, parts[0], reply_markup=kb if len(parts) == 1 else None)
         except Exception:
-            logger.exception("Failed to ensure DB indexes")
+            logger.exception("safe_edit: failed to edit/send first chunk")
 
-
-    for i, part in enumerate(parts):
-        await safe_send(chat_id, part, reply_markup=reply_markup if i == len(parts)-1 else None)
+    # Send remaining chunks (if any)
+    if len(parts) > 1:
+        for i, part in enumerate(parts[1:], start=1):
+            try:
+                await safe_send(chat_id, part, reply_markup=kb if i == len(parts) - 1 else None)
+            except Exception:
+                logger.exception("safe_edit: failed to send chunk %s/%s", i + 1, len(parts))
 
 def _fmt_perf(uid: int, b: dict) -> str:
     trades = int(b.get("trades", 0))
@@ -429,7 +467,7 @@ async def init_db() -> None:
         try:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
         except Exception:
-            logger.exception("Failed to ensure DB indexes")
+            logger.exception("Failed to send message to uid=%s", uid)
 
 async def ensure_user(user_id: int) -> None:
     if not pool or not user_id:
@@ -614,7 +652,7 @@ def _signal_text(uid: int, s: Signal) -> str:
             if float(s.tp2) > 0 and abs(float(s.tp2) - float(s.tp1)) > 1e-12:
                 lines.append(f"TP2: {s.tp2:.6f}")
         except Exception:
-            logger.exception("Failed to ensure DB indexes")
+            logger.exception("Failed to send message to uid=%s", uid)
         return lines
 
     ex_line_raw = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
@@ -843,7 +881,7 @@ async def broadcast_signal(sig: Signal) -> None:
             kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
             await safe_send(uid, _signal_text(uid, sig), reply_markup=kb_u.as_markup())
         except Exception:
-            logger.exception("Failed to ensure DB indexes")
+            logger.exception("Failed to send message to uid=%s", uid)
 
 
 async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, float], tz_name: str) -> None:
@@ -856,10 +894,7 @@ async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, f
             tail = tr(uid, 'macro_tail_fut_off') if action == 'FUTURES_OFF' else tr(uid, 'macro_tail_paused')
             await safe_send(uid, f"{title}\n\n{body}{tail}")
         except Exception:
-            logger.exception("Failed to ensure DB indexes")
-
-# Backward-compat alias
-broadcast_macro = broadcast_macro_alert
+            logger.exception("Failed to send message to uid=%s", uid)
 
 # ---------------- commands ----------------
 @dp.message(Command("start"))
@@ -1040,8 +1075,6 @@ async def stats_text(uid: int) -> str:
         parts.append(hint)
 
     return "\n".join(parts).strip()
-
-@dp.callback_query(lambda c: (c.data or "").startswith("menu:"))
 async def menu_handler(call: types.CallbackQuery) -> None:
     action = (call.data or "").split(":", 1)[1]
     uid = call.from_user.id if call.from_user else 0
@@ -1194,26 +1227,349 @@ async def notify_handler(call: types.CallbackQuery) -> None:
         await safe_edit(call.message, txt, notify_kb(uid, enabled))
         return
 
-    # Fallback: return to menu
-    await safe_edit(call.message, tr(uid, 'welcome'), menu_kb(uid))
-    return
+    if action == "status":
+        # cancel previous auto-refresh task (if any)
+        uid = call.from_user.id if call.from_user else 0
+        t = STATUS_TASKS.pop(uid, None)
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+        try:
+            txt = await _build_status_text(uid)
+        except Exception as e:
+            txt = f"Status error: {e}"
+        if call.from_user and _is_admin(call.from_user.id) and backend.last_signal:
+            ls = backend.last_signal
+            extra_dir = f" {ls.direction}" if getattr(ls, 'market', '') != 'SPOT' else ""
+            txt += f"\nLast signal: {ls.symbol} {ls.market}{extra_dir} conf={ls.confidence}"
+
+        msg = await _render_in_place(call, txt, menu_kb(call.from_user.id))
+
+        # auto-refresh countdown for a short window
+        task = asyncio.create_task(_status_autorefresh(uid, msg.chat.id, msg.message_id))
+        STATUS_TASKS[uid] = task
+        return
+
+    if action == "stats":
+        # cancel previous auto-refresh task (if any)
+        uid = call.from_user.id if call.from_user else 0
+        t = STATUS_TASKS.pop(uid, None)
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+        # performance (separate Spot / Futures)
+        spot_today = await backend.perf_today("SPOT")
+        fut_today = await backend.perf_today("FUTURES")
+        spot_week = await backend.perf_week("SPOT")
+        fut_week = await backend.perf_week("FUTURES")
+
+        try:
+            spot_daily = backend.report_daily("SPOT", 7)
+            fut_daily = backend.report_daily("FUTURES", 7)
+            spot_weekly = backend.report_weekly("SPOT", 4)
+            fut_weekly = backend.report_weekly("FUTURES", 4)
+        except Exception:
+            spot_daily, fut_daily, spot_weekly, fut_weekly = [], [], [], []
+
+        spot_daily_nz = [x for x in spot_daily if "trades=0" not in x]
+        fut_daily_nz = [x for x in fut_daily if "trades=0" not in x]
+        spot_weekly_nz = [x for x in spot_weekly if "trades=0" not in x]
+        fut_weekly_nz = [x for x in fut_weekly if "trades=0" not in x]
+
+        parts = []
+        parts.append(tr(uid, "stats_title"))
+        parts.append("")
+        parts.append(tr(uid, "perf_today"))
+        parts.append("🟢 " + tr(uid, "lbl_spot"))
+        parts.append(_fmt_perf(uid, spot_today))
+        parts.append("")
+        parts.append("🔴 " + tr(uid, "lbl_futures"))
+        parts.append(_fmt_perf(uid, fut_today))
+        parts.append("")
+        parts.append(tr(uid, "perf_week"))
+        parts.append("🟢 " + tr(uid, "lbl_spot"))
+        parts.append(_fmt_perf(uid, spot_week))
+        parts.append("")
+        parts.append("🔴 " + tr(uid, "lbl_futures"))
+        parts.append(_fmt_perf(uid, fut_week))
+        parts.append("")
+        parts.append(tr(uid, "daily_title"))
+        parts.append("🟢 " + tr(uid, "lbl_spot") + ":")
+        parts.append("\n".join(spot_daily_nz) if spot_daily_nz else tr(uid, "no_closed"))
+        parts.append("")
+        parts.append("🔴 " + tr(uid, "lbl_futures") + ":")
+        parts.append("\n".join(fut_daily_nz) if fut_daily_nz else tr(uid, "no_closed"))
+        parts.append("")
+        parts.append(tr(uid, "weekly_title"))
+        parts.append("🟢 " + tr(uid, "lbl_spot") + ":")
+        parts.append("\n".join(spot_weekly_nz) if spot_weekly_nz else tr(uid, "no_closed"))
+        parts.append("")
+        parts.append("🔴 " + tr(uid, "lbl_futures") + ":")
+        parts.append("\n".join(fut_weekly_nz) if fut_weekly_nz else tr(uid, "no_closed"))
+        parts.append("")
+        parts.append(tr(uid, "tip_closed"))
+        txt = "\n".join(parts)
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text=tr(uid, "refresh"), callback_data="menu:stats")
+        kb.button(text=tr(uid, "back"), callback_data="menu:back")
+        kb.adjust(2)
+        await _render_in_place(call, txt, kb.as_markup())
+        return
+
+    if action == "back":
+        prev = _get_last_view(call.from_user.id, "status")
+        # fallback to status
+        call.data = f"menu:{prev}"
+        await menu_handler(call)
+        return
 
 
+    if action in ("spot", "futures"):
+        sig = backend.last_spot_signal if action == "spot" else backend.last_futures_signal
+        if not sig:
+            await _render_in_place(call, tr(uid, "no_live"), menu_kb(uid))
+            return
+        kb = InlineKeyboardBuilder()
+        kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+        await safe_send(call.from_user.id, _signal_text(sig), reply_markup=kb.as_markup())
+        return
 
-# ---------------- entrypoint ----------------
+
+# ---------------- trades list (with buttons) ----------------
+PAGE_SIZE = 10
+
+def _trades_page_kb(uid: int, trades: list[dict], offset: int) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for t in trades:
+        sid = int(t.get("signal_id") or 0)
+        symbol = str(t.get("symbol") or "")
+        market = str(t.get("market") or "FUTURES").upper()
+        status = str(t.get("status") or "ACTIVE").upper()
+        label = f"{_trade_status_emoji(status)} {symbol} {tr_market(uid, market)} ({status})"
+        kb.button(text=label, callback_data=f"trade:view:{sid}:{offset}")
+    # pagination
+    nav = InlineKeyboardBuilder()
+    if offset > 0:
+        nav.button(text=tr(uid, "btn_prev"), callback_data=f"trades:page:{max(0, offset-PAGE_SIZE)}")
+    if len(trades) == PAGE_SIZE:
+        nav.button(text=tr(uid, "btn_next"), callback_data=f"trades:page:{offset+PAGE_SIZE}")
+    if nav.buttons:
+        kb.adjust(1)
+        kb.row(*[b for b in nav.buttons])
+    kb.row(types.InlineKeyboardButton(text=tr(uid, "m_menu"), callback_data="menu:status"))
+    return kb.as_markup()
+
+@dp.callback_query(lambda c: (c.data or "").startswith("trades:page:"))
+async def trades_page(call: types.CallbackQuery) -> None:
+    await call.answer()
+    try:
+        offset = int((call.data or "").split(":")[-1])
+    except Exception:
+        offset = 0
+
+    all_trades = await backend.get_user_trades(call.from_user.id)
+    if not all_trades:
+        await safe_send(call.from_user.id, tr(call.from_user.id, "my_trades_empty"), reply_markup=menu_kb(call.from_user.id))
+        return
+
+    page = all_trades[offset:offset+PAGE_SIZE]
+    txt = tr(call.from_user.id, "my_trades_title").format(a=offset+1, b=min(offset+PAGE_SIZE, len(all_trades)), n=len(all_trades))
+    await safe_send(call.from_user.id, txt, reply_markup=_trades_page_kb(call.from_user.id, page, offset))
+
+# ---------------- trade card ----------------
+
+def _trade_card_text(uid: int, t: dict) -> str:
+    symbol = str(t.get("symbol") or "")
+    market = str(t.get("market") or "FUTURES").upper()
+    side = str(t.get("side") or "LONG").upper()
+    status = str(t.get("status") or "ACTIVE").upper()
+
+    entry = float(t.get("entry") or 0.0)
+    tp1 = t.get("tp1")
+    tp2 = t.get("tp2")
+    sl = t.get("sl")
+
+    head = f"🪙 {symbol} | {tr_market(uid, market)}"
+    if market != "SPOT":
+        head += f" | {side}"
+
+    parts = [
+        "📌 " + tr(uid, "m_trades"),
+        "",
+        head,
+        "",
+        f"{tr(uid, 'sig_entry')}: {entry:.6f}",
+    ]
+    if sl is not None:
+        parts.append(f"SL: {float(sl):.6f}")
+    if tp1 is not None:
+        parts.append(f"TP1: {float(tp1):.6f}")
+    if tp2 is not None and float(tp2) > 0 and (tp1 is None or abs(float(tp2) - float(tp1)) > 1e-12):
+        parts.append(f"TP2: {float(tp2):.6f}")
+
+    parts += [
+        "",
+        f"{tr(uid, 'sig_status')}: {status} {_trade_status_emoji(status)}",
+    ]
+
+    pnl = t.get("pnl_total_pct")
+    if pnl is not None and status in ("WIN","LOSS","BE","CLOSED"):
+        try:
+            parts.append(f"PnL: {float(pnl):+.2f}%")
+        except Exception:
+            pass
+
+    return "\n".join(parts)
+
+def _trade_card_kb(uid: int, signal_id: int, back_offset: int = 0) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "sig_btn_refresh"), callback_data=f"trade:refresh:{signal_id}:{back_offset}")
+    kb.button(text=tr(uid, "sig_btn_orig"), callback_data=f"trade:orig:{signal_id}:{back_offset}")
+    kb.button(text=tr(uid, "sig_btn_close"), callback_data=f"trade:close:{signal_id}:{back_offset}")
+    kb.button(text=tr(uid, "sig_btn_back"), callback_data=f"trades:page:{back_offset}")
+    kb.adjust(2, 2)
+    return kb.as_markup()
+
+@dp.callback_query(lambda c: (c.data or "").startswith("trade:view:"))
+async def trade_view(call: types.CallbackQuery) -> None:
+    await call.answer()
+    parts = (call.data or "").split(":")
+    try:
+        signal_id = int(parts[2])
+        back_offset = int(parts[3]) if len(parts) > 3 else 0
+    except Exception:
+        return
+    t = await backend.get_trade(call.from_user.id, signal_id)
+    if not t:
+        await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
+        return
+    await safe_send(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, signal_id, back_offset))
+
+@dp.callback_query(lambda c: (c.data or "").startswith("trade:refresh:"))
+async def trade_refresh(call: types.CallbackQuery) -> None:
+    await call.answer()
+    parts = (call.data or "").split(":")
+    try:
+        signal_id = int(parts[2])
+        back_offset = int(parts[3]) if len(parts) > 3 else 0
+    except Exception:
+        return
+    t = await backend.get_trade(call.from_user.id, signal_id)
+    if not t:
+        await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
+        return
+    await safe_send(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, signal_id, back_offset))
+
+@dp.callback_query(lambda c: (c.data or "").startswith("trade:close:"))
+async def trade_close(call: types.CallbackQuery) -> None:
+    await call.answer()
+    parts = (call.data or "").split(":")
+    try:
+        signal_id = int(parts[2])
+        back_offset = int(parts[3]) if len(parts) > 3 else 0
+    except Exception:
+        return
+    removed = await backend.remove_trade(call.from_user.id, signal_id)
+    if removed:
+        await safe_send(call.from_user.id, tr(call.from_user.id, "trade_removed"), reply_markup=menu_kb(call.from_user.id))
+    else:
+        await safe_send(call.from_user.id, tr(call.from_user.id, "trade_removed_fail"), reply_markup=menu_kb(call.from_user.id))
+
+@dp.callback_query(lambda c: (c.data or "").startswith("trade:orig:"))
+async def trade_orig(call: types.CallbackQuery) -> None:
+    await call.answer()
+    parts = (call.data or "").split(":")
+    try:
+        signal_id = int(parts[2])
+        back_offset = int(parts[3]) if len(parts) > 3 else 0
+    except Exception:
+        return
+
+    t = await backend.get_trade(call.from_user.id, signal_id)
+    text = (t.get("orig_text") if isinstance(t, dict) else None) if t else None
+    if not text:
+        await safe_send(call.from_user.id, tr(call.from_user.id, "sig_orig_title") + ": " + tr(call.from_user.id, "lbl_none"), reply_markup=menu_kb(call.from_user.id))
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(call.from_user.id, "sig_btn_back_trade"), callback_data=f"trade:view:{signal_id}:{back_offset}")
+    kb.button(text=tr(call.from_user.id, "sig_btn_my_trades"), callback_data=f"trades:page:{back_offset}")
+    kb.button(text=tr(call.from_user.id, "m_menu"), callback_data="menu:status")
+    kb.adjust(1, 2)
+
+    await safe_send(call.from_user.id, "📌 Original signal (1:1)\n\n" + text, reply_markup=kb.as_markup())
+
+# ---------------- open signal ----------------
+@dp.callback_query(lambda c: (c.data or "").startswith("open:"))
+async def opened(call: types.CallbackQuery) -> None:
+    try:
+        signal_id = int((call.data or "").split(":", 1)[1])
+    except Exception:
+        await call.answer("Error", show_alert=True)
+        return
+
+    sig = SIGNALS.get(signal_id)
+    if not sig:
+        await call.answer("Signal not available", show_alert=True)
+        return
+
+    allowed, reason, price = await backend.check_signal_openable(sig)
+    if not allowed:
+        # remove stale from Live cache
+        mkt = (sig.market or "FUTURES").upper()
+        if LAST_SIGNAL_BY_MARKET.get(mkt) and LAST_SIGNAL_BY_MARKET[mkt].signal_id == sig.signal_id:
+            LAST_SIGNAL_BY_MARKET[mkt] = None
+        await _expire_signal_message(call, sig, reason, price)
+        await call.answer(tr(call.from_user.id, "sig_too_late_toast"), show_alert=True)
+        await safe_send(call.from_user.id, _too_late_text(call.from_user.id, sig, reason, price), reply_markup=menu_kb(call.from_user.id))
+        return
+
+    opened_ok = await backend.open_trade(call.from_user.id, sig, orig_text=_signal_text(call.from_user.id, sig))
+    if not opened_ok:
+        # Already opened before -> remove button to prevent retries
+        try:
+            if call.message:
+                await safe_edit_markup(call.from_user.id, call.message.message_id, None)
+        except Exception:
+            pass
+        await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
+        await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
+        return
+
+    # Remove the ✅ ОТКРЫЛ СДЕЛКУ button from the original NEW SIGNAL message
+    try:
+        if call.message:
+            await safe_edit_markup(call.from_user.id, call.message.message_id, None)
+    except Exception:
+        pass
+
+    await call.answer(tr(call.from_user.id, "trade_opened_toast"))
+    # IMPORTANT: send OPEN card only after user pressed ✅ ОТКРЫЛ СДЕЛКУ
+    await safe_send(
+        call.from_user.id,
+        _open_card_text(call.from_user.id, sig),
+        reply_markup=menu_kb(call.from_user.id),
+    )
 
 async def main() -> None:
-    load_langs()
-    try:
-        await init_db()
-    except Exception:
-        logger.exception("DB init failed")
-    # Start background loops
-    asyncio.create_task(backend.track_loop(bot))
-    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
-    # Polling
-    await dp.start_polling(bot)
+    import time
+    globals()["time"] = time
 
+    logger.info("Bot starting; TZ=%s", TZ_NAME)
+    await init_db()
+    load_langs()
+    logger.info("Starting track_loop")
+    asyncio.create_task(backend.track_loop(bot))
+    logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
+    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
