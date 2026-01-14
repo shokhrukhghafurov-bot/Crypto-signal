@@ -965,52 +965,24 @@ class Backend:
                 b[k] = v
         return b
 
-    async def perf_today(self, market: str) -> dict:
+    async def perf_today(self, user_id: int, market: str) -> dict:
         now = dt.datetime.now(dt.timezone.utc)
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + dt.timedelta(days=1)
-        return await db_store.perf_bucket((market or "FUTURES").upper(), since=start, until=end)
+        return await db_store.perf_bucket(int(user_id), (market or "FUTURES").upper(), since=start, until=end)
 
-    async def perf_week(self, market: str) -> dict:
+    async def perf_week(self, user_id: int, market: str) -> dict:
         now = dt.datetime.now(dt.timezone.utc)
         # ISO week start (Monday)
         start = (now - dt.timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + dt.timedelta(days=7)
-        return await db_store.perf_bucket((market or "FUTURES").upper(), since=start, until=end)
+        return await db_store.perf_bucket(int(user_id), (market or "FUTURES").upper(), since=start, until=end)
 
-    async def report_daily(self, market: str, days: int = 7) -> list[str]:
-        return await db_store.daily_report((market or "FUTURES").upper(), days=int(days))
+    async def report_daily(self, user_id: int, market: str, days: int = 7, tz: str = "UTC") -> list[dict]:
+        return await db_store.daily_report(int(user_id), (market or "FUTURES").upper(), days=int(days), tz=str(tz))
 
-    async def report_weekly(self, market: str, weeks: int = 4) -> list[str]:
-        # Simple weekly aggregation can be added later; for now return last 4 weeks header lines from daily data.
-        # Keeping structure stable: bot will print 'нет закрытых сделок' if list is empty.
-        pool = db_store.get_pool()
-        mkt = (market or "FUTURES").upper()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                '''
-                SELECT to_char(date_trunc('week', closed_at), 'IYYY-"W"IW') AS wk,
-                       COUNT(*)::int AS trades,
-                       SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END)::int AS wins,
-                       COALESCE(SUM(CASE WHEN pnl_total_pct IS NULL THEN 0 ELSE pnl_total_pct END), 0)::float AS pnl
-                FROM trades
-                WHERE market=$1 AND status IN ('WIN','LOSS','BE','CLOSED')
-                  AND closed_at >= (NOW() - ($2::int || ' weeks')::interval)
-                GROUP BY wk
-                ORDER BY wk ASC;
-                ''',
-                mkt,
-                int(weeks),
-            )
-        out: list[str] = []
-        for r in rows:
-            wk = r.get("wk")
-            trades = int(r.get("trades") or 0)
-            wins = int(r.get("wins") or 0)
-            pnl = float(r.get("pnl") or 0.0)
-            wr = (wins / trades * 100.0) if trades else 0.0
-            out.append(f"{wk}: trades={trades} winrate={wr:.1f}% pnl={pnl:+.2f}%")
-        return out
+    async def report_weekly(self, user_id: int, market: str, weeks: int = 4, tz: str = "UTC") -> list[dict]:
+        return await db_store.weekly_report(int(user_id), (market or "FUTURES").upper(), weeks=int(weeks), tz=str(tz))
 
     async def get_trade(self, user_id: int, signal_id: int) -> Optional[dict]:
         return await db_store.get_trade_by_user_signal(int(user_id), int(signal_id))
