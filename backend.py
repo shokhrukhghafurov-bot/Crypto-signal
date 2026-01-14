@@ -1014,7 +1014,7 @@ class Backend:
         except Exception:
             return None
 
-async def _get_price(self, signal: Signal) -> float:
+    async def _get_price(self, signal: Signal) -> float:
         market = (signal.market or "FUTURES").upper()
         base = float(getattr(signal, "entry", 0) or 0) or None
 
