@@ -477,21 +477,9 @@ async def init_db() -> None:
         # safety indexes (if table already exists, IF NOT EXISTS works on PG 9.5+ for indexes)
         try:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
-        except (TelegramForbiddenError, TelegramBadRequest) as e:
-            # Do not spam stack traces for common delivery issues
-            msg = str(e).lower()
-            if "chat not found" in msg or "bot was blocked by the user" in msg:
-                logger.warning("Skip uid=%s: %s", uid, e)
-            else:
-                logger.exception("Failed to send message to uid=%s", uid)
-        except (TelegramForbiddenError, TelegramBadRequest) as e:
-            msg = str(e).lower()
-            if "chat not found" in msg or "bot was blocked by the user" in msg:
-                logger.warning("Skip uid=%s: %s", uid, e)
-            else:
-                logger.exception("Failed to send message to uid=%s", uid)
         except Exception:
-            logger.exception("Failed to send message to uid=%s", uid)
+            # Best effort: index creation may fail on some managed DBs / permissions.
+            logger.exception("Failed to create idx_users_telegram_id")
 
 async def ensure_user(user_id: int) -> None:
     if not pool or not user_id:
