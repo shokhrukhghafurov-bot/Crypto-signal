@@ -1272,7 +1272,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 left = _fmt_countdown(float(until_ts) - time.time())
                 lines.append(trf(uid, "status_macro_timer", left=left))
 
-        lines.append(trf(uid, "status_next_macro", value=next_macro))
+        lines.append(trf(uid, "status_next_macro", value=(next_macro or tr(uid, "lbl_none"))))
         lines.append(trf(uid, "status_notifications", state=notif_state))
 
         txt = "\n".join(lines)
