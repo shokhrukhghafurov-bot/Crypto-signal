@@ -340,7 +340,7 @@ async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKe
         try:
             await safe_send(chat_id, text, reply_markup=kb)
         except Exception:
-            logger.exception("Failed to send message to uid=%s", uid)
+            logger.exception("Failed to ensure DB indexes")
 
 
     for i, part in enumerate(parts):
@@ -429,7 +429,7 @@ async def init_db() -> None:
         try:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
         except Exception:
-            logger.exception("Failed to send message to uid=%s", uid)
+            logger.exception("Failed to ensure DB indexes")
 
 async def ensure_user(user_id: int) -> None:
     if not pool or not user_id:
@@ -614,7 +614,7 @@ def _signal_text(uid: int, s: Signal) -> str:
             if float(s.tp2) > 0 and abs(float(s.tp2) - float(s.tp1)) > 1e-12:
                 lines.append(f"TP2: {s.tp2:.6f}")
         except Exception:
-            logger.exception("Failed to send message to uid=%s", uid)
+            logger.exception("Failed to ensure DB indexes")
         return lines
 
     ex_line_raw = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
@@ -843,7 +843,7 @@ async def broadcast_signal(sig: Signal) -> None:
             kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
             await safe_send(uid, _signal_text(uid, sig), reply_markup=kb_u.as_markup())
         except Exception:
-            logger.exception("Failed to send message to uid=%s", uid)
+            logger.exception("Failed to ensure DB indexes")
 
 
 async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, float], tz_name: str) -> None:
@@ -856,7 +856,7 @@ async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, f
             tail = tr(uid, 'macro_tail_fut_off') if action == 'FUTURES_OFF' else tr(uid, 'macro_tail_paused')
             await safe_send(uid, f"{title}\n\n{body}{tail}")
         except Exception:
-            logger.exception("Failed to send message to uid=%s", uid)
+            logger.exception("Failed to ensure DB indexes")
 
 # ---------------- commands ----------------
 @dp.message(Command("start"))
@@ -1195,3 +1195,22 @@ async def notify_handler(call: types.CallbackQuery) -> None:
     await safe_edit(call.message, tr(uid, 'welcome'), menu_kb(uid))
     return
 
+
+
+# ---------------- entrypoint ----------------
+
+async def main() -> None:
+    load_langs()
+    try:
+        await init_db()
+    except Exception:
+        logger.exception("DB init failed")
+    # Start background loops
+    asyncio.create_task(backend.track_loop(bot))
+    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro))
+    # Polling
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
