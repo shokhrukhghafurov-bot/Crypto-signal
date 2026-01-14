@@ -200,6 +200,37 @@ def fmt_pnl_pct(p: float) -> str:
 TOP_N = max(10, _env_int("TOP_N", 50))
 SCAN_INTERVAL_SECONDS = max(30, _env_int("SCAN_INTERVAL_SECONDS", 150))
 CONFIDENCE_MIN = max(0, min(100, _env_int("CONFIDENCE_MIN", 80)))
+# --- TA Quality mode (strict/medium) ---
+SIGNAL_MODE = (os.getenv("SIGNAL_MODE", "").strip().lower() or "strict")
+if SIGNAL_MODE not in ("strict", "medium"):
+    SIGNAL_MODE = "strict"
+
+# Per-market minimum TA score (0..100). Can be overridden via env.
+_def_spot = 78 if SIGNAL_MODE == "strict" else 65
+_def_fut = 74 if SIGNAL_MODE == "strict" else 62
+TA_MIN_SCORE_SPOT = max(0, min(100, _env_int("TA_MIN_SCORE_SPOT", _def_spot)))
+TA_MIN_SCORE_FUTURES = max(0, min(100, _env_int("TA_MIN_SCORE_FUTURES", _def_fut)))
+
+# Trend strength filter (ADX)
+TA_MIN_ADX = max(0.0, _env_float("TA_MIN_ADX", 22.0 if SIGNAL_MODE == "strict" else 17.0))
+
+# Volume confirmation: require volume >= SMA(volume,20) * X
+TA_MIN_VOL_X = max(0.5, _env_float("TA_MIN_VOL_X", 1.25 if SIGNAL_MODE == "strict" else 1.05))
+
+# MACD histogram threshold (momentum). For LONG require hist >= +X, for SHORT <= -X
+TA_MIN_MACD_H = max(0.0, _env_float("TA_MIN_MACD_H", 0.0 if SIGNAL_MODE == "strict" else 0.0))
+
+# Bollinger rule: if 1, require breakout/cross of midline in direction of trend on the last candle
+TA_BB_REQUIRE_BREAKOUT = _env_bool("TA_BB_REQUIRE_BREAKOUT", True if SIGNAL_MODE == "strict" else False)
+
+# RSI guard rails
+TA_RSI_MAX_LONG = max(1.0, _env_float("TA_RSI_MAX_LONG", 68.0 if SIGNAL_MODE == "strict" else 72.0))
+TA_RSI_MIN_SHORT = max(0.0, _env_float("TA_RSI_MIN_SHORT", 32.0 if SIGNAL_MODE == "strict" else 28.0))
+
+# Multi-timeframe confirmation: if 1, require 4h and 1h trend alignment (recommended).
+# If 0, allow 4h trend only (more signals).
+TA_REQUIRE_1H_TREND = _env_bool("TA_REQUIRE_1H_TREND", True if SIGNAL_MODE == "strict" else False)
+
 COOLDOWN_MINUTES = max(1, _env_int("COOLDOWN_MINUTES", 180))
 
 USE_REAL_PRICE = _env_bool("USE_REAL_PRICE", True)
@@ -930,52 +961,81 @@ def _trend_dir(df: pd.DataFrame) -> Optional[str]:
     return "LONG" if row["ema50"] > row["ema200"] else ("SHORT" if row["ema50"] < row["ema200"] else None)
 
 def _trigger_15m(direction: str, df15i: pd.DataFrame) -> bool:
+    """
+    Entry trigger on 15m timeframe with configurable strict/medium thresholds via ENV.
+    """
     if len(df15i) < 25:
         return False
     last = df15i.iloc[-1]
     prev = df15i.iloc[-2]
 
     # Required indicators
-    req = ("rsi","macd","macd_signal","macd_hist","bb_mavg","bb_high","bb_low","vol_sma20","mfi")
+    req = ("rsi", "macd", "macd_signal", "macd_hist", "bb_mavg", "bb_high", "bb_low", "vol_sma20", "mfi", "adx")
     if any(pd.isna(last.get(x, np.nan)) for x in req) or pd.isna(prev.get("macd_hist", np.nan)):
         return False
 
-    # MACD momentum confirmation
+    close = float(last["close"])
+    prev_close = float(prev["close"])
+
+    # ADX on 15m should show at least some structure (helps reduce chop)
+    adx15 = float(last.get("adx", np.nan))
+    if not np.isnan(adx15) and adx15 < max(10.0, TA_MIN_ADX - 6.0):
+        return False
+
+    # MACD momentum confirmation + optional histogram magnitude
+    macd_hist = float(last["macd_hist"])
+    prev_hist = float(prev["macd_hist"])
     if direction == "LONG":
-        macd_ok = (last["macd"] > last["macd_signal"]) and (last["macd_hist"] > prev["macd_hist"])
+        macd_ok = (last["macd"] > last["macd_signal"]) and (macd_hist > prev_hist) and (macd_hist >= TA_MIN_MACD_H)
     else:
-        macd_ok = (last["macd"] < last["macd_signal"]) and (last["macd_hist"] < prev["macd_hist"])
+        macd_ok = (last["macd"] < last["macd_signal"]) and (macd_hist < prev_hist) and (macd_hist <= -TA_MIN_MACD_H)
     if not macd_ok:
         return False
 
-    # RSI cross 50 with guard rails
+    # RSI cross 50 with guard rails (configurable)
+    rsi_last = float(last["rsi"])
+    rsi_prev = float(prev["rsi"])
     if direction == "LONG":
-        rsi_ok = (prev["rsi"] < 50) and (last["rsi"] >= 50) and (last["rsi"] <= 70)
-    else:
-        rsi_ok = (prev["rsi"] > 50) and (last["rsi"] <= 50) and (last["rsi"] >= 30)
-    if not rsi_ok:
-        return False
-
-    # Bollinger filter: avoid extremes
-    close = float(last["close"])
-    if direction == "LONG":
-        if not (close > float(last["bb_mavg"]) and close < float(last["bb_high"])):
-            return False
+        rsi_ok = (rsi_prev < 50) and (rsi_last >= 50) and (rsi_last <= TA_RSI_MAX_LONG)
         if float(last["mfi"]) >= 80:
             return False
     else:
-        if not (close < float(last["bb_mavg"]) and close > float(last["bb_low"])):
-            return False
+        rsi_ok = (rsi_prev > 50) and (rsi_last <= 50) and (rsi_last >= TA_RSI_MIN_SHORT)
         if float(last["mfi"]) <= 20:
             return False
+    if not rsi_ok:
+        return False
+
+    # Bollinger filter
+    bb_mid = float(last["bb_mavg"])
+    bb_high = float(last["bb_high"])
+    bb_low = float(last["bb_low"])
+
+    if direction == "LONG":
+        # avoid extremes: stay below upper band unless breakout is required
+        if TA_BB_REQUIRE_BREAKOUT:
+            # require cross above midline on the last candle
+            if not (prev_close <= bb_mid and close > bb_mid):
+                return False
+        else:
+            if not (close > bb_mid and close < bb_high):
+                return False
+    else:
+        if TA_BB_REQUIRE_BREAKOUT:
+            if not (prev_close >= bb_mid and close < bb_mid):
+                return False
+        else:
+            if not (close < bb_mid and close > bb_low):
+                return False
 
     # Volume activity: require above-average volume
     vol = float(last.get("volume", 0.0) or 0.0)
     vol_sma = float(last["vol_sma20"])
-    if vol_sma > 0 and vol < vol_sma * 1.05:
+    if vol_sma > 0 and vol < vol_sma * TA_MIN_VOL_X:
         return False
 
     return True
+
 
 def _build_levels(direction: str, entry: float, atr: float) -> Tuple[float, float, float, float]:
     R = max(1e-9, ATR_MULT_SL * atr)
@@ -989,6 +1049,151 @@ def _build_levels(direction: str, entry: float, atr: float) -> Tuple[float, floa
         tp2 = entry - TP2_R * R
     rr = abs(tp2 - entry) / abs(entry - sl)
     return sl, tp1, tp2, rr
+
+def _candle_pattern(df: pd.DataFrame) -> Tuple[str, int]:
+    """
+    Very lightweight candlestick pattern detection on the last 2 candles.
+    Returns (pattern_name, bias) where bias: +1 bullish, -1 bearish, 0 neutral.
+    """
+    try:
+        if df is None or len(df) < 3:
+            return ("—", 0)
+        c1 = df.iloc[-2]
+        c2 = df.iloc[-1]
+        o1,h1,l1,cl1 = float(c1["open"]), float(c1["high"]), float(c1["low"]), float(c1["close"])
+        o2,h2,l2,cl2 = float(c2["open"]), float(c2["high"]), float(c2["low"]), float(c2["close"])
+
+        body1 = abs(cl1 - o1)
+        body2 = abs(cl2 - o2)
+        rng2 = max(1e-12, h2 - l2)
+
+        # Doji
+        if body2 <= rng2 * 0.1:
+            return ("Doji", 0)
+
+        # Engulfing
+        bull_engulf = (cl1 < o1) and (cl2 > o2) and (o2 <= cl1) and (cl2 >= o1)
+        bear_engulf = (cl1 > o1) and (cl2 < o2) and (o2 >= cl1) and (cl2 <= o1)
+        if bull_engulf:
+            return ("Bullish Engulfing", +1)
+        if bear_engulf:
+            return ("Bearish Engulfing", -1)
+
+        # Hammer / Shooting Star (simple)
+        upper_w = h2 - max(o2, cl2)
+        lower_w = min(o2, cl2) - l2
+        if body2 <= rng2 * 0.35:
+            if lower_w >= body2 * 1.8 and upper_w <= body2 * 0.7:
+                return ("Hammer", +1)
+            if upper_w >= body2 * 1.8 and lower_w <= body2 * 0.7:
+                return ("Shooting Star", -1)
+
+        # Inside bar
+        if (h2 <= h1) and (l2 >= l1):
+            return ("Inside Bar", 0)
+
+        return ("—", 0)
+    except Exception:
+        return ("—", 0)
+
+
+def _nearest_levels(df: pd.DataFrame, lookback: int = 180, swing: int = 3) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Finds nearest swing support/resistance levels using simple local extrema on 'high'/'low'.
+    Returns (support, resistance) relative to the last close.
+    """
+    try:
+        if df is None or df.empty or len(df) < (swing * 2 + 5):
+            return (None, None)
+        d = df.tail(max(lookback, swing * 2 + 5)).copy()
+        last_close = float(d.iloc[-1]["close"])
+
+        highs = d["high"].astype(float).values
+        lows = d["low"].astype(float).values
+
+        swing_highs = []
+        swing_lows = []
+        n = len(d)
+
+        for i in range(swing, n - swing):
+            h = highs[i]
+            l = lows[i]
+            if h == max(highs[i - swing:i + swing + 1]):
+                swing_highs.append(h)
+            if l == min(lows[i - swing:i + swing + 1]):
+                swing_lows.append(l)
+
+        # nearest below and above price
+        support = None
+        resistance = None
+        below = [x for x in swing_lows if x <= last_close]
+        above = [x for x in swing_highs if x >= last_close]
+        if below:
+            support = max(below)
+        if above:
+            resistance = min(above)
+
+        return (support, resistance)
+    except Exception:
+        return (None, None)
+
+
+def _fmt_ta_block(ta: Dict[str, Any]) -> str:
+    """
+    Format TA snapshot for Telegram/UX. Keep it short but informative.
+    """
+    try:
+        if not ta:
+            return ""
+        score = ta.get("score", "—")
+        rsi = ta.get("rsi15", "—")
+        macd_h = ta.get("macd_hist15", "—")
+        adx1 = ta.get("adx1", "—")
+        adx4 = ta.get("adx4", "—")
+        atrp = ta.get("atr_pct", "—")
+        bb = ta.get("bb_pos", "—")
+        volr = ta.get("vol_rel", "—")
+        vwap = ta.get("vwap_bias", "—")
+        pat = ta.get("pattern", "—")
+        sup = ta.get("support", None)
+        res = ta.get("resistance", None)
+
+        def fnum(x, fmt="{:.2f}"):
+            try:
+                if x is None or (isinstance(x, float) and np.isnan(x)):
+                    return "—"
+                return fmt.format(float(x))
+            except Exception:
+                return "—"
+
+        def fint(x):
+            try:
+                if x is None or (isinstance(x, float) and np.isnan(x)):
+                    return "—"
+                return str(int(round(float(x))))
+            except Exception:
+                return "—"
+
+        lines = [
+            f"📊 TA score: {fint(score)}/100 | Mode: {SIGNAL_MODE}",
+            f"RSI: {fnum(rsi, '{:.1f}')} | MACD hist: {fnum(macd_h, '{:.4f}')}",
+            f"ADX 1h/4h: {fnum(adx1, '{:.1f}')}/{fnum(adx4, '{:.1f}')} | ATR%: {fnum(atrp, '{:.2f}')}",
+            f"BB: {bb} | Vol xAvg: {fnum(volr, '{:.2f}')} | VWAP: {vwap}",
+        ]
+        extra = []
+        if pat and pat != "—":
+            extra.append(f"Pattern: {pat}")
+        if sup is not None:
+            extra.append(f"Support: {fnum(sup, '{:.6g}')}")
+        if res is not None:
+            extra.append(f"Resistance: {fnum(res, '{:.6g}')}")
+        if extra:
+            lines.append(" | ".join(extra))
+        return "
+".join(lines).strip()
+    except Exception:
+        return ""
+
 
 def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
     score = 0
@@ -1006,16 +1211,31 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     df15i = _add_indicators(df15)
     df1hi = _add_indicators(df1h)
     df4hi = _add_indicators(df4h)
-    dir4 = _trend_dir(df4hi)
-    dir1 = _trend_dir(df1hi)
-    if dir4 is None or dir1 is None or dir4 != dir1:
+dir4 = _trend_dir(df4hi)
+dir1 = _trend_dir(df1hi)
+
+# Multi-timeframe confirmation (configurable)
+if dir4 is None:
+    return None
+if TA_REQUIRE_1H_TREND:
+    if dir1 is None or dir4 != dir1:
         return None
-    adx4 = float(df4hi.iloc[-1]["adx"]) if not pd.isna(df4hi.iloc[-1]["adx"]) else np.nan
-    adx1 = float(df1hi.iloc[-1]["adx"]) if not pd.isna(df1hi.iloc[-1]["adx"]) else np.nan
-    if np.isnan(adx4) or adx4 < 20:
-        return None
-    if np.isnan(adx1) or adx1 < 18:
-        return None
+else:
+    # Use 4h trend as the main direction; 1h may be noisy in medium mode
+    if dir1 is None:
+        dir1 = dir4
+
+adx4 = float(df4hi.iloc[-1]["adx"]) if not pd.isna(df4hi.iloc[-1]["adx"]) else np.nan
+adx1 = float(df1hi.iloc[-1]["adx"]) if not pd.isna(df1hi.iloc[-1]["adx"]) else np.nan
+
+# Trend strength filter (configurable)
+min_adx_4h = TA_MIN_ADX
+min_adx_1h = max(10.0, TA_MIN_ADX - 2.0)
+
+if np.isnan(adx4) or adx4 < min_adx_4h:
+    return None
+if np.isnan(adx1) or adx1 < min_adx_1h:
+    return None
     if not _trigger_15m(dir1, df15i):
         return None
     last15 = df15i.iloc[-1]
@@ -1582,13 +1802,17 @@ class Backend:
                         sl = float(np.median([s[1]["sl"] for s in supporters]))
                         tp1 = float(np.median([s[1]["tp1"] for s in supporters]))
                         tp2 = float(np.median([s[1]["tp2"] for s in supporters]))
-                        rr = float(np.median([s[1]["rr"] for s in supporters]))
-                        conf = int(np.median([s[1]["confidence"] for s in supporters]))
+rr = float(np.median([s[1]["rr"] for s in supporters]))
+conf = int(np.median([s[1]["confidence"] for s in supporters]))
 
-                        if conf < CONFIDENCE_MIN or rr < 2.0:
-                            continue
+market = choose_market(float(np.nanmax([s[1]["adx1"] for s in supporters])),
+                      float(np.nanmax([s[1]["atr_pct"] for s in supporters])))
 
-                        market = choose_market(float(np.nanmax([s[1]["adx1"] for s in supporters])), float(np.nanmax([s[1]["atr_pct"] for s in supporters])))
+min_conf = TA_MIN_SCORE_FUTURES if market == "FUTURES" else TA_MIN_SCORE_SPOT
+
+if conf < min_conf or rr < 2.0:
+    continue
+
                         risk_notes = []
 
                         # Add TA summary (real indicators) to the signal card
