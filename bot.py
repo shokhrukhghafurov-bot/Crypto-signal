@@ -464,7 +464,7 @@ async def init_db() -> None:
         # Allow running without Postgres locally, but notifications will be disabled.
         pool = None
         return
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, timeout=8, command_timeout=10)
     # Share the same pool with trade storage
     db_store.set_pool(pool)
     await db_store.ensure_schema()
@@ -914,6 +914,13 @@ async def broadcast_signal(sig: Signal) -> None:
     except Exception:
         pass
 
+
+    # Ensure signal_id is globally unique across restarts (Postgres sequence)
+    try:
+        sig.signal_id = await db_store.next_signal_id()
+    except Exception:
+        # fallback: keep existing in-memory id
+        pass
 
     logger.info("Broadcast signal id=%s %s %s %s conf=%s rr=%.2f", sig.signal_id, sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr))
     SIGNALS[sig.signal_id] = sig
