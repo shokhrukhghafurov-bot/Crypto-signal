@@ -1006,6 +1006,56 @@ class Backend:
         latest = self.feed.get_latest(market, signal.symbol)
         return latest if latest is not None else self.feed.mock_price(market, signal.symbol)
 
+    async def check_signal_openable(self, signal: Signal) -> tuple[bool, str, float]:
+        """Return (allowed, reason_code, current_price).
+
+        reason_code is one of: OK, TP2, TP1, SL, TIME, ERROR
+        """
+        try:
+            now = time.time()
+            ttl = int(os.getenv("SIGNAL_OPEN_TTL_SECONDS", "1800"))  # 30 min default
+            sig_ts = float(getattr(signal, "ts", 0) or 0)
+            if sig_ts and ttl > 0 and (now - sig_ts) > ttl:
+                price = await self._get_price(signal)
+                return False, "TIME", float(price)
+
+            price = float(await self._get_price(signal))
+
+            direction = (getattr(signal, "direction", None) or getattr(signal, "side", None) or "").upper()
+            is_short = "SHORT" in direction
+            is_long = not is_short
+
+            tp1 = getattr(signal, "tp1", None)
+            tp2 = getattr(signal, "tp2", None)
+            sl = getattr(signal, "sl", None)
+
+            tp1_f = float(tp1) if tp1 is not None else None
+            tp2_f = float(tp2) if tp2 is not None else None
+            sl_f = float(sl) if sl is not None else None
+
+            if is_long:
+                if tp2_f is not None and price >= tp2_f:
+                    return False, "TP2", price
+                if tp1_f is not None and price >= tp1_f:
+                    return False, "TP1", price
+                if sl_f is not None and price <= sl_f:
+                    return False, "SL", price
+            else:
+                if tp2_f is not None and price <= tp2_f:
+                    return False, "TP2", price
+                if tp1_f is not None and price <= tp1_f:
+                    return False, "TP1", price
+                if sl_f is not None and price >= sl_f:
+                    return False, "SL", price
+
+            return True, "OK", price
+        except Exception:
+            try:
+                price = float(await self._get_price(signal))
+            except Exception:
+                price = 0.0
+            return False, "ERROR", price
+
     async def track_loop(self, bot) -> None:
         while True:
             # iterate over snapshot to allow removals
