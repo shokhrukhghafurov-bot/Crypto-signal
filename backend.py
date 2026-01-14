@@ -201,7 +201,8 @@ def fmt_pnl_pct(p: float) -> str:
     except Exception:
         return "0.0%"
 
-TOP_N = max(10, _env_int("TOP_N", 50))
+TOP_N = _env_int("TOP_N", 50)
+# TOP_N controls how many USDT symbols to scan. Set TOP_N=0 to scan ALL USDT pairs.
 SCAN_INTERVAL_SECONDS = max(30, _env_int("SCAN_INTERVAL_SECONDS", 150))
 CONFIDENCE_MIN = max(0, min(100, _env_int("CONFIDENCE_MIN", 80)))
 # --- TA Quality mode (strict/medium) ---
@@ -802,6 +803,8 @@ class MultiExchangeData:
                 qv = 0.0
             items.append((qv, sym))
         items.sort(reverse=True, key=lambda x: x[0])
+        if n <= 0:
+            return [sym for _, sym in items]
         return [sym for _, sym in items[:n]]
 
     async def _get_json(self, url: str, params: Optional[Dict[str, str]] = None) -> Any:
