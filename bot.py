@@ -648,6 +648,14 @@ def _fmt_symbol(sym: str) -> str:
         return f"{a.strip()} / {b.strip()}"
     return s
 
+def _fmt_price(v) -> str:
+    try:
+        if v is None:
+            return "—"
+        return f"{float(v):.6f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(v) if v is not None else "—"
+
 def _calc_profit_pct(sig: Signal) -> float:
     """Model expected profit % using TP2 if available, otherwise TP1."""
     try:
@@ -711,6 +719,60 @@ def _open_card_text(uid: int, sig: Signal) -> str:
         tag=base,
     )
 
+def _too_late_reason_key(reason: str) -> str:
+    return {
+        "TP2": "sig_too_late_reason_tp2",
+        "TP1": "sig_too_late_reason_tp1",
+        "SL": "sig_too_late_reason_sl",
+        "TIME": "sig_too_late_reason_time",
+        "ERROR": "sig_too_late_reason_error",
+        "OK": "sig_too_late_reason_error",
+    }.get((reason or "").upper(), "sig_too_late_reason_error")
+
+
+async def _expire_signal_message(call: types.CallbackQuery, sig: Signal, reason: str, price: float) -> None:
+    """Remove the OPEN button and mark the signal as expired in-place."""
+    uid = call.from_user.id
+    reason_key = _too_late_reason_key(reason)
+    note = tr(uid, "sig_expired_note").format(
+        reason=tr(uid, reason_key),
+        price=_fmt_price(price),
+    )
+    try:
+        current_text = (call.message.text or "").rstrip()
+        if "⛔" not in current_text:
+            new_text = current_text + "\n\n" + note
+        else:
+            new_text = current_text
+        await call.message.edit_text(new_text, reply_markup=None)
+    except Exception:
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+
+def _too_late_text(uid: int, sig: Signal, reason: str, price: float) -> str:
+    mkt = (sig.market or "FUTURES").upper()
+    mkt_emoji = "🟢" if mkt == "SPOT" else "🔴"
+    sym = _fmt_symbol(sig.symbol)
+    hhmm = _fmt_hhmm(float(getattr(sig, "ts", 0.0) or 0.0))
+
+    reason_key = _too_late_reason_key(reason)
+
+    return tr(uid, "sig_too_late_body").format(
+        market_emoji=mkt_emoji,
+        market=mkt,
+        symbol=sym,
+        reason=tr(uid, reason_key),
+        price=_fmt_price(price),
+        tp1=_fmt_price(getattr(sig, "tp1", None)),
+        tp2=_fmt_price(getattr(sig, "tp2", None)),
+        sl=_fmt_price(getattr(sig, "sl", None)),
+        time=hhmm,
+    )
+
+
 def _fmt_countdown(seconds: float) -> str:
     if seconds < 0:
         seconds = 0
@@ -723,9 +785,9 @@ def _fmt_countdown(seconds: float) -> str:
 
 def _trade_status_emoji(status: str) -> str:
     return {
-        "ACTIVE": "⏳",
+        "ACTIVE": "🟢",
         "TP1": "🟡",
-        "WIN": "🟢",
+        "WIN": "🟣",
         "LOSS": "🔴",
         "BE": "⚪",
         "CLOSED": "✅",
@@ -1045,9 +1107,18 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             await safe_edit(call.message, tr(uid, "no_live_signals"), menu_kb(uid))
             return
 
+        allowed, reason, price = await backend.check_signal_openable(sig)
+        if not allowed:
+            # Drop stale signal from Live caches
+            if LAST_SIGNAL_BY_MARKET.get(market) and LAST_SIGNAL_BY_MARKET[market].signal_id == sig.signal_id:
+                LAST_SIGNAL_BY_MARKET[market] = None
+            await safe_edit(call.message, tr(uid, "no_live_signals"), menu_kb(uid))
+            return
+
         kb = InlineKeyboardBuilder()
         kb.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
-        await safe_send(uid, _signal_text(uid, sig), reply_markup=kb.as_markup())
+        kb.adjust(1)
+        await safe_edit(call.message, _signal_text(uid, sig), kb.as_markup())
         return
 
     # ---- NOTIFICATIONS ----
@@ -1421,6 +1492,17 @@ async def opened(call: types.CallbackQuery) -> None:
     sig = SIGNALS.get(signal_id)
     if not sig:
         await call.answer("Signal not available", show_alert=True)
+        return
+
+    allowed, reason, price = await backend.check_signal_openable(sig)
+    if not allowed:
+        # remove stale from Live cache
+        mkt = (sig.market or "FUTURES").upper()
+        if LAST_SIGNAL_BY_MARKET.get(mkt) and LAST_SIGNAL_BY_MARKET[mkt].signal_id == sig.signal_id:
+            LAST_SIGNAL_BY_MARKET[mkt] = None
+        await _expire_signal_message(call, sig, reason, price)
+        await call.answer(tr(call.from_user.id, "sig_too_late_toast"), show_alert=True)
+        await safe_send(call.from_user.id, _too_late_text(call.from_user.id, sig, reason, price), reply_markup=menu_kb(call.from_user.id))
         return
 
     backend.open_trade(call.from_user.id, sig)
