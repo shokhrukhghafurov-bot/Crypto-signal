@@ -1271,6 +1271,12 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             if until_ts:
                 left = _fmt_countdown(float(until_ts) - time.time())
                 lines.append(trf(uid, "status_macro_timer", left=left))
+            # Timer to end of blackout window (more explicit)
+            if not until_ts and win and isinstance(win, (tuple, list)) and len(win) == 2:
+                until_ts = float(win[1])
+            if until_ts:
+                left_end = _fmt_countdown(float(until_ts) - time.time())
+                lines.append(trf(uid, "status_macro_blackout_timer", left=left_end))
 
         lines.append(trf(uid, "status_next_macro", value=(next_macro or tr(uid, "lbl_none"))))
         lines.append(trf(uid, "status_notifications", state=notif_state))
