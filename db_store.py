@@ -206,7 +206,7 @@ async def close_trade(trade_id: int, *, status: str, price: float | None = None,
             (float(pnl_total_pct) if pnl_total_pct is not None else None),
         )
 
-async def perf_bucket(market: str, *, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
+async def perf_bucket(user_id: int, market: str, *, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
     """
     Aggregates CLOSED trades in [since, until).
     """
@@ -222,53 +222,77 @@ async def perf_bucket(market: str, *, since: dt.datetime, until: dt.datetime) ->
               SUM(CASE WHEN status='TP1' THEN 1 ELSE 0 END)::int AS tp1_hits,
               COALESCE(SUM(CASE WHEN pnl_total_pct IS NULL THEN 0 ELSE pnl_total_pct END), 0)::float AS sum_pnl_pct
             FROM trades
-            WHERE market=$1
+            WHERE user_id=$1 AND market=$2
               AND status IN ('WIN','LOSS','BE','CLOSED')
-              AND closed_at >= $2 AND closed_at < $3;
+              AND closed_at >= $3 AND closed_at < $4;
             """,
+            int(user_id),
             market,
             since,
             until,
         )
         return dict(row) if row else {"trades":0,"wins":0,"losses":0,"be":0,"tp1_hits":0,"sum_pnl_pct":0.0}
 
-async def daily_report(market: str, *, days: int, tz: str = "UTC") -> List[str]:
+async def daily_report(user_id: int, market: str, *, days: int, tz: str = "UTC") -> List[dict]:
     """
-    Returns lines like YYYY-MM-DD: trades=... winrate=... pnl=...
+    Returns per-day buckets (only days that have at least 1 closed trade).
+    Each item: {"day":"YYYY-MM-DD","trades":..,"wins":..,"losses":..,"be":..,"tp1_hits":..,"sum_pnl_pct":..}
+    Day boundaries are computed in the given timezone.
     """
-    # We do day bucketing in SQL using date_trunc in UTC; tz conversion on DB side can be added later if needed.
     pool = get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT
-              (closed_at AT TIME ZONE 'UTC')::date AS day,
+              (closed_at AT TIME ZONE $4)::date AS day,
               COUNT(*)::int AS trades,
               SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END)::int AS wins,
-              COALESCE(SUM(CASE WHEN pnl_total_pct IS NULL THEN 0 ELSE pnl_total_pct END), 0)::float AS pnl
+              SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END)::int AS losses,
+              SUM(CASE WHEN status='BE' THEN 1 ELSE 0 END)::int AS be,
+              SUM(CASE WHEN tp1_hit THEN 1 ELSE 0 END)::int AS tp1_hits,
+              COALESCE(SUM(CASE WHEN pnl_total_pct IS NULL THEN 0 ELSE pnl_total_pct END), 0)::float AS sum_pnl_pct
             FROM trades
-            WHERE market=$1
+            WHERE user_id=$1 AND market=$2
               AND status IN ('WIN','LOSS','BE','CLOSED')
-              AND closed_at >= (NOW() - ($2::int || ' days')::interval)
+              AND closed_at >= (NOW() - ($3::int || ' days')::interval)
             GROUP BY day
             ORDER BY day ASC;
             """,
+            int(user_id),
             market,
             int(days),
+            str(tz),
         )
-        # Build full range with empty days
-        today = dt.datetime.utcnow().date()
-        by_day = {r["day"].isoformat(): dict(r) for r in rows if r.get("day")}
-        out: List[str] = []
-        for i in range(days-1, -1, -1):
-            d = (today - dt.timedelta(days=i)).isoformat()
-            r = by_day.get(d)
-            if not r:
-                out.append(f"{d}: trades=0 winrate=0.0% pnl=+0.00%")
-                continue
-            trades = int(r["trades"])
-            wins = int(r["wins"])
-            pnl = float(r["pnl"])
-            wr = (wins / trades * 100.0) if trades else 0.0
-            out.append(f"{d}: trades={trades} winrate={wr:.1f}% pnl={pnl:+.2f}%")
-        return out
+    return [dict(r) for r in rows]
+
+
+async def weekly_report(user_id: int, market: str, *, weeks: int, tz: str = "UTC") -> List[dict]:
+    """
+    Returns per-week buckets (ISO week label) for the last N weeks that have at least 1 closed trade.
+    Each item: {"week":"2026-W03","trades":..,"wins":..,"losses":..,"be":..,"tp1_hits":..,"sum_pnl_pct":..}
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+              to_char(date_trunc('week', (closed_at AT TIME ZONE $4)), 'IYYY-"W"IW') AS week,
+              COUNT(*)::int AS trades,
+              SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END)::int AS wins,
+              SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END)::int AS losses,
+              SUM(CASE WHEN status='BE' THEN 1 ELSE 0 END)::int AS be,
+              SUM(CASE WHEN tp1_hit THEN 1 ELSE 0 END)::int AS tp1_hits,
+              COALESCE(SUM(CASE WHEN pnl_total_pct IS NULL THEN 0 ELSE pnl_total_pct END), 0)::float AS sum_pnl_pct
+            FROM trades
+            WHERE user_id=$1 AND market=$2
+              AND status IN ('WIN','LOSS','BE','CLOSED')
+              AND closed_at >= (NOW() - ($3::int || ' weeks')::interval)
+            GROUP BY week
+            ORDER BY week ASC;
+            """,
+            int(user_id),
+            market,
+            int(weeks),
+            str(tz),
+        )
+    return [dict(r) for r in rows]
