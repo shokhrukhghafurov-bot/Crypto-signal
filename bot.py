@@ -17,6 +17,8 @@ import datetime as dt
 
 import asyncpg
 
+import db_store
+
 from backend import Backend, Signal, MacroEvent, open_metrics
 
 load_dotenv()
@@ -262,6 +264,14 @@ def _nav_back(user_id: int, default: str = "status") -> str:
 
 PREV_VIEW: dict[int, str] = {}
 
+
+async def safe_edit_markup(chat_id: int, message_id: int, reply_markup, *, ctx: str = ""):
+    """Edit message reply_markup only (e.g., remove inline keyboard)."""
+    try:
+        return await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+    except Exception:
+        return None
+
 async def _send_long(chat_id: int, text: str, reply_markup=None) -> None:
     # Telegram message limit ~4096 chars. Send in chunks if needed.
     max_len = 3800
@@ -406,6 +416,9 @@ async def init_db() -> None:
         pool = None
         return
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    # Share the same pool with trade storage
+    db_store.set_pool(pool)
+    await db_store.ensure_schema()
     async with pool.acquire() as conn:
         # notify_signals flag (shared access + per-bot notification toggle)
         await conn.execute("""
@@ -931,13 +944,13 @@ def _parse_report_lines(lines: list[str]) -> list[tuple[str,int,float,float]]:
         out.append((m.group("k"), int(m.group("t")), float(m.group("wr")), float(m.group("pnl"))))
     return out
 
-def stats_text(uid: int) -> str:
+async def stats_text(uid: int) -> str:
     lang = get_lang(uid)
 
-    spot_today = backend.perf_today("SPOT")
-    fut_today = backend.perf_today("FUTURES")
-    spot_week = backend.perf_week("SPOT")
-    fut_week = backend.perf_week("FUTURES")
+    spot_today = await backend.perf_today("SPOT")
+    fut_today = await backend.perf_today("FUTURES")
+    spot_week = await backend.perf_week("SPOT")
+    fut_week = await backend.perf_week("FUTURES")
 
     if lang == "en":
         header = "📈 Trading statistics"
@@ -1095,7 +1108,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             except Exception:
                 pass
 
-        txt = stats_text(uid)
+        txt = await stats_text(uid)
         await safe_edit(call.message, txt, menu_kb(uid))
         return
 
@@ -1217,10 +1230,10 @@ async def notify_handler(call: types.CallbackQuery) -> None:
                 pass
 
         # performance (separate Spot / Futures)
-        spot_today = backend.perf_today("SPOT")
-        fut_today = backend.perf_today("FUTURES")
-        spot_week = backend.perf_week("SPOT")
-        fut_week = backend.perf_week("FUTURES")
+        spot_today = await backend.perf_today("SPOT")
+        fut_today = await backend.perf_today("FUTURES")
+        spot_week = await backend.perf_week("SPOT")
+        fut_week = await backend.perf_week("FUTURES")
 
         try:
             spot_daily = backend.report_daily("SPOT", 7)
@@ -1298,12 +1311,15 @@ async def notify_handler(call: types.CallbackQuery) -> None:
 # ---------------- trades list (with buttons) ----------------
 PAGE_SIZE = 10
 
-def _trades_page_kb(trades: List, offset: int) -> types.InlineKeyboardMarkup:
+def _trades_page_kb(uid: int, trades: list[dict], offset: int) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for t in trades:
-        s = t.signal
-        label = f"{_trade_status_emoji(t.result)} {s.symbol} {tr_market(uid, s.market)} ({t.result})"
-        kb.button(text=label, callback_data=f"trade:view:{s.signal_id}")
+        sid = int(t.get("signal_id") or 0)
+        symbol = str(t.get("symbol") or "")
+        market = str(t.get("market") or "FUTURES").upper()
+        status = str(t.get("status") or "ACTIVE").upper()
+        label = f"{_trade_status_emoji(status)} {symbol} {tr_market(uid, market)} ({status})"
+        kb.button(text=label, callback_data=f"trade:view:{sid}:{offset}")
     # pagination
     nav = InlineKeyboardBuilder()
     if offset > 0:
@@ -1324,7 +1340,7 @@ async def trades_page(call: types.CallbackQuery) -> None:
     except Exception:
         offset = 0
 
-    all_trades = backend.get_user_trades(call.from_user.id)
+    all_trades = await backend.get_user_trades(call.from_user.id)
     if not all_trades:
         await safe_send(call.from_user.id, tr(call.from_user.id, "my_trades_empty"), reply_markup=menu_kb(call.from_user.id))
         return
@@ -1335,74 +1351,47 @@ async def trades_page(call: types.CallbackQuery) -> None:
 
 # ---------------- trade card ----------------
 
-def _trade_card_text(uid: int, t) -> str:
-    s = t.signal
-    last_price = f"{t.last_price:.6f}" if getattr(t, "last_price", 0.0) else "-"
-    head = f"🪙 {s.symbol} | {tr_market(uid, s.market)}"
-    # Direction is meaningful only for futures; hide for spot.
-    if s.market != 'SPOT':
-        head += f" | {s.direction}"
+def _trade_card_text(uid: int, t: dict) -> str:
+    symbol = str(t.get("symbol") or "")
+    market = str(t.get("market") or "FUTURES").upper()
+    side = str(t.get("side") or "LONG").upper()
+    status = str(t.get("status") or "ACTIVE").upper()
 
-    def _fmt_exchanges(raw: str) -> str:
-        xs = [x.strip() for x in (raw or '').replace(',', '+').split('+') if x.strip()]
-        pretty = []
-        for x in xs:
-            u = x.upper()
-            if u == 'BINANCE':
-                pretty.append('Binance')
-            elif u == 'BYBIT':
-                pretty.append('Bybit')
-            elif u == 'OKX':
-                pretty.append('OKX')
-            else:
-                pretty.append(x)
-        out: List[str] = []
-        for p in pretty:
-            if p not in out:
-                out.append(p)
-        return ' • '.join(out)
+    entry = float(t.get("entry") or 0.0)
+    tp1 = t.get("tp1")
+    tp2 = t.get("tp2")
+    sl = t.get("sl")
 
-    def _tp_lines() -> List[str]:
-        tps_obj = getattr(s, 'tps', None)
-        if isinstance(tps_obj, (list, tuple)) and len(tps_obj) > 0:
-            out: List[str] = []
-            for i, v in enumerate(tps_obj, start=1):
-                try:
-                    fv = float(v)
-                except Exception:
-                    continue
-                if fv <= 0:
-                    continue
-                out.append(f"TP{i}: {fv:.6f}")
-            if out:
-                return out
-        out = [f"TP1: {s.tp1:.6f}"]
-        try:
-            if float(s.tp2) > 0 and abs(float(s.tp2) - float(s.tp1)) > 1e-12:
-                out.append(f"TP2: {s.tp2:.6f}")
-        except Exception:
-            logger.exception("Failed to send message to uid=%s", uid)
-        return out
+    head = f"🪙 {symbol} | {tr_market(uid, market)}"
+    if market != "SPOT":
+        head += f" | {side}"
+
     parts = [
         "📌 " + tr(uid, "m_trades"),
         "",
         head,
+        "",
+        f"{tr(uid, 'sig_entry')}: {entry:.6f}",
     ]
-
-    ex_line = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
-    if ex_line:
-        parts.append(f"{tr(uid, 'sig_exchanges')}: {ex_line}")
+    if sl is not None:
+        parts.append(f"SL: {float(sl):.6f}")
+    if tp1 is not None:
+        parts.append(f"TP1: {float(tp1):.6f}")
+    if tp2 is not None and float(tp2) > 0 and (tp1 is None or abs(float(tp2) - float(tp1)) > 1e-12):
+        parts.append(f"TP2: {float(tp2):.6f}")
 
     parts += [
-        f"{tr(uid, 'sig_tf')}: {s.timeframe}",
         "",
-        f"{tr(uid, 'sig_entry')}: {s.entry:.6f}",
-        f"SL: {s.sl:.6f}",
-        *_tp_lines(),
-        "",
-        f"{tr(uid, 'sig_status')}: {t.result} {_trade_status_emoji(t.result)}",
-        f"{tr(uid, 'sig_last')}: {last_price}",
+        f"{tr(uid, 'sig_status')}: {status} {_trade_status_emoji(status)}",
     ]
+
+    pnl = t.get("pnl_total_pct")
+    if pnl is not None and status in ("WIN","LOSS","BE","CLOSED"):
+        try:
+            parts.append(f"PnL: {float(pnl):+.2f}%")
+        except Exception:
+            pass
+
     return "\n".join(parts)
 
 def _trade_card_kb(uid: int, signal_id: int, back_offset: int = 0) -> types.InlineKeyboardMarkup:
@@ -1417,15 +1406,17 @@ def _trade_card_kb(uid: int, signal_id: int, back_offset: int = 0) -> types.Inli
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:view:"))
 async def trade_view(call: types.CallbackQuery) -> None:
     await call.answer()
+    parts = (call.data or "").split(":")
     try:
-        signal_id = int((call.data or "").split(":")[-1])
+        signal_id = int(parts[2])
+        back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
-    t = backend.get_trade(call.from_user.id, signal_id)
+    t = await backend.get_trade(call.from_user.id, signal_id)
     if not t:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
         return
-    await safe_send(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, signal_id, 0))
+    await safe_send(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, signal_id, back_offset))
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:refresh:"))
 async def trade_refresh(call: types.CallbackQuery) -> None:
@@ -1436,7 +1427,7 @@ async def trade_refresh(call: types.CallbackQuery) -> None:
         back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
-    t = backend.get_trade(call.from_user.id, signal_id)
+    t = await backend.get_trade(call.from_user.id, signal_id)
     if not t:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
         return
@@ -1451,7 +1442,7 @@ async def trade_close(call: types.CallbackQuery) -> None:
         back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
-    removed = backend.remove_trade(call.from_user.id, signal_id)
+    removed = await backend.remove_trade(call.from_user.id, signal_id)
     if removed:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_removed"), reply_markup=menu_kb(call.from_user.id))
     else:
@@ -1467,13 +1458,14 @@ async def trade_orig(call: types.CallbackQuery) -> None:
     except Exception:
         return
 
-    text = ORIGINAL_SIGNAL_TEXT.get((call.from_user.id, signal_id)) or ORIGINAL_SIGNAL_TEXT.get((0, signal_id))
+    t = await backend.get_trade(call.from_user.id, signal_id)
+    text = (t.get("orig_text") if isinstance(t, dict) else None) if t else None
     if not text:
         await safe_send(call.from_user.id, tr(call.from_user.id, "sig_orig_title") + ": " + tr(call.from_user.id, "lbl_none"), reply_markup=menu_kb(call.from_user.id))
         return
 
     kb = InlineKeyboardBuilder()
-    kb.button(text=tr(call.from_user.id, "sig_btn_back_trade"), callback_data=f"trade:view:{signal_id}")
+    kb.button(text=tr(call.from_user.id, "sig_btn_back_trade"), callback_data=f"trade:view:{signal_id}:{back_offset}")
     kb.button(text=tr(call.from_user.id, "sig_btn_my_trades"), callback_data=f"trades:page:{back_offset}")
     kb.button(text=tr(call.from_user.id, "m_menu"), callback_data="menu:status")
     kb.adjust(1, 2)
@@ -1505,7 +1497,25 @@ async def opened(call: types.CallbackQuery) -> None:
         await safe_send(call.from_user.id, _too_late_text(call.from_user.id, sig, reason, price), reply_markup=menu_kb(call.from_user.id))
         return
 
-    backend.open_trade(call.from_user.id, sig)
+    opened_ok = await backend.open_trade(call.from_user.id, sig, orig_text=_signal_text(call.from_user.id, sig))
+    if not opened_ok:
+        # Already opened before -> remove button to prevent retries
+        try:
+            if call.message:
+                await safe_edit_markup(call.from_user.id, call.message.message_id, None)
+        except Exception:
+            pass
+        await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
+        await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
+        return
+
+    # Remove the ✅ ОТКРЫЛ СДЕЛКУ button from the original NEW SIGNAL message
+    try:
+        if call.message:
+            await safe_edit_markup(call.from_user.id, call.message.message_id, None)
+    except Exception:
+        pass
+
     await call.answer(tr(call.from_user.id, "trade_opened_toast"))
     # IMPORTANT: send OPEN card only after user pressed ✅ ОТКРЫЛ СДЕЛКУ
     await safe_send(
