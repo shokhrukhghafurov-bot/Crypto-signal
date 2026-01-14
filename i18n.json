@@ -122,7 +122,8 @@
     "sig_too_late_body": "⛔️ Too late\n\n{market_emoji} {market} | {symbol}\n🕒 Signal: {time}\n\n📌 Reason: {reason}\n💱 Current price: {price}\n\nLevels: TP1 {tp1} • TP2 {tp2} • SL {sl}\n\nTip: wait for a new signal in Spot live / Futures live.",
     "sig_expired_note": "⛔️ Too late — the signal has already played out.\nReason: {reason}\nCurrent price: {price}\nButton disabled.",
     "sig_already_opened_toast": "Trade already opened",
-    "sig_already_opened_msg": "ℹ️ You already opened this signal earlier.\nOpen “📁 My trades” to see the status."
+    "sig_already_opened_msg": "ℹ️ You already opened this signal earlier.\nOpen “📁 My trades” to see the status.",
+    "stats_hint": "Tip: statistics appear only after a trade is closed (TP2 / SL / BE / manual)."
   },
   "ru": {
     "access_blocked": "🚫 Доступ запрещён.",
@@ -247,6 +248,7 @@
     "sig_too_late_body": "⛔️ Слишком поздно\n\n{market_emoji} {market} | {symbol}\n🕒 Сигнал: {time}\n\n📌 Причина: {reason}\n💱 Текущая цена: {price}\n\nУровни: TP1 {tp1} • TP2 {tp2} • SL {sl}\n\nПодсказка: дождись нового сигнала в «Spot live / Futures live».",
     "sig_expired_note": "⛔️ Уже поздно — сигнал отработал.\nПричина: {reason}\nТекущая цена: {price}\nКнопка отключена.",
     "sig_already_opened_toast": "Сделка уже открыта",
-    "sig_already_opened_msg": "ℹ️ Этот сигнал уже был открыт раньше.\nОткрой «📁 Мои сделки», чтобы увидеть статус."
+    "sig_already_opened_msg": "ℹ️ Этот сигнал уже был открыт раньше.\nОткрой «📁 Мои сделки», чтобы увидеть статус.",
+    "stats_hint": "Подсказка: статистика появляется только после закрытия сделки (TP2 / SL / BE / вручную)."
   }
 }
