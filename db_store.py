@@ -43,7 +43,40 @@ async def ensure_schema() -> None:
           orig_text TEXT NOT NULL
         );
         """)
+        
+        # --- schema compat: allow many users to open same signal ---
+        # Older DBs could have UNIQUE(signal_id) which blocks other users.
         await conn.execute("""
+        DO $$
+        DECLARE r RECORD;
+        BEGIN
+          -- Drop UNIQUE constraints that are only on signal_id (legacy)
+          FOR r IN
+            SELECT conname
+            FROM pg_constraint
+            WHERE conrelid = 'trades'::regclass
+              AND contype = 'u'
+              AND pg_get_constraintdef(oid) ILIKE '%(signal_id)%'
+              AND pg_get_constraintdef(oid) NOT ILIKE '%user_id%'
+          LOOP
+            EXECUTE format('ALTER TABLE trades DROP CONSTRAINT IF EXISTS %I;', r.conname);
+          END LOOP;
+
+          -- Drop UNIQUE indexes that are only on signal_id (legacy)
+          FOR r IN
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'trades'
+              AND indexdef ILIKE '%unique%'
+              AND indexdef ILIKE '%(signal_id)%'
+              AND indexdef NOT ILIKE '%user_id%'
+          LOOP
+            EXECUTE format('DROP INDEX IF EXISTS %I;', r.indexname);
+          END LOOP;
+        END $$;
+        """)
+await conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_user_signal
         ON trades (user_id, signal_id);
         """)
@@ -71,25 +104,6 @@ async def ensure_schema() -> None:
         ON trade_events (trade_id, created_at DESC);
         """)
 
-
-
-        # --- TP1 should be recorded at most once per trade (DB-level guard) ---
-        # Clean up duplicate TP1 events (keep earliest) before creating unique index
-        await conn.execute("""
-        WITH d AS (
-          SELECT id,
-                 ROW_NUMBER() OVER (PARTITION BY trade_id ORDER BY created_at ASC, id ASC) AS rn
-          FROM trade_events
-          WHERE event_type = 'TP1'
-        )
-        DELETE FROM trade_events
-        WHERE id IN (SELECT id FROM d WHERE rn > 1);
-        """)
-        await conn.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_trade_events_tp1_once
-        ON trade_events (trade_id)
-        WHERE event_type = 'TP1';
-        """)
 async def open_trade_once(
     *,
     user_id: int,
