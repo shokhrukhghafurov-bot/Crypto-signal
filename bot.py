@@ -1721,3 +1721,17 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+# v16 appended
+
+    # --- Next macro ETA (even when ALLOW) ---
+    try:
+        ne = backend.macro.next_event()  # type: ignore[attr-defined]
+    except Exception:
+        ne = None
+    if ne:
+        ev, win = ne
+        now = time.time()
+        eta = max(0, int(ev.start_ts_utc - now))
+        h = eta // 3600; m = (eta % 3600) // 60; s = eta % 60
+        eta_txt = f"{h:02d}:{m:02d}:{s:02d}"
+        txt += f"\nДо события: {eta_txt}"
