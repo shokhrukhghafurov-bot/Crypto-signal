@@ -69,6 +69,10 @@ def _env_float(name: str, default: float) -> float:
     except Exception:
         return default
 
+
+def _env_str(name: str, default: str) -> str:
+    v = os.getenv(name, "").strip()
+    return v if v else default
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name, "").strip().lower()
     if v == "":
@@ -268,6 +272,18 @@ MACRO_FILTER = _env_bool("MACRO_FILTER", False)
 
 # Orderbook filter (optional)
 ORDERBOOK_FILTER = _env_bool("ORDERBOOK_FILTER", False)
+# ------------------ Orderbook filter (FUTURES only recommended) ------------------
+# Backward compatible alias: ORDERBOOK_FILTER
+USE_ORDERBOOK = _env_bool("USE_ORDERBOOK", ORDERBOOK_FILTER)
+ORDERBOOK_EXCHANGES = [x.strip().lower() for x in _env_str("ORDERBOOK_EXCHANGES", "binance,bybit").split(",") if x.strip()]
+ORDERBOOK_FUTURES_ONLY = _env_bool("ORDERBOOK_FUTURES_ONLY", True)
+
+# Strict defaults (can be overridden via ENV)
+ORDERBOOK_LEVELS = max(5, _env_int("ORDERBOOK_LEVELS", 20))
+ORDERBOOK_IMBALANCE_MIN = max(1.0, _env_float("ORDERBOOK_IMBALANCE_MIN", 1.6))  # bids/asks ratio
+ORDERBOOK_WALL_RATIO = max(1.0, _env_float("ORDERBOOK_WALL_RATIO", 4.0))  # max_level / avg_level
+ORDERBOOK_WALL_NEAR_PCT = max(0.05, _env_float("ORDERBOOK_WALL_NEAR_PCT", 0.5))  # consider walls within X% from mid
+ORDERBOOK_MAX_SPREAD_PCT = max(0.0, _env_float("ORDERBOOK_MAX_SPREAD_PCT", 0.08))  # block if spread too wide
 MACRO_ACTION = os.getenv("MACRO_ACTION", "FUTURES_OFF").strip().upper()  # FUTURES_OFF / PAUSE_ALL
 BLACKOUT_BEFORE_MIN = max(0, _env_int("BLACKOUT_BEFORE_MIN", 30))
 BLACKOUT_AFTER_MIN = max(0, _env_int("BLACKOUT_AFTER_MIN", 45))
@@ -751,6 +767,7 @@ class PriceFeed:
 # ------------------ Exchange data (candles) ------------------
 class MultiExchangeData:
     BINANCE_SPOT = "https://api.binance.com"
+    BINANCE_FUTURES = "https://fapi.binance.com"
     BYBIT = "https://api.bybit.com"
     OKX = "https://www.okx.com"
 
@@ -1189,8 +1206,7 @@ def _fmt_ta_block(ta: Dict[str, Any]) -> str:
             extra.append(f"Resistance: {fnum(res, '{:.6g}')}")
         if extra:
             lines.append(" | ".join(extra))
-        return "
-".join(lines).strip()
+        return "\n".join(lines).strip()
     except Exception:
         return ""
 
@@ -1206,182 +1222,223 @@ def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
     return int(max(0, min(100, score)))
 
 def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """Compute direction + levels + TA snapshot for one exchange using 15m/1h/4h OHLCV."""
     if df15.empty or df1h.empty or df4h.empty:
         return None
+
     df15i = _add_indicators(df15)
     df1hi = _add_indicators(df1h)
     df4hi = _add_indicators(df4h)
-dir4 = _trend_dir(df4hi)
-dir1 = _trend_dir(df1hi)
 
-# Multi-timeframe confirmation (configurable)
-if dir4 is None:
-    return None
-if TA_REQUIRE_1H_TREND:
-    if dir1 is None or dir4 != dir1:
+    dir4 = _trend_dir(df4hi)
+    dir1 = _trend_dir(df1hi)
+
+    # Multi-timeframe confirmation (configurable)
+    if dir4 is None:
         return None
-else:
-    # Use 4h trend as the main direction; 1h may be noisy in medium mode
-    if dir1 is None:
-        dir1 = dir4
+    if TA_REQUIRE_1H_TREND:
+        if dir1 is None or dir4 != dir1:
+            return None
+    else:
+        if dir1 is None:
+            dir1 = dir4
 
-adx4 = float(df4hi.iloc[-1]["adx"]) if not pd.isna(df4hi.iloc[-1]["adx"]) else np.nan
-adx1 = float(df1hi.iloc[-1]["adx"]) if not pd.isna(df1hi.iloc[-1]["adx"]) else np.nan
-
-# Trend strength filter (configurable)
-min_adx_4h = TA_MIN_ADX
-min_adx_1h = max(10.0, TA_MIN_ADX - 2.0)
-
-if np.isnan(adx4) or adx4 < min_adx_4h:
-    return None
-if np.isnan(adx1) or adx1 < min_adx_1h:
-    return None
-    if not _trigger_15m(dir1, df15i):
-        return None
     last15 = df15i.iloc[-1]
+    last1h = df1hi.iloc[-1]
+    last4h = df4hi.iloc[-1]
+
     entry = float(last15["close"])
-    atr = float(last15["atr"]) if not pd.isna(last15["atr"]) else 0.0
-    if atr <= 0:
+    atr = float(last1h.get("atr", np.nan))
+    if np.isnan(atr) or atr <= 0:
         return None
+
     atr_pct = (atr / entry) * 100.0 if entry > 0 else 0.0
     sl, tp1, tp2, rr = _build_levels(dir1, entry, atr)
 
-    # --- Advanced TA snapshot (for display + scoring) ---
+    # Snapshot values
     rsi15 = float(last15.get("rsi", np.nan))
     macd_hist15 = float(last15.get("macd_hist", np.nan))
+    adx4 = float(last4h.get("adx", np.nan))
+    adx1 = float(last1h.get("adx", np.nan))
+
     bb_low = float(last15.get("bb_low", np.nan))
     bb_mid = float(last15.get("bb_mavg", np.nan))
     bb_high = float(last15.get("bb_high", np.nan))
+
     vol = float(last15.get("volume", 0.0) or 0.0)
     vol_sma = float(last15.get("vol_sma20", np.nan))
     vol_rel = (vol / vol_sma) if (vol_sma and not np.isnan(vol_sma) and vol_sma > 0) else np.nan
 
+    # Pattern + S/R
     pattern, pat_bias = _candle_pattern(df15i)
     support, resistance = _nearest_levels(df1hi, lookback=180, swing=3)
 
-    vwap15 = float(last15.get("vwap", np.nan))
-    vwap_bias = "—"
-    try:
-        if not np.isnan(vwap15):
-            vwap_bias = "above" if entry >= vwap15 else "below"
-    except Exception:
-        pass
+    # Strict-ish trigger on 15m (uses ENV thresholds)
+    if not _trigger_15m(dir1, df15i):
+        return None
 
-    bb_pos = "—"
-    try:
-        if not (np.isnan(bb_low) or np.isnan(bb_mid) or np.isnan(bb_high)):
-            if entry >= bb_high:
-                bb_pos = "upper"
-            elif entry <= bb_low:
-                bb_pos = "lower"
-            else:
-                bb_pos = "mid"
-    except Exception:
-        pass
-
-    # --- Score (0..100) used as confidence ---
-    score = 50
-    # trend already aligned on 1h/4h, reward stronger trend
-    if not np.isnan(adx1) and adx1 >= 25:
-        score += 10
-    if not np.isnan(adx4) and adx4 >= 25:
-        score += 10
-
-    # momentum confirmation
-    if not np.isnan(macd_hist15):
-        if dir1 == "LONG" and macd_hist15 > 0:
-            score += 10
-        if dir1 == "SHORT" and macd_hist15 < 0:
-            score += 10
-
-    # RSI quality zone
-    if not np.isnan(rsi15):
-        if dir1 == "LONG" and (50 <= rsi15 <= 70):
-            score += 8
-        if dir1 == "SHORT" and (30 <= rsi15 <= 50):
-            score += 8
-
-    # Bollinger position (avoid extremes; mid/upper for long, mid/lower for short)
-    if bb_pos != "—":
-        if dir1 == "LONG" and bb_pos in ("mid", "upper"):
-            score += 4
-        if dir1 == "SHORT" and bb_pos in ("mid", "lower"):
-            score += 4
-
-    # volume activity
-    if not np.isnan(vol_rel):
-        if vol_rel >= 1.05:
-            score += 6
-        elif vol_rel >= 0.95:
-            score += 3
-
-    # candle pattern bias
-    if pat_bias != 0:
-        if dir1 == "LONG" and pat_bias > 0:
-            score += 6
-        if dir1 == "SHORT" and pat_bias < 0:
-            score += 6
-
-    # proximity to support/resistance (better R:R)
-    try:
-        if support and dir1 == "LONG":
-            dist = abs(entry - support) / max(1e-12, entry)
-            if dist <= 0.006:
-                score += 4
-        if resistance and dir1 == "SHORT":
-            dist = abs(resistance - entry) / max(1e-12, entry)
-            if dist <= 0.006:
-                score += 4
-    except Exception:
-        pass
-
-    # VWAP bias
-    if vwap_bias != "—":
-        if dir1 == "LONG" and vwap_bias == "above":
-            score += 2
-        if dir1 == "SHORT" and vwap_bias == "below":
-            score += 2
-
-    score = int(max(0, min(100, score)))
-
-    # Keep legacy confidence too (for logs/back-compat)
-    conf_legacy = _confidence(adx4, adx1, rsi15 if not np.isnan(rsi15) else 50.0, atr_pct)
+    confidence = _confidence(adx4, adx1, rsi15, atr_pct)
 
     ta = {
-        "trend": f"{dir4}/{dir1}",
-        "rsi15": rsi15,
-        "macd_hist15": macd_hist15,
-        "adx1": adx1,
-        "adx4": adx4,
-        "atr_pct": atr_pct,
-        "bb_pos": bb_pos,
-        "vol_rel": vol_rel,
-        "pattern": pattern,
-        "support": support,
-        "resistance": resistance,
-        "vwap_bias": vwap_bias,
-        "score": score,
-    }
-
-    return {
         "direction": dir1,
         "entry": entry,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
         "rr": rr,
-        "confidence": score,
-        "confidence_legacy": int(conf_legacy),
-        "adx1": adx1,
+        "confidence": confidence,
         "atr_pct": atr_pct,
-        "ta": ta,
-        "ta_block": _fmt_ta_block(ta),
+        "adx1": adx1,
+        "adx4": adx4,
+        "rsi15": rsi15,
+        "macd_hist15": macd_hist15,
+        "bb_low": bb_low,
+        "bb_mid": bb_mid,
+        "bb_high": bb_high,
+        "vol_rel": vol_rel,
+        "pattern": pattern,
+        "support": support,
+        "resistance": resistance,
     }
-
+    ta["ta_block"] = _fmt_ta_block(ta)
+    return ta
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
     return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
 
 # ------------------ Backend ------------------
+
+    async def orderbook_binance_futures(self, symbol: str, limit: int = 100) -> Dict[str, Any]:
+        """Binance USDT-M futures orderbook."""
+        assert self.session is not None
+        url = f"{self.BINANCE_FUTURES}/fapi/v1/depth"
+        params = {"symbol": symbol, "limit": str(limit)}
+        return await self._get_json(url, params=params)
+
+    async def orderbook_bybit_linear(self, symbol: str, limit: int = 50) -> Dict[str, Any]:
+        """Bybit linear futures orderbook."""
+        assert self.session is not None
+        url = f"{self.BYBIT}/v5/market/orderbook"
+        params = {"category": "linear", "symbol": symbol, "limit": str(limit)}
+        return await self._get_json(url, params=params)
+
+
+# ------------------ Orderbook filter helpers ------------------
+def _orderbook_metrics(bids: List[List[Any]], asks: List[List[Any]], *, levels: int) -> Dict[str, float]:
+    """Return imbalance (bids/asks notional), spread_pct, bid_wall_ratio, ask_wall_ratio, bid_wall_near, ask_wall_near."""
+    def _take(side: List[List[Any]]) -> List[Tuple[float, float]]:
+        out: List[Tuple[float, float]] = []
+        for row in side[:levels]:
+            try:
+                p = float(row[0])
+                q = float(row[1])
+                out.append((p, q))
+            except Exception:
+                continue
+        return out
+
+    b = _take(bids)
+    a = _take(asks)
+    if not b or not a:
+        return {"imbalance": 1.0, "spread_pct": 999.0, "bid_wall_ratio": 0.0, "ask_wall_ratio": 0.0, "mid": 0.0}
+
+    best_bid = b[0][0]
+    best_ask = a[0][0]
+    mid = (best_bid + best_ask) / 2.0 if (best_bid > 0 and best_ask > 0) else max(best_bid, best_ask)
+    spread_pct = ((best_ask - best_bid) / mid * 100.0) if mid > 0 else 999.0
+
+    bid_not = [p * q for p, q in b]
+    ask_not = [p * q for p, q in a]
+    sum_b = float(sum(bid_not))
+    sum_a = float(sum(ask_not))
+    imbalance = (sum_b / sum_a) if sum_a > 0 else 999.0
+
+    bid_avg = (sum_b / len(bid_not)) if bid_not else 0.0
+    ask_avg = (sum_a / len(ask_not)) if ask_not else 0.0
+    bid_wall_ratio = (max(bid_not) / bid_avg) if bid_avg > 0 else 0.0
+    ask_wall_ratio = (max(ask_not) / ask_avg) if ask_avg > 0 else 0.0
+
+    return {
+        "imbalance": float(imbalance),
+        "spread_pct": float(spread_pct),
+        "bid_wall_ratio": float(bid_wall_ratio),
+        "ask_wall_ratio": float(ask_wall_ratio),
+        "mid": float(mid),
+    }
+
+def _orderbook_has_near_wall(side: List[List[Any]], *, mid: float, direction: str, near_pct: float, wall_ratio: float, levels: int) -> bool:
+    """Detect an unusually large level close to current price."""
+    # side: bids for SHORT-wall, asks for LONG-wall
+    vals: List[Tuple[float, float]] = []
+    for row in side[:levels]:
+        try:
+            p = float(row[0]); q = float(row[1])
+            if p <= 0 or q <= 0:
+                continue
+            vals.append((p, p*q))
+        except Exception:
+            continue
+    if not vals or mid <= 0:
+        return False
+    avg = sum(v for _, v in vals) / len(vals)
+    if avg <= 0:
+        return False
+    # wall candidates near mid
+    if direction == "LONG":
+        # ask wall above mid within near_pct
+        near = [(p, v) for p, v in vals if p >= mid and (p - mid) / mid * 100.0 <= near_pct]
+    else:
+        # bid wall below mid within near_pct
+        near = [(p, v) for p, v in vals if p <= mid and (mid - p) / mid * 100.0 <= near_pct]
+    if not near:
+        return False
+    max_near = max(v for _, v in near)
+    return (max_near / avg) >= wall_ratio
+
+async def orderbook_filter(api: "MultiExchangeData", exchange: str, symbol: str, direction: str) -> Tuple[bool, str]:
+    """Return (allow, summary) for FUTURES orderbook confirmation."""
+    exchange_l = exchange.strip().lower()
+    try:
+        if exchange_l == "binance":
+            raw = await api.orderbook_binance_futures(symbol, limit=max(50, ORDERBOOK_LEVELS))
+            bids = raw.get("bids", []) or []
+            asks = raw.get("asks", []) or []
+        elif exchange_l == "bybit":
+            raw = await api.orderbook_bybit_linear(symbol, limit=max(50, ORDERBOOK_LEVELS))
+            res = (raw.get("result", {}) or {})
+            bids = res.get("b", []) or []
+            asks = res.get("a", []) or []
+        else:
+            return (True, f"OB {exchange}: skip")
+    except Exception:
+        return (True, f"OB {exchange}: err")
+
+    m = _orderbook_metrics(bids, asks, levels=ORDERBOOK_LEVELS)
+    imb = m["imbalance"]
+    spread = m["spread_pct"]
+    mid = m["mid"]
+
+    # quick blocks
+    if spread > ORDERBOOK_MAX_SPREAD_PCT:
+        return (False, f"OB {exchange}: spread {spread:.3f}%")
+
+    # near wall blocks
+    ask_wall_near = _orderbook_has_near_wall(asks, mid=mid, direction="LONG", near_pct=ORDERBOOK_WALL_NEAR_PCT, wall_ratio=ORDERBOOK_WALL_RATIO, levels=ORDERBOOK_LEVELS)
+    bid_wall_near = _orderbook_has_near_wall(bids, mid=mid, direction="SHORT", near_pct=ORDERBOOK_WALL_NEAR_PCT, wall_ratio=ORDERBOOK_WALL_RATIO, levels=ORDERBOOK_LEVELS)
+
+    if direction == "LONG":
+        if imb < ORDERBOOK_IMBALANCE_MIN:
+            return (False, f"OB {exchange}: imb {imb:.2f}x")
+        if ask_wall_near:
+            return (False, f"OB {exchange}: ask-wall")
+    else:
+        # for SHORT we need asks/bids >= min  => bids/asks <= 1/min
+        if imb > (1.0 / ORDERBOOK_IMBALANCE_MIN):
+            return (False, f"OB {exchange}: imb {imb:.2f}x")
+        if bid_wall_near:
+            return (False, f"OB {exchange}: bid-wall")
+
+    return (True, f"OB {exchange}: ok imb {imb:.2f}x spr {spread:.3f}%")
+
 class Backend:
     def __init__(self) -> None:
         self.feed = PriceFeed()
@@ -1802,17 +1859,33 @@ class Backend:
                         sl = float(np.median([s[1]["sl"] for s in supporters]))
                         tp1 = float(np.median([s[1]["tp1"] for s in supporters]))
                         tp2 = float(np.median([s[1]["tp2"] for s in supporters]))
-rr = float(np.median([s[1]["rr"] for s in supporters]))
-conf = int(np.median([s[1]["confidence"] for s in supporters]))
+                        rr = float(np.median([s[1]["rr"] for s in supporters]))
+                        conf = int(np.median([s[1]["confidence"] for s in supporters]))
+                        
+                        market = choose_market(float(np.nanmax([s[1]["adx1"] for s in supporters])),
+                                              float(np.nanmax([s[1]["atr_pct"] for s in supporters])))
+                        
+                        min_conf = TA_MIN_SCORE_FUTURES if market == "FUTURES" else TA_MIN_SCORE_SPOT
 
-market = choose_market(float(np.nanmax([s[1]["adx1"] for s in supporters])),
-                      float(np.nanmax([s[1]["atr_pct"] for s in supporters])))
-
-min_conf = TA_MIN_SCORE_FUTURES if market == "FUTURES" else TA_MIN_SCORE_SPOT
-
-if conf < min_conf or rr < 2.0:
-    continue
-
+# Orderbook confirmation (FUTURES only, enabled via ENV)
+                        if USE_ORDERBOOK and (not ORDERBOOK_FUTURES_ONLY or market == "FUTURES"):
+                            ob_allows: List[bool] = []
+                            ob_notes: List[str] = []
+                            for ex in [s[0] for s in supporters]:
+                                if ex.strip().lower() not in ORDERBOOK_EXCHANGES:
+                                    continue
+                                ok, note = await orderbook_filter(api, ex, sym, best_dir)
+                                ob_allows.append(bool(ok))
+                                ob_notes.append(note)
+                            # If we checked at least one exchange and none allowed -> block signal
+                            if ob_allows and not any(ob_allows):
+                                # keep a short reason in logs
+                                logger.info("[orderbook] block %s %s %s notes=%s", sym, market, best_dir, "; ".join(ob_notes)[:200])
+                                continue
+                        
+                        if conf < min_conf or rr < 2.0:
+                            continue
+                        
                         risk_notes = []
 
                         # Add TA summary (real indicators) to the signal card
