@@ -316,4 +316,3 @@ async def weekly_report(user_id: int, market: str, *, weeks: int, tz: str = "UTC
             str(tz),
         )
     return [dict(r) for r in rows]
-
