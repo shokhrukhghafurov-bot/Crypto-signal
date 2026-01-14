@@ -1,1216 +1,318 @@
 from __future__ import annotations
 
-import asyncio
-import json
-import os
-import logging
-import re
-from pathlib import Path
-from typing import Dict, List, Set, Tuple
-
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from dotenv import load_dotenv
-from zoneinfo import ZoneInfo
-import datetime as dt
-
 import asyncpg
+import datetime as dt
+from typing import Any, Dict, List, Optional, Tuple
 
-import db_store
+_pool: Optional[asyncpg.Pool] = None
 
-from backend import Backend, Signal, MacroEvent, open_metrics
+def set_pool(pool: asyncpg.Pool) -> None:
+    global _pool
+    _pool = pool
 
-load_dotenv()
+def get_pool() -> asyncpg.Pool:
+    if _pool is None:
+        raise RuntimeError("DB pool is not initialized. Call set_pool() first.")
+    return _pool
 
-# ---- logging to stdout (Railway Deploy Logs) ----
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("bot")
-
-# --- i18n template safety guard (prevents leaking {placeholders} to users) ---
-_UNFILLED_RE = re.compile(r'(?<!\{)\{[a-zA-Z0-9_]+\}(?!\})')
-
-def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
-    """Guard against unfilled {placeholders} leaking to users."""
-    if not text:
-        return text
-    hits = _UNFILLED_RE.findall(text)
-    if hits:
-        logger.error("Unfilled i18n placeholders for uid=%s ctx=%s hits=%s text=%r", uid, ctx, sorted(set(hits)), text)
-        text = _UNFILLED_RE.sub("", text)
-        text = re.sub(r"[ \t]{2,}", " ", text)
-        text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text
-
-async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
-    text = _sanitize_template_text(chat_id, text, ctx=ctx)
-    # Never recurse. Send via bot API.
-    return await bot.send_message(chat_id, text, **kwargs)
-
-async def safe_edit_text(chat_id: int, message_id: int, text: str, *, ctx: str = "", **kwargs):
-    text = _sanitize_template_text(chat_id, text, ctx=ctx)
-    return await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, **kwargs)
-
-
-# -----------------------------------------------
-
-
-def _must_env(name: str) -> str:
-    v = os.getenv(name, "").strip()
-    if not v:
-        raise RuntimeError(f"{name} is missing. Put it into Railway Variables or .env.")
-    return v
-
-BOT_TOKEN = _must_env("BOT_TOKEN")
-
-ADMIN_IDS: List[int] = []
-_raw_admins = os.getenv("ADMIN_IDS", "").strip()
-if _raw_admins:
-    for part in _raw_admins.split(","):
-        part = part.strip()
-        if part:
-            ADMIN_IDS.append(int(part))
-
-def _is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-TZ_NAME = os.getenv("TZ_NAME", "Europe/Berlin").strip() or "Europe/Berlin"
-TZ = ZoneInfo(TZ_NAME)
-
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
-backend = Backend()
-
-# Keep last broadcast signals for 'Spot live' / 'Futures live' buttons
-LAST_SIGNAL_BY_MARKET = {"SPOT": None, "FUTURES": None}
-
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-pool: asyncpg.Pool | None = None
-
-LANG_FILE = Path("langs.json")
-LANG: Dict[int, str] = {}  # user_id -> "ru" | "en"
-
-def load_langs() -> None:
-    global LANG
-    if LANG_FILE.exists():
-        try:
-            data = json.loads(LANG_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                LANG = {int(k): str(v) for k, v in data.items()}
-        except Exception:
-            LANG = {}
-
-def save_langs() -> None:
-    try:
-        LANG_FILE.write_text(json.dumps({str(k): v for k, v in LANG.items()}, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-    except Exception:
-        pass
-
-def get_lang(uid: int) -> str:
-    v = (LANG.get(uid) or "").lower().strip()
-    return "en" if v == "en" else "ru"
-
-def set_lang(uid: int, lang: str) -> None:
-    LANG[uid] = "en" if (lang or "").lower().startswith("en") else "ru"
-    save_langs()
-
-
-I18N_FILE = Path(__file__).with_name("i18n.json")
-
-def load_i18n() -> dict:
-    # Load i18n from external file (preferred). Fall back to embedded defaults if needed.
-    try:
-        if I18N_FILE.exists():
-            data = json.loads(I18N_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "en" in data:
-                return data
-    except Exception:
-        pass
-    return {"ru": {}, "en": {}}
-
-I18N = load_i18n()
-
-
-def tr(uid: int, key: str) -> str:
-    lang = get_lang(uid)
-    return I18N.get(lang, I18N["en"]).get(key, I18N["en"].get(key, key))
-
-
-
-
-class _SafeDict(dict):
-    def __missing__(self, key):
-        return "{" + key + "}"
-
-def trf(uid: int, key: str, **kwargs) -> str:
-    tmpl = tr(uid, key)
-    try:
-        return str(tmpl).format_map(_SafeDict(**kwargs))
-    except Exception:
-        return str(tmpl)
-
-def tr_action(uid: int, v: str) -> str:
-    vv = (v or "").upper().strip()
-    if vv == "ALLOW":
-        return tr(uid, "action_allow")
-    if vv in {"PAUSE", "PAUSED", "STOP", "BLOCK"}:
-        return tr(uid, "action_pause")
-    return v
-
-def tr_market(uid: int, market: str) -> str:
-    return tr(uid, "lbl_spot") if (market or "").upper().strip() == "SPOT" else tr(uid, "lbl_futures")
-
-SIGNALS: Dict[int, Signal] = {}
-ORIGINAL_SIGNAL_TEXT: Dict[tuple[int,int], str] = {}  # (uid, signal_id) -> text
-
-# Anti-duplicate protection for broadcasted signals.
-# Some scanners can emit the same signal multiple times (sometimes with different IDs).
-_SENT_SIG_CACHE: Dict[str, float] = {}  # signature -> last_sent_ts
-_SENT_SIG_TTL_SEC = int(os.getenv("SENT_SIG_TTL_SEC", "600"))  # default 10 minutes
-
-# ---------------- signal stats (daily/weekly) ----------------
-STATS_FILE = Path("signal_stats.json")
-SIGNAL_STATS: Dict[str, Dict[str, int]] = {"days": {}, "weeks": {}}
-
-def load_signal_stats() -> None:
-    global SIGNAL_STATS
-    if STATS_FILE.exists():
-        try:
-            data = json.loads(STATS_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                days = data.get("days") or {}
-                weeks = data.get("weeks") or {}
-                if isinstance(days, dict) and isinstance(weeks, dict):
-                    SIGNAL_STATS = {
-                        "days": {str(k): int(v) for k, v in days.items()},
-                        "weeks": {str(k): int(v) for k, v in weeks.items()},
-                    }
-        except Exception:
-            SIGNAL_STATS = {"days": {}, "weeks": {}}
-
-def save_signal_stats() -> None:
-    try:
-        STATS_FILE.write_text(json.dumps(SIGNAL_STATS, ensure_ascii=False, sort_keys=True), encoding="utf-8")
-    except Exception:
-        pass
-
-def _day_key(d: dt.date) -> str:
-    return d.isoformat()
-
-def _week_key(d: dt.date) -> str:
-    y, w, _ = d.isocalendar()
-    return f"{y}-W{int(w):02d}"
-
-def bump_signal_stats() -> None:
-    # Counts are global (for all users) and respect TZ_NAME
-    now = dt.datetime.now(TZ)
-    dk = _day_key(now.date())
-    wk = _week_key(now.date())
-    SIGNAL_STATS["days"][dk] = int(SIGNAL_STATS["days"].get(dk, 0)) + 1
-    SIGNAL_STATS["weeks"][wk] = int(SIGNAL_STATS["weeks"].get(wk, 0)) + 1
-    save_signal_stats()
-
-def _signals_today() -> int:
-    dk = _day_key(dt.datetime.now(TZ).date())
-    return int(SIGNAL_STATS["days"].get(dk, 0))
-
-def _signals_this_week() -> int:
-    wk = _week_key(dt.datetime.now(TZ).date())
-    return int(SIGNAL_STATS["weeks"].get(wk, 0))
-
-def _daily_report_lines(days: int = 7) -> list[str]:
-    today = dt.datetime.now(TZ).date()
-    out: list[str] = []
-    for i in range(days - 1, -1, -1):
-        d = today - dt.timedelta(days=i)
-        k = _day_key(d)
-        cnt = int(SIGNAL_STATS["days"].get(k, 0))
-        out.append(f"{k}: {cnt}")
-    return out
-
-def _weekly_report_lines(weeks: int = 4) -> list[str]:
-    today = dt.datetime.now(TZ).date()
-    # go back (weeks-1) weeks and build iso week keys
-    out: list[str] = []
-    seen = set()
-    for i in range(weeks - 1, -1, -1):
-        d = today - dt.timedelta(days=7*i)
-        k = _week_key(d)
-        if k in seen:
-            continue
-        seen.add(k)
-        cnt = int(SIGNAL_STATS["weeks"].get(k, 0))
-        out.append(f"{k}: {cnt}")
-    return out
-
-# Status auto-refresh (per user)
-STATUS_TASKS: Dict[int, asyncio.Task] = {}
-
-CURRENT_VIEW: dict[int, str] = {}
-
-def _nav_enter(user_id: int, view: str) -> None:
-    prev = CURRENT_VIEW.get(user_id)
-    if view != "back":
-        if prev and prev != view:
-            PREV_VIEW[user_id] = prev
-        CURRENT_VIEW[user_id] = view
-
-def _nav_back(user_id: int, default: str = "status") -> str:
-    return PREV_VIEW.get(user_id) or default
-
-PREV_VIEW: dict[int, str] = {}
-
-
-async def safe_edit_markup(chat_id: int, message_id: int, reply_markup, *, ctx: str = ""):
-    """Edit message reply_markup only (e.g., remove inline keyboard)."""
-    try:
-        return await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
-    except Exception:
-        return None
-
-async def _send_long(chat_id: int, text: str, reply_markup=None) -> None:
-    # Telegram message limit ~4096 chars. Send in chunks if needed.
-    max_len = 3800
-    if len(text) <= max_len:
-        await safe_send(chat_id, text, reply_markup=reply_markup)
-        return
-    parts = []
-    cur = ""
-    for line in text.splitlines(True):
-        if len(cur) + len(line) > max_len and cur:
-            parts.append(cur)
-            cur = ""
-        cur += line
-    if cur:
-        parts.append(cur)
-
-
-
-async def safe_edit(message: types.Message | None, txt: str, kb: types.InlineKeyboardMarkup) -> None:
-    """Edit message text if possible; otherwise send a new message."""
-    try:
-        if message:
-            await bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=message.message_id,
-                text=txt,
-                reply_markup=kb,
-            )
-            return
-    except Exception:
-        # message may be too old/not modified/etc. Fall back to send.
-        pass
-
-    try:
-        if message:
-            await safe_send(message.chat.id, txt, reply_markup=kb)
-    except Exception:
-        pass
-
-
-async def _render_in_place(call: types.CallbackQuery, txt: str, kb: types.InlineKeyboardMarkup) -> types.Message:
-    """Prefer editing the message that contains the pressed button."""
-    try:
-        if call.message:
-            await bot.edit_message_text(chat_id=call.from_user.id, message_id=call.message.message_id, text=txt, reply_markup=kb)
-            return call.message
-    except Exception:
-        pass
-    return await safe_send(call.from_user.id, txt, reply_markup=kb)
-
-
-async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKeyboardMarkup | None = None) -> None:
-    """Edit message text if possible, otherwise send a new message.
-
-    Used for menu actions (including Notifications toggle).
+async def ensure_schema() -> None:
     """
-    if not message:
-        return
-    chat_id = message.chat.id
-    msg_id = message.message_id
-    try:
-        await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=kb)
-        return
-    except Exception:
-        # Fallback: try sending a new message to the chat
-        try:
-            await safe_send(chat_id, text, reply_markup=kb)
-        except Exception:
-            logger.exception("Failed to ensure DB indexes")
-
-
-    for i, part in enumerate(parts):
-        await safe_send(chat_id, part, reply_markup=reply_markup if i == len(parts)-1 else None)
-
-def _fmt_perf(uid: int, b: dict) -> str:
-    trades = int(b.get("trades", 0))
-    wins = int(b.get("wins", 0))
-    losses = int(b.get("losses", 0))
-    be = int(b.get("be", 0))
-    tp1 = int(b.get("tp1_hits", 0))
-    pnl = float(b.get("sum_pnl_pct", 0.0))
-    wr = (wins / trades * 100.0) if trades else 0.0
-
-    return (
-        f"{tr(uid, 'lbl_trades')}: {trades} | "
-        f"{tr(uid, 'lbl_wins')}: {wins} | "
-        f"{tr(uid, 'lbl_losses')}: {losses} | "
-        f"{tr(uid, 'lbl_be')}: {be} | "
-        f"{tr(uid, 'lbl_tp1')}: {tp1}\n"
-        f"{tr(uid, 'lbl_winrate')}: {wr:.1f}%\n"
-        f"{tr(uid, 'lbl_pnl')}: {pnl:+.2f}%"
-    )
-
-async def _build_status_text(uid: int = 0) -> str:
-    next_macro = backend.get_next_macro()
-    macro_action = (backend.last_macro_action or "ALLOW").upper()
-    macro_prefix = "🟢" if macro_action == "ALLOW" else "🔴"
-
-    macro_line = tr(uid, "next_macro").format(v=tr(uid, "lbl_none"))
-    if next_macro:
-        ev, (w0, w1) = next_macro
-        secs = max(0, w0 - time.time())
-        macro_line = f"🟡 {ev}: {_fmt_hhmm(w0)}–{_fmt_hhmm(w1)} | {tr(uid, 'lbl_in')} {_fmt_countdown(secs)}"
-
-    scan_line = tr(uid, "scanner_run")
-    news_line = tr(uid, "news_action").format(v=tr_action(uid, backend.last_news_action))
-    macro_line2 = tr(uid, "macro_action").format(v=tr_action(uid, macro_action))
-
-    enabled = True
-    try:
-        enabled = await get_notify_signals(uid) if uid else True
-    except Exception:
-        enabled = True
-    state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
-    notif_line = tr(uid, "status_notify").format(v=state)
-
-    return "\n".join([scan_line, news_line, f"{macro_prefix} {macro_line2}", macro_line, notif_line])
-
-async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: int = 120, interval: int = 5) -> None:
-    # Refresh countdown + macro status for a short window to avoid spam/rate limits
-    end = time.time() + max(10, seconds)
-    last_txt: str | None = None
-    while time.time() < end:
-        await asyncio.sleep(interval)
-        try:
-            txt = await _build_status_text(uid)
-            if txt == last_txt:
-                continue
-            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=txt, reply_markup=menu_kb(uid))
-            last_txt = txt
-        except Exception:
-            return
-
-
-# ---------------- DB helpers ----------------
-
-async def init_db() -> None:
-    """Init Postgres pool and ensure required columns exist."""
-    global pool
-    if not DATABASE_URL:
-        # Allow running without Postgres locally, but notifications will be disabled.
-        pool = None
-        return
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    # Share the same pool with trade storage
-    db_store.set_pool(pool)
-    await db_store.ensure_schema()
+    Creates tables needed for persistent trades/statistics.
+    Uses IDENTITY (auto increment) columns.
+    """
+    pool = get_pool()
     async with pool.acquire() as conn:
-        # notify_signals flag (shared access + per-bot notification toggle)
         await conn.execute("""
-        ALTER TABLE users
-          ADD COLUMN IF NOT EXISTS notify_signals BOOLEAN NOT NULL DEFAULT TRUE;
+        CREATE TABLE IF NOT EXISTS trades (
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          user_id BIGINT NOT NULL,
+          signal_id BIGINT NOT NULL, -- signal id used in bot callbacks (in-memory signal sequence)
+          market TEXT NOT NULL CHECK (market IN ('SPOT','FUTURES')),
+          symbol TEXT NOT NULL,
+          side TEXT NOT NULL,
+          entry NUMERIC(18,8) NOT NULL,
+          tp1   NUMERIC(18,8),
+          tp2   NUMERIC(18,8),
+          sl    NUMERIC(18,8),
+          status TEXT NOT NULL CHECK (status IN ('ACTIVE','TP1','BE','WIN','LOSS','CLOSED')),
+          tp1_hit BOOLEAN NOT NULL DEFAULT FALSE,
+          be_price NUMERIC(18,8),
+          opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          closed_at TIMESTAMPTZ,
+          pnl_total_pct NUMERIC(10,4),
+          orig_text TEXT NOT NULL
+        );
         """)
-        # safety indexes (if table already exists, IF NOT EXISTS works on PG 9.5+ for indexes)
+        await conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_user_signal
+        ON trades (user_id, signal_id);
+        """)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_trades_user_status
+        ON trades (user_id, status);
+        """)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_trades_status_opened
+        ON trades (status, opened_at DESC);
+        """)
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS trade_events (
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          trade_id BIGINT NOT NULL REFERENCES trades(id) ON DELETE CASCADE,
+          event_type TEXT NOT NULL CHECK (event_type IN ('OPEN','TP1','BE','WIN','LOSS','CLOSE')),
+          price NUMERIC(18,8),
+          pnl_pct NUMERIC(10,4),
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_trade_events_trade_time
+        ON trade_events (trade_id, created_at DESC);
+        """)
+
+async def open_trade_once(
+    *,
+    user_id: int,
+    signal_id: int,
+    market: str,
+    symbol: str,
+    side: str,
+    entry: float,
+    tp1: float | None,
+    tp2: float | None,
+    sl: float | None,
+    orig_text: str,
+) -> Tuple[bool, Optional[int]]:
+    """
+    Inserts a new trade if not already opened (unique user_id+signal_id).
+    Returns (inserted, trade_db_id).
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
         try:
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
+            row = await conn.fetchrow(
+                """
+                INSERT INTO trades (user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl, status, orig_text)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'ACTIVE',$10)
+                ON CONFLICT (user_id, signal_id) DO NOTHING
+                RETURNING id;
+                """,
+                int(user_id), int(signal_id), market, symbol, side, float(entry),
+                (float(tp1) if tp1 is not None else None),
+                (float(tp2) if tp2 is not None else None),
+                (float(sl) if sl is not None else None),
+                orig_text or ""
+            )
+            if row and row["id"] is not None:
+                trade_id = int(row["id"])
+                await conn.execute(
+                    "INSERT INTO trade_events (trade_id, event_type) VALUES ($1,'OPEN');",
+                    trade_id,
+                )
+                return True, trade_id
+            return False, None
         except Exception:
-            logger.exception("Failed to ensure DB indexes")
+            # let caller log
+            raise
 
-async def ensure_user(user_id: int) -> None:
-    if not pool or not user_id:
-        return
-    async with pool.acquire() as conn:
-        # Create user row if missing. Do not change existing access fields.
-        await conn.execute(
-            """INSERT INTO users (telegram_id, notify_signals)
-                   VALUES ($1, TRUE)
-                   ON CONFLICT (telegram_id) DO NOTHING;""",
-            user_id,
-        )
-
-async def get_user_row(user_id: int):
-    if not pool or not user_id:
-        return None
-    async with pool.acquire() as conn:
-        return await conn.fetchrow(
-            """SELECT telegram_id, expires_at, is_blocked, notify_signals
-                 FROM users WHERE telegram_id=$1""",
-            user_id,
-        )
-
-def _access_status_from_row(row) -> str:
-    if row is None:
-        return "no_user"
-    try:
-        if bool(row.get("is_blocked")):
-            return "blocked"
-    except Exception:
-        pass
-    expires_at = row.get("expires_at") if row is not None else None
-    if expires_at is None:
-        return "expired"
-    try:
-        now = dt.datetime.now(dt.timezone.utc)
-        if expires_at < now:
-            return "expired"
-    except Exception:
-        return "expired"
-    return "ok"
-
-async def get_access_status(user_id: int) -> str:
-    row = await get_user_row(user_id)
-    return _access_status_from_row(row)
-
-async def get_notify_signals(user_id: int) -> bool:
-    row = await get_user_row(user_id)
-    if row is None:
-        return True
-    v = row.get("notify_signals")
-    return True if v is None else bool(v)
-
-async def toggle_notify_signals(user_id: int) -> bool:
-    if not pool or not user_id:
-        return True
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """UPDATE users
-                   SET notify_signals = NOT COALESCE(notify_signals, TRUE)
-                 WHERE telegram_id=$1
-             RETURNING notify_signals""",
-            user_id,
-        )
-        if row is None:
-            await ensure_user(user_id)
-            return True
-        return bool(row["notify_signals"])
-
-
-async def set_notify_signals(user_id: int, value: bool) -> bool:
-    """Set notify_signals explicitly. Returns the saved value."""
-    if not pool or not user_id:
-        return True
-    await ensure_user(user_id)
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """UPDATE users
-                   SET notify_signals = $2
-                 WHERE telegram_id=$1
-             RETURNING notify_signals""",
-            user_id, bool(value)
-        )
-        if row is None:
-            # if user row didn't exist for some reason, ensure_user created it with TRUE
-            return bool(value)
-        return bool(row["notify_signals"])
-
-async def get_broadcast_user_ids() -> List[int]:
-    """Users allowed to receive signals."""
-    if not pool:
-        return []
+async def list_user_trades(user_id: int, *, include_closed: bool = True, limit: int = 50) -> List[Dict[str, Any]]:
+    pool = get_pool()
+    where = "user_id=$1"
+    if not include_closed:
+        where += " AND status IN ('ACTIVE','TP1')"
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT telegram_id
-                 FROM users
-                 WHERE COALESCE(is_blocked, FALSE) = FALSE
-                   AND expires_at IS NOT NULL
-                   AND expires_at > now()
-                   AND COALESCE(notify_signals, TRUE) = TRUE"""
+            f"""
+            SELECT id, user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl,
+                   status, tp1_hit, be_price, opened_at, closed_at, pnl_total_pct, orig_text
+            FROM trades
+            WHERE {where}
+            ORDER BY opened_at DESC
+            LIMIT {int(limit)};
+            """,
+            int(user_id),
         )
-        return [int(r["telegram_id"]) for r in rows if r and r.get("telegram_id") is not None]
+        return [dict(r) for r in rows]
 
+async def get_trade_by_user_signal(user_id: int, signal_id: int) -> Optional[Dict[str, Any]]:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl,
+                   status, tp1_hit, be_price, opened_at, closed_at, pnl_total_pct, orig_text
+            FROM trades
+            WHERE user_id=$1 AND signal_id=$2
+            """,
+            int(user_id), int(signal_id)
+        )
+        return dict(row) if row else None
 
-# ---------------- UI helpers ----------------
+async def list_active_trades(limit: int = 500) -> List[Dict[str, Any]]:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl,
+                   status, tp1_hit, be_price, opened_at, closed_at, pnl_total_pct, orig_text
+            FROM trades
+            WHERE status IN ('ACTIVE','TP1')
+            ORDER BY opened_at DESC
+            LIMIT $1
+            """,
+            int(limit),
+        )
+        return [dict(r) for r in rows]
 
-def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.button(text=tr(uid, "m_status"), callback_data="menu:status")
-    kb.button(text=tr(uid, "m_stats"), callback_data="menu:stats")
-    kb.button(text=tr(uid, "m_spot"), callback_data="menu:spot")
-    kb.button(text=tr(uid, "m_fut"), callback_data="menu:futures")
-    kb.button(text=tr(uid, "m_trades"), callback_data="trades:page:0")
-    kb.button(text=tr(uid, "m_notify"), callback_data="menu:notify")
-    kb.adjust(2, 2, 1)
-    return kb.as_markup()
-
-
-def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    # Show only one toggle button to keep UI clean
-    if enabled:
-        kb.button(text=tr(uid, "btn_notify_off"), callback_data="notify:set:off")
-    else:
-        kb.button(text=tr(uid, "btn_notify_on"), callback_data="notify:set:on")
-    kb.adjust(1)
-    kb.button(text=tr(uid, "btn_back"), callback_data="notify:back")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-
-
-def _signal_text(uid: int, s: Signal) -> str:
-    header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
-    market_banner = tr(uid, 'sig_spot_new') if s.market == 'SPOT' else tr(uid, 'sig_fut_new')
-
-    # Visual marker near symbol (kept simple to avoid hard-depending on any exchange)
-    symbol_emoji = "🟢" if s.market == 'SPOT' else "🌕"
-
-    # Direction should be shown for both SPOT and FUTURES.
-    arrow = tr(uid, 'sig_long') if s.direction == 'LONG' else tr(uid, 'sig_short')
-    direction_line = arrow + "\n"
-
-    def _fmt_exchanges(raw: str) -> str:
-        xs = [x.strip() for x in (raw or '').replace(',', '+').split('+') if x.strip()]
-        pretty = []
-        for x in xs:
-            u = x.upper()
-            if u == 'BINANCE':
-                pretty.append('Binance')
-            elif u == 'BYBIT':
-                pretty.append('Bybit')
-            elif u == 'OKX':
-                pretty.append('OKX')
-            else:
-                pretty.append(x)
-        out: List[str] = []
-        for p in pretty:
-            if p not in out:
-                out.append(p)
-        return ' • '.join(out)
-
-    def _tp_lines() -> List[str]:
-        tps_obj = getattr(s, 'tps', None)
-        if isinstance(tps_obj, (list, tuple)) and len(tps_obj) > 0:
-            lines: List[str] = []
-            for i, v in enumerate(tps_obj, start=1):
-                try:
-                    fv = float(v)
-                except Exception:
-                    continue
-                if fv <= 0:
-                    continue
-                lines.append(f"TP{i}: {fv:.6f}")
-            if lines:
-                return lines
-
-        lines: List[str] = []
-        lines.append(f"TP1: {s.tp1:.6f}")
-        try:
-            if float(s.tp2) > 0 and abs(float(s.tp2) - float(s.tp1)) > 1e-12:
-                lines.append(f"TP2: {s.tp2:.6f}")
-        except Exception:
-            logger.exception("Failed to ensure DB indexes")
-        return lines
-
-    ex_line_raw = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
-    exchanges_line = f"{tr(uid, 'sig_exchanges')}: {ex_line_raw}\n" if ex_line_raw else ""
-    # Keep TF on its own line; timeframe string already like 15m/1h/4h
-    tf_line = f"{tr(uid, 'sig_tf')}: {s.timeframe}"
-
-    tp_lines = "\n".join(_tp_lines())
-
-    rr_line = f"{tr(uid, 'sig_rr')}: 1:{s.rr:.2f}"
-    conf_line = f"{tr(uid, 'sig_confidence')}: {s.confidence}/100"
-    confirm_line = f"{tr(uid, 'sig_confirm')}: {s.confirmations}"
-
-    risk_note = (s.risk_note or '').strip()
-    risk_block = f"\n\n{risk_note}" if risk_note else ""
-
-    return trf(uid, "msg_open_card",
-        market_banner=market_banner,
-        header=header,
-        symbol_emoji=symbol_emoji,
-        symbol=s.symbol,
-        direction_line=direction_line,
-        exchanges_line=exchanges_line,
-        tf_line=tf_line,
-        entry_label=tr(uid, 'sig_entry'),
-        entry=f"{s.entry:.6f}",
-        sl=f"{s.sl:.6f}",
-        tp_lines=tp_lines,
-        rr_line=rr_line,
-        conf_line=conf_line,
-        confirm_line=confirm_line,
-        risk_block=risk_block,
-        open_prompt=tr(uid, 'sig_open_prompt')
-    )
-
-def _fmt_hhmm(ts_utc: float) -> str:
-    d = dt.datetime.fromtimestamp(ts_utc, tz=ZoneInfo("UTC")).astimezone(TZ)
-    return d.strftime("%H:%M")
-
-def _fmt_symbol(sym: str) -> str:
-    s = (sym or "").strip().upper()
-    if "/" in s:
-        a, b = s.split("/", 1)
-        return f"{a.strip()} / {b.strip()}"
-    return s
-
-def _fmt_price(v) -> str:
-    try:
-        if v is None:
-            return "—"
-        return f"{float(v):.6f}".rstrip("0").rstrip(".")
-    except Exception:
-        return str(v) if v is not None else "—"
-
-def _calc_profit_pct(sig: Signal) -> float:
-    """Model expected profit % using TP2 if available, otherwise TP1."""
-    try:
-        entry = float(sig.entry)
-        tp = float(sig.tp2) if float(getattr(sig, "tp2", 0.0) or 0.0) > 0 else float(sig.tp1)
-        side = (sig.direction or "LONG").upper().strip()
-        if entry <= 0:
-            return 0.0
-        if side == "SHORT":
-            return (entry - tp) / entry * 100.0
-        return (tp - entry) / entry * 100.0
-    except Exception:
-        return 0.0
-
-def _open_card_text(uid: int, sig: Signal) -> str:
-    sym_disp = _fmt_symbol(sig.symbol)
-    base = sym_disp.split("/")[0].strip().replace(" ", "") if sym_disp else "SYMBOL"
-    exchanges = (getattr(sig, "confirmations", "") or "").replace("+", " • ")
-    if not exchanges:
-        exchanges = tr(uid, "lbl_none")
-
-    # backend-only metrics (profit/leverage/rr computed in backend.py)
-    mx = open_metrics(sig)
-    profit = mx.get("profit", 0.0)
-    hhmm = _fmt_hhmm(float(getattr(sig, "ts", 0.0) or 0.0))
-
-    side = mx.get("side", (sig.direction or "LONG")).upper().strip()
-    mkt = mx.get("market", (sig.market or "FUTURES")).upper().strip()
-    lev = str(mx.get("lev", "5"))
-    rr = mx.get("rr", getattr(sig, "rr", 0.0))
-
-    if mkt == "SPOT":
-        return trf(
-            uid,
-            "open_spot",
-            symbol=sym_disp,
-            exchanges=exchanges,
-            entry=f"{float(sig.entry):.5f}",
-            tp1=f"{float(sig.tp1):.5f}",
-            tp2=f"{float(sig.tp2):.5f}",
-            sl=f"{float(sig.sl):.5f}",
-            profit=f"{float(profit):.1f}",
-            time=hhmm,
-            tag=base,
+async def set_tp1(trade_id: int, *, be_price: float, price: float | None = None, pnl_pct: float | None = None) -> None:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE trades
+            SET status='TP1', tp1_hit=TRUE, be_price=$2
+            WHERE id=$1;
+            """,
+            int(trade_id), float(be_price)
+        )
+        await conn.execute(
+            "INSERT INTO trade_events (trade_id, event_type, price, pnl_pct) VALUES ($1,'TP1',$2,$3);",
+            int(trade_id),
+            (float(price) if price is not None else None),
+            (float(pnl_pct) if pnl_pct is not None else None),
         )
 
-    return trf(
-        uid,
-        "open_futures",
-        symbol=sym_disp,
-        exchanges=exchanges,
-        side=side,
-        lev=lev,
-        entry=f"{float(sig.entry):.5f}",
-        tp1=f"{float(sig.tp1):.5f}",
-        tp2=f"{float(sig.tp2):.5f}",
-        sl=f"{float(sig.sl):.5f}",
-        rr=f"{float(rr):.1f}",
-        profit=f"{float(profit):.1f}",
-        time=hhmm,
-        tag=base,
-    )
-
-def _too_late_reason_key(reason: str) -> str:
-    return {
-        "TP2": "sig_too_late_reason_tp2",
-        "TP1": "sig_too_late_reason_tp1",
-        "SL": "sig_too_late_reason_sl",
-        "TIME": "sig_too_late_reason_time",
-        "ERROR": "sig_too_late_reason_error",
-        "OK": "sig_too_late_reason_error",
-    }.get((reason or "").upper(), "sig_too_late_reason_error")
-
-
-async def _expire_signal_message(call: types.CallbackQuery, sig: Signal, reason: str, price: float) -> None:
-    """Remove the OPEN button and mark the signal as expired in-place."""
-    uid = call.from_user.id
-    reason_key = _too_late_reason_key(reason)
-    note = tr(uid, "sig_expired_note").format(
-        reason=tr(uid, reason_key),
-        price=_fmt_price(price),
-    )
-    try:
-        current_text = (call.message.text or "").rstrip()
-        if "⛔" not in current_text:
-            new_text = current_text + "\n\n" + note
-        else:
-            new_text = current_text
-        await call.message.edit_text(new_text, reply_markup=None)
-    except Exception:
-        try:
-            await call.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
-
-def _too_late_text(uid: int, sig: Signal, reason: str, price: float) -> str:
-    mkt = (sig.market or "FUTURES").upper()
-    mkt_emoji = "🟢" if mkt == "SPOT" else "🔴"
-    sym = _fmt_symbol(sig.symbol)
-    hhmm = _fmt_hhmm(float(getattr(sig, "ts", 0.0) or 0.0))
-
-    reason_key = _too_late_reason_key(reason)
-
-    return tr(uid, "sig_too_late_body").format(
-        market_emoji=mkt_emoji,
-        market=mkt,
-        symbol=sym,
-        reason=tr(uid, reason_key),
-        price=_fmt_price(price),
-        tp1=_fmt_price(getattr(sig, "tp1", None)),
-        tp2=_fmt_price(getattr(sig, "tp2", None)),
-        sl=_fmt_price(getattr(sig, "sl", None)),
-        time=hhmm,
-    )
-
-
-def _fmt_countdown(seconds: float) -> str:
-    if seconds < 0:
-        seconds = 0
-    m = int(seconds // 60)
-    h = m // 60
-    m = m % 60
-    if h > 0:
-        return f"{h}h {m}m"
-    return f"{m}m"
-
-def _trade_status_emoji(status: str) -> str:
-    return {
-        "ACTIVE": "🟢",
-        "TP1": "🟡",
-        "WIN": "🟣",
-        "LOSS": "🔴",
-        "BE": "⚪",
-        "CLOSED": "✅",
-    }.get(status, "⏳")
-
-# ---------------- broadcasting ----------------
-async def broadcast_signal(sig: Signal) -> None:
-    # Deduplicate: avoid sending the same signal twice (common when scanner emits duplicates).
-    import time, hashlib
-    now = time.time()
-    for k, ts in list(_SENT_SIG_CACHE.items()):
-        if now - ts > _SENT_SIG_TTL_SEC:
-            _SENT_SIG_CACHE.pop(k, None)
-
-    sig_raw = f"{sig.market}|{sig.symbol}|{sig.direction}|{sig.timeframe}|{sig.entry}|{sig.sl}|{sig.tp1}|{sig.tp2}|{sig.confirmations}"
-    sig_key = hashlib.sha1(sig_raw.encode('utf-8')).hexdigest()
-    if sig_key in _SENT_SIG_CACHE:
-        logger.info("Skip duplicate signal %s %s %s (within ttl)", sig.market, sig.symbol, sig.direction)
-        return
-    _SENT_SIG_CACHE[sig_key] = now
-
-    # Save as last live signal for menu buttons
-    try:
-        LAST_SIGNAL_BY_MARKET["SPOT" if sig.market == "SPOT" else "FUTURES"] = sig
-    except Exception:
-        pass
-
-
-    logger.info("Broadcast signal id=%s %s %s %s conf=%s rr=%.2f", sig.signal_id, sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr))
-    SIGNALS[sig.signal_id] = sig
-    ORIGINAL_SIGNAL_TEXT[(0, sig.signal_id)] = _signal_text(0, sig)
-    kb = InlineKeyboardBuilder()
-    kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
-
-    uids = await get_broadcast_user_ids()
-    for uid in uids:
-        try:
-            ORIGINAL_SIGNAL_TEXT[(uid, sig.signal_id)] = _signal_text(uid, sig)
-            kb_u = InlineKeyboardBuilder()
-            kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
-            await safe_send(uid, _signal_text(uid, sig), reply_markup=kb_u.as_markup())
-        except Exception:
-            logger.exception("Failed to ensure DB indexes")
-
-
-async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, float], tz_name: str) -> None:
-    w0, w1 = win
-    uids = await get_broadcast_user_ids()
-    for uid in uids:
-        try:
-            title = tr(uid, 'macro_title')
-            body = f"{ev.name}\n{tr(uid, 'macro_blackout')}: {_fmt_hhmm(w0)} – {_fmt_hhmm(w1)}\n\n"
-            tail = tr(uid, 'macro_tail_fut_off') if action == 'FUTURES_OFF' else tr(uid, 'macro_tail_paused')
-            await safe_send(uid, f"{title}\n\n{body}{tail}")
-        except Exception:
-            logger.exception("Failed to ensure DB indexes")
-
-# ---------------- commands ----------------
-@dp.message(Command("start"))
-async def start(message: types.Message) -> None:
-    uid = message.from_user.id if message.from_user else 0
-    if uid:
-        await ensure_user(uid)
-
-    # If language not chosen yet, ask first
-    if uid and uid not in LANG:
-        kb = InlineKeyboardBuilder()
-        kb.button(text=tr(uid, "btn_ru"), callback_data="lang:ru")
-        kb.button(text=tr(uid, "btn_en"), callback_data="lang:en")
-        kb.adjust(2)
-        await message.answer(tr(uid, "choose_lang"), reply_markup=kb.as_markup())
-        return
-
-    # Shared access control (Postgres)
-    access = await get_access_status(uid) if uid else "no_user"
-    if access != "ok":
-        await message.answer(tr(uid, f"access_{access}"), reply_markup=menu_kb(uid))
-        return
-
-    await message.answer(tr(uid, "welcome"), reply_markup=menu_kb(uid))
-
-
-# ---------------- language selection ----------------
-@dp.callback_query(lambda c: (c.data or "").startswith("lang:"))
-async def lang_choose(call: types.CallbackQuery) -> None:
-    await call.answer()
-    uid = call.from_user.id if call.from_user else 0
-    lang = (call.data or "lang:ru").split(":", 1)[1]
-    if uid:
-        set_lang(uid, lang)
-    # show welcome + menu in-place
-    try:
-        if call.message:
-            await bot.edit_message_text(chat_id=uid, message_id=call.message.message_id, text=tr(uid, "welcome"), reply_markup=menu_kb(uid))
-            return
-    except Exception:
-        pass
-    await safe_send(uid, tr(uid, "welcome"), reply_markup=menu_kb(uid))
-
-# ---------------- menu callbacks ----------------
-def _fmt_stats_block_ru(title: str, b: dict | None = None) -> str:
-    b = b or {}
-    trades = int(b.get("trades", 0))
-    wins = int(b.get("wins", 0))
-    losses = int(b.get("losses", 0))
-    be = int(b.get("be", 0))
-    tp1 = int(b.get("tp1_hits", 0))
-    wr = (wins / trades * 100.0) if trades else 0.0
-    pnl = float(b.get("sum_pnl_pct", 0.0))
-    return (
-        f"{title}\n"
-        f"Сделки: {trades} | Плюс: {wins} | Минус: {losses} | BE: {be} | TP1: {tp1}\n"
-        f"Процент побед: {wr:.1f}%\n"
-        f"PnL: {pnl:+.2f}%"
-    )
-
-def _fmt_stats_block_en(title: str, b: dict | None = None) -> str:
-    b = b or {}
-    trades = int(b.get("trades", 0))
-    wins = int(b.get("wins", 0))
-    losses = int(b.get("losses", 0))
-    be = int(b.get("be", 0))
-    tp1 = int(b.get("tp1_hits", 0))
-    wr = (wins / trades * 100.0) if trades else 0.0
-    pnl = float(b.get("sum_pnl_pct", 0.0))
-    return (
-        f"{title}\n"
-        f"Trades: {trades} | Wins: {wins} | Losses: {losses} | BE: {be} | TP1: {tp1}\n"
-        f"Win rate: {wr:.1f}%\n"
-        f"PnL: {pnl:+.2f}%"
-    )
-
-def _parse_report_lines(lines: list[str]) -> list[tuple[str,int,float,float]]:
-    # returns (key, trades, winrate, pnl)
-    out = []
-    rx = re.compile(r"^(?P<k>[^:]+):\s*trades=(?P<t>\d+)\s+winrate=(?P<wr>[\d\.]+)%\s+pnl=(?P<pnl>[\+\-]?[\d\.]+)%\s*$")
-    for ln in lines:
-        m = rx.match((ln or "").strip())
-        if not m:
-            continue
-        out.append((m.group("k"), int(m.group("t")), float(m.group("wr")), float(m.group("pnl"))))
-    return out
-
-async def stats_text(uid: int) -> str:
-    """Render trading statistics for the user from Postgres (backend-only)."""
-    lang = get_lang(uid)
-    tz_name = os.getenv("TZ", "UTC")
-
-    # ---- buckets ----
-    spot_today = await backend.perf_today(uid, "SPOT")
-    fut_today = await backend.perf_today(uid, "FUTURES")
-    spot_week = await backend.perf_week(uid, "SPOT")
-    fut_week = await backend.perf_week(uid, "FUTURES")
-
-    spot_days = await backend.report_daily(uid, "SPOT", 7, tz=tz_name)
-    fut_days = await backend.report_daily(uid, "FUTURES", 7, tz=tz_name)
-
-    spot_weeks = await backend.report_weekly(uid, "SPOT", 4, tz=tz_name)
-    fut_weeks = await backend.report_weekly(uid, "FUTURES", 4, tz=tz_name)
-
-    # ---- formatting helpers ----
-    def block_title(market: str) -> str:
-        if market == "SPOT":
-            return f"🟢 {tr(uid, 'lbl_spot')}"
-        return f"🔴 {tr(uid, 'lbl_futures')}"
-
-    def fmt_block(title: str, b: dict) -> str:
-        if lang == "en":
-            return _fmt_stats_block_en(title, b)
-        return _fmt_stats_block_ru(title, b)
-
-    def fmt_lines(rows: list[dict]) -> list[str]:
-        out: list[str] = []
-        for r in rows:
-            # day is date, week is text label
-            key = r.get("day")
-            if key is not None:
-                k = key.isoformat() if hasattr(key, "isoformat") else str(key)
-            else:
-                k = str(r.get("week"))
-            trades = int(r.get("trades", 0) or 0)
-            wins = int(r.get("wins", 0) or 0)
-            pnl = float(r.get("sum_pnl_pct", 0.0) or 0.0)
-            wr = (wins / trades * 100.0) if trades else 0.0
-            if lang == "en":
-                out.append(f"{k}: trades {trades} | winrate {wr:.1f}% | pnl {pnl:+.2f}%")
-            else:
-                out.append(f"{k}: Сделки {trades} | Победы {wr:.1f}% | PnL {pnl:+.2f}%")
-        return out
-
-    no_closed = tr(uid, "no_closed")
-
-    parts: list[str] = []
-    parts.append(tr(uid, "stats_title"))
-    parts.append("")
-    parts.append(tr(uid, "perf_today"))
-    parts.append(fmt_block(block_title("SPOT"), spot_today))
-    parts.append("")
-    parts.append(fmt_block(block_title("FUTURES"), fut_today))
-    parts.append("")
-    parts.append(tr(uid, "perf_week"))
-    parts.append(fmt_block(block_title("SPOT"), spot_week))
-    parts.append("")
-    parts.append(fmt_block(block_title("FUTURES"), fut_week))
-    parts.append("")
-    parts.append(tr(uid, "daily_title"))
-    parts.append(f"🟢 {tr(uid,'lbl_spot')}:")
-    if not spot_days:
-        parts.append(no_closed)
-    else:
-        parts.extend(fmt_lines(spot_days))
-    parts.append("")
-    parts.append(f"🔴 {tr(uid,'lbl_futures')}:")
-    if not fut_days:
-        parts.append(no_closed)
-    else:
-        parts.extend(fmt_lines(fut_days))
-    parts.append("")
-    parts.append(tr(uid, "weekly_title"))
-    parts.append(f"🟢 {tr(uid,'lbl_spot')}:")
-    if not spot_weeks:
-        parts.append(no_closed)
-    else:
-        parts.extend(fmt_lines(spot_weeks))
-    parts.append("")
-    parts.append(f"🔴 {tr(uid,'lbl_futures')}:")
-    if not fut_weeks:
-        parts.append(no_closed)
-    else:
-        parts.extend(fmt_lines(fut_weeks))
-    parts.append("")
-    hint = tr(uid, "stats_hint") if "stats_hint" in I18N.get(lang, {}) else ""
-    if hint:
-        parts.append(hint)
-
-    return "\n".join(parts).strip()
-
-@dp.callback_query(lambda c: (c.data or "").startswith("menu:"))
-async def menu_handler(call: types.CallbackQuery) -> None:
-    action = (call.data or "").split(":", 1)[1]
-    uid = call.from_user.id if call.from_user else 0
-    _nav_enter(uid, action)
-    if action == "back":
-        action = _nav_back(uid, "status")
-
-    await call.answer()
-
-    # Shared access control (Postgres)
-    access = await get_access_status(uid) if uid else "no_user"
-    if action not in ("status", "notify") and access != "ok":
-        await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
-        return
-
-    # ---- STATUS (main screen) ----
-    if action == "status":
-        t = STATUS_TASKS.pop(uid, None)
-        if t:
-            try:
-                t.cancel()
-            except Exception:
-                pass
-
-        await ensure_user(uid)
-
-        # macro info (optional)
-        try:
-            macro = backend.get_next_macro()
-        except Exception:
-            macro = None
-
-        enabled = False
-        try:
-            enabled = await get_notify_signals(uid)
-        except Exception:
-            pass
-
-        macro_line = ""
-        if macro:
-            try:
-                macro_line = "\n" + trf(uid, "status_macro_line",
-                                        name=macro.get("name", "-"),
-                                        eta=macro.get("eta", "-"),
-                                        action=macro.get("action", "-"))
-            except Exception:
-                macro_line = ""
-
-        notify_line = ""
-        try:
-            notify_line = "\n" + (tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off"))
-        except Exception:
-            notify_line = ""
-
-        txt = tr(uid, "welcome") + macro_line + notify_line
-        await safe_edit(call.message, txt, menu_kb(uid))
-        return
-
-    # ---- STATS ----
-    if action == "stats":
-        t = STATUS_TASKS.pop(uid, None)
-        if t:
-            try:
-                t.cancel()
-            except Exception:
-                pass
-
-        txt = await stats_text(uid)
-        await safe_edit(call.message, txt, menu_kb(uid))
-        return
-
-    # ---- LIVE SIGNALS ----
-    if action in ("spot", "futures"):
-        market = "SPOT" if action == "spot" else "FUTURES"
-        sig = LAST_SIGNAL_BY_MARKET.get(market)
-        if not sig:
-            await safe_edit(call.message, tr(uid, "no_live_signals"), menu_kb(uid))
-            return
-
-        allowed, reason, price = await backend.check_signal_openable(sig)
-        if not allowed:
-            # Drop stale signal from Live caches
-            if LAST_SIGNAL_BY_MARKET.get(market) and LAST_SIGNAL_BY_MARKET[market].signal_id == sig.signal_id:
-                LAST_SIGNAL_BY_MARKET[market] = None
-            await safe_edit(call.message, tr(uid, "no_live_signals"), menu_kb(uid))
-            return
-
-        kb = InlineKeyboardBuilder()
-        kb.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
-        kb.adjust(1)
-        await safe_edit(call.message, _signal_text(uid, sig), kb.as_markup())
-        return
-
-    # ---- NOTIFICATIONS ----
-    if action == "notify":
-        if uid:
-            await ensure_user(uid)
-            enabled = await get_notify_signals(uid)
-            state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
-            desc = tr(uid, "notify_desc_on") if enabled else tr(uid, "notify_desc_off")
-            txt = trf(uid, "notify_screen", title=tr(uid, "notify_title"), state=state, desc=desc)
-            await safe_send(uid, txt, reply_markup=notify_kb(uid, enabled))
-        return
-
-    # fallback
-    await safe_edit(call.message, tr(uid, "welcome"), menu_kb(uid))
-
-
-# ---------------- notifications callbacks ----------------
-@dp.callback_query(lambda c: (c.data or "").startswith("notify:"))
-async def notify_handler(call: types.CallbackQuery) -> None:
-    """Handle inline buttons inside Notifications screen."""
-    await call.answer()
-    uid = call.from_user.id if call.from_user else 0
-    if not uid:
-        return
-
-    parts = (call.data or "").split(":")
-    # notify:set:on | notify:set:off | notify:back
-    try:
-        action = parts[1]
-    except Exception:
-        action = ""
-
-    # shared access check (same as menu)
-    access = await get_access_status(uid)
-    if access != "ok":
-        await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
-        return
-
-    if action == "back":
-        # Return to main menu (do not delete messages)
-        await safe_edit(call.message, tr(uid, "welcome"), menu_kb(uid))
-        return
-
-    if action == "set":
-        # Explicit ON/OFF
-        value = (parts[2] if len(parts) > 2 else "").lower()
-        await ensure_user(uid)
-        if value == "on":
-            enabled = await set_notify_signals(uid, True)
-        elif value == "off":
-            enabled = await set_notify_signals(uid, False)
-        else:
-            enabled = await get_notify_signals(uid)
-
-        state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
-        desc = tr(uid, "notify_desc_on") if enabled else tr(uid, "notify_desc_off")
-        txt = trf(uid, "notify_screen", title=tr(uid, "notify_title"), state=state, desc=desc)
-        await safe_edit(call.message, txt, notify_kb(uid, enabled))
-        return
-
-    # Fallback: return to menu
-    await safe_edit(call.message, tr(uid, 'welcome'), menu_kb(uid))
-    return
-
-
-
-# ---------------- entrypoint ----------------
-
-async def main() -> None:
-    load_langs()
-    try:
-        await init_db()
-    except Exception:
-        logger.exception("DB init failed")
-    # Start background loops
-    asyncio.create_task(backend.track_loop(bot))
-    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro))
-    # Polling
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+async def close_trade(trade_id: int, *, status: str, price: float | None = None, pnl_total_pct: float | None = None) -> None:
+    """
+    status: BE / WIN / LOSS / CLOSED
+    """
+    pool = get_pool()
+    ev = "CLOSE" if status == "CLOSED" else status
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE trades
+            SET status=$2, closed_at=NOW(), pnl_total_pct=$3
+            WHERE id=$1;
+            """,
+            int(trade_id), status, (float(pnl_total_pct) if pnl_total_pct is not None else None),
+        )
+        await conn.execute(
+            "INSERT INTO trade_events (trade_id, event_type, price, pnl_pct) VALUES ($1,$2,$3,$4);",
+            int(trade_id),
+            ev,
+            (float(price) if price is not None else None),
+            (float(pnl_total_pct) if pnl_total_pct is not None else None),
+        )
+
+async def perf_bucket(user_id: int, market: str, *, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
+    """
+    Aggregates performance in [since, until) using trade_events.
+
+    Events-based stats are more robust than reading the final trades rows,
+    because TP1 should be counted even if a trade is later closed manually,
+    and close results are best represented by the final close event.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            WITH ev AS (
+              SELECT e.trade_id, e.event_type, e.pnl_pct
+              FROM trade_events e
+              JOIN trades t ON t.id = e.trade_id
+              WHERE t.user_id=$1 AND t.market=$2
+                AND e.created_at >= $3 AND e.created_at < $4
+            )
+            SELECT
+              SUM(CASE WHEN event_type IN ('WIN','LOSS','BE','CLOSE') THEN 1 ELSE 0 END)::int AS trades,
+              SUM(CASE WHEN event_type='WIN' THEN 1 ELSE 0 END)::int AS wins,
+              SUM(CASE WHEN event_type='LOSS' THEN 1 ELSE 0 END)::int AS losses,
+              SUM(CASE WHEN event_type='BE' THEN 1 ELSE 0 END)::int AS be,
+              COUNT(DISTINCT CASE WHEN event_type='TP1' THEN trade_id END)::int AS tp1_hits,
+              COALESCE(SUM(CASE WHEN event_type IN ('WIN','LOSS','BE','CLOSE') THEN COALESCE(pnl_pct,0) ELSE 0 END), 0)::float AS sum_pnl_pct
+            FROM ev;
+            """,
+            int(user_id),
+            market,
+            since,
+            until,
+        )
+        base = {"trades":0,"wins":0,"losses":0,"be":0,"tp1_hits":0,"sum_pnl_pct":0.0}
+        if not row:
+            return base
+        d = dict(row)
+        # asyncpg may return None for SUMs when no rows
+        return {
+            "trades": int(d.get("trades") or 0),
+            "wins": int(d.get("wins") or 0),
+            "losses": int(d.get("losses") or 0),
+            "be": int(d.get("be") or 0),
+            "tp1_hits": int(d.get("tp1_hits") or 0),
+            "sum_pnl_pct": float(d.get("sum_pnl_pct") or 0.0),
+        }
+
+async def daily_report(user_id: int, market: str, *, days: int, tz: str = "UTC") -> List[dict]:
+    """
+    Returns per-day buckets for the last N days using trade_events.
+    Each item: {"day":"YYYY-MM-DD","trades":..,"wins":..,"losses":..,"be":..,"tp1_hits":..,"sum_pnl_pct":..}
+    Day boundaries are computed in the given timezone.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+              (e.created_at AT TIME ZONE $4)::date AS day,
+              SUM(CASE WHEN e.event_type IN ('WIN','LOSS','BE','CLOSE') THEN 1 ELSE 0 END)::int AS trades,
+              SUM(CASE WHEN e.event_type='WIN' THEN 1 ELSE 0 END)::int AS wins,
+              SUM(CASE WHEN e.event_type='LOSS' THEN 1 ELSE 0 END)::int AS losses,
+              SUM(CASE WHEN e.event_type='BE' THEN 1 ELSE 0 END)::int AS be,
+              COUNT(DISTINCT CASE WHEN e.event_type='TP1' THEN e.trade_id END)::int AS tp1_hits,
+              COALESCE(SUM(CASE WHEN e.event_type IN ('WIN','LOSS','BE','CLOSE') THEN COALESCE(e.pnl_pct,0) ELSE 0 END), 0)::float AS sum_pnl_pct
+            FROM trade_events e
+            JOIN trades t ON t.id = e.trade_id
+            WHERE t.user_id=$1 AND t.market=$2
+              AND e.created_at >= (NOW() - ($3::int || ' days')::interval)
+            GROUP BY day
+            ORDER BY day ASC;
+            """,
+            int(user_id),
+            market,
+            int(days),
+            str(tz),
+        )
+    return [dict(r) for r in rows]
+
+
+async def weekly_report(user_id: int, market: str, *, weeks: int, tz: str = "UTC") -> List[dict]:
+    """
+    Returns per-week buckets (ISO week label) for the last N weeks using trade_events.
+    Each item: {"week":"2026-W03","trades":..,"wins":..,"losses":..,"be":..,"tp1_hits":..,"sum_pnl_pct":..}
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+              to_char(date_trunc('week', (e.created_at AT TIME ZONE $4)), 'IYYY-"W"IW') AS week,
+              SUM(CASE WHEN e.event_type IN ('WIN','LOSS','BE','CLOSE') THEN 1 ELSE 0 END)::int AS trades,
+              SUM(CASE WHEN e.event_type='WIN' THEN 1 ELSE 0 END)::int AS wins,
+              SUM(CASE WHEN e.event_type='LOSS' THEN 1 ELSE 0 END)::int AS losses,
+              SUM(CASE WHEN e.event_type='BE' THEN 1 ELSE 0 END)::int AS be,
+              COUNT(DISTINCT CASE WHEN e.event_type='TP1' THEN e.trade_id END)::int AS tp1_hits,
+              COALESCE(SUM(CASE WHEN e.event_type IN ('WIN','LOSS','BE','CLOSE') THEN COALESCE(e.pnl_pct,0) ELSE 0 END), 0)::float AS sum_pnl_pct
+            FROM trade_events e
+            JOIN trades t ON t.id = e.trade_id
+            WHERE t.user_id=$1 AND t.market=$2
+              AND e.created_at >= (NOW() - ($3::int || ' weeks')::interval)
+            GROUP BY week
+            ORDER BY week ASC;
+            """,
+            int(user_id),
+            market,
+            int(weeks),
+            str(tz),
+        )
+    return [dict(r) for r in rows]
