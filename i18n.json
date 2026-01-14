@@ -142,7 +142,8 @@
     "status_news_timer": "Time left: {left}",
     "status_macro_reason": "Reason: {reason}",
     "status_macro_timer": "Time left: {left}",
-    "status_macro_window": "Window: {before}–{after}"
+    "status_macro_window": "Window: {before}–{after}",
+    "status_macro_blackout_timer": "Blackout ends in: {left}"
   },
   "ru": {
     "access_blocked": "🚫 Доступ запрещён.",
@@ -287,6 +288,7 @@
     "status_news_timer": "Осталось: {left}",
     "status_macro_reason": "Причина: {reason}",
     "status_macro_timer": "Осталось: {left}",
-    "status_macro_window": "Окно: {before}–{after}"
+    "status_macro_window": "Окно: {before}–{after}",
+    "status_macro_blackout_timer": "До конца blackout: {left}"
   }
 }
