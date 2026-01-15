@@ -2111,11 +2111,30 @@ class Backend:
                             market = "SPOT"
                             risk_notes.append("⚠️ Futures signals are temporarily disabled (macro)")
 
-                        # Policy: do not emit SPOT SHORT signals (confusing / not executable for most users).
-                        # If a signal resolves to SPOT market but direction is SHORT, we skip it.
+                        # Policy: SPOT + SHORT is confusing for most users. Default behavior:
+                        # auto-convert SPOT SHORT -> FUTURES SHORT (keeps Entry/SL/TP intact).
+                        # Exception: if futures signals are currently forced OFF (news/macro), we cannot convert,
+                        # so we skip such signals to avoid sending a non-executable SPOT SHORT.
                         if market == "SPOT" and str(best_dir).upper() == "SHORT":
-                            logger.info("[signal] skip %s %s %s reason=spot_short_disabled", sym, market, best_dir)
-                            continue
+                            fut_forced_off = any(
+                                ("Futures paused" in n) or ("Futures signals are temporarily disabled" in n)
+                                for n in risk_notes
+                            )
+                            if fut_forced_off:
+                                logger.info(
+                                    "[signal] skip %s %s %s reason=spot_short_but_futures_forced_off",
+                                    sym,
+                                    market,
+                                    best_dir,
+                                )
+                                continue
+
+                            market = "FUTURES"
+                            risk_notes.append("ℹ️ Auto-converted: SPOT SHORT → FUTURES")
+                            logger.info(
+                                "[signal] convert %s SPOT/SHORT -> FUTURES/SHORT",
+                                sym,
+                            )
 
                         conf_names = "+".join(sorted([s[0] for s in supporters]))
 
