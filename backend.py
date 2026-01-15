@@ -1201,6 +1201,190 @@ def _nearest_levels(df: pd.DataFrame, lookback: int = 180, swing: int = 3) -> Tu
         return (None, None)
 
 
+def _pivot_points(series: np.ndarray, *, left: int = 3, right: int = 3, mode: str = "high") -> List[Tuple[int, float]]:
+    """Return pivot highs/lows as (index, value) using simple local extrema."""
+    pts: List[Tuple[int, float]] = []
+    n = len(series)
+    if n < left + right + 3:
+        return pts
+    for i in range(left, n - right):
+        window = series[i - left:i + right + 1]
+        v = series[i]
+        if mode == "high":
+            if v == np.max(window):
+                pts.append((i, float(v)))
+        else:
+            if v == np.min(window):
+                pts.append((i, float(v)))
+    return pts
+
+
+def _rsi_divergence(df: pd.DataFrame, *, lookback: int = 120, pivot: int = 3) -> str:
+    """Detect basic bullish/bearish RSI divergence on recent pivots. Returns 'BULL', 'BEAR' or '—'."""
+    try:
+        if df is None or df.empty or len(df) < 40:
+            return "—"
+        d = df.tail(lookback).copy()
+        if "rsi" not in d.columns:
+            return "—"
+        closes = d["close"].astype(float).values
+        rsi = d["rsi"].astype(float).values
+        # pivots on price
+        ph = _pivot_points(closes, left=pivot, right=pivot, mode="high")
+        pl = _pivot_points(closes, left=pivot, right=pivot, mode="low")
+        # need last two pivots of each kind
+        if len(ph) >= 2:
+            (i1, p1), (i2, p2) = ph[-2], ph[-1]
+            if i1 < i2 and p2 > p1 and (rsi[i2] < rsi[i1]):
+                return "BEAR"
+        if len(pl) >= 2:
+            (i1, p1), (i2, p2) = pl[-2], pl[-1]
+            if i1 < i2 and p2 < p1 and (rsi[i2] > rsi[i1]):
+                return "BULL"
+        return "—"
+    except Exception:
+        return "—"
+
+
+def _linreg_channel(df: pd.DataFrame, *, window: int = 120, k: float = 2.0) -> Tuple[str, float, float]:
+    """Linear regression channel on close. Returns (label, pos, slope). label like 'desc@upper'."""
+    try:
+        if df is None or df.empty or len(df) < max(60, window // 2):
+            return ("—", float("nan"), float("nan"))
+        d = df.tail(window).copy()
+        y = d["close"].astype(float).values
+        x = np.arange(len(y), dtype=float)
+        # y = a*x + b
+        a, b = np.polyfit(x, y, 1)
+        y_hat = a * x + b
+        resid = y - y_hat
+        sd = float(np.std(resid))
+        last = float(y[-1])
+        mid = float(y_hat[-1])
+        upper = mid + k * sd
+        lower = mid - k * sd
+        width = max(1e-12, upper - lower)
+        pos = (last - lower) / width  # 0..1 typically
+        # trend label
+        if abs(a) < 1e-6:
+            trend = "flat"
+        else:
+            trend = "asc" if a > 0 else "desc"
+        if pos >= 0.8:
+            where = "upper"
+        elif pos <= 0.2:
+            where = "lower"
+        else:
+            where = "mid"
+        return (f"{trend}@{where}", pos, float(a))
+    except Exception:
+        return ("—", float("nan"), float("nan"))
+
+
+def _market_structure(df: pd.DataFrame, *, lookback: int = 180, swing: int = 3) -> str:
+    """Minimal market-structure label from swing highs/lows: 'HH-HL', 'LH-LL', or '—'."""
+    try:
+        if df is None or df.empty or len(df) < (swing * 2 + 10):
+            return "—"
+        d = df.tail(lookback).copy()
+        highs = d["high"].astype(float).values
+        lows = d["low"].astype(float).values
+        sh = _pivot_points(highs, left=swing, right=swing, mode="high")
+        sl = _pivot_points(lows, left=swing, right=swing, mode="low")
+        if len(sh) < 2 or len(sl) < 2:
+            return "—"
+        (_, h1), (_, h2) = sh[-2], sh[-1]
+        (_, l1), (_, l2) = sl[-2], sl[-1]
+        hh = h2 > h1
+        hl = l2 > l1
+        lh = h2 < h1
+        ll = l2 < l1
+        if hh and hl:
+            return "HH-HL"
+        if lh and ll:
+            return "LH-LL"
+        # mixed / range
+        return "RANGE"
+    except Exception:
+        return "—"
+
+
+def _bb_position(close: float, bb_low: float, bb_mid: float, bb_high: float) -> str:
+    try:
+        if any(np.isnan(x) for x in [close, bb_low, bb_mid, bb_high]):
+            return "—"
+        if close >= bb_high:
+            return "↑high"
+        if close <= bb_low:
+            return "↓low"
+        if close >= bb_mid:
+            return "mid→high"
+        return "low→mid"
+    except Exception:
+        return "—"
+
+
+def _ta_score(*,
+              direction: str,
+              adx1: float,
+              adx4: float,
+              rsi15: float,
+              macd_hist15: float,
+              vol_rel: float,
+              bb_pos: str,
+              rsi_div: str,
+              channel: str,
+              mstruct: str,
+              pat_bias: int,
+              atr_pct: float) -> int:
+    """Compute 0..100 TA score (used as 'confidence' too). Keep deterministic and simple."""
+    score = 50.0
+    # trend strength
+    if not np.isnan(adx4):
+        score += min(18.0, max(0.0, (adx4 - 15.0) * 1.2))
+    if not np.isnan(adx1):
+        score += min(12.0, max(0.0, (adx1 - 15.0) * 0.9))
+    # volume
+    if not np.isnan(vol_rel):
+        score += min(10.0, max(0.0, (vol_rel - 1.0) * 8.0))
+    # macd impulse
+    if not np.isnan(macd_hist15):
+        if direction == "LONG":
+            score += 6.0 if macd_hist15 >= 0 else 0.0
+        else:
+            score += 6.0 if macd_hist15 <= 0 else 0.0
+    # rsi sanity
+    if not np.isnan(rsi15):
+        if direction == "LONG":
+            score += 6.0 if 45 <= rsi15 <= TA_RSI_MAX_LONG else 2.0
+        else:
+            score += 6.0 if TA_RSI_MIN_SHORT <= rsi15 <= 55 else 2.0
+    # divergence bonus
+    if (direction == "LONG" and rsi_div == "BULL") or (direction == "SHORT" and rsi_div == "BEAR"):
+        score += 8.0
+    # channel bonus
+    if isinstance(channel, str) and channel != "—":
+        if direction == "LONG" and ("asc@lower" in channel or "flat@lower" in channel):
+            score += 4.0
+        if direction == "SHORT" and ("desc@upper" in channel or "flat@upper" in channel):
+            score += 4.0
+    # market structure
+    if (direction == "LONG" and mstruct == "HH-HL") or (direction == "SHORT" and mstruct == "LH-LL"):
+        score += 7.0
+    elif mstruct == "RANGE":
+        score -= 4.0
+    # pattern
+    if (direction == "LONG" and pat_bias > 0) or (direction == "SHORT" and pat_bias < 0):
+        score += 3.0
+    # atr sanity (too wild reduces score)
+    if not np.isnan(atr_pct):
+        if atr_pct > 6.0:
+            score -= 6.0
+        elif atr_pct > 4.0:
+            score -= 3.0
+    return int(max(0, min(100, round(score))))
+
+
 def _fmt_ta_block(ta: Dict[str, Any]) -> str:
     """
     Format TA snapshot for Telegram/UX. Keep it short but informative.
@@ -1218,6 +1402,9 @@ def _fmt_ta_block(ta: Dict[str, Any]) -> str:
         volr = ta.get("vol_rel", "—")
         vwap = ta.get("vwap_bias", "—")
         pat = ta.get("pattern", "—")
+        div = ta.get("rsi_div", "—")
+        ch = ta.get("channel", "—")
+        ms = ta.get("mstruct", "—")
         sup = ta.get("support", None)
         res = ta.get("resistance", None)
 
@@ -1243,6 +1430,16 @@ def _fmt_ta_block(ta: Dict[str, Any]) -> str:
             f"ADX 1h/4h: {fnum(adx1, '{:.1f}')}/{fnum(adx4, '{:.1f}')} | ATR%: {fnum(atrp, '{:.2f}')}",
             f"BB: {bb} | Vol xAvg: {fnum(volr, '{:.2f}')} | VWAP: {vwap}",
         ]
+        # extra context (keep concise)
+        ctx = []
+        if div and div != "—":
+            ctx.append(f"Div: {div}")
+        if ch and ch != "—":
+            ctx.append(f"Ch: {ch}")
+        if ms and ms != "—":
+            ctx.append(f"PA: {ms}")
+        if ctx:
+            lines.append(" | ".join(ctx))
         extra = []
         if pat and pat != "—":
             extra.append(f"Pattern: {pat}")
@@ -1319,11 +1516,32 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     pattern, pat_bias = _candle_pattern(df15i)
     support, resistance = _nearest_levels(df1hi, lookback=180, swing=3)
 
+    # Divergence / channels / minimal market structure (algorithmic)
+    rsi_div = _rsi_divergence(df15i, lookback=140, pivot=3)
+    channel, ch_pos, ch_slope = _linreg_channel(df1hi, window=140, k=2.0)
+    mstruct = _market_structure(df1hi, lookback=200, swing=3)
+    bb_pos = _bb_position(entry, bb_low, bb_mid, bb_high)
+
     # Strict-ish trigger on 15m (uses ENV thresholds)
     if not _trigger_15m(dir1, df15i):
         return None
 
-    confidence = _confidence(adx4, adx1, rsi15, atr_pct)
+    score = _ta_score(
+        direction=dir1,
+        adx1=adx1,
+        adx4=adx4,
+        rsi15=rsi15,
+        macd_hist15=macd_hist15,
+        vol_rel=vol_rel,
+        bb_pos=bb_pos,
+        rsi_div=rsi_div,
+        channel=channel,
+        mstruct=mstruct,
+        pat_bias=pat_bias,
+        atr_pct=atr_pct,
+    )
+    # keep legacy name 'confidence' used by filters, but make it the same as TA score
+    confidence = int(score)
 
     ta = {
         "direction": dir1,
@@ -1332,6 +1550,7 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
         "tp1": tp1,
         "tp2": tp2,
         "rr": rr,
+        "score": score,
         "confidence": confidence,
         "atr_pct": atr_pct,
         "adx1": adx1,
@@ -1341,8 +1560,12 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
         "bb_low": bb_low,
         "bb_mid": bb_mid,
         "bb_high": bb_high,
+        "bb_pos": bb_pos,
         "vol_rel": vol_rel,
         "pattern": pattern,
+        "rsi_div": rsi_div,
+        "channel": channel,
+        "mstruct": mstruct,
         "support": support,
         "resistance": resistance,
     }
