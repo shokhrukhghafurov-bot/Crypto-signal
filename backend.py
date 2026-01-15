@@ -193,6 +193,39 @@ def open_metrics(sig: "Signal") -> dict:
         "rr": round(float(getattr(sig, "rr", 0.0) or 0.0), 1),
     }
 
+
+
+def _price_debug_block(uid: int, *, price: float, source: str, side: str, sl: float | None, tp1: float | None, tp2: float | None) -> str:
+    try:
+        price_f = float(price)
+    except Exception:
+        return ""
+
+    side_u = (side or "LONG").upper()
+    def hit_tp(lvl: float) -> bool:
+        return price_f >= lvl if side_u == "LONG" else price_f <= lvl
+    def hit_sl(lvl: float) -> bool:
+        return price_f <= lvl if side_u == "LONG" else price_f >= lvl
+
+    lines = [
+        f"💹 {_tr(uid, 'lbl_price_now')}: {price_f:.6f}",
+        f"🔌 {_tr(uid, 'lbl_price_src')}: {source}",
+    ]
+    checks = []
+    if sl is not None and float(sl) > 0:
+        lvl = float(sl)
+        checks.append(f"SL: {lvl:.6f} {'✅' if hit_sl(lvl) else '❌'}")
+    if tp1 is not None and float(tp1) > 0:
+        lvl = float(tp1)
+        checks.append(f"{_tr(uid, 'lbl_tp1')}: {lvl:.6f} {'✅' if hit_tp(lvl) else '❌'}")
+    if tp2 is not None and float(tp2) > 0:
+        lvl = float(tp2)
+        checks.append(f"TP2: {lvl:.6f} {'✅' if hit_tp(lvl) else '❌'}")
+    if checks:
+        lines.append(f"🧪 {_tr(uid, 'lbl_check')}:" )
+        lines.extend(["• " + c for c in checks])
+    return "\n".join(lines)
+
 def fmt_pnl_pct(p: float) -> str:
     try:
         p = float(p)
@@ -724,13 +757,19 @@ class MacroCalendar:
 class PriceFeed:
     def __init__(self) -> None:
         self._prices: Dict[Tuple[str, str], float] = {}
+        self._sources: Dict[Tuple[str, str], str] = {}
         self._tasks: Dict[Tuple[str, str], asyncio.Task] = {}
 
     def get_latest(self, market: str, symbol: str) -> Optional[float]:
         return self._prices.get((market.upper(), symbol.upper()))
 
-    def _set_latest(self, market: str, symbol: str, price: float) -> None:
-        self._prices[(market.upper(), symbol.upper())] = float(price)
+    def get_latest_source(self, market: str, symbol: str) -> Optional[str]:
+        return self._sources.get((market.upper(), symbol.upper()))
+
+    def _set_latest(self, market: str, symbol: str, price: float, source: str = "WS") -> None:
+        key = (market.upper(), symbol.upper())
+        self._prices[key] = float(price)
+        self._sources[key] = str(source or "WS")
 
     async def ensure_stream(self, market: str, symbol: str) -> None:
         key = (market.upper(), symbol.upper())
@@ -752,7 +791,7 @@ class PriceFeed:
                         data = json.loads(msg)
                         p = data.get("p")
                         if p is not None:
-                            self._set_latest(m, symbol, float(p))
+                            self._set_latest(m, symbol, float(p), source="WS")
             except Exception:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
@@ -763,6 +802,7 @@ class PriceFeed:
         price = self._prices.get(key, seed if seed is not None else random.uniform(100, 50000))
         price *= random.uniform(0.996, 1.004)
         self._prices[key] = price
+        self._sources[key] = "MOCK"
         return price
 
 # ------------------ Exchange data (candles) ------------------
@@ -1566,6 +1606,50 @@ class Backend:
     async def get_trade(self, user_id: int, signal_id: int) -> Optional[dict]:
         return await db_store.get_trade_by_user_signal(int(user_id), int(signal_id))
 
+    async def get_trade_live(self, user_id: int, signal_id: int) -> Optional[dict]:
+        """Return trade row with live price + price source + hit checks."""
+        t = await db_store.get_trade_by_user_signal(int(user_id), int(signal_id))
+        if not t:
+            return None
+        try:
+            market = (t.get('market') or 'FUTURES').upper()
+            symbol = str(t.get('symbol') or '')
+            side = (t.get('side') or 'LONG').upper()
+            s = Signal(
+                signal_id=int(t.get('signal_id') or 0),
+                market=market,
+                symbol=symbol,
+                direction=side,
+                timeframe='',
+                entry=float(t.get('entry') or 0.0),
+                sl=float(t.get('sl') or 0.0),
+                tp1=float(t.get('tp1') or 0.0),
+                tp2=float(t.get('tp2') or 0.0),
+                rr=0.0,
+                confidence=0,
+                confirmations='',
+                risk_note='',
+                ts=float(dt.datetime.now(dt.timezone.utc).timestamp()),
+            )
+            price, src = await self._get_price_with_source(s)
+            price_f = float(price)
+            def hit_tp(lvl: float) -> bool:
+                return price_f >= lvl if side == 'LONG' else price_f <= lvl
+            def hit_sl(lvl: float) -> bool:
+                return price_f <= lvl if side == 'LONG' else price_f >= lvl
+            sl = float(t.get('sl') or 0.0) if t.get('sl') is not None else 0.0
+            tp1 = float(t.get('tp1') or 0.0) if t.get('tp1') is not None else 0.0
+            tp2 = float(t.get('tp2') or 0.0) if t.get('tp2') is not None else 0.0
+            out = dict(t)
+            out['price_f'] = price_f
+            out['price_src'] = src
+            out['hit_sl'] = bool(sl and hit_sl(float(sl)))
+            out['hit_tp1'] = bool(tp1 and hit_tp(float(tp1)))
+            out['hit_tp2'] = bool(tp2 and hit_tp(float(tp2)))
+            return out
+        except Exception:
+            return dict(t)
+
     async def get_user_trades(self, user_id: int) -> list[dict]:
         return await db_store.list_user_trades(int(user_id), include_closed=False, limit=50)
 
@@ -1615,29 +1699,40 @@ class Backend:
         except Exception:
             return None
 
-    async def _get_price(self, signal: Signal) -> float:
+    async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
+        """Return (price, source). Source: BINANCE_WS / BINANCE_REST / MOCK."""
         market = (signal.market or "FUTURES").upper()
         base = float(getattr(signal, "entry", 0) or 0) or None
 
         # Mock mode: keep prices around entry to avoid nonsense.
         if not USE_REAL_PRICE:
-            return self.feed.mock_price(market, signal.symbol, base=base)
+            return float(self.feed.mock_price(market, signal.symbol, base=base)), "MOCK"
 
-        # Real mode: websocket first, REST fallback, then (last resort) base/ mock near base.
+        # Real mode: websocket first, REST fallback, then (last resort) mock near entry.
         await self.feed.ensure_stream(market, signal.symbol)
         latest = self.feed.get_latest(market, signal.symbol)
         if latest is not None:
-            return float(latest)
+            src = self.feed.get_latest_source(market, signal.symbol) or "BINANCE_WS"
+            # normalize
+            if src == "WS":
+                src = "BINANCE_WS"
+            elif src == "REST":
+                src = "BINANCE_REST"
+            return float(latest), str(src)
 
         rest = await self._fetch_rest_price(market, signal.symbol)
         if rest is not None and rest > 0:
-            self.feed._set_latest(market, signal.symbol, float(rest))
-            return float(rest)
+            self.feed._set_latest(market, signal.symbol, float(rest), source="REST")
+            return float(rest), "BINANCE_REST"
 
         # Last resort: keep near entry (never random huge).
         if base is not None and base > 0:
-            return self.feed.mock_price(market, signal.symbol, base=base)
-        return self.feed.mock_price(market, signal.symbol, base=None)
+            return float(self.feed.mock_price(market, signal.symbol, base=base)), "MOCK"
+        return float(self.feed.mock_price(market, signal.symbol, base=None)), "MOCK"
+
+    async def _get_price(self, signal: Signal) -> float:
+        price, _src = await self._get_price_with_source(signal)
+        return float(price)
 
     async def check_signal_openable(self, signal: Signal) -> tuple[bool, str, float]:
         """Return (allowed, reason_code, current_price).
@@ -1723,8 +1818,9 @@ class Backend:
                         ts=float(dt.datetime.now(dt.timezone.utc).timestamp()),
                     )
 
-                    price = await self._get_price(s)
-                    price_f = float(price)
+                    price_f, price_src = await self._get_price_with_source(s)
+                    price_f = float(price_f)
+                    dbg = _price_debug_block(uid, price=price_f, source=price_src, side=side, sl=(float(s.sl) if s.sl else None), tp1=(float(s.tp1) if s.tp1 else None), tp2=(float(s.tp2) if s.tp2 else None))
 
                     def hit_tp(lvl: float) -> bool:
                         return price_f >= lvl if side == "LONG" else price_f <= lvl
@@ -1735,26 +1831,45 @@ class Backend:
                     status = str(row.get("status") or "ACTIVE").upper()
                     tp1_hit = bool(row.get("tp1_hit"))
                     be_price = float(row.get("be_price") or 0.0) if row.get("be_price") is not None else 0.0
+                    # 1) Before TP1: TP2 (gap) -> WIN
+                    if not tp1_hit and s.tp2 and hit_tp(float(s.tp2)):
+                        pnl = calc_profit_pct(s.entry, float(s.tp2), side)
+                        txt = _trf(uid, "msg_auto_win",
+                            symbol=s.symbol,
+                            pnl_total=fmt_pnl_pct(float(pnl)),
+                            status="WIN",
+                        )
+                        if dbg:
+                            txt += "\n\n" + dbg
+                        await safe_send(bot, uid, txt, ctx="msg_auto_win")
+                        await db_store.close_trade(trade_id, status="WIN", price=float(s.tp2), pnl_total_pct=float(pnl))
+                        continue
 
-                    # 1) SL before TP1 -> LOSS
+                    # 2) Before TP1: SL -> LOSS
                     if not tp1_hit and s.sl and hit_sl(float(s.sl)):
                         pnl = calc_profit_pct(s.entry, float(s.sl), side)
-                        await safe_send(bot, uid, _trf(uid, "msg_auto_loss",
+                        txt = _trf(uid, "msg_auto_loss",
                             symbol=s.symbol,
                             status="LOSS",
-                        ), ctx="msg_auto_loss")
+                        )
+                        if dbg:
+                            txt += "\n\n" + dbg
+                        await safe_send(bot, uid, txt, ctx="msg_auto_loss")
                         await db_store.close_trade(trade_id, status="LOSS", price=float(s.sl), pnl_total_pct=float(pnl))
                         continue
 
-                    # 2) TP1 -> partial close + BE
+                    # 3) TP1 -> partial close + BE
                     if not tp1_hit and s.tp1 and hit_tp(float(s.tp1)):
                         be_px = _be_exit_price(s.entry, side, market)
-                        await safe_send(bot, uid, _trf(uid, "msg_auto_tp1",
+                        txt = _trf(uid, "msg_auto_tp1",
                             symbol=s.symbol,
                             closed_pct=int(_partial_close_pct(market)),
                             be_price=f"{float(be_px):.6f}",
                             status="TP1",
-                        ), ctx="msg_auto_tp1")
+                        )
+                        if dbg:
+                            txt += "\n\n" + dbg
+                        await safe_send(bot, uid, txt, ctx="msg_auto_tp1")
                         await db_store.set_tp1(trade_id, be_price=float(be_px), price=float(s.tp1), pnl_pct=float(calc_profit_pct(s.entry, float(s.tp1), side)))
                         continue
 
@@ -1762,22 +1877,28 @@ class Backend:
                     if tp1_hit and _be_enabled(market):
                         be_lvl = be_price if be_price else _be_exit_price(s.entry, side, market)
                         if hit_sl(float(be_lvl)):
-                            await safe_send(bot, uid, _trf(uid, "msg_auto_be",
+                            txt = _trf(uid, "msg_auto_be",
                                 symbol=s.symbol,
                                 be_price=f"{float(be_lvl):.6f}",
                                 status="BE",
-                            ), ctx="msg_auto_be")
+                            )
+                            if dbg:
+                                txt += "\n\n" + dbg
+                            await safe_send(bot, uid, txt, ctx="msg_auto_be")
                             await db_store.close_trade(trade_id, status="BE", price=float(be_lvl), pnl_total_pct=0.0)
                             continue
 
                     # 4) TP2 -> WIN
                     if s.tp2 and hit_tp(float(s.tp2)):
                         pnl = calc_profit_pct(s.entry, float(s.tp2), side)
-                        await safe_send(bot, uid, _trf(uid, "msg_auto_win",
+                        txt = _trf(uid, "msg_auto_win",
                             symbol=s.symbol,
                             pnl_total=fmt_pnl_pct(float(pnl)),
                             status="WIN",
-                        ), ctx="msg_auto_win")
+                        )
+                        if dbg:
+                            txt += "\n\n" + dbg
+                        await safe_send(bot, uid, txt, ctx="msg_auto_win")
                         await db_store.close_trade(trade_id, status="WIN", price=float(s.tp2), pnl_total_pct=float(pnl))
                         continue
 
