@@ -1527,12 +1527,12 @@ PAGE_SIZE = 10
 def _trades_page_kb(uid: int, trades: list[dict], offset: int) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for t in trades:
-        sid = int(t.get("signal_id") or 0)
+        trade_id = int(t.get('id') or 0)
         symbol = str(t.get("symbol") or "")
         market = str(t.get("market") or "FUTURES").upper()
         status = str(t.get("status") or "ACTIVE").upper()
         label = f"{_trade_status_emoji(status)} {symbol} {tr_market(uid, market)} ({status})"
-        kb.button(text=label, callback_data=f"trade:view:{sid}:{offset}")
+        kb.button(text=label, callback_data=f"trade:view:{int(t.get('id') or 0)}:{offset}")
     # pagination
     nav = InlineKeyboardBuilder()
     if offset > 0:
@@ -1628,11 +1628,11 @@ def _trade_card_text(uid: int, t: dict) -> str:
 
     return "\n".join(parts)
 
-def _trade_card_kb(uid: int, signal_id: int, back_offset: int = 0) -> types.InlineKeyboardMarkup:
+def _trade_card_kb(uid: int, trade_id: int, back_offset: int = 0) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text=tr(uid, "sig_btn_refresh"), callback_data=f"trade:refresh:{signal_id}:{back_offset}")
-    kb.button(text=tr(uid, "sig_btn_orig"), callback_data=f"trade:orig:{signal_id}:{back_offset}")
-    kb.button(text=tr(uid, "sig_btn_close"), callback_data=f"trade:close:{signal_id}:{back_offset}")
+    kb.button(text=tr(uid, "sig_btn_refresh"), callback_data=f"trade:refresh:{trade_id}:{back_offset}")
+    kb.button(text=tr(uid, "sig_btn_orig"), callback_data=f"trade:orig:{trade_id}:{back_offset}")
+    kb.button(text=tr(uid, "sig_btn_close"), callback_data=f"trade:close:{trade_id}:{back_offset}")
     kb.button(text=tr(uid, "sig_btn_back"), callback_data=f"trades:page:{back_offset}")
     kb.adjust(2, 2)
     return kb.as_markup()
@@ -1642,41 +1642,41 @@ async def trade_view(call: types.CallbackQuery) -> None:
     await call.answer()
     parts = (call.data or "").split(":")
     try:
-        signal_id = int(parts[2])
+        trade_id = int(parts[2])
         back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
-    t = await backend.get_trade_live(call.from_user.id, signal_id)
+    t = await backend.get_trade_live_by_id(call.from_user.id, trade_id)
     if not t:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
         return
-    await safe_send(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, signal_id, back_offset))
+    await safe_send(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, trade_id, back_offset))
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:refresh:"))
 async def trade_refresh(call: types.CallbackQuery) -> None:
     await call.answer()
     parts = (call.data or "").split(":")
     try:
-        signal_id = int(parts[2])
+        trade_id = int(parts[2])
         back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
-    t = await backend.get_trade_live(call.from_user.id, signal_id)
+    t = await backend.get_trade_live_by_id(call.from_user.id, trade_id)
     if not t:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
         return
-    await safe_send(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, signal_id, back_offset))
+    await safe_send(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, trade_id, back_offset))
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:close:"))
 async def trade_close(call: types.CallbackQuery) -> None:
     await call.answer()
     parts = (call.data or "").split(":")
     try:
-        signal_id = int(parts[2])
+        trade_id = int(parts[2])
         back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
-    removed = await backend.remove_trade(call.from_user.id, signal_id)
+    removed = await backend.remove_trade_by_id(call.from_user.id, trade_id)
     if removed:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_removed"), reply_markup=menu_kb(call.from_user.id))
     else:
@@ -1687,19 +1687,19 @@ async def trade_orig(call: types.CallbackQuery) -> None:
     await call.answer()
     parts = (call.data or "").split(":")
     try:
-        signal_id = int(parts[2])
+        trade_id = int(parts[2])
         back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
 
-    t = await backend.get_trade_live(call.from_user.id, signal_id)
+    t = await backend.get_trade_live_by_id(call.from_user.id, trade_id)
     text = (t.get("orig_text") if isinstance(t, dict) else None) if t else None
     if not text:
         await safe_send(call.from_user.id, tr(call.from_user.id, "sig_orig_title") + ": " + tr(call.from_user.id, "lbl_none"), reply_markup=menu_kb(call.from_user.id))
         return
 
     kb = InlineKeyboardBuilder()
-    kb.button(text=tr(call.from_user.id, "sig_btn_back_trade"), callback_data=f"trade:view:{signal_id}:{back_offset}")
+    kb.button(text=tr(call.from_user.id, "sig_btn_back_trade"), callback_data=f"trade:view:{trade_id}:{back_offset}")
     kb.button(text=tr(call.from_user.id, "sig_btn_my_trades"), callback_data=f"trades:page:{back_offset}")
     kb.button(text=tr(call.from_user.id, "m_menu"), callback_data="menu:status")
     kb.adjust(1, 2)
