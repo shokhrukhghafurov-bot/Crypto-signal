@@ -668,9 +668,12 @@ def _signal_text(uid: int, s: Signal) -> str:
     # Visual marker near symbol (kept simple to avoid hard-depending on any exchange)
     symbol_emoji = "🟢" if s.market == 'SPOT' else "🌕"
 
-    # Direction should be shown for both SPOT and FUTURES.
-    arrow = tr(uid, 'sig_long') if s.direction == 'LONG' else tr(uid, 'sig_short')
-    direction_line = arrow + "\n"
+    # Direction should be shown only for FUTURES.
+    # For SPOT it's always "buy/long" and printing "ЛОНГ" confuses users.
+    direction_line = ""
+    if s.market != 'SPOT':
+        arrow = tr(uid, 'sig_long') if s.direction == 'LONG' else tr(uid, 'sig_short')
+        direction_line = arrow + "\n"
 
     def _fmt_exchanges(raw: str) -> str:
         xs = [x.strip() for x in (raw or '').replace(',', '+').split('+') if x.strip()]
