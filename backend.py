@@ -272,6 +272,9 @@ TA_REQUIRE_1H_TREND = _env_bool("TA_REQUIRE_1H_TREND", True if SIGNAL_MODE == "s
 COOLDOWN_MINUTES = max(1, _env_int("COOLDOWN_MINUTES", 180))
 
 USE_REAL_PRICE = _env_bool("USE_REAL_PRICE", True)
+# Price source selection per market: BINANCE / BYBIT / MEDIAN
+SPOT_PRICE_SOURCE = (os.getenv("SPOT_PRICE_SOURCE", "MEDIAN").strip().upper() or "MEDIAN")
+FUTURES_PRICE_SOURCE = (os.getenv("FUTURES_PRICE_SOURCE", "MEDIAN").strip().upper() or "MEDIAN")
 TRACK_INTERVAL_SECONDS = max(1, _env_int("TRACK_INTERVAL_SECONDS", 3))
 # Backward-compatible default partial close percent (legacy)
 TP1_PARTIAL_CLOSE_PCT = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT", 50)))
@@ -1678,10 +1681,8 @@ class Backend:
             reason = coin
             until_ts = until
         return {"action": act, "reason": reason, "until_ts": until_ts}
-
-    
     async def _fetch_rest_price(self, market: str, symbol: str) -> float | None:
-        """REST fallback for price when websocket hasn't produced a tick yet."""
+        """Binance REST fallback price (spot/futures)."""
         m = (market or "FUTURES").upper()
         sym = (symbol or "").upper()
         if not sym:
@@ -1694,13 +1695,59 @@ class Backend:
                     if r.status != 200:
                         return None
                     data = await r.json()
-            p = data.get("price")
+            p = data.get("price") if isinstance(data, dict) else None
+            return float(p) if p is not None else None
+        except Exception:
+            return None
+
+    async def _fetch_bybit_price(self, market: str, symbol: str) -> float | None:
+        """Bybit REST price (spot/futures). Uses V5 tickers.
+
+        market: SPOT -> category=spot
+                FUTURES -> category=linear (USDT perpetual)
+        """
+        mkt = (market or "FUTURES").upper()
+        sym = (symbol or "").upper().replace("/", "")
+        if not sym:
+            return None
+        category = "spot" if mkt == "SPOT" else "linear"
+        url = "https://api.bybit.com/v5/market/tickers"
+        try:
+            timeout = aiohttp.ClientTimeout(total=6)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(url, params={"category": category, "symbol": sym}) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json()
+            if not isinstance(data, dict):
+                return None
+            if int(data.get("retCode", 0) or 0) != 0:
+                return None
+            res = data.get("result") or {}
+            lst = (res.get("list") or []) if isinstance(res, dict) else []
+            if not lst:
+                return None
+            item = lst[0] if isinstance(lst, list) else None
+            if not isinstance(item, dict):
+                return None
+            p = item.get("lastPrice") or item.get("indexPrice") or item.get("markPrice")
             return float(p) if p is not None else None
         except Exception:
             return None
 
     async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
-        """Return (price, source). Source: BINANCE_WS / BINANCE_REST / MOCK."""
+        """Return (price, source) for tracking.
+
+        Sources:
+          - BINANCE_WS / BINANCE_REST
+          - BYBIT_REST
+          - MEDIAN(BINANCE+BYBIT) / BINANCE_ONLY / BYBIT_ONLY
+          - MOCK
+
+        Selection is controlled via env:
+          SPOT_PRICE_SOURCE=BINANCE|BYBIT|MEDIAN
+          FUTURES_PRICE_SOURCE=BINANCE|BYBIT|MEDIAN
+        """
         market = (signal.market or "FUTURES").upper()
         base = float(getattr(signal, "entry", 0) or 0) or None
 
@@ -1708,22 +1755,57 @@ class Backend:
         if not USE_REAL_PRICE:
             return float(self.feed.mock_price(market, signal.symbol, base=base)), "MOCK"
 
-        # Real mode: websocket first, REST fallback, then (last resort) mock near entry.
-        await self.feed.ensure_stream(market, signal.symbol)
-        latest = self.feed.get_latest(market, signal.symbol)
-        if latest is not None:
-            src = self.feed.get_latest_source(market, signal.symbol) or "BINANCE_WS"
-            # normalize
-            if src == "WS":
-                src = "BINANCE_WS"
-            elif src == "REST":
-                src = "BINANCE_REST"
-            return float(latest), str(src)
+        mode = (SPOT_PRICE_SOURCE if market == "SPOT" else FUTURES_PRICE_SOURCE).upper().strip() or "MEDIAN"
+        if mode not in ("BINANCE", "BYBIT", "MEDIAN"):
+            mode = "MEDIAN"
 
-        rest = await self._fetch_rest_price(market, signal.symbol)
-        if rest is not None and rest > 0:
-            self.feed._set_latest(market, signal.symbol, float(rest), source="REST")
-            return float(rest), "BINANCE_REST"
+        async def get_binance() -> tuple[float | None, str]:
+            # websocket first, REST fallback
+            try:
+                await self.feed.ensure_stream(market, signal.symbol)
+                latest = self.feed.get_latest(market, signal.symbol)
+                if latest is not None:
+                    src = self.feed.get_latest_source(market, signal.symbol) or "BINANCE_WS"
+                    if src == "WS":
+                        src = "BINANCE_WS"
+                    elif src == "REST":
+                        src = "BINANCE_REST"
+                    return float(latest), str(src)
+            except Exception:
+                pass
+            rest = await self._fetch_rest_price(market, signal.symbol)
+            if rest is not None and rest > 0:
+                try:
+                    self.feed._set_latest(market, signal.symbol, float(rest), source="REST")
+                except Exception:
+                    pass
+                return float(rest), "BINANCE_REST"
+            return None, "BINANCE"
+
+        async def get_bybit() -> tuple[float | None, str]:
+            p = await self._fetch_bybit_price(market, signal.symbol)
+            if p is not None and p > 0:
+                return float(p), "BYBIT_REST"
+            return None, "BYBIT"
+
+        if mode == "BINANCE":
+            b, bsrc = await get_binance()
+            if b is not None:
+                return float(b), bsrc
+        elif mode == "BYBIT":
+            y, ysrc = await get_bybit()
+            if y is not None:
+                return float(y), ysrc
+        else:  # MEDIAN
+            b, bsrc = await get_binance()
+            y, ysrc = await get_bybit()
+            if b is not None and y is not None:
+                price = float(np.median([float(b), float(y)]))
+                return price, "MEDIAN(BINANCE+BYBIT)"
+            if b is not None:
+                return float(b), "BINANCE_ONLY"
+            if y is not None:
+                return float(y), "BYBIT_ONLY"
 
         # Last resort: keep near entry (never random huge).
         if base is not None and base > 0:
