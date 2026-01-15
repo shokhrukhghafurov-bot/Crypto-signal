@@ -1876,6 +1876,63 @@ class Backend:
         except Exception:
             return dict(t)
 
+
+    async def get_trade_live_by_id(self, user_id: int, trade_id: int) -> Optional[dict]:
+        """Return trade row (by DB id) with live price + price source + hit checks."""
+        t = await db_store.get_trade_by_id(int(user_id), int(trade_id))
+        if not t:
+            return None
+        try:
+            market = (t.get('market') or 'FUTURES').upper()
+            symbol = str(t.get('symbol') or '')
+            side = (t.get('side') or 'LONG').upper()
+            s = Signal(
+                signal_id=int(t.get('signal_id') or 0),
+                market=market,
+                symbol=symbol,
+                direction=side,
+                timeframe='',
+                entry=float(t.get('entry') or 0.0),
+                sl=float(t.get('sl') or 0.0),
+                tp1=float(t.get('tp1') or 0.0),
+                tp2=float(t.get('tp2') or 0.0),
+                rr=0.0,
+                confidence=0,
+                confirmations='',
+                risk_note='',
+                ts=float(dt.datetime.now(dt.timezone.utc).timestamp()),
+            )
+            price, src = await self._get_price_with_source(s)
+            price_f = float(price)
+            def hit_tp(lvl: float) -> bool:
+                return price_f >= lvl if side == 'LONG' else price_f <= lvl
+            def hit_sl(lvl: float) -> bool:
+                return price_f <= lvl if side == 'LONG' else price_f >= lvl
+            sl = float(t.get('sl') or 0.0) if t.get('sl') is not None else 0.0
+            tp1 = float(t.get('tp1') or 0.0) if t.get('tp1') is not None else 0.0
+            tp2 = float(t.get('tp2') or 0.0) if t.get('tp2') is not None else 0.0
+            out = dict(t)
+            out['price_f'] = price_f
+            out['price_src'] = src
+            out['hit_sl'] = bool(sl and hit_sl(float(sl)))
+            out['hit_tp1'] = bool(tp1 and hit_tp(float(tp1)))
+            out['hit_tp2'] = bool(tp2 and hit_tp(float(tp2)))
+            return out
+        except Exception:
+            return dict(t)
+
+    async def remove_trade_by_id(self, user_id: int, trade_id: int) -> bool:
+        row = await db_store.get_trade_by_id(int(user_id), int(trade_id))
+        if not row:
+            return False
+        # manual close (keep last known price if present)
+        close_price = float(row.get('entry') or 0.0)
+        try:
+            await db_store.close_trade(int(trade_id), status='CLOSED', price=close_price, pnl_total_pct=float(row.get('pnl_total_pct') or 0.0))
+        except Exception:
+            await db_store.close_trade(int(trade_id), status='CLOSED')
+        return True
+
     async def get_user_trades(self, user_id: int) -> list[dict]:
         return await db_store.list_user_trades(int(user_id), include_closed=False, limit=50)
 
