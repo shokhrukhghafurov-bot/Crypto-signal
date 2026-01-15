@@ -1595,49 +1595,129 @@ class Backend:
             until_ts = until
         return {"action": act, "reason": reason, "until_ts": until_ts}
 
-    
-    async def _fetch_rest_price(self, market: str, symbol: str) -> float | None:
-        """REST fallback for price when websocket hasn't produced a tick yet."""
-        m = (market or "FUTURES").upper()
-        sym = (symbol or "").upper()
-        if not sym:
+async def _fetch_rest_price_binance(self, market: str, symbol: str) -> float | None:
+    """REST fallback price from Binance."""
+    m = (market or "FUTURES").upper()
+    sym = (symbol or "").upper()
+    if not sym:
+        return None
+    url = "https://api.binance.com/api/v3/ticker/price" if m == "SPOT" else "https://fapi.binance.com/fapi/v1/ticker/price"
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url, params={"symbol": sym}) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+        p = (data or {}).get("price")
+        return float(p) if p is not None else None
+    except Exception:
+        return None
+
+async def _fetch_rest_price_bybit_linear(self, symbol: str) -> float | None:
+    """REST price from Bybit v5 (linear futures)."""
+    sym = (symbol or "").upper()
+    if not sym:
+        return None
+    url = "https://api.bybit.com/v5/market/tickers"
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url, params={"category": "linear", "symbol": sym}) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+        res = (data or {}).get("result") or {}
+        lst = res.get("list") or []
+        if not lst:
             return None
-        url = "https://api.binance.com/api/v3/ticker/price" if m == "SPOT" else "https://fapi.binance.com/fapi/v1/ticker/price"
-        try:
-            timeout = aiohttp.ClientTimeout(total=6)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(url, params={"symbol": sym}) as r:
-                    if r.status != 200:
-                        return None
-                    data = await r.json()
-            p = data.get("price")
-            return float(p) if p is not None else None
-        except Exception:
+        lp = lst[0].get("lastPrice")
+        return float(lp) if lp is not None else None
+    except Exception:
+        return None
+    url = "https://api.bybit.com/v5/market/tickers"
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url, params={"category": "linear", "symbol": sym}) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+        # data: {"retCode":0,"result":{"list":[{"lastPrice":"..."}]}}
+        res = (data or {}).get("result") or {}
+        lst = res.get("list") or []
+        if not lst:
             return None
+        lp = lst[0].get("lastPrice")
+        return float(lp) if lp is not None else None
+    except Exception:
+        return None
 
-    async def _get_price(self, signal: Signal) -> float:
-        market = (signal.market or "FUTURES").upper()
-        base = float(getattr(signal, "entry", 0) or 0) or None
+async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
+    """Return (price, source). For FUTURES can use median(Binance,Bybit) when enabled.
 
-        # Mock mode: keep prices around entry to avoid nonsense.
-        if not USE_REAL_PRICE:
-            return self.feed.mock_price(market, signal.symbol, base=base)
+    Set env FUTURES_PRICE_SOURCE=median to enable.
+    """
+    market = (signal.market or "FUTURES").upper()
+    base = float(getattr(signal, "entry", 0) or 0) or None
 
-        # Real mode: websocket first, REST fallback, then (last resort) base/ mock near base.
-        await self.feed.ensure_stream(market, signal.symbol)
-        latest = self.feed.get_latest(market, signal.symbol)
+    # Mock mode: keep prices around entry to avoid nonsense.
+    if not USE_REAL_PRICE:
+        return (self.feed.mock_price(market, signal.symbol, base=base), "mock")
+
+    sym = (signal.symbol or "").upper()
+
+    # FUTURES: optional median price across Binance (WS/REST) and Bybit (REST).
+    use_median = (market == "FUTURES") and (os.getenv("FUTURES_PRICE_SOURCE", "binance").lower() in {"median", "median_binance_bybit", "median_bybit_binance"})
+    bin_price: float | None = None
+    byb_price: float | None = None
+
+    # Binance: websocket first, REST fallback
+    try:
+        await self.feed.ensure_stream(market, sym)
+        latest = self.feed.get_latest(market, sym)
         if latest is not None:
-            return float(latest)
+            bin_price = float(latest)
+        else:
+            rest = await self._fetch_rest_price_binance(market, sym)
+            if rest is not None and rest > 0:
+                bin_price = float(rest)
+                self.feed._set_latest(market, sym, float(rest))
+    except Exception:
+        bin_price = None
 
-        rest = await self._fetch_rest_price(market, signal.symbol)
-        if rest is not None and rest > 0:
-            self.feed._set_latest(market, signal.symbol, float(rest))
-            return float(rest)
+    # Bybit: REST (linear futures)
+    if use_median:
+        byb = await self._fetch_rest_price_bybit_linear(sym)
+        if byb is not None and byb > 0:
+            byb_price = float(byb)
 
-        # Last resort: keep near entry (never random huge).
-        if base is not None and base > 0:
-            return self.feed.mock_price(market, signal.symbol, base=base)
-        return self.feed.mock_price(market, signal.symbol, base=None)
+    # Decide price
+    if use_median:
+        avail = []
+        if bin_price is not None and bin_price > 0:
+            avail.append((bin_price, "binance"))
+        if byb_price is not None and byb_price > 0:
+            avail.append((byb_price, "bybit"))
+        if len(avail) >= 2:
+            a = sorted([avail[0][0], avail[1][0]])
+            med = (a[0] + a[1]) / 2.0
+            return (float(med), "median(binance,bybit)")
+        if len(avail) == 1:
+            return (float(avail[0][0]), avail[0][1])
+
+    # Non-median path (default): Binance only
+    if bin_price is not None and bin_price > 0:
+        return (float(bin_price), "binance")
+
+    # Last resort: keep near entry (never random huge).
+    if base is not None and base > 0:
+        return (self.feed.mock_price(market, sym, base=base), "mock(base)")
+    return (self.feed.mock_price(market, sym, base=None), "mock")
+
+async def _get_price(self, signal: Signal) -> float:
+    price, _src = await self._get_price_with_source(signal)
+    return float(price)
 
     async def check_signal_openable(self, signal: Signal) -> tuple[bool, str, float]:
         """Return (allowed, reason_code, current_price).
@@ -1723,7 +1803,7 @@ class Backend:
                         ts=float(dt.datetime.now(dt.timezone.utc).timestamp()),
                     )
 
-                    price = await self._get_price(s)
+                    price, price_src = await self._get_price_with_source(s)
                     price_f = float(price)
 
                     def hit_tp(lvl: float) -> bool:
@@ -1741,6 +1821,9 @@ class Backend:
                         pnl = calc_profit_pct(s.entry, float(s.sl), side)
                         await safe_send(bot, uid, _trf(uid, "msg_auto_loss",
                             symbol=s.symbol,
+                            current_price=f"{price_f:.6f}",
+                            trigger_price=f"{float(s.sl):.6f}",
+                            price_src=price_src,
                             status="LOSS",
                         ), ctx="msg_auto_loss")
                         await db_store.close_trade(trade_id, status="LOSS", price=float(s.sl), pnl_total_pct=float(pnl))
@@ -1751,6 +1834,9 @@ class Backend:
                         be_px = _be_exit_price(s.entry, side, market)
                         await safe_send(bot, uid, _trf(uid, "msg_auto_tp1",
                             symbol=s.symbol,
+                            current_price=f"{price_f:.6f}",
+                            trigger_price=f"{float(s.tp1):.6f}",
+                            price_src=price_src,
                             closed_pct=int(_partial_close_pct(market)),
                             be_price=f"{float(be_px):.6f}",
                             status="TP1",
@@ -1764,6 +1850,9 @@ class Backend:
                         if hit_sl(float(be_lvl)):
                             await safe_send(bot, uid, _trf(uid, "msg_auto_be",
                                 symbol=s.symbol,
+                                current_price=f"{price_f:.6f}",
+                                trigger_price=f"{float(be_lvl):.6f}",
+                                price_src=price_src,
                                 be_price=f"{float(be_lvl):.6f}",
                                 status="BE",
                             ), ctx="msg_auto_be")
@@ -1775,6 +1864,9 @@ class Backend:
                         pnl = calc_profit_pct(s.entry, float(s.tp2), side)
                         await safe_send(bot, uid, _trf(uid, "msg_auto_win",
                             symbol=s.symbol,
+                            current_price=f"{price_f:.6f}",
+                            trigger_price=f"{float(s.tp2):.6f}",
+                            price_src=price_src,
                             pnl_total=fmt_pnl_pct(float(pnl)),
                             status="WIN",
                         ), ctx="msg_auto_win")
