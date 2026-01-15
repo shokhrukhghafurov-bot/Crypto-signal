@@ -1595,453 +1595,93 @@ class Backend:
             until_ts = until
         return {"action": act, "reason": reason, "until_ts": until_ts}
 
-async def _fetch_rest_price_binance(self, market: str, symbol: str) -> float | None:
-    """REST fallback price from Binance."""
-    m = (market or "FUTURES").upper()
-    sym = (symbol or "").upper()
-    if not sym:
-        return None
-    url = "https://api.binance.com/api/v3/ticker/price" if m == "SPOT" else "https://fapi.binance.com/fapi/v1/ticker/price"
-    try:
-        timeout = aiohttp.ClientTimeout(total=6)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get(url, params={"symbol": sym}) as r:
-                if r.status != 200:
-                    return None
-                data = await r.json()
-        p = (data or {}).get("price")
-        return float(p) if p is not None else None
-    except Exception:
-        return None
-
-async def _fetch_rest_price_bybit_linear(self, symbol: str) -> float | None:
-    """REST price from Bybit v5 (linear futures)."""
-    sym = (symbol or "").upper()
-    if not sym:
-        return None
-    url = "https://api.bybit.com/v5/market/tickers"
-    try:
-        timeout = aiohttp.ClientTimeout(total=6)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get(url, params={"category": "linear", "symbol": sym}) as r:
-                if r.status != 200:
-                    return None
-                data = await r.json()
-        res = (data or {}).get("result") or {}
-        lst = res.get("list") or []
-        if not lst:
+    # ---------------- price helpers (trade tracking) ----------------
+    async def _fetch_rest_price_binance(self, market: str, symbol: str) -> float | None:
+        """REST fallback price from Binance (spot/futures)."""
+        m = (market or "FUTURES").upper()
+        sym = (symbol or "").upper()
+        if not sym:
             return None
-        lp = lst[0].get("lastPrice")
-        return float(lp) if lp is not None else None
-    except Exception:
-        return None
-    url = "https://api.bybit.com/v5/market/tickers"
-    try:
-        timeout = aiohttp.ClientTimeout(total=6)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get(url, params={"category": "linear", "symbol": sym}) as r:
-                if r.status != 200:
-                    return None
-                data = await r.json()
-        # data: {"retCode":0,"result":{"list":[{"lastPrice":"..."}]}}
-        res = (data or {}).get("result") or {}
-        lst = res.get("list") or []
-        if not lst:
+        url = "https://api.binance.com/api/v3/ticker/price" if m == "SPOT" else "https://fapi.binance.com/fapi/v1/ticker/price"
+        try:
+            timeout = aiohttp.ClientTimeout(total=6)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(url, params={"symbol": sym}) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json()
+            p = (data or {}).get("price")
+            return float(p) if p is not None else None
+        except Exception:
             return None
-        lp = lst[0].get("lastPrice")
-        return float(lp) if lp is not None else None
-    except Exception:
-        return None
 
-async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
-    """Return (price, source). For FUTURES can use median(Binance,Bybit) when enabled.
-
-    Set env FUTURES_PRICE_SOURCE=median to enable.
-    """
-    market = (signal.market or "FUTURES").upper()
-    base = float(getattr(signal, "entry", 0) or 0) or None
-
-    # Mock mode: keep prices around entry to avoid nonsense.
-    if not USE_REAL_PRICE:
-        return (self.feed.mock_price(market, signal.symbol, base=base), "mock")
-
-    sym = (signal.symbol or "").upper()
-
-    # FUTURES: optional median price across Binance (WS/REST) and Bybit (REST).
-    use_median = (market == "FUTURES") and (os.getenv("FUTURES_PRICE_SOURCE", "binance").lower() in {"median", "median_binance_bybit", "median_bybit_binance"})
-    bin_price: float | None = None
-    byb_price: float | None = None
-
-    # Binance: websocket first, REST fallback
-    try:
-        await self.feed.ensure_stream(market, sym)
-        latest = self.feed.get_latest(market, sym)
-        if latest is not None:
-            bin_price = float(latest)
-        else:
-            rest = await self._fetch_rest_price_binance(market, sym)
-            if rest is not None and rest > 0:
-                bin_price = float(rest)
-                self.feed._set_latest(market, sym, float(rest))
-    except Exception:
-        bin_price = None
-
-    # Bybit: REST (linear futures)
-    if use_median:
-        byb = await self._fetch_rest_price_bybit_linear(sym)
-        if byb is not None and byb > 0:
-            byb_price = float(byb)
-
-    # Decide price
-    if use_median:
-        avail = []
-        if bin_price is not None and bin_price > 0:
-            avail.append((bin_price, "binance"))
-        if byb_price is not None and byb_price > 0:
-            avail.append((byb_price, "bybit"))
-        if len(avail) >= 2:
-            a = sorted([avail[0][0], avail[1][0]])
-            med = (a[0] + a[1]) / 2.0
-            return (float(med), "median(binance,bybit)")
-        if len(avail) == 1:
-            return (float(avail[0][0]), avail[0][1])
-
-    # Non-median path (default): Binance only
-    if bin_price is not None and bin_price > 0:
-        return (float(bin_price), "binance")
-
-    # Last resort: keep near entry (never random huge).
-    if base is not None and base > 0:
-        return (self.feed.mock_price(market, sym, base=base), "mock(base)")
-    return (self.feed.mock_price(market, sym, base=None), "mock")
-
-async def _get_price(self, signal: Signal) -> float:
-    price, _src = await self._get_price_with_source(signal)
-    return float(price)
-
-async def check_signal_openable(self, signal: Signal) -> tuple[bool, str, float]:
-    """Return (allowed, reason_code, current_price).
-
-    reason_code is one of: OK, TP2, TP1, SL, TIME, ERROR
-    """
-    try:
-        now = time.time()
-        ttl = int(os.getenv("SIGNAL_OPEN_TTL_SECONDS", "1800"))  # 30 min default
-        sig_ts = float(getattr(signal, "ts", 0) or 0)
-        if sig_ts and ttl > 0 and (now - sig_ts) > ttl:
-            price = await self._get_price(signal)
-            return False, "TIME", float(price)
-
-        price = float(await self._get_price(signal))
-
-        direction = (getattr(signal, "direction", None) or getattr(signal, "side", None) or "").upper()
-        is_short = "SHORT" in direction
-        is_long = not is_short
-
-        tp1 = getattr(signal, "tp1", None)
-        tp2 = getattr(signal, "tp2", None)
-        sl = getattr(signal, "sl", None)
-
-        tp1_f = float(tp1) if tp1 is not None else None
-        tp2_f = float(tp2) if tp2 is not None else None
-        sl_f = float(sl) if sl is not None else None
-
-        if is_long:
-            if tp2_f is not None and price >= tp2_f:
-                return False, "TP2", price
-            if tp1_f is not None and price >= tp1_f:
-                return False, "TP1", price
-            if sl_f is not None and price <= sl_f:
-                return False, "SL", price
-        else:
-            if tp2_f is not None and price <= tp2_f:
-                return False, "TP2", price
-            if tp1_f is not None and price <= tp1_f:
-                return False, "TP1", price
-            if sl_f is not None and price >= sl_f:
-                return False, "SL", price
-
-        return True, "OK", price
-    except Exception:
+    async def _fetch_rest_price_bybit_linear(self, symbol: str) -> float | None:
+        """REST price from Bybit v5 (linear futures)."""
+        sym = (symbol or "").upper()
+        if not sym:
+            return None
+        url = "https://api.bybit.com/v5/market/tickers"
         try:
-            price = float(await self._get_price(signal))
+            timeout = aiohttp.ClientTimeout(total=6)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(url, params={"category": "linear", "symbol": sym}) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json()
+            res = (data or {}).get("result") or {}
+            lst = res.get("list") or []
+            if not lst:
+                return None
+            lp = lst[0].get("lastPrice")
+            return float(lp) if lp is not None else None
         except Exception:
-            price = 0.0
-        return False, "ERROR", price
+            return None
 
-async def track_loop(self, bot) -> None:
-    """Main tracker loop. Reads ACTIVE/TP1 trades from PostgreSQL and updates their status."""
-    while True:
+    async def _get_price_with_source(self, signal: "Signal") -> tuple[float, str]:
+        """Return (price, source).
+
+        - SPOT: Binance WS -> Binance REST fallback
+        - FUTURES:
+            - if FUTURES_PRICE_SOURCE=median => median(Binance, Bybit)
+            - else => Binance WS/REST
+        """
+        market = (getattr(signal, "market", None) or "FUTURES").upper()
+        sym = (getattr(signal, "symbol", None) or "").upper()
+        entry = getattr(signal, "entry", None)
+        base = float(entry) if entry is not None else None
+
+        if not USE_REAL_PRICE:
+            return (self.feed.mock_price(market, sym, base=base), "mock")
+
+        # Binance: WS first (via PriceFeed), then REST
+        bin_price: float | None = None
         try:
-            rows = await db_store.list_active_trades(limit=500)
+            await self.feed.ensure_stream(market, sym)
+            bin_price = self.feed.get_latest(market, sym)
         except Exception:
-            logger.exception("track_loop: failed to load active trades from DB")
-            rows = []
+            bin_price = None
+        if bin_price is None:
+            bin_price = await self._fetch_rest_price_binance(market, sym)
 
-        for row in rows:
-            try:
-                trade_id = int(row["id"])
-                uid = int(row["user_id"])
-                market = (row.get("market") or "FUTURES").upper()
-                symbol = str(row.get("symbol") or "")
-                side = str(row.get("side") or "LONG").upper()
+        # FUTURES median across Binance + Bybit
+        use_median = (market == "FUTURES") and (os.getenv("FUTURES_PRICE_SOURCE", "binance").lower() in {"median", "median_binance_bybit", "median_bybit_binance"})
+        if use_median:
+            byb_price = await self._fetch_rest_price_bybit_linear(sym)
+            if bin_price is not None and byb_price is not None:
+                return ((float(bin_price) + float(byb_price)) / 2.0, "median(binance,bybit)")
+            if byb_price is not None:
+                return (float(byb_price), "bybit")
+            if bin_price is not None:
+                return (float(bin_price), "binance")
+            # last resort
+            return (self.feed.mock_price(market, sym, base=base), "mock")
 
-                s = Signal(
-                    signal_id=int(row.get("signal_id") or 0),
-                    market=market,
-                    symbol=symbol,
-                    direction=side,
-                    timeframe="",
-                    entry=float(row.get("entry") or 0.0),
-                    sl=float(row.get("sl") or 0.0),
-                    tp1=float(row.get("tp1") or 0.0),
-                    tp2=float(row.get("tp2") or 0.0),
-                    rr=0.0,
-                    confidence=0,
-                    confirmations="",
-                    risk_note="",
-                    ts=float(dt.datetime.now(dt.timezone.utc).timestamp()),
-                )
+        # Default: Binance only
+        if bin_price is not None:
+            return (float(bin_price), "binance")
+        return (self.feed.mock_price(market, sym, base=base), "mock")
 
-                price, price_src = await self._get_price_with_source(s)
-                price_f = float(price)
+    async def _get_price(self, signal: "Signal") -> float:
+        price, _src = await self._get_price_with_source(signal)
+        return float(price)
 
-                def hit_tp(lvl: float) -> bool:
-                    return price_f >= lvl if side == "LONG" else price_f <= lvl
-
-                def hit_sl(lvl: float) -> bool:
-                    return price_f <= lvl if side == "LONG" else price_f >= lvl
-
-                status = str(row.get("status") or "ACTIVE").upper()
-                tp1_hit = bool(row.get("tp1_hit"))
-                be_price = float(row.get("be_price") or 0.0) if row.get("be_price") is not None else 0.0
-
-                # 1) SL before TP1 -> LOSS
-                if not tp1_hit and s.sl and hit_sl(float(s.sl)):
-                    pnl = calc_profit_pct(s.entry, float(s.sl), side)
-                    await safe_send(bot, uid, _trf(uid, "msg_auto_loss",
-                        symbol=s.symbol,
-                        current_price=f"{price_f:.6f}",
-                        trigger_price=f"{float(s.sl):.6f}",
-                        price_src=price_src,
-                        status="LOSS",
-                    ), ctx="msg_auto_loss")
-                    await db_store.close_trade(trade_id, status="LOSS", price=float(s.sl), pnl_total_pct=float(pnl))
-                    continue
-
-                # 2) TP1 -> partial close + BE
-                if not tp1_hit and s.tp1 and hit_tp(float(s.tp1)):
-                    be_px = _be_exit_price(s.entry, side, market)
-                    await safe_send(bot, uid, _trf(uid, "msg_auto_tp1",
-                        symbol=s.symbol,
-                        current_price=f"{price_f:.6f}",
-                        trigger_price=f"{float(s.tp1):.6f}",
-                        price_src=price_src,
-                        closed_pct=int(_partial_close_pct(market)),
-                        be_price=f"{float(be_px):.6f}",
-                        status="TP1",
-                    ), ctx="msg_auto_tp1")
-                    await db_store.set_tp1(trade_id, be_price=float(be_px), price=float(s.tp1), pnl_pct=float(calc_profit_pct(s.entry, float(s.tp1), side)))
-                    continue
-
-                # 3) After TP1: BE close
-                if tp1_hit and _be_enabled(market):
-                    be_lvl = be_price if be_price else _be_exit_price(s.entry, side, market)
-                    if hit_sl(float(be_lvl)):
-                        await safe_send(bot, uid, _trf(uid, "msg_auto_be",
-                            symbol=s.symbol,
-                            current_price=f"{price_f:.6f}",
-                            trigger_price=f"{float(be_lvl):.6f}",
-                            price_src=price_src,
-                            be_price=f"{float(be_lvl):.6f}",
-                            status="BE",
-                        ), ctx="msg_auto_be")
-                        await db_store.close_trade(trade_id, status="BE", price=float(be_lvl), pnl_total_pct=0.0)
-                        continue
-
-                # 4) TP2 -> WIN
-                if s.tp2 and hit_tp(float(s.tp2)):
-                    pnl = calc_profit_pct(s.entry, float(s.tp2), side)
-                    await safe_send(bot, uid, _trf(uid, "msg_auto_win",
-                        symbol=s.symbol,
-                        current_price=f"{price_f:.6f}",
-                        trigger_price=f"{float(s.tp2):.6f}",
-                        price_src=price_src,
-                        pnl_total=fmt_pnl_pct(float(pnl)),
-                        status="WIN",
-                    ), ctx="msg_auto_win")
-                    await db_store.close_trade(trade_id, status="WIN", price=float(s.tp2), pnl_total_pct=float(pnl))
-                    continue
-
-            except Exception:
-                logger.exception("track_loop: error while tracking trade row=%r", row)
-
-        await asyncio.sleep(TRACK_INTERVAL_SECONDS)
-
-async def scanner_loop(self, emit_signal_cb, emit_macro_alert_cb) -> None:
-    while True:
-        start = time.time()
-        logger.info("SCAN tick start top_n=%s interval=%ss news_filter=%s macro_filter=%s", TOP_N, SCAN_INTERVAL_SECONDS, bool(NEWS_FILTER and CRYPTOPANIC_TOKEN), bool(MACRO_FILTER))
-        logger.info("[scanner] tick start TOP_N=%s interval=%ss", TOP_N, SCAN_INTERVAL_SECONDS)
-        self.last_scan_ts = start
-        try:
-            async with MultiExchangeData() as api:
-                await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
-
-                symbols = await api.get_top_usdt_symbols(TOP_N)
-                self.scanned_symbols_last = len(symbols)
-                logger.info("[scanner] symbols loaded: %s", self.scanned_symbols_last)
-
-                mac_act, mac_ev, mac_win = self.macro.current_action()
-                self.last_macro_action = mac_act
-                if MACRO_FILTER:
-                    logger.info("[scanner] macro action=%s next=%s window=%s", mac_act, getattr(mac_ev, "name", None) if mac_ev else None, mac_win)
-
-                if mac_act != "ALLOW" and mac_ev and mac_win and self.macro.should_notify(mac_ev):
-                    logger.info("[macro] alert: action=%s event=%s window=%s", mac_act, getattr(mac_ev, "name", None), mac_win)
-                    await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
-
-                for sym in symbols:
-                    if not self.can_emit(sym):
-                        continue
-                    if mac_act == "PAUSE_ALL":
-                        continue
-
-                    # News action
-                    try:
-                        if self.news.enabled():
-                            news_act = await self.news.action_for_symbol(api.session, sym)  # type: ignore[arg-type]
-                        else:
-                            news_act = "ALLOW"
-                    except Exception:
-                        news_act = "ALLOW"
-                    self.last_news_action = news_act
-                    if news_act == "PAUSE_ALL":
-                        continue
-
-                    async def fetch_exchange(name: str):
-                        try:
-                            if name == "BINANCE":
-                                df15 = await api.klines_binance(sym, "15m", 250)
-                                df1h = await api.klines_binance(sym, "1h", 250)
-                                df4h = await api.klines_binance(sym, "4h", 250)
-                            elif name == "BYBIT":
-                                df15 = await api.klines_bybit(sym, "15m", 200)
-                                df1h = await api.klines_bybit(sym, "1h", 200)
-                                df4h = await api.klines_bybit(sym, "4h", 200)
-                            else:
-                                df15 = await api.klines_okx(sym, "15m", 200)
-                                df1h = await api.klines_okx(sym, "1h", 200)
-                                df4h = await api.klines_okx(sym, "4h", 200)
-                            res = evaluate_on_exchange(df15, df1h, df4h)
-                            return name, res
-                        except Exception:
-                            return name, None
-
-                    results = await asyncio.gather(fetch_exchange("BINANCE"), fetch_exchange("BYBIT"), fetch_exchange("OKX"))
-                    good = [(name, r) for (name, r) in results if r is not None]
-                    if len(good) < 2:
-                        continue
-
-                    dirs: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
-                    for name, r in good:
-                        dirs.setdefault(r["direction"], []).append((name, r))
-                    best_dir, supporters = max(dirs.items(), key=lambda kv: len(kv[1]))
-                    if len(supporters) < 2:
-                        continue
-
-                    entry = float(np.median([s[1]["entry"] for s in supporters]))
-                    sl = float(np.median([s[1]["sl"] for s in supporters]))
-                    tp1 = float(np.median([s[1]["tp1"] for s in supporters]))
-                    tp2 = float(np.median([s[1]["tp2"] for s in supporters]))
-                    rr = float(np.median([s[1]["rr"] for s in supporters]))
-                    conf = int(np.median([s[1]["confidence"] for s in supporters]))
-                    
-                    market = choose_market(float(np.nanmax([s[1]["adx1"] for s in supporters])),
-                                          float(np.nanmax([s[1]["atr_pct"] for s in supporters])))
-                    
-                    min_conf = TA_MIN_SCORE_FUTURES if market == "FUTURES" else TA_MIN_SCORE_SPOT
-
-# Orderbook confirmation (FUTURES only, enabled via ENV)
-                    if USE_ORDERBOOK and (not ORDERBOOK_FUTURES_ONLY or market == "FUTURES"):
-                        ob_allows: List[bool] = []
-                        ob_notes: List[str] = []
-                        for ex in [s[0] for s in supporters]:
-                            if ex.strip().lower() not in ORDERBOOK_EXCHANGES:
-                                continue
-                            ok, note = await orderbook_filter(api, ex, sym, best_dir)
-                            ob_allows.append(bool(ok))
-                            ob_notes.append(note)
-                        # If we checked at least one exchange and none allowed -> block signal
-                        if ob_allows and not any(ob_allows):
-                            # keep a short reason in logs
-                            logger.info("[orderbook] block %s %s %s notes=%s", sym, market, best_dir, "; ".join(ob_notes)[:200])
-                            continue
-                    
-                    if conf < min_conf or rr < 2.0:
-                        continue
-                    
-                    risk_notes = []
-
-                    # Add TA summary (real indicators) to the signal card
-                    try:
-                        best_supporter = max(supporters, key=lambda s: int(s[1].get("confidence", 0)))
-                        ta_block = str(best_supporter[1].get("ta_block", "") or "").strip()
-                        if ta_block:
-                            risk_notes.append(ta_block)
-                    except Exception:
-                        pass
-
-
-                    if news_act == "FUTURES_OFF" and market == "FUTURES":
-                        market = "SPOT"
-                        risk_notes.append("⚠️ Futures paused due to news")
-                    if mac_act == "FUTURES_OFF" and market == "FUTURES":
-                        market = "SPOT"
-                        risk_notes.append("⚠️ Futures signals are temporarily disabled (macro)")
-
-                    conf_names = "+".join(sorted([s[0] for s in supporters]))
-
-                    sid = self.next_signal_id()
-                    sig = Signal(
-                        signal_id=sid,
-                        market=market,
-                        symbol=sym,
-                        direction=best_dir,
-                        timeframe="15m/1h/4h",
-                        entry=entry,
-                        sl=sl,
-                        tp1=tp1,
-                        tp2=tp2,
-                        rr=rr,
-                        confidence=conf,
-                        confirmations=conf_names,
-                        risk_note="\\n".join(risk_notes).strip(),
-                        ts=time.time(),
-                    )
-
-                    self.mark_emitted(sym)
-                    self.last_signal = sig
-                    if sig.market == "SPOT":
-                        self.last_spot_signal = sig
-                    else:
-                        self.last_futures_signal = sig
-
-                    logger.info("[signal] emit %s %s %s conf=%s rr=%.2f notes=%s", sig.symbol, sig.market, sig.direction, sig.confidence, sig.rr, (sig.risk_note or "-")[:120])
-                    logger.info("SIGNAL %s %s %s conf=%s rr=%.2f notes=%s", sig.market, sig.symbol, sig.direction, sig.confidence, sig.rr, (sig.risk_note or "-"))
-                    logger.info("SIGNAL found %s %s %s conf=%s rr=%.2f exch=%s", sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr), sig.confirmations)
-                    await emit_signal_cb(sig)
-                    await asyncio.sleep(2)
-
-        except Exception:
-            logger.exception("scanner_loop error")
-
-        elapsed = time.time() - start
-        logger.info("SCAN tick done scanned=%s elapsed=%.1fs last_news=%s last_macro=%s", int(getattr(self, "scanned_symbols_last", 0) or 0), elapsed, getattr(self, "last_news_action", "?"), getattr(self, "last_macro_action", "?"))
-        await asyncio.sleep(max(5, SCAN_INTERVAL_SECONDS - elapsed))
-
-
-# --- Bind runtime loops to Backend as methods (keeps bot.py calls stable)
-Backend.check_signal_openable = check_signal_openable
-Backend.track_loop = track_loop
-Backend.scanner_loop = scanner_loop
