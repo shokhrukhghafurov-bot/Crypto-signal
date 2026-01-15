@@ -13,7 +13,7 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import datetime as dt
 
 import asyncpg
@@ -89,8 +89,32 @@ if _raw_admins:
 def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-TZ_NAME = os.getenv("TZ_NAME", "Europe/Berlin").strip() or "Europe/Berlin"
-TZ = ZoneInfo(TZ_NAME)
+# Timezone
+# NOTE: "MSK" is a common shorthand, but it's not a valid IANA tz database key.
+# Use "Europe/Moscow" (MSK / UTC+3) instead.
+_tz_raw = (os.getenv("TZ_NAME", "Europe/Berlin") or "").strip()
+
+_TZ_ALIASES = {
+    "MSK": "Europe/Moscow",
+    "MOSCOW": "Europe/Moscow",
+    "RUSSIA/MOSCOW": "Europe/Moscow",
+    "EUROPE/MOSCOW": "Europe/Moscow",
+    "UTC+3": "Europe/Moscow",
+    "GMT+3": "Europe/Moscow",
+}
+
+TZ_NAME = _TZ_ALIASES.get(_tz_raw.upper(), _tz_raw) or "Europe/Moscow"
+try:
+    TZ = ZoneInfo(TZ_NAME)
+except (ZoneInfoNotFoundError, FileNotFoundError):
+    # If tzdata isn't installed or the key is invalid, fall back safely.
+    # Prefer Moscow for your bot (as requested), otherwise UTC.
+    try:
+        TZ_NAME = "Europe/Moscow"
+        TZ = ZoneInfo(TZ_NAME)
+    except Exception:
+        TZ_NAME = "UTC"
+        TZ = ZoneInfo("UTC")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
