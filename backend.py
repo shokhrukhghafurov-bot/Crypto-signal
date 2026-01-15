@@ -2111,6 +2111,12 @@ class Backend:
                             market = "SPOT"
                             risk_notes.append("⚠️ Futures signals are temporarily disabled (macro)")
 
+                        # Policy: do not emit SPOT SHORT signals (confusing / not executable for most users).
+                        # If a signal resolves to SPOT market but direction is SHORT, we skip it.
+                        if market == "SPOT" and str(best_dir).upper() == "SHORT":
+                            logger.info("[signal] skip %s %s %s reason=spot_short_disabled", sym, market, best_dir)
+                            continue
+
                         conf_names = "+".join(sorted([s[0] for s in supporters]))
 
                         sid = self.next_signal_id()
