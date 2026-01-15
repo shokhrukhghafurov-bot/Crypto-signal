@@ -92,7 +92,8 @@ def _is_admin(user_id: int) -> bool:
 # Timezone
 # NOTE: "MSK" is a common shorthand, but it's not a valid IANA tz database key.
 # Use "Europe/Moscow" (MSK / UTC+3) instead.
-_tz_raw = (os.getenv("TZ_NAME", "Europe/Berlin") or "").strip()
+# Default to Moscow time for the bot (can be overridden via TZ_NAME env).
+_tz_raw = (os.getenv("TZ_NAME", "Europe/Moscow") or "").strip()
 
 _TZ_ALIASES = {
     "MSK": "Europe/Moscow",
