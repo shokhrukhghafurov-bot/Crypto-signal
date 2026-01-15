@@ -1,38 +1,42 @@
-\
 from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 import os
-import random
-import re
-import time
-import datetime as dt
-import math
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List, Any
-
-import aiohttp
-import numpy as np
-import pandas as pd
-import websockets
-from ta.trend import EMAIndicator, MACD, ADXIndicator
-from ta.momentum import RSIIndicator
-from ta.volatility import AverageTrueRange, BollingerBands
-from ta.volume import OnBalanceVolumeIndicator, MFIIndicator
-from zoneinfo import ZoneInfo
-
 import logging
+import re
+from pathlib import Path
+from typing import Dict, List, Set, Tuple
+
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
+import datetime as dt
+
+import asyncpg
 
 import db_store
 
-logger = logging.getLogger("crypto-signal")
+from backend import Backend, Signal, MacroEvent, open_metrics
+
+load_dotenv()
+
+# ---- logging to stdout (Railway Deploy Logs) ----
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("bot")
 
 # --- i18n template safety guard (prevents leaking {placeholders} to users) ---
 _UNFILLED_RE = re.compile(r'(?<!\{)\{[a-zA-Z0-9_]+\}(?!\})')
 
 def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
+    """Guard against unfilled {placeholders} leaking to users."""
     if not text:
         return text
     hits = _UNFILLED_RE.findall(text)
@@ -43,2103 +47,1683 @@ def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
-async def safe_send(bot, chat_id: int, text: str, *, ctx: str = "", **kwargs):
+async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
     # Never recurse. Send via bot API.
-    return await bot.send_message(chat_id, text, **kwargs)
+    try:
+        return await bot.send_message(chat_id, text, **kwargs)
+    except TelegramForbiddenError:
+        # User blocked the bot or cannot be contacted
+        await set_user_blocked(chat_id, blocked=True)
+        raise
+    except TelegramBadRequest as e:
+        if "chat not found" in str(e).lower():
+            # Chat does not exist / user never started the bot
+            await set_user_blocked(chat_id, blocked=True)
+        raise
+
+async def safe_edit_text(chat_id: int, message_id: int, text: str, *, ctx: str = "", **kwargs):
+    text = _sanitize_template_text(chat_id, text, ctx=ctx)
+    return await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, **kwargs)
 
 
+# -----------------------------------------------
 
-# ------------------ ENV helpers ------------------
-def _env_int(name: str, default: int) -> int:
+
+def _must_env(name: str) -> str:
     v = os.getenv(name, "").strip()
     if not v:
-        return default
-    try:
-        return int(v)
-    except Exception:
-        return default
+        raise RuntimeError(f"{name} is missing. Put it into Railway Variables or .env.")
+    return v
 
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name, "").strip()
-    if not v:
-        return default
-    try:
-        return float(v)
-    except Exception:
-        return default
+BOT_TOKEN = _must_env("BOT_TOKEN")
 
+ADMIN_IDS: List[int] = []
+_raw_admins = os.getenv("ADMIN_IDS", "").strip()
+if _raw_admins:
+    for part in _raw_admins.split(","):
+        part = part.strip()
+        if part:
+            ADMIN_IDS.append(int(part))
 
-def _env_str(name: str, default: str) -> str:
-    v = os.getenv(name, "").strip()
-    return v if v else default
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name, "").strip().lower()
-    if v == "":
-        return default
-    return v in ("1", "true", "yes", "y", "on")
+def _is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
+TZ_NAME = os.getenv("TZ_NAME", "Europe/Berlin").strip() or "Europe/Berlin"
+TZ = ZoneInfo(TZ_NAME)
 
-# --- i18n helpers (loaded from i18n.json; no hardcoded auto-close texts) ---
-I18N_FILE = Path(__file__).with_name("i18n.json")
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+backend = Backend()
+
+# Keep last broadcast signals for 'Spot live' / 'Futures live' buttons
+LAST_SIGNAL_BY_MARKET = {"SPOT": None, "FUTURES": None}
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+pool: asyncpg.Pool | None = None
+
 LANG_FILE = Path("langs.json")
+LANG: Dict[int, str] = {}  # user_id -> "ru" | "en"
 
-_I18N_CACHE: dict = {}
-_I18N_MTIME: float = 0.0
-_LANG_CACHE: dict[int, str] = {}
-_LANG_CACHE_MTIME: float = 0.0
+def load_langs() -> None:
+    global LANG
+    if LANG_FILE.exists():
+        try:
+            data = json.loads(LANG_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                LANG = {int(k): str(v) for k, v in data.items()}
+        except Exception:
+            LANG = {}
 
-def _load_i18n() -> dict:
-    global _I18N_CACHE, _I18N_MTIME
+def save_langs() -> None:
+    try:
+        LANG_FILE.write_text(json.dumps({str(k): v for k, v in LANG.items()}, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
+
+def get_lang(uid: int) -> str:
+    v = (LANG.get(uid) or "").lower().strip()
+    return "en" if v == "en" else "ru"
+
+def set_lang(uid: int, lang: str) -> None:
+    LANG[uid] = "en" if (lang or "").lower().startswith("en") else "ru"
+    save_langs()
+
+
+I18N_FILE = Path(__file__).with_name("i18n.json")
+
+def load_i18n() -> dict:
+    # Load i18n from external file (preferred). Fall back to embedded defaults if needed.
     try:
         if I18N_FILE.exists():
-            mt = I18N_FILE.stat().st_mtime
-            if _I18N_CACHE and mt == _I18N_MTIME:
-                return _I18N_CACHE
             data = json.loads(I18N_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "ru" in data and "en" in data:
-                _I18N_CACHE = data
-                _I18N_MTIME = mt
+            if isinstance(data, dict) and "en" in data:
                 return data
     except Exception:
         pass
-    if not _I18N_CACHE:
-        _I18N_CACHE = {"ru": {}, "en": {}}
-    return _I18N_CACHE
+    return {"ru": {}, "en": {}}
 
-def _load_langs_if_needed() -> None:
-    global _LANG_CACHE, _LANG_CACHE_MTIME
-    try:
-        if not LANG_FILE.exists():
-            _LANG_CACHE = {}
-            _LANG_CACHE_MTIME = 0.0
-            return
-        mt = LANG_FILE.stat().st_mtime
-        if mt == _LANG_CACHE_MTIME:
-            return
-        raw = json.loads(LANG_FILE.read_text(encoding="utf-8"))
-        if isinstance(raw, dict):
-            tmp: dict[int, str] = {}
-            for k, v in raw.items():
-                try:
-                    uid = int(k)
-                except Exception:
-                    continue
-                vv = (v or "").lower().strip()
-                tmp[uid] = "en" if vv == "en" else "ru"
-            _LANG_CACHE = tmp
-            _LANG_CACHE_MTIME = mt
-    except Exception:
-        pass
+I18N = load_i18n()
 
-def _get_lang(uid: int) -> str:
-    _load_langs_if_needed()
-    return _LANG_CACHE.get(int(uid), "ru")
 
-def _tr(uid: int, key: str) -> str:
-    lang = _get_lang(uid)
-    i18n = _load_i18n()
-    return i18n.get(lang, i18n.get("en", {})).get(key, key)
+def tr(uid: int, key: str) -> str:
+    lang = get_lang(uid)
+    return I18N.get(lang, I18N["en"]).get(key, I18N["en"].get(key, key))
+
+
+
 
 class _SafeDict(dict):
     def __missing__(self, key):
         return "{" + key + "}"
 
-def _trf(uid: int, key: str, **kwargs) -> str:
-    tmpl = _tr(uid, key)
+def trf(uid: int, key: str, **kwargs) -> str:
+    tmpl = tr(uid, key)
     try:
         return str(tmpl).format_map(_SafeDict(**kwargs))
     except Exception:
         return str(tmpl)
 
-def _market_label(uid: int, market: str) -> str:
-    return _tr(uid, "lbl_spot") if str(market).upper() == "SPOT" else _tr(uid, "lbl_futures")
-# --- /i18n helpers ---
+def tr_action(uid: int, v: str) -> str:
+    vv = (v or "").upper().strip()
+    if vv == "ALLOW":
+        return tr(uid, "action_allow")
+    if vv in {"PAUSE", "PAUSED", "STOP", "BLOCK"}:
+        return tr(uid, "action_pause")
+    return v
 
+def tr_market(uid: int, market: str) -> str:
+    return tr(uid, "lbl_spot") if (market or "").upper().strip() == "SPOT" else tr(uid, "lbl_futures")
 
-# ------------------ backend-only metrics helpers ------------------
+SIGNALS: Dict[int, Signal] = {}
+ORIGINAL_SIGNAL_TEXT: Dict[tuple[int,int], str] = {}  # (uid, signal_id) -> text
 
-def calc_profit_pct(entry: float, tp: float, direction: str) -> float:
-    """Estimated profit percent from entry to tp for LONG/SHORT."""
+# Anti-duplicate protection for broadcasted signals.
+# Some scanners can emit the same signal multiple times (sometimes with different IDs).
+_SENT_SIG_CACHE: Dict[str, float] = {}  # signature -> last_sent_ts
+_SENT_SIG_TTL_SEC = int(os.getenv("SENT_SIG_TTL_SEC", "600"))  # default 10 minutes
+
+# ---------------- signal stats (daily/weekly) ----------------
+STATS_FILE = Path("signal_stats.json")
+SIGNAL_STATS: Dict[str, Dict[str, int]] = {"days": {}, "weeks": {}}
+
+def load_signal_stats() -> None:
+    global SIGNAL_STATS
+    if STATS_FILE.exists():
+        try:
+            data = json.loads(STATS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                days = data.get("days") or {}
+                weeks = data.get("weeks") or {}
+                if isinstance(days, dict) and isinstance(weeks, dict):
+                    SIGNAL_STATS = {
+                        "days": {str(k): int(v) for k, v in days.items()},
+                        "weeks": {str(k): int(v) for k, v in weeks.items()},
+                    }
+        except Exception:
+            SIGNAL_STATS = {"days": {}, "weeks": {}}
+
+def save_signal_stats() -> None:
     try:
-        entry = float(entry)
-        tp = float(tp)
-        if entry == 0:
+        STATS_FILE.write_text(json.dumps(SIGNAL_STATS, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
+
+def _day_key(d: dt.date) -> str:
+    return d.isoformat()
+
+def _week_key(d: dt.date) -> str:
+    y, w, _ = d.isocalendar()
+    return f"{y}-W{int(w):02d}"
+
+def bump_signal_stats() -> None:
+    # Counts are global (for all users) and respect TZ_NAME
+    now = dt.datetime.now(TZ)
+    dk = _day_key(now.date())
+    wk = _week_key(now.date())
+    SIGNAL_STATS["days"][dk] = int(SIGNAL_STATS["days"].get(dk, 0)) + 1
+    SIGNAL_STATS["weeks"][wk] = int(SIGNAL_STATS["weeks"].get(wk, 0)) + 1
+    save_signal_stats()
+
+def _signals_today() -> int:
+    dk = _day_key(dt.datetime.now(TZ).date())
+    return int(SIGNAL_STATS["days"].get(dk, 0))
+
+def _signals_this_week() -> int:
+    wk = _week_key(dt.datetime.now(TZ).date())
+    return int(SIGNAL_STATS["weeks"].get(wk, 0))
+
+def _daily_report_lines(days: int = 7) -> list[str]:
+    today = dt.datetime.now(TZ).date()
+    out: list[str] = []
+    for i in range(days - 1, -1, -1):
+        d = today - dt.timedelta(days=i)
+        k = _day_key(d)
+        cnt = int(SIGNAL_STATS["days"].get(k, 0))
+        out.append(f"{k}: {cnt}")
+    return out
+
+def _weekly_report_lines(weeks: int = 4) -> list[str]:
+    today = dt.datetime.now(TZ).date()
+    # go back (weeks-1) weeks and build iso week keys
+    out: list[str] = []
+    seen = set()
+    for i in range(weeks - 1, -1, -1):
+        d = today - dt.timedelta(days=7*i)
+        k = _week_key(d)
+        if k in seen:
+            continue
+        seen.add(k)
+        cnt = int(SIGNAL_STATS["weeks"].get(k, 0))
+        out.append(f"{k}: {cnt}")
+    return out
+
+# Status auto-refresh (per user)
+STATUS_TASKS: Dict[int, asyncio.Task] = {}
+
+CURRENT_VIEW: dict[int, str] = {}
+
+def _nav_enter(user_id: int, view: str) -> None:
+    prev = CURRENT_VIEW.get(user_id)
+    if view != "back":
+        if prev and prev != view:
+            PREV_VIEW[user_id] = prev
+        CURRENT_VIEW[user_id] = view
+
+def _nav_back(user_id: int, default: str = "status") -> str:
+    return PREV_VIEW.get(user_id) or default
+
+PREV_VIEW: dict[int, str] = {}
+
+
+async def safe_edit_markup(chat_id: int, message_id: int, reply_markup, *, ctx: str = ""):
+    """Edit message reply_markup only (e.g., remove inline keyboard)."""
+    try:
+        return await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+    except Exception:
+        return None
+
+async def _send_long(chat_id: int, text: str, reply_markup=None) -> None:
+    # Telegram message limit ~4096 chars. Send in chunks if needed.
+    max_len = 3800
+    if len(text) <= max_len:
+        await safe_send(chat_id, text, reply_markup=reply_markup)
+        return
+    parts = []
+    cur = ""
+    for line in text.splitlines(True):
+        if len(cur) + len(line) > max_len and cur:
+            parts.append(cur)
+            cur = ""
+        cur += line
+    if cur:
+        parts.append(cur)
+
+
+
+async def safe_edit(message: types.Message | None, txt: str, kb: types.InlineKeyboardMarkup) -> None:
+    """Edit message text if possible; otherwise send a new message."""
+    try:
+        if message:
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                text=txt,
+                reply_markup=kb,
+            )
+            return
+    except Exception:
+        # message may be too old/not modified/etc. Fall back to send.
+        pass
+
+    try:
+        if message:
+            await safe_send(message.chat.id, txt, reply_markup=kb)
+    except Exception:
+        pass
+
+
+async def _render_in_place(call: types.CallbackQuery, txt: str, kb: types.InlineKeyboardMarkup) -> types.Message:
+    """Prefer editing the message that contains the pressed button."""
+    try:
+        if call.message:
+            await bot.edit_message_text(chat_id=call.from_user.id, message_id=call.message.message_id, text=txt, reply_markup=kb)
+            return call.message
+    except Exception:
+        pass
+    return await safe_send(call.from_user.id, txt, reply_markup=kb)
+
+
+async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKeyboardMarkup | None = None) -> None:
+    """Safely update an existing bot message.
+
+    Telegram has a 4096 char limit for message text. This helper:
+    - tries to edit the existing message (best UX)
+    - if edit fails (or text is too long), sends new message(s)
+
+    IMPORTANT: never raise from here; menu callbacks must not crash the bot.
+    """
+
+    if not message:
+        return
+
+    chat_id = message.chat.id
+    msg_id = message.message_id
+
+    def _split_text(s: str, limit: int = 3900) -> list[str]:
+        s = s or ""
+        if len(s) <= limit:
+            return [s]
+        out: list[str] = []
+        buf: list[str] = []
+        cur = 0
+        for line in s.split("\n"):
+            piece = line + "\n"
+            if cur + len(piece) > limit and buf:
+                out.append("".join(buf).rstrip("\n"))
+                buf = [piece]
+                cur = len(piece)
+            else:
+                buf.append(piece)
+                cur += len(piece)
+        if buf:
+            out.append("".join(buf).rstrip("\n"))
+        return out
+
+    parts = _split_text(text)
+
+    # Try to edit with the first chunk
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=parts[0],
+            reply_markup=kb if len(parts) == 1 else None,
+        )
+    except Exception:
+        # If we can't edit (old message, same text, etc.) - just send new
+        try:
+            await safe_send(chat_id, parts[0], reply_markup=kb if len(parts) == 1 else None)
+        except Exception:
+            logger.exception("safe_edit: failed to edit/send first chunk")
+
+    # Send remaining chunks (if any)
+    if len(parts) > 1:
+        for i, part in enumerate(parts[1:], start=1):
+            try:
+                await safe_send(chat_id, part, reply_markup=kb if i == len(parts) - 1 else None)
+            except Exception:
+                logger.exception("safe_edit: failed to send chunk %s/%s", i + 1, len(parts))
+
+def _fmt_perf(uid: int, b: dict) -> str:
+    trades = int(b.get("trades", 0))
+    wins = int(b.get("wins", 0))
+    losses = int(b.get("losses", 0))
+    be = int(b.get("be", 0))
+    tp1 = int(b.get("tp1_hits", 0))
+    pnl = float(b.get("sum_pnl_pct", 0.0))
+    wr = (wins / trades * 100.0) if trades else 0.0
+
+    return (
+        f"{tr(uid, 'lbl_trades')}: {trades} | "
+        f"{tr(uid, 'lbl_wins')}: {wins} | "
+        f"{tr(uid, 'lbl_losses')}: {losses} | "
+        f"{tr(uid, 'lbl_be')}: {be} | "
+        f"{tr(uid, 'lbl_tp1')}: {tp1}\n"
+        f"{tr(uid, 'lbl_winrate')}: {wr:.1f}%\n"
+        f"{tr(uid, 'lbl_pnl')}: {pnl:+.2f}%"
+    )
+
+async def _build_status_text(uid: int = 0) -> str:
+    next_macro = backend.get_next_macro()
+    macro_action = (backend.last_macro_action or "ALLOW").upper()
+    macro_prefix = "🟢" if macro_action == "ALLOW" else "🔴"
+
+    macro_line = tr(uid, "next_macro").format(v=tr(uid, "lbl_none"))
+    if next_macro:
+        ev, (w0, w1) = next_macro
+        secs = max(0, w0 - time.time())
+        macro_line = f"🟡 {ev}: {_fmt_hhmm(w0)}–{_fmt_hhmm(w1)} | {tr(uid, 'lbl_in')} {_fmt_countdown(secs)}"
+
+    scan_line = tr(uid, "scanner_run")
+    news_line = tr(uid, "news_action").format(v=tr_action(uid, backend.last_news_action))
+    macro_line2 = tr(uid, "macro_action").format(v=tr_action(uid, macro_action))
+
+    enabled = True
+    try:
+        enabled = await get_notify_signals(uid) if uid else True
+    except Exception:
+        enabled = True
+    state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
+    notif_line = tr(uid, "status_notify").format(v=state)
+
+    return "\n".join([scan_line, news_line, f"{macro_prefix} {macro_line2}", macro_line, notif_line])
+
+async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: int = 120, interval: int = 5) -> None:
+    # Refresh countdown + macro status for a short window to avoid spam/rate limits
+    end = time.time() + max(10, seconds)
+    last_txt: str | None = None
+    while time.time() < end:
+        await asyncio.sleep(interval)
+        try:
+            txt = await _build_status_text(uid)
+            if txt == last_txt:
+                continue
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=txt, reply_markup=menu_kb(uid))
+            last_txt = txt
+        except Exception:
+            return
+
+
+# ---------------- DB helpers ----------------
+
+async def init_db() -> None:
+    """Init Postgres pool and ensure required columns exist."""
+    global pool
+    if not DATABASE_URL:
+        # Allow running without Postgres locally, but notifications will be disabled.
+        pool = None
+        return
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, timeout=8, command_timeout=10)
+    # Share the same pool with trade storage
+    db_store.set_pool(pool)
+    await db_store.ensure_schema()
+    async with pool.acquire() as conn:
+        # notify_signals flag (shared access + per-bot notification toggle)
+        await conn.execute("""
+        ALTER TABLE users
+          ADD COLUMN IF NOT EXISTS notify_signals BOOLEAN NOT NULL DEFAULT TRUE;
+        """)
+        # safety indexes (if table already exists, IF NOT EXISTS works on PG 9.5+ for indexes)
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
+        except Exception:
+            # Best effort: index creation may fail on some managed DBs / permissions.
+            logger.exception("Failed to create idx_users_telegram_id")
+
+async def ensure_user(user_id: int) -> None:
+    if not pool or not user_id:
+        return
+    async with pool.acquire() as conn:
+        # Create user row if missing. Do not change existing access fields.
+        await conn.execute(
+            """INSERT INTO users (telegram_id, notify_signals)
+                   VALUES ($1, TRUE)
+                   ON CONFLICT (telegram_id) DO NOTHING;""",
+            user_id,
+        )
+
+
+async def set_user_blocked(user_id: int, blocked: bool = True) -> None:
+    """Disable broadcasts for users who blocked the bot / never started it (prevents spammy 'chat not found')."""
+    if not pool or not user_id:
+        return
+    async with pool.acquire() as conn:
+        if blocked:
+            await conn.execute(
+                """UPDATE users
+                      SET is_blocked = TRUE,
+                          notify_signals = FALSE
+                    WHERE telegram_id = $1;""",
+                user_id,
+            )
+        else:
+            await conn.execute(
+                """UPDATE users
+                      SET is_blocked = FALSE
+                    WHERE telegram_id = $1;""",
+                user_id,
+            )
+
+
+async def get_user_row(user_id: int):
+    if not pool or not user_id:
+        return None
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            """SELECT telegram_id, expires_at, is_blocked, notify_signals
+                 FROM users WHERE telegram_id=$1""",
+            user_id,
+        )
+
+def _access_status_from_row(row) -> str:
+    if row is None:
+        return "no_user"
+    try:
+        if bool(row.get("is_blocked")):
+            return "blocked"
+    except Exception:
+        pass
+    expires_at = row.get("expires_at") if row is not None else None
+    if expires_at is None:
+        return "expired"
+    try:
+        now = dt.datetime.now(dt.timezone.utc)
+        if expires_at < now:
+            return "expired"
+    except Exception:
+        return "expired"
+    return "ok"
+
+async def get_access_status(user_id: int) -> str:
+    row = await get_user_row(user_id)
+    return _access_status_from_row(row)
+
+async def get_notify_signals(user_id: int) -> bool:
+    row = await get_user_row(user_id)
+    if row is None:
+        return True
+    v = row.get("notify_signals")
+    return True if v is None else bool(v)
+
+async def toggle_notify_signals(user_id: int) -> bool:
+    if not pool or not user_id:
+        return True
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE users
+                   SET notify_signals = NOT COALESCE(notify_signals, TRUE)
+                 WHERE telegram_id=$1
+             RETURNING notify_signals""",
+            user_id,
+        )
+        if row is None:
+            await ensure_user(user_id)
+            return True
+        return bool(row["notify_signals"])
+
+
+async def set_notify_signals(user_id: int, value: bool) -> bool:
+    """Set notify_signals explicitly. Returns the saved value."""
+    if not pool or not user_id:
+        return True
+    await ensure_user(user_id)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE users
+                   SET notify_signals = $2
+                 WHERE telegram_id=$1
+             RETURNING notify_signals""",
+            user_id, bool(value)
+        )
+        if row is None:
+            # if user row didn't exist for some reason, ensure_user created it with TRUE
+            return bool(value)
+        return bool(row["notify_signals"])
+
+async def get_broadcast_user_ids() -> List[int]:
+    """Users allowed to receive signals."""
+    if not pool:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT telegram_id
+                 FROM users
+                 WHERE COALESCE(is_blocked, FALSE) = FALSE
+                   AND expires_at IS NOT NULL
+                   AND expires_at > now()
+                   AND COALESCE(notify_signals, TRUE) = TRUE"""
+        )
+        return [int(r["telegram_id"]) for r in rows if r and r.get("telegram_id") is not None]
+
+
+# ---------------- UI helpers ----------------
+
+def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "m_status"), callback_data="menu:status")
+    kb.button(text=tr(uid, "m_stats"), callback_data="menu:stats")
+    kb.button(text=tr(uid, "m_spot"), callback_data="menu:spot")
+    kb.button(text=tr(uid, "m_fut"), callback_data="menu:futures")
+    kb.button(text=tr(uid, "m_trades"), callback_data="trades:page:0")
+    kb.button(text=tr(uid, "m_notify"), callback_data="menu:notify")
+    kb.adjust(2, 2, 1)
+    return kb.as_markup()
+
+
+def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    # Show only one toggle button to keep UI clean
+    if enabled:
+        kb.button(text=tr(uid, "btn_notify_off"), callback_data="notify:set:off")
+    else:
+        kb.button(text=tr(uid, "btn_notify_on"), callback_data="notify:set:on")
+    kb.adjust(1)
+    kb.button(text=tr(uid, "btn_back"), callback_data="notify:back")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+
+
+def _signal_text(uid: int, s: Signal) -> str:
+    header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
+    market_banner = tr(uid, 'sig_spot_new') if s.market == 'SPOT' else tr(uid, 'sig_fut_new')
+
+    # Visual marker near symbol (kept simple to avoid hard-depending on any exchange)
+    symbol_emoji = "🟢" if s.market == 'SPOT' else "🌕"
+
+    # Direction should be shown for both SPOT and FUTURES.
+    arrow = tr(uid, 'sig_long') if s.direction == 'LONG' else tr(uid, 'sig_short')
+    direction_line = arrow + "\n"
+
+    def _fmt_exchanges(raw: str) -> str:
+        xs = [x.strip() for x in (raw or '').replace(',', '+').split('+') if x.strip()]
+        pretty = []
+        for x in xs:
+            u = x.upper()
+            if u == 'BINANCE':
+                pretty.append('Binance')
+            elif u == 'BYBIT':
+                pretty.append('Bybit')
+            elif u == 'OKX':
+                pretty.append('OKX')
+            else:
+                pretty.append(x)
+        out: List[str] = []
+        for p in pretty:
+            if p not in out:
+                out.append(p)
+        return ' • '.join(out)
+
+    def _tp_lines() -> List[str]:
+        tps_obj = getattr(s, 'tps', None)
+        if isinstance(tps_obj, (list, tuple)) and len(tps_obj) > 0:
+            lines: List[str] = []
+            for i, v in enumerate(tps_obj, start=1):
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                if fv <= 0:
+                    continue
+                lines.append(f"TP{i}: {fv:.6f}")
+            if lines:
+                return lines
+
+        lines: List[str] = []
+        lines.append(f"TP1: {s.tp1:.6f}")
+        try:
+            if float(s.tp2) > 0 and abs(float(s.tp2) - float(s.tp1)) > 1e-12:
+                lines.append(f"TP2: {s.tp2:.6f}")
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            # Do not spam stack traces for common delivery issues
+            msg = str(e).lower()
+            if "chat not found" in msg or "bot was blocked by the user" in msg:
+                logger.warning("Skip uid=%s: %s", uid, e)
+            else:
+                logger.exception("Failed to send message to uid=%s", uid)
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            msg = str(e).lower()
+            if "chat not found" in msg or "bot was blocked by the user" in msg:
+                logger.warning("Skip uid=%s: %s", uid, e)
+            else:
+                logger.exception("Failed to send message to uid=%s", uid)
+        except Exception:
+            logger.exception("Failed to send message to uid=%s", uid)
+        return lines
+
+    ex_line_raw = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
+    exchanges_line = f"{tr(uid, 'sig_exchanges')}: {ex_line_raw}\n" if ex_line_raw else ""
+    # Keep TF on its own line; timeframe string already like 15m/1h/4h
+    tf_line = f"{tr(uid, 'sig_tf')}: {s.timeframe}"
+
+    tp_lines = "\n".join(_tp_lines())
+
+    rr_line = f"{tr(uid, 'sig_rr')}: 1:{s.rr:.2f}"
+    conf_line = f"{tr(uid, 'sig_confidence')}: {s.confidence}/100"
+    confirm_line = f"{tr(uid, 'sig_confirm')}: {s.confirmations}"
+
+    risk_note = (s.risk_note or '').strip()
+    risk_block = f"\n\n{risk_note}" if risk_note else ""
+
+    return trf(uid, "msg_open_card",
+        market_banner=market_banner,
+        header=header,
+        symbol_emoji=symbol_emoji,
+        symbol=s.symbol,
+        direction_line=direction_line,
+        exchanges_line=exchanges_line,
+        tf_line=tf_line,
+        entry_label=tr(uid, 'sig_entry'),
+        entry=f"{s.entry:.6f}",
+        sl=f"{s.sl:.6f}",
+        tp_lines=tp_lines,
+        rr_line=rr_line,
+        conf_line=conf_line,
+        confirm_line=confirm_line,
+        risk_block=risk_block,
+        open_prompt=tr(uid, 'sig_open_prompt')
+    )
+
+def _fmt_hhmm(ts_utc: float) -> str:
+    d = dt.datetime.fromtimestamp(ts_utc, tz=ZoneInfo("UTC")).astimezone(TZ)
+    return d.strftime("%H:%M")
+
+def _fmt_symbol(sym: str) -> str:
+    s = (sym or "").strip().upper()
+    if "/" in s:
+        a, b = s.split("/", 1)
+        return f"{a.strip()} / {b.strip()}"
+    return s
+
+def _fmt_price(v) -> str:
+    try:
+        if v is None:
+            return "—"
+        return f"{float(v):.6f}".rstrip("0").rstrip(".")
+    except Exception:
+        return str(v) if v is not None else "—"
+
+def _calc_profit_pct(sig: Signal) -> float:
+    """Model expected profit % using TP2 if available, otherwise TP1."""
+    try:
+        entry = float(sig.entry)
+        tp = float(sig.tp2) if float(getattr(sig, "tp2", 0.0) or 0.0) > 0 else float(sig.tp1)
+        side = (sig.direction or "LONG").upper().strip()
+        if entry <= 0:
             return 0.0
-        side = str(direction or "LONG").upper().strip()
         if side == "SHORT":
             return (entry - tp) / entry * 100.0
         return (tp - entry) / entry * 100.0
     except Exception:
         return 0.0
 
-def default_futures_leverage() -> str:
-    v = os.getenv("FUTURES_LEVERAGE_DEFAULT", "5").strip()
-    return v or "5"
+def _open_card_text(uid: int, sig: Signal) -> str:
+    sym_disp = _fmt_symbol(sig.symbol)
+    base = sym_disp.split("/")[0].strip().replace(" ", "") if sym_disp else "SYMBOL"
+    exchanges = (getattr(sig, "confirmations", "") or "").replace("+", " • ")
+    if not exchanges:
+        exchanges = tr(uid, "lbl_none")
 
-def open_metrics(sig: "Signal") -> dict:
-    """Return placeholders for OPEN templates, computed only here (backend-only)."""
-    side = (getattr(sig, "direction", "") or "LONG").upper().strip()
-    mkt = (getattr(sig, "market", "") or "FUTURES").upper().strip()
-    # prefer TP2 for estimate; fallback to TP1
-    tp = getattr(sig, "tp2", 0.0) or getattr(sig, "tp1", 0.0) or 0.0
-    entry = getattr(sig, "entry", 0.0) or 0.0
-    profit = calc_profit_pct(entry, tp, side)
+    # backend-only metrics (profit/leverage/rr computed in backend.py)
+    mx = open_metrics(sig)
+    profit = mx.get("profit", 0.0)
+    hhmm = _fmt_hhmm(float(getattr(sig, "ts", 0.0) or 0.0))
+
+    side = mx.get("side", (sig.direction or "LONG")).upper().strip()
+    mkt = mx.get("market", (sig.market or "FUTURES")).upper().strip()
+    lev = str(mx.get("lev", "5"))
+    rr = mx.get("rr", getattr(sig, "rr", 0.0))
+
+    if mkt == "SPOT":
+        return trf(
+            uid,
+            "open_spot",
+            symbol=sym_disp,
+            exchanges=exchanges,
+            entry=f"{float(sig.entry):.5f}",
+            tp1=f"{float(sig.tp1):.5f}",
+            tp2=f"{float(sig.tp2):.5f}",
+            sl=f"{float(sig.sl):.5f}",
+            profit=f"{float(profit):.1f}",
+            time=hhmm,
+            tag=base,
+        )
+
+    return trf(
+        uid,
+        "open_futures",
+        symbol=sym_disp,
+        exchanges=exchanges,
+        side=side,
+        lev=lev,
+        entry=f"{float(sig.entry):.5f}",
+        tp1=f"{float(sig.tp1):.5f}",
+        tp2=f"{float(sig.tp2):.5f}",
+        sl=f"{float(sig.sl):.5f}",
+        rr=f"{float(rr):.1f}",
+        profit=f"{float(profit):.1f}",
+        time=hhmm,
+        tag=base,
+    )
+
+def _too_late_reason_key(reason: str) -> str:
     return {
-        "side": side,
-        "market": mkt,
-        "profit": round(float(profit), 1),
-        "lev": default_futures_leverage(),
-        "rr": round(float(getattr(sig, "rr", 0.0) or 0.0), 1),
-    }
+        "TP2": "sig_too_late_reason_tp2",
+        "TP1": "sig_too_late_reason_tp1",
+        "SL": "sig_too_late_reason_sl",
+        "TIME": "sig_too_late_reason_time",
+        "ERROR": "sig_too_late_reason_error",
+        "OK": "sig_too_late_reason_error",
+    }.get((reason or "").upper(), "sig_too_late_reason_error")
 
-def fmt_pnl_pct(p: float) -> str:
+
+async def _expire_signal_message(call: types.CallbackQuery, sig: Signal, reason: str, price: float) -> None:
+    """Remove the OPEN button and mark the signal as expired in-place."""
+    uid = call.from_user.id
+    reason_key = _too_late_reason_key(reason)
+    note = tr(uid, "sig_expired_note").format(
+        reason=tr(uid, reason_key),
+        price=_fmt_price(price),
+    )
     try:
-        p = float(p)
-        sign = "+" if p > 0 else ""
-        return f"{sign}{p:.1f}%"
-    except Exception:
-        return "0.0%"
-
-TOP_N = _env_int("TOP_N", 50)
-# TOP_N controls how many USDT symbols to scan. Set TOP_N=0 to scan ALL USDT pairs.
-SCAN_INTERVAL_SECONDS = max(30, _env_int("SCAN_INTERVAL_SECONDS", 150))
-CONFIDENCE_MIN = max(0, min(100, _env_int("CONFIDENCE_MIN", 80)))
-# --- TA Quality mode (strict/medium) ---
-SIGNAL_MODE = (os.getenv("SIGNAL_MODE", "").strip().lower() or "strict")
-if SIGNAL_MODE not in ("strict", "medium"):
-    SIGNAL_MODE = "strict"
-
-# Per-market minimum TA score (0..100). Can be overridden via env.
-_def_spot = 78 if SIGNAL_MODE == "strict" else 65
-_def_fut = 74 if SIGNAL_MODE == "strict" else 62
-TA_MIN_SCORE_SPOT = max(0, min(100, _env_int("TA_MIN_SCORE_SPOT", _def_spot)))
-TA_MIN_SCORE_FUTURES = max(0, min(100, _env_int("TA_MIN_SCORE_FUTURES", _def_fut)))
-
-# Trend strength filter (ADX)
-TA_MIN_ADX = max(0.0, _env_float("TA_MIN_ADX", 22.0 if SIGNAL_MODE == "strict" else 17.0))
-
-# Volume confirmation: require volume >= SMA(volume,20) * X
-TA_MIN_VOL_X = max(0.5, _env_float("TA_MIN_VOL_X", 1.25 if SIGNAL_MODE == "strict" else 1.05))
-
-# MACD histogram threshold (momentum). For LONG require hist >= +X, for SHORT <= -X
-TA_MIN_MACD_H = max(0.0, _env_float("TA_MIN_MACD_H", 0.0 if SIGNAL_MODE == "strict" else 0.0))
-
-# Bollinger rule: if 1, require breakout/cross of midline in direction of trend on the last candle
-TA_BB_REQUIRE_BREAKOUT = _env_bool("TA_BB_REQUIRE_BREAKOUT", True if SIGNAL_MODE == "strict" else False)
-
-# RSI guard rails
-TA_RSI_MAX_LONG = max(1.0, _env_float("TA_RSI_MAX_LONG", 68.0 if SIGNAL_MODE == "strict" else 72.0))
-TA_RSI_MIN_SHORT = max(0.0, _env_float("TA_RSI_MIN_SHORT", 32.0 if SIGNAL_MODE == "strict" else 28.0))
-
-# Multi-timeframe confirmation: if 1, require 4h and 1h trend alignment (recommended).
-# If 0, allow 4h trend only (more signals).
-TA_REQUIRE_1H_TREND = _env_bool("TA_REQUIRE_1H_TREND", True if SIGNAL_MODE == "strict" else False)
-
-COOLDOWN_MINUTES = max(1, _env_int("COOLDOWN_MINUTES", 180))
-
-USE_REAL_PRICE = _env_bool("USE_REAL_PRICE", True)
-TRACK_INTERVAL_SECONDS = max(1, _env_int("TRACK_INTERVAL_SECONDS", 3))
-# Backward-compatible default partial close percent (legacy)
-TP1_PARTIAL_CLOSE_PCT = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT", 50)))
-
-# New per-market settings
-TP1_PARTIAL_CLOSE_PCT_SPOT = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT_SPOT", TP1_PARTIAL_CLOSE_PCT)))
-TP1_PARTIAL_CLOSE_PCT_FUTURES = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT_FUTURES", TP1_PARTIAL_CLOSE_PCT)))
-
-BE_AFTER_TP1_SPOT = _env_bool("BE_AFTER_TP1_SPOT", True)
-BE_AFTER_TP1_FUTURES = _env_bool("BE_AFTER_TP1_FUTURES", True)
-
-# Fee-protected BE: exit remaining position at entry +/- fee buffer so BE is not negative after fees (model)
-BE_FEE_BUFFER = _env_bool("BE_FEE_BUFFER", True)
-FEE_RATE_SPOT = max(0.0, _env_float("FEE_RATE_SPOT", 0.001))        # e.g. 0.001 = 0.10%
-FEE_RATE_FUTURES = max(0.0, _env_float("FEE_RATE_FUTURES", 0.001))  # e.g. 0.001 = 0.10%
-FEE_BUFFER_MULTIPLIER = max(0.0, _env_float("FEE_BUFFER_MULTIPLIER", 2.0))  # 2 = entry+exit fees
-ATR_MULT_SL = max(0.5, _env_float("ATR_MULT_SL", 1.5))
-TP1_R = max(0.5, _env_float("TP1_R", 1.5))
-TP2_R = max(1.0, _env_float("TP2_R", 3.0))
-
-# News filter
-NEWS_FILTER = _env_bool("NEWS_FILTER", False)
-CRYPTOPANIC_TOKEN = os.getenv("CRYPTOPANIC_TOKEN", "").strip()
-CRYPTOPANIC_PUBLIC = _env_bool("CRYPTOPANIC_PUBLIC", False)
-CRYPTOPANIC_REGIONS = os.getenv("CRYPTOPANIC_REGIONS", "en").strip() or "en"
-CRYPTOPANIC_KIND = os.getenv("CRYPTOPANIC_KIND", "news").strip() or "news"
-NEWS_LOOKBACK_MIN = max(5, _env_int("NEWS_LOOKBACK_MIN", 60))
-NEWS_ACTION = os.getenv("NEWS_ACTION", "FUTURES_OFF").strip().upper()  # FUTURES_OFF / PAUSE_ALL
-
-# Macro filter
-MACRO_FILTER = _env_bool("MACRO_FILTER", False)
-
-# Orderbook filter (optional)
-ORDERBOOK_FILTER = _env_bool("ORDERBOOK_FILTER", False)
-# ------------------ Orderbook filter (FUTURES only recommended) ------------------
-# Backward compatible alias: ORDERBOOK_FILTER
-USE_ORDERBOOK = _env_bool("USE_ORDERBOOK", ORDERBOOK_FILTER)
-ORDERBOOK_EXCHANGES = [x.strip().lower() for x in _env_str("ORDERBOOK_EXCHANGES", "binance,bybit").split(",") if x.strip()]
-ORDERBOOK_FUTURES_ONLY = _env_bool("ORDERBOOK_FUTURES_ONLY", True)
-
-# Strict defaults (can be overridden via ENV)
-ORDERBOOK_LEVELS = max(5, _env_int("ORDERBOOK_LEVELS", 20))
-ORDERBOOK_IMBALANCE_MIN = max(1.0, _env_float("ORDERBOOK_IMBALANCE_MIN", 1.6))  # bids/asks ratio
-ORDERBOOK_WALL_RATIO = max(1.0, _env_float("ORDERBOOK_WALL_RATIO", 4.0))  # max_level / avg_level
-ORDERBOOK_WALL_NEAR_PCT = max(0.05, _env_float("ORDERBOOK_WALL_NEAR_PCT", 0.5))  # consider walls within X% from mid
-ORDERBOOK_MAX_SPREAD_PCT = max(0.0, _env_float("ORDERBOOK_MAX_SPREAD_PCT", 0.08))  # block if spread too wide
-MACRO_ACTION = os.getenv("MACRO_ACTION", "FUTURES_OFF").strip().upper()  # FUTURES_OFF / PAUSE_ALL
-BLACKOUT_BEFORE_MIN = max(0, _env_int("BLACKOUT_BEFORE_MIN", 30))
-BLACKOUT_AFTER_MIN = max(0, _env_int("BLACKOUT_AFTER_MIN", 45))
-TZ_NAME = os.getenv("TZ_NAME", "Europe/Berlin").strip() or "Europe/Berlin"
-
-FOMC_DECISION_HOUR_ET = max(0, min(23, _env_int("FOMC_DECISION_HOUR_ET", 14)))
-FOMC_DECISION_MINUTE_ET = max(0, min(59, _env_int("FOMC_DECISION_MINUTE_ET", 0)))
-
-# ------------------ Models ------------------
-@dataclass(frozen=True)
-class Signal:
-    signal_id: int
-    market: str
-    symbol: str
-    direction: str
-    timeframe: str
-    entry: float
-    sl: float
-    tp1: float
-    tp2: float
-    rr: float
-    confidence: int
-    confirmations: str
-    risk_note: str
-    ts: float
-
-@dataclass
-class UserTrade:
-    user_id: int
-    signal: Signal
-    tp1_hit: bool = False
-    sl_moved_to_be: bool = False
-    be_price: float = 0.0
-    active: bool = True
-    result: str = "ACTIVE"  # ACTIVE / TP1 / WIN / LOSS / BE / CLOSED
-    last_price: float = 0.0
-    opened_ts: float = 0.0
-
-
-# ------------------ Trade performance stats (spot/futures) ------------------
-TRADE_STATS_FILE = Path("trade_stats.json")
-
-# structure:
-# {
-#   "spot": {"days": {"YYYY-MM-DD": {...}}, "weeks": {"YYYY-WNN": {...}}},
-#   "futures": {...}
-# }
-def _empty_bucket() -> Dict[str, float]:
-    return {
-        "trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "be": 0,
-        "tp1_hits": 0,
-        "sum_pnl_pct": 0.0,
-    }
-
-def _safe_pct(x: float) -> float:
-    if not math.isfinite(x):
-        return 0.0
-    return float(x)
-
-def _market_key(market: str) -> str:
-    m = (market or "FUTURES").strip().upper()
-    return "spot" if m == "SPOT" else "futures"
-
-
-def _tp1_partial_close_pct(market: str) -> float:
-    mk = _market_key(market)
-    return float(TP1_PARTIAL_CLOSE_PCT_SPOT if mk == "spot" else TP1_PARTIAL_CLOSE_PCT_FUTURES)
-
-
-# Backward-compat alias (older code referenced _partial_close_pct)
-def _partial_close_pct(market: str) -> float:
-    return _tp1_partial_close_pct(market)
-
-
-# Backward-compat alias (older code referenced _be_enabled)
-def _be_enabled(market: str) -> bool:
-    return _be_after_tp1(market)
-
-
-def _be_after_tp1(market: str) -> bool:
-    mk = _market_key(market)
-    return bool(BE_AFTER_TP1_SPOT if mk == "spot" else BE_AFTER_TP1_FUTURES)
-
-def _fee_rate(market: str) -> float:
-    mk = _market_key(market)
-    return float(FEE_RATE_SPOT if mk == "spot" else FEE_RATE_FUTURES)
-
-def _be_exit_price(entry: float, side: str, market: str) -> float:
-    """Return modeled BE exit price that covers fees on remaining position."""
-    entry = float(entry)
-    if not BE_FEE_BUFFER:
-        return entry
-    fr = max(0.0, _fee_rate(market))
-    buf = max(0.0, float(FEE_BUFFER_MULTIPLIER)) * fr
-    side = (side or "LONG").upper()
-    if side == "SHORT":
-        return entry * (1.0 - buf)
-    return entry * (1.0 + buf)
-
-
-def _day_key_tz(ts: float) -> str:
-    d = dt.datetime.fromtimestamp(ts, tz=ZoneInfo(TZ_NAME)).date()
-    return d.isoformat()
-
-def _week_key_tz(ts: float) -> str:
-    d = dt.datetime.fromtimestamp(ts, tz=ZoneInfo(TZ_NAME)).date()
-    y, w, _ = d.isocalendar()
-    return f"{y}-W{int(w):02d}"
-
-def _calc_effective_pnl_pct(trade: "UserTrade", close_price: float, close_reason: str) -> float:
-    s = trade.signal
-    entry = float(s.entry or 0.0)
-    if entry <= 0:
-        return 0.0
-
-    side = (s.direction or "LONG").upper()
-    def pnl_pct_for(price: float) -> float:
-        price = float(price)
-        if side == "SHORT":
-            return (entry - price) / entry * 100.0
-        return (price - entry) / entry * 100.0
-
-    # No TP1 hit => full position closes at close_price
-    if not trade.tp1_hit:
-        return _safe_pct(pnl_pct_for(close_price))
-
-    # TP1 hit => partial close at TP1, rest closes at BE or TP2 (or manual)
-    p = max(0.0, min(100.0, float(_tp1_partial_close_pct(s.market))))
-    a = p / 100.0
-    tp1_price = float(s.tp1 or close_price)
-
-    pnl_tp1 = pnl_pct_for(tp1_price) * a
-
-    # Remaining portion:
-    if close_reason == "WIN":
-        # rest closes at TP2 (if provided), else close_price
-        tp2_price = float(s.tp2 or close_price)
-        pnl_rest = pnl_pct_for(tp2_price) * (1.0 - a)
-    elif close_reason == "BE":
-        pnl_rest = 0.0
-    else:
-        # manual close / unknown: use close_price for remaining
-        pnl_rest = pnl_pct_for(close_price) * (1.0 - a)
-
-    return _safe_pct(pnl_tp1 + pnl_rest)
-
-def _bump_stats(store: dict, market: str, ts: float, close_reason: str, pnl_pct: float, tp1_hit: bool) -> None:
-    mk = _market_key(market)
-    dayk = _day_key_tz(ts)
-    weekk = _week_key_tz(ts)
-
-    mroot = store.setdefault(mk, {"days": {}, "weeks": {}})
-    days = mroot.setdefault("days", {})
-    weeks = mroot.setdefault("weeks", {})
-
-    def get_bucket(root: dict, k: str) -> dict:
-        b = root.get(k)
-        if not isinstance(b, dict):
-            b = _empty_bucket()
-            root[k] = b
-        # ensure keys
-        for kk, vv in _empty_bucket().items():
-            if kk not in b:
-                b[kk] = vv
-        return b
-
-    bd = get_bucket(days, dayk)
-    bw = get_bucket(weeks, weekk)
-
-    def apply(bucket: dict) -> None:
-        bucket["trades"] = int(bucket.get("trades", 0)) + 1
-        # wins/losses based on pnl sign (если WIN но ушёл в минус — засчитываем как LOSS)
-        if pnl_pct > 0:
-            bucket["wins"] = int(bucket.get("wins", 0)) + 1
-        elif pnl_pct < 0:
-            bucket["losses"] = int(bucket.get("losses", 0)) + 1
+        current_text = (call.message.text or "").rstrip()
+        if "⛔" not in current_text:
+            new_text = current_text + "\n\n" + note
         else:
-            bucket["be"] = int(bucket.get("be", 0)) + 1
-
-        if tp1_hit:
-            bucket["tp1_hits"] = int(bucket.get("tp1_hits", 0)) + 1
-
-        bucket["sum_pnl_pct"] = float(bucket.get("sum_pnl_pct", 0.0)) + float(pnl_pct)
-
-    apply(bd)
-    apply(bw)
-
-@dataclass(frozen=True)
-
-class MacroEvent:
-    name: str
-    type: str
-    start_ts_utc: float
-
-# ------------------ News risk filter (CryptoPanic) ------------------
-class NewsFilter:
-    # Use Developer v2 endpoint (matches API Reference in CryptoPanic Developers panel)
-    BASE_URL = "https://cryptopanic.com/api/developer/v2/posts/"
-
-    def __init__(self) -> None:
-        self._last_block: tuple[str, float] | None = None
-        self._cache: Dict[str, Tuple[float, str]] = {}
-        self._cache_ttl = 60
-        # prevent hanging network calls
-        self._timeout = aiohttp.ClientTimeout(total=8)
-
-    def enabled(self) -> bool:
-        return NEWS_FILTER and bool(CRYPTOPANIC_TOKEN)
-
-    def base_coin(self, symbol: str) -> str:
-        # Accept formats: BTCUSDT, BTC/USDT, BTC-USDT, etc.
-        s = str(symbol).upper().replace("/", "").replace("-", "").strip()
-        for q in ("USDT", "USDC", "BUSD", "USD", "FDUSD", "TUSD", "DAI", "EUR", "BTC", "ETH"):
-            if s.endswith(q) and len(s) > len(q):
-                return s[:-len(q)]
-        return s
-
-    async def action_for_symbol(self, session: aiohttp.ClientSession, symbol: str) -> str:
-        if not self.enabled():
-            return "ALLOW"
-
-        coin = self.base_coin(symbol)
-        key = f"{coin}:{NEWS_ACTION}:{NEWS_LOOKBACK_MIN}"
-        now = time.time()
-        cached = self._cache.get(key)
-        if cached and (now - cached[0]) < self._cache_ttl:
-            return cached[1]
-
-        action = "ALLOW"
+            new_text = current_text
+        await call.message.edit_text(new_text, reply_markup=None)
+    except Exception:
         try:
-            params = {
-                "auth_token": CRYPTOPANIC_TOKEN,
-                "currencies": coin,
-                "filter": "important",
-                # reduce noise; can be overridden via env if desired
-                "kind": CRYPTOPANIC_KIND,
-                "regions": CRYPTOPANIC_REGIONS,
-            }
-            if CRYPTOPANIC_PUBLIC:
-                params["public"] = "true"
-
-            async with session.get(self.BASE_URL, params=params, timeout=self._timeout) as r:
-                if r.status != 200:
-                    action = "ALLOW"
-                else:
-                    data = await r.json()
-                    posts = (data or {}).get("results", []) or []
-                    cutoff = now - (NEWS_LOOKBACK_MIN * 60)
-                    recent = False
-                    recent_post = None
-                    for p in posts[:20]:
-                        published_at = p.get("published_at") or p.get("created_at")
-                        if not published_at:
-                            continue
-                        try:
-                            ts = pd.to_datetime(published_at.replace("Z", "+00:00")).timestamp()
-                        except Exception:
-                            continue
-                        if ts >= cutoff:
-                            recent = True
-                            recent_post = p
-                            break
-                    if recent:
-                        action = NEWS_ACTION if NEWS_ACTION in ("FUTURES_OFF", "PAUSE_ALL") else "FUTURES_OFF"
-                        # remember last block for status (reason, until_ts)
-                        reason = coin
-                        try:
-                            if recent_post:
-                                title = (recent_post.get("title") or recent_post.get("slug") or "").strip()
-                                src = None
-                                if isinstance(recent_post.get("source"), dict):
-                                    src = (recent_post["source"].get("title") or recent_post["source"].get("name"))
-                                if not src:
-                                    src = (recent_post.get("domain") or recent_post.get("source") or "")
-                                src = (src or "").strip()
-                                # CryptoPanic 'important' filter is used; keep it in text for clarity
-                                parts = []
-                                if src:
-                                    parts.append(src)
-                                parts.append("Important")
-                                if title:
-                                    parts.append(title)
-                                reason = "CryptoPanic — " + " / ".join(parts)
-                        except Exception:
-                            pass
-                        self._last_block = (reason, now + NEWS_LOOKBACK_MIN * 60)
-        except Exception:
-            action = "ALLOW"
-
-        self._cache[key] = (now, action)
-        return action
-
-# ------------------ Macro calendar (AUTO fetch) ------------------
-
-    def last_block_info(self) -> tuple[str, float] | None:
-        """Return (reason, until_ts) for the last time news filter triggered."""
-        return self._last_block
-
-class MacroCalendar:
-    BLS_URL = "https://www.bls.gov/schedule/news_release/current_year.asp"
-    FOMC_URL = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
-
-    def __init__(self) -> None:
-        self._events: List[MacroEvent] = []
-        self._last_fetch_ts: float = 0.0
-        self._fetch_ttl: float = 6 * 60 * 60
-        self._notified: Dict[str, float] = {}
-        self._notify_cooldown = 6 * 60 * 60
-
-    def enabled(self) -> bool:
-        return MACRO_FILTER
-
-    async def ensure_loaded(self, session: aiohttp.ClientSession) -> None:
-        if not self.enabled():
-            self._events = []
-            return
-        now = time.time()
-        if self._events and (now - self._last_fetch_ts) < self._fetch_ttl:
-            return
-        await self.fetch(session)
-
-    async def fetch(self, session: aiohttp.ClientSession) -> None:
-        events: List[MacroEvent] = []
-
-        # BLS schedule
-        try:
-            async with session.get(self.BLS_URL) as r:
-                r.raise_for_status()
-                html = await r.text()
-
-            tables = pd.read_html(html)
-            for t in tables:
-                cols = [c.strip().lower() for c in t.columns.astype(str).tolist()]
-                if not ("release" in cols and "date" in cols):
-                    continue
-                t2 = t.copy()
-                t2.columns = cols
-                for _, row in t2.iterrows():
-                    release = str(row.get("release", "")).strip()
-                    date_str = str(row.get("date", "")).strip()
-                    time_str = str(row.get("time", "")).strip()
-                    if not release or not date_str or not time_str:
-                        continue
-
-                    rel_l = release.lower()
-                    if "consumer price index" in rel_l:
-                        name = "CPI (US Inflation)"
-                        etype = "CPI"
-                    elif "employment situation" in rel_l:
-                        name = "NFP (US Jobs)"
-                        etype = "NFP"
-                    else:
-                        continue
-
-                    try:
-                        dt_et = pd.to_datetime(f"{date_str} {time_str}")
-                    except Exception:
-                        continue
-                    dt_et = dt_et.tz_localize(ZoneInfo("America/New_York"), ambiguous="NaT", nonexistent="shift_forward")
-                    dt_utc = dt_et.tz_convert(ZoneInfo("UTC")).timestamp()
-                    events.append(MacroEvent(name=name, type=etype, start_ts_utc=float(dt_utc)))
-                break
+            await call.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
 
-        # FOMC calendar (best-effort parse)
+
+def _too_late_text(uid: int, sig: Signal, reason: str, price: float) -> str:
+    mkt = (sig.market or "FUTURES").upper()
+    mkt_emoji = "🟢" if mkt == "SPOT" else "🔴"
+    sym = _fmt_symbol(sig.symbol)
+    hhmm = _fmt_hhmm(float(getattr(sig, "ts", 0.0) or 0.0))
+
+    reason_key = _too_late_reason_key(reason)
+
+    return tr(uid, "sig_too_late_body").format(
+        market_emoji=mkt_emoji,
+        market=mkt,
+        symbol=sym,
+        reason=tr(uid, reason_key),
+        price=_fmt_price(price),
+        tp1=_fmt_price(getattr(sig, "tp1", None)),
+        tp2=_fmt_price(getattr(sig, "tp2", None)),
+        sl=_fmt_price(getattr(sig, "sl", None)),
+        time=hhmm,
+    )
+
+
+def _fmt_countdown(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0
+    m = int(seconds // 60)
+    h = m // 60
+    m = m % 60
+    if h > 0:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+def _trade_status_emoji(status: str) -> str:
+    return {
+        "ACTIVE": "🟢",
+        "TP1": "🟡",
+        "WIN": "🟣",
+        "LOSS": "🔴",
+        "BE": "⚪",
+        "CLOSED": "✅",
+    }.get(status, "⏳")
+
+# ---------------- broadcasting ----------------
+async def broadcast_signal(sig: Signal) -> None:
+    # Deduplicate: avoid sending the same signal twice (common when scanner emits duplicates).
+    import time, hashlib
+    now = time.time()
+    for k, ts in list(_SENT_SIG_CACHE.items()):
+        if now - ts > _SENT_SIG_TTL_SEC:
+            _SENT_SIG_CACHE.pop(k, None)
+
+    sig_raw = f"{sig.market}|{sig.symbol}|{sig.direction}|{sig.timeframe}|{sig.entry}|{sig.sl}|{sig.tp1}|{sig.tp2}|{sig.confirmations}"
+    sig_key = hashlib.sha1(sig_raw.encode('utf-8')).hexdigest()
+    if sig_key in _SENT_SIG_CACHE:
+        logger.info("Skip duplicate signal %s %s %s (within ttl)", sig.market, sig.symbol, sig.direction)
+        return
+    _SENT_SIG_CACHE[sig_key] = now
+
+    # Assign a globally unique signal_id from DB sequence (survives restarts).
+    # This prevents collisions that cause "already opened" for unrelated signals after container restart.
+    try:
+        sig.signal_id = await db_store.next_signal_id()
+    except Exception as e:
+        # Fallback to existing id if DB is unavailable; still log for visibility.
+        logger.error("Failed to allocate signal_id from DB sequence: %s", e)
+    # Save as last live signal for menu buttons
+    try:
+        LAST_SIGNAL_BY_MARKET["SPOT" if sig.market == "SPOT" else "FUTURES"] = sig
+    except Exception:
+        pass
+
+
+    # Ensure signal_id is globally unique across restarts (Postgres sequence)
+    try:
+        sig.signal_id = await db_store.next_signal_id()
+    except Exception:
+        # fallback: keep existing in-memory id
+        pass
+
+    logger.info("Broadcast signal id=%s %s %s %s conf=%s rr=%.2f", sig.signal_id, sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr))
+    SIGNALS[sig.signal_id] = sig
+    ORIGINAL_SIGNAL_TEXT[(0, sig.signal_id)] = _signal_text(0, sig)
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+
+    uids = await get_broadcast_user_ids()
+    for uid in uids:
         try:
-            async with session.get(self.FOMC_URL) as r:
-                r.raise_for_status()
-                txt = await r.text()
-
-            year = pd.Timestamp.utcnow().year
-            months = ["January","February","March","April","May","June","July","August","September","October","November","December"]
-            for m in months:
-                pattern = rf"{m}\\s*\\n\\s*(\\d{{1,2}})\\s*[-–]\\s*(\\d{{1,2}})"
-                m1 = re.search(pattern, txt, flags=re.IGNORECASE)
-                if not m1:
-                    continue
-                d2 = int(m1.group(2))
-                try:
-                    dt_et = pd.Timestamp(year=year, month=months.index(m)+1, day=d2, hour=FOMC_DECISION_HOUR_ET, minute=FOMC_DECISION_MINUTE_ET, tz="America/New_York")
-                except Exception:
-                    continue
-                events.append(MacroEvent(name="FOMC Rate Decision", type="FED", start_ts_utc=float(dt_et.tz_convert("UTC").timestamp())))
+            ORIGINAL_SIGNAL_TEXT[(uid, sig.signal_id)] = _signal_text(uid, sig)
+            kb_u = InlineKeyboardBuilder()
+            kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+            await safe_send(uid, _signal_text(uid, sig), reply_markup=kb_u.as_markup())
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            # Do not spam stack traces for common delivery issues
+            msg = str(e).lower()
+            if "chat not found" in msg or "bot was blocked by the user" in msg:
+                logger.warning("Skip uid=%s: %s", uid, e)
+            else:
+                logger.exception("Failed to send message to uid=%s", uid)
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            msg = str(e).lower()
+            if "chat not found" in msg or "bot was blocked by the user" in msg:
+                logger.warning("Skip uid=%s: %s", uid, e)
+            else:
+                logger.exception("Failed to send message to uid=%s", uid)
         except Exception:
-            pass
+            logger.exception("Failed to send message to uid=%s", uid)
 
-        now = time.time()
-        filtered = [e for e in events if (now - 2*24*3600) <= e.start_ts_utc <= (now + 370*24*3600)]
-        filtered.sort(key=lambda e: e.start_ts_utc)
-        self._events = filtered
-        self._last_fetch_ts = time.time()
 
-    def blackout_window(self, ev: MacroEvent) -> Tuple[float, float]:
-        start = ev.start_ts_utc - (BLACKOUT_BEFORE_MIN * 60)
-        end = ev.start_ts_utc + (BLACKOUT_AFTER_MIN * 60)
-        return start, end
+async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, float], tz_name: str) -> None:
+    w0, w1 = win
+    uids = await get_broadcast_user_ids()
+    for uid in uids:
+        try:
+            title = tr(uid, 'macro_title')
+            body = f"{ev.name}\n{tr(uid, 'macro_blackout')}: {_fmt_hhmm(w0)} – {_fmt_hhmm(w1)}\n\n"
+            tail = tr(uid, 'macro_tail_fut_off') if action == 'FUTURES_OFF' else tr(uid, 'macro_tail_paused')
+            await safe_send(uid, f"{title}\n\n{body}{tail}")
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            # Do not spam stack traces for common delivery issues
+            msg = str(e).lower()
+            if "chat not found" in msg or "bot was blocked by the user" in msg:
+                logger.warning("Skip uid=%s: %s", uid, e)
+            else:
+                logger.exception("Failed to send message to uid=%s", uid)
+        except (TelegramForbiddenError, TelegramBadRequest) as e:
+            msg = str(e).lower()
+            if "chat not found" in msg or "bot was blocked by the user" in msg:
+                logger.warning("Skip uid=%s: %s", uid, e)
+            else:
+                logger.exception("Failed to send message to uid=%s", uid)
+        except Exception:
+            logger.exception("Failed to send message to uid=%s", uid)
 
-    def current_action(self) -> Tuple[str, Optional[MacroEvent], Optional[Tuple[float, float]]]:
-        if not self.enabled():
-            return "ALLOW", None, None
-        now = time.time()
-        for ev in self._events:
-            w0, w1 = self.blackout_window(ev)
-            if w0 <= now <= w1:
-                act = MACRO_ACTION if MACRO_ACTION in ("FUTURES_OFF", "PAUSE_ALL") else "FUTURES_OFF"
-                return act, ev, (w0, w1)
-        return "ALLOW", None, None
+# ---------------- commands ----------------
+@dp.message(Command("start"))
+async def start(message: types.Message) -> None:
+    uid = message.from_user.id if message.from_user else 0
+    if uid:
+        await ensure_user(uid)
+        await set_user_blocked(uid, blocked=False)
 
-    def status(self) -> tuple[str, MacroEvent | None, tuple[float, float] | None]:
-        """Return (action, event, (w0,w1)) for current moment."""
-        return self.current_action()
+    # If language not chosen yet, ask first
+    if uid and uid not in LANG:
+        kb = InlineKeyboardBuilder()
+        kb.button(text=tr(uid, "btn_ru"), callback_data="lang:ru")
+        kb.button(text=tr(uid, "btn_en"), callback_data="lang:en")
+        kb.adjust(2)
+        await message.answer(tr(uid, "choose_lang"), reply_markup=kb.as_markup())
+        return
 
-    def next_event(self) -> Optional[Tuple[MacroEvent, Tuple[float, float]]]:
-        if not self.enabled():
-            return None
-        now = time.time()
-        for ev in self._events:
-            w0, w1 = self.blackout_window(ev)
-            if now < w0:
-                return ev, (w0, w1)
-        return None
+    # Shared access control (Postgres)
+    access = await get_access_status(uid) if uid else "no_user"
+    if access != "ok":
+        await message.answer(tr(uid, f"access_{access}"), reply_markup=menu_kb(uid))
+        return
 
-    def should_notify(self, ev: MacroEvent) -> bool:
-        key = f"{ev.type}:{ev.start_ts_utc}"
-        now = time.time()
-        last = self._notified.get(key, 0.0)
-        if (now - last) >= self._notify_cooldown:
-            self._notified[key] = now
-            return True
-        return False
+    await message.answer(tr(uid, "welcome"), reply_markup=menu_kb(uid))
 
-# ------------------ Price feed (WS, Binance) ------------------
-class PriceFeed:
-    def __init__(self) -> None:
-        self._prices: Dict[Tuple[str, str], float] = {}
-        self._tasks: Dict[Tuple[str, str], asyncio.Task] = {}
 
-    def get_latest(self, market: str, symbol: str) -> Optional[float]:
-        return self._prices.get((market.upper(), symbol.upper()))
-
-    def _set_latest(self, market: str, symbol: str, price: float) -> None:
-        self._prices[(market.upper(), symbol.upper())] = float(price)
-
-    async def ensure_stream(self, market: str, symbol: str) -> None:
-        key = (market.upper(), symbol.upper())
-        t = self._tasks.get(key)
-        if t and not t.done():
+# ---------------- language selection ----------------
+@dp.callback_query(lambda c: (c.data or "").startswith("lang:"))
+async def lang_choose(call: types.CallbackQuery) -> None:
+    await call.answer()
+    uid = call.from_user.id if call.from_user else 0
+    lang = (call.data or "lang:ru").split(":", 1)[1]
+    if uid:
+        set_lang(uid, lang)
+    # show welcome + menu in-place
+    try:
+        if call.message:
+            await bot.edit_message_text(chat_id=uid, message_id=call.message.message_id, text=tr(uid, "welcome"), reply_markup=menu_kb(uid))
             return
-        self._tasks[key] = asyncio.create_task(self._run_stream(market, symbol))
-
-    async def _run_stream(self, market: str, symbol: str) -> None:
-        m = market.upper()
-        sym = symbol.lower()
-        url = f"wss://stream.binance.com:9443/ws/{sym}@trade" if m == "SPOT" else f"wss://fstream.binance.com/ws/{sym}@trade"
-        backoff = 1
-        while True:
-            try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                    backoff = 1
-                    async for msg in ws:
-                        data = json.loads(msg)
-                        p = data.get("p")
-                        if p is not None:
-                            self._set_latest(m, symbol, float(p))
-            except Exception:
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30)
-
-    def mock_price(self, market: str, symbol: str, base: float | None = None) -> float:
-        key = ("MOCK:" + market.upper(), symbol.upper())
-        seed = (float(base) if base is not None and base > 0 else None)
-        price = self._prices.get(key, seed if seed is not None else random.uniform(100, 50000))
-        price *= random.uniform(0.996, 1.004)
-        self._prices[key] = price
-        return price
-
-# ------------------ Exchange data (candles) ------------------
-class MultiExchangeData:
-    BINANCE_SPOT = "https://api.binance.com"
-    BINANCE_FUTURES = "https://fapi.binance.com"
-    BYBIT = "https://api.bybit.com"
-    OKX = "https://www.okx.com"
-
-    def __init__(self) -> None:
-        self.session: Optional[aiohttp.ClientSession] = None
-
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        if self.session:
-            await self.session.close()
-
-    async def get_top_usdt_symbols(self, n: int) -> List[str]:
-        assert self.session is not None
-        url = f"{self.BINANCE_SPOT}/api/v3/ticker/24hr"
-        async with self.session.get(url) as r:
-            r.raise_for_status()
-            data = await r.json()
-
-        items = []
-        for t in data:
-            sym = t.get("symbol", "")
-            if not sym.endswith("USDT"):
-                continue
-            if any(x in sym for x in ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
-                continue
-            try:
-                qv = float(t.get("quoteVolume", "0") or 0)
-            except Exception:
-                qv = 0.0
-            items.append((qv, sym))
-        items.sort(reverse=True, key=lambda x: x[0])
-        if n <= 0:
-            return [sym for _, sym in items]
-        return [sym for _, sym in items[:n]]
-
-    async def _get_json(self, url: str, params: Optional[Dict[str, str]] = None) -> Any:
-        assert self.session is not None
-        async with self.session.get(url, params=params) as r:
-            r.raise_for_status()
-            return await r.json()
-
-    def _df_from_ohlcv(self, rows: List[List[Any]], order: str) -> pd.DataFrame:
-        if not rows:
-            return pd.DataFrame()
-
-        if order == "binance":
-            df = pd.DataFrame(rows, columns=[
-                "open_time","open","high","low","close","volume",
-                "close_time","quote_volume","n_trades","taker_base","taker_quote","ignore"
-            ])
-            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-            for col in ("open","high","low","close","volume","quote_volume"):
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        elif order == "bybit":
-            df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","turnover"])
-            df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="ms")
-            for col in ("open","high","low","close","volume","turnover"):
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-        else:
-            df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","vol_ccy","vol_quote","confirm"])
-            df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="ms")
-            for col in ("open","high","low","close","volume","vol_ccy","vol_quote"):
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        df = df.dropna(subset=["open","high","low","close"]).sort_values("open_time").reset_index(drop=True)
-        return df
-
-    async def klines_binance(self, symbol: str, interval: str, limit: int = 250) -> pd.DataFrame:
-        url = f"{self.BINANCE_SPOT}/api/v3/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
-        raw = await self._get_json(url, params=params)
-        return self._df_from_ohlcv(raw, "binance")
-
-    
-    async def depth_binance(self, symbol: str, limit: int = 20) -> Optional[dict]:
-        """Fetch top-of-book depth from Binance Spot. Returns None on errors.
-        When ORDERBOOK_FILTER is enabled, you can use this to compute imbalance.
-        """
-        url = f"{self.BINANCE_SPOT}/api/v3/depth"
-        params = {"symbol": symbol, "limit": str(limit)}
-        try:
-            data = await self._get_json(url, params=params)
-            return data if isinstance(data, dict) else None
-        except Exception:
-            return None
-    async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        interval_map = {"15m":"15", "1h":"60", "4h":"240"}
-        itv = interval_map.get(interval, "15")
-        url = f"{self.BYBIT}/v5/market/kline"
-        params = {"category": "spot", "symbol": symbol, "interval": itv, "limit": str(limit)}
-        data = await self._get_json(url, params=params)
-        rows = (data or {}).get("result", {}).get("list", []) or []
-        rows = list(reversed(rows))
-        return self._df_from_ohlcv(rows, "bybit")
-
-    def okx_inst(self, symbol: str) -> str:
-        if symbol.endswith("USDT"):
-            base = symbol[:-4]
-            return f"{base}-USDT"
-        return symbol
-
-    async def klines_okx(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        bar_map = {"15m":"15m", "1h":"1H", "4h":"4H"}
-        bar = bar_map.get(interval, "15m")
-        inst = self.okx_inst(symbol)
-        url = f"{self.OKX}/api/v5/market/candles"
-        params = {"instId": inst, "bar": bar, "limit": str(limit)}
-        data = await self._get_json(url, params=params)
-        rows = (data or {}).get("data", []) or []
-        rows = list(reversed(rows))
-        return self._df_from_ohlcv(rows, "okx")
-
-# ------------------ Indicators / engine ------------------
-def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add core indicators used by the engine.
-    Expected columns: open, high, low, close, (optional) volume.
-    """
-    df = df.copy()
-    close = df["close"].astype(float)
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-
-    # Trend
-    try:
-        df["ema50"] = EMAIndicator(close, window=50).ema_indicator()
-        df["ema200"] = EMAIndicator(close, window=200).ema_indicator()
     except Exception:
-        df["ema50"] = np.nan
-        df["ema200"] = np.nan
-
-    # Momentum
-    try:
-        df["rsi"] = RSIIndicator(close, window=14).rsi()
-    except Exception:
-        df["rsi"] = np.nan
-
-    try:
-        macd = MACD(close, window_slow=26, window_fast=12, window_sign=9)
-        df["macd"] = macd.macd()
-        df["macd_signal"] = macd.macd_signal()
-        df["macd_hist"] = macd.macd_diff()
-    except Exception:
-        df["macd"] = np.nan
-        df["macd_signal"] = np.nan
-        df["macd_hist"] = np.nan
-
-    # Trend strength
-    try:
-        df["adx"] = ADXIndicator(high, low, close, window=14).adx()
-    except Exception:
-        df["adx"] = np.nan
-
-    # Volatility
-    try:
-        df["atr"] = AverageTrueRange(high, low, close, window=14).average_true_range()
-    except Exception:
-        df["atr"] = np.nan
-
-    # Bollinger Bands
-    try:
-        bb = BollingerBands(close, window=20, window_dev=2)
-        df["bb_mavg"] = bb.bollinger_mavg()
-        df["bb_high"] = bb.bollinger_hband()
-        df["bb_low"] = bb.bollinger_lband()
-    except Exception:
-        df["bb_mavg"] = np.nan
-        df["bb_high"] = np.nan
-        df["bb_low"] = np.nan
-
-    # Volume-based (optional)
-    if "volume" in df.columns:
-        vol = df["volume"].astype(float).fillna(0.0)
-        df["vol_sma20"] = vol.rolling(window=20, min_periods=5).mean()
-
-        try:
-            df["obv"] = OnBalanceVolumeIndicator(close, vol).on_balance_volume()
-        except Exception:
-            df["obv"] = np.nan
-
-        try:
-            df["mfi"] = MFIIndicator(high, low, close, vol, window=14).money_flow_index()
-        except Exception:
-            df["mfi"] = np.nan
-
-        # VWAP (cumulative)
-        try:
-            tp = (high + low + close) / 3.0
-            pv = tp * vol
-            cum_vol = vol.cumsum().replace(0, np.nan)
-            df["vwap"] = pv.cumsum() / cum_vol
-        except Exception:
-            df["vwap"] = np.nan
-    else:
-        df["vol_sma20"] = np.nan
-        df["obv"] = np.nan
-        df["mfi"] = np.nan
-        df["vwap"] = np.nan
-
-    return df
-
-
-def _trend_dir(df: pd.DataFrame) -> Optional[str]:
-    row = df.iloc[-1]
-    if pd.isna(row["ema50"]) or pd.isna(row["ema200"]):
-        return None
-    return "LONG" if row["ema50"] > row["ema200"] else ("SHORT" if row["ema50"] < row["ema200"] else None)
-
-def _trigger_15m(direction: str, df15i: pd.DataFrame) -> bool:
-    """
-    Entry trigger on 15m timeframe with configurable strict/medium thresholds via ENV.
-    """
-    if len(df15i) < 25:
-        return False
-    last = df15i.iloc[-1]
-    prev = df15i.iloc[-2]
-
-    # Required indicators
-    req = ("rsi", "macd", "macd_signal", "macd_hist", "bb_mavg", "bb_high", "bb_low", "vol_sma20", "mfi", "adx")
-    if any(pd.isna(last.get(x, np.nan)) for x in req) or pd.isna(prev.get("macd_hist", np.nan)):
-        return False
-
-    close = float(last["close"])
-    prev_close = float(prev["close"])
-
-    # ADX on 15m should show at least some structure (helps reduce chop)
-    adx15 = float(last.get("adx", np.nan))
-    if not np.isnan(adx15) and adx15 < max(10.0, TA_MIN_ADX - 6.0):
-        return False
-
-    # MACD momentum confirmation + optional histogram magnitude
-    macd_hist = float(last["macd_hist"])
-    prev_hist = float(prev["macd_hist"])
-    if direction == "LONG":
-        macd_ok = (last["macd"] > last["macd_signal"]) and (macd_hist > prev_hist) and (macd_hist >= TA_MIN_MACD_H)
-    else:
-        macd_ok = (last["macd"] < last["macd_signal"]) and (macd_hist < prev_hist) and (macd_hist <= -TA_MIN_MACD_H)
-    if not macd_ok:
-        return False
-
-    # RSI cross 50 with guard rails (configurable)
-    rsi_last = float(last["rsi"])
-    rsi_prev = float(prev["rsi"])
-    if direction == "LONG":
-        rsi_ok = (rsi_prev < 50) and (rsi_last >= 50) and (rsi_last <= TA_RSI_MAX_LONG)
-        if float(last["mfi"]) >= 80:
-            return False
-    else:
-        rsi_ok = (rsi_prev > 50) and (rsi_last <= 50) and (rsi_last >= TA_RSI_MIN_SHORT)
-        if float(last["mfi"]) <= 20:
-            return False
-    if not rsi_ok:
-        return False
-
-    # Bollinger filter
-    bb_mid = float(last["bb_mavg"])
-    bb_high = float(last["bb_high"])
-    bb_low = float(last["bb_low"])
-
-    if direction == "LONG":
-        # avoid extremes: stay below upper band unless breakout is required
-        if TA_BB_REQUIRE_BREAKOUT:
-            # require cross above midline on the last candle
-            if not (prev_close <= bb_mid and close > bb_mid):
-                return False
-        else:
-            if not (close > bb_mid and close < bb_high):
-                return False
-    else:
-        if TA_BB_REQUIRE_BREAKOUT:
-            if not (prev_close >= bb_mid and close < bb_mid):
-                return False
-        else:
-            if not (close < bb_mid and close > bb_low):
-                return False
-
-    # Volume activity: require above-average volume
-    vol = float(last.get("volume", 0.0) or 0.0)
-    vol_sma = float(last["vol_sma20"])
-    if vol_sma > 0 and vol < vol_sma * TA_MIN_VOL_X:
-        return False
-
-    return True
-
-
-def _build_levels(direction: str, entry: float, atr: float) -> Tuple[float, float, float, float]:
-    R = max(1e-9, ATR_MULT_SL * atr)
-    if direction == "LONG":
-        sl = entry - R
-        tp1 = entry + TP1_R * R
-        tp2 = entry + TP2_R * R
-    else:
-        sl = entry + R
-        tp1 = entry - TP1_R * R
-        tp2 = entry - TP2_R * R
-    rr = abs(tp2 - entry) / abs(entry - sl)
-    return sl, tp1, tp2, rr
-
-def _candle_pattern(df: pd.DataFrame) -> Tuple[str, int]:
-    """
-    Very lightweight candlestick pattern detection on the last 2 candles.
-    Returns (pattern_name, bias) where bias: +1 bullish, -1 bearish, 0 neutral.
-    """
-    try:
-        if df is None or len(df) < 3:
-            return ("—", 0)
-        c1 = df.iloc[-2]
-        c2 = df.iloc[-1]
-        o1,h1,l1,cl1 = float(c1["open"]), float(c1["high"]), float(c1["low"]), float(c1["close"])
-        o2,h2,l2,cl2 = float(c2["open"]), float(c2["high"]), float(c2["low"]), float(c2["close"])
-
-        body1 = abs(cl1 - o1)
-        body2 = abs(cl2 - o2)
-        rng2 = max(1e-12, h2 - l2)
-
-        # Doji
-        if body2 <= rng2 * 0.1:
-            return ("Doji", 0)
-
-        # Engulfing
-        bull_engulf = (cl1 < o1) and (cl2 > o2) and (o2 <= cl1) and (cl2 >= o1)
-        bear_engulf = (cl1 > o1) and (cl2 < o2) and (o2 >= cl1) and (cl2 <= o1)
-        if bull_engulf:
-            return ("Bullish Engulfing", +1)
-        if bear_engulf:
-            return ("Bearish Engulfing", -1)
-
-        # Hammer / Shooting Star (simple)
-        upper_w = h2 - max(o2, cl2)
-        lower_w = min(o2, cl2) - l2
-        if body2 <= rng2 * 0.35:
-            if lower_w >= body2 * 1.8 and upper_w <= body2 * 0.7:
-                return ("Hammer", +1)
-            if upper_w >= body2 * 1.8 and lower_w <= body2 * 0.7:
-                return ("Shooting Star", -1)
-
-        # Inside bar
-        if (h2 <= h1) and (l2 >= l1):
-            return ("Inside Bar", 0)
-
-        return ("—", 0)
-    except Exception:
-        return ("—", 0)
-
-
-def _nearest_levels(df: pd.DataFrame, lookback: int = 180, swing: int = 3) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Finds nearest swing support/resistance levels using simple local extrema on 'high'/'low'.
-    Returns (support, resistance) relative to the last close.
-    """
-    try:
-        if df is None or df.empty or len(df) < (swing * 2 + 5):
-            return (None, None)
-        d = df.tail(max(lookback, swing * 2 + 5)).copy()
-        last_close = float(d.iloc[-1]["close"])
-
-        highs = d["high"].astype(float).values
-        lows = d["low"].astype(float).values
-
-        swing_highs = []
-        swing_lows = []
-        n = len(d)
-
-        for i in range(swing, n - swing):
-            h = highs[i]
-            l = lows[i]
-            if h == max(highs[i - swing:i + swing + 1]):
-                swing_highs.append(h)
-            if l == min(lows[i - swing:i + swing + 1]):
-                swing_lows.append(l)
-
-        # nearest below and above price
-        support = None
-        resistance = None
-        below = [x for x in swing_lows if x <= last_close]
-        above = [x for x in swing_highs if x >= last_close]
-        if below:
-            support = max(below)
-        if above:
-            resistance = min(above)
-
-        return (support, resistance)
-    except Exception:
-        return (None, None)
-
-
-def _fmt_ta_block(ta: Dict[str, Any]) -> str:
-    """
-    Format TA snapshot for Telegram/UX. Keep it short but informative.
-    """
-    try:
-        if not ta:
-            return ""
-        score = ta.get("score", "—")
-        rsi = ta.get("rsi15", "—")
-        macd_h = ta.get("macd_hist15", "—")
-        adx1 = ta.get("adx1", "—")
-        adx4 = ta.get("adx4", "—")
-        atrp = ta.get("atr_pct", "—")
-        bb = ta.get("bb_pos", "—")
-        volr = ta.get("vol_rel", "—")
-        vwap = ta.get("vwap_bias", "—")
-        pat = ta.get("pattern", "—")
-        sup = ta.get("support", None)
-        res = ta.get("resistance", None)
-
-        def fnum(x, fmt="{:.2f}"):
-            try:
-                if x is None or (isinstance(x, float) and np.isnan(x)):
-                    return "—"
-                return fmt.format(float(x))
-            except Exception:
-                return "—"
-
-        def fint(x):
-            try:
-                if x is None or (isinstance(x, float) and np.isnan(x)):
-                    return "—"
-                return str(int(round(float(x))))
-            except Exception:
-                return "—"
-
-        lines = [
-            f"📊 TA score: {fint(score)}/100 | Mode: {SIGNAL_MODE}",
-            f"RSI: {fnum(rsi, '{:.1f}')} | MACD hist: {fnum(macd_h, '{:.4f}')}",
-            f"ADX 1h/4h: {fnum(adx1, '{:.1f}')}/{fnum(adx4, '{:.1f}')} | ATR%: {fnum(atrp, '{:.2f}')}",
-            f"BB: {bb} | Vol xAvg: {fnum(volr, '{:.2f}')} | VWAP: {vwap}",
-        ]
-        extra = []
-        if pat and pat != "—":
-            extra.append(f"Pattern: {pat}")
-        if sup is not None:
-            extra.append(f"Support: {fnum(sup, '{:.6g}')}")
-        if res is not None:
-            extra.append(f"Resistance: {fnum(res, '{:.6g}')}")
-        if extra:
-            lines.append(" | ".join(extra))
-        return "\n".join(lines).strip()
-    except Exception:
-        return ""
-
-
-def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
-    score = 0
-    score += 0 if np.isnan(adx4) else int(min(25, max(0, (adx4 - 15) * 1.25)))
-    score += 0 if np.isnan(adx1) else int(min(25, max(0, (adx1 - 15) * 1.25)))
-    if not np.isnan(rsi15):
-        score += 20 if 40 <= rsi15 <= 60 else (15 if 35 <= rsi15 <= 65 else 8)
-    score += 20 if 0.3 <= atr_pct <= 3.0 else (14 if 0.2 <= atr_pct <= 4.0 else 8)
-    score += 10
-    return int(max(0, min(100, score)))
-
-def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """Compute direction + levels + TA snapshot for one exchange using 15m/1h/4h OHLCV."""
-    if df15.empty or df1h.empty or df4h.empty:
-        return None
-
-    df15i = _add_indicators(df15)
-    df1hi = _add_indicators(df1h)
-    df4hi = _add_indicators(df4h)
-
-    dir4 = _trend_dir(df4hi)
-    dir1 = _trend_dir(df1hi)
-
-    # Multi-timeframe confirmation (configurable)
-    if dir4 is None:
-        return None
-    if TA_REQUIRE_1H_TREND:
-        if dir1 is None or dir4 != dir1:
-            return None
-    else:
-        if dir1 is None:
-            dir1 = dir4
-
-    last15 = df15i.iloc[-1]
-    last1h = df1hi.iloc[-1]
-    last4h = df4hi.iloc[-1]
-
-    entry = float(last15["close"])
-    atr = float(last1h.get("atr", np.nan))
-    if np.isnan(atr) or atr <= 0:
-        return None
-
-    atr_pct = (atr / entry) * 100.0 if entry > 0 else 0.0
-    sl, tp1, tp2, rr = _build_levels(dir1, entry, atr)
-
-    # Snapshot values
-    rsi15 = float(last15.get("rsi", np.nan))
-    macd_hist15 = float(last15.get("macd_hist", np.nan))
-    adx4 = float(last4h.get("adx", np.nan))
-    adx1 = float(last1h.get("adx", np.nan))
-
-    bb_low = float(last15.get("bb_low", np.nan))
-    bb_mid = float(last15.get("bb_mavg", np.nan))
-    bb_high = float(last15.get("bb_high", np.nan))
-
-    vol = float(last15.get("volume", 0.0) or 0.0)
-    vol_sma = float(last15.get("vol_sma20", np.nan))
-    vol_rel = (vol / vol_sma) if (vol_sma and not np.isnan(vol_sma) and vol_sma > 0) else np.nan
-
-    # Pattern + S/R
-    pattern, pat_bias = _candle_pattern(df15i)
-    support, resistance = _nearest_levels(df1hi, lookback=180, swing=3)
-
-    # Strict-ish trigger on 15m (uses ENV thresholds)
-    if not _trigger_15m(dir1, df15i):
-        return None
-
-    confidence = _confidence(adx4, adx1, rsi15, atr_pct)
-
-    ta = {
-        "direction": dir1,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "rr": rr,
-        "confidence": confidence,
-        "atr_pct": atr_pct,
-        "adx1": adx1,
-        "adx4": adx4,
-        "rsi15": rsi15,
-        "macd_hist15": macd_hist15,
-        "bb_low": bb_low,
-        "bb_mid": bb_mid,
-        "bb_high": bb_high,
-        "vol_rel": vol_rel,
-        "pattern": pattern,
-        "support": support,
-        "resistance": resistance,
-    }
-    ta["ta_block"] = _fmt_ta_block(ta)
-    return ta
-def choose_market(adx1_max: float, atr_pct_max: float) -> str:
-    return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
-
-# ------------------ Backend ------------------
-
-    async def orderbook_binance_futures(self, symbol: str, limit: int = 100) -> Dict[str, Any]:
-        """Binance USDT-M futures orderbook."""
-        assert self.session is not None
-        url = f"{self.BINANCE_FUTURES}/fapi/v1/depth"
-        params = {"symbol": symbol, "limit": str(limit)}
-        return await self._get_json(url, params=params)
-
-    async def orderbook_bybit_linear(self, symbol: str, limit: int = 50) -> Dict[str, Any]:
-        """Bybit linear futures orderbook."""
-        assert self.session is not None
-        url = f"{self.BYBIT}/v5/market/orderbook"
-        params = {"category": "linear", "symbol": symbol, "limit": str(limit)}
-        return await self._get_json(url, params=params)
-
-
-# ------------------ Orderbook filter helpers ------------------
-def _orderbook_metrics(bids: List[List[Any]], asks: List[List[Any]], *, levels: int) -> Dict[str, float]:
-    """Return imbalance (bids/asks notional), spread_pct, bid_wall_ratio, ask_wall_ratio, bid_wall_near, ask_wall_near."""
-    def _take(side: List[List[Any]]) -> List[Tuple[float, float]]:
-        out: List[Tuple[float, float]] = []
-        for row in side[:levels]:
-            try:
-                p = float(row[0])
-                q = float(row[1])
-                out.append((p, q))
-            except Exception:
-                continue
+        pass
+    await safe_send(uid, tr(uid, "welcome"), reply_markup=menu_kb(uid))
+
+# ---------------- menu callbacks ----------------
+def _fmt_stats_block_ru(title: str, b: dict | None = None) -> str:
+    b = b or {}
+    trades = int(b.get("trades", 0))
+    wins = int(b.get("wins", 0))
+    losses = int(b.get("losses", 0))
+    be = int(b.get("be", 0))
+    tp1 = int(b.get("tp1_hits", 0))
+    wr = (wins / trades * 100.0) if trades else 0.0
+    pnl = float(b.get("sum_pnl_pct", 0.0))
+    return (
+        f"{title}\n"
+        f"Сделки: {trades} | Плюс: {wins} | Минус: {losses} | BE: {be} | TP1: {tp1}\n"
+        f"Процент побед: {wr:.1f}%\n"
+        f"PnL: {pnl:+.2f}%"
+    )
+
+def _fmt_stats_block_en(title: str, b: dict | None = None) -> str:
+    b = b or {}
+    trades = int(b.get("trades", 0))
+    wins = int(b.get("wins", 0))
+    losses = int(b.get("losses", 0))
+    be = int(b.get("be", 0))
+    tp1 = int(b.get("tp1_hits", 0))
+    wr = (wins / trades * 100.0) if trades else 0.0
+    pnl = float(b.get("sum_pnl_pct", 0.0))
+    return (
+        f"{title}\n"
+        f"Trades: {trades} | Wins: {wins} | Losses: {losses} | BE: {be} | TP1: {tp1}\n"
+        f"Win rate: {wr:.1f}%\n"
+        f"PnL: {pnl:+.2f}%"
+    )
+
+def _parse_report_lines(lines: list[str]) -> list[tuple[str,int,float,float]]:
+    # returns (key, trades, winrate, pnl)
+    out = []
+    rx = re.compile(r"^(?P<k>[^:]+):\s*trades=(?P<t>\d+)\s+winrate=(?P<wr>[\d\.]+)%\s+pnl=(?P<pnl>[\+\-]?[\d\.]+)%\s*$")
+    for ln in lines:
+        m = rx.match((ln or "").strip())
+        if not m:
+            continue
+        out.append((m.group("k"), int(m.group("t")), float(m.group("wr")), float(m.group("pnl"))))
+    return out
+
+async def stats_text(uid: int) -> str:
+    """Render trading statistics for the user from Postgres (backend-only)."""
+    lang = get_lang(uid)
+    tz_name = os.getenv("TZ", "UTC")
+
+    # ---- buckets ----
+    spot_today = await backend.perf_today(uid, "SPOT")
+    fut_today = await backend.perf_today(uid, "FUTURES")
+    spot_week = await backend.perf_week(uid, "SPOT")
+    fut_week = await backend.perf_week(uid, "FUTURES")
+
+    spot_days = await backend.report_daily(uid, "SPOT", 7, tz=tz_name)
+    fut_days = await backend.report_daily(uid, "FUTURES", 7, tz=tz_name)
+
+    spot_weeks = await backend.report_weekly(uid, "SPOT", 4, tz=tz_name)
+    fut_weeks = await backend.report_weekly(uid, "FUTURES", 4, tz=tz_name)
+
+    # ---- formatting helpers ----
+    def block_title(market: str) -> str:
+        if market == "SPOT":
+            return f"🟢 {tr(uid, 'lbl_spot')}"
+        return f"🔴 {tr(uid, 'lbl_futures')}"
+
+    def fmt_block(title: str, b: dict) -> str:
+        if lang == "en":
+            return _fmt_stats_block_en(title, b)
+        return _fmt_stats_block_ru(title, b)
+
+    def fmt_lines(rows: list[dict]) -> list[str]:
+        out: list[str] = []
+        for r in rows:
+            # day is date, week is text label
+            key = r.get("day")
+            if key is not None:
+                k = key.isoformat() if hasattr(key, "isoformat") else str(key)
+            else:
+                k = str(r.get("week"))
+            trades = int(r.get("trades", 0) or 0)
+            wins = int(r.get("wins", 0) or 0)
+            pnl = float(r.get("sum_pnl_pct", 0.0) or 0.0)
+            wr = (wins / trades * 100.0) if trades else 0.0
+            if lang == "en":
+                out.append(f"{k}: trades {trades} | winrate {wr:.1f}% | pnl {pnl:+.2f}%")
+            else:
+                out.append(f"{k}: Сделки {trades} | Победы {wr:.1f}% | PnL {pnl:+.2f}%")
         return out
 
-    b = _take(bids)
-    a = _take(asks)
-    if not b or not a:
-        return {"imbalance": 1.0, "spread_pct": 999.0, "bid_wall_ratio": 0.0, "ask_wall_ratio": 0.0, "mid": 0.0}
+    no_closed = tr(uid, "no_closed")
 
-    best_bid = b[0][0]
-    best_ask = a[0][0]
-    mid = (best_bid + best_ask) / 2.0 if (best_bid > 0 and best_ask > 0) else max(best_bid, best_ask)
-    spread_pct = ((best_ask - best_bid) / mid * 100.0) if mid > 0 else 999.0
-
-    bid_not = [p * q for p, q in b]
-    ask_not = [p * q for p, q in a]
-    sum_b = float(sum(bid_not))
-    sum_a = float(sum(ask_not))
-    imbalance = (sum_b / sum_a) if sum_a > 0 else 999.0
-
-    bid_avg = (sum_b / len(bid_not)) if bid_not else 0.0
-    ask_avg = (sum_a / len(ask_not)) if ask_not else 0.0
-    bid_wall_ratio = (max(bid_not) / bid_avg) if bid_avg > 0 else 0.0
-    ask_wall_ratio = (max(ask_not) / ask_avg) if ask_avg > 0 else 0.0
-
-    return {
-        "imbalance": float(imbalance),
-        "spread_pct": float(spread_pct),
-        "bid_wall_ratio": float(bid_wall_ratio),
-        "ask_wall_ratio": float(ask_wall_ratio),
-        "mid": float(mid),
-    }
-
-def _orderbook_has_near_wall(side: List[List[Any]], *, mid: float, direction: str, near_pct: float, wall_ratio: float, levels: int) -> bool:
-    """Detect an unusually large level close to current price."""
-    # side: bids for SHORT-wall, asks for LONG-wall
-    vals: List[Tuple[float, float]] = []
-    for row in side[:levels]:
-        try:
-            p = float(row[0]); q = float(row[1])
-            if p <= 0 or q <= 0:
-                continue
-            vals.append((p, p*q))
-        except Exception:
-            continue
-    if not vals or mid <= 0:
-        return False
-    avg = sum(v for _, v in vals) / len(vals)
-    if avg <= 0:
-        return False
-    # wall candidates near mid
-    if direction == "LONG":
-        # ask wall above mid within near_pct
-        near = [(p, v) for p, v in vals if p >= mid and (p - mid) / mid * 100.0 <= near_pct]
+    parts: list[str] = []
+    parts.append(tr(uid, "stats_title"))
+    parts.append("")
+    parts.append(tr(uid, "perf_today"))
+    parts.append(fmt_block(block_title("SPOT"), spot_today))
+    parts.append("")
+    parts.append(fmt_block(block_title("FUTURES"), fut_today))
+    parts.append("")
+    parts.append(tr(uid, "perf_week"))
+    parts.append(fmt_block(block_title("SPOT"), spot_week))
+    parts.append("")
+    parts.append(fmt_block(block_title("FUTURES"), fut_week))
+    parts.append("")
+    parts.append(tr(uid, "daily_title"))
+    parts.append(f"🟢 {tr(uid,'lbl_spot')}:")
+    if not spot_days:
+        parts.append(no_closed)
     else:
-        # bid wall below mid within near_pct
-        near = [(p, v) for p, v in vals if p <= mid and (mid - p) / mid * 100.0 <= near_pct]
-    if not near:
-        return False
-    max_near = max(v for _, v in near)
-    return (max_near / avg) >= wall_ratio
-
-async def orderbook_filter(api: "MultiExchangeData", exchange: str, symbol: str, direction: str) -> Tuple[bool, str]:
-    """Return (allow, summary) for FUTURES orderbook confirmation."""
-    exchange_l = exchange.strip().lower()
-    try:
-        if exchange_l == "binance":
-            raw = await api.orderbook_binance_futures(symbol, limit=max(50, ORDERBOOK_LEVELS))
-            bids = raw.get("bids", []) or []
-            asks = raw.get("asks", []) or []
-        elif exchange_l == "bybit":
-            raw = await api.orderbook_bybit_linear(symbol, limit=max(50, ORDERBOOK_LEVELS))
-            res = (raw.get("result", {}) or {})
-            bids = res.get("b", []) or []
-            asks = res.get("a", []) or []
-        else:
-            return (True, f"OB {exchange}: skip")
-    except Exception:
-        return (True, f"OB {exchange}: err")
-
-    m = _orderbook_metrics(bids, asks, levels=ORDERBOOK_LEVELS)
-    imb = m["imbalance"]
-    spread = m["spread_pct"]
-    mid = m["mid"]
-
-    # quick blocks
-    if spread > ORDERBOOK_MAX_SPREAD_PCT:
-        return (False, f"OB {exchange}: spread {spread:.3f}%")
-
-    # near wall blocks
-    ask_wall_near = _orderbook_has_near_wall(asks, mid=mid, direction="LONG", near_pct=ORDERBOOK_WALL_NEAR_PCT, wall_ratio=ORDERBOOK_WALL_RATIO, levels=ORDERBOOK_LEVELS)
-    bid_wall_near = _orderbook_has_near_wall(bids, mid=mid, direction="SHORT", near_pct=ORDERBOOK_WALL_NEAR_PCT, wall_ratio=ORDERBOOK_WALL_RATIO, levels=ORDERBOOK_LEVELS)
-
-    if direction == "LONG":
-        if imb < ORDERBOOK_IMBALANCE_MIN:
-            return (False, f"OB {exchange}: imb {imb:.2f}x")
-        if ask_wall_near:
-            return (False, f"OB {exchange}: ask-wall")
+        parts.extend(fmt_lines(spot_days))
+    parts.append("")
+    parts.append(f"🔴 {tr(uid,'lbl_futures')}:")
+    if not fut_days:
+        parts.append(no_closed)
     else:
-        # for SHORT we need asks/bids >= min  => bids/asks <= 1/min
-        if imb > (1.0 / ORDERBOOK_IMBALANCE_MIN):
-            return (False, f"OB {exchange}: imb {imb:.2f}x")
-        if bid_wall_near:
-            return (False, f"OB {exchange}: bid-wall")
+        parts.extend(fmt_lines(fut_days))
+    parts.append("")
+    parts.append(tr(uid, "weekly_title"))
+    parts.append(f"🟢 {tr(uid,'lbl_spot')}:")
+    if not spot_weeks:
+        parts.append(no_closed)
+    else:
+        parts.extend(fmt_lines(spot_weeks))
+    parts.append("")
+    parts.append(f"🔴 {tr(uid,'lbl_futures')}:")
+    if not fut_weeks:
+        parts.append(no_closed)
+    else:
+        parts.extend(fmt_lines(fut_weeks))
+    parts.append("")
+    hint = tr(uid, "stats_hint") if "stats_hint" in I18N.get(lang, {}) else ""
+    if hint:
+        parts.append(hint)
 
-    return (True, f"OB {exchange}: ok imb {imb:.2f}x spr {spread:.3f}%")
+    return "\n".join(parts).strip()
+@dp.callback_query(lambda c: (c.data or "").startswith("menu:"))
+async def menu_handler(call: types.CallbackQuery) -> None:
+    action = (call.data or "").split(":", 1)[1]
+    uid = call.from_user.id if call.from_user else 0
+    _nav_enter(uid, action)
+    if action == "back":
+        action = _nav_back(uid, "status")
 
-class Backend:
-    def __init__(self) -> None:
-        self.feed = PriceFeed()
-        self.news = NewsFilter()
-        self.macro = MacroCalendar()
-        # Trades are stored in PostgreSQL (db_store)
-        self._last_signal_ts: Dict[str, float] = {}
-        self._signal_seq = 1
+    await call.answer()
 
-        self.last_signal: Optional[Signal] = None
-        self.last_spot_signal: Optional[Signal] = None
-        self.last_futures_signal: Optional[Signal] = None
-        self.scanned_symbols_last: int = 0
-        self.last_news_action: str = "ALLOW"
-        self.last_macro_action: str = "ALLOW"
-        self.scanner_running: bool = True
-        self.last_scan_ts: float = 0.0
-        self.trade_stats: dict = {}
-        self._load_trade_stats()
+    # Shared access control (Postgres)
+    access = await get_access_status(uid) if uid else "no_user"
+    if action not in ("status", "notify") and access != "ok":
+        await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+        return
 
-
-    def next_signal_id(self) -> int:
-        sid = self._signal_seq
-        self._signal_seq += 1
-        return sid
-
-    def can_emit(self, symbol: str) -> bool:
-        ts = self._last_signal_ts.get(symbol.upper(), 0.0)
-        return (time.time() - ts) >= (COOLDOWN_MINUTES * 60)
-
-    def mark_emitted(self, symbol: str) -> None:
-        self._last_signal_ts[symbol.upper()] = time.time()
-
-    async def open_trade(self, user_id: int, signal: Signal, orig_text: str) -> bool:
-        """Persist trade in Postgres. Returns False if already opened."""
-        inserted, _tid = await db_store.open_trade_once(
-            user_id=int(user_id),
-            signal_id=int(signal.signal_id),
-            market=(signal.market or "FUTURES").upper(),
-            symbol=signal.symbol,
-            side=(signal.direction or "LONG").upper(),
-            entry=float(signal.entry or 0.0),
-            tp1=float(signal.tp1) if signal.tp1 is not None else None,
-            tp2=float(signal.tp2) if signal.tp2 is not None else None,
-            sl=float(signal.sl) if signal.sl is not None else None,
-            orig_text=orig_text or "",
-        )
-        return bool(inserted)
-
-
-    async def remove_trade(self, user_id: int, signal_id: int) -> bool:
-        row = await db_store.get_trade_by_user_signal(int(user_id), int(signal_id))
-        if not row:
-            return False
-        trade_id = int(row["id"])
-        # manual close (keep last known price if present)
-        close_price = float(row.get("entry") or 0.0)
-        try:
-            await db_store.close_trade(trade_id, status="CLOSED", price=close_price, pnl_total_pct=float(row.get("pnl_total_pct") or 0.0))
-        except Exception:
-            # best effort
-            await db_store.close_trade(trade_id, status="CLOSED")
-        return True
-
-
-    # ---------------- trade stats helpers ----------------
-    def _load_trade_stats(self) -> None:
-        self.trade_stats = {"spot": {"days": {}, "weeks": {}}, "futures": {"days": {}, "weeks": {}}}
-        if TRADE_STATS_FILE.exists():
+    # ---- STATUS (main screen) ----
+    if action == "status":
+        t = STATUS_TASKS.pop(uid, None)
+        if t:
             try:
-                data = json.loads(TRADE_STATS_FILE.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    self.trade_stats.update(data)
+                t.cancel()
             except Exception:
-                logger.exception("scanner_loop exception")
+                pass
 
-    def _save_trade_stats(self) -> None:
+        await ensure_user(uid)
+        await set_user_blocked(uid, blocked=False)
+
+        # Notifications toggle state (per user)
+        enabled = None
         try:
-            TRADE_STATS_FILE.write_text(json.dumps(self.trade_stats, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+            import asyncio as _asyncio
+            enabled = await _asyncio.wait_for(get_notify_signals(uid), timeout=2.5)
+        except Exception:
+            enabled = None
+
+        # Global states
+        try:
+            scanner_on = bool(getattr(backend, "scanner_running", True))
+        except Exception:
+            scanner_on = True
+
+        # News / Macro status with reason + timer
+        try:
+            news_stat = backend.get_news_status()
+        except Exception:
+            news_stat = {"action": "ALLOW", "reason": None, "until_ts": None}
+
+        try:
+            macro_stat = backend.get_macro_status()
+        except Exception:
+            macro_stat = {"action": "ALLOW", "reason": None, "until_ts": None, "event": None, "window": None}
+
+        def _is_allow(action: str) -> bool:
+            return (action or "").upper() == "ALLOW"
+
+        scanner_state = tr(uid, "status_scanner_on") if scanner_on else tr(uid, "status_scanner_off")
+        news_state = tr(uid, "status_allow") if _is_allow(news_stat.get("action")) else tr(uid, "status_block")
+        macro_action = (macro_stat.get("action") or "ALLOW").upper()
+        macro_state = tr(uid, "status_allow") if _is_allow(macro_action) else tr(uid, "status_block")
+        macro_icon = "🟢" if _is_allow(macro_action) else "🔴"
+        notif_state = (tr(uid, "status_notif_on") if enabled is True else (tr(uid, "status_notif_off") if enabled is False else tr(uid, "status_unknown")))
+
+        # Next macro (if known)
+        next_macro = tr(uid, "status_next_macro_none")
+        try:
+            nm = backend.get_next_macro()
+        except Exception:
+            nm = None
+        if nm:
+            ev, (w0, w1) = nm
+            name = getattr(ev, "name", None) or getattr(ev, "type", None) or "-"
+            hhmm = _fmt_hhmm(getattr(ev, "start_ts_utc", time.time()))
+            next_macro = f"{name} {hhmm}"
+
+        lines = [
+            tr(uid, "status_title"),
+            "",
+            trf(uid, "status_scanner", state=scanner_state),
+            trf(uid, "status_news", state=news_state),
+        ]
+
+        # News details when blocked
+        if not _is_allow(news_stat.get("action")):
+            reason = news_stat.get("reason")
+            if reason:
+                lines.append(trf(uid, "status_news_reason", reason=reason))
+            until_ts = news_stat.get("until_ts")
+            if until_ts:
+                left = _fmt_countdown(float(until_ts) - time.time())
+                lines.append(trf(uid, "status_news_timer", left=left))
+
+        lines.append(trf(uid, "status_macro", icon=macro_icon, state=macro_state))
+
+        # Macro details when blocked
+        if not _is_allow(macro_action):
+            reason = macro_stat.get("reason")
+            if reason:
+                lines.append(trf(uid, "status_macro_reason", reason=reason))
+            win = macro_stat.get("window")
+            if win and isinstance(win, (tuple, list)) and len(win) == 2:
+                w0, w1 = float(win[0]), float(win[1])
+                lines.append(trf(uid, "status_macro_window", before=_fmt_hhmm(w0), after=_fmt_hhmm(w1)))
+            until_ts = macro_stat.get("until_ts")
+            if until_ts:
+                left = _fmt_countdown(float(until_ts) - time.time())
+                lines.append(trf(uid, "status_macro_timer", left=left))
+            # Timer to end of blackout window (more explicit)
+            if not until_ts and win and isinstance(win, (tuple, list)) and len(win) == 2:
+                until_ts = float(win[1])
+            if until_ts:
+                left_end = _fmt_countdown(float(until_ts) - time.time())
+                lines.append(trf(uid, "status_macro_blackout_timer", left=left_end))
+
+        lines.append(trf(uid, "status_next_macro", value=(next_macro or tr(uid, "lbl_none"))))
+        lines.append(trf(uid, "status_notifications", state=notif_state))
+
+        txt = "\n".join(lines)
+        await safe_edit(call.message, txt, menu_kb(uid))
+        return
+
+# ---- STATS ----
+    if action == "stats":
+        t = STATUS_TASKS.pop(uid, None)
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+        txt = await stats_text(uid)
+        await safe_edit(call.message, txt, menu_kb(uid))
+        return
+
+    # ---- LIVE SIGNALS ----
+    if action in ("spot", "futures"):
+        market = "SPOT" if action == "spot" else "FUTURES"
+        sig = LAST_SIGNAL_BY_MARKET.get(market)
+        if not sig:
+            await safe_edit(call.message, tr(uid, "no_live_signals"), menu_kb(uid))
+            return
+
+        allowed, reason, price = await backend.check_signal_openable(sig)
+        if not allowed:
+            # Drop stale signal from Live caches
+            if LAST_SIGNAL_BY_MARKET.get(market) and LAST_SIGNAL_BY_MARKET[market].signal_id == sig.signal_id:
+                LAST_SIGNAL_BY_MARKET[market] = None
+            await safe_edit(call.message, tr(uid, "no_live_signals"), menu_kb(uid))
+            return
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+        kb.adjust(1)
+        await safe_edit(call.message, _signal_text(uid, sig), kb.as_markup())
+        return
+
+    # ---- NOTIFICATIONS ----
+    if action == "notify":
+        if uid:
+            await ensure_user(uid)
+            await set_user_blocked(uid, blocked=False)
+            enabled = await get_notify_signals(uid)
+            state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
+            desc = tr(uid, "notify_desc_on") if enabled else tr(uid, "notify_desc_off")
+            txt = trf(uid, "notify_screen", title=tr(uid, "notify_title"), state=state, desc=desc)
+            await safe_send(uid, txt, reply_markup=notify_kb(uid, enabled))
+        return
+
+    # fallback
+    await safe_edit(call.message, tr(uid, "welcome"), menu_kb(uid))
+
+
+# ---------------- notifications callbacks ----------------
+@dp.callback_query(lambda c: (c.data or "").startswith("notify:"))
+async def notify_handler(call: types.CallbackQuery) -> None:
+    """Handle inline buttons inside Notifications screen."""
+    await call.answer()
+    uid = call.from_user.id if call.from_user else 0
+    if not uid:
+        return
+
+    parts = (call.data or "").split(":")
+    # notify:set:on | notify:set:off | notify:back
+    try:
+        action = parts[1]
+    except Exception:
+        action = ""
+
+    # shared access check (same as menu)
+    access = await get_access_status(uid)
+    if access != "ok":
+        await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+        return
+
+    if action == "back":
+        # Return to main menu (do not delete messages)
+        await safe_edit(call.message, tr(uid, "welcome"), menu_kb(uid))
+        return
+
+    if action == "set":
+        # Explicit ON/OFF
+        value = (parts[2] if len(parts) > 2 else "").lower()
+        await ensure_user(uid)
+        await set_user_blocked(uid, blocked=False)
+        if value == "on":
+            enabled = await set_notify_signals(uid, True)
+        elif value == "off":
+            enabled = await set_notify_signals(uid, False)
+        else:
+            enabled = await get_notify_signals(uid)
+
+        state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
+        desc = tr(uid, "notify_desc_on") if enabled else tr(uid, "notify_desc_off")
+        txt = trf(uid, "notify_screen", title=tr(uid, "notify_title"), state=state, desc=desc)
+        await safe_edit(call.message, txt, notify_kb(uid, enabled))
+        return
+
+    if action == "status":
+        # cancel previous auto-refresh task (if any)
+        uid = call.from_user.id if call.from_user else 0
+        t = STATUS_TASKS.pop(uid, None)
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+        try:
+            txt = await _build_status_text(uid)
+        except Exception as e:
+            txt = f"Status error: {e}"
+        if call.from_user and _is_admin(call.from_user.id) and backend.last_signal:
+            ls = backend.last_signal
+            extra_dir = f" {ls.direction}" if getattr(ls, 'market', '') != 'SPOT' else ""
+            txt += f"\nLast signal: {ls.symbol} {ls.market}{extra_dir} conf={ls.confidence}"
+
+        msg = await _render_in_place(call, txt, menu_kb(call.from_user.id))
+
+        # auto-refresh countdown for a short window
+        task = asyncio.create_task(_status_autorefresh(uid, msg.chat.id, msg.message_id))
+        STATUS_TASKS[uid] = task
+        return
+
+    if action == "stats":
+        # cancel previous auto-refresh task (if any)
+        uid = call.from_user.id if call.from_user else 0
+        t = STATUS_TASKS.pop(uid, None)
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+        # performance (separate Spot / Futures)
+        spot_today = await backend.perf_today("SPOT")
+        fut_today = await backend.perf_today("FUTURES")
+        spot_week = await backend.perf_week("SPOT")
+        fut_week = await backend.perf_week("FUTURES")
+
+        try:
+            spot_daily = backend.report_daily("SPOT", 7)
+            fut_daily = backend.report_daily("FUTURES", 7)
+            spot_weekly = backend.report_weekly("SPOT", 4)
+            fut_weekly = backend.report_weekly("FUTURES", 4)
+        except Exception:
+            spot_daily, fut_daily, spot_weekly, fut_weekly = [], [], [], []
+
+        spot_daily_nz = [x for x in spot_daily if "trades=0" not in x]
+        fut_daily_nz = [x for x in fut_daily if "trades=0" not in x]
+        spot_weekly_nz = [x for x in spot_weekly if "trades=0" not in x]
+        fut_weekly_nz = [x for x in fut_weekly if "trades=0" not in x]
+
+        parts = []
+        parts.append(tr(uid, "stats_title"))
+        parts.append("")
+        parts.append(tr(uid, "perf_today"))
+        parts.append("🟢 " + tr(uid, "lbl_spot"))
+        parts.append(_fmt_perf(uid, spot_today))
+        parts.append("")
+        parts.append("🔴 " + tr(uid, "lbl_futures"))
+        parts.append(_fmt_perf(uid, fut_today))
+        parts.append("")
+        parts.append(tr(uid, "perf_week"))
+        parts.append("🟢 " + tr(uid, "lbl_spot"))
+        parts.append(_fmt_perf(uid, spot_week))
+        parts.append("")
+        parts.append("🔴 " + tr(uid, "lbl_futures"))
+        parts.append(_fmt_perf(uid, fut_week))
+        parts.append("")
+        parts.append(tr(uid, "daily_title"))
+        parts.append("🟢 " + tr(uid, "lbl_spot") + ":")
+        parts.append("\n".join(spot_daily_nz) if spot_daily_nz else tr(uid, "no_closed"))
+        parts.append("")
+        parts.append("🔴 " + tr(uid, "lbl_futures") + ":")
+        parts.append("\n".join(fut_daily_nz) if fut_daily_nz else tr(uid, "no_closed"))
+        parts.append("")
+        parts.append(tr(uid, "weekly_title"))
+        parts.append("🟢 " + tr(uid, "lbl_spot") + ":")
+        parts.append("\n".join(spot_weekly_nz) if spot_weekly_nz else tr(uid, "no_closed"))
+        parts.append("")
+        parts.append("🔴 " + tr(uid, "lbl_futures") + ":")
+        parts.append("\n".join(fut_weekly_nz) if fut_weekly_nz else tr(uid, "no_closed"))
+        parts.append("")
+        parts.append(tr(uid, "tip_closed"))
+        txt = "\n".join(parts)
+
+        kb = InlineKeyboardBuilder()
+        kb.button(text=tr(uid, "refresh"), callback_data="menu:stats")
+        kb.button(text=tr(uid, "back"), callback_data="menu:back")
+        kb.adjust(2)
+        await _render_in_place(call, txt, kb.as_markup())
+        return
+
+    if action == "back":
+        prev = _get_last_view(call.from_user.id, "status")
+        # fallback to status
+        call.data = f"menu:{prev}"
+        await menu_handler(call)
+        return
+
+
+    if action in ("spot", "futures"):
+        sig = backend.last_spot_signal if action == "spot" else backend.last_futures_signal
+        if not sig:
+            await _render_in_place(call, tr(uid, "no_live"), menu_kb(uid))
+            return
+        kb = InlineKeyboardBuilder()
+        kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+        await safe_send(call.from_user.id, _signal_text(sig), reply_markup=kb.as_markup())
+        return
+
+
+# ---------------- trades list (with buttons) ----------------
+PAGE_SIZE = 10
+
+def _trades_page_kb(uid: int, trades: list[dict], offset: int) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for t in trades:
+        sid = int(t.get("signal_id") or 0)
+        symbol = str(t.get("symbol") or "")
+        market = str(t.get("market") or "FUTURES").upper()
+        status = str(t.get("status") or "ACTIVE").upper()
+        label = f"{_trade_status_emoji(status)} {symbol} {tr_market(uid, market)} ({status})"
+        kb.button(text=label, callback_data=f"trade:view:{sid}:{offset}")
+    # pagination
+    nav = InlineKeyboardBuilder()
+    if offset > 0:
+        nav.button(text=tr(uid, "btn_prev"), callback_data=f"trades:page:{max(0, offset-PAGE_SIZE)}")
+    if len(trades) == PAGE_SIZE:
+        nav.button(text=tr(uid, "btn_next"), callback_data=f"trades:page:{offset+PAGE_SIZE}")
+    if nav.buttons:
+        kb.adjust(1)
+        kb.row(*[b for b in nav.buttons])
+    kb.row(types.InlineKeyboardButton(text=tr(uid, "m_menu"), callback_data="menu:status"))
+    return kb.as_markup()
+
+@dp.callback_query(lambda c: (c.data or "").startswith("trades:page:"))
+async def trades_page(call: types.CallbackQuery) -> None:
+    await call.answer()
+    try:
+        offset = int((call.data or "").split(":")[-1])
+    except Exception:
+        offset = 0
+
+    all_trades = await backend.get_user_trades(call.from_user.id)
+    if not all_trades:
+        await safe_send(call.from_user.id, tr(call.from_user.id, "my_trades_empty"), reply_markup=menu_kb(call.from_user.id))
+        return
+
+    page = all_trades[offset:offset+PAGE_SIZE]
+    txt = tr(call.from_user.id, "my_trades_title").format(a=offset+1, b=min(offset+PAGE_SIZE, len(all_trades)), n=len(all_trades))
+    await safe_send(call.from_user.id, txt, reply_markup=_trades_page_kb(call.from_user.id, page, offset))
+
+# ---------------- trade card ----------------
+
+def _trade_card_text(uid: int, t: dict) -> str:
+    symbol = str(t.get("symbol") or "")
+    market = str(t.get("market") or "FUTURES").upper()
+    side = str(t.get("side") or "LONG").upper()
+    status = str(t.get("status") or "ACTIVE").upper()
+
+    entry = float(t.get("entry") or 0.0)
+    tp1 = t.get("tp1")
+    tp2 = t.get("tp2")
+    sl = t.get("sl")
+
+    head = f"🪙 {symbol} | {tr_market(uid, market)}"
+    if market != "SPOT":
+        head += f" | {side}"
+
+    parts = [
+        "📌 " + tr(uid, "m_trades"),
+        "",
+        head,
+        "",
+        f"{tr(uid, 'sig_entry')}: {entry:.6f}",
+    ]
+    if sl is not None:
+        parts.append(f"SL: {float(sl):.6f}")
+    if tp1 is not None:
+        parts.append(f"TP1: {float(tp1):.6f}")
+    if tp2 is not None and float(tp2) > 0 and (tp1 is None or abs(float(tp2) - float(tp1)) > 1e-12):
+        parts.append(f"TP2: {float(tp2):.6f}")
+
+    parts += [
+        "",
+        f"{tr(uid, 'sig_status')}: {status} {_trade_status_emoji(status)}",
+    ]
+
+    pnl = t.get("pnl_total_pct")
+    if pnl is not None and status in ("WIN","LOSS","BE","CLOSED"):
+        try:
+            parts.append(f"PnL: {float(pnl):+.2f}%")
         except Exception:
             pass
 
-    def record_trade_close(self, trade: UserTrade, close_reason: str, close_price: float, close_ts: float | None = None) -> None:
-        ts = float(close_ts if close_ts is not None else time.time())
-        pnl_pct = _calc_effective_pnl_pct(trade, float(close_price), close_reason)
-        _bump_stats(self.trade_stats, trade.signal.market, ts, close_reason, pnl_pct, bool(trade.tp1_hit))
-        self._save_trade_stats()
+    return "\n".join(parts)
 
-    def _bucket(self, market: str, period: str, key: str) -> dict:
-        mk = _market_key(market)
-        root = (self.trade_stats or {}).get(mk, {})
-        per = root.get(period, {}) if isinstance(root, dict) else {}
-        b = per.get(key, {}) if isinstance(per, dict) else {}
-        if not isinstance(b, dict):
-            b = _empty_bucket()
-        # normalize keys
-        base = _empty_bucket()
-        for k, v in base.items():
-            if k not in b:
-                b[k] = v
-        return b
+def _trade_card_kb(uid: int, signal_id: int, back_offset: int = 0) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "sig_btn_refresh"), callback_data=f"trade:refresh:{signal_id}:{back_offset}")
+    kb.button(text=tr(uid, "sig_btn_orig"), callback_data=f"trade:orig:{signal_id}:{back_offset}")
+    kb.button(text=tr(uid, "sig_btn_close"), callback_data=f"trade:close:{signal_id}:{back_offset}")
+    kb.button(text=tr(uid, "sig_btn_back"), callback_data=f"trades:page:{back_offset}")
+    kb.adjust(2, 2)
+    return kb.as_markup()
 
-    async def perf_today(self, user_id: int, market: str) -> dict:
-        now = dt.datetime.now(dt.timezone.utc)
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = start + dt.timedelta(days=1)
-        return await db_store.perf_bucket(int(user_id), (market or "FUTURES").upper(), since=start, until=end)
-
-    async def perf_week(self, user_id: int, market: str) -> dict:
-        now = dt.datetime.now(dt.timezone.utc)
-        # ISO week start (Monday)
-        start = (now - dt.timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        end = start + dt.timedelta(days=7)
-        return await db_store.perf_bucket(int(user_id), (market or "FUTURES").upper(), since=start, until=end)
-
-    async def report_daily(self, user_id: int, market: str, days: int = 7, tz: str = "UTC") -> list[dict]:
-        return await db_store.daily_report(int(user_id), (market or "FUTURES").upper(), days=int(days), tz=str(tz))
-
-    async def report_weekly(self, user_id: int, market: str, weeks: int = 4, tz: str = "UTC") -> list[dict]:
-        return await db_store.weekly_report(int(user_id), (market or "FUTURES").upper(), weeks=int(weeks), tz=str(tz))
-
-    async def get_trade(self, user_id: int, signal_id: int) -> Optional[dict]:
-        return await db_store.get_trade_by_user_signal(int(user_id), int(signal_id))
-
-    async def get_user_trades(self, user_id: int) -> list[dict]:
-        return await db_store.list_user_trades(int(user_id), include_closed=False, limit=50)
-
-    def get_next_macro(self) -> Optional[Tuple[MacroEvent, Tuple[float, float]]]:
-        return self.macro.next_event()
-
-    def get_macro_status(self) -> dict:
-        act, ev, win = self.macro.status()
-        until_ts = None
-        reason = None
-        window = None
-        if act != "ALLOW" and ev and win:
-            w0, w1 = win
-            until_ts = w1
-            window = (w0, w1)
-            reason = getattr(ev, "name", None) or getattr(ev, "title", None) or getattr(ev, "type", None)
-        return {"action": act, "event": ev, "window": window, "until_ts": until_ts, "reason": reason}
-
-    def get_news_status(self) -> dict:
-        act = getattr(self, "last_news_action", "ALLOW")
-        info = self.news.last_block_info() if hasattr(self, "news") else None
-        reason = None
-        until_ts = None
-        if info:
-            coin, until = info
-            reason = coin
-            until_ts = until
-        return {"action": act, "reason": reason, "until_ts": until_ts}
-
-    # ---------------- price helpers (trade tracking) ----------------
-    async def _fetch_rest_price_binance(self, market: str, symbol: str) -> float | None:
-        """REST fallback price from Binance (spot/futures)."""
-        m = (market or "FUTURES").upper()
-        sym = (symbol or "").upper()
-        if not sym:
-            return None
-        url = "https://api.binance.com/api/v3/ticker/price" if m == "SPOT" else "https://fapi.binance.com/fapi/v1/ticker/price"
-        try:
-            timeout = aiohttp.ClientTimeout(total=6)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(url, params={"symbol": sym}) as r:
-                    if r.status != 200:
-                        return None
-                    data = await r.json()
-            p = (data or {}).get("price")
-            return float(p) if p is not None else None
-        except Exception:
-            return None
-
-    async def _fetch_rest_price_bybit_linear(self, symbol: str) -> float | None:
-        """REST price from Bybit v5 (linear futures)."""
-        sym = (symbol or "").upper()
-        if not sym:
-            return None
-        url = "https://api.bybit.com/v5/market/tickers"
-        try:
-            timeout = aiohttp.ClientTimeout(total=6)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(url, params={"category": "linear", "symbol": sym}) as r:
-                    if r.status != 200:
-                        return None
-                    data = await r.json()
-            res = (data or {}).get("result") or {}
-            lst = res.get("list") or []
-            if not lst:
-                return None
-            lp = lst[0].get("lastPrice")
-            return float(lp) if lp is not None else None
-        except Exception:
-            return None
-
-    async def _get_price_with_source(self, signal: "Signal") -> tuple[float, str]:
-        """Return (price, source).
-
-        - SPOT: Binance WS -> Binance REST fallback
-        - FUTURES:
-            - if FUTURES_PRICE_SOURCE=median => median(Binance, Bybit)
-            - else => Binance WS/REST
-        """
-        market = (getattr(signal, "market", None) or "FUTURES").upper()
-        sym = (getattr(signal, "symbol", None) or "").upper()
-        entry = getattr(signal, "entry", None)
-        base = float(entry) if entry is not None else None
-
-        if not USE_REAL_PRICE:
-            return (self.feed.mock_price(market, sym, base=base), "mock")
-
-        # Binance: WS first (via PriceFeed), then REST
-        bin_price: float | None = None
-        try:
-            await self.feed.ensure_stream(market, sym)
-            bin_price = self.feed.get_latest(market, sym)
-        except Exception:
-            bin_price = None
-        if bin_price is None:
-            bin_price = await self._fetch_rest_price_binance(market, sym)
-
-        # FUTURES median across Binance + Bybit
-        use_median = (market == "FUTURES") and (os.getenv("FUTURES_PRICE_SOURCE", "binance").lower() in {"median", "median_binance_bybit", "median_bybit_binance"})
-        if use_median:
-            byb_price = await self._fetch_rest_price_bybit_linear(sym)
-            if bin_price is not None and byb_price is not None:
-                return ((float(bin_price) + float(byb_price)) / 2.0, "median(binance,bybit)")
-            if byb_price is not None:
-                return (float(byb_price), "bybit")
-            if bin_price is not None:
-                return (float(bin_price), "binance")
-            # last resort
-            return (self.feed.mock_price(market, sym, base=base), "mock")
-
-        # Default: Binance only
-        if bin_price is not None:
-            return (float(bin_price), "binance")
-        return (self.feed.mock_price(market, sym, base=base), "mock")
-
-    async def _get_price(self, signal: "Signal") -> float:
-        price, _src = await self._get_price_with_source(signal)
-        return float(price)
-
-async def _fetch_rest_price_binance(self, market: str, symbol: str) -> float | None:
-    """REST fallback price from Binance."""
-    m = (market or "FUTURES").upper()
-    sym = (symbol or "").upper()
-    if not sym:
-        return None
-    url = "https://api.binance.com/api/v3/ticker/price" if m == "SPOT" else "https://fapi.binance.com/fapi/v1/ticker/price"
+@dp.callback_query(lambda c: (c.data or "").startswith("trade:view:"))
+async def trade_view(call: types.CallbackQuery) -> None:
+    await call.answer()
+    parts = (call.data or "").split(":")
     try:
-        timeout = aiohttp.ClientTimeout(total=6)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get(url, params={"symbol": sym}) as r:
-                if r.status != 200:
-                    return None
-                data = await r.json()
-        p = (data or {}).get("price")
-        return float(p) if p is not None else None
+        signal_id = int(parts[2])
+        back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
-        return None
+        return
+    t = await backend.get_trade(call.from_user.id, signal_id)
+    if not t:
+        await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
+        return
+    await safe_send(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, signal_id, back_offset))
 
-async def _fetch_rest_price_bybit_linear(self, symbol: str) -> float | None:
-    """REST price from Bybit v5 (linear futures)."""
-    sym = (symbol or "").upper()
-    if not sym:
-        return None
-    url = "https://api.bybit.com/v5/market/tickers"
+@dp.callback_query(lambda c: (c.data or "").startswith("trade:refresh:"))
+async def trade_refresh(call: types.CallbackQuery) -> None:
+    await call.answer()
+    parts = (call.data or "").split(":")
     try:
-        timeout = aiohttp.ClientTimeout(total=6)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get(url, params={"category": "linear", "symbol": sym}) as r:
-                if r.status != 200:
-                    return None
-                data = await r.json()
-        res = (data or {}).get("result") or {}
-        lst = res.get("list") or []
-        if not lst:
-            return None
-        lp = lst[0].get("lastPrice")
-        return float(lp) if lp is not None else None
+        signal_id = int(parts[2])
+        back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
-        return None
-    url = "https://api.bybit.com/v5/market/tickers"
+        return
+    t = await backend.get_trade(call.from_user.id, signal_id)
+    if not t:
+        await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
+        return
+    await safe_send(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, signal_id, back_offset))
+
+@dp.callback_query(lambda c: (c.data or "").startswith("trade:close:"))
+async def trade_close(call: types.CallbackQuery) -> None:
+    await call.answer()
+    parts = (call.data or "").split(":")
     try:
-        timeout = aiohttp.ClientTimeout(total=6)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get(url, params={"category": "linear", "symbol": sym}) as r:
-                if r.status != 200:
-                    return None
-                data = await r.json()
-        # data: {"retCode":0,"result":{"list":[{"lastPrice":"..."}]}}
-        res = (data or {}).get("result") or {}
-        lst = res.get("list") or []
-        if not lst:
-            return None
-        lp = lst[0].get("lastPrice")
-        return float(lp) if lp is not None else None
+        signal_id = int(parts[2])
+        back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
-        return None
+        return
+    removed = await backend.remove_trade(call.from_user.id, signal_id)
+    if removed:
+        await safe_send(call.from_user.id, tr(call.from_user.id, "trade_removed"), reply_markup=menu_kb(call.from_user.id))
+    else:
+        await safe_send(call.from_user.id, tr(call.from_user.id, "trade_removed_fail"), reply_markup=menu_kb(call.from_user.id))
 
-async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
-    """Return (price, source). For FUTURES can use median(Binance,Bybit) when enabled.
-
-    Set env FUTURES_PRICE_SOURCE=median to enable.
-    """
-    market = (signal.market or "FUTURES").upper()
-    base = float(getattr(signal, "entry", 0) or 0) or None
-
-    # Mock mode: keep prices around entry to avoid nonsense.
-    if not USE_REAL_PRICE:
-        return (self.feed.mock_price(market, signal.symbol, base=base), "mock")
-
-    sym = (signal.symbol or "").upper()
-
-    # FUTURES: optional median price across Binance (WS/REST) and Bybit (REST).
-    use_median = (market == "FUTURES") and (os.getenv("FUTURES_PRICE_SOURCE", "binance").lower() in {"median", "median_binance_bybit", "median_bybit_binance"})
-    bin_price: float | None = None
-    byb_price: float | None = None
-
-    # Binance: websocket first, REST fallback
+@dp.callback_query(lambda c: (c.data or "").startswith("trade:orig:"))
+async def trade_orig(call: types.CallbackQuery) -> None:
+    await call.answer()
+    parts = (call.data or "").split(":")
     try:
-        await self.feed.ensure_stream(market, sym)
-        latest = self.feed.get_latest(market, sym)
-        if latest is not None:
-            bin_price = float(latest)
-        else:
-            rest = await self._fetch_rest_price_binance(market, sym)
-            if rest is not None and rest > 0:
-                bin_price = float(rest)
-                self.feed._set_latest(market, sym, float(rest))
+        signal_id = int(parts[2])
+        back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
-        bin_price = None
+        return
 
-    # Bybit: REST (linear futures)
-    if use_median:
-        byb = await self._fetch_rest_price_bybit_linear(sym)
-        if byb is not None and byb > 0:
-            byb_price = float(byb)
+    t = await backend.get_trade(call.from_user.id, signal_id)
+    text = (t.get("orig_text") if isinstance(t, dict) else None) if t else None
+    if not text:
+        await safe_send(call.from_user.id, tr(call.from_user.id, "sig_orig_title") + ": " + tr(call.from_user.id, "lbl_none"), reply_markup=menu_kb(call.from_user.id))
+        return
 
-    # Decide price
-    if use_median:
-        avail = []
-        if bin_price is not None and bin_price > 0:
-            avail.append((bin_price, "binance"))
-        if byb_price is not None and byb_price > 0:
-            avail.append((byb_price, "bybit"))
-        if len(avail) >= 2:
-            a = sorted([avail[0][0], avail[1][0]])
-            med = (a[0] + a[1]) / 2.0
-            return (float(med), "median(binance,bybit)")
-        if len(avail) == 1:
-            return (float(avail[0][0]), avail[0][1])
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(call.from_user.id, "sig_btn_back_trade"), callback_data=f"trade:view:{signal_id}:{back_offset}")
+    kb.button(text=tr(call.from_user.id, "sig_btn_my_trades"), callback_data=f"trades:page:{back_offset}")
+    kb.button(text=tr(call.from_user.id, "m_menu"), callback_data="menu:status")
+    kb.adjust(1, 2)
 
-    # Non-median path (default): Binance only
-    if bin_price is not None and bin_price > 0:
-        return (float(bin_price), "binance")
+    await safe_send(call.from_user.id, "📌 Original signal (1:1)\n\n" + text, reply_markup=kb.as_markup())
 
-    # Last resort: keep near entry (never random huge).
-    if base is not None and base > 0:
-        return (self.feed.mock_price(market, sym, base=base), "mock(base)")
-    return (self.feed.mock_price(market, sym, base=None), "mock")
-
-async def _get_price(self, signal: Signal) -> float:
-    price, _src = await self._get_price_with_source(signal)
-    return float(price)
-
-async def check_signal_openable(self, signal: Signal) -> tuple[bool, str, float]:
-    """Return (allowed, reason_code, current_price).
-
-    reason_code is one of: OK, TP2, TP1, SL, TIME, ERROR
-    """
+# ---------------- open signal ----------------
+@dp.callback_query(lambda c: (c.data or "").startswith("open:"))
+async def opened(call: types.CallbackQuery) -> None:
     try:
-        now = time.time()
-        ttl = int(os.getenv("SIGNAL_OPEN_TTL_SECONDS", "1800"))  # 30 min default
-        sig_ts = float(getattr(signal, "ts", 0) or 0)
-        if sig_ts and ttl > 0 and (now - sig_ts) > ttl:
-            price = await self._get_price(signal)
-            return False, "TIME", float(price)
-
-        price = float(await self._get_price(signal))
-
-        direction = (getattr(signal, "direction", None) or getattr(signal, "side", None) or "").upper()
-        is_short = "SHORT" in direction
-        is_long = not is_short
-
-        tp1 = getattr(signal, "tp1", None)
-        tp2 = getattr(signal, "tp2", None)
-        sl = getattr(signal, "sl", None)
-
-        tp1_f = float(tp1) if tp1 is not None else None
-        tp2_f = float(tp2) if tp2 is not None else None
-        sl_f = float(sl) if sl is not None else None
-
-        if is_long:
-            if tp2_f is not None and price >= tp2_f:
-                return False, "TP2", price
-            if tp1_f is not None and price >= tp1_f:
-                return False, "TP1", price
-            if sl_f is not None and price <= sl_f:
-                return False, "SL", price
-        else:
-            if tp2_f is not None and price <= tp2_f:
-                return False, "TP2", price
-            if tp1_f is not None and price <= tp1_f:
-                return False, "TP1", price
-            if sl_f is not None and price >= sl_f:
-                return False, "SL", price
-
-        return True, "OK", price
+        signal_id = int((call.data or "").split(":", 1)[1])
     except Exception:
+        await call.answer("Error", show_alert=True)
+        return
+
+    sig = SIGNALS.get(signal_id)
+    if not sig:
+        await call.answer("Signal not available", show_alert=True)
+        return
+
+    allowed, reason, price = await backend.check_signal_openable(sig)
+    if not allowed:
+        # remove stale from Live cache
+        mkt = (sig.market or "FUTURES").upper()
+        if LAST_SIGNAL_BY_MARKET.get(mkt) and LAST_SIGNAL_BY_MARKET[mkt].signal_id == sig.signal_id:
+            LAST_SIGNAL_BY_MARKET[mkt] = None
+        await _expire_signal_message(call, sig, reason, price)
+        await call.answer(tr(call.from_user.id, "sig_too_late_toast"), show_alert=True)
+        await safe_send(call.from_user.id, _too_late_text(call.from_user.id, sig, reason, price), reply_markup=menu_kb(call.from_user.id))
+        return
+
+    opened_ok = await backend.open_trade(call.from_user.id, sig, orig_text=_signal_text(call.from_user.id, sig))
+    if not opened_ok:
+        # Already opened before -> remove button to prevent retries
         try:
-            price = float(await self._get_price(signal))
+            if call.message:
+                await safe_edit_markup(call.from_user.id, call.message.message_id, None)
         except Exception:
-            price = 0.0
-        return False, "ERROR", price
+            pass
+        await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
+        await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
+        return
 
-async def track_loop(self, bot) -> None:
-    """Main tracker loop. Reads ACTIVE/TP1 trades from PostgreSQL and updates their status."""
-    while True:
-        try:
-            rows = await db_store.list_active_trades(limit=500)
-        except Exception:
-            logger.exception("track_loop: failed to load active trades from DB")
-            rows = []
+    # Remove the ✅ ОТКРЫЛ СДЕЛКУ button from the original NEW SIGNAL message
+    try:
+        if call.message:
+            await safe_edit_markup(call.from_user.id, call.message.message_id, None)
+    except Exception:
+        pass
 
-        for row in rows:
-            try:
-                trade_id = int(row["id"])
-                uid = int(row["user_id"])
-                market = (row.get("market") or "FUTURES").upper()
-                symbol = str(row.get("symbol") or "")
-                side = str(row.get("side") or "LONG").upper()
+    await call.answer(tr(call.from_user.id, "trade_opened_toast"))
+    # IMPORTANT: send OPEN card only after user pressed ✅ ОТКРЫЛ СДЕЛКУ
+    await safe_send(
+        call.from_user.id,
+        _open_card_text(call.from_user.id, sig),
+        reply_markup=menu_kb(call.from_user.id),
+    )
 
-                s = Signal(
-                    signal_id=int(row.get("signal_id") or 0),
-                    market=market,
-                    symbol=symbol,
-                    direction=side,
-                    timeframe="",
-                    entry=float(row.get("entry") or 0.0),
-                    sl=float(row.get("sl") or 0.0),
-                    tp1=float(row.get("tp1") or 0.0),
-                    tp2=float(row.get("tp2") or 0.0),
-                    rr=0.0,
-                    confidence=0,
-                    confirmations="",
-                    risk_note="",
-                    ts=float(dt.datetime.now(dt.timezone.utc).timestamp()),
-                )
+async def main() -> None:
+    import time
+    globals()["time"] = time
 
-                price, price_src = await self._get_price_with_source(s)
-                price_f = float(price)
+    logger.info("Bot starting; TZ=%s", TZ_NAME)
+    await init_db()
+    load_langs()
+    logger.info("Starting track_loop")
+    asyncio.create_task(backend.track_loop(bot))
+    logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
+    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+    await dp.start_polling(bot)
 
-                def hit_tp(lvl: float) -> bool:
-                    return price_f >= lvl if side == "LONG" else price_f <= lvl
-
-                def hit_sl(lvl: float) -> bool:
-                    return price_f <= lvl if side == "LONG" else price_f >= lvl
-
-                status = str(row.get("status") or "ACTIVE").upper()
-                tp1_hit = bool(row.get("tp1_hit"))
-                be_price = float(row.get("be_price") or 0.0) if row.get("be_price") is not None else 0.0
-
-                # 1) SL before TP1 -> LOSS
-                if not tp1_hit and s.sl and hit_sl(float(s.sl)):
-                    pnl = calc_profit_pct(s.entry, float(s.sl), side)
-                    await safe_send(bot, uid, _trf(uid, "msg_auto_loss",
-                        symbol=s.symbol,
-                        current_price=f"{price_f:.6f}",
-                        trigger_price=f"{float(s.sl):.6f}",
-                        price_src=price_src,
-                        status="LOSS",
-                    ), ctx="msg_auto_loss")
-                    await db_store.close_trade(trade_id, status="LOSS", price=float(s.sl), pnl_total_pct=float(pnl))
-                    continue
-
-                # 2) TP1 -> partial close + BE
-                if not tp1_hit and s.tp1 and hit_tp(float(s.tp1)):
-                    be_px = _be_exit_price(s.entry, side, market)
-                    await safe_send(bot, uid, _trf(uid, "msg_auto_tp1",
-                        symbol=s.symbol,
-                        current_price=f"{price_f:.6f}",
-                        trigger_price=f"{float(s.tp1):.6f}",
-                        price_src=price_src,
-                        closed_pct=int(_partial_close_pct(market)),
-                        be_price=f"{float(be_px):.6f}",
-                        status="TP1",
-                    ), ctx="msg_auto_tp1")
-                    await db_store.set_tp1(trade_id, be_price=float(be_px), price=float(s.tp1), pnl_pct=float(calc_profit_pct(s.entry, float(s.tp1), side)))
-                    continue
-
-                # 3) After TP1: BE close
-                if tp1_hit and _be_enabled(market):
-                    be_lvl = be_price if be_price else _be_exit_price(s.entry, side, market)
-                    if hit_sl(float(be_lvl)):
-                        await safe_send(bot, uid, _trf(uid, "msg_auto_be",
-                            symbol=s.symbol,
-                            current_price=f"{price_f:.6f}",
-                            trigger_price=f"{float(be_lvl):.6f}",
-                            price_src=price_src,
-                            be_price=f"{float(be_lvl):.6f}",
-                            status="BE",
-                        ), ctx="msg_auto_be")
-                        await db_store.close_trade(trade_id, status="BE", price=float(be_lvl), pnl_total_pct=0.0)
-                        continue
-
-                # 4) TP2 -> WIN
-                if s.tp2 and hit_tp(float(s.tp2)):
-                    pnl = calc_profit_pct(s.entry, float(s.tp2), side)
-                    await safe_send(bot, uid, _trf(uid, "msg_auto_win",
-                        symbol=s.symbol,
-                        current_price=f"{price_f:.6f}",
-                        trigger_price=f"{float(s.tp2):.6f}",
-                        price_src=price_src,
-                        pnl_total=fmt_pnl_pct(float(pnl)),
-                        status="WIN",
-                    ), ctx="msg_auto_win")
-                    await db_store.close_trade(trade_id, status="WIN", price=float(s.tp2), pnl_total_pct=float(pnl))
-                    continue
-
-            except Exception:
-                logger.exception("track_loop: error while tracking trade row=%r", row)
-
-        await asyncio.sleep(TRACK_INTERVAL_SECONDS)
-
-async def scanner_loop(self, emit_signal_cb, emit_macro_alert_cb) -> None:
-    while True:
-        start = time.time()
-        logger.info("SCAN tick start top_n=%s interval=%ss news_filter=%s macro_filter=%s", TOP_N, SCAN_INTERVAL_SECONDS, bool(NEWS_FILTER and CRYPTOPANIC_TOKEN), bool(MACRO_FILTER))
-        logger.info("[scanner] tick start TOP_N=%s interval=%ss", TOP_N, SCAN_INTERVAL_SECONDS)
-        self.last_scan_ts = start
-        try:
-            async with MultiExchangeData() as api:
-                await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
-
-                symbols = await api.get_top_usdt_symbols(TOP_N)
-                self.scanned_symbols_last = len(symbols)
-                logger.info("[scanner] symbols loaded: %s", self.scanned_symbols_last)
-
-                mac_act, mac_ev, mac_win = self.macro.current_action()
-                self.last_macro_action = mac_act
-                if MACRO_FILTER:
-                    logger.info("[scanner] macro action=%s next=%s window=%s", mac_act, getattr(mac_ev, "name", None) if mac_ev else None, mac_win)
-
-                if mac_act != "ALLOW" and mac_ev and mac_win and self.macro.should_notify(mac_ev):
-                    logger.info("[macro] alert: action=%s event=%s window=%s", mac_act, getattr(mac_ev, "name", None), mac_win)
-                    await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
-
-                for sym in symbols:
-                    if not self.can_emit(sym):
-                        continue
-                    if mac_act == "PAUSE_ALL":
-                        continue
-
-                    # News action
-                    try:
-                        if self.news.enabled():
-                            news_act = await self.news.action_for_symbol(api.session, sym)  # type: ignore[arg-type]
-                        else:
-                            news_act = "ALLOW"
-                    except Exception:
-                        news_act = "ALLOW"
-                    self.last_news_action = news_act
-                    if news_act == "PAUSE_ALL":
-                        continue
-
-                    async def fetch_exchange(name: str):
-                        try:
-                            if name == "BINANCE":
-                                df15 = await api.klines_binance(sym, "15m", 250)
-                                df1h = await api.klines_binance(sym, "1h", 250)
-                                df4h = await api.klines_binance(sym, "4h", 250)
-                            elif name == "BYBIT":
-                                df15 = await api.klines_bybit(sym, "15m", 200)
-                                df1h = await api.klines_bybit(sym, "1h", 200)
-                                df4h = await api.klines_bybit(sym, "4h", 200)
-                            else:
-                                df15 = await api.klines_okx(sym, "15m", 200)
-                                df1h = await api.klines_okx(sym, "1h", 200)
-                                df4h = await api.klines_okx(sym, "4h", 200)
-                            res = evaluate_on_exchange(df15, df1h, df4h)
-                            return name, res
-                        except Exception:
-                            return name, None
-
-                    results = await asyncio.gather(fetch_exchange("BINANCE"), fetch_exchange("BYBIT"), fetch_exchange("OKX"))
-                    good = [(name, r) for (name, r) in results if r is not None]
-                    if len(good) < 2:
-                        continue
-
-                    dirs: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
-                    for name, r in good:
-                        dirs.setdefault(r["direction"], []).append((name, r))
-                    best_dir, supporters = max(dirs.items(), key=lambda kv: len(kv[1]))
-                    if len(supporters) < 2:
-                        continue
-
-                    entry = float(np.median([s[1]["entry"] for s in supporters]))
-                    sl = float(np.median([s[1]["sl"] for s in supporters]))
-                    tp1 = float(np.median([s[1]["tp1"] for s in supporters]))
-                    tp2 = float(np.median([s[1]["tp2"] for s in supporters]))
-                    rr = float(np.median([s[1]["rr"] for s in supporters]))
-                    conf = int(np.median([s[1]["confidence"] for s in supporters]))
-                    
-                    market = choose_market(float(np.nanmax([s[1]["adx1"] for s in supporters])),
-                                          float(np.nanmax([s[1]["atr_pct"] for s in supporters])))
-                    
-                    min_conf = TA_MIN_SCORE_FUTURES if market == "FUTURES" else TA_MIN_SCORE_SPOT
-
-# Orderbook confirmation (FUTURES only, enabled via ENV)
-                    if USE_ORDERBOOK and (not ORDERBOOK_FUTURES_ONLY or market == "FUTURES"):
-                        ob_allows: List[bool] = []
-                        ob_notes: List[str] = []
-                        for ex in [s[0] for s in supporters]:
-                            if ex.strip().lower() not in ORDERBOOK_EXCHANGES:
-                                continue
-                            ok, note = await orderbook_filter(api, ex, sym, best_dir)
-                            ob_allows.append(bool(ok))
-                            ob_notes.append(note)
-                        # If we checked at least one exchange and none allowed -> block signal
-                        if ob_allows and not any(ob_allows):
-                            # keep a short reason in logs
-                            logger.info("[orderbook] block %s %s %s notes=%s", sym, market, best_dir, "; ".join(ob_notes)[:200])
-                            continue
-                    
-                    if conf < min_conf or rr < 2.0:
-                        continue
-                    
-                    risk_notes = []
-
-                    # Add TA summary (real indicators) to the signal card
-                    try:
-                        best_supporter = max(supporters, key=lambda s: int(s[1].get("confidence", 0)))
-                        ta_block = str(best_supporter[1].get("ta_block", "") or "").strip()
-                        if ta_block:
-                            risk_notes.append(ta_block)
-                    except Exception:
-                        pass
-
-
-                    if news_act == "FUTURES_OFF" and market == "FUTURES":
-                        market = "SPOT"
-                        risk_notes.append("⚠️ Futures paused due to news")
-                    if mac_act == "FUTURES_OFF" and market == "FUTURES":
-                        market = "SPOT"
-                        risk_notes.append("⚠️ Futures signals are temporarily disabled (macro)")
-
-                    conf_names = "+".join(sorted([s[0] for s in supporters]))
-
-                    sid = self.next_signal_id()
-                    sig = Signal(
-                        signal_id=sid,
-                        market=market,
-                        symbol=sym,
-                        direction=best_dir,
-                        timeframe="15m/1h/4h",
-                        entry=entry,
-                        sl=sl,
-                        tp1=tp1,
-                        tp2=tp2,
-                        rr=rr,
-                        confidence=conf,
-                        confirmations=conf_names,
-                        risk_note="\\n".join(risk_notes).strip(),
-                        ts=time.time(),
-                    )
-
-                    self.mark_emitted(sym)
-                    self.last_signal = sig
-                    if sig.market == "SPOT":
-                        self.last_spot_signal = sig
-                    else:
-                        self.last_futures_signal = sig
-
-                    logger.info("[signal] emit %s %s %s conf=%s rr=%.2f notes=%s", sig.symbol, sig.market, sig.direction, sig.confidence, sig.rr, (sig.risk_note or "-")[:120])
-                    logger.info("SIGNAL %s %s %s conf=%s rr=%.2f notes=%s", sig.market, sig.symbol, sig.direction, sig.confidence, sig.rr, (sig.risk_note or "-"))
-                    logger.info("SIGNAL found %s %s %s conf=%s rr=%.2f exch=%s", sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr), sig.confirmations)
-                    await emit_signal_cb(sig)
-                    await asyncio.sleep(2)
-
-        except Exception:
-            logger.exception("scanner_loop error")
-
-        elapsed = time.time() - start
-        logger.info("SCAN tick done scanned=%s elapsed=%.1fs last_news=%s last_macro=%s", int(getattr(self, "scanned_symbols_last", 0) or 0), elapsed, getattr(self, "last_news_action", "?"), getattr(self, "last_macro_action", "?"))
-        await asyncio.sleep(max(5, SCAN_INTERVAL_SECONDS - elapsed))
-
-
-# --- Bind runtime helpers/loops to Backend as methods (keeps bot.py calls stable)
-# NOTE: Some functions are defined at module level; binding ensures the instance has them.
-for _name in (
-    "_get_price_with_source",
-    "_get_price",
-    "check_signal_openable",
-    "track_loop",
-    "scanner_loop",
-):
-    _fn = globals().get(_name)
-    if _fn is not None:
-        setattr(Backend, _name, _fn)
+if __name__ == "__main__":
+    asyncio.run(main())
