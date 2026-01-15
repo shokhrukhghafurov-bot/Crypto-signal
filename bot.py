@@ -1568,6 +1568,27 @@ def _trade_card_text(uid: int, t: dict) -> str:
     if tp2 is not None and float(tp2) > 0 and (tp1 is None or abs(float(tp2) - float(tp1)) > 1e-12):
         parts.append(f"TP2: {float(tp2):.6f}")
 
+    # Live price info (shown when loaded via get_trade_live)
+    if t.get('price_f') is not None:
+        try:
+            px = float(t.get('price_f') or 0.0)
+            src = str(t.get('price_src') or '')
+            parts.append("")
+            parts.append(f"💹 {tr(uid, 'lbl_price_now')}: {px:.6f}")
+            if src:
+                parts.append(f"🔌 {tr(uid, 'lbl_price_src')}: {src}")
+            checks = []
+            if t.get('sl') is not None:
+                checks.append(f"SL: {'✅' if t.get('hit_sl') else '❌'}")
+            if t.get('tp1') is not None:
+                checks.append(f"{tr(uid, 'lbl_tp1')}: {'✅' if t.get('hit_tp1') else '❌'}")
+            if t.get('tp2') is not None and float(t.get('tp2') or 0) > 0:
+                checks.append(f"TP2: {'✅' if t.get('hit_tp2') else '❌'}")
+            if checks:
+                parts.append(f"🧪 {tr(uid, 'lbl_check')}: " + ' '.join(checks))
+        except Exception:
+            pass
+
     parts += [
         "",
         f"{tr(uid, 'sig_status')}: {status} {_trade_status_emoji(status)}",
@@ -1600,7 +1621,7 @@ async def trade_view(call: types.CallbackQuery) -> None:
         back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
-    t = await backend.get_trade(call.from_user.id, signal_id)
+    t = await backend.get_trade_live(call.from_user.id, signal_id)
     if not t:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
         return
@@ -1615,7 +1636,7 @@ async def trade_refresh(call: types.CallbackQuery) -> None:
         back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
-    t = await backend.get_trade(call.from_user.id, signal_id)
+    t = await backend.get_trade_live(call.from_user.id, signal_id)
     if not t:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
         return
@@ -1646,7 +1667,7 @@ async def trade_orig(call: types.CallbackQuery) -> None:
     except Exception:
         return
 
-    t = await backend.get_trade(call.from_user.id, signal_id)
+    t = await backend.get_trade_live(call.from_user.id, signal_id)
     text = (t.get("orig_text") if isinstance(t, dict) else None) if t else None
     if not text:
         await safe_send(call.from_user.id, tr(call.from_user.id, "sig_orig_title") + ": " + tr(call.from_user.id, "lbl_none"), reply_markup=menu_kb(call.from_user.id))
