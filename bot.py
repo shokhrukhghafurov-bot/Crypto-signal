@@ -89,8 +89,9 @@ if _raw_admins:
 def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-TZ_NAME = os.getenv("TZ_NAME", "Europe/Berlin").strip() or "Europe/Berlin"
-TZ = ZoneInfo(TZ_NAME)
+TZ_NAME = os.getenv("TZ_NAME", "MSK").strip() or "MSK"
+MSK_TZ = dt.timezone(dt.timedelta(hours=3))
+TZ = MSK_TZ
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
