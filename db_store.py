@@ -144,26 +144,63 @@ async def open_trade_once(
     pool = get_pool()
     async with pool.acquire() as conn:
         try:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO trades (user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl, status, orig_text)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'ACTIVE',$10)
-                ON CONFLICT (user_id, signal_id) WHERE status IN ('ACTIVE','TP1') DO NOTHING
-                RETURNING id;
-                """,
-                int(user_id), int(signal_id), market, symbol, side, float(entry),
-                (float(tp1) if tp1 is not None else None),
-                (float(tp2) if tp2 is not None else None),
-                (float(sl) if sl is not None else None),
-                orig_text or ""
-            )
-            if row and row["id"] is not None:
-                trade_id = int(row["id"])
+            async def _insert(with_signal_id: int) -> Optional[int]:
+                r = await conn.fetchrow(
+                    """
+                    INSERT INTO trades (user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl, status, orig_text)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'ACTIVE',$10)
+                    ON CONFLICT (user_id, signal_id) WHERE status IN ('ACTIVE','TP1') DO NOTHING
+                    RETURNING id;
+                    """,
+                    int(user_id), int(with_signal_id), market, symbol, side, float(entry),
+                    (float(tp1) if tp1 is not None else None),
+                    (float(tp2) if tp2 is not None else None),
+                    (float(sl) if sl is not None else None),
+                    orig_text or "",
+                )
+                return int(r["id"]) if (r and r.get("id") is not None) else None
+
+            # 1) Try normal insert (works on correct schema with partial unique index)
+            trade_id = await _insert(int(signal_id))
+            if trade_id is not None:
                 await conn.execute(
                     "INSERT INTO trade_events (trade_id, event_type) VALUES ($1,'OPEN');",
                     trade_id,
                 )
                 return True, trade_id
+
+            # 2) If insert was blocked, check why.
+            # On legacy DBs there may be a FULL UNIQUE(user_id, signal_id) which blocks reopening even after WIN/LOSS.
+            existing = await conn.fetchrow(
+                """
+                SELECT id, market, status, closed_at
+                FROM trades
+                WHERE user_id=$1 AND signal_id=$2
+                ORDER BY opened_at DESC
+                LIMIT 1;
+                """,
+                int(user_id), int(signal_id),
+            )
+            if existing:
+                ex_market = str(existing.get("market") or "").upper()
+                st = str(existing.get("status") or "").upper()
+                closed_at = existing.get("closed_at")
+                # Truly active -> treat as already opened
+                if ex_market == str(market or "").upper() and st in ("ACTIVE", "TP1") and closed_at is None:
+                    return False, None
+
+            # 3) Reopen fallback: generate a new callback-safe signal_id and insert.
+            # This keeps the user experience correct even if the DB still has a legacy UNIQUE constraint.
+            new_sid_row = await conn.fetchrow("SELECT nextval('signal_seq') AS sid;")
+            new_sid = int(new_sid_row["sid"]) if new_sid_row and new_sid_row.get("sid") is not None else int(signal_id)
+            trade_id = await _insert(new_sid)
+            if trade_id is not None:
+                await conn.execute(
+                    "INSERT INTO trade_events (trade_id, event_type) VALUES ($1,'OPEN');",
+                    trade_id,
+                )
+                return True, trade_id
+
             return False, None
         except Exception:
             # let caller log
