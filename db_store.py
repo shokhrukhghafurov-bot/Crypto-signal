@@ -202,6 +202,22 @@ async def get_trade_by_user_signal(user_id: int, signal_id: int) -> Optional[Dic
         )
         return dict(row) if row else None
 
+
+async def get_trade_by_id(user_id: int, trade_id: int) -> Optional[Dict[str, Any]]:
+    """Fetch a trade by its DB id, ensuring it belongs to the user."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl,
+                   status, tp1_hit, be_price, opened_at, closed_at, pnl_total_pct, orig_text
+            FROM trades
+            WHERE user_id=$1 AND id=$2
+            """,
+            int(user_id), int(trade_id)
+        )
+        return dict(row) if row else None
+
 async def list_active_trades(limit: int = 500) -> List[Dict[str, Any]]:
     pool = get_pool()
     async with pool.acquire() as conn:
