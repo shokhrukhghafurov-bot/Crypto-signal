@@ -1798,8 +1798,11 @@ async def main() -> None:
     globals()["time"] = time
 
     logger.info("Bot starting; TZ=%s", TZ_NAME)
-    await init_db()
-    load_langs()
+
+    # IMPORTANT (Railway): bind HTTP port ASAP.
+    # Railway marks the deployment as failed if the process does not listen on  quickly.
+    # init_db() can be slow/unavailable, so we start HTTP first and only then init DB.
+
 
     # --- Admin HTTP API for Status panel (Signal bot access) ---
     # NOTE: Railway public domain requires an HTTP server listening on $PORT.
@@ -1850,6 +1853,8 @@ async def main() -> None:
         async def list_users(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
+            if pool is None:
+                return web.json_response({"ok": False, "error": "db_unavailable"}, status=503)
             q = (request.query.get("q") or "").strip()
             flt = (request.query.get("filter") or "all").strip().lower()
             async with pool.acquire() as conn:
@@ -1890,6 +1895,8 @@ async def main() -> None:
         async def save_user(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
+            if pool is None:
+                return web.json_response({"ok": False, "error": "db_unavailable"}, status=503)
             data = await request.json()
             tid = int(data.get("telegram_id") or 0)
             if not tid:
@@ -1929,6 +1936,7 @@ async def main() -> None:
 
         # Routes
         app.router.add_route("GET", "/health", health)
+        app.router.add_route("GET", "/", health)
         app.router.add_route("GET", "/api/infra/admin/signal/users", list_users)
         app.router.add_route("POST", "/api/infra/admin/signal/users", save_user)
         # Allow preflight
@@ -1955,8 +1963,13 @@ async def main() -> None:
         site = web.TCPSite(runner, host="0.0.0.0", port=port)
         await site.start()
         logger.info("Admin HTTP API started on 0.0.0.0:%s", port)
+    # Start HTTP server first (Railway expects a listener on ).
+    await _start_http_server()
 
-    asyncio.create_task(_start_http_server())
+    # Then init database and load langs (can be slow).
+    await init_db()
+    load_langs()
+
     logger.info("Starting track_loop")
     asyncio.create_task(backend.track_loop(bot))
     logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
