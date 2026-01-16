@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import datetime as dt
 
 import asyncpg
+from aiohttp import web
 
 import db_store
 
@@ -1799,6 +1800,154 @@ async def main() -> None:
     logger.info("Bot starting; TZ=%s", TZ_NAME)
     await init_db()
     load_langs()
+
+    # --- Admin HTTP API for Status panel (Signal bot access) ---
+    # NOTE: Railway public domain requires an HTTP server listening on $PORT.
+    # We run a tiny aiohttp server alongside the Telegram bot.
+    async def _admin_http_app() -> web.Application:
+        app = web.Application()
+
+        # ---- Basic Auth ----
+        ADMIN_USER = os.getenv("SIGNAL_ADMIN_USER") or os.getenv("ADMIN_USER") or "admin"
+        ADMIN_PASS = os.getenv("SIGNAL_ADMIN_PASS") or os.getenv("ADMIN_PASS") or "password"
+
+        def _unauthorized() -> web.Response:
+            return web.Response(status=401, headers={"WWW-Authenticate": 'Basic realm="signal-admin"'})
+
+        def _check_basic(request: web.Request) -> bool:
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Basic "):
+                return False
+            import base64
+            try:
+                raw = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8")
+                u, p = raw.split(":", 1)
+                return (u == ADMIN_USER) and (p == ADMIN_PASS)
+            except Exception:
+                return False
+
+        # ---- CORS (for browser-based Status panel) ----
+        @web.middleware
+        async def cors_mw(request: web.Request, handler):
+            # Preflight
+            if request.method == "OPTIONS":
+                resp = web.Response(status=204)
+            else:
+                resp = await handler(request)
+            origin = request.headers.get("Origin")
+            resp.headers["Access-Control-Allow-Origin"] = origin or "*"
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PATCH,OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type"
+            resp.headers["Access-Control-Max-Age"] = "86400"
+            return resp
+
+        app.middlewares.append(cors_mw)
+
+        async def health(_: web.Request) -> web.Response:
+            return web.json_response({"ok": True, "service": "crypto-signal"})
+
+        async def list_users(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            q = (request.query.get("q") or "").strip()
+            flt = (request.query.get("filter") or "all").strip().lower()
+            async with pool.acquire() as conn:
+                where = []
+                args = []
+                if q:
+                    where.append("CAST(telegram_id AS TEXT) ILIKE $%d" % (len(args)+1))
+                    args.append(f"%{q}%")
+                if flt == "active":
+                    where.append("COALESCE(signal_enabled,FALSE)=TRUE")
+                    where.append("signal_expires_at IS NOT NULL")
+                    where.append("signal_expires_at > now()")
+                elif flt == "expired":
+                    where.append("(COALESCE(signal_enabled,FALSE)=FALSE OR signal_expires_at IS NULL OR signal_expires_at <= now())")
+                elif flt == "blocked":
+                    where.append("COALESCE(is_blocked,FALSE)=TRUE")
+                where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+                rows = await conn.fetch(
+                    f"""
+                    SELECT telegram_id, signal_enabled, signal_expires_at, COALESCE(is_blocked,FALSE) AS is_blocked
+                    FROM users
+                    {where_sql}
+                    ORDER BY telegram_id DESC
+                    LIMIT 500
+                    """,
+                    *args,
+                )
+            out = []
+            for r in rows:
+                out.append({
+                    "telegram_id": int(r["telegram_id"]),
+                    "signal_enabled": bool(r["signal_enabled"]),
+                    "signal_expires_at": (r["signal_expires_at"].isoformat() if r["signal_expires_at"] else None),
+                    "is_blocked": bool(r["is_blocked"]),
+                })
+            return web.json_response({"items": out})
+
+        async def save_user(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            data = await request.json()
+            tid = int(data.get("telegram_id") or 0)
+            if not tid:
+                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
+            enabled = bool(data.get("signal_enabled", True))
+            expires = data.get("signal_expires_at")
+            add_days = int(data.get("add_days") or 0)
+
+            await ensure_user(tid)
+            async with pool.acquire() as conn:
+                if add_days:
+                    await conn.execute(
+                        """UPDATE users
+                               SET signal_enabled = TRUE,
+                                   signal_expires_at = COALESCE(signal_expires_at, now()) + ($2 || ' days')::interval
+                             WHERE telegram_id=$1""",
+                        tid, add_days,
+                    )
+                else:
+                    if expires:
+                        # Accept ISO string; store as timestamptz
+                        await conn.execute(
+                            """UPDATE users
+                                   SET signal_enabled=$2,
+                                       signal_expires_at=$3::timestamptz
+                                 WHERE telegram_id=$1""",
+                            tid, enabled, expires,
+                        )
+                    else:
+                        await conn.execute(
+                            """UPDATE users
+                                   SET signal_enabled=$2
+                                 WHERE telegram_id=$1""",
+                            tid, enabled,
+                        )
+            return web.json_response({"ok": True})
+
+        # Routes
+        app.router.add_route("GET", "/health", health)
+        app.router.add_route("GET", "/api/infra/admin/signal/users", list_users)
+        app.router.add_route("POST", "/api/infra/admin/signal/users", save_user)
+        # Allow preflight
+        app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204))
+        return app
+
+    async def _start_http_server() -> None:
+        try:
+            port = int(os.getenv("PORT", "8080"))
+        except Exception:
+            port = 8080
+        app = await _admin_http_app()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host="0.0.0.0", port=port)
+        await site.start()
+        logger.info("Admin HTTP API started on 0.0.0.0:%s", port)
+
+    asyncio.create_task(_start_http_server())
     logger.info("Starting track_loop")
     asyncio.create_task(backend.track_loop(bot))
     logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
