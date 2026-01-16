@@ -1936,10 +1936,19 @@ async def main() -> None:
         return app
 
     async def _start_http_server() -> None:
+        # Railway requires that the process listens on $PORT.
+        # If $PORT is missing/misconfigured, default to 8000.
+        port_raw = (
+            os.getenv("PORT")
+            or os.getenv("RAILWAY_PORT")
+            or os.getenv("HTTP_PORT")
+            or os.getenv("WEB_PORT")
+            or "8000"
+        )
         try:
-            port = int(os.getenv("PORT", "8080"))
+            port = int(str(port_raw).strip())
         except Exception:
-            port = 8080
+            port = 8000
         app = await _admin_http_app()
         runner = web.AppRunner(app)
         await runner.setup()
