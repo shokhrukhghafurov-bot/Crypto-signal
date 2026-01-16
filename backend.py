@@ -2039,22 +2039,49 @@ class Backend:
         if mode not in ("BINANCE", "BYBIT", "MEDIAN"):
             mode = "MEDIAN"
 
+        def _is_reasonable(p: float | None) -> bool:
+            """Sanity filter to avoid using bad ticks (e.g., 0.0) that can
+            accidentally distort MEDIAN logic and trigger false TP/SL hits.
+
+            We keep it intentionally permissive, but:
+              - reject non-finite / <= 0
+              - if entry is known, reject values that are wildly off-scale
+                (e.g., 10x away), which usually indicates a wrong market/symbol.
+            """
+            if p is None:
+                return False
+            try:
+                fp = float(p)
+            except Exception:
+                return False
+            if not math.isfinite(fp) or fp <= 0:
+                return False
+            if base is not None and base > 0:
+                lo = base * 0.10
+                hi = base * 10.0
+                if fp < lo or fp > hi:
+                    return False
+            return True
+
         async def get_binance() -> tuple[float | None, str]:
             # websocket first, REST fallback
             try:
                 await self.feed.ensure_stream(market, signal.symbol)
                 latest = self.feed.get_latest(market, signal.symbol)
-                if latest is not None:
+                if latest is not None and float(latest) > 0:
                     src = self.feed.get_latest_source(market, signal.symbol) or "BINANCE_WS"
                     if src == "WS":
                         src = "BINANCE_WS"
                     elif src == "REST":
                         src = "BINANCE_REST"
-                    return float(latest), str(src)
+                    # Guard against rare cases where a stale/invalid cached tick
+                    # (e.g., 0.0) could slip through.
+                    if _is_reasonable(float(latest)):
+                        return float(latest), str(src)
             except Exception:
                 pass
             rest = await self._fetch_rest_price(market, signal.symbol)
-            if rest is not None and rest > 0:
+            if _is_reasonable(rest):
                 try:
                     self.feed._set_latest(market, signal.symbol, float(rest), source="REST")
                 except Exception:
@@ -2064,7 +2091,7 @@ class Backend:
 
         async def get_bybit() -> tuple[float | None, str]:
             p = await self._fetch_bybit_price(market, signal.symbol)
-            if p is not None and p > 0:
+            if _is_reasonable(p):
                 return float(p), "BYBIT_REST"
             return None, "BYBIT"
 
@@ -2079,12 +2106,39 @@ class Backend:
         else:  # MEDIAN
             b, bsrc = await get_binance()
             y, ysrc = await get_bybit()
-            if b is not None and y is not None:
-                price = float(np.median([float(b), float(y)]))
+
+            b_ok = _is_reasonable(b)
+            y_ok = _is_reasonable(y)
+
+            if b_ok and y_ok:
+                fb = float(b)
+                fy = float(y)
+                # If one exchange suddenly returns a very different price
+                # (or we somehow got a stale tick), don't average it —
+                # it can create a fake mid-price and trigger TP/SL.
+                try:
+                    div = abs(fb - fy) / max(1e-12, min(fb, fy))
+                except Exception:
+                    div = 0.0
+
+                max_div = float(os.getenv("PRICE_MAX_DIVERGENCE_PCT", "0.05") or 0.05)
+                if max_div < 0:
+                    max_div = 0.0
+
+                if div > max_div:
+                    if base is not None and base > 0:
+                        # choose the one closer to entry
+                        if abs(fb - base) <= abs(fy - base):
+                            return fb, "BINANCE_ONLY(DIVERGE)"
+                        return fy, "BYBIT_ONLY(DIVERGE)"
+                    # default preference: Binance
+                    return fb, "BINANCE_ONLY(DIVERGE)"
+
+                price = float(np.median([fb, fy]))
                 return price, "MEDIAN(BINANCE+BYBIT)"
-            if b is not None:
+            if b_ok:
                 return float(b), "BINANCE_ONLY"
-            if y is not None:
+            if y_ok:
                 return float(y), "BYBIT_ONLY"
 
         # Last resort: keep near entry (never random huge).
