@@ -1893,17 +1893,27 @@ async def main() -> None:
                     "is_blocked": bool(r["is_blocked"]),
                 })
             return web.json_response({"items": out})
-
         async def save_user(request: web.Request) -> web.Response:
+            """Create/update Signal access for a user.
+
+            Expected JSON:
+              telegram_id (required)
+              signal_enabled (optional)
+              signal_expires_at (optional ISO)
+              add_days (optional int)
+              is_blocked (optional bool)
+            """
             if not _check_basic(request):
                 return _unauthorized()
             data = await request.json()
             tid = int(data.get("telegram_id") or 0)
             if not tid:
                 return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
+
             enabled = bool(data.get("signal_enabled", True))
             expires = data.get("signal_expires_at")
             add_days = int(data.get("add_days") or 0)
+            is_blocked = data.get("is_blocked")
 
             await ensure_user(tid)
             async with pool.acquire() as conn:
@@ -1917,7 +1927,6 @@ async def main() -> None:
                     )
                 else:
                     if expires:
-                        # Accept ISO string; store as timestamptz
                         await conn.execute(
                             """UPDATE users
                                    SET signal_enabled=$2,
@@ -1932,12 +1941,99 @@ async def main() -> None:
                                  WHERE telegram_id=$1""",
                             tid, enabled,
                         )
+
+                if is_blocked is not None:
+                    try:
+                        await conn.execute(
+                            "UPDATE users SET is_blocked=$2 WHERE telegram_id=$1",
+                            tid, bool(is_blocked),
+                        )
+                    except Exception:
+                        # Column may not exist on some legacy DBs
+                        pass
+
             return web.json_response({"ok": True})
+
+        async def patch_user(request: web.Request) -> web.Response:
+            """Compat endpoint: PATCH /api/infra/admin/signal/users/{telegram_id}"""
+            if not _check_basic(request):
+                return _unauthorized()
+            tid = int(request.match_info.get("telegram_id") or 0)
+            if not tid:
+                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
+            data = await request.json()
+            data["telegram_id"] = tid
+            # reuse save_user logic by running the same update code inline
+            enabled = bool(data.get("signal_enabled", True))
+            expires = data.get("signal_expires_at")
+            add_days = int(data.get("add_days") or 0)
+            is_blocked = data.get("is_blocked")
+
+            await ensure_user(tid)
+            async with pool.acquire() as conn:
+                if add_days:
+                    await conn.execute(
+                        """UPDATE users
+                               SET signal_enabled = TRUE,
+                                   signal_expires_at = COALESCE(signal_expires_at, now()) + ($2 || ' days')::interval
+                             WHERE telegram_id=$1""",
+                        tid, add_days,
+                    )
+                else:
+                    if expires:
+                        await conn.execute(
+                            """UPDATE users
+                                   SET signal_enabled=$2,
+                                       signal_expires_at=$3::timestamptz
+                                 WHERE telegram_id=$1""",
+                            tid, enabled, expires,
+                        )
+                    else:
+                        await conn.execute(
+                            """UPDATE users
+                                   SET signal_enabled=$2
+                                 WHERE telegram_id=$1""",
+                            tid, enabled,
+                        )
+
+                if is_blocked is not None:
+                    try:
+                        await conn.execute(
+                            "UPDATE users SET is_blocked=$2 WHERE telegram_id=$1",
+                            tid, bool(is_blocked),
+                        )
+                    except Exception:
+                        pass
+            return web.json_response({"ok": True})
+
+        async def block_user(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            tid = int(request.match_info.get("telegram_id") or 0)
+            if not tid:
+                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
+            async with pool.acquire() as conn:
+                await conn.execute("UPDATE users SET is_blocked=TRUE WHERE telegram_id=$1", tid)
+            return web.json_response({"ok": True})
+
+        async def unblock_user(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            tid = int(request.match_info.get("telegram_id") or 0)
+            if not tid:
+                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
+            async with pool.acquire() as conn:
+                await conn.execute("UPDATE users SET is_blocked=FALSE WHERE telegram_id=$1", tid)
+            return web.json_response({"ok": True})
+
 
         # Routes
         app.router.add_route("GET", "/health", health)
         app.router.add_route("GET", "/api/infra/admin/signal/users", list_users)
         app.router.add_route("POST", "/api/infra/admin/signal/users", save_user)
+        app.router.add_route("PATCH", "/api/infra/admin/signal/users/{telegram_id}", patch_user)
+        app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/block", block_user)
+        app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/unblock", unblock_user)
         # Allow preflight
         app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204))
         return app
