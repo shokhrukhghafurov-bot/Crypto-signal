@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncpg
 import datetime as dt
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 _pool: Optional[asyncpg.Pool] = None
+
+logger = logging.getLogger("db_store")
 
 def set_pool(pool: asyncpg.Pool) -> None:
     global _pool
@@ -116,6 +119,72 @@ async def ensure_schema() -> None:
         CREATE INDEX IF NOT EXISTS idx_trade_events_trade_time
         ON trade_events (trade_id, created_at DESC);
         """)
+
+
+async def ensure_users_columns() -> None:
+    """Best-effort schema migration for users table.
+
+    We keep it here (db_store) so bot.py stays clean and all DB migrations
+    live in one place.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        # users table is created/managed elsewhere (backend). We only add missing columns.
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS notify_signals BOOLEAN NOT NULL DEFAULT TRUE;
+                """
+            )
+        except Exception:
+            logger.exception("ensure_users_columns: failed to add notify_signals")
+
+        # --- Signal bot access (separate from Arbitrage access) ---
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS signal_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+                """
+            )
+        except Exception:
+            logger.exception("ensure_users_columns: failed to add signal_enabled")
+
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS signal_expires_at TIMESTAMPTZ;
+                """
+            )
+        except Exception:
+            logger.exception("ensure_users_columns: failed to add signal_expires_at")
+
+        # Helpful index; ignore failure on managed DBs.
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
+        except Exception:
+            logger.exception("ensure_users_columns: failed to create idx_users_telegram_id")
+
+
+async def ensure_user_signal_trial(user_id: int) -> None:
+    """Create user row if missing and grant 24h Signal trial ONCE.
+
+    IMPORTANT: does NOT touch Arbitrage access.
+    """
+    if not user_id:
+        return
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (telegram_id, notify_signals, signal_enabled, signal_expires_at)
+            VALUES ($1, TRUE, TRUE, (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours')
+            ON CONFLICT (telegram_id) DO NOTHING;
+            """,
+            int(user_id),
+        )
 
 async def next_signal_id() -> int:
     """Return a globally unique signal_id for bot callbacks (Postgres sequence)."""
