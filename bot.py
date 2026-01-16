@@ -589,10 +589,18 @@ def _access_status_from_row(row) -> str:
             signal_enabled = True
             signal_expires_at = legacy_exp
 
+    # If explicitly disabled → it's not "expired" (admin can enable again)
+    if signal_enabled is False:
+        return "disabled"
+
+    # If enabled is falsy/None here → consider no paid access
     if not bool(signal_enabled):
         return "expired"
+
+    # Enabled + NULL expiry means "lifetime" access
     if signal_expires_at is None:
-        return "expired"
+        return "ok"
+
     try:
         now = dt.datetime.now(dt.timezone.utc)
         if signal_expires_at < now:
@@ -657,8 +665,7 @@ async def get_broadcast_user_ids() -> List[int]:
                  FROM users
                  WHERE COALESCE(is_blocked, FALSE) = FALSE
                    AND COALESCE(signal_enabled, FALSE) = TRUE
-                   AND signal_expires_at IS NOT NULL
-                   AND signal_expires_at > now()
+                   AND (signal_expires_at IS NULL OR signal_expires_at > now())
                    AND COALESCE(notify_signals, TRUE) = TRUE"""
         )
         return [int(r["telegram_id"]) for r in rows if r and r.get("telegram_id") is not None]
@@ -1798,6 +1805,8 @@ async def main() -> None:
     globals()["time"] = time
 
     logger.info("Bot starting; TZ=%s", TZ_NAME)
+    await init_db()
+    load_langs()
 
     # --- Admin HTTP API for Status panel (Signal bot access) ---
     # NOTE: Railway public domain requires an HTTP server listening on $PORT.
@@ -1848,8 +1857,6 @@ async def main() -> None:
         async def list_users(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
-            if pool is None:
-                return web.json_response({"ok": False, "error": "db_unavailable"}, status=503)
             q = (request.query.get("q") or "").strip()
             flt = (request.query.get("filter") or "all").strip().lower()
             async with pool.acquire() as conn:
@@ -1890,8 +1897,6 @@ async def main() -> None:
         async def save_user(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
-            if pool is None:
-                return web.json_response({"ok": False, "error": "db_unavailable"}, status=503)
             data = await request.json()
             tid = int(data.get("telegram_id") or 0)
             if not tid:
@@ -1938,28 +1943,10 @@ async def main() -> None:
         return app
 
     async def _start_http_server() -> None:
-        # Railway requires that the process listens on $PORT.
-        # If $PORT is missing/misconfigured, default to 8000.
-        port_raw = (
-            # Prefer Railway-internal port vars first.
-            # If a user-defined PORT exists (e.g. 8080), it can break Railway routing.
-            os.getenv("RAILWAY_PORT")
-            or os.getenv("HTTP_PORT")
-            or os.getenv("WEB_PORT")
-            or os.getenv("PORT")
-            or "8000"
-        )
         try:
-            port = int(str(port_raw).strip())
+            port = int(os.getenv("PORT", "8080"))
         except Exception:
-            port = 8000
-
-        # Heuristic: some deployments accidentally set PORT=8080 as a custom variable while Railway service port is 8000.
-        # If no explicit port override is provided, prefer 8000 in that case.
-        explicit_port = (os.getenv("RAILWAY_PORT") or os.getenv("HTTP_PORT") or os.getenv("WEB_PORT"))
-        if port == 8080 and not explicit_port:
-            port = 8000
-
+            port = 8080
         app = await _admin_http_app()
         runner = web.AppRunner(app)
         await runner.setup()
@@ -1968,11 +1955,6 @@ async def main() -> None:
         logger.info("Admin HTTP API started on 0.0.0.0:%s", port)
 
     asyncio.create_task(_start_http_server())
-
-    # Init DB after HTTP is up (Railway will not mark the app as unhealthy while DB is slow)
-    await init_db()
-    load_langs()
-
     logger.info("Starting track_loop")
     asyncio.create_task(backend.track_loop(bot))
     logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
