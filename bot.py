@@ -493,30 +493,18 @@ async def init_db() -> None:
     # Share the same pool with trade storage
     db_store.set_pool(pool)
     await db_store.ensure_schema()
-    async with pool.acquire() as conn:
-        # notify_signals flag (shared access + per-bot notification toggle)
-        await conn.execute("""
-        ALTER TABLE users
-          ADD COLUMN IF NOT EXISTS notify_signals BOOLEAN NOT NULL DEFAULT TRUE;
-        """)
-        # safety indexes (if table already exists, IF NOT EXISTS works on PG 9.5+ for indexes)
-        try:
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
-        except Exception:
-            # Best effort: index creation may fail on some managed DBs / permissions.
-            logger.exception("Failed to create idx_users_telegram_id")
+    # Users table migrations (signal access columns) live in db_store
+    await db_store.ensure_users_columns()
 
 async def ensure_user(user_id: int) -> None:
     if not pool or not user_id:
         return
-    async with pool.acquire() as conn:
-        # Create user row if missing. Do not change existing access fields.
-        await conn.execute(
-            """INSERT INTO users (telegram_id, notify_signals)
-                   VALUES ($1, TRUE)
-                   ON CONFLICT (telegram_id) DO NOTHING;""",
-            user_id,
-        )
+    # Create user row if missing and grant 24h Signal trial ONCE.
+    # IMPORTANT: does NOT touch Arbitrage access.
+    try:
+        await db_store.ensure_user_signal_trial(int(user_id))
+    except Exception:
+        logger.exception("ensure_user: failed")
 
 
 async def set_user_blocked(user_id: int, blocked: bool = True) -> None:
@@ -546,8 +534,18 @@ async def get_user_row(user_id: int):
         return None
     async with pool.acquire() as conn:
         return await conn.fetchrow(
-            """SELECT telegram_id, expires_at, is_blocked, notify_signals
-                 FROM users WHERE telegram_id=$1""",
+            """
+            SELECT telegram_id,
+                   is_blocked,
+                   notify_signals,
+                   -- signal access (new)
+                   signal_enabled,
+                   signal_expires_at,
+                   -- legacy shared access (fallback for older DBs)
+                   expires_at
+              FROM users
+             WHERE telegram_id=$1
+            """,
             user_id,
         )
 
@@ -559,12 +557,25 @@ def _access_status_from_row(row) -> str:
             return "blocked"
     except Exception:
         pass
-    expires_at = row.get("expires_at") if row is not None else None
-    if expires_at is None:
+    # Signal bot access: prefer dedicated fields
+    signal_enabled = row.get("signal_enabled")
+    signal_expires_at = row.get("signal_expires_at")
+
+    # Backward compatibility: if signal_* not set but legacy expires_at exists,
+    # treat legacy expiry as signal access to avoid locking out existing users.
+    if signal_enabled is None and signal_expires_at is None:
+        legacy_exp = row.get("expires_at")
+        if legacy_exp is not None:
+            signal_enabled = True
+            signal_expires_at = legacy_exp
+
+    if not bool(signal_enabled):
+        return "expired"
+    if signal_expires_at is None:
         return "expired"
     try:
         now = dt.datetime.now(dt.timezone.utc)
-        if expires_at < now:
+        if signal_expires_at < now:
             return "expired"
     except Exception:
         return "expired"
@@ -625,8 +636,9 @@ async def get_broadcast_user_ids() -> List[int]:
             """SELECT telegram_id
                  FROM users
                  WHERE COALESCE(is_blocked, FALSE) = FALSE
-                   AND expires_at IS NOT NULL
-                   AND expires_at > now()
+                   AND COALESCE(signal_enabled, FALSE) = TRUE
+                   AND signal_expires_at IS NOT NULL
+                   AND signal_expires_at > now()
                    AND COALESCE(notify_signals, TRUE) = TRUE"""
         )
         return [int(r["telegram_id"]) for r in rows if r and r.get("telegram_id") is not None]
