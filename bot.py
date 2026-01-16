@@ -1893,6 +1893,40 @@ async def main() -> None:
                     "is_blocked": bool(r["is_blocked"]),
                 })
             return web.json_response({"items": out})
+
+
+
+
+
+        def _parse_iso_dt(v):
+            """Parse ISO datetime string from UI (e.g. 2026-02-15T20:55:00.000Z) into tz-aware datetime."""
+            if v is None:
+                return None
+            if isinstance(v, dt.datetime):
+                return v if v.tzinfo is not None else v.replace(tzinfo=dt.timezone.utc)
+            if isinstance(v, str):
+                s = v.strip()
+                if not s:
+                    return None
+                # JS ISO often ends with 'Z' (UTC)
+                if s.endswith('Z'):
+                    s = s[:-1] + '+00:00'
+                try:
+                    dtt = dt.datetime.fromisoformat(s)
+                except Exception:
+                    # Fallback: drop milliseconds if any and try again
+                    if '.' in s:
+                        base = s.split('.', 1)[0]
+                        # if timezone part missing after split, assume UTC
+                        if base[-6:] not in ('+00:00','-00:00') and ('+' not in base and '-' not in base[10:]):
+                            base = base + '+00:00'
+                        dtt = dt.datetime.fromisoformat(base)
+                    else:
+                        raise
+                if dtt.tzinfo is None:
+                    dtt = dtt.replace(tzinfo=dt.timezone.utc)
+                return dtt
+            raise TypeError('expected ISO datetime string or datetime')
         async def save_user(request: web.Request) -> web.Response:
             """Create/update Signal access for a user.
 
@@ -1911,7 +1945,13 @@ async def main() -> None:
                 return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
 
             enabled = bool(data.get("signal_enabled", True))
-            expires = data.get("signal_expires_at")
+            expires_raw = data.get("signal_expires_at")
+            expires = None
+            if expires_raw:
+                try:
+                    expires = _parse_iso_dt(expires_raw)
+                except Exception:
+                    return web.json_response({"ok": False, "error": "bad signal_expires_at"}, status=400)
             add_days = int(data.get("add_days") or 0)
             is_blocked = data.get("is_blocked")
 
@@ -1965,7 +2005,13 @@ async def main() -> None:
             data["telegram_id"] = tid
             # reuse save_user logic by running the same update code inline
             enabled = bool(data.get("signal_enabled", True))
-            expires = data.get("signal_expires_at")
+            expires_raw = data.get("signal_expires_at")
+            expires = None
+            if expires_raw:
+                try:
+                    expires = _parse_iso_dt(expires_raw)
+                except Exception:
+                    return web.json_response({"ok": False, "error": "bad signal_expires_at"}, status=400)
             add_days = int(data.get("add_days") or 0)
             is_blocked = data.get("is_blocked")
 
