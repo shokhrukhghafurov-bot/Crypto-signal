@@ -170,10 +170,17 @@ def load_i18n() -> dict:
 
 I18N = load_i18n()
 
+# Support username (without @) is configurable via env
+SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', 'cryptoarb_web_bot_admin').lstrip('@')
+
 
 def tr(uid: int, key: str) -> str:
     lang = get_lang(uid)
-    return I18N.get(lang, I18N["en"]).get(key, I18N["en"].get(key, key))
+    tmpl = I18N.get(lang, I18N['en']).get(key, I18N['en'].get(key, key))
+    # Allow using @{support} placeholder in i18n texts, configured via SUPPORT_USERNAME env
+    if isinstance(tmpl, str) and '{support}' in tmpl:
+        return tmpl.replace('{support}', SUPPORT_USERNAME)
+    return tmpl
 
 
 
@@ -183,6 +190,8 @@ class _SafeDict(dict):
         return "{" + key + "}"
 
 def trf(uid: int, key: str, **kwargs) -> str:
+    # Inject support placeholder for templates using @{support}
+    kwargs.setdefault('support', SUPPORT_USERNAME)
     tmpl = tr(uid, key)
     try:
         return str(tmpl).format_map(_SafeDict(**kwargs))
@@ -550,6 +559,16 @@ async def get_user_row(user_id: int):
         )
 
 def _access_status_from_row(row) -> str:
+    # Global maintenance switch (Signal bot only).
+    # Enable via env: SIGNAL_MAINTENANCE=1 or MAINTENANCE_MODE=1
+    try:
+        import os
+        mm = (os.getenv("SIGNAL_MAINTENANCE") or os.getenv("MAINTENANCE_MODE") or "").strip().lower()
+        if mm in {"1", "true", "yes", "on"}:
+            return "maintenance"
+    except Exception:
+        pass
+
     if row is None:
         return "no_user"
     try:
