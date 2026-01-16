@@ -1799,11 +1799,6 @@ async def main() -> None:
 
     logger.info("Bot starting; TZ=%s", TZ_NAME)
 
-    # IMPORTANT (Railway): bind HTTP port ASAP.
-    # Railway marks the deployment as failed if the process does not listen on  quickly.
-    # init_db() can be slow/unavailable, so we start HTTP first and only then init DB.
-
-
     # --- Admin HTTP API for Status panel (Signal bot access) ---
     # NOTE: Railway public domain requires an HTTP server listening on $PORT.
     # We run a tiny aiohttp server alongside the Telegram bot.
@@ -1936,7 +1931,6 @@ async def main() -> None:
 
         # Routes
         app.router.add_route("GET", "/health", health)
-        app.router.add_route("GET", "/", health)
         app.router.add_route("GET", "/api/infra/admin/signal/users", list_users)
         app.router.add_route("POST", "/api/infra/admin/signal/users", save_user)
         # Allow preflight
@@ -1947,26 +1941,35 @@ async def main() -> None:
         # Railway requires that the process listens on $PORT.
         # If $PORT is missing/misconfigured, default to 8000.
         port_raw = (
-            os.getenv("PORT")
-            or os.getenv("RAILWAY_PORT")
+            # Prefer Railway-internal port vars first.
+            # If a user-defined PORT exists (e.g. 8080), it can break Railway routing.
+            os.getenv("RAILWAY_PORT")
             or os.getenv("HTTP_PORT")
             or os.getenv("WEB_PORT")
+            or os.getenv("PORT")
             or "8000"
         )
         try:
             port = int(str(port_raw).strip())
         except Exception:
             port = 8000
+
+        # Heuristic: some deployments accidentally set PORT=8080 as a custom variable while Railway service port is 8000.
+        # If no explicit port override is provided, prefer 8000 in that case.
+        explicit_port = (os.getenv("RAILWAY_PORT") or os.getenv("HTTP_PORT") or os.getenv("WEB_PORT"))
+        if port == 8080 and not explicit_port:
+            port = 8000
+
         app = await _admin_http_app()
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, host="0.0.0.0", port=port)
         await site.start()
         logger.info("Admin HTTP API started on 0.0.0.0:%s", port)
-    # Start HTTP server first (Railway expects a listener on ).
-    await _start_http_server()
 
-    # Then init database and load langs (can be slow).
+    asyncio.create_task(_start_http_server())
+
+    # Init DB after HTTP is up (Railway will not mark the app as unhealthy while DB is slow)
     await init_db()
     load_langs()
 
