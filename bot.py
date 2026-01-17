@@ -1955,11 +1955,14 @@ async def main() -> None:
                     where.append("CAST(telegram_id AS TEXT) ILIKE $%d" % (len(args)+1))
                     args.append(f"%{q}%")
                 if flt == "active":
-                    where.append("COALESCE(signal_enabled,FALSE)=TRUE")
-                    where.append("signal_expires_at IS NOT NULL")
-                    where.append("signal_expires_at > now()")
+                    # Access is determined ONLY by expiry time + block, NOT by signal_enabled.
+                    where.append("COALESCE(is_blocked,FALSE)=FALSE")
+                    where.append("(signal_expires_at IS NULL OR signal_expires_at > now())")
                 elif flt == "expired":
-                    where.append("(COALESCE(signal_enabled,FALSE)=FALSE OR signal_expires_at IS NULL OR signal_expires_at <= now())")
+                    # Expired access (but not blocked). signal_enabled does not matter here.
+                    where.append("COALESCE(is_blocked,FALSE)=FALSE")
+                    where.append("signal_expires_at IS NOT NULL")
+                    where.append("signal_expires_at <= now()")
                 elif flt == "blocked":
                     where.append("COALESCE(is_blocked,FALSE)=TRUE")
                 where_sql = ("WHERE " + " AND ".join(where)) if where else ""
