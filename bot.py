@@ -246,6 +246,9 @@ _SENT_SIG_TTL_SEC = int(os.getenv("SENT_SIG_TTL_SEC", "600"))  # default 10 minu
 STATS_FILE = Path("signal_stats.json")
 SIGNAL_STATS: Dict[str, Dict[str, int]] = {"days": {}, "weeks": {}}
 
+# Trade stats file (written by backend.py). We expose READ-ONLY aggregates via admin HTTP.
+TRADE_STATS_FILE = Path("trade_stats.json")
+
 def load_signal_stats() -> None:
     global SIGNAL_STATS
     if STATS_FILE.exists():
@@ -291,6 +294,75 @@ def _signals_today() -> int:
 def _signals_this_week() -> int:
     wk = _week_key(dt.datetime.now(TZ).date())
     return int(SIGNAL_STATS["weeks"].get(wk, 0))
+
+def _signals_this_month() -> int:
+    """Return number of signals sent in current month (based on SIGNAL_STATS['days'])."""
+    today = dt.datetime.now(TZ).date()
+    prefix = f"{today.year:04d}-{today.month:02d}-"
+    total = 0
+    for k, v in (SIGNAL_STATS.get("days") or {}).items():
+        if isinstance(k, str) and k.startswith(prefix):
+            try:
+                total += int(v)
+            except Exception:
+                pass
+    return int(total)
+
+def _safe_load_json(path: Path) -> dict:
+    try:
+        if path.exists():
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+def _sum_trade_buckets(days_map: dict, keys: list[str]) -> dict:
+    """Sum trade buckets (wins/losses/be/trades/tp1_hits/sum_pnl_pct) across given day keys."""
+    out = {"trades": 0, "wins": 0, "losses": 0, "be": 0, "tp1_hits": 0, "sum_pnl_pct": 0.0}
+    for k in keys:
+        b = (days_map or {}).get(k) or {}
+        try:
+            out["trades"] += int(b.get("trades", 0) or 0)
+            out["wins"] += int(b.get("wins", 0) or 0)
+            out["losses"] += int(b.get("losses", 0) or 0)
+            out["be"] += int(b.get("be", 0) or 0)
+            out["tp1_hits"] += int(b.get("tp1_hits", 0) or 0)
+            out["sum_pnl_pct"] += float(b.get("sum_pnl_pct", 0.0) or 0.0)
+        except Exception:
+            continue
+    return out
+
+def _trade_stats_agg() -> dict:
+    """Aggregate trade stats by market for day/week/month. Read-only."""
+    store = _safe_load_json(TRADE_STATS_FILE)
+    today = dt.datetime.now(TZ).date()
+    dayk = _day_key(today)
+    weekk = _week_key(today)
+    prefix = f"{today.year:04d}-{today.month:02d}-"
+
+    out: dict[str, dict] = {}
+    for mk in ("spot", "futures"):
+        mroot = store.get(mk) if isinstance(store, dict) else None
+        mroot = mroot if isinstance(mroot, dict) else {"days": {}, "weeks": {}}
+        days = mroot.get("days") if isinstance(mroot.get("days"), dict) else {}
+        weeks = mroot.get("weeks") if isinstance(mroot.get("weeks"), dict) else {}
+
+        # day
+        day_b = days.get(dayk) if isinstance(days.get(dayk), dict) else {"trades": 0, "wins": 0, "losses": 0, "be": 0, "tp1_hits": 0, "sum_pnl_pct": 0.0}
+        # week
+        week_b = weeks.get(weekk) if isinstance(weeks.get(weekk), dict) else {"trades": 0, "wins": 0, "losses": 0, "be": 0, "tp1_hits": 0, "sum_pnl_pct": 0.0}
+        # month = sum days in current month
+        month_keys = [k for k in days.keys() if isinstance(k, str) and k.startswith(prefix)]
+        month_b = _sum_trade_buckets(days, month_keys)
+
+        out[mk] = {
+            "day": day_b,
+            "week": week_b,
+            "month": month_b,
+        }
+    return out
 
 def _daily_report_lines(days: int = 7) -> list[str]:
     today = dt.datetime.now(TZ).date()
@@ -1917,6 +1989,30 @@ async def main() -> None:
                     "is_blocked": bool(r["is_blocked"]),
                 })
             return web.json_response({"items": out})
+
+        async def signal_stats(request: web.Request) -> web.Response:
+            """Read-only aggregated statistics for the admin panel.
+
+            Returns counts for:
+              - signals sent: day/week/month
+              - trades performance: day/week/month per market (spot/futures)
+            """
+            if not _check_basic(request):
+                return _unauthorized()
+
+            # Ensure we have latest in-memory counters from file (best-effort)
+            try:
+                load_signal_stats()
+            except Exception:
+                pass
+
+            signals = {
+                "day": _signals_today(),
+                "week": _signals_this_week(),
+                "month": _signals_this_month(),
+            }
+            trades = _trade_stats_agg()
+            return web.json_response({"ok": True, "signals": signals, "trades": trades})
         async def save_user(request: web.Request) -> web.Response:
             """Create/update Signal access for a user.
 
@@ -2059,6 +2155,7 @@ async def main() -> None:
 
         # Routes
         app.router.add_route("GET", "/health", health)
+        app.router.add_route("GET", "/api/infra/admin/signal/stats", signal_stats)
         app.router.add_route("GET", "/api/infra/admin/signal/users", list_users)
         app.router.add_route("POST", "/api/infra/admin/signal/users", save_user)
         app.router.add_route("PATCH", "/api/infra/admin/signal/users/{telegram_id}", patch_user)
