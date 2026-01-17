@@ -428,6 +428,51 @@ async def perf_bucket(user_id: int, market: str, *, since: dt.datetime, until: d
             "sum_pnl_pct": float(d.get("sum_pnl_pct") or 0.0),
         }
 
+
+async def perf_bucket_global(market: str, *, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
+    """Global performance aggregation (all users) in [since, until) using trade_events.
+
+    This mirrors perf_bucket(), but without filtering by user_id.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            WITH ev AS (
+              SELECT e.trade_id, e.event_type, e.pnl_pct
+              FROM trade_events e
+              JOIN trades t ON t.id = e.trade_id
+              WHERE t.market=$1
+                AND e.created_at >= $2 AND e.created_at < $3
+            )
+            SELECT
+              SUM(CASE WHEN event_type IN ('WIN','LOSS','BE','CLOSE') THEN 1 ELSE 0 END)::int AS trades,
+              SUM(CASE WHEN event_type='WIN' THEN 1 ELSE 0 END)::int AS wins,
+              SUM(CASE WHEN event_type='LOSS' THEN 1 ELSE 0 END)::int AS losses,
+              SUM(CASE WHEN event_type='BE' THEN 1 ELSE 0 END)::int AS be,
+              SUM(CASE WHEN event_type='CLOSE' THEN 1 ELSE 0 END)::int AS closes,
+              COUNT(DISTINCT CASE WHEN event_type='TP1' THEN trade_id END)::int AS tp1_hits,
+              COALESCE(SUM(CASE WHEN event_type IN ('WIN','LOSS','BE','CLOSE') THEN COALESCE(pnl_pct,0) ELSE 0 END), 0)::float AS sum_pnl_pct
+            FROM ev;
+            """,
+            market,
+            since,
+            until,
+        )
+        base = {"trades":0,"wins":0,"losses":0,"be":0,"closes":0,"tp1_hits":0,"sum_pnl_pct":0.0}
+        if not row:
+            return base
+        d = dict(row)
+        return {
+            "trades": int(d.get("trades") or 0),
+            "wins": int(d.get("wins") or 0),
+            "losses": int(d.get("losses") or 0),
+            "be": int(d.get("be") or 0),
+            "closes": int(d.get("closes") or 0),
+            "tp1_hits": int(d.get("tp1_hits") or 0),
+            "sum_pnl_pct": float(d.get("sum_pnl_pct") or 0.0),
+        }
+
 async def daily_report(user_id: int, market: str, *, days: int, tz: str = "UTC") -> List[dict]:
     """
     Returns per-day buckets for the last N days using trade_events.
