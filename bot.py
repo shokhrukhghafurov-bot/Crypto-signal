@@ -1948,7 +1948,7 @@ async def main() -> None:
                     await conn.execute(
                         """UPDATE users
                                SET signal_enabled = TRUE,
-                                   signal_expires_at = COALESCE(signal_expires_at, now()) + ($2 || ' days')::interval
+                                   signal_expires_at = COALESCE(signal_expires_at, now()) + make_interval(days => $2)
                              WHERE telegram_id=$1""",
                         tid, add_days,
                     )
@@ -2005,7 +2005,7 @@ async def main() -> None:
                     await conn.execute(
                         """UPDATE users
                                SET signal_enabled = TRUE,
-                                   signal_expires_at = COALESCE(signal_expires_at, now()) + ($2 || ' days')::interval
+                                   signal_expires_at = COALESCE(signal_expires_at, now()) + make_interval(days => $2)
                              WHERE telegram_id=$1""",
                         tid, add_days,
                     )
