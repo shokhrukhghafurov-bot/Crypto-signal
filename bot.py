@@ -1995,7 +1995,10 @@ async def main() -> None:
 
             Returns counts for:
               - signals sent: day/week/month
-              - trades performance: day/week/month per market (spot/futures)
+              - trade outcomes & real pnl%: day/week/month per market (SPOT/FUTURES)
+
+            Trade stats are computed from Postgres trade_events (WIN/LOSS/BE/CLOSE + TP1).
+            This gives correct PnL% that matches how positions were closed.
             """
             if not _check_basic(request):
                 return _unauthorized()
@@ -2006,13 +2009,66 @@ async def main() -> None:
             except Exception:
                 pass
 
+            now_tz = dt.datetime.now(TZ)
+
+            def _to_utc(d: dt.datetime) -> dt.datetime:
+                if d.tzinfo is None:
+                    d = d.replace(tzinfo=TZ)
+                return d.astimezone(dt.timezone.utc)
+
+            # Period boundaries in bot TZ (MSK by default)
+            day_start = now_tz.replace(hour=0, minute=0, second=0, microsecond=0)
+            week_start = (now_tz - dt.timedelta(days=now_tz.isoweekday() - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            month_start = now_tz.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+            ranges = {
+                "day": (_to_utc(day_start), _to_utc(now_tz)),
+                "week": (_to_utc(week_start), _to_utc(now_tz)),
+                "month": (_to_utc(month_start), _to_utc(now_tz)),
+            }
+
             signals = {
                 "day": _signals_today(),
                 "week": _signals_this_week(),
                 "month": _signals_this_month(),
             }
-            trades = _trade_stats_agg()
-            return web.json_response({"ok": True, "signals": signals, "trades": trades})
+
+            async def _mk(market: str) -> dict:
+                out: dict[str, dict] = {}
+                for k, (since, until) in ranges.items():
+                    b = await db_store.perf_bucket_global(market, since=since, until=until)
+                    trades = int(b.get('trades') or 0)
+                    wins = int(b.get('wins') or 0)      # TP2 hits (WIN)
+                    losses = int(b.get('losses') or 0)  # SL hits (LOSS)
+                    be = int(b.get('be') or 0)          # BE hits
+                    tp1 = int(b.get('tp1_hits') or 0)   # TP1 hits (partial)
+                    closes = int(b.get('closes') or 0)  # manual CLOSE
+                    manual = max(0, closes)
+                    sum_pnl = float(b.get('sum_pnl_pct') or 0.0)
+                    avg_pnl = (sum_pnl / trades) if trades else 0.0
+                    out[k] = {
+                        "trades": trades,
+                        "tp2": wins,
+                        "sl": losses,
+                        "be": be,
+                        "tp1": tp1,
+                        "manual": manual,
+                        "sum_pnl_pct": sum_pnl,
+                        "avg_pnl_pct": avg_pnl,
+                    }
+                return out
+
+            perf = {
+                "spot": await _mk('SPOT'),
+                "futures": await _mk('FUTURES'),
+            }
+
+            return web.json_response({
+                "ok": True,
+                "signals": signals,
+                "perf": perf,
+            })
+
         async def save_user(request: web.Request) -> web.Response:
             """Create/update Signal access for a user.
 
