@@ -673,27 +673,20 @@ def _access_status_from_row(row) -> str:
             return "blocked"
     except Exception:
         pass
-    # Signal bot access: prefer dedicated fields
-    signal_enabled = row.get("signal_enabled")
+    # Signal bot access is time-based.
+    # IMPORTANT: signal_enabled must NOT block access.
+    # It is used to control whether the user receives new signals (broadcast),
+    # not whether the user can open the bot/menu.
     signal_expires_at = row.get("signal_expires_at")
 
-    # Backward compatibility: if signal_* not set but legacy expires_at exists,
+    # Backward compatibility: if signal_expires_at is missing but legacy expires_at exists,
     # treat legacy expiry as signal access to avoid locking out existing users.
-    if signal_enabled is None and signal_expires_at is None:
+    if signal_expires_at is None:
         legacy_exp = row.get("expires_at")
         if legacy_exp is not None:
-            signal_enabled = True
             signal_expires_at = legacy_exp
 
-    # If explicitly disabled → it's not "expired" (admin can enable again)
-    if signal_enabled is False:
-        return "disabled"
-
-    # If enabled is falsy/None here → consider no paid access
-    if not bool(signal_enabled):
-        return "expired"
-
-    # Enabled + NULL expiry means "lifetime" access
+    # NULL expiry means "lifetime" access
     if signal_expires_at is None:
         return "ok"
 
