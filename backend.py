@@ -2370,7 +2370,8 @@ class Backend:
                     be_price = float(row.get("be_price") or 0.0) if row.get("be_price") is not None else 0.0
                     # 1) Before TP1: TP2 (gap) -> WIN
                     if not tp1_hit and s.tp2 and hit_tp(float(s.tp2)):
-                        pnl = calc_profit_pct(s.entry, float(s.tp2), side)
+                        trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
+                        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.tp2), close_reason="WIN")
                         txt = _trf(uid, "msg_auto_win",
                             symbol=s.symbol,
                             pnl_total=fmt_pnl_pct(float(pnl)),
@@ -2384,7 +2385,8 @@ class Backend:
 
                     # 2) Before TP1: SL -> LOSS
                     if not tp1_hit and s.sl and hit_sl(float(s.sl)):
-                        pnl = calc_profit_pct(s.entry, float(s.sl), side)
+                        trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
+                        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.sl), close_reason="LOSS")
                         txt = _trf(uid, "msg_auto_loss",
                             symbol=s.symbol,
                             status="LOSS",
@@ -2422,12 +2424,15 @@ class Backend:
                             if dbg:
                                 txt += "\n\n" + dbg
                             await safe_send(bot, uid, txt, ctx="msg_auto_be")
-                            await db_store.close_trade(trade_id, status="BE", price=float(be_lvl), pnl_total_pct=0.0)
+                            trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
+                            pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(be_lvl), close_reason="BE")
+                            await db_store.close_trade(trade_id, status="BE", price=float(be_lvl), pnl_total_pct=float(pnl))
                             continue
 
                     # 4) TP2 -> WIN
                     if s.tp2 and hit_tp(float(s.tp2)):
-                        pnl = calc_profit_pct(s.entry, float(s.tp2), side)
+                        trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
+                        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.tp2), close_reason="WIN")
                         txt = _trf(uid, "msg_auto_win",
                             symbol=s.symbol,
                             pnl_total=fmt_pnl_pct(float(pnl)),
