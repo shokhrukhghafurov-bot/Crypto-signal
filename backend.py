@@ -14,6 +14,9 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List, Any
 
 import aiohttp
+import hmac
+import hashlib
+import urllib.parse
 import numpy as np
 import pandas as pd
 import websockets
@@ -27,7 +30,1488 @@ import logging
 
 import db_store
 
+from cryptography.fernet import Fernet
+
 logger = logging.getLogger("crypto-signal")
+
+
+# ------------------ Auto-trade exchange API helpers ------------------
+
+class ExchangeAPIError(RuntimeError):
+    """Raised when an exchange API call fails (network / auth / rate limit / etc.)."""
+
+
+def _extract_signal_id(sig: object) -> int:
+    """Extract a stable, non-null signal id from a signal object."""
+    try:
+        v = getattr(sig, "signal_id", None)
+        if v is None:
+            v = getattr(sig, "id", None)
+        v = int(v)
+        return v if v > 0 else 0
+    except Exception:
+        return 0
+
+
+def _should_deactivate_key(err_text: str) -> bool:
+    """Return True only for credential/permission/IP-whitelist failures."""
+    t = (err_text or "").lower()
+    needles = (
+        "invalid api-key",
+        "api-key invalid",
+        "invalid api key",
+        "invalid key",
+        "invalid signature",
+        "signature for this request is not valid",
+        "signature mismatch",
+        "permission denied",
+        "not authorized",
+        "no permission",
+        "apikey permission",
+        "trade permission",
+        "ip",
+        "whitelist",
+    )
+    return any(n in t for n in needles)
+
+
+async def _binance_signed_request(
+    session: aiohttp.ClientSession,
+    *,
+    base_url: str,
+    path: str,
+    method: str,
+    api_key: str,
+    api_secret: str,
+    params: dict | None = None,
+) -> dict:
+    """Minimal Binance signed request helper (HMAC SHA256 query signature)."""
+    params = dict(params or {})
+    params.setdefault("timestamp", str(int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)))
+    query = urllib.parse.urlencode(params, doseq=True)
+    sig = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+    url = f"{base_url}{path}?{query}&signature={sig}"
+    headers = {"X-MBX-APIKEY": api_key}
+    try:
+        async with session.request(method.upper(), url, headers=headers) as r:
+            data = await r.json(content_type=None)
+            if r.status != 200:
+                raise ExchangeAPIError(f"Binance API HTTP {r.status}: {data}")
+            return data if isinstance(data, dict) else {"data": data}
+    except ExchangeAPIError:
+        raise
+    except Exception as e:
+        raise ExchangeAPIError(f"Binance API error: {e}")
+
+
+async def _bybit_signed_request(
+    session: aiohttp.ClientSession,
+    *,
+    base_url: str,
+    path: str,
+    method: str,
+    api_key: str,
+    api_secret: str,
+    params: dict | None = None,
+) -> dict:
+    """Bybit V5 signing helper (HMAC SHA256). We use GET for validation."""
+    params = dict(params or {})
+    ts = str(int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000))
+    recv = "5000"
+    query = urllib.parse.urlencode(params, doseq=True)
+    pre = ts + api_key + recv + query
+    sig = hmac.new(api_secret.encode("utf-8"), pre.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-SIGN": sig,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+    }
+    url = f"{base_url}{path}"
+    if query:
+        url += f"?{query}"
+    try:
+        async with session.request(method.upper(), url, headers=headers) as r:
+            data = await r.json(content_type=None)
+            if r.status != 200:
+                raise ExchangeAPIError(f"Bybit API HTTP {r.status}: {data}")
+            if isinstance(data, dict) and int(data.get("retCode", 0) or 0) != 0:
+                raise ExchangeAPIError(f"Bybit API retCode {data.get('retCode')}: {data.get('retMsg')}")
+            return data if isinstance(data, dict) else {"data": data}
+    except ExchangeAPIError:
+        raise
+    except Exception as e:
+        raise ExchangeAPIError(f"Bybit API error: {e}")
+
+
+async def _bybit_v5_request(
+    session: aiohttp.ClientSession,
+    *,
+    method: str,
+    path: str,
+    api_key: str,
+    api_secret: str,
+    params: dict | None = None,
+    json_body: dict | None = None,
+    base_url: str = "https://api.bybit.com",
+) -> dict:
+    """Bybit V5 request helper for GET/POST with proper signing.
+
+    Signature: HMAC_SHA256(secret, timestamp + apiKey + recvWindow + payload)
+      - payload is queryString for GET
+      - payload is JSON string for POST
+    """
+    params = dict(params or {})
+    ts = str(int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000))
+    recv = "5000"
+    method_u = method.upper()
+    query = urllib.parse.urlencode(params, doseq=True)
+    body_str = ""
+    if json_body is not None:
+        body_str = json.dumps(json_body, separators=(",", ":"), ensure_ascii=False)
+    payload = query if method_u == "GET" else body_str
+    pre = ts + api_key + recv + payload
+    sig = hmac.new(api_secret.encode("utf-8"), pre.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-SIGN": sig,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "Content-Type": "application/json",
+    }
+    url = f"{base_url}{path}"
+    if query and method_u == "GET":
+        url += f"?{query}"
+    try:
+        async with session.request(method_u, url, headers=headers, data=(body_str if method_u != "GET" else None)) as r:
+            data = await r.json(content_type=None)
+            if r.status != 200:
+                raise ExchangeAPIError(f"Bybit API HTTP {r.status}: {data}")
+            if isinstance(data, dict) and int(data.get("retCode", 0) or 0) != 0:
+                raise ExchangeAPIError(f"Bybit API retCode {data.get('retCode')}: {data.get('retMsg')}")
+            return data if isinstance(data, dict) else {"data": data}
+    except ExchangeAPIError:
+        raise
+    except Exception as e:
+        raise ExchangeAPIError(f"Bybit API error: {e}")
+
+
+async def validate_autotrade_keys(
+    *,
+    exchange: str,
+    market_type: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str | None = None,
+) -> dict:
+    """Validate keys for READ + TRADE permissions.
+
+    We avoid placing real orders. For Binance we use `canTrade` field
+    from signed account endpoints when available.
+
+    Returns:
+      {"ok": bool, "read_ok": bool, "trade_ok": bool, "error": str|None}
+    """
+    ex = (exchange or "binance").lower().strip()
+    mt = (market_type or "spot").lower().strip()
+    if ex not in ("binance", "bybit"):
+        ex = "binance"
+    if mt not in ("spot", "futures"):
+        mt = "spot"
+    api_key = (api_key or "").strip()
+    api_secret = (api_secret or "").strip()
+    if not api_key or not api_secret:
+        return {"ok": False, "read_ok": False, "trade_ok": False, "error": "missing_keys"}
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            if ex == "binance":
+                if mt == "spot":
+                    acc = await _binance_signed_request(
+                        s,
+                        base_url="https://api.binance.com",
+                        path="/api/v3/account",
+                        method="GET",
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        params={"recvWindow": "5000"},
+                    )
+                    can_trade = acc.get("canTrade")
+                    if can_trade is not None and not bool(can_trade):
+                        return {"ok": False, "read_ok": True, "trade_ok": False, "error": "trade_permission_missing"}
+                    # READ ok; if canTrade absent, treat as ok and rely on runtime errors.
+                    return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
+
+                acc = await _binance_signed_request(
+                    s,
+                    base_url="https://fapi.binance.com",
+                    path="/fapi/v2/account",
+                    method="GET",
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    params={"recvWindow": "5000"},
+                )
+                can_trade = acc.get("canTrade")
+                if can_trade is not None and not bool(can_trade):
+                    return {"ok": False, "read_ok": True, "trade_ok": False, "error": "trade_permission_missing"}
+                return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
+
+            # Bybit: query key info (best-effort)
+            data = await _bybit_signed_request(
+                s,
+                base_url="https://api.bybit.com",
+                path="/v5/user/query-api",
+                method="GET",
+                api_key=api_key,
+                api_secret=api_secret,
+                params={},
+            )
+            res = data.get("result") or {}
+            if isinstance(res, dict):
+                # readOnly=1 typically means no trading
+                ro = res.get("readOnly")
+                if ro is not None and int(ro) == 1:
+                    return {"ok": False, "read_ok": True, "trade_ok": False, "error": "trade_permission_missing"}
+                perm = res.get("permissions") or res.get("permission")
+                if isinstance(perm, dict):
+                    trade_flag = perm.get("Trade") or perm.get("trade") or perm.get("SpotTrade") or perm.get("ContractTrade")
+                    if trade_flag is not None and not bool(trade_flag):
+                        return {"ok": False, "read_ok": True, "trade_ok": False, "error": "trade_permission_missing"}
+            return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
+    except ExchangeAPIError as e:
+        return {"ok": False, "read_ok": False, "trade_ok": False, "error": str(e)}
+
+
+def _autotrade_fernet() -> Fernet:
+    k = (os.getenv("AUTOTRADE_MASTER_KEY") or "").strip()
+    if not k:
+        raise RuntimeError("AUTOTRADE_MASTER_KEY env is missing")
+    return Fernet(k.encode("utf-8"))
+
+
+def _decrypt_token(token: str | None) -> str:
+    if not token:
+        return ""
+    f = _autotrade_fernet()
+    return f.decrypt(token.encode("utf-8")).decode("utf-8")
+
+
+async def _http_json(method: str, url: str, *, params: dict | None = None, json_body: dict | None = None, headers: dict | None = None, timeout_s: int = 10) -> dict:
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        async with s.request(method.upper(), url, params=params, json=json_body, headers=headers) as r:
+            data = await r.json(content_type=None)
+            if r.status != 200:
+                raise ExchangeAPIError(f"HTTP {r.status} {url}: {data}")
+            return data if isinstance(data, dict) else {"data": data}
+
+
+def _round_step(qty: float, step: float) -> float:
+    """Round quantity down to the nearest step."""
+    if step <= 0:
+        return float(qty)
+    return math.floor(float(qty) / float(step)) * float(step)
+
+
+def _round_tick(price: float, tick: float) -> float:
+    """Round price down to the nearest tick."""
+    if tick <= 0:
+        return float(price)
+    return math.floor(float(price) / float(tick)) * float(tick)
+
+
+_BINANCE_INFO_CACHE: dict[str, dict] = {}
+
+
+async def _binance_exchange_info(*, futures: bool) -> dict:
+    key = "futures" if futures else "spot"
+    if key in _BINANCE_INFO_CACHE and _BINANCE_INFO_CACHE[key].get("_ts", 0) > time.time() - 3600:
+        return _BINANCE_INFO_CACHE[key]
+    url = "https://fapi.binance.com/fapi/v1/exchangeInfo" if futures else "https://api.binance.com/api/v3/exchangeInfo"
+    data = await _http_json("GET", url, timeout_s=10)
+    data["_ts"] = time.time()
+    _BINANCE_INFO_CACHE[key] = data
+    return data
+
+
+def _binance_symbol_filters(info: dict, symbol: str) -> tuple[float, float, float, float]:
+    """Return (qty_step, min_qty, tick_size, min_notional) for symbol. Best-effort."""
+    sym = symbol.upper()
+    for s in info.get("symbols", []) or []:
+        if str(s.get("symbol")).upper() == sym:
+            step = 0.0
+            min_qty = 0.0
+            tick = 0.0
+            min_notional = 0.0
+            for f in s.get("filters", []) or []:
+                if f.get("filterType") == "LOT_SIZE":
+                    step = float(f.get("stepSize") or 0.0)
+                    min_qty = float(f.get("minQty") or 0.0)
+                elif f.get("filterType") == "PRICE_FILTER":
+                    tick = float(f.get("tickSize") or 0.0)
+                elif f.get("filterType") in ("MIN_NOTIONAL", "NOTIONAL"):
+                    # spot often uses MIN_NOTIONAL; some endpoints expose NOTIONAL
+                    mn = f.get("minNotional")
+                    if mn is None:
+                        mn = f.get("notional")
+                    try:
+                        min_notional = float(mn or 0.0)
+                    except Exception:
+                        pass
+            return step, min_qty, tick, min_notional
+    return 0.0, 0.0, 0.0, 0.0
+
+
+async def _binance_price(symbol: str, *, futures: bool) -> float:
+    sym = symbol.upper()
+    url = "https://fapi.binance.com/fapi/v1/ticker/price" if futures else "https://api.binance.com/api/v3/ticker/price"
+    data = await _http_json("GET", url, params={"symbol": sym}, timeout_s=8)
+    return float(data.get("price") or 0.0)
+
+
+# ------------------ Bybit trading helpers (V5, unified API) ------------------
+
+async def _bybit_price(symbol: str, *, category: str) -> float:
+    sym = symbol.upper()
+    data = await _http_json(
+        "GET",
+        "https://api.bybit.com/v5/market/tickers",
+        params={"category": category, "symbol": sym},
+        timeout_s=10,
+    )
+    lst = (data.get("result") or {}).get("list") or []
+    if lst and isinstance(lst, list) and isinstance(lst[0], dict):
+        return float(lst[0].get("lastPrice") or 0.0)
+    return 0.0
+
+
+_BYBIT_INFO_CACHE: dict[str, dict] = {}
+
+
+async def _bybit_instrument_filters(*, category: str, symbol: str) -> tuple[float, float, float]:
+    """Return (qty_step, min_qty, tick_size) for a Bybit V5 instrument."""
+    key = f"{category}:{symbol.upper()}"
+    cached = _BYBIT_INFO_CACHE.get(key)
+    if cached and cached.get("_ts", 0) > time.time() - 3600:
+        return float(cached.get("qty_step") or 0.0), float(cached.get("min_qty") or 0.0), float(cached.get("tick") or 0.0)
+
+    data = await _http_json(
+        "GET",
+        "https://api.bybit.com/v5/market/instruments-info",
+        params={"category": category, "symbol": symbol.upper()},
+        timeout_s=10,
+    )
+    lst = ((data.get("result") or {}).get("list") or [])
+    qty_step = 0.0
+    min_qty = 0.0
+    tick = 0.0
+    if lst and isinstance(lst, list) and isinstance(lst[0], dict):
+        it = lst[0]
+        lot = it.get("lotSizeFilter") or {}
+        pf = it.get("priceFilter") or {}
+        try:
+            qty_step = float(lot.get("qtyStep") or 0.0)
+        except Exception:
+            qty_step = 0.0
+        try:
+            min_qty = float(lot.get("minOrderQty") or 0.0)
+        except Exception:
+            min_qty = 0.0
+        try:
+            tick = float(pf.get("tickSize") or 0.0)
+        except Exception:
+            tick = 0.0
+
+    _BYBIT_INFO_CACHE[key] = {"_ts": time.time(), "qty_step": qty_step, "min_qty": min_qty, "tick": tick}
+    return qty_step, min_qty, tick
+
+
+async def _bybit_available_usdt(api_key: str, api_secret: str) -> float:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _bybit_v5_request(
+            s,
+            method="GET",
+            path="/v5/account/wallet-balance",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"accountType": "UNIFIED", "coin": "USDT"},
+        )
+        res = (data.get("result") or {})
+        lst = res.get("list") or []
+        if not lst:
+            return 0.0
+        coin = None
+        # bybit nests coin list
+        cl = lst[0].get("coin") if isinstance(lst[0], dict) else None
+        if isinstance(cl, list) and cl:
+            coin = cl[0]
+        if isinstance(coin, dict):
+            for k in ("availableToWithdraw", "walletBalance", "equity"):
+                if coin.get(k) is not None:
+                    try:
+                        return float(coin.get(k) or 0.0)
+                    except Exception:
+                        pass
+        # fallback total
+        try:
+            return float(lst[0].get("totalAvailableBalance") or 0.0)
+        except Exception:
+            return 0.0
+
+
+async def _bybit_order_create(
+    *,
+    api_key: str,
+    api_secret: str,
+    category: str,
+    symbol: str,
+    side: str,
+    order_type: str,
+    qty: float,
+    price: float | None = None,
+    reduce_only: bool | None = None,
+    trigger_price: float | None = None,
+    close_on_trigger: bool | None = None,
+) -> dict:
+    body: dict[str, Any] = {
+        "category": category,
+        "symbol": symbol.upper(),
+        "side": "Buy" if side.upper() in ("BUY", "LONG") else "Sell",
+        "orderType": order_type,
+        "qty": str(float(qty)),
+        "timeInForce": "GTC",
+    }
+    if price is not None:
+        body["price"] = str(float(price))
+    if reduce_only is not None:
+        body["reduceOnly"] = bool(reduce_only)
+    if trigger_price is not None:
+        body["triggerPrice"] = str(float(trigger_price))
+    if close_on_trigger is not None:
+        body["closeOnTrigger"] = bool(close_on_trigger)
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        return await _bybit_v5_request(
+            s,
+            method="POST",
+            path="/v5/order/create",
+            api_key=api_key,
+            api_secret=api_secret,
+            json_body=body,
+        )
+
+
+async def _bybit_order_status(*, api_key: str, api_secret: str, category: str, symbol: str, order_id: str) -> dict:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        return await _bybit_v5_request(
+            s,
+            method="GET",
+            path="/v5/order/realtime",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"category": category, "symbol": symbol.upper(), "orderId": str(order_id)},
+        )
+
+
+async def _bybit_cancel_order(*, api_key: str, api_secret: str, category: str, symbol: str, order_id: str) -> None:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        await _bybit_v5_request(
+            s,
+            method="POST",
+            path="/v5/order/cancel",
+            api_key=api_key,
+            api_secret=api_secret,
+            json_body={"category": category, "symbol": symbol.upper(), "orderId": str(order_id)},
+        )
+
+
+async def _binance_spot_free_usdt(api_key: str, api_secret: str) -> float:
+    timeout = aiohttp.ClientTimeout(total=8)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        acc = await _binance_signed_request(
+            s,
+            base_url="https://api.binance.com",
+            path="/api/v3/account",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"recvWindow": "5000"},
+        )
+        for b in acc.get("balances", []) or []:
+            if str(b.get("asset")) == "USDT":
+                return float(b.get("free") or 0.0)
+    return 0.0
+
+
+async def _binance_futures_available_margin(api_key: str, api_secret: str) -> float:
+    timeout = aiohttp.ClientTimeout(total=8)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        acc = await _binance_signed_request(
+            s,
+            base_url="https://fapi.binance.com",
+            path="/fapi/v2/account",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"recvWindow": "5000"},
+        )
+        # availableBalance is the best signal for free margin
+        try:
+            return float(acc.get("availableBalance") or 0.0)
+        except Exception:
+            return 0.0
+
+
+async def _binance_spot_market_buy_quote(
+    *,
+    api_key: str,
+    api_secret: str,
+    symbol: str,
+    quote_usdt: float,
+) -> dict:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        return await _binance_signed_request(
+            s,
+            base_url="https://api.binance.com",
+            path="/api/v3/order",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={
+                "symbol": symbol.upper(),
+                "side": "BUY",
+                "type": "MARKET",
+                "quoteOrderQty": f"{quote_usdt:.8f}",
+                "newOrderRespType": "FULL",
+                "recvWindow": "5000",
+            },
+        )
+
+
+async def _binance_spot_market_sell_base(
+    *,
+    api_key: str,
+    api_secret: str,
+    symbol: str,
+    qty: float,
+) -> dict:
+    """Emergency spot close (SELL MARKET by base quantity)."""
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        return await _binance_signed_request(
+            s,
+            base_url="https://api.binance.com",
+            path="/api/v3/order",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={
+                "symbol": symbol.upper(),
+                "side": "SELL",
+                "type": "MARKET",
+                "quantity": f"{float(qty):.8f}",
+                "newOrderRespType": "FULL",
+                "recvWindow": "5000",
+            },
+        )
+
+
+async def _binance_spot_limit_sell(
+    *,
+    api_key: str,
+    api_secret: str,
+    symbol: str,
+    qty: float,
+    price: float,
+) -> dict:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        return await _binance_signed_request(
+            s,
+            base_url="https://api.binance.com",
+            path="/api/v3/order",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={
+                "symbol": symbol.upper(),
+                "side": "SELL",
+                "type": "LIMIT",
+                "timeInForce": "GTC",
+                "quantity": f"{qty:.8f}",
+                "price": f"{price:.8f}",
+                "recvWindow": "5000",
+            },
+        )
+
+
+async def _binance_spot_stop_loss_limit_sell(
+    *,
+    api_key: str,
+    api_secret: str,
+    symbol: str,
+    qty: float,
+    stop_price: float,
+) -> dict:
+    # For STOP_LOSS_LIMIT, Binance requires both stopPrice and price.
+    limit_price = stop_price * 0.999
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        return await _binance_signed_request(
+            s,
+            base_url="https://api.binance.com",
+            path="/api/v3/order",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={
+                "symbol": symbol.upper(),
+                "side": "SELL",
+                "type": "STOP_LOSS_LIMIT",
+                "timeInForce": "GTC",
+                "quantity": f"{qty:.8f}",
+                "price": f"{limit_price:.8f}",
+                "stopPrice": f"{stop_price:.8f}",
+                "recvWindow": "5000",
+            },
+        )
+
+
+async def _binance_futures_set_leverage(*, api_key: str, api_secret: str, symbol: str, leverage: int) -> None:
+    lev = int(leverage or 1)
+    if lev < 1:
+        lev = 1
+    if lev > 125:
+        lev = 125
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        await _binance_signed_request(
+            s,
+            base_url="https://fapi.binance.com",
+            path="/fapi/v1/leverage",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"symbol": symbol.upper(), "leverage": str(lev), "recvWindow": "5000"},
+        )
+
+
+async def _binance_futures_market_open(
+    *,
+    api_key: str,
+    api_secret: str,
+    symbol: str,
+    side: str,
+    qty: float,
+) -> dict:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        return await _binance_signed_request(
+            s,
+            base_url="https://fapi.binance.com",
+            path="/fapi/v1/order",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={
+                "symbol": symbol.upper(),
+                "side": side.upper(),
+                "type": "MARKET",
+                "quantity": f"{qty:.8f}",
+                "recvWindow": "5000",
+            },
+        )
+
+
+async def _binance_futures_reduce_limit(
+    *,
+    api_key: str,
+    api_secret: str,
+    symbol: str,
+    side: str,
+    qty: float,
+    price: float,
+) -> dict:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        return await _binance_signed_request(
+            s,
+            base_url="https://fapi.binance.com",
+            path="/fapi/v1/order",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={
+                "symbol": symbol.upper(),
+                "side": side.upper(),
+                "type": "LIMIT",
+                "timeInForce": "GTC",
+                "reduceOnly": "true",
+                "quantity": f"{qty:.8f}",
+                "price": f"{price:.8f}",
+                "recvWindow": "5000",
+            },
+        )
+
+
+async def _binance_futures_reduce_market(
+    *,
+    api_key: str,
+    api_secret: str,
+    symbol: str,
+    side: str,
+    qty: float,
+) -> dict:
+    """Reduce-only MARKET order (emergency close / partial close)."""
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        return await _binance_signed_request(
+            s,
+            base_url="https://fapi.binance.com",
+            path="/fapi/v1/order",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={
+                "symbol": symbol.upper(),
+                "side": side.upper(),
+                "type": "MARKET",
+                "reduceOnly": "true",
+                "quantity": f"{float(qty):.8f}",
+                "recvWindow": "5000",
+            },
+        )
+
+
+async def _binance_futures_stop_market_close_all(
+    *,
+    api_key: str,
+    api_secret: str,
+    symbol: str,
+    side: str,
+    stop_price: float,
+) -> dict:
+    # side is the close side (opposite to entry): SELL closes long, BUY closes short.
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        return await _binance_signed_request(
+            s,
+            base_url="https://fapi.binance.com",
+            path="/fapi/v1/order",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={
+                "symbol": symbol.upper(),
+                "side": side.upper(),
+                "type": "STOP_MARKET",
+                "stopPrice": f"{stop_price:.8f}",
+                "closePosition": "true",
+                "recvWindow": "5000",
+            },
+        )
+
+
+async def _binance_order_status(
+    *,
+    api_key: str,
+    api_secret: str,
+    symbol: str,
+    order_id: int,
+    futures: bool,
+) -> dict:
+    timeout = aiohttp.ClientTimeout(total=10)
+    base_url = "https://fapi.binance.com" if futures else "https://api.binance.com"
+    path = "/fapi/v1/order" if futures else "/api/v3/order"
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        return await _binance_signed_request(
+            s,
+            base_url=base_url,
+            path=path,
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"symbol": symbol.upper(), "orderId": str(int(order_id)), "recvWindow": "5000"},
+        )
+
+
+async def _binance_cancel_order(*, api_key: str, api_secret: str, symbol: str, order_id: int, futures: bool) -> None:
+    timeout = aiohttp.ClientTimeout(total=10)
+    base_url = "https://fapi.binance.com" if futures else "https://api.binance.com"
+    path = "/fapi/v1/order" if futures else "/api/v3/order"
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        await _binance_signed_request(
+            s,
+            base_url=base_url,
+            path=path,
+            method="DELETE",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"symbol": symbol.upper(), "orderId": str(int(order_id)), "recvWindow": "5000"},
+        )
+
+
+async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
+    """Execute real trading orders for a signal for a single user.
+
+    Returns dict:
+      {"ok": bool, "skipped": bool, "api_error": str|None}
+    """
+    uid = int(user_id)
+    market = (getattr(sig, "market", "") or "").upper()
+    if market not in ("SPOT", "FUTURES"):
+        return {"ok": False, "skipped": True, "api_error": None}
+
+    st = await db_store.get_autotrade_settings(uid)
+    mt = "spot" if market == "SPOT" else "futures"
+    enabled = bool(st.get("spot_enabled")) if mt == "spot" else bool(st.get("futures_enabled"))
+    if not enabled:
+        return {"ok": False, "skipped": True, "api_error": None}
+
+    exchange = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "binance").lower()
+    if exchange not in ("binance", "bybit"):
+        exchange = "binance"
+
+    # amounts
+    spot_amt = float(st.get("spot_amount_per_trade") or 0.0)
+    fut_margin = float(st.get("futures_margin_per_trade") or 0.0)
+    fut_cap = float(st.get("futures_cap") or 0.0)
+    fut_lev = int(st.get("futures_leverage") or 1)
+
+    need_usdt = spot_amt if mt == "spot" else fut_margin
+    # Hard minimums (validated in bot UI and DB, but re-checked here for safety)
+    if mt == "spot" and 0 < need_usdt < 10:
+        return {"ok": False, "skipped": True, "api_error": None}
+    if mt == "futures" and 0 < need_usdt < 5:
+        return {"ok": False, "skipped": True, "api_error": None}
+    if need_usdt <= 0:
+        return {"ok": False, "skipped": True, "api_error": None}
+
+    # fetch keys
+    row = await db_store.get_autotrade_keys_row(user_id=uid, exchange=exchange, market_type=mt)
+    if not row or not bool(row.get("is_active")):
+        return {"ok": False, "skipped": True, "api_error": None}
+    try:
+        api_key = _decrypt_token(row.get("api_key_enc"))
+        api_secret = _decrypt_token(row.get("api_secret_enc"))
+    except Exception as e:
+        await db_store.mark_autotrade_key_error(
+            user_id=uid,
+            exchange=exchange,
+            market_type=mt,
+            error=f"decrypt_error: {e}",
+            deactivate=True,
+        )
+        return {"ok": False, "skipped": True, "api_error": f"decrypt_error"}
+
+    symbol = str(getattr(sig, "symbol", "") or "").upper().replace("/", "")
+    if not symbol:
+        return {"ok": False, "skipped": True, "api_error": None}
+
+    direction = str(getattr(sig, "direction", "LONG") or "LONG").upper()
+    entry = float(getattr(sig, "entry", 0.0) or 0.0)
+    sl = float(getattr(sig, "sl", 0.0) or 0.0)
+    tp1 = float(getattr(sig, "tp1", 0.0) or 0.0)
+    tp2 = float(getattr(sig, "tp2", 0.0) or 0.0)
+
+    try:
+        if exchange == "bybit":
+            category = "spot" if mt == "spot" else "linear"
+            # Futures cap is user-defined (by margin). Spot cap is implicit (wallet balance).
+            if mt == "futures":
+                used = await db_store.get_autotrade_used_usdt(uid, "futures")
+                if fut_cap > 0 and used + need_usdt > fut_cap:
+                    return {"ok": False, "skipped": True, "api_error": None}
+            free = await _bybit_available_usdt(api_key, api_secret)
+            if free < need_usdt:
+                return {"ok": False, "skipped": True, "api_error": None}
+
+            direction_local = direction
+            if mt == "spot":
+                # Spot: only long/buy is supported.
+                side = "BUY"
+            else:
+                side = "BUY" if direction_local == "LONG" else "SELL"
+            close_side = "SELL" if side == "BUY" else "BUY"
+
+            px = await _bybit_price(symbol, category=category)
+            if px <= 0:
+                raise ExchangeAPIError("Bybit price=0")
+
+            qty_step, min_qty, tick = await _bybit_instrument_filters(category=category, symbol=symbol)
+
+            # Spot qty in base; Futures qty in contracts (approx via notional/price)
+            if mt == "spot":
+                qty = max(0.0, need_usdt / px)
+            else:
+                qty = max(0.0, (need_usdt * float(fut_lev)) / px)
+            if qty_step > 0:
+                qty = _round_step(qty, qty_step)
+            if min_qty > 0 and qty < min_qty:
+                raise ExchangeAPIError(f"Bybit qty<minQty after rounding: {qty} < {min_qty}")
+
+            entry_res = await _bybit_order_create(
+                api_key=api_key,
+                api_secret=api_secret,
+                category=category,
+                symbol=symbol,
+                side=side,
+                order_type="Market",
+                qty=qty,
+                reduce_only=False if mt == "futures" else None,
+            )
+            order_id = ((entry_res.get("result") or {}).get("orderId") or (entry_res.get("result") or {}).get("orderId"))
+
+            has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
+            qty1 = _round_step(qty * (0.5 if has_tp2 else 1.0), qty_step)
+            qty2 = _round_step(qty - qty1, qty_step) if has_tp2 else 0.0
+            if has_tp2 and min_qty > 0 and qty2 < min_qty:
+                has_tp2 = False
+                qty1 = qty
+                qty2 = 0.0
+
+            # Place SL first; if SL fails, immediately close to avoid unprotected exposure.
+            try:
+                sl_res = await _bybit_order_create(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    category=category,
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="Market",
+                    qty=qty,
+                    reduce_only=(True if mt == "futures" else None),
+                    trigger_price=_round_tick(sl, tick),
+                    close_on_trigger=(True if mt == "futures" else None),
+                )
+            except Exception:
+                try:
+                    await _bybit_order_create(
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        category=category,
+                        symbol=symbol,
+                        side=close_side,
+                        order_type="Market",
+                        qty=qty,
+                        reduce_only=(True if mt == "futures" else None),
+                    )
+                except Exception:
+                    pass
+                raise
+
+            # TP(s) as limit reduce-only for futures; spot normal sell. If TP1 fails, close to avoid half-configured strategy.
+            try:
+                tp1_res = await _bybit_order_create(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    category=category,
+                    symbol=symbol,
+                    side=close_side,
+                    order_type="Limit",
+                    qty=qty1,
+                    price=_round_tick(tp1, tick),
+                    reduce_only=(True if mt == "futures" else None),
+                )
+            except Exception:
+                try:
+                    await _bybit_cancel_order(api_key=api_key, api_secret=api_secret, category=category, symbol=symbol, order_id=str((sl_res.get("result") or {}).get("orderId") or ""))
+                except Exception:
+                    pass
+                try:
+                    await _bybit_order_create(
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        category=category,
+                        symbol=symbol,
+                        side=close_side,
+                        order_type="Market",
+                        qty=qty,
+                        reduce_only=(True if mt == "futures" else None),
+                    )
+                except Exception:
+                    pass
+                raise
+
+            tp2_res = None
+            if has_tp2 and qty2 > 0:
+                try:
+                    tp2_res = await _bybit_order_create(
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        category=category,
+                        symbol=symbol,
+                        side=close_side,
+                        order_type="Limit",
+                        qty=qty2,
+                        price=_round_tick(tp2, tick),
+                        reduce_only=(True if mt == "futures" else None),
+                    )
+                except Exception:
+                    tp2_res = None
+
+            def _rid(x: dict | None) -> str | None:
+                if not isinstance(x, dict):
+                    return None
+                return str((x.get("result") or {}).get("orderId") or "") or None
+
+            ref = {
+                "exchange": "bybit",
+                "market_type": mt,
+                "category": category,
+                "symbol": symbol,
+                "side": side,
+                "close_side": close_side,
+                "entry_order_id": str(order_id) if order_id else None,
+                "sl_order_id": _rid(sl_res),
+                "tp1_order_id": _rid(tp1_res),
+                "tp2_order_id": _rid(tp2_res),
+                "entry_price": float(entry or 0.0),
+                "be_price": float(entry or 0.0),
+                "be_moved": False,
+                "qty": qty,
+                "tp1": tp1,
+                "tp2": tp2,
+                "sl": sl,
+            }
+
+            sig_id = _extract_signal_id(sig)
+            if sig_id <= 0:
+                raise ExchangeAPIError("missing signal_id")
+            await db_store.create_autotrade_position(
+                user_id=uid,
+                signal_id=sig_id,
+                exchange="bybit",
+                market_type=mt,
+                symbol=symbol,
+                side=side,
+                allocated_usdt=need_usdt,
+                api_order_ref=json.dumps(ref),
+            )
+            return {"ok": True, "skipped": False, "api_error": None}
+
+        # -------- Binance --------
+        if mt == "spot":
+            free = await _binance_spot_free_usdt(api_key, api_secret)
+            if free < need_usdt:
+                return {"ok": False, "skipped": True, "api_error": None}
+
+            info = await _binance_exchange_info(futures=False)
+            qty_step, min_qty, tick, min_notional = _binance_symbol_filters(info, symbol)
+
+            # Entry: market buy by quote amount (USDT)
+            entry_res = await _binance_spot_market_buy_quote(
+                api_key=api_key,
+                api_secret=api_secret,
+                symbol=symbol,
+                quote_usdt=need_usdt,
+            )
+
+            exec_qty = float(entry_res.get("executedQty") or 0.0)
+            if exec_qty <= 0:
+                # fallback: attempt to infer from fills
+                q = 0.0
+                for f in entry_res.get("fills", []) or []:
+                    q += float(f.get("qty") or 0.0)
+                exec_qty = q
+            if exec_qty <= 0:
+                raise ExchangeAPIError(f"Binance SPOT entry executedQty=0: {entry_res}")
+
+            # Split for TP1/TP2 (respect LOT_SIZE)
+            has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
+            qty1 = exec_qty * (0.5 if has_tp2 else 1.0)
+            qty2 = exec_qty - qty1 if has_tp2 else 0.0
+            qty1 = _round_step(qty1, qty_step)
+            qty2 = _round_step(qty2, qty_step)
+            exec_qty = _round_step(exec_qty, qty_step)
+            if exec_qty < min_qty:
+                raise ExchangeAPIError(f"Binance SPOT qty<minQty after rounding: {exec_qty} < {min_qty}")
+            if has_tp2 and qty2 < min_qty:
+                # If the second leg becomes too small, do a single TP.
+                has_tp2 = False
+                qty1 = exec_qty
+                qty2 = 0.0
+
+            # Place SL first; if SL fails, immediately close (sell) to avoid an unprotected position.
+            try:
+                sl_res = await _binance_spot_stop_loss_limit_sell(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    symbol=symbol,
+                    qty=exec_qty,
+                    stop_price=_round_tick(sl, tick),
+                )
+            except Exception as e:
+                # Emergency close
+                try:
+                    await _binance_spot_market_sell_base(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=exec_qty)
+                except Exception:
+                    pass
+                raise
+
+            # Place TP(s). If TP1 fails, close to avoid keeping a half-configured strategy.
+            try:
+                tp1_res = await _binance_spot_limit_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=qty1, price=_round_tick(tp1, tick))
+            except Exception:
+                try:
+                    await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_res.get("orderId") or 0), futures=False)
+                except Exception:
+                    pass
+                try:
+                    await _binance_spot_market_sell_base(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=exec_qty)
+                except Exception:
+                    pass
+                raise
+            tp2_res = None
+            if has_tp2 and qty2 > 0:
+                tp2_res = await _binance_spot_limit_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=qty2, price=_round_tick(tp2, tick))
+
+            ref = {
+                "exchange": "binance",
+                "market_type": "spot",
+                "symbol": symbol,
+                "side": "BUY",
+                "entry_order_id": entry_res.get("orderId"),
+                "sl_order_id": sl_res.get("orderId"),
+                "tp1_order_id": tp1_res.get("orderId"),
+                "tp2_order_id": (tp2_res.get("orderId") if isinstance(tp2_res, dict) else None),
+                "entry_price": float(entry or 0.0),
+                "be_price": float(entry or 0.0),
+                "be_moved": False,
+                "qty": exec_qty,
+                "tp1": tp1,
+                "tp2": tp2,
+                "sl": sl,
+            }
+
+            sig_id = _extract_signal_id(sig)
+            if sig_id <= 0:
+                raise ExchangeAPIError("missing signal_id")
+            await db_store.create_autotrade_position(
+                user_id=uid,
+                signal_id=sig_id,
+                exchange="binance",
+                market_type="spot",
+                symbol=symbol,
+                side="BUY",
+                allocated_usdt=need_usdt,
+                api_order_ref=json.dumps(ref),
+            )
+            return {"ok": True, "skipped": False, "api_error": None}
+
+        # futures
+        used = await db_store.get_autotrade_used_usdt(uid, "futures")
+        if fut_cap > 0 and used + need_usdt > fut_cap:
+            return {"ok": False, "skipped": True, "api_error": None}
+
+        avail = await _binance_futures_available_margin(api_key, api_secret)
+        if avail < need_usdt:
+            return {"ok": False, "skipped": True, "api_error": None}
+
+        await _binance_futures_set_leverage(api_key=api_key, api_secret=api_secret, symbol=symbol, leverage=fut_lev)
+
+        # compute qty from margin*leverage/price
+        px = await _binance_price(symbol, futures=True)
+        if px <= 0:
+            raise ExchangeAPIError("Binance futures price=0")
+        raw_qty = (need_usdt * float(fut_lev)) / px
+        info = await _binance_exchange_info(futures=True)
+        step, min_qty, tick, _mn = _binance_symbol_filters(info, symbol)
+        qty = _round_step(raw_qty, step) if step > 0 else raw_qty
+        if min_qty > 0 and qty < min_qty:
+            qty = min_qty
+
+        side = "BUY" if direction == "LONG" else "SELL"
+        close_side = "SELL" if side == "BUY" else "BUY"
+        entry_res = await _binance_futures_market_open(api_key=api_key, api_secret=api_secret, symbol=symbol, side=side, qty=qty)
+
+        # Place SL first; if SL fails, immediately close position to avoid unprotected exposure.
+        try:
+            sl_res = await _binance_futures_stop_market_close_all(
+                api_key=api_key,
+                api_secret=api_secret,
+                symbol=symbol,
+                side=close_side,
+                stop_price=_round_tick(sl, tick),
+            )
+        except Exception:
+            try:
+                await _binance_futures_reduce_market(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=qty)
+            except Exception:
+                pass
+            raise
+
+        # TP reduce-only limits (respect LOT_SIZE)
+        has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
+        qty1 = _round_step(qty * (0.5 if has_tp2 else 1.0), step)
+        qty2 = _round_step(qty - qty1, step) if has_tp2 else 0.0
+        if min_qty > 0 and qty1 < min_qty:
+            # Not enough size for strategy
+            raise ExchangeAPIError(f"Binance FUTURES qty<minQty after rounding: {qty1} < {min_qty}")
+        if has_tp2 and min_qty > 0 and qty2 < min_qty:
+            has_tp2 = False
+            qty1 = qty
+            qty2 = 0.0
+        try:
+            tp1_res = await _binance_futures_reduce_limit(
+                api_key=api_key,
+                api_secret=api_secret,
+                symbol=symbol,
+                side=close_side,
+                qty=qty1,
+                price=_round_tick(tp1, tick),
+            )
+        except Exception:
+            # Cancel SL and close to avoid half-configured strategy
+            try:
+                await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_res.get("orderId") or 0), futures=True)
+            except Exception:
+                pass
+            try:
+                await _binance_futures_reduce_market(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=qty)
+            except Exception:
+                pass
+            raise
+        tp2_res = None
+        if has_tp2 and qty2 > 0:
+            try:
+                tp2_res = await _binance_futures_reduce_limit(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=qty2, price=_round_tick(tp2, tick))
+            except Exception:
+                tp2_res = None
+
+        ref = {
+            "exchange": "binance",
+            "market_type": "futures",
+            "symbol": symbol,
+            "side": side,
+            "close_side": close_side,
+            "entry_order_id": entry_res.get("orderId"),
+            "sl_order_id": sl_res.get("orderId"),
+            "tp1_order_id": tp1_res.get("orderId"),
+            "tp2_order_id": (tp2_res.get("orderId") if isinstance(tp2_res, dict) else None),
+            "entry_price": float(entry or 0.0),
+            "be_price": float(entry or 0.0),
+            "be_moved": False,
+            "qty": qty,
+            "tp1": tp1,
+            "tp2": tp2,
+            "sl": sl,
+        }
+
+        sig_id = _extract_signal_id(sig)
+        if sig_id <= 0:
+            raise ExchangeAPIError("missing signal_id")
+        await db_store.create_autotrade_position(
+            user_id=uid,
+            signal_id=sig_id,
+            exchange="binance",
+            market_type="futures",
+            symbol=symbol,
+            side=side,
+            allocated_usdt=need_usdt,
+            api_order_ref=json.dumps(ref),
+        )
+        return {"ok": True, "skipped": False, "api_error": None}
+
+    except ExchangeAPIError as e:
+        err = str(e)
+        await db_store.mark_autotrade_key_error(
+            user_id=uid,
+            exchange=exchange,
+            market_type=mt,
+            error=err,
+            deactivate=_should_deactivate_key(err),
+        )
+        return {"ok": False, "skipped": False, "api_error": err}
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        await db_store.mark_autotrade_key_error(
+            user_id=uid,
+            exchange=exchange,
+            market_type=mt,
+            error=err,
+            deactivate=_should_deactivate_key(err),
+        )
+        return {"ok": False, "skipped": False, "api_error": err}
+
+
+async def autotrade_manager_loop(*, notify_api_error) -> None:
+    """Background loop to manage SL/TP/BE for real orders.
+
+    notify_api_error(user_id:int, text:str) will be called only on API errors.
+    """
+    # Best-effort; never crash.
+    while True:
+        try:
+            rows = await db_store.list_open_autotrade_positions(limit=500)
+            for r in rows:
+                try:
+                    ref = json.loads(r.get("api_order_ref") or "{}")
+                except Exception:
+                    continue
+                ex = str(ref.get("exchange") or r.get("exchange") or "").lower()
+                if ex not in ("binance", "bybit"):
+                    continue
+
+                uid = int(r.get("user_id"))
+                mt = str(ref.get("market_type") or r.get("market_type") or "").lower()
+                futures = (mt == "futures")
+                symbol = str(ref.get("symbol") or r.get("symbol") or "").upper()
+
+                # Load keys
+                row = await db_store.get_autotrade_keys_row(user_id=uid, exchange=ex, market_type=mt)
+                if not row or not bool(row.get("is_active")):
+                    continue
+                try:
+                    api_key = _decrypt_token(row.get("api_key_enc"))
+                    api_secret = _decrypt_token(row.get("api_secret_enc"))
+                except Exception:
+                    continue
+
+                tp1_id = ref.get("tp1_order_id")
+                tp2_id = ref.get("tp2_order_id")
+                sl_id = ref.get("sl_order_id")
+                be_moved = bool(ref.get("be_moved"))
+                be_price = float(ref.get("be_price") or 0.0)
+                close_side = str(ref.get("close_side") or ("SELL" if str(ref.get("side")) == "BUY" else "BUY")).upper()
+
+                # If TP1 filled and BE not moved: cancel SL and place new SL at entry (BE)
+                if tp1_id and (not be_moved) and be_price > 0:
+                    if ex == "binance":
+                        try:
+                            o = await _binance_order_status(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(tp1_id), futures=futures)
+                            tp1_filled = (str(o.get("status")) == "FILLED")
+                        except ExchangeAPIError as e:
+                            try:
+                                notify_api_error(uid, f"⚠️ Auto-trade ERROR ({ex} {mt})\n{str(e)[:200]}")
+                            except Exception:
+                                pass
+                            continue
+                    else:
+                        category = str(ref.get("category") or ("spot" if mt == "spot" else "linear"))
+                        try:
+                            o = await _bybit_order_status(api_key=api_key, api_secret=api_secret, category=category, symbol=symbol, order_id=str(tp1_id))
+                            lst = ((o.get("result") or {}).get("list") or [])
+                            st = (lst[0].get("orderStatus") if (lst and isinstance(lst[0], dict)) else None)
+                            tp1_filled = (str(st) == "Filled")
+                        except ExchangeAPIError as e:
+                            try:
+                                notify_api_error(uid, f"⚠️ Auto-trade ERROR ({ex} {mt})\n{str(e)[:200]}")
+                            except Exception:
+                                pass
+                            continue
+                    if tp1_filled:
+                        try:
+                            if sl_id:
+                                if ex == "binance":
+                                    await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_id), futures=futures)
+                                else:
+                                    category = str(ref.get("category") or ("spot" if mt == "spot" else "linear"))
+                                    await _bybit_cancel_order(api_key=api_key, api_secret=api_secret, category=category, symbol=symbol, order_id=str(sl_id))
+                        except Exception:
+                            pass
+
+                        # Place new SL at BE
+                        if ex == "binance":
+                            if futures:
+                                new_sl = await _binance_futures_stop_market_close_all(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, stop_price=be_price)
+                            else:
+                                qty = float(ref.get("qty") or 0.0)
+                                new_sl = await _binance_spot_stop_loss_limit_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=qty, stop_price=be_price)
+                        else:
+                            category = str(ref.get("category") or ("spot" if mt == "spot" else "linear"))
+                            qty = float(ref.get("qty") or 0.0)
+                            new_sl = await _bybit_order_create(
+                                api_key=api_key,
+                                api_secret=api_secret,
+                                category=category,
+                                symbol=symbol,
+                                side=close_side,
+                                order_type="Market",
+                                qty=qty,
+                                trigger_price=be_price,
+                                reduce_only=(True if mt == "futures" else None),
+                                close_on_trigger=(True if mt == "futures" else None),
+                            )
+
+                        if ex == "binance":
+                            ref["sl_order_id"] = new_sl.get("orderId")
+                        else:
+                            ref["sl_order_id"] = str(((new_sl.get("result") or {}).get("orderId") or "")) or None
+                        ref["be_moved"] = True
+                        await db_store.update_autotrade_order_ref(row_id=int(r.get("id")), api_order_ref=json.dumps(ref))
+
+                # Close detection: SL filled OR (TP2 filled if exists else TP1 filled)
+                # If SL FILLED -> closed
+                if sl_id:
+                    if ex == "binance":
+                        try:
+                            o_sl = await _binance_order_status(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_id), futures=futures)
+                            sl_filled = (str(o_sl.get("status")) == "FILLED")
+                        except ExchangeAPIError as e:
+                            try:
+                                notify_api_error(uid, f"⚠️ Auto-trade ERROR ({ex} {mt})\n{str(e)[:200]}")
+                            except Exception:
+                                pass
+                            continue
+                    else:
+                        category = str(ref.get("category") or ("spot" if mt == "spot" else "linear"))
+                        try:
+                            o_sl = await _bybit_order_status(api_key=api_key, api_secret=api_secret, category=category, symbol=symbol, order_id=str(sl_id))
+                            lst = ((o_sl.get("result") or {}).get("list") or [])
+                            stx = (lst[0].get("orderStatus") if (lst and isinstance(lst[0], dict)) else None)
+                            sl_filled = (str(stx) == "Filled")
+                        except ExchangeAPIError as e:
+                            try:
+                                notify_api_error(uid, f"⚠️ Auto-trade ERROR ({ex} {mt})\n{str(e)[:200]}")
+                            except Exception:
+                                pass
+                            continue
+                    if sl_filled:
+                        await db_store.close_autotrade_position(user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED")
+                        continue
+
+                target_id = tp2_id or tp1_id
+                if target_id:
+                    if ex == "binance":
+                        try:
+                            o_tp = await _binance_order_status(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(target_id), futures=futures)
+                            tp_filled = (str(o_tp.get("status")) == "FILLED")
+                        except ExchangeAPIError as e:
+                            try:
+                                notify_api_error(uid, f"⚠️ Auto-trade ERROR ({ex} {mt})\n{str(e)[:200]}")
+                            except Exception:
+                                pass
+                            continue
+                    else:
+                        category = str(ref.get("category") or ("spot" if mt == "spot" else "linear"))
+                        try:
+                            o_tp = await _bybit_order_status(api_key=api_key, api_secret=api_secret, category=category, symbol=symbol, order_id=str(target_id))
+                            lst = ((o_tp.get("result") or {}).get("list") or [])
+                            stx = (lst[0].get("orderStatus") if (lst and isinstance(lst[0], dict)) else None)
+                            tp_filled = (str(stx) == "Filled")
+                        except ExchangeAPIError as e:
+                            try:
+                                notify_api_error(uid, f"⚠️ Auto-trade ERROR ({ex} {mt})\n{str(e)[:200]}")
+                            except Exception:
+                                pass
+                            continue
+                    if tp_filled:
+                        await db_store.close_autotrade_position(user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED")
+
+        except ExchangeAPIError as e:
+            # global API issue; no user id here
+            logger.warning("Auto-trade manager API error: %s", e)
+        except Exception:
+            logger.exception("Auto-trade manager loop error")
+
+        await asyncio.sleep(10)
+
 
 # --- i18n template safety guard (prevents leaking {placeholders} to users) ---
 _UNFILLED_RE = re.compile(r'(?<!\{)\{[a-zA-Z0-9_]+\}(?!\})')
@@ -2082,6 +3566,7 @@ class Backend:
         except Exception:
             return None
 
+
     async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
         """Return (price, source) for tracking.
 
@@ -2372,9 +3857,14 @@ class Backend:
                     if not tp1_hit and s.tp2 and hit_tp(float(s.tp2)):
                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
                         pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.tp2), close_reason="WIN")
+                        import datetime as _dt
+                        now_utc = _dt.datetime.now(_dt.timezone.utc)
                         txt = _trf(uid, "msg_auto_win",
                             symbol=s.symbol,
+                            market=market,
                             pnl_total=fmt_pnl_pct(float(pnl)),
+                            opened_time=fmt_dt_msk(row.get("opened_at")),
+                            closed_time=fmt_dt_msk(now_utc),
                             status="WIN",
                         )
                         if dbg:
@@ -2387,8 +3877,14 @@ class Backend:
                     if not tp1_hit and s.sl and hit_sl(float(s.sl)):
                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
                         pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.sl), close_reason="LOSS")
+                        import datetime as _dt
+                        now_utc = _dt.datetime.now(_dt.timezone.utc)
                         txt = _trf(uid, "msg_auto_loss",
                             symbol=s.symbol,
+                            market=market,
+                            sl=f"{float(s.sl):.6f}",
+                            opened_time=fmt_dt_msk(row.get("opened_at")),
+                            closed_time=fmt_dt_msk(now_utc),
                             status="LOSS",
                         )
                         if dbg:
@@ -2400,10 +3896,15 @@ class Backend:
                     # 3) TP1 -> partial close + BE
                     if not tp1_hit and s.tp1 and hit_tp(float(s.tp1)):
                         be_px = _be_exit_price(s.entry, side, market)
+                        import datetime as _dt
+                        now_utc = _dt.datetime.now(_dt.timezone.utc)
                         txt = _trf(uid, "msg_auto_tp1",
                             symbol=s.symbol,
+                            market=market,
                             closed_pct=int(_partial_close_pct(market)),
                             be_price=f"{float(be_px):.6f}",
+                            opened_time=fmt_dt_msk(row.get("opened_at")),
+                            event_time=fmt_dt_msk(now_utc),
                             status="TP1",
                         )
                         if dbg:
@@ -2416,9 +3917,14 @@ class Backend:
                     if tp1_hit and _be_enabled(market):
                         be_lvl = be_price if be_price else _be_exit_price(s.entry, side, market)
                         if hit_sl(float(be_lvl)):
+                            import datetime as _dt
+                            now_utc = _dt.datetime.now(_dt.timezone.utc)
                             txt = _trf(uid, "msg_auto_be",
                                 symbol=s.symbol,
+                                market=market,
                                 be_price=f"{float(be_lvl):.6f}",
+                                opened_time=fmt_dt_msk(row.get("opened_at")),
+                                closed_time=fmt_dt_msk(now_utc),
                                 status="BE",
                             )
                             if dbg:
@@ -2433,9 +3939,14 @@ class Backend:
                     if s.tp2 and hit_tp(float(s.tp2)):
                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
                         pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.tp2), close_reason="WIN")
+                        import datetime as _dt
+                        now_utc = _dt.datetime.now(_dt.timezone.utc)
                         txt = _trf(uid, "msg_auto_win",
                             symbol=s.symbol,
+                            market=market,
                             pnl_total=fmt_pnl_pct(float(pnl)),
+                            opened_time=fmt_dt_msk(row.get("opened_at")),
+                            closed_time=fmt_dt_msk(now_utc),
                             status="WIN",
                         )
                         if dbg:
