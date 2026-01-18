@@ -1049,35 +1049,17 @@ def _trade_status_emoji(status: str) -> str:
     }.get(status, "⏳")
 
 # ---------------- broadcasting ----------------
-_SIGNAL_SETTINGS_CACHE = {"ts": 0.0, "data": {"pause_signals": False, "maintenance_mode": False}}
-
-async def get_signal_global_settings(force: bool = False) -> dict:
-    """Return global Signal-bot settings with a short in-memory cache."""
-    import time as _time
-    now = _time.time()
-    if (not force) and (now - float(_SIGNAL_SETTINGS_CACHE.get("ts", 0.0)) < 5.0):
-        return dict(_SIGNAL_SETTINGS_CACHE.get("data") or {})
-    try:
-        data = await db_store.get_signal_bot_settings()
-        _SIGNAL_SETTINGS_CACHE["data"] = {
-            "pause_signals": bool(data.get("pause_signals")),
-            "maintenance_mode": bool(data.get("maintenance_mode")),
-        }
-    except Exception:
-        # If DB unavailable, default to not paused (do not brick bot).
-        _SIGNAL_SETTINGS_CACHE["data"] = {"pause_signals": False, "maintenance_mode": False}
-    _SIGNAL_SETTINGS_CACHE["ts"] = now
-    return dict(_SIGNAL_SETTINGS_CACHE.get("data") or {})
-
 async def broadcast_signal(sig: Signal) -> None:
-    # Global pause (Signal bot): полностью отключает рассылку НОВЫХ сигналов.
+    # Global pause for sending NEW signals (Signal Bot admin setting)
     try:
-        st = await get_signal_global_settings()
-        if st.get("pause_signals"):
-            logger.info("Signal broadcast paused: skip %s %s %s", sig.market, sig.symbol, sig.direction)
+        st = await db_store.get_signal_bot_settings()
+        if bool(st.get('pause_signals')):
+            logger.info("Signal broadcasting is paused (pause_signals=true). Skipping new signal %s %s", sig.market, sig.symbol)
             return
     except Exception:
+        # best effort: if settings table not ready, don't block
         pass
+
     # Deduplicate: avoid sending the same signal twice (common when scanner emits duplicates).
     import time, hashlib
     now = time.time()
@@ -2286,50 +2268,78 @@ async def main() -> None:
             return web.json_response({"ok": True})
 
 
-        # --- Signal bot global settings (pause new signals) ---
-        async def get_signal_settings(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            try:
-                data = await db_store.get_signal_bot_settings()
-                return web.json_response({"ok": True, **data})
-            except Exception as e:
-                return web.json_response({"ok": False, "error": str(e)}, status=500)
+        # -------- Signal bot: messages & settings (admin) --------
 
-        async def set_signal_settings(request: web.Request) -> web.Response:
+        async def signal_get_settings(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
             try:
-                payload = await request.json()
+                st = await db_store.get_signal_bot_settings()
             except Exception:
-                payload = {}
-            pause_signals = bool(payload.get("pause_signals", False))
-            maintenance_mode = bool(payload.get("maintenance_mode", False))
-            try:
-                await db_store.set_signal_bot_settings(
-                    pause_signals=pause_signals,
-                    maintenance_mode=maintenance_mode,
-                )
-                # refresh in-memory cache quickly
+                st = {"pause_signals": False, "maintenance_mode": False, "updated_at": None}
+            return web.json_response({
+                "ok": True,
+                "pause_signals": bool(st.get("pause_signals")),
+                "maintenance_mode": bool(st.get("maintenance_mode")),
+                "updated_at": st.get("updated_at"),
+            })
+
+        async def signal_save_settings(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            data = await request.json()
+            pause_signals = bool(data.get("pause_signals"))
+            maintenance_mode = bool(data.get("maintenance_mode"))
+            await db_store.set_signal_bot_settings(pause_signals=pause_signals, maintenance_mode=maintenance_mode)
+            return web.json_response({"ok": True})
+
+        async def signal_broadcast_text(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            data = await request.json()
+            text = str(data.get("text") or "").strip()
+            if not text:
+                return web.json_response({"ok": False, "error": "text required"}, status=400)
+            uids = await get_broadcast_user_ids()
+            total = len(uids)
+            sent = 0
+            for uid in uids:
                 try:
-                    await get_signal_global_settings(force=True)
+                    await safe_send(int(uid), text)
+                    sent += 1
                 except Exception:
                     pass
-                return web.json_response({"ok": True})
+            return web.json_response({"ok": True, "sent": sent, "total": total})
+
+        async def signal_send_text(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            tid = int(request.match_info.get("telegram_id") or 0)
+            if not tid:
+                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
+            data = await request.json()
+            text = str(data.get("text") or "").strip()
+            if not text:
+                return web.json_response({"ok": False, "error": "text required"}, status=400)
+            try:
+                await safe_send(tid, text)
             except Exception as e:
                 return web.json_response({"ok": False, "error": str(e)}, status=500)
+            return web.json_response({"ok": True})
 
 
         # Routes
         app.router.add_route("GET", "/health", health)
+        app.router.add_route("GET", "/api/infra/admin/signal/settings", signal_get_settings)
+        app.router.add_route("POST", "/api/infra/admin/signal/settings", signal_save_settings)
+        app.router.add_route("POST", "/api/infra/admin/signal/broadcast", signal_broadcast_text)
+        app.router.add_route("POST", "/api/infra/admin/signal/send/{telegram_id}", signal_send_text)
         app.router.add_route("GET", "/api/infra/admin/signal/stats", signal_stats)
         app.router.add_route("GET", "/api/infra/admin/signal/users", list_users)
         app.router.add_route("POST", "/api/infra/admin/signal/users", save_user)
         app.router.add_route("PATCH", "/api/infra/admin/signal/users/{telegram_id}", patch_user)
         app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/block", block_user)
         app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/unblock", unblock_user)
-        app.router.add_route("GET", "/api/infra/admin/signal/settings", get_signal_settings)
-        app.router.add_route("POST", "/api/infra/admin/signal/settings", set_signal_settings)
         # Allow preflight
         app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204))
         return app
