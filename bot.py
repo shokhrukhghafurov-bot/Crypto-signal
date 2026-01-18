@@ -896,6 +896,30 @@ def _fmt_hhmm(ts_utc: float) -> str:
     d = dt.datetime.fromtimestamp(ts_utc, tz=ZoneInfo("UTC")).astimezone(TZ)
     return d.strftime("%H:%M")
 
+def _fmt_dt_msk(v) -> str:
+    """Format datetime as Moscow time (TZ / Europe/Moscow)."""
+    try:
+        if not v:
+            return "—"
+        if isinstance(v, dt.datetime):
+            d = v
+        elif isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return "—"
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            d = dt.datetime.fromisoformat(s)
+        else:
+            return "—"
+
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        d = d.astimezone(TZ)
+        return d.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return "—"
+
 def _fmt_symbol(sym: str) -> str:
     s = (sym or "").strip().upper()
     if "/" in s:
@@ -1763,6 +1787,7 @@ def _trade_card_text(uid: int, t: dict) -> str:
         parts.append(f"TP2: {float(tp2):.6f}")
 
     # Live price info (shown when loaded via get_trade_live)
+    had_live_block = False
     if t.get('price_f') is not None:
         try:
             px = float(t.get('price_f') or 0.0)
@@ -1780,8 +1805,16 @@ def _trade_card_text(uid: int, t: dict) -> str:
                 checks.append(f"TP2: {'✅' if t.get('hit_tp2') else '❌'}")
             if checks:
                 parts.append(f"🧪 {tr(uid, 'lbl_check')}: " + ' '.join(checks))
+            had_live_block = True
         except Exception:
             pass
+
+    # Opened datetime (MSK)
+    opened_at = _fmt_dt_msk(t.get('opened_at'))
+    opened_lbl = tr(uid, 'trade_opened_at') if 'trade_opened_at' in I18N.get(get_lang(uid), {}) else "Открыта"
+    opened_line = f"🕒 {opened_lbl}: {opened_at} (MSK)"
+    if opened_at and opened_at != "—":
+        parts.append(opened_line)
 
     parts += [
         "",
