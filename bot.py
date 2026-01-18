@@ -1050,11 +1050,17 @@ def _trade_status_emoji(status: str) -> str:
 
 # ---------------- broadcasting ----------------
 async def broadcast_signal(sig: Signal) -> None:
-    # Global pause for sending NEW signals (Signal Bot admin setting)
+    # Global pause/maintenance for sending NEW signals (Signal Bot admin setting)
     try:
         st = await db_store.get_signal_bot_settings()
         if bool(st.get('pause_signals')):
             logger.info("Signal broadcasting is paused (pause_signals=true). Skipping new signal %s %s", sig.market, sig.symbol)
+            return
+        # Maintenance mode: do NOT send new signals to users.
+        # IMPORTANT: we also keep LAST_SIGNAL_BY_MARKET unchanged so users can still open the last
+        # live signal that was broadcasted BEFORE maintenance was enabled.
+        if bool(st.get('maintenance_mode')):
+            logger.info("Signal broadcasting is in maintenance mode. Skipping new signal %s %s", sig.market, sig.symbol)
             return
     except Exception:
         # best effort: if settings table not ready, don't block
@@ -1442,6 +1448,20 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 lines.append(trf(uid, "status_macro_blackout_timer", left=left_end))
 
         lines.append(trf(uid, "status_next_macro", value=(next_macro or tr(uid, "lbl_none"))))
+
+        # Signal bot global state (pause / maintenance) from admin dashboard
+        try:
+            sb = await db_store.get_signal_bot_settings()
+            if bool(sb.get('maintenance_mode')):
+                sig_state = tr(uid, 'sig_state_maintenance')
+            elif bool(sb.get('pause_signals')):
+                sig_state = tr(uid, 'sig_state_paused')
+            else:
+                sig_state = tr(uid, 'sig_state_on')
+            lines.append(trf(uid, 'status_signals', state=sig_state))
+        except Exception:
+            pass
+
         lines.append(trf(uid, "status_notifications", state=notif_state))
 
         txt = "\n".join(lines)
@@ -1464,6 +1484,17 @@ async def menu_handler(call: types.CallbackQuery) -> None:
     # ---- LIVE SIGNALS ----
     if action in ("spot", "futures"):
         market = "SPOT" if action == "spot" else "FUTURES"
+
+        # If maintenance mode is enabled, do not show live signal cards.
+        # Users should see a clear explanation instead of confusing "no live".
+        try:
+            st = await db_store.get_signal_bot_settings()
+            if bool(st.get('maintenance_mode')):
+                await safe_edit(call.message, tr(uid, "sig_maintenance_live"), menu_kb(uid))
+                return
+        except Exception:
+            pass
+
         sig = LAST_SIGNAL_BY_MARKET.get(market)
         if not sig:
             await safe_edit(call.message, tr(uid, "no_live_signals"), menu_kb(uid))
