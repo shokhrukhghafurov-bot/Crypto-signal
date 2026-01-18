@@ -433,9 +433,16 @@ def _be_exit_price(entry: float, side: str, market: str) -> float:
     fr = max(0.0, _fee_rate(market))
     buf = max(0.0, float(FEE_BUFFER_MULTIPLIER)) * fr
     side = (side or "LONG").upper()
+    # IMPORTANT:
+    # BE after TP1 is used as a *protective stop* on the remaining position.
+    # Therefore the BE level must be on the "risk" side of the current price:
+    #   - LONG: stop triggers when price falls back -> BE below entry
+    #   - SHORT: stop triggers when price rises back -> BE above entry
+    # Otherwise (e.g., SHORT with BE below entry) the condition (price >= BE)
+    # would be true immediately and the trade would auto-close right after TP1.
     if side == "SHORT":
-        return entry * (1.0 - buf)
-    return entry * (1.0 + buf)
+        return entry * (1.0 + buf)
+    return entry * (1.0 - buf)
 
 
 def _day_key_tz(ts: float) -> str:
