@@ -2319,11 +2319,13 @@ class Backend:
                         if close_after_min <= 0 or (now_ts - first) < (close_after_min * 60.0):
                             logger.warning("price unavailable: skip tick trade_id=%s %s %s err=%s", trade_id, market, symbol, str(e)[:200])
                             continue
-                        # Forced close after N minutes without price
-                        txt = _trf(uid, "msg_price_unavailable_close") if "msg_price_unavailable_close" in I18N.get(get_lang(uid), {}) else (
-                            f"⚠️ Цена недоступна более {int(close_after_min)} мин. Закрываю сделку.\n\n{symbol} | {market}"
 
-                        )
+                        # Forced close after N minutes without price
+                        minutes = int(close_after_min)
+                        txt = _trf(uid, 'msg_price_unavailable_close', minutes=minutes, symbol=symbol, market=market)
+                        if txt == 'msg_price_unavailable_close':
+                            # fallback if i18n key missing
+                            txt = f"⚠️ Price unavailable for {minutes} min. Force-closing trade.\n\n{symbol} | {market}"
                         try:
                             await safe_send(bot, uid, txt, ctx="msg_price_unavailable_close")
                         except Exception:
