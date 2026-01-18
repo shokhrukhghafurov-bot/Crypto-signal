@@ -121,6 +121,27 @@ async def ensure_schema() -> None:
         """)
 
 
+        # --- signals sent counters (persistent, for admin dashboard) ---
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS signal_sent_events (
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          sig_key TEXT NOT NULL,
+          market TEXT NOT NULL CHECK (market IN ('SPOT','FUTURES')),
+          signal_id BIGINT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (sig_key)
+        );
+        """)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_signal_sent_events_time
+        ON signal_sent_events (created_at DESC);
+        """)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_signal_sent_events_market_time
+        ON signal_sent_events (market, created_at DESC);
+        """)
+
+
 async def ensure_users_columns() -> None:
     """Best-effort schema migration for users table.
 
@@ -536,3 +557,60 @@ async def weekly_report(user_id: int, market: str, *, weeks: int, tz: str = "UTC
             str(tz),
         )
     return [dict(r) for r in rows]
+
+
+# ---------------- signals sent counters ----------------
+
+async def record_signal_sent(*, sig_key: str, market: str, signal_id: int | None = None) -> bool:
+    """Persist an event that a signal was broadcast (dedup by sig_key).
+
+    Returns True if inserted, False if duplicate or failed.
+    """
+    if not sig_key:
+        return False
+    market = str(market or '').upper()
+    if market not in ('SPOT','FUTURES'):
+        return False
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        try:
+            r = await conn.fetchrow(
+                """
+                INSERT INTO signal_sent_events (sig_key, market, signal_id)
+                VALUES ($1,$2,$3)
+                ON CONFLICT (sig_key) DO NOTHING
+                RETURNING id;
+                """,
+                sig_key, market, (int(signal_id) if signal_id is not None else None),
+            )
+            return bool(r)
+        except Exception:
+            logger.exception('record_signal_sent failed')
+            return False
+
+
+async def count_signal_sent_by_market(*, since: dt.datetime, until: dt.datetime) -> Dict[str, int]:
+    """Count broadcasted signals in [since, until) grouped by market.
+
+    Returns dict like {'SPOT': n, 'FUTURES': m}. Missing keys mean 0.
+    """
+    pool = get_pool()
+    out: Dict[str, int] = {'SPOT': 0, 'FUTURES': 0}
+    async with pool.acquire() as conn:
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT market, COUNT(*)::BIGINT AS n
+                FROM signal_sent_events
+                WHERE created_at >= $1 AND created_at < $2
+                GROUP BY market;
+                """,
+                since, until,
+            )
+            for r in rows or []:
+                mk = str(r.get('market') or '').upper()
+                if mk in out:
+                    out[mk] = int(r.get('n') or 0)
+        except Exception:
+            logger.exception('count_signal_sent_by_market failed')
+    return out
