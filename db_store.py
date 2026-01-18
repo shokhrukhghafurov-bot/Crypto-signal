@@ -426,23 +426,40 @@ async def perf_bucket(user_id: int, market: str, *, since: dt.datetime, until: d
     """
     pool = get_pool()
     async with pool.acquire() as conn:
+        # IMPORTANT:
+        # We must count outcomes per *trade*, not per *event row*.
+        # Some setups can emit multiple CLOSE events for the same trade_id.
+        # If we simply SUM() event rows, TRADES/PNL% become incorrect.
         row = await conn.fetchrow(
             """
-            WITH ev AS (
-              SELECT e.trade_id, e.event_type, e.pnl_pct
+            WITH last_outcome AS (
+              SELECT DISTINCT ON (e.trade_id)
+                e.trade_id,
+                e.event_type,
+                COALESCE(e.pnl_pct, 0) AS pnl_pct
               FROM trade_events e
               JOIN trades t ON t.id = e.trade_id
               WHERE t.user_id=$1 AND t.market=$2
                 AND e.created_at >= $3 AND e.created_at < $4
+                AND e.event_type IN ('WIN','LOSS','BE','CLOSE')
+              ORDER BY e.trade_id, e.created_at DESC
+            ),
+            tp1 AS (
+              SELECT COUNT(DISTINCT e.trade_id)::int AS tp1_hits
+              FROM trade_events e
+              JOIN trades t ON t.id = e.trade_id
+              WHERE t.user_id=$1 AND t.market=$2
+                AND e.created_at >= $3 AND e.created_at < $4
+                AND e.event_type = 'TP1'
             )
             SELECT
-              SUM(CASE WHEN event_type IN ('WIN','LOSS','BE','CLOSE') THEN 1 ELSE 0 END)::int AS trades,
+              COUNT(*)::int AS trades,
               SUM(CASE WHEN event_type='WIN' THEN 1 ELSE 0 END)::int AS wins,
               SUM(CASE WHEN event_type='LOSS' THEN 1 ELSE 0 END)::int AS losses,
               SUM(CASE WHEN event_type='BE' THEN 1 ELSE 0 END)::int AS be,
-              COUNT(DISTINCT CASE WHEN event_type='TP1' THEN trade_id END)::int AS tp1_hits,
-              COALESCE(SUM(CASE WHEN event_type IN ('WIN','LOSS','BE','CLOSE') THEN COALESCE(pnl_pct,0) ELSE 0 END), 0)::float AS sum_pnl_pct
-            FROM ev;
+              (SELECT tp1_hits FROM tp1)::int AS tp1_hits,
+              COALESCE(SUM(pnl_pct), 0)::float AS sum_pnl_pct
+            FROM last_outcome;
             """,
             int(user_id),
             market,
@@ -471,24 +488,39 @@ async def perf_bucket_global(market: str, *, since: dt.datetime, until: dt.datet
     """
     pool = get_pool()
     async with pool.acquire() as conn:
+        # IMPORTANT:
+        # Count outcomes per trade_id (last outcome within the period), not per event row.
         row = await conn.fetchrow(
             """
-            WITH ev AS (
-              SELECT e.trade_id, e.event_type, e.pnl_pct
+            WITH last_outcome AS (
+              SELECT DISTINCT ON (e.trade_id)
+                e.trade_id,
+                e.event_type,
+                COALESCE(e.pnl_pct, 0) AS pnl_pct
               FROM trade_events e
               JOIN trades t ON t.id = e.trade_id
               WHERE t.market=$1
                 AND e.created_at >= $2 AND e.created_at < $3
+                AND e.event_type IN ('WIN','LOSS','BE','CLOSE')
+              ORDER BY e.trade_id, e.created_at DESC
+            ),
+            tp1 AS (
+              SELECT COUNT(DISTINCT e.trade_id)::int AS tp1_hits
+              FROM trade_events e
+              JOIN trades t ON t.id = e.trade_id
+              WHERE t.market=$1
+                AND e.created_at >= $2 AND e.created_at < $3
+                AND e.event_type = 'TP1'
             )
             SELECT
-              SUM(CASE WHEN event_type IN ('WIN','LOSS','BE','CLOSE') THEN 1 ELSE 0 END)::int AS trades,
+              COUNT(*)::int AS trades,
               SUM(CASE WHEN event_type='WIN' THEN 1 ELSE 0 END)::int AS wins,
               SUM(CASE WHEN event_type='LOSS' THEN 1 ELSE 0 END)::int AS losses,
               SUM(CASE WHEN event_type='BE' THEN 1 ELSE 0 END)::int AS be,
               SUM(CASE WHEN event_type='CLOSE' THEN 1 ELSE 0 END)::int AS closes,
-              COUNT(DISTINCT CASE WHEN event_type='TP1' THEN trade_id END)::int AS tp1_hits,
-              COALESCE(SUM(CASE WHEN event_type IN ('WIN','LOSS','BE','CLOSE') THEN COALESCE(pnl_pct,0) ELSE 0 END), 0)::float AS sum_pnl_pct
-            FROM ev;
+              (SELECT tp1_hits FROM tp1)::int AS tp1_hits,
+              COALESCE(SUM(pnl_pct), 0)::float AS sum_pnl_pct
+            FROM last_outcome;
             """,
             market,
             since,
