@@ -1861,15 +1861,62 @@ async def opened(call: types.CallbackQuery) -> None:
 
     opened_ok = await backend.open_trade(call.from_user.id, sig, orig_text=_signal_text(call.from_user.id, sig))
     if not opened_ok:
-        # Already opened before -> remove button to prevent retries
+        # IMPORTANT:
+        # Treat as "already opened" ONLY if the user has an ACTIVE/TP1 trade for this signal_id.
+        # This also protects from rare signal_id collisions after restarts / legacy DB constraints.
+        row = None
         try:
-            if call.message:
-                await safe_edit_markup(call.from_user.id, call.message.message_id, None)
+            row = await backend.get_trade(call.from_user.id, int(sig.signal_id))
+        except Exception:
+            row = None
+
+        st = str((row or {}).get('status') or '').upper() if isinstance(row, dict) else ''
+        if row and st in ("ACTIVE", "TP1"):
+            # Already opened -> remove button to prevent retries
+            try:
+                if call.message:
+                    await safe_edit_markup(call.from_user.id, call.message.message_id, None)
+            except Exception:
+                pass
+            await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
+            await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
+            return
+
+        # No ACTIVE trade found, but insert was blocked.
+        # Re-try with a fresh unique signal_id (prevents "phantom already opened" situations).
+        try:
+            new_sid = await db_store.next_signal_id()
+        except Exception:
+            import time as _time
+            new_sid = int(_time.time() * 1000)
+
+        try:
+            SIGNALS.pop(int(signal_id), None)
         except Exception:
             pass
-        await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
-        await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
-        return
+
+        from dataclasses import replace as _dc_replace
+
+        new_sig = sig
+        try:
+            new_sig = _dc_replace(sig, signal_id=int(new_sid))
+        except Exception:
+            new_sig = sig
+
+        SIGNALS[int(new_sid)] = new_sig
+        sig = new_sig
+
+        opened_ok = await backend.open_trade(call.from_user.id, sig, orig_text=_signal_text(call.from_user.id, sig))
+        if not opened_ok:
+            # Fallback: show message if still blocked
+            try:
+                if call.message:
+                    await safe_edit_markup(call.from_user.id, call.message.message_id, None)
+            except Exception:
+                pass
+            await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
+            await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
+            return
 
     # Remove the ✅ ОТКРЫЛ СДЕЛКУ button from the original NEW SIGNAL message
     try:
