@@ -1049,7 +1049,35 @@ def _trade_status_emoji(status: str) -> str:
     }.get(status, "⏳")
 
 # ---------------- broadcasting ----------------
+_SIGNAL_SETTINGS_CACHE = {"ts": 0.0, "data": {"pause_signals": False, "maintenance_mode": False}}
+
+async def get_signal_global_settings(force: bool = False) -> dict:
+    """Return global Signal-bot settings with a short in-memory cache."""
+    import time as _time
+    now = _time.time()
+    if (not force) and (now - float(_SIGNAL_SETTINGS_CACHE.get("ts", 0.0)) < 5.0):
+        return dict(_SIGNAL_SETTINGS_CACHE.get("data") or {})
+    try:
+        data = await db_store.get_signal_bot_settings()
+        _SIGNAL_SETTINGS_CACHE["data"] = {
+            "pause_signals": bool(data.get("pause_signals")),
+            "maintenance_mode": bool(data.get("maintenance_mode")),
+        }
+    except Exception:
+        # If DB unavailable, default to not paused (do not brick bot).
+        _SIGNAL_SETTINGS_CACHE["data"] = {"pause_signals": False, "maintenance_mode": False}
+    _SIGNAL_SETTINGS_CACHE["ts"] = now
+    return dict(_SIGNAL_SETTINGS_CACHE.get("data") or {})
+
 async def broadcast_signal(sig: Signal) -> None:
+    # Global pause (Signal bot): полностью отключает рассылку НОВЫХ сигналов.
+    try:
+        st = await get_signal_global_settings()
+        if st.get("pause_signals"):
+            logger.info("Signal broadcast paused: skip %s %s %s", sig.market, sig.symbol, sig.direction)
+            return
+    except Exception:
+        pass
     # Deduplicate: avoid sending the same signal twice (common when scanner emits duplicates).
     import time, hashlib
     now = time.time()
@@ -2258,6 +2286,40 @@ async def main() -> None:
             return web.json_response({"ok": True})
 
 
+        # --- Signal bot global settings (pause new signals) ---
+        async def get_signal_settings(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            try:
+                data = await db_store.get_signal_bot_settings()
+                return web.json_response({"ok": True, **data})
+            except Exception as e:
+                return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+        async def set_signal_settings(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            try:
+                payload = await request.json()
+            except Exception:
+                payload = {}
+            pause_signals = bool(payload.get("pause_signals", False))
+            maintenance_mode = bool(payload.get("maintenance_mode", False))
+            try:
+                await db_store.set_signal_bot_settings(
+                    pause_signals=pause_signals,
+                    maintenance_mode=maintenance_mode,
+                )
+                # refresh in-memory cache quickly
+                try:
+                    await get_signal_global_settings(force=True)
+                except Exception:
+                    pass
+                return web.json_response({"ok": True})
+            except Exception as e:
+                return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+
         # Routes
         app.router.add_route("GET", "/health", health)
         app.router.add_route("GET", "/api/infra/admin/signal/stats", signal_stats)
@@ -2266,6 +2328,8 @@ async def main() -> None:
         app.router.add_route("PATCH", "/api/infra/admin/signal/users/{telegram_id}", patch_user)
         app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/block", block_user)
         app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/unblock", unblock_user)
+        app.router.add_route("GET", "/api/infra/admin/signal/settings", get_signal_settings)
+        app.router.add_route("POST", "/api/infra/admin/signal/settings", set_signal_settings)
         # Allow preflight
         app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204))
         return app
