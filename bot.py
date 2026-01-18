@@ -1077,16 +1077,13 @@ async def broadcast_signal(sig: Signal) -> None:
     except Exception:
         pass
 
-
-    # Ensure signal_id is globally unique across restarts (Postgres sequence)
-    try:
-        sig.signal_id = await db_store.next_signal_id()
-    except Exception:
-        # fallback: keep existing in-memory id
-        pass
-
     logger.info("Broadcast signal id=%s %s %s %s conf=%s rr=%.2f", sig.signal_id, sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr))
     SIGNALS[sig.signal_id] = sig
+    # Persist 'signals sent' counters in Postgres (dedup by sig_key)
+    try:
+        await db_store.record_signal_sent(sig_key=sig_key, market=str(sig.market).upper(), signal_id=int(sig.signal_id or 0))
+    except Exception:
+        pass
     ORIGINAL_SIGNAL_TEXT[(0, sig.signal_id)] = _signal_text(0, sig)
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
@@ -1999,12 +1996,6 @@ async def main() -> None:
             if not _check_basic(request):
                 return _unauthorized()
 
-            # Ensure we have latest in-memory counters from file (best-effort)
-            try:
-                load_signal_stats()
-            except Exception:
-                pass
-
             now_tz = dt.datetime.now(TZ)
 
             def _to_utc(d: dt.datetime) -> dt.datetime:
@@ -2022,12 +2013,27 @@ async def main() -> None:
                 "week": (_to_utc(week_start), _to_utc(now_tz)),
                 "month": (_to_utc(month_start), _to_utc(now_tz)),
             }
-
-            signals = {
-                "day": _signals_today(),
-                "week": _signals_this_week(),
-                "month": _signals_this_month(),
-            }
+            # Signals sent counters are stored in Postgres (signal_sent_events).
+            # Backward compatible fields: day/week/month totals + split day_spot/day_futures/...
+            signals: dict = {}
+            for k, (since, until) in ranges.items():
+                spot_n = 0
+                fut_n = 0
+                if pool is not None:
+                    try:
+                        counts = await db_store.count_signal_sent_by_market(since=since, until=until)
+                        spot_n = int(counts.get('SPOT') or 0)
+                        fut_n = int(counts.get('FUTURES') or 0)
+                    except Exception:
+                        spot_n = 0
+                        fut_n = 0
+                total_n = spot_n + fut_n
+                # legacy totals
+                signals[k] = total_n
+                # explicit totals + split
+                signals[f"{k}_total"] = total_n
+                signals[f"{k}_spot"] = spot_n
+                signals[f"{k}_futures"] = fut_n
 
             async def _mk(market: str) -> dict:
                 out: dict[str, dict] = {}
