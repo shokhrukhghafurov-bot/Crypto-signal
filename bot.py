@@ -21,7 +21,7 @@ from aiohttp import web
 
 import db_store
 
-from backend import Backend, Signal, MacroEvent, open_metrics
+from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop
 
 load_dotenv()
 
@@ -768,9 +768,10 @@ def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     kb.button(text=tr(uid, "m_stats"), callback_data="menu:stats")
     kb.button(text=tr(uid, "m_spot"), callback_data="menu:spot")
     kb.button(text=tr(uid, "m_fut"), callback_data="menu:futures")
+    kb.button(text=tr(uid, "m_autotrade"), callback_data="menu:autotrade")
     kb.button(text=tr(uid, "m_trades"), callback_data="trades:page:0")
     kb.button(text=tr(uid, "m_notify"), callback_data="menu:notify")
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -783,6 +784,115 @@ def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
         kb.button(text=tr(uid, "btn_notify_on"), callback_data="notify:set:on")
     kb.adjust(1)
     kb.button(text=tr(uid, "btn_back"), callback_data="notify:back")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+# ---------------- Auto-trade UI + input state ----------------
+
+from cryptography.fernet import Fernet, InvalidToken
+
+AUTOTRADE_INPUT: Dict[int, Dict[str, str]] = {}
+
+# Notify only on API errors (anti-spam)
+AUTOTRADE_API_ERR_LAST: Dict[tuple[int, str, str], float] = {}
+AUTOTRADE_API_ERR_COOLDOWN_SEC = 300
+
+async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str, error_text: str) -> None:
+    import time
+    key = (int(uid), str(exchange or '').lower(), str(market_type or '').lower())
+    now = time.time()
+    last = AUTOTRADE_API_ERR_LAST.get(key, 0.0)
+    if now - last < AUTOTRADE_API_ERR_COOLDOWN_SEC:
+        return
+    AUTOTRADE_API_ERR_LAST[key] = now
+    # Minimal message; RU/EN based on user language
+    title = tr(uid, "at_api_error_title")
+    ex = (exchange or '').upper()
+    mt = (market_type or '').upper()
+    msg = f"{title} ({ex} {mt})\n{error_text}"
+    try:
+        await safe_send(uid, msg)
+    except Exception:
+        pass
+
+def _fernet() -> Fernet:
+    k = (os.getenv("AUTOTRADE_MASTER_KEY") or "").strip()
+    if not k:
+        raise RuntimeError("AUTOTRADE_MASTER_KEY env is missing")
+    return Fernet(k.encode("utf-8"))
+
+def _key_status_map(keys: List[Dict[str, any]]) -> Dict[str, Dict[str, any]]:
+    out: Dict[str, Dict[str, any]] = {}
+    for r in keys or []:
+        ex = str(r.get("exchange") or "").lower()
+        mt = str(r.get("market_type") or "").lower()
+        out[f"{ex}:{mt}"] = r
+    return out
+
+def autotrade_kb(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    spot_on = bool(s.get("spot_enabled"))
+    fut_on = bool(s.get("futures_enabled"))
+    kb.button(text=(tr(uid, "at_spot_on") if spot_on else tr(uid, "at_spot_off")), callback_data="at:toggle:spot")
+    kb.button(text=(tr(uid, "at_fut_on") if fut_on else tr(uid, "at_fut_off")), callback_data="at:toggle:futures")
+    kb.adjust(2)
+
+    # Settings
+    kb.button(text=tr(uid, "at_spot_exchange"), callback_data="at:ex:spot")
+    kb.button(text=tr(uid, "at_fut_exchange"), callback_data="at:ex:futures")
+    kb.adjust(2)
+    kb.button(text=tr(uid, "at_spot_amount"), callback_data="at:set:spot_amount")
+    kb.button(text=tr(uid, "at_fut_margin"), callback_data="at:set:fut_margin")
+    kb.adjust(2)
+    kb.button(text=tr(uid, "at_fut_leverage"), callback_data="at:set:fut_leverage")
+    kb.button(text=tr(uid, "at_fut_cap"), callback_data="at:set:fut_cap")
+    kb.adjust(2)
+
+    kb.button(text=tr(uid, "at_keys"), callback_data="at:keys")
+    kb.button(text=tr(uid, "btn_back"), callback_data="menu:status")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> str:
+    km = _key_status_map(keys)
+    def ks(ex: str, mt: str) -> str:
+        r = km.get(f"{ex}:{mt}")
+        return "✅" if (r and bool(r.get("is_active"))) else "❌"
+    spot_ex = str(s.get("spot_exchange") or "binance")
+    fut_ex = str(s.get("futures_exchange") or "binance")
+    spot_amt = float(s.get("spot_amount_per_trade") or 0.0)
+    fut_margin = float(s.get("futures_margin_per_trade") or 0.0)
+    fut_lev = int(s.get("futures_leverage") or 1)
+    fut_cap = float(s.get("futures_cap") or 0.0)
+
+    return trf(
+        uid,
+        "at_screen",
+        spot_state=(tr(uid, "at_state_on") if s.get("spot_enabled") else tr(uid, "at_state_off")),
+        fut_state=(tr(uid, "at_state_on") if s.get("futures_enabled") else tr(uid, "at_state_off")),
+        spot_ex=spot_ex,
+        fut_ex=fut_ex,
+        spot_amt=f"{spot_amt:g}",
+        fut_margin=f"{fut_margin:g}",
+        fut_lev=str(fut_lev),
+        fut_cap=f"{fut_cap:g}",
+        b_spot=ks("binance","spot"),
+        b_fut=ks("binance","futures"),
+        y_spot=ks("bybit","spot"),
+        y_fut=ks("bybit","futures"),
+    )
+
+
+def autotrade_keys_kb(uid: int) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    # 4 sets (exchange+market)
+    for ex in ("binance", "bybit"):
+        kb.button(text=f"{ex.upper()} SPOT", callback_data=f"at:keys:set:{ex}:spot")
+        kb.button(text=f"{ex.upper()} FUTURES", callback_data=f"at:keys:set:{ex}:futures")
+        kb.adjust(2)
+    kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -1135,6 +1245,26 @@ async def broadcast_signal(sig: Signal) -> None:
             kb_u = InlineKeyboardBuilder()
             kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
             await safe_send(uid, _signal_text(uid, sig), reply_markup=kb_u.as_markup())
+
+            # Auto-trade: execute real orders asynchronously, without affecting broadcast.
+            async def _run_autotrade(_uid: int, _sig: Signal):
+                try:
+                    res = await autotrade_execute(_uid, _sig)
+                    err = res.get("api_error") if isinstance(res, dict) else None
+                    if err:
+                        # notify ONLY for API errors
+                        st = await db_store.get_autotrade_settings(_uid)
+                        mt = "spot" if _sig.market == "SPOT" else "futures"
+                        ex = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "").lower()
+                        await _notify_autotrade_api_error(_uid, ex, mt, str(err)[:500])
+                except Exception as e:
+                    # unexpected errors are treated as API errors for visibility
+                    st = await db_store.get_autotrade_settings(_uid)
+                    mt = "spot" if _sig.market == "SPOT" else "futures"
+                    ex = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "").lower()
+                    await _notify_autotrade_api_error(_uid, ex, mt, f"{type(e).__name__}: {e}"[:500])
+
+            asyncio.create_task(_run_autotrade(uid, sig))
         except (TelegramForbiddenError, TelegramBadRequest) as e:
             # Do not spam stack traces for common delivery issues
             msg = str(e).lower()
@@ -1550,6 +1680,26 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             await safe_send(uid, txt, reply_markup=notify_kb(uid, enabled))
         return
 
+    # ---- AUTO-TRADE ----
+    if action == "autotrade":
+        try:
+            st = await db_store.get_autotrade_settings(uid)
+            keys = await db_store.get_autotrade_keys_status(uid)
+        except Exception:
+            st = {
+                "spot_enabled": False,
+                "futures_enabled": False,
+                "spot_exchange": "binance",
+                "futures_exchange": "binance",
+                "spot_amount_per_trade": 0.0,
+                "futures_margin_per_trade": 0.0,
+                "futures_leverage": 1,
+                "futures_cap": 0.0,
+            }
+            keys = []
+        await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
+        return
+
     # fallback
     await safe_edit(call.message, tr(uid, "welcome"), menu_kb(uid))
 
@@ -1737,6 +1887,228 @@ def _trades_page_kb(uid: int, trades: list[dict], offset: int) -> types.InlineKe
         kb.row(*[b for b in nav.buttons])
     kb.row(types.InlineKeyboardButton(text=tr(uid, "m_menu"), callback_data="menu:status"))
     return kb.as_markup()
+
+
+# ---------------- auto-trade callbacks ----------------
+@dp.callback_query(lambda c: (c.data or "").startswith("at:"))
+async def autotrade_callback(call: types.CallbackQuery) -> None:
+    await call.answer()
+    uid = call.from_user.id if call.from_user else 0
+    if not uid:
+        return
+
+    # Shared access control
+    access = await get_access_status(uid)
+    if access != "ok":
+        await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+        return
+
+    parts = (call.data or "").split(":")
+    # at:toggle:spot | at:toggle:futures | at:set:* | at:ex:* | at:keys | at:keys:set:EX:MT
+    action = parts[1] if len(parts) > 1 else ""
+
+    # Load current state
+    st = await db_store.get_autotrade_settings(uid)
+    keys = await db_store.get_autotrade_keys_status(uid)
+
+    if action == "toggle" and len(parts) >= 3:
+        mt = parts[2]
+        if mt == "spot":
+            await db_store.set_autotrade_toggle(uid, "spot", not bool(st.get("spot_enabled")))
+        elif mt == "futures":
+            await db_store.set_autotrade_toggle(uid, "futures", not bool(st.get("futures_enabled")))
+        st = await db_store.get_autotrade_settings(uid)
+        await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
+        return
+
+    if action == "keys":
+        # at:keys or at:keys:set:ex:mt
+        if len(parts) == 2:
+            await safe_edit(call.message, tr(uid, "at_keys_screen"), autotrade_keys_kb(uid))
+            return
+        if len(parts) >= 5 and parts[2] == "set":
+            ex = parts[3]
+            mt = parts[4]
+            AUTOTRADE_INPUT[uid] = {"mode": "keys", "exchange": ex, "market_type": mt, "step": "api_key"}
+            await safe_send(uid, trf(uid, "at_enter_api_key", exchange=ex.upper(), market=mt.upper()))
+            return
+
+    if action == "set" and len(parts) >= 3:
+        field = parts[2]
+        if field == "spot_amount":
+            AUTOTRADE_INPUT[uid] = {"mode": "set", "field": "spot_amount"}
+            await safe_send(uid, tr(uid, "at_enter_spot_amount"))
+            return
+        if field == "fut_margin":
+            AUTOTRADE_INPUT[uid] = {"mode": "set", "field": "fut_margin"}
+            await safe_send(uid, tr(uid, "at_enter_fut_margin"))
+            return
+        if field == "fut_leverage":
+            AUTOTRADE_INPUT[uid] = {"mode": "set", "field": "fut_leverage"}
+            await safe_send(uid, tr(uid, "at_enter_fut_leverage"))
+            return
+        if field == "fut_cap":
+            AUTOTRADE_INPUT[uid] = {"mode": "set", "field": "fut_cap"}
+            await safe_send(uid, tr(uid, "at_enter_fut_cap"))
+            return
+
+    if action == "ex" and len(parts) >= 3:
+        mt = parts[2]
+        # show exchange choices
+        kb = InlineKeyboardBuilder()
+        kb.button(text="Binance", callback_data=f"at:exset:{mt}:binance")
+        kb.button(text="Bybit", callback_data=f"at:exset:{mt}:bybit")
+        kb.adjust(2)
+        kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
+        kb.adjust(1)
+        await safe_edit(call.message, tr(uid, "at_choose_exchange"), kb.as_markup())
+        return
+
+    if action == "exset" and len(parts) >= 4:
+        mt = parts[2]
+        ex = parts[3]
+        await db_store.set_autotrade_exchange(uid, "spot" if mt == "spot" else "futures", ex)
+        st = await db_store.get_autotrade_settings(uid)
+        await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
+        return
+
+    # default: return to autotrade screen
+    st = await db_store.get_autotrade_settings(uid)
+    keys = await db_store.get_autotrade_keys_status(uid)
+    await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
+
+
+@dp.message()
+async def autotrade_input_handler(message: types.Message) -> None:
+    """Handle text input for Auto-trade configuration.
+
+    We only consume messages when the user is in AUTOTRADE_INPUT state.
+    """
+    uid = message.from_user.id if message.from_user else 0
+    if not uid:
+        return
+    state = AUTOTRADE_INPUT.get(uid)
+    if not state:
+        return
+
+    # Access check
+    access = await get_access_status(uid)
+    if access != "ok":
+        AUTOTRADE_INPUT.pop(uid, None)
+        await message.answer(tr(uid, f"access_{access}"), reply_markup=menu_kb(uid))
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        return
+
+    if state.get("mode") == "set":
+        field = state.get("field") or ""
+        success = False
+        try:
+            if field in ("spot_amount", "fut_margin", "fut_cap"):
+                val = float(text.replace(",", "."))
+                if val < 0:
+                    raise ValueError
+                if field == "spot_amount":
+                    # Hard minimum: SPOT amount per trade must be >= 10 USDT
+                    if val < 10:
+                        await message.answer(tr(uid, "at_min_spot_amount"))
+                        return
+                    await db_store.set_autotrade_amount(uid, "spot", val)
+                elif field == "fut_margin":
+                    # Hard minimum: FUTURES margin per trade must be >= 5 USDT
+                    if val < 5:
+                        await message.answer(tr(uid, "at_min_fut_margin"))
+                        return
+                    await db_store.set_autotrade_amount(uid, "futures", val)
+                elif field == "fut_cap":
+                    await db_store.set_autotrade_futures_cap(uid, val)
+            elif field == "fut_leverage":
+                lev = int(float(text.replace(",", ".")))
+                if lev < 1 or lev > 125:
+                    raise ValueError
+                await db_store.set_autotrade_futures_leverage(uid, lev)
+            else:
+                # unknown field
+                return
+            success = True
+        except Exception:
+            # Keep simple: ask again
+            await message.answer(tr(uid, "bad_number"))
+            return
+
+        if success:
+            AUTOTRADE_INPUT.pop(uid, None)
+
+        st = await db_store.get_autotrade_settings(uid)
+        keys = await db_store.get_autotrade_keys_status(uid)
+        await message.answer(autotrade_text(uid, st, keys), reply_markup=autotrade_kb(uid, st, keys))
+        return
+
+    if state.get("mode") == "keys":
+        ex = (state.get("exchange") or "binance").lower()
+        mt = (state.get("market_type") or "spot").lower()
+        step = state.get("step") or "api_key"
+
+        if step == "api_key":
+            state["api_key"] = text
+            state["step"] = "api_secret"
+            AUTOTRADE_INPUT[uid] = state
+            await message.answer(tr(uid, "at_enter_api_secret"))
+            return
+
+        if step == "api_secret":
+            api_key = (state.get("api_key") or "").strip()
+            api_secret = text
+            AUTOTRADE_INPUT.pop(uid, None)
+
+            # Validate (READ + TRADE). If TRADE missing -> reject.
+            try:
+                res = await validate_autotrade_keys(exchange=ex, market_type=mt, api_key=api_key, api_secret=api_secret)
+            except Exception as e:
+                res = {"ok": False, "read_ok": False, "trade_ok": False, "error": str(e)}
+
+            if not res.get("ok"):
+                err = str(res.get("error") or "API error")
+                # Store error (inactive) so UI shows ❌
+                try:
+                    await db_store.mark_autotrade_key_error(user_id=uid, exchange=ex, market_type=mt, error=err, deactivate=True)
+                except Exception:
+                    pass
+                await message.answer(trf(uid, "at_keys_invalid", err=err))
+            elif not res.get("trade_ok"):
+                try:
+                    await db_store.mark_autotrade_key_error(user_id=uid, exchange=ex, market_type=mt, error="trade_permission_missing", deactivate=True)
+                except Exception:
+                    pass
+                await message.answer(tr(uid, "at_keys_trade_missing"))
+            else:
+                # Encrypt + store active
+                try:
+                    f = _fernet()
+                except Exception:
+                    await message.answer(tr(uid, "at_master_key_missing"))
+                else:
+                    api_key_enc = f.encrypt(api_key.encode("utf-8")).decode("utf-8")
+                    api_secret_enc = f.encrypt(api_secret.encode("utf-8")).decode("utf-8")
+                    await db_store.upsert_autotrade_keys(
+                        user_id=uid,
+                        exchange=ex,
+                        market_type=mt,
+                        api_key_enc=api_key_enc,
+                        api_secret_enc=api_secret_enc,
+                        passphrase_enc=None,
+                        is_active=True,
+                        last_error=None,
+                    )
+                    await message.answer(tr(uid, "at_keys_ok"))
+
+            st = await db_store.get_autotrade_settings(uid)
+            keys = await db_store.get_autotrade_keys_status(uid)
+            await message.answer(autotrade_text(uid, st, keys), reply_markup=autotrade_kb(uid, st, keys))
+            return
+
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trades:page:"))
 async def trades_page(call: types.CallbackQuery) -> None:
@@ -2425,6 +2797,9 @@ async def main() -> None:
     asyncio.create_task(backend.track_loop(bot))
     logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+
+    # Auto-trade manager (SL/TP/BE) - runs in background.
+    asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
