@@ -2064,9 +2064,17 @@ async def autotrade_input_handler(message: types.Message) -> None:
             AUTOTRADE_INPUT.pop(uid, None)
 
             # Basic pre-validation to avoid confusing raw exchange errors when
-            # user pastes a wrong value (e.g. random short text). Most real API
-            # keys/secrets are long; if too short, treat as invalid format.
-            if len(api_key.strip()) < 20 or len(api_secret.strip()) < 20:
+            # user pastes a wrong value (e.g. random short text). Exchange key
+            # lengths differ, so keep it permissive for Bybit (their API key can
+            # be < 20 chars) while still blocking obvious junk.
+            api_key_s = api_key.strip()
+            api_secret_s = str(api_secret).strip()
+            if ex == "bybit":
+                bad_format = (len(api_key_s) < 8) or (len(api_secret_s) < 20)
+            else:
+                bad_format = (len(api_key_s) < 20) or (len(api_secret_s) < 20)
+
+            if bad_format:
                 try:
                     await db_store.mark_autotrade_key_error(
                         user_id=uid,
