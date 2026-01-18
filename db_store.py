@@ -141,6 +141,57 @@ async def ensure_schema() -> None:
         ON signal_sent_events (market, created_at DESC);
         """)
 
+        # --- Signal bot global settings (pause new signals, maintenance mode) ---
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS signal_bot_settings (
+          id SMALLINT PRIMARY KEY DEFAULT 1,
+          pause_signals BOOLEAN NOT NULL DEFAULT FALSE,
+          maintenance_mode BOOLEAN NOT NULL DEFAULT FALSE,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+
+        # Ensure a single row exists
+        await conn.execute("""
+        INSERT INTO signal_bot_settings (id)
+        VALUES (1)
+        ON CONFLICT (id) DO NOTHING;
+        """)
+
+
+async def get_signal_bot_settings() -> Dict[str, Any]:
+    """Get global Signal-bot settings."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT pause_signals, maintenance_mode, updated_at FROM signal_bot_settings WHERE id=1"
+        )
+        if not row:
+            return {"pause_signals": False, "maintenance_mode": False, "updated_at": None}
+        return {
+            "pause_signals": bool(row.get("pause_signals")),
+            "maintenance_mode": bool(row.get("maintenance_mode")),
+            "updated_at": (row.get("updated_at").isoformat() if row.get("updated_at") else None),
+        }
+
+
+async def set_signal_bot_settings(*, pause_signals: bool, maintenance_mode: bool) -> None:
+    """Set global Signal-bot settings."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO signal_bot_settings (id, pause_signals, maintenance_mode, updated_at)
+            VALUES (1, $1, $2, NOW())
+            ON CONFLICT (id)
+            DO UPDATE SET pause_signals=EXCLUDED.pause_signals,
+                          maintenance_mode=EXCLUDED.maintenance_mode,
+                          updated_at=NOW();
+            """,
+            bool(pause_signals),
+            bool(maintenance_mode),
+        )
+
 
 async def ensure_users_columns() -> None:
     """Best-effort schema migration for users table.
