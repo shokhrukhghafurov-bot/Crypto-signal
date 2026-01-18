@@ -226,6 +226,20 @@ def _price_debug_block(uid: int, *, price: float, source: str, side: str, sl: fl
         lines.extend(["• " + c for c in checks])
     return "\n".join(lines)
 
+
+from zoneinfo import ZoneInfo
+MSK = ZoneInfo("Europe/Moscow")
+
+def fmt_dt_msk(d):
+    if not d:
+        return "—"
+    import datetime as dt
+    if isinstance(d, dt.datetime):
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return d.astimezone(MSK).strftime("%d.%m.%Y %H:%M")
+    return "—"
+
 def fmt_pnl_pct(p: float) -> str:
     try:
         p = float(p)
