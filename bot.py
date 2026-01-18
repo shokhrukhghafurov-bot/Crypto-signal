@@ -2063,6 +2063,27 @@ async def autotrade_input_handler(message: types.Message) -> None:
             api_secret = text
             AUTOTRADE_INPUT.pop(uid, None)
 
+            # Basic pre-validation to avoid confusing raw exchange errors when
+            # user pastes a wrong value (e.g. random short text). Most real API
+            # keys/secrets are long; if too short, treat as invalid format.
+            if len(api_key.strip()) < 20 or len(api_secret.strip()) < 20:
+                try:
+                    await db_store.mark_autotrade_key_error(
+                        user_id=uid,
+                        exchange=ex,
+                        market_type=mt,
+                        error="bad_format",
+                        deactivate=True,
+                    )
+                except Exception:
+                    pass
+                await message.answer(trf(uid, "at_keys_bad_format", exchange=ex.upper(), market=mt.upper()))
+
+                st = await db_store.get_autotrade_settings(uid)
+                keys = await db_store.get_autotrade_keys_status(uid)
+                await message.answer(autotrade_text(uid, st, keys), reply_markup=autotrade_kb(uid, st, keys))
+                return
+
             # Validate (READ + TRADE). If TRADE missing -> reject.
             try:
                 res = await validate_autotrade_keys(exchange=ex, market_type=mt, api_key=api_key, api_secret=api_secret)
@@ -2070,13 +2091,27 @@ async def autotrade_input_handler(message: types.Message) -> None:
                 res = {"ok": False, "read_ok": False, "trade_ok": False, "error": str(e)}
 
             if not res.get("ok"):
-                err = str(res.get("error") or "API error")
-                # Store error (inactive) so UI shows ❌
+                raw_err = str(res.get("error") or "API error")
+
+                # Map raw exchange errors to user-friendly messages.
+                raw_low = raw_err.lower()
+                if ex == "binance" and ("api-key format invalid" in raw_low or "-2014" in raw_low):
+                    user_key = "at_keys_binance_format"
+                elif ex == "binance" and ("-2015" in raw_low or "invalid api-key" in raw_low):
+                    user_key = "at_keys_binance_invalid"
+                elif ex == "bybit" and ("10003" in raw_low or "api key is invalid" in raw_low):
+                    user_key = "at_keys_bybit_invalid"
+                elif ("whitelist" in raw_low) or ("ip" in raw_low and "not" in raw_low and "allowed" in raw_low) or ("restricted" in raw_low and "ip" in raw_low):
+                    user_key = "at_keys_ip_restricted"
+                else:
+                    user_key = "at_keys_api_error"
+
+                # Store raw error (inactive) so UI shows ❌ and for troubleshooting.
                 try:
-                    await db_store.mark_autotrade_key_error(user_id=uid, exchange=ex, market_type=mt, error=err, deactivate=True)
+                    await db_store.mark_autotrade_key_error(user_id=uid, exchange=ex, market_type=mt, error=raw_err, deactivate=True)
                 except Exception:
                     pass
-                await message.answer(trf(uid, "at_keys_invalid", err=err))
+                await message.answer(trf(uid, user_key, exchange=ex.upper(), market=mt.upper()))
             elif not res.get("trade_ok"):
                 try:
                     await db_store.mark_autotrade_key_error(user_id=uid, exchange=ex, market_type=mt, error="trade_permission_missing", deactivate=True)
