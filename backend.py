@@ -1708,6 +1708,12 @@ async def orderbook_filter(api: "MultiExchangeData", exchange: str, symbol: str,
 
     return (True, f"OB {exchange}: ok imb {imb:.2f}x spr {spread:.3f}%")
 
+
+
+class PriceUnavailableError(Exception):
+    """Raised when all price sources failed for a symbol/market."""
+    pass
+
 class Backend:
     def __init__(self) -> None:
         self.feed = PriceFeed()
@@ -1716,6 +1722,9 @@ class Backend:
         # Trades are stored in PostgreSQL (db_store)
         self._last_signal_ts: Dict[str, float] = {}
         self._signal_seq = 1
+
+        # Track when price fetching started failing per trade_id (used for forced CLOSE)
+        self._price_fail_since: Dict[int, float] = {}
 
         self.last_signal: Optional[Signal] = None
         self.last_spot_signal: Optional[Signal] = None
@@ -2015,6 +2024,43 @@ class Backend:
         except Exception:
             return None
 
+
+    async def _fetch_okx_price(self, market: str, symbol: str) -> float | None:
+        """OKX REST price (spot/futures).
+
+        market: SPOT -> instId=BASE-USDT
+                FUTURES -> instId=BASE-USDT-SWAP (USDT perpetual)
+        """
+        mkt = (market or "FUTURES").upper()
+        sym = (symbol or "").upper().replace("/", "")
+        if not sym:
+            return None
+        try:
+            if sym.endswith("USDT"):
+                base = sym[:-4]
+            else:
+                base = sym
+            inst = f"{base}-USDT" if mkt == "SPOT" else f"{base}-USDT-SWAP"
+            url = "https://www.okx.com/api/v5/market/ticker"
+            timeout = aiohttp.ClientTimeout(total=6)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(url, params={"instId": inst}) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json()
+            if not isinstance(data, dict):
+                return None
+            arr = data.get("data") or []
+            if not arr or not isinstance(arr, list):
+                return None
+            item = arr[0] if arr else None
+            if not isinstance(item, dict):
+                return None
+            p = item.get("last") or item.get("lastPrice")
+            return float(p) if p is not None else None
+        except Exception:
+            return None
+
     async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
         """Return (price, source) for tracking.
 
@@ -2022,7 +2068,9 @@ class Backend:
           - BINANCE_WS / BINANCE_REST
           - BYBIT_REST
           - MEDIAN(BINANCE+BYBIT) / BINANCE_ONLY / BYBIT_ONLY
-          - MOCK
+          - OKX_REST
+
+        Note: if all sources fail, raises PriceUnavailableError.
 
         Selection is controlled via env:
           SPOT_PRICE_SOURCE=BINANCE|BYBIT|MEDIAN
@@ -2095,14 +2143,32 @@ class Backend:
                 return float(p), "BYBIT_REST"
             return None, "BYBIT"
 
+        async def get_okx() -> tuple[float | None, str]:
+            p = await self._fetch_okx_price(market, signal.symbol)
+            if _is_reasonable(p):
+                return float(p), "OKX_REST"
+            return None, "OKX"
+
         if mode == "BINANCE":
             b, bsrc = await get_binance()
             if b is not None:
                 return float(b), bsrc
+            y, ysrc = await get_bybit()
+            if y is not None:
+                return float(y), ysrc
+            o, osrc = await get_okx()
+            if o is not None:
+                return float(o), osrc
         elif mode == "BYBIT":
             y, ysrc = await get_bybit()
             if y is not None:
                 return float(y), ysrc
+            o, osrc = await get_okx()
+            if o is not None:
+                return float(o), osrc
+            b, bsrc = await get_binance()
+            if b is not None:
+                return float(b), bsrc
         else:  # MEDIAN
             b, bsrc = await get_binance()
             y, ysrc = await get_bybit()
@@ -2141,10 +2207,13 @@ class Backend:
             if y_ok:
                 return float(y), "BYBIT_ONLY"
 
-        # Last resort: keep near entry (never random huge).
-        if base is not None and base > 0:
-            return float(self.feed.mock_price(market, signal.symbol, base=base)), "MOCK"
-        return float(self.feed.mock_price(market, signal.symbol, base=None)), "MOCK"
+
+            o, osrc = await get_okx()
+            if _is_reasonable(o):
+                return float(o), "OKX_ONLY"
+
+        # All sources failed -> let caller decide (skip tick / forced CLOSE)
+        raise PriceUnavailableError(f"price unavailable market={market} symbol={signal.symbol} mode={mode}")
 
     async def _get_price(self, signal: Signal) -> float:
         price, _src = await self._get_price_with_source(signal)
@@ -2234,8 +2303,37 @@ class Backend:
                         ts=float(dt.datetime.now(dt.timezone.utc).timestamp()),
                     )
 
-                    price_f, price_src = await self._get_price_with_source(s)
-                    price_f = float(price_f)
+                    try:
+                        price_f, price_src = await self._get_price_with_source(s)
+                        price_f = float(price_f)
+                        # clear failure tracker on success
+                        self._price_fail_since.pop(trade_id, None)
+                    except PriceUnavailableError as e:
+                        now_ts = time.time()
+                        first = self._price_fail_since.get(trade_id)
+                        if first is None:
+                            self._price_fail_since[trade_id] = now_ts
+                            first = now_ts
+                        close_after_min = float(os.getenv("PRICE_FAIL_CLOSE_MINUTES", "10") or 10)
+                        # skip this tick; try again next loop
+                        if close_after_min <= 0 or (now_ts - first) < (close_after_min * 60.0):
+                            logger.warning("price unavailable: skip tick trade_id=%s %s %s err=%s", trade_id, market, symbol, str(e)[:200])
+                            continue
+                        # Forced close after N minutes without price
+                        txt = _trf(uid, "msg_price_unavailable_close") if "msg_price_unavailable_close" in I18N.get(get_lang(uid), {}) else (
+                            f"⚠️ Цена недоступна более {int(close_after_min)} мин. Закрываю сделку.\n\n{symbol} | {market}"
+
+                        )
+                        try:
+                            await safe_send(bot, uid, txt, ctx="msg_price_unavailable_close")
+                        except Exception:
+                            pass
+                        # Use entry as best-effort close price
+                        close_px = float(s.entry or 0.0)
+                        await db_store.close_trade(trade_id, status="CLOSED", price=close_px, pnl_total_pct=float(row.get("pnl_total_pct") or 0.0) if row.get("pnl_total_pct") is not None else 0.0)
+                        self._price_fail_since.pop(trade_id, None)
+                        continue
+
                     dbg = _price_debug_block(uid, price=price_f, source=price_src, side=side, sl=(float(s.sl) if s.sl else None), tp1=(float(s.tp1) if s.tp1 else None), tp2=(float(s.tp2) if s.tp2 else None))
 
                     def hit_tp(lvl: float) -> bool:
