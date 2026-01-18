@@ -134,6 +134,92 @@ async def ensure_schema() -> None:
         ON trade_events (trade_id, created_at DESC);
         """)
 
+        # ------------------------
+        # Auto-trade (separate from manual tracking)
+        # ------------------------
+        # Settings are per user and split by market (spot/futures).
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS autotrade_settings (
+          user_id BIGINT PRIMARY KEY,
+          spot_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+          futures_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+
+          spot_exchange TEXT NOT NULL DEFAULT 'binance' CHECK (spot_exchange IN ('binance','bybit')),
+          futures_exchange TEXT NOT NULL DEFAULT 'binance' CHECK (futures_exchange IN ('binance','bybit')),
+
+          -- Amounts are validated both in bot UI and DB. 0 means "not set".
+          spot_amount_per_trade NUMERIC(18,8) NOT NULL DEFAULT 0
+            CHECK (spot_amount_per_trade = 0 OR spot_amount_per_trade >= 10),
+          futures_margin_per_trade NUMERIC(18,8) NOT NULL DEFAULT 0
+            CHECK (futures_margin_per_trade = 0 OR futures_margin_per_trade >= 5),
+          futures_leverage INT NOT NULL DEFAULT 1,
+          futures_cap NUMERIC(18,8) NOT NULL DEFAULT 0,
+
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+
+        # Add constraints for existing installations (CREATE TABLE IF NOT EXISTS won't update old schema).
+        await conn.execute("""
+        DO $$
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_spot_min') THEN
+            ALTER TABLE autotrade_settings
+              ADD CONSTRAINT ck_autotrade_spot_min
+              CHECK (spot_amount_per_trade = 0 OR spot_amount_per_trade >= 10);
+          END IF;
+          IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_futures_min') THEN
+            ALTER TABLE autotrade_settings
+              ADD CONSTRAINT ck_autotrade_futures_min
+              CHECK (futures_margin_per_trade = 0 OR futures_margin_per_trade >= 5);
+          END IF;
+        END $$;
+        """)
+
+        # Exchange keys are stored encrypted (ciphertext only).
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS autotrade_keys (
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          user_id BIGINT NOT NULL,
+          exchange TEXT NOT NULL CHECK (exchange IN ('binance','bybit')),
+          market_type TEXT NOT NULL CHECK (market_type IN ('spot','futures')),
+          api_key_enc TEXT,
+          api_secret_enc TEXT,
+          passphrase_enc TEXT,
+          is_active BOOLEAN NOT NULL DEFAULT FALSE,
+          last_ok_at TIMESTAMPTZ,
+          last_error TEXT,
+          last_error_at TIMESTAMPTZ,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE (user_id, exchange, market_type)
+        );
+        """)
+
+        # Stores allocated amounts for open autotrade positions (used to count "used" caps).
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS autotrade_positions (
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          user_id BIGINT NOT NULL,
+          signal_id BIGINT,
+          exchange TEXT NOT NULL CHECK (exchange IN ('binance','bybit')),
+          market_type TEXT NOT NULL CHECK (market_type IN ('spot','futures')),
+          symbol TEXT NOT NULL,
+          side TEXT NOT NULL,
+          allocated_usdt NUMERIC(18,8) NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','CLOSED','ERROR')),
+          api_order_ref TEXT,
+          opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          closed_at TIMESTAMPTZ,
+          UNIQUE (user_id, signal_id, exchange, market_type)
+        );
+        """)
+
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_autotrade_positions_user_open
+        ON autotrade_positions (user_id, market_type, status);
+        """)
+
 
         # --- signals sent counters (persistent, for admin dashboard) ---
         await conn.execute("""
@@ -697,3 +783,436 @@ async def set_signal_bot_settings(*, pause_signals: bool, maintenance_mode: bool
             """,
             bool(pause_signals), bool(maintenance_mode),
         )
+
+
+# ---------------- Auto-trade settings / keys ----------------
+
+async def get_autotrade_settings(user_id: int) -> Dict[str, Any]:
+    """Return autotrade settings for the user (with defaults)."""
+    pool = get_pool()
+    uid = int(user_id)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT user_id, spot_enabled, futures_enabled,
+                   spot_exchange, futures_exchange,
+                   spot_amount_per_trade, futures_margin_per_trade,
+                   futures_leverage, futures_cap
+            FROM autotrade_settings
+            WHERE user_id=$1
+            """,
+            uid,
+        )
+        if not row:
+            # Ensure row exists with defaults
+            await conn.execute(
+                """
+                INSERT INTO autotrade_settings(user_id) VALUES ($1)
+                ON CONFLICT (user_id) DO NOTHING;
+                """,
+                uid,
+            )
+            return {
+                "user_id": uid,
+                "spot_enabled": False,
+                "futures_enabled": False,
+                "spot_exchange": "binance",
+                "futures_exchange": "binance",
+                "spot_amount_per_trade": 0.0,
+                "futures_margin_per_trade": 0.0,
+                "futures_leverage": 1,
+                "futures_cap": 0.0,
+            }
+        return {
+            "user_id": uid,
+            "spot_enabled": bool(row.get("spot_enabled")),
+            "futures_enabled": bool(row.get("futures_enabled")),
+            "spot_exchange": str(row.get("spot_exchange") or "binance"),
+            "futures_exchange": str(row.get("futures_exchange") or "binance"),
+            "spot_amount_per_trade": float(row.get("spot_amount_per_trade") or 0.0),
+            "futures_margin_per_trade": float(row.get("futures_margin_per_trade") or 0.0),
+            "futures_leverage": int(row.get("futures_leverage") or 1),
+            "futures_cap": float(row.get("futures_cap") or 0.0),
+        }
+
+
+async def set_autotrade_toggle(user_id: int, market_type: str, enabled: bool) -> None:
+    pool = get_pool()
+    uid = int(user_id)
+    m = (market_type or "").lower().strip()
+    col = "spot_enabled" if m == "spot" else "futures_enabled"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"""
+            INSERT INTO autotrade_settings(user_id, {col}, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+              SET {col}=EXCLUDED.{col}, updated_at=NOW();
+            """,
+            uid,
+            bool(enabled),
+        )
+
+
+async def set_autotrade_exchange(user_id: int, market_type: str, exchange: str) -> None:
+    pool = get_pool()
+    uid = int(user_id)
+    m = (market_type or "").lower().strip()
+    ex = (exchange or "binance").lower().strip()
+    if ex not in ("binance", "bybit"):
+        ex = "binance"
+    col = "spot_exchange" if m == "spot" else "futures_exchange"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"""
+            INSERT INTO autotrade_settings(user_id, {col}, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+              SET {col}=EXCLUDED.{col}, updated_at=NOW();
+            """,
+            uid,
+            ex,
+        )
+
+
+async def set_autotrade_amount(user_id: int, market_type: str, amount_usdt: float) -> None:
+    pool = get_pool()
+    uid = int(user_id)
+    m = (market_type or "").lower().strip()
+    col = "spot_amount_per_trade" if m == "spot" else "futures_margin_per_trade"
+    amt = float(amount_usdt or 0.0)
+    if amt < 0:
+        amt = 0.0
+    # Hard minimums (also enforced in DB schema):
+    # - SPOT amount per trade >= 10 USDT (or 0 when unset)
+    # - FUTURES margin per trade >= 5 USDT (or 0 when unset)
+    if m == "spot" and 0 < amt < 10:
+        raise ValueError("SPOT amount per trade must be >= 10")
+    if m != "spot" and 0 < amt < 5:
+        raise ValueError("FUTURES margin per trade must be >= 5")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"""
+            INSERT INTO autotrade_settings(user_id, {col}, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+              SET {col}=EXCLUDED.{col}, updated_at=NOW();
+            """,
+            uid,
+            amt,
+        )
+
+
+async def set_autotrade_futures_leverage(user_id: int, leverage: int) -> None:
+    pool = get_pool()
+    uid = int(user_id)
+    lev = int(leverage or 1)
+    if lev < 1:
+        lev = 1
+    if lev > 125:
+        lev = 125
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO autotrade_settings(user_id, futures_leverage, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+              SET futures_leverage=EXCLUDED.futures_leverage, updated_at=NOW();
+            """,
+            uid,
+            lev,
+        )
+
+
+async def set_autotrade_futures_cap(user_id: int, cap_usdt: float) -> None:
+    pool = get_pool()
+    uid = int(user_id)
+    cap = float(cap_usdt or 0.0)
+    if cap < 0:
+        cap = 0.0
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO autotrade_settings(user_id, futures_cap, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+              SET futures_cap=EXCLUDED.futures_cap, updated_at=NOW();
+            """,
+            uid,
+            cap,
+        )
+
+
+async def get_autotrade_keys_status(user_id: int) -> List[Dict[str, Any]]:
+    """Return list with statuses for all stored keys."""
+    pool = get_pool()
+    uid = int(user_id)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT exchange, market_type, is_active, last_ok_at, last_error, last_error_at
+            FROM autotrade_keys
+            WHERE user_id=$1
+            ORDER BY exchange, market_type;
+            """,
+            uid,
+        )
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            out.append(
+                {
+                    "exchange": str(r.get("exchange")),
+                    "market_type": str(r.get("market_type")),
+                    "is_active": bool(r.get("is_active")),
+                    "last_ok_at": r.get("last_ok_at"),
+                    "last_error": r.get("last_error"),
+                    "last_error_at": r.get("last_error_at"),
+                }
+            )
+        return out
+
+
+async def get_autotrade_keys_row(*, user_id: int, exchange: str, market_type: str) -> Optional[Dict[str, Any]]:
+    """Return encrypted key row for (user_id, exchange, market_type).
+
+    NOTE: returns ciphertext only. Decryption must happen outside db_store.
+    """
+    pool = get_pool()
+    uid = int(user_id)
+    ex = (exchange or "binance").lower().strip()
+    mt = (market_type or "spot").lower().strip()
+    if ex not in ("binance", "bybit"):
+        ex = "binance"
+    if mt not in ("spot", "futures"):
+        mt = "spot"
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow(
+            """
+            SELECT user_id, exchange, market_type, api_key_enc, api_secret_enc, passphrase_enc,
+                   is_active, last_ok_at, last_error, last_error_at
+            FROM autotrade_keys
+            WHERE user_id=$1 AND exchange=$2 AND market_type=$3
+            """,
+            uid,
+            ex,
+            mt,
+        )
+        return dict(r) if r else None
+
+
+async def create_autotrade_position(
+    *,
+    user_id: int,
+    signal_id: Optional[int],
+    exchange: str,
+    market_type: str,
+    symbol: str,
+    side: str,
+    allocated_usdt: float,
+    api_order_ref: Optional[str] = None,
+) -> None:
+    """Insert or update autotrade position row as OPEN."""
+    pool = get_pool()
+    uid = int(user_id)
+    ex = (exchange or "binance").lower().strip()
+    mt = (market_type or "spot").lower().strip()
+    sym = str(symbol or "").upper().strip()
+    side = str(side or "").upper().strip()
+    if ex not in ("binance", "bybit"):
+        ex = "binance"
+    if mt not in ("spot", "futures"):
+        mt = "spot"
+    if not sym:
+        sym = "UNKNOWN"
+    if side not in ("BUY", "SELL"):
+        side = "BUY"
+    alloc = float(allocated_usdt or 0.0)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO autotrade_positions(user_id, signal_id, exchange, market_type, symbol, side, allocated_usdt, status, api_order_ref, opened_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,'OPEN',$8,NOW())
+            ON CONFLICT (user_id, signal_id, exchange, market_type)
+            DO UPDATE SET allocated_usdt=EXCLUDED.allocated_usdt,
+                          status='OPEN',
+                          api_order_ref=EXCLUDED.api_order_ref,
+                          opened_at=NOW(),
+                          closed_at=NULL;
+            """,
+            uid,
+            signal_id,
+            ex,
+            mt,
+            sym,
+            side,
+            alloc,
+            api_order_ref,
+        )
+
+
+async def close_autotrade_position(*, user_id: int, signal_id: Optional[int], exchange: str, market_type: str, status: str = "CLOSED") -> None:
+    pool = get_pool()
+    uid = int(user_id)
+    ex = (exchange or "binance").lower().strip()
+    mt = (market_type or "spot").lower().strip()
+    st = (status or "CLOSED").upper().strip()
+    if st not in ("CLOSED", "ERROR"):
+        st = "CLOSED"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE autotrade_positions
+            SET status=$5, closed_at=NOW()
+            WHERE user_id=$1 AND signal_id=$2 AND exchange=$3 AND market_type=$4;
+            """,
+            uid,
+            signal_id,
+            ex,
+            mt,
+            st,
+        )
+
+
+async def list_open_autotrade_positions(*, limit: int = 200) -> List[Dict[str, Any]]:
+    pool = get_pool()
+    lim = int(limit or 200)
+    if lim < 1:
+        lim = 1
+    if lim > 2000:
+        lim = 2000
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, signal_id, exchange, market_type, symbol, side, allocated_usdt, api_order_ref, opened_at
+            FROM autotrade_positions
+            WHERE status='OPEN'
+            ORDER BY opened_at ASC
+            LIMIT $1;
+            """,
+            lim,
+        )
+        return [dict(r) for r in rows]
+
+
+async def update_autotrade_order_ref(*, row_id: int, api_order_ref: str) -> None:
+    pool = get_pool()
+    rid = int(row_id)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE autotrade_positions
+            SET api_order_ref=$2
+            WHERE id=$1;
+            """,
+            rid,
+            api_order_ref,
+        )
+
+
+async def upsert_autotrade_keys(
+    *,
+    user_id: int,
+    exchange: str,
+    market_type: str,
+    api_key_enc: str | None,
+    api_secret_enc: str | None,
+    passphrase_enc: str | None = None,
+    is_active: bool = False,
+    last_error: str | None = None,
+) -> None:
+    pool = get_pool()
+    uid = int(user_id)
+    ex = (exchange or "binance").lower().strip()
+    mt = (market_type or "spot").lower().strip()
+    if ex not in ("binance", "bybit"):
+        ex = "binance"
+    if mt not in ("spot", "futures"):
+        mt = "spot"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO autotrade_keys(user_id, exchange, market_type, api_key_enc, api_secret_enc, passphrase_enc,
+                                      is_active, last_ok_at, last_error, last_error_at, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7, CASE WHEN $7 THEN NOW() ELSE NULL END, $8, CASE WHEN $8 IS NULL THEN NULL ELSE NOW() END, NOW())
+            ON CONFLICT (user_id, exchange, market_type)
+            DO UPDATE SET api_key_enc=EXCLUDED.api_key_enc,
+                          api_secret_enc=EXCLUDED.api_secret_enc,
+                          passphrase_enc=EXCLUDED.passphrase_enc,
+                          is_active=EXCLUDED.is_active,
+                          last_ok_at=EXCLUDED.last_ok_at,
+                          last_error=EXCLUDED.last_error,
+                          last_error_at=EXCLUDED.last_error_at,
+                          updated_at=NOW();
+            """,
+            uid,
+            ex,
+            mt,
+            api_key_enc,
+            api_secret_enc,
+            passphrase_enc,
+            bool(is_active),
+            last_error,
+        )
+
+
+async def mark_autotrade_key_error(
+    *,
+    user_id: int,
+    exchange: str,
+    market_type: str,
+    error: str,
+    deactivate: bool = False,
+) -> None:
+    pool = get_pool()
+    uid = int(user_id)
+    ex = (exchange or "binance").lower().strip()
+    mt = (market_type or "spot").lower().strip()
+    async with pool.acquire() as conn:
+        # Only deactivate keys on *credential/permission* failures. Network/rate-limit/order-parameter
+        # errors should not permanently disable a key.
+        if bool(deactivate):
+            await conn.execute(
+                """
+                INSERT INTO autotrade_keys(user_id, exchange, market_type, is_active, last_error, last_error_at, updated_at)
+                VALUES ($1,$2,$3,FALSE,$4,NOW(),NOW())
+                ON CONFLICT (user_id, exchange, market_type)
+                DO UPDATE SET is_active=FALSE, last_error=$4, last_error_at=NOW(), updated_at=NOW();
+                """,
+                uid,
+                ex,
+                mt,
+                (error or "API error")[:500],
+            )
+        else:
+            await conn.execute(
+                """
+                INSERT INTO autotrade_keys(user_id, exchange, market_type, is_active, last_error, last_error_at, updated_at)
+                VALUES ($1,$2,$3,TRUE,$4,NOW(),NOW())
+                ON CONFLICT (user_id, exchange, market_type)
+                DO UPDATE SET last_error=$4, last_error_at=NOW(), updated_at=NOW();
+                """,
+                uid,
+                ex,
+                mt,
+                (error or "API error")[:500],
+            )
+
+async def get_autotrade_used_usdt(user_id: int, market_type: str) -> float:
+    pool = get_pool()
+    uid = int(user_id)
+    mt = (market_type or "spot").lower().strip()
+    async with pool.acquire() as conn:
+        v = await conn.fetchval(
+            """
+            SELECT COALESCE(SUM(allocated_usdt), 0)
+            FROM autotrade_positions
+            WHERE user_id=$1 AND market_type=$2 AND status='OPEN'
+            """,
+            uid,
+            mt,
+        )
+        try:
+            return float(v or 0.0)
+        except Exception:
+            return 0.0
+
