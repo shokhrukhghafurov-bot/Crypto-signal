@@ -151,7 +151,12 @@
     "trade_removed_fail": "Trade not found.",
     "weekly_title": "🗓️ Weekly (last 4w)",
     "welcome": "PRO Auto-Scanner Bot\n\n✅ You are subscribed to signals.\nUse the buttons below:",
-    "access_maintenance": "🚧 Maintenance in progress. Bot is temporarily unavailable."
+    "access_maintenance": "🚧 Maintenance in progress. Bot is temporarily unavailable.",
+    "sig_maintenance_live": "🛠 Signals are under maintenance\n\nNew signals are temporarily disabled.\nPlease try again later.",
+    "sig_state_on": "✅ ON",
+    "sig_state_paused": "⏸ PAUSED",
+    "sig_state_maintenance": "🛠 MAINTENANCE",
+    "status_signals": "Signals: {state}"
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -305,7 +310,11 @@
     "trade_removed_fail": "Сделка не найдена.",
     "weekly_title": "🗓️ По неделям (4н)",
     "welcome": "PRO Auto-Scanner Bot\n\n✅ Ты подписан на сигналы.\nНажимай кнопки ниже:",
-    "access_maintenance": "🚧 Идут технические работы. Бот временно недоступен."
+    "access_maintenance": "🚧 Идут технические работы. Бот временно недоступен.",
+    "sig_maintenance_live": "🛠 Сигналы на обслуживании\n\nНовые сигналы временно отключены.\nПопробуй позже.",
+    "sig_state_on": "✅ ВКЛ",
+    "sig_state_paused": "⏸ ПАУЗА",
+    "sig_state_maintenance": "🛠 ОБСЛУЖИВАНИЕ",
+    "status_signals": "Сигналы: {state}"
   }
 }
-
