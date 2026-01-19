@@ -2105,12 +2105,34 @@ async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
         await safe_edit(call.message, tr(uid, "at_info_text"), autotrade_info_kb(uid))
         return
 
+    if action == "faq":
+        await safe_edit(call.message, autotrade_faq_text(uid), autotrade_faq_kb(uid))
+        return
+
     await safe_edit(call.message, tr(uid, "welcome"), menu_kb(uid))
 
 
 def autotrade_info_kb(uid: int) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "at_menu_faq"), callback_data="atmenu:faq")
     kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def autotrade_faq_text(uid: int) -> str:
+    """FAQ text from i18n."""
+    lang = get_lang(uid)
+    title = tr(uid, 'at_faq_title')
+    body = tr(uid, 'at_faq_text')
+    # Optional support line
+    support = f"\n\n@{SUPPORT_USERNAME}" if SUPPORT_USERNAME else ''
+    return f"{title}\n\n{body}{support}"
+
+
+def autotrade_faq_kb(uid: int) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "btn_back"), callback_data="atmenu:info")
     kb.adjust(1)
     return kb.as_markup()
 
