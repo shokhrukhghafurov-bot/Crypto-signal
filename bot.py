@@ -900,17 +900,27 @@ def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
     spot_state = tr(uid, "at_state_on") if s.get("spot_enabled") else tr(uid, "at_state_off")
     fut_state = tr(uid, "at_state_on") if s.get("futures_enabled") else tr(uid, "at_state_off")
 
+    title = tr(uid, "at_title")
+    spot_header = tr(uid, "at_spot_header")
+    fut_header = tr(uid, "at_futures_header")
+    lbl_ex = tr(uid, "at_label_exchange")
+    lbl_spot_amt = tr(uid, "at_label_spot_amount")
+    lbl_fut_margin = tr(uid, "at_label_futures_margin")
+    lbl_lev = tr(uid, "at_label_leverage")
+    lbl_cap = tr(uid, "at_label_cap")
+    cap_auto_spot = tr(uid, "at_cap_auto_spot")
+
     return (
-        "🤖 Auto-trade\n\n"
-        f"🌕 SPOT: {spot_state}\n"
-        f"Биржа: {spot_ex}\n"
-        f"Сумма на сделку: {spot_amt:g} USDT\n"
-        "Cap: Авто (баланс Spot)\n\n"
-        f"⚡ FUTURES: {fut_state}\n"
-        f"Биржа: {fut_ex}\n"
-        f"Маржа на сделку: {fut_margin:g} USDT\n"
-        f"Плечо: {fut_lev}x\n"
-        f"Cap: {fut_cap:g} USDT"
+        f"{title}\n\n"
+        f"{spot_header}: {spot_state}\n"
+        f"{lbl_ex}: {spot_ex}\n"
+        f"{lbl_spot_amt}: {spot_amt:g} USDT\n"
+        f"{lbl_cap}: {cap_auto_spot}\n\n"
+        f"{fut_header}: {fut_state}\n"
+        f"{lbl_ex}: {fut_ex}\n"
+        f"{lbl_fut_margin}: {fut_margin:g} USDT\n"
+        f"{lbl_lev}: {fut_lev}x\n"
+        f"{lbl_cap}: {fut_cap:g} USDT"
     )
 
 
@@ -928,15 +938,15 @@ def autotrade_stats_kb(uid: int, *, market_type: str, period: str) -> types.Inli
     mt = (market_type or "all").lower()
     pr = (period or "today").lower()
     kb = InlineKeyboardBuilder()
-    kb.button(text="🌕 SPOT" + (" ✅" if mt == "spot" else ""), callback_data="atstats:type:spot")
-    kb.button(text="⚡ FUTURES" + (" ✅" if mt == "futures" else ""), callback_data="atstats:type:futures")
-    kb.button(text="📊 ВСЕ" + (" ✅" if mt == "all" else ""), callback_data="atstats:type:all")
+    kb.button(text=tr(uid, "at_stats_type_spot") + (" ✅" if mt == "spot" else ""), callback_data="atstats:type:spot")
+    kb.button(text=tr(uid, "at_stats_type_futures") + (" ✅" if mt == "futures" else ""), callback_data="atstats:type:futures")
+    kb.button(text=tr(uid, "at_stats_type_all") + (" ✅" if mt == "all" else ""), callback_data="atstats:type:all")
     kb.adjust(3)
-    kb.button(text="📅 Сегодня" + (" ✅" if pr == "today" else ""), callback_data="atstats:period:today")
-    kb.button(text="📆 Неделя" + (" ✅" if pr == "week" else ""), callback_data="atstats:period:week")
-    kb.button(text="🗓 Месяц" + (" ✅" if pr == "month" else ""), callback_data="atstats:period:month")
+    kb.button(text=tr(uid, "at_stats_period_today") + (" ✅" if pr == "today" else ""), callback_data="atstats:period:today")
+    kb.button(text=tr(uid, "at_stats_period_week") + (" ✅" if pr == "week" else ""), callback_data="atstats:period:week")
+    kb.button(text=tr(uid, "at_stats_period_month") + (" ✅" if pr == "month" else ""), callback_data="atstats:period:month")
     kb.adjust(3)
-    kb.button(text="🔄 Обновить", callback_data="atstats:refresh")
+    kb.button(text=tr(uid, "at_stats_refresh"), callback_data="atstats:refresh")
     kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
     kb.adjust(1)
     return kb.as_markup()
