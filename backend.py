@@ -3325,16 +3325,23 @@ class Backend:
         return b
 
     async def perf_today(self, user_id: int, market: str) -> dict:
-        now = dt.datetime.now(dt.timezone.utc)
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = start + dt.timedelta(days=1)
+        tz = ZoneInfo(TZ_NAME)
+        now_tz = dt.datetime.now(tz)
+        start_tz = now_tz.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_tz = start_tz + dt.timedelta(days=1)
+        start = start_tz.astimezone(dt.timezone.utc)
+        end = end_tz.astimezone(dt.timezone.utc)
         return await db_store.perf_bucket(int(user_id), (market or "FUTURES").upper(), since=start, until=end)
 
     async def perf_week(self, user_id: int, market: str) -> dict:
-        now = dt.datetime.now(dt.timezone.utc)
-        # ISO week start (Monday)
-        start = (now - dt.timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-        end = start + dt.timedelta(days=7)
+        """Last 7 days rolling window in TZ_NAME (inclusive of today)."""
+        tz = ZoneInfo(TZ_NAME)
+        now_tz = dt.datetime.now(tz)
+        # start at local midnight 6 days ago => 7 calendar days including today
+        start_tz = (now_tz - dt.timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_tz = now_tz
+        start = start_tz.astimezone(dt.timezone.utc)
+        end = end_tz.astimezone(dt.timezone.utc)
         return await db_store.perf_bucket(int(user_id), (market or "FUTURES").upper(), since=start, until=end)
 
     async def report_daily(self, user_id: int, market: str, days: int = 7, tz: str = "UTC") -> list[dict]:
