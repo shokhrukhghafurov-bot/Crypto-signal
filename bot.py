@@ -794,6 +794,9 @@ from cryptography.fernet import Fernet, InvalidToken
 
 AUTOTRADE_INPUT: Dict[int, Dict[str, str]] = {}
 
+# Auto-trade stats UI state
+AUTOTRADE_STATS_STATE: Dict[int, Dict[str, str]] = {}
+
 # Notify only on API errors (anti-spam)
 AUTOTRADE_API_ERR_LAST: Dict[tuple[int, str, str], float] = {}
 AUTOTRADE_API_ERR_COOLDOWN_SEC = 300
@@ -850,7 +853,8 @@ def autotrade_kb(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> typ
     kb.adjust(2)
 
     kb.button(text=tr(uid, "at_keys"), callback_data="at:keys")
-    kb.button(text=tr(uid, "btn_back"), callback_data="menu:status")
+    # Back to Auto-trade main screen
+    kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -883,6 +887,65 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
         y_spot=ks("bybit","spot"),
         y_fut=ks("bybit","futures"),
     )
+
+
+def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
+    """Compact Auto-trade screen (main), per UX request."""
+    spot_ex = str(s.get("spot_exchange") or "binance").capitalize()
+    fut_ex = str(s.get("futures_exchange") or "binance").capitalize()
+    spot_amt = float(s.get("spot_amount_per_trade") or 0.0)
+    fut_margin = float(s.get("futures_margin_per_trade") or 0.0)
+    fut_lev = int(s.get("futures_leverage") or 1)
+    fut_cap = float(s.get("futures_cap") or 0.0)
+    spot_state = tr(uid, "at_state_on") if s.get("spot_enabled") else tr(uid, "at_state_off")
+    fut_state = tr(uid, "at_state_on") if s.get("futures_enabled") else tr(uid, "at_state_off")
+
+    return (
+        "🤖 Auto-trade\n\n"
+        f"🌕 SPOT: {spot_state}\n"
+        f"Биржа: {spot_ex}\n"
+        f"Сумма на сделку: {spot_amt:g} USDT\n"
+        "Cap: Авто (баланс Spot)\n\n"
+        f"⚡ FUTURES: {fut_state}\n"
+        f"Биржа: {fut_ex}\n"
+        f"Маржа на сделку: {fut_margin:g} USDT\n"
+        f"Плечо: {fut_lev}x\n"
+        f"Cap: {fut_cap:g} USDT"
+    )
+
+
+def autotrade_main_kb(uid: int) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "at_menu_settings"), callback_data="atmenu:settings")
+    kb.button(text=tr(uid, "at_menu_stats"), callback_data="atmenu:stats")
+    kb.adjust(2)
+    kb.button(text=tr(uid, "btn_back"), callback_data="menu:status")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def autotrade_stats_kb(uid: int, *, market_type: str, period: str) -> types.InlineKeyboardMarkup:
+    mt = (market_type or "all").lower()
+    pr = (period or "today").lower()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🌕 SPOT" + (" ✅" if mt == "spot" else ""), callback_data="atstats:type:spot")
+    kb.button(text="⚡ FUTURES" + (" ✅" if mt == "futures" else ""), callback_data="atstats:type:futures")
+    kb.button(text="📊 ВСЕ" + (" ✅" if mt == "all" else ""), callback_data="atstats:type:all")
+    kb.adjust(3)
+    kb.button(text="📅 Сегодня" + (" ✅" if pr == "today" else ""), callback_data="atstats:period:today")
+    kb.button(text="📆 Неделя" + (" ✅" if pr == "week" else ""), callback_data="atstats:period:week")
+    kb.button(text="🗓 Месяц" + (" ✅" if pr == "month" else ""), callback_data="atstats:period:month")
+    kb.adjust(3)
+    kb.button(text="🔄 Обновить", callback_data="atstats:refresh")
+    kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def _fmt_pnl_line(pnl: float, roi: float) -> str:
+    sign = "+" if pnl > 0 else ("" if pnl < 0 else "")
+    roi_sign = "+" if roi > 0 else ("" if roi < 0 else "")
+    return f"{sign}{pnl:.2f} USDT ({roi_sign}{roi:.2f}%)"
 
 
 def autotrade_keys_kb(uid: int) -> types.InlineKeyboardMarkup:
@@ -1699,7 +1762,6 @@ async def menu_handler(call: types.CallbackQuery) -> None:
     if action == "autotrade":
         try:
             st = await db_store.get_autotrade_settings(uid)
-            keys = await db_store.get_autotrade_keys_status(uid)
         except Exception:
             st = {
                 "spot_enabled": False,
@@ -1711,8 +1773,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 "futures_leverage": 1,
                 "futures_cap": 0.0,
             }
-            keys = []
-        await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
+        await safe_edit(call.message, autotrade_main_text(uid, st), autotrade_main_kb(uid))
         return
 
     # fallback
@@ -1991,6 +2052,94 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
     st = await db_store.get_autotrade_settings(uid)
     keys = await db_store.get_autotrade_keys_status(uid)
     await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
+
+
+@dp.callback_query(lambda c: (c.data or "").startswith("atmenu:"))
+async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
+    await call.answer()
+    uid = call.from_user.id if call.from_user else 0
+    if not uid:
+        return
+
+    access = await get_access_status(uid)
+    if access != "ok":
+        await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+        return
+
+    action = (call.data or "").split(":", 1)[1]
+    if action == "settings":
+        st = await db_store.get_autotrade_settings(uid)
+        keys = await db_store.get_autotrade_keys_status(uid)
+        await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
+        return
+
+    if action == "stats":
+        # initialize state
+        AUTOTRADE_STATS_STATE.setdefault(uid, {"market_type": "all", "period": "today"})
+        state = AUTOTRADE_STATS_STATE[uid]
+        stats = await db_store.get_autotrade_stats(user_id=uid, market_type=state["market_type"], period=state["period"])
+        txt = _render_autotrade_stats_text(uid, state["market_type"], state["period"], stats)
+        await safe_edit(call.message, txt, autotrade_stats_kb(uid, market_type=state["market_type"], period=state["period"]))
+        return
+
+    await safe_edit(call.message, tr(uid, "welcome"), menu_kb(uid))
+
+
+def _render_autotrade_stats_text(uid: int, market_type: str, period: str, stats: Dict[str, any]) -> str:
+    mt = (market_type or "all").lower()
+    pr = (period or "today").lower()
+    mt_label = "🌕 SPOT" if mt == "spot" else ("⚡ FUTURES" if mt == "futures" else "📊 ВСЕ")
+    pr_label = "Сегодня" if pr == "today" else ("Неделя" if pr == "week" else "Месяц")
+
+    opened = int(stats.get("opened") or 0)
+    closed_plus = int(stats.get("closed_plus") or 0)
+    closed_minus = int(stats.get("closed_minus") or 0)
+    active = int(stats.get("active") or 0)
+    pnl_total = float(stats.get("pnl_total") or 0.0)
+    roi = float(stats.get("roi_percent") or 0.0)
+
+    return (
+        "📊 Auto-trade | Статистика\n"
+        f"🔍 Тип: {mt_label}\n"
+        f"📅 Период: {pr_label}\n\n"
+        f"📂 Открыто сделок: {opened}\n"
+        f"✅ Закрыто в плюс: {closed_plus}\n"
+        f"❌ Закрыто в минус: {closed_minus}\n"
+        f"⏳ Активных сейчас: {active}\n\n"
+        "💰 PnL (USDT / %):\n"
+        f"• Итог: {_fmt_pnl_line(pnl_total, roi)}"
+    )
+
+
+@dp.callback_query(lambda c: (c.data or "").startswith("atstats:"))
+async def autotrade_stats_callback(call: types.CallbackQuery) -> None:
+    await call.answer()
+    uid = call.from_user.id if call.from_user else 0
+    if not uid:
+        return
+
+    access = await get_access_status(uid)
+    if access != "ok":
+        await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+        return
+
+    state = AUTOTRADE_STATS_STATE.setdefault(uid, {"market_type": "all", "period": "today"})
+    parts = (call.data or "").split(":")
+    # atstats:type:spot | atstats:period:today | atstats:refresh
+    if len(parts) >= 2:
+        if parts[1] == "type" and len(parts) >= 3:
+            mt = parts[2].lower()
+            if mt in ("spot", "futures", "all"):
+                state["market_type"] = mt
+        elif parts[1] == "period" and len(parts) >= 3:
+            pr = parts[2].lower()
+            if pr in ("today", "week", "month"):
+                state["period"] = pr
+        # refresh -> no state change
+
+    stats = await db_store.get_autotrade_stats(user_id=uid, market_type=state["market_type"], period=state["period"])
+    txt = _render_autotrade_stats_text(uid, state["market_type"], state["period"], stats)
+    await safe_edit(call.message, txt, autotrade_stats_kb(uid, market_type=state["market_type"], period=state["period"]))
 
 
 @dp.message()
