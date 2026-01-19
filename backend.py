@@ -1822,7 +1822,25 @@ ORDERBOOK_MAX_SPREAD_PCT = max(0.0, _env_float("ORDERBOOK_MAX_SPREAD_PCT", 0.08)
 MACRO_ACTION = os.getenv("MACRO_ACTION", "FUTURES_OFF").strip().upper()  # FUTURES_OFF / PAUSE_ALL
 BLACKOUT_BEFORE_MIN = max(0, _env_int("BLACKOUT_BEFORE_MIN", 30))
 BLACKOUT_AFTER_MIN = max(0, _env_int("BLACKOUT_AFTER_MIN", 45))
-TZ_NAME = os.getenv("TZ_NAME", "Europe/Berlin").strip() or "Europe/Berlin"
+_tz_raw = (os.getenv("TZ_NAME", "Europe/Berlin") or "").strip()
+# Normalize common non-IANA aliases (ZoneInfo requires IANA names)
+_TZ_ALIASES = {
+    "MSK": "Europe/Moscow",
+    "MOSCOW": "Europe/Moscow",
+    "EUROPE/MOSCOW": "Europe/Moscow",
+    "UTC+3": "Europe/Moscow",
+    "UTC+03:00": "Europe/Moscow",
+    "GMT+3": "Europe/Moscow",
+    "GMT+03:00": "Europe/Moscow",
+}
+
+TZ_NAME = _TZ_ALIASES.get(_tz_raw.upper(), _tz_raw) or "Europe/Berlin"
+
+# If TZ_NAME is still invalid, fall back to a safe default
+try:
+    ZoneInfo(TZ_NAME)
+except Exception:
+    TZ_NAME = "Europe/Moscow" if TZ_NAME.upper() in _TZ_ALIASES else "UTC"
 
 FOMC_DECISION_HOUR_ET = max(0, min(23, _env_int("FOMC_DECISION_HOUR_ET", 14)))
 FOMC_DECISION_MINUTE_ET = max(0, min(59, _env_int("FOMC_DECISION_MINUTE_ET", 0)))
