@@ -220,6 +220,18 @@ async def ensure_schema() -> None:
         ON autotrade_positions (user_id, market_type, status);
         """)
 
+        # Prevent duplicate OPEN positions per symbol (race-condition safe)
+        # NOTE: partial unique index; Postgres supports this.
+        try:
+            await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_autotrade_positions_user_symbol_open
+            ON autotrade_positions (user_id, market_type, symbol)
+            WHERE status='OPEN';
+            """)
+        except Exception:
+            # Some managed DBs may restrict CREATE INDEX; ignore.
+            pass
+
 
         # --- signals sent counters (persistent, for admin dashboard) ---
         await conn.execute("""
@@ -334,6 +346,25 @@ async def open_trade_once(
     pool = get_pool()
     async with pool.acquire() as conn:
         try:
+            # Prevent duplicate open trades per symbol+market for the same user.
+            # If an ACTIVE/TP1 trade exists for this symbol, do not open a new one.
+            existing_sym = await conn.fetchval(
+                """
+                SELECT id
+                FROM trades
+                WHERE user_id=$1
+                  AND UPPER(market)=UPPER($2)
+                  AND UPPER(symbol)=UPPER($3)
+                  AND status IN ('ACTIVE','TP1')
+                  AND closed_at IS NULL
+                ORDER BY opened_at DESC
+                LIMIT 1;
+                """,
+                int(user_id), str(market or ''), str(symbol or '')
+            )
+            if existing_sym is not None:
+                return False, None
+
             async def _insert(with_signal_id: int) -> Optional[int]:
                 r = await conn.fetchrow(
                     """
@@ -1028,6 +1059,18 @@ async def create_autotrade_position(
         side = "BUY"
     alloc = float(allocated_usdt or 0.0)
     async with pool.acquire() as conn:
+        # Prevent duplicates: if there is already an OPEN position for this symbol, do nothing.
+        exists = await conn.fetchval(
+            """
+            SELECT 1 FROM autotrade_positions
+            WHERE user_id=$1 AND market_type=$2 AND symbol=$3 AND status='OPEN'
+            LIMIT 1;
+            """,
+            uid, mt, sym,
+        )
+        if exists:
+            return
+
         await conn.execute(
             """
             INSERT INTO autotrade_positions(user_id, signal_id, exchange, market_type, symbol, side, allocated_usdt, status, api_order_ref, opened_at)
