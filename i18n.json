@@ -194,7 +194,8 @@
     "at_keys_api_error": "❌ Exchange API error while checking keys ({exchange} {market}).\nPlease try again in a minute. If it repeats, check permissions and IP whitelist.",
     "at_master_key_missing": "⚠️ Server is not configured (AUTOTRADE_MASTER_KEY missing).",
     "at_screen": "🤖 Auto-trade\n\n🪙 SPOT: {spot_state}\n🏦 Exchange: {spot_ex}\n💰 Amount per trade: {spot_amt} USDT\n📌 Cap: Auto (Spot balance)\n\n⚡ FUTURES: {fut_state}\n🏦 Exchange: {fut_ex}\n💰 Margin per trade: {fut_margin} USDT\n🎚 Leverage: {fut_lev}x\n📌 Cap: {fut_cap} USDT\n\n🔑 Keys status:\nBinance SPOT: {b_spot} | Binance FUTURES: {b_fut}\nBybit SPOT: {y_spot} | Bybit FUTURES: {y_fut}",
-    "welcome": "PRO Auto-Scanner Bot\n\n✅ You are subscribed to signals.\nUse the buttons below:"
+    "welcome": "PRO Auto-Scanner Bot\n\n✅ You are subscribed to signals.\nUse the buttons below:",
+    "stats_error": "Statistics error. Please try again later."
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -391,6 +392,8 @@
     "at_keys_api_error": "❌ Ошибка API биржи при проверке ключей ({exchange} {market}).\nПопробуй ещё раз через минуту. Если повторяется — проверь права и IP whitelist.",
     "at_master_key_missing": "⚠️ Сервер не настроен (нет AUTOTRADE_MASTER_KEY).",
     "at_screen": "🤖 Auto-trade\n\n🪙 SPOT: {spot_state}\n🏦 Биржа: {spot_ex}\n💰 Сумма на сделку: {spot_amt} USDT\n📌 Cap: Авто (баланс Spot)\n\n⚡ FUTURES: {fut_state}\n🏦 Биржа: {fut_ex}\n💰 Маржа на сделку: {fut_margin} USDT\n🎚 Плечо: {fut_lev}x\n📌 Cap: {fut_cap} USDT\n\n🔑 Статус ключей:\nBinance SPOT: {b_spot} | Binance FUTURES: {b_fut}\nBybit SPOT: {y_spot} | Bybit FUTURES: {y_fut}",
-    "welcome": "PRO Auto-Scanner Bot\n\n✅ Ты подписан на сигналы.\nНажимай кнопки ниже:"
+    "welcome": "PRO Auto-Scanner Bot\n\n✅ Ты подписан на сигналы.\nНажимай кнопки ниже:",
+    "stats_error": "Ошибка статистики. Попробуй позже."
   }
 }
+
