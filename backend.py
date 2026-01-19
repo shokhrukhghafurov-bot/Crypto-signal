@@ -1345,6 +1345,72 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
 
     notify_api_error(user_id:int, text:str) will be called only on API errors.
     """
+
+    def _as_float(x, default: float = 0.0) -> float:
+        try:
+            if x is None:
+                return float(default)
+            return float(str(x))
+        except Exception:
+            return float(default)
+
+    def _binance_avg_price(order: dict) -> float:
+        if not isinstance(order, dict):
+            return 0.0
+        ap = _as_float(order.get("avgPrice"), 0.0)
+        if ap > 0:
+            return ap
+        exec_qty = _as_float(order.get("executedQty"), 0.0)
+        cqq = _as_float(order.get("cummulativeQuoteQty"), 0.0)
+        return (cqq / exec_qty) if exec_qty > 0 else 0.0
+
+    def _bybit_avg_price(resp: dict) -> float:
+        # resp is full response from _bybit_order_status
+        try:
+            lst = ((resp.get("result") or {}).get("list") or [])
+            o = lst[0] if (lst and isinstance(lst[0], dict)) else {}
+        except Exception:
+            o = {}
+        ap = _as_float(o.get("avgPrice"), 0.0)
+        if ap > 0:
+            return ap
+        qty = _as_float(o.get("cumExecQty"), 0.0)
+        val = _as_float(o.get("cumExecValue"), 0.0)
+        return (val / qty) if qty > 0 else 0.0
+
+    def _calc_autotrade_pnl_from_orders(*, ref: dict, entry_order: dict, exit_order: dict, exchange: str, market_type: str, allocated_usdt: float) -> tuple[float | None, float | None]:
+        """Compute approximate pnl using entry/exit average fill prices.
+
+        Note: This is an approximation. For partial closes, it accounts only the final closing order.
+        """
+        try:
+            side = str(ref.get("side") or "BUY").upper()
+            qty = _as_float(ref.get("qty"), 0.0)
+            if qty <= 0:
+                return None, None
+
+            if exchange == "binance":
+                entry_p = _binance_avg_price(entry_order)
+                exit_p = _binance_avg_price(exit_order)
+            else:
+                entry_p = _bybit_avg_price(entry_order)
+                exit_p = _bybit_avg_price(exit_order)
+
+            if entry_p <= 0 or exit_p <= 0:
+                return None, None
+
+            # BUY = long, SELL = short (for futures); for spot we assume BUY then SELL
+            if side == "BUY":
+                pnl = (exit_p - entry_p) * qty
+            else:
+                pnl = (entry_p - exit_p) * qty
+
+            alloc = float(allocated_usdt or 0.0)
+            roi = (pnl / alloc * 100.0) if alloc > 0 else None
+            return float(pnl), (float(roi) if roi is not None else None)
+        except Exception:
+            return None, None
+
     # Best-effort; never crash.
     while True:
         try:
@@ -1473,7 +1539,50 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 pass
                             continue
                     if sl_filled:
-                        await db_store.close_autotrade_position(user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED")
+                        pnl_usdt = None
+                        roi_percent = None
+                        try:
+                            entry_id = ref.get("entry_order_id")
+                            entry_order = None
+                            if entry_id:
+                                if ex == "binance":
+                                    entry_order = await _binance_order_status(
+                                        api_key=api_key,
+                                        api_secret=api_secret,
+                                        symbol=symbol,
+                                        order_id=int(entry_id),
+                                        futures=futures,
+                                    )
+                                else:
+                                    category = str(ref.get("category") or ("spot" if mt == "spot" else "linear"))
+                                    entry_order = await _bybit_order_status(
+                                        api_key=api_key,
+                                        api_secret=api_secret,
+                                        category=category,
+                                        symbol=symbol,
+                                        order_id=str(entry_id),
+                                    )
+                            if entry_order:
+                                pnl_usdt, roi_percent = _calc_autotrade_pnl_from_orders(
+                                    ref=ref,
+                                    entry_order=entry_order,
+                                    exit_order=o_sl,
+                                    exchange=ex,
+                                    market_type=mt,
+                                    allocated_usdt=float(r.get("allocated_usdt") or 0.0),
+                                )
+                        except Exception:
+                            pnl_usdt = None
+                            roi_percent = None
+                        await db_store.close_autotrade_position(
+                            user_id=uid,
+                            signal_id=r.get("signal_id"),
+                            exchange=ex,
+                            market_type=mt,
+                            status="CLOSED",
+                            pnl_usdt=pnl_usdt,
+                            roi_percent=roi_percent,
+                        )
                         continue
 
                 target_id = tp2_id or tp1_id
@@ -1502,7 +1611,50 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 pass
                             continue
                     if tp_filled:
-                        await db_store.close_autotrade_position(user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED")
+                        pnl_usdt = None
+                        roi_percent = None
+                        try:
+                            entry_id = ref.get("entry_order_id")
+                            entry_order = None
+                            if entry_id:
+                                if ex == "binance":
+                                    entry_order = await _binance_order_status(
+                                        api_key=api_key,
+                                        api_secret=api_secret,
+                                        symbol=symbol,
+                                        order_id=int(entry_id),
+                                        futures=futures,
+                                    )
+                                else:
+                                    category = str(ref.get("category") or ("spot" if mt == "spot" else "linear"))
+                                    entry_order = await _bybit_order_status(
+                                        api_key=api_key,
+                                        api_secret=api_secret,
+                                        category=category,
+                                        symbol=symbol,
+                                        order_id=str(entry_id),
+                                    )
+                            if entry_order:
+                                pnl_usdt, roi_percent = _calc_autotrade_pnl_from_orders(
+                                    ref=ref,
+                                    entry_order=entry_order,
+                                    exit_order=o_tp,
+                                    exchange=ex,
+                                    market_type=mt,
+                                    allocated_usdt=float(r.get("allocated_usdt") or 0.0),
+                                )
+                        except Exception:
+                            pnl_usdt = None
+                            roi_percent = None
+                        await db_store.close_autotrade_position(
+                            user_id=uid,
+                            signal_id=r.get("signal_id"),
+                            exchange=ex,
+                            market_type=mt,
+                            status="CLOSED",
+                            pnl_usdt=pnl_usdt,
+                            roi_percent=roi_percent,
+                        )
 
         except ExchangeAPIError as e:
             # global API issue; no user id here
