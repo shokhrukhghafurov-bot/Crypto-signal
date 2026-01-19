@@ -2210,14 +2210,20 @@ def _trade_card_text(uid: int, t: dict) -> str:
             parts.append("")
             parts.append(f"💹 {tr(uid, 'lbl_price_now')}: {px:.6f}")
             if src:
-                parts.append(f"🔌 {tr(uid, 'lbl_price_src')}: {src}")
+                parts.append(f"🔌 {tr(uid, 'lbl_price_src')}: {src}")            # "Checks" should reflect executed state when TP/SL already happened.
+            # Otherwise it can show ❌ for TP1 after price moved away, even though TP1 was reached earlier.
+            st = str(t.get('status') or status).upper()
+            hit_sl = bool(t.get('hit_sl')) or st in ('LOSS',)
+            hit_tp1 = bool(t.get('hit_tp1')) or st in ('TP1','WIN','TP2')
+            hit_tp2 = bool(t.get('hit_tp2')) or st in ('WIN','TP2')
+
             checks = []
             if t.get('sl') is not None:
-                checks.append(f"SL: {'✅' if t.get('hit_sl') else '❌'}")
+                checks.append(f"SL: {'✅' if hit_sl else '❌'}")
             if t.get('tp1') is not None:
-                checks.append(f"{tr(uid, 'lbl_tp1')}: {'✅' if t.get('hit_tp1') else '❌'}")
+                checks.append(f"{tr(uid, 'lbl_tp1')}: {'✅' if hit_tp1 else '❌'}")
             if t.get('tp2') is not None and float(t.get('tp2') or 0) > 0:
-                checks.append(f"TP2: {'✅' if t.get('hit_tp2') else '❌'}")
+                checks.append(f"TP2: {'✅' if hit_tp2 else '❌'}")
             if checks:
                 parts.append(f"🧪 {tr(uid, 'lbl_check')}: " + ' '.join(checks))
             had_live_block = True
