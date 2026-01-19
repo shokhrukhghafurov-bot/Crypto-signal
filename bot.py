@@ -1358,7 +1358,9 @@ def _fmt_stats_block_ru(title: str, b: dict | None = None) -> str:
     losses = int(b.get("losses", 0))
     be = int(b.get("be", 0))
     tp1 = int(b.get("tp1_hits", 0))
-    wr = (wins / trades * 100.0) if trades else 0.0
+    # WinRate should be based on WIN/(WIN+LOSS). BE does not affect WinRate.
+    denom = (wins + losses)
+    wr = (wins / denom * 100.0) if denom else 0.0
     pnl = float(b.get("sum_pnl_pct", 0.0))
     return (
         f"{title}\n"
@@ -1374,7 +1376,9 @@ def _fmt_stats_block_en(title: str, b: dict | None = None) -> str:
     losses = int(b.get("losses", 0))
     be = int(b.get("be", 0))
     tp1 = int(b.get("tp1_hits", 0))
-    wr = (wins / trades * 100.0) if trades else 0.0
+    # WinRate should be based on WIN/(WIN+LOSS). BE does not affect WinRate.
+    denom = (wins + losses)
+    wr = (wins / denom * 100.0) if denom else 0.0
     pnl = float(b.get("sum_pnl_pct", 0.0))
     return (
         f"{title}\n"
@@ -1397,7 +1401,9 @@ def _parse_report_lines(lines: list[str]) -> list[tuple[str,int,float,float]]:
 async def stats_text(uid: int) -> str:
     """Render trading statistics for the user from Postgres (backend-only)."""
     lang = get_lang(uid)
-    tz_name = os.getenv("TZ", "UTC")
+    # IMPORTANT: use the bot's configured IANA timezone (TZ_NAME), not env "TZ".
+    # Many servers/users set TZ to aliases like "MSK" which are not valid for Postgres AT TIME ZONE.
+    tz_name = TZ_NAME
 
     # ---- buckets ----
     spot_today = await backend.perf_today(uid, "SPOT")
@@ -1433,8 +1439,10 @@ async def stats_text(uid: int) -> str:
                 k = str(r.get("week"))
             trades = int(r.get("trades", 0) or 0)
             wins = int(r.get("wins", 0) or 0)
+            losses = int(r.get("losses", 0) or 0)
             pnl = float(r.get("sum_pnl_pct", 0.0) or 0.0)
-            wr = (wins / trades * 100.0) if trades else 0.0
+            denom = (wins + losses)
+            wr = (wins / denom * 100.0) if denom else 0.0
             if lang == "en":
                 out.append(f"{k}: trades {trades} | winrate {wr:.1f}% | pnl {pnl:+.2f}%")
             else:
@@ -1631,7 +1639,14 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             except Exception:
                 pass
 
-        txt = await stats_text(uid)
+        try:
+            txt = await stats_text(uid)
+        except Exception as e:
+            logger.exception("menu:stats failed for uid=%s", uid)
+            txt = tr(uid, "stats_error") if ("stats_error" in I18N.get(get_lang(uid), {})) else ("Ошибка статистики. Попробуй позже.")
+            # Append a short technical hint for admins only
+            if _is_admin(uid):
+                txt += f"\n\nERR: {type(e).__name__}: {e}"
         await safe_edit(call.message, txt, menu_kb(uid))
         return
 
