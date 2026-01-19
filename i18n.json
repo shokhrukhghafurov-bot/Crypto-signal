@@ -215,7 +215,10 @@
     "at_stats_period_today": "📅 Today",
     "at_stats_period_week": "📆 Week",
     "at_stats_period_month": "🗓 Month",
-    "at_stats_refresh": "🔄 Refresh"
+    "at_stats_refresh": "🔄 Refresh",
+    "at_menu_faq": "📘 FAQ",
+    "at_faq_title": "📘 FAQ",
+    "at_faq_text": "📘 FAQ — Common questions\n\n❓ Why was no trade opened?\n• Auto-trade is disabled (SPOT / FUTURES)\n• API keys are not connected or Trade permission is missing\n• Insufficient balance or Cap limit reached\n• Trade amount/margin is too small\n• Temporary exchange error\n\n✅ What to do:\n• Check SPOT/FUTURES toggles\n• Open 🔑 API keys and re-save\n• Increase amount/margin or Cap\n\n❓ How to stop Auto-trade?\n• Disable SPOT and/or FUTURES in ⚙️ Settings\n"
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -433,6 +436,9 @@
     "at_stats_period_today": "📅 Сегодня",
     "at_stats_period_week": "📆 Неделя",
     "at_stats_period_month": "🗓 Месяц",
-    "at_stats_refresh": "🔄 Обновить"
+    "at_stats_refresh": "🔄 Обновить",
+    "at_menu_faq": "📘 FAQ",
+    "at_faq_title": "📘 FAQ",
+    "at_faq_text": "📘 FAQ — Частые вопросы\n\n❓ Почему не открылась сделка?\n• Auto-trade выключен (SPOT / FUTURES)\n• Не подключены API ключи или нет разрешения Trade\n• Недостаточно средств или достигнут Cap\n• Слишком маленькая сумма/маржа\n• Временная ошибка биржи\n\n✅ Что сделать:\n• Проверь переключатели SPOT/FUTURES\n• Открой 🔑 API ключи и пересохрани\n• Увеличь сумму/маржу или Cap\n\n❓ Как остановить Auto-trade?\n• Выключи SPOT и/или FUTURES в ⚙️ Настройке\n"
   }
 }
