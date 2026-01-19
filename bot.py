@@ -929,7 +929,16 @@ def autotrade_main_kb(uid: int) -> types.InlineKeyboardMarkup:
     kb.button(text=tr(uid, "at_menu_settings"), callback_data="atmenu:settings")
     kb.button(text=tr(uid, "at_menu_stats"), callback_data="atmenu:stats")
     kb.adjust(2)
+    kb.button(text=tr(uid, "at_menu_info"), callback_data="atmenu:info")
+    kb.adjust(1)
     kb.button(text=tr(uid, "btn_back"), callback_data="menu:status")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def autotrade_info_kb(uid: int) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -2092,7 +2101,18 @@ async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
         await safe_edit(call.message, txt, autotrade_stats_kb(uid, market_type=state["market_type"], period=state["period"]))
         return
 
+    if action == "info":
+        await safe_edit(call.message, tr(uid, "at_info_text"), autotrade_info_kb(uid))
+        return
+
     await safe_edit(call.message, tr(uid, "welcome"), menu_kb(uid))
+
+
+def autotrade_info_kb(uid: int) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
+    kb.adjust(1)
+    return kb.as_markup()
 
 
 def _render_autotrade_stats_text(uid: int, market_type: str, period: str, stats: Dict[str, any]) -> str:
