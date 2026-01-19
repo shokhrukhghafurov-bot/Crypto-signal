@@ -207,6 +207,8 @@ async def ensure_schema() -> None:
           symbol TEXT NOT NULL,
           side TEXT NOT NULL,
           allocated_usdt NUMERIC(18,8) NOT NULL DEFAULT 0,
+          pnl_usdt NUMERIC(18,8),
+          roi_percent NUMERIC(18,8),
           status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','CLOSED','ERROR')),
           api_order_ref TEXT,
           opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -214,6 +216,13 @@ async def ensure_schema() -> None:
           UNIQUE (user_id, signal_id, exchange, market_type)
         );
         """)
+
+        # Backward-compatible migrations for existing DBs
+        try:
+            await conn.execute("ALTER TABLE autotrade_positions ADD COLUMN IF NOT EXISTS pnl_usdt NUMERIC(18,8);")
+            await conn.execute("ALTER TABLE autotrade_positions ADD COLUMN IF NOT EXISTS roi_percent NUMERIC(18,8);")
+        except Exception:
+            pass
 
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_autotrade_positions_user_open
@@ -1093,7 +1102,16 @@ async def create_autotrade_position(
         )
 
 
-async def close_autotrade_position(*, user_id: int, signal_id: Optional[int], exchange: str, market_type: str, status: str = "CLOSED") -> None:
+async def close_autotrade_position(
+    *,
+    user_id: int,
+    signal_id: Optional[int],
+    exchange: str,
+    market_type: str,
+    status: str = "CLOSED",
+    pnl_usdt: Optional[float] = None,
+    roi_percent: Optional[float] = None,
+) -> None:
     pool = get_pool()
     uid = int(user_id)
     ex = (exchange or "binance").lower().strip()
@@ -1105,7 +1123,10 @@ async def close_autotrade_position(*, user_id: int, signal_id: Optional[int], ex
         await conn.execute(
             """
             UPDATE autotrade_positions
-            SET status=$5, closed_at=NOW()
+            SET status=$5,
+                closed_at=NOW(),
+                pnl_usdt=COALESCE($6, pnl_usdt),
+                roi_percent=COALESCE($7, roi_percent)
             WHERE user_id=$1 AND signal_id=$2 AND exchange=$3 AND market_type=$4;
             """,
             uid,
@@ -1113,6 +1134,8 @@ async def close_autotrade_position(*, user_id: int, signal_id: Optional[int], ex
             ex,
             mt,
             st,
+            pnl_usdt,
+            roi_percent,
         )
 
 
@@ -1258,4 +1281,124 @@ async def get_autotrade_used_usdt(user_id: int, market_type: str) -> float:
             return float(v or 0.0)
         except Exception:
             return 0.0
+
+
+async def get_autotrade_stats(
+    *,
+    user_id: int,
+    market_type: str = "all",  # 'spot' | 'futures' | 'all'
+    period: str = "today",     # 'today' | 'week' | 'month'
+) -> Dict[str, Any]:
+    """Return Auto-trade stats for the period.
+
+    Counting rules:
+    - opened: positions opened within the period
+    - closed (+/-): positions CLOSED within the period based on pnl_usdt sign
+    - active: current OPEN positions (not period-bound)
+    - pnl: sum of pnl_usdt for CLOSED positions within the period
+    - roi_percent: (sum pnl) / (sum allocated_usdt of closed) * 100
+    """
+    pool = get_pool()
+    uid = int(user_id)
+    mt = (market_type or "all").lower().strip()
+    if mt not in ("spot", "futures", "all"):
+        mt = "all"
+    pr = (period or "today").lower().strip()
+    if pr not in ("today", "week", "month"):
+        pr = "today"
+    start_expr = {
+        "today": "date_trunc('day', NOW())",
+        "week": "date_trunc('week', NOW())",
+        "month": "date_trunc('month', NOW())",
+    }[pr]
+
+    mt_where = "" if mt == "all" else "AND market_type=$2"
+
+    async with pool.acquire() as conn:
+        # opened
+        if mt == "all":
+            opened = await conn.fetchval(
+                f"""
+                SELECT COUNT(*)
+                FROM autotrade_positions
+                WHERE user_id=$1 AND opened_at >= {start_expr}
+                """,
+                uid,
+            )
+        else:
+            opened = await conn.fetchval(
+                f"""
+                SELECT COUNT(*)
+                FROM autotrade_positions
+                WHERE user_id=$1 {mt_where} AND opened_at >= {start_expr}
+                """,
+                uid,
+                mt,
+            )
+
+        # closed + / - and pnl + invested for ROI
+        if mt == "all":
+            row = await conn.fetchrow(
+                f"""
+                SELECT
+                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} AND COALESCE(pnl_usdt,0) > 0 THEN 1 ELSE 0 END),0) AS closed_plus,
+                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} AND COALESCE(pnl_usdt,0) < 0 THEN 1 ELSE 0 END),0) AS closed_minus,
+                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} THEN COALESCE(pnl_usdt,0) ELSE 0 END),0) AS pnl_total,
+                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} THEN COALESCE(allocated_usdt,0) ELSE 0 END),0) AS invested_closed
+                FROM autotrade_positions
+                WHERE user_id=$1;
+                """,
+                uid,
+            )
+        else:
+            row = await conn.fetchrow(
+                f"""
+                SELECT
+                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} AND COALESCE(pnl_usdt,0) > 0 THEN 1 ELSE 0 END),0) AS closed_plus,
+                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} AND COALESCE(pnl_usdt,0) < 0 THEN 1 ELSE 0 END),0) AS closed_minus,
+                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} THEN COALESCE(pnl_usdt,0) ELSE 0 END),0) AS pnl_total,
+                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} THEN COALESCE(allocated_usdt,0) ELSE 0 END),0) AS invested_closed
+                FROM autotrade_positions
+                WHERE user_id=$1 AND market_type=$2;
+                """,
+                uid,
+                mt,
+            )
+
+        # active (current)
+        if mt == "all":
+            active = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM autotrade_positions
+                WHERE user_id=$1 AND status='OPEN'
+                """,
+                uid,
+            )
+        else:
+            active = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM autotrade_positions
+                WHERE user_id=$1 AND market_type=$2 AND status='OPEN'
+                """,
+                uid,
+                mt,
+            )
+
+    closed_plus = int(row["closed_plus"] or 0)
+    closed_minus = int(row["closed_minus"] or 0)
+    pnl_total = float(row["pnl_total"] or 0.0)
+    invested_closed = float(row["invested_closed"] or 0.0)
+    roi = (pnl_total / invested_closed * 100.0) if invested_closed > 0 else 0.0
+
+    return {
+        "opened": int(opened or 0),
+        "closed_plus": closed_plus,
+        "closed_minus": closed_minus,
+        "active": int(active or 0),
+        "pnl_total": pnl_total,
+        "roi_percent": roi,
+        "invested_closed": invested_closed,
+    }
 
