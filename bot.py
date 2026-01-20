@@ -1331,6 +1331,15 @@ async def broadcast_signal(sig: Signal) -> None:
             # Auto-trade: execute real orders asynchronously, without affecting broadcast.
             async def _run_autotrade(_uid: int, _sig: Signal):
                 try:
+                    # Global auto-trade pause/maintenance (admin panel)
+                    try:
+                        gst = await db_store.get_autotrade_bot_settings()
+                        if bool(gst.get("pause_autotrade")) or bool(gst.get("maintenance_mode")):
+                            logger.info("Auto-trade skipped by global setting (pause/maintenance) uid=%s", _uid)
+                            return
+                    except Exception:
+                        pass
+
                     res = await autotrade_execute(_uid, _sig)
                     err = res.get("api_error") if isinstance(res, dict) else None
                     if err:
@@ -2741,167 +2750,6 @@ async def main() -> None:
                 })
             return web.json_response({"items": out})
 
-        # ---------------- AUTO-TRADE ADMIN (per-user gate like SIGNAL) ----------------
-        async def list_autotrade_users(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            q = (request.query.get("q") or request.query.get("query") or "").strip()
-            flt = (request.query.get("filter") or "all").strip().lower()
-            async with pool.acquire() as conn:
-                where = []
-                args = []
-                if q:
-                    where.append("CAST(telegram_id AS TEXT) ILIKE $%d" % (len(args)+1))
-                    args.append(f"%{q}%")
-                if flt == "active":
-                    where.append("COALESCE(is_blocked,FALSE)=FALSE")
-                    where.append("(autotrade_expires_at IS NULL OR autotrade_expires_at > now())")
-                elif flt == "expired":
-                    where.append("COALESCE(is_blocked,FALSE)=FALSE")
-                    where.append("autotrade_expires_at IS NOT NULL")
-                    where.append("autotrade_expires_at <= now()")
-                elif flt == "blocked":
-                    where.append("COALESCE(is_blocked,FALSE)=TRUE")
-                where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-                rows = await conn.fetch(
-                    f"""
-                    SELECT telegram_id,
-                           COALESCE(autotrade_enabled,FALSE) AS autotrade_enabled,
-                           autotrade_expires_at,
-                           COALESCE(is_blocked,FALSE) AS is_blocked
-                    FROM users
-                    {where_sql}
-                    ORDER BY telegram_id DESC
-                    LIMIT 500
-                    """,
-                    *args,
-                )
-            out = []
-            for r in rows:
-                out.append({
-                    "telegram_id": int(r["telegram_id"]),
-                    "autotrade_enabled": bool(r["autotrade_enabled"]),
-                    "autotrade_expires_at": (r["autotrade_expires_at"].isoformat() if r["autotrade_expires_at"] else None),
-                    "is_blocked": bool(r["is_blocked"]),
-                })
-            return web.json_response({"items": out})
-
-        async def save_autotrade_user(request: web.Request) -> web.Response:
-            """Create/update Auto-trade access gate for a user.
-
-            Expected JSON:
-              telegram_id (required)
-              autotrade_enabled (optional)
-              autotrade_expires_at (optional ISO)
-              add_days (optional int)
-              is_blocked (optional bool)
-            """
-            if not _check_basic(request):
-                return _unauthorized()
-            data = await request.json()
-            tid = int(data.get("telegram_id") or 0)
-            if not tid:
-                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-
-            enabled = bool(data.get("autotrade_enabled", True))
-            expires_raw = data.get("autotrade_expires_at")
-            expires = _parse_iso_dt(expires_raw)
-            if expires_raw and (expires is None):
-                return web.json_response({"ok": False, "error": "bad autotrade_expires_at"}, status=400)
-            add_days = int(data.get("add_days") or 0)
-            is_blocked = data.get("is_blocked")
-
-            await ensure_user(tid)
-            async with pool.acquire() as conn:
-                if add_days:
-                    await conn.execute(
-                        """UPDATE users
-                               SET autotrade_enabled = TRUE,
-                                   autotrade_expires_at = COALESCE(autotrade_expires_at, now()) + make_interval(days => $2)
-                             WHERE telegram_id=$1""",
-                        tid, add_days,
-                    )
-                else:
-                    if expires:
-                        await conn.execute(
-                            """UPDATE users
-                                   SET autotrade_enabled=$2,
-                                       autotrade_expires_at=$3::timestamptz
-                                 WHERE telegram_id=$1""",
-                            tid, enabled, expires,
-                        )
-                    else:
-                        await conn.execute(
-                            """UPDATE users
-                                   SET autotrade_enabled=$2
-                                 WHERE telegram_id=$1""",
-                            tid, enabled,
-                        )
-
-                if is_blocked is not None:
-                    try:
-                        await conn.execute(
-                            "UPDATE users SET is_blocked=$2 WHERE telegram_id=$1",
-                            tid, bool(is_blocked),
-                        )
-                    except Exception:
-                        pass
-
-            return web.json_response({"ok": True})
-
-        async def patch_autotrade_user(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            tid = int(request.match_info.get("telegram_id") or 0)
-            if not tid:
-                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-            data = await request.json()
-            data["telegram_id"] = tid
-            # reuse save logic inline
-            enabled = bool(data.get("autotrade_enabled", True))
-            expires_raw = data.get("autotrade_expires_at")
-            expires = _parse_iso_dt(expires_raw)
-            if expires_raw and (expires is None):
-                return web.json_response({"ok": False, "error": "bad autotrade_expires_at"}, status=400)
-            add_days = int(data.get("add_days") or 0)
-            is_blocked = data.get("is_blocked")
-
-            await ensure_user(tid)
-            async with pool.acquire() as conn:
-                if add_days:
-                    await conn.execute(
-                        """UPDATE users
-                               SET autotrade_enabled = TRUE,
-                                   autotrade_expires_at = COALESCE(autotrade_expires_at, now()) + make_interval(days => $2)
-                             WHERE telegram_id=$1""",
-                        tid, add_days,
-                    )
-                else:
-                    if expires:
-                        await conn.execute(
-                            """UPDATE users
-                                   SET autotrade_enabled=$2,
-                                       autotrade_expires_at=$3::timestamptz
-                                 WHERE telegram_id=$1""",
-                            tid, enabled, expires,
-                        )
-                    else:
-                        await conn.execute(
-                            """UPDATE users
-                                   SET autotrade_enabled=$2
-                                 WHERE telegram_id=$1""",
-                            tid, enabled,
-                        )
-                if is_blocked is not None:
-                    try:
-                        await conn.execute(
-                            "UPDATE users SET is_blocked=$2 WHERE telegram_id=$1",
-                            tid, bool(is_blocked),
-                        )
-                    except Exception:
-                        pass
-            return web.json_response({"ok": True})
-
         async def signal_stats(request: web.Request) -> web.Response:
             """Read-only aggregated statistics for the admin panel.
 
@@ -3139,11 +2987,19 @@ async def main() -> None:
                 st = await db_store.get_signal_bot_settings()
             except Exception:
                 st = {"pause_signals": False, "maintenance_mode": False, "updated_at": None}
-            return web.json_response({
+            try:
+                at = await db_store.get_autotrade_bot_settings()
+            except Exception:
+                at = {"pause_autotrade": False, "maintenance_mode": False, "updated_at": None}
+return web.json_response({
                 "ok": True,
                 "pause_signals": bool(st.get("pause_signals")),
                 "maintenance_mode": bool(st.get("maintenance_mode")),
                 "updated_at": st.get("updated_at"),
+                # Auto-trade global toggles (admin)
+                "pause_autotrade": bool(at.get("pause_autotrade")),
+                "autotrade_maintenance_mode": bool(at.get("maintenance_mode")),
+                "autotrade_updated_at": at.get("updated_at"),
             })
 
         async def signal_save_settings(request: web.Request) -> web.Response:
@@ -3152,7 +3008,10 @@ async def main() -> None:
             data = await request.json()
             pause_signals = bool(data.get("pause_signals"))
             maintenance_mode = bool(data.get("maintenance_mode"))
+            pause_autotrade = bool(data.get("pause_autotrade"))
+            autotrade_maintenance_mode = bool(data.get("autotrade_maintenance_mode"))
             await db_store.set_signal_bot_settings(pause_signals=pause_signals, maintenance_mode=maintenance_mode)
+            await db_store.set_autotrade_bot_settings(pause_autotrade=pause_autotrade, maintenance_mode=autotrade_maintenance_mode)
             return web.json_response({"ok": True})
 
         async def signal_broadcast_text(request: web.Request) -> web.Response:
@@ -3202,11 +3061,6 @@ async def main() -> None:
         app.router.add_route("PATCH", "/api/infra/admin/signal/users/{telegram_id}", patch_user)
         app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/block", block_user)
         app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/unblock", unblock_user)
-
-        # Auto-trade access gate (enable/disable from admin panel)
-        app.router.add_route("GET", "/api/infra/admin/autotrade/users", list_autotrade_users)
-        app.router.add_route("POST", "/api/infra/admin/autotrade/users", save_autotrade_user)
-        app.router.add_route("PATCH", "/api/infra/admin/autotrade/users/{telegram_id}", patch_autotrade_user)
         # Allow preflight
         app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204))
         return app
