@@ -70,17 +70,17 @@ async def ensure_schema() -> None:
 
         # --- Auto-trade global settings (single row) ---
         await conn.execute("""
-        CREATE TABLE IF NOT EXISTS autotrade_bot_settings (
-          id INT PRIMARY KEY CHECK (id = 1),
-          pause_autotrade BOOLEAN NOT NULL DEFAULT FALSE,
-          maintenance_mode BOOLEAN NOT NULL DEFAULT FALSE,
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        """)
+CREATE TABLE IF NOT EXISTS autotrade_bot_settings (
+  id INT PRIMARY KEY CHECK (id = 1),
+  pause_autotrade BOOLEAN NOT NULL DEFAULT FALSE,
+  maintenance_mode BOOLEAN NOT NULL DEFAULT FALSE,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+""")
         await conn.execute("""
         INSERT INTO autotrade_bot_settings(id) VALUES (1)
-        ON CONFLICT (id) DO NOTHING;
-        """)
+ON CONFLICT (id) DO NOTHING;
+""")
         # --- schema compat: allow many users to open same signal ---
         # Older DBs could have UNIQUE(signal_id) which blocks other users.
         await conn.execute("""
@@ -317,6 +317,28 @@ async def ensure_users_columns() -> None:
             )
         except Exception:
             logger.exception("ensure_users_columns: failed to add signal_expires_at")
+
+
+        # --- Auto-trade access (managed from Signal admin panel) ---
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS autotrade_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+                """
+            )
+        except Exception:
+            logger.exception("ensure_users_columns: failed to add autotrade_enabled")
+
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS autotrade_expires_at TIMESTAMPTZ;
+                """
+            )
+        except Exception:
+            logger.exception("ensure_users_columns: failed to add autotrade_expires_at")
 
         # Helpful index; ignore failure on managed DBs.
         try:
@@ -1453,4 +1475,3 @@ async def get_autotrade_stats(
         "roi_percent": roi,
         "invested_closed": invested_closed,
     }
-
