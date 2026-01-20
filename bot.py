@@ -2991,7 +2991,7 @@ async def main() -> None:
                 at = await db_store.get_autotrade_bot_settings()
             except Exception:
                 at = {"pause_autotrade": False, "maintenance_mode": False, "updated_at": None}
-return web.json_response({
+            return web.json_response({
                 "ok": True,
                 "pause_signals": bool(st.get("pause_signals")),
                 "maintenance_mode": bool(st.get("maintenance_mode")),
