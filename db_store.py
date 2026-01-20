@@ -68,19 +68,19 @@ async def ensure_schema() -> None:
         
 
 
-# --- Auto-trade global settings (single row) ---
-await conn.execute("""
-CREATE TABLE IF NOT EXISTS autotrade_bot_settings (
-  id INT PRIMARY KEY CHECK (id = 1),
-  pause_autotrade BOOLEAN NOT NULL DEFAULT FALSE,
-  maintenance_mode BOOLEAN NOT NULL DEFAULT FALSE,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-""")
-await conn.execute("""
-INSERT INTO autotrade_bot_settings(id) VALUES (1)
-ON CONFLICT (id) DO NOTHING;
-""")
+        # --- Auto-trade global settings (single row) ---
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS autotrade_bot_settings (
+          id INT PRIMARY KEY CHECK (id = 1),
+          pause_autotrade BOOLEAN NOT NULL DEFAULT FALSE,
+          maintenance_mode BOOLEAN NOT NULL DEFAULT FALSE,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+        await conn.execute("""
+        INSERT INTO autotrade_bot_settings(id) VALUES (1)
+        ON CONFLICT (id) DO NOTHING;
+        """)
         # --- schema compat: allow many users to open same signal ---
         # Older DBs could have UNIQUE(signal_id) which blocks other users.
         await conn.execute("""
