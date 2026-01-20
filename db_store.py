@@ -303,6 +303,29 @@ async def ensure_users_columns() -> None:
         except Exception:
             logger.exception("ensure_users_columns: failed to add signal_expires_at")
 
+        # --- Auto-trade access (admin-controlled) ---
+        # This is independent from per-market toggles in autotrade_settings.
+        # If autotrade_enabled is FALSE or expired, no real orders should be executed.
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS autotrade_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+                """
+            )
+        except Exception:
+            logger.exception("ensure_users_columns: failed to add autotrade_enabled")
+
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS autotrade_expires_at TIMESTAMPTZ;
+                """
+            )
+        except Exception:
+            logger.exception("ensure_users_columns: failed to add autotrade_expires_at")
+
         # Helpful index; ignore failure on managed DBs.
         try:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
@@ -327,6 +350,42 @@ async def ensure_user_signal_trial(user_id: int) -> None:
             """,
             int(user_id),
         )
+
+
+async def get_autotrade_access(user_id: int) -> Dict[str, Any]:
+    """Return Auto-trade access flags for a user.
+
+    Columns are best-effort (may be missing on legacy DBs).
+    Returned dict keys: autotrade_enabled (bool), autotrade_expires_at (dt|None), is_blocked (bool)
+    """
+    pool = get_pool()
+    uid = int(user_id or 0)
+    if not uid:
+        return {"autotrade_enabled": False, "autotrade_expires_at": None, "is_blocked": False}
+    async with pool.acquire() as conn:
+        try:
+            r = await conn.fetchrow(
+                """
+                SELECT COALESCE(autotrade_enabled,FALSE) AS autotrade_enabled,
+                       autotrade_expires_at,
+                       COALESCE(is_blocked,FALSE) AS is_blocked
+                  FROM users
+                 WHERE telegram_id=$1
+                 LIMIT 1
+                """,
+                uid,
+            )
+        except Exception:
+            # Columns/table may not exist yet
+            return {"autotrade_enabled": False, "autotrade_expires_at": None, "is_blocked": False}
+    if not r:
+        return {"autotrade_enabled": False, "autotrade_expires_at": None, "is_blocked": False}
+    d = dict(r)
+    return {
+        "autotrade_enabled": bool(d.get("autotrade_enabled")),
+        "autotrade_expires_at": d.get("autotrade_expires_at"),
+        "is_blocked": bool(d.get("is_blocked")),
+    }
 
 async def next_signal_id() -> int:
     """Return a globally unique signal_id for bot callbacks (Postgres sequence)."""
