@@ -869,6 +869,31 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
     st = await db_store.get_autotrade_settings(uid)
     mt = "spot" if market == "SPOT" else "futures"
+
+    # --- Admin gate (like SIGNAL): global per-user Auto-trade allow/deny + expiry ---
+    # This is independent from per-market toggles in autotrade_settings.
+    # If disabled/expired/blocked -> skip silently.
+    try:
+        acc = await db_store.get_autotrade_access(uid)
+        if bool(acc.get("is_blocked")):
+            return {"ok": False, "skipped": True, "api_error": None}
+        if not bool(acc.get("autotrade_enabled")):
+            return {"ok": False, "skipped": True, "api_error": None}
+        exp = acc.get("autotrade_expires_at")
+        if exp is not None:
+            import datetime as _dt
+            now = _dt.datetime.now(_dt.timezone.utc)
+            try:
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=_dt.timezone.utc)
+                if exp <= now:
+                    return {"ok": False, "skipped": True, "api_error": None}
+            except Exception:
+                return {"ok": False, "skipped": True, "api_error": None}
+    except Exception:
+        # best-effort: if access columns not ready, default to allow
+        pass
+
     enabled = bool(st.get("spot_enabled")) if mt == "spot" else bool(st.get("futures_enabled"))
     if not enabled:
         return {"ok": False, "skipped": True, "api_error": None}
