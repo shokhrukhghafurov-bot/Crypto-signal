@@ -879,6 +879,8 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             return {"ok": False, "skipped": True, "api_error": None}
         if not bool(acc.get("autotrade_enabled")):
             return {"ok": False, "skipped": True, "api_error": None}
+        if bool(acc.get("autotrade_stop_after_close")):
+            return {"ok": False, "skipped": True, "api_error": None}
         exp = acc.get("autotrade_expires_at")
         if exp is not None:
             import datetime as _dt
@@ -1607,7 +1609,14 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             status="CLOSED",
                             pnl_usdt=pnl_usdt,
                             roi_percent=roi_percent,
-                        )
+)
+                        try:
+                            acc2 = await db_store.get_autotrade_access(uid)
+                            if bool(acc2.get("autotrade_stop_after_close")):
+                                if await db_store.count_open_autotrade_positions(uid) <= 0:
+                                    await db_store.finalize_autotrade_disable(uid)
+                        except Exception:
+                            pass
                         continue
 
                 target_id = tp2_id or tp1_id
@@ -1680,6 +1689,13 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             pnl_usdt=pnl_usdt,
                             roi_percent=roi_percent,
                         )
+                        try:
+                            acc2 = await db_store.get_autotrade_access(uid)
+                            if bool(acc2.get("autotrade_stop_after_close")):
+                                if await db_store.count_open_autotrade_positions(uid) <= 0:
+                                    await db_store.finalize_autotrade_disable(uid)
+                        except Exception:
+                            pass
 
         except ExchangeAPIError as e:
             # global API issue; no user id here
