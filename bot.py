@@ -3083,48 +3083,7 @@ async def main() -> None:
             await db_store.set_autotrade_bot_settings(pause_autotrade=pause_autotrade, maintenance_mode=autotrade_maintenance_mode)
             return web.json_response({"ok": True})
 
-        
-# -------- Auto-trade: global settings (admin) --------
-
-async def autotrade_get_settings(request: web.Request) -> web.Response:
-    if not _check_basic(request):
-        return _unauthorized()
-    def _iso(v):
-        try:
-            return v.isoformat() if v else None
-        except Exception:
-            return None
-    try:
-        st = await db_store.get_autotrade_bot_settings()
-    except Exception:
-        st = {"pause_autotrade": False, "maintenance_mode": False, "updated_at": None}
-    return web.json_response({
-        "ok": True,
-        "pause_autotrade": bool(st.get("pause_autotrade")),
-        "maintenance_mode": bool(st.get("maintenance_mode")),
-        "updated_at": _iso(st.get("updated_at")),
-    })
-
-
-async def autotrade_save_settings(request: web.Request) -> web.Response:
-    if not _check_basic(request):
-        return _unauthorized()
-    try:
-        data = await request.json()
-    except Exception:
-        data = {}
-    pause_autotrade = bool(data.get("pause_autotrade", False))
-    maintenance_mode = bool(data.get("maintenance_mode", False))
-    try:
-        await db_store.set_autotrade_bot_settings(pause_autotrade=pause_autotrade, maintenance_mode=maintenance_mode)
-    except Exception as e:
-        logger.exception("autotrade_save_settings failed")
-        return web.json_response({"ok": False, "error": str(e)[:200]}, status=500)
-    return web.json_response({"ok": True})
-
-
-
-async def signal_broadcast_text(request: web.Request) -> web.Response:
+        async def signal_broadcast_text(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
             data = await request.json()
@@ -3142,29 +3101,11 @@ async def signal_broadcast_text(request: web.Request) -> web.Response:
                     pass
             return web.json_response({"ok": True, "sent": sent, "total": total})
 
-        async def signal_send_text(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            tid = int(request.match_info.get("telegram_id") or 0)
-            if not tid:
-                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-            data = await request.json()
-            text = str(data.get("text") or "").strip()
-            if not text:
-                return web.json_response({"ok": False, "error": "text required"}, status=400)
-            try:
-                await safe_send(tid, text)
-            except Exception as e:
-                return web.json_response({"ok": False, "error": str(e)}, status=500)
-            return web.json_response({"ok": True})
-
-
+        
         # Routes
         app.router.add_route("GET", "/health", health)
         app.router.add_route("GET", "/api/infra/admin/signal/settings", signal_get_settings)
         app.router.add_route("POST", "/api/infra/admin/signal/settings", signal_save_settings)
-        app.router.add_route("GET", "/api/infra/admin/autotrade/settings", autotrade_get_settings)
-        app.router.add_route("POST", "/api/infra/admin/autotrade/settings", autotrade_save_settings)
         app.router.add_route("POST", "/api/infra/admin/signal/broadcast", signal_broadcast_text)
         app.router.add_route("POST", "/api/infra/admin/signal/send/{telegram_id}", signal_send_text)
         app.router.add_route("GET", "/api/infra/admin/signal/stats", signal_stats)
@@ -3201,3 +3142,26 @@ async def signal_broadcast_text(request: web.Request) -> web.Response:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
+async def signal_send_text(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        telegram_id = int(data.get("telegram_id"))
+        text = data.get("text", "").strip()
+
+        if not telegram_id or not text:
+            return web.json_response(
+                {"ok": False, "error": "telegram_id or text missing"},
+                status=400
+            )
+
+        await send_telegram_message(telegram_id, text)
+        return web.json_response({"ok": True})
+
+    except Exception as e:
+        return web.json_response(
+            {"ok": False, "error": str(e)},
+            status=500
+        )
