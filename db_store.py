@@ -430,6 +430,85 @@ async def finalize_autotrade_disable(user_id: int) -> None:
         )
 
 
+async def disable_autotrade_with_stop(user_id: int) -> str:
+    """Disable auto-trade for a user with STOP semantics.
+
+    Returns the resulting state string:
+      - 'OFF'  : auto-trade disabled immediately (no OPEN positions)
+      - 'STOP' : stop-after-close mode enabled (has OPEN positions)
+
+    STOP means:
+      - new auto-trade positions are not opened
+      - existing OPEN positions are managed until closed
+      - once all positions are CLOSED, finalize_autotrade_disable() flips to OFF
+    """
+    uid = int(user_id)
+    open_n = await count_open_autotrade_positions(uid)
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        if open_n > 0:
+            await conn.execute(
+                """
+                UPDATE users
+                SET autotrade_enabled=TRUE,
+                    autotrade_stop_after_close=TRUE
+                WHERE telegram_id=$1
+                """,
+                uid,
+            )
+            return "STOP"
+        await conn.execute(
+            """
+            UPDATE users
+            SET autotrade_enabled=FALSE,
+                autotrade_stop_after_close=FALSE
+            WHERE telegram_id=$1
+            """,
+            uid,
+        )
+        return "OFF"
+
+
+async def apply_autotrade_global_stop() -> None:
+    """Apply STOP/OFF logic for ALL users.
+
+    Used by admin "Pause AUTO-TRADE" / "Maintenance mode (autotrade)".
+
+    - Users with OPEN positions -> STOP
+    - Users without OPEN positions -> OFF
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        # STOP: users with open positions
+        await conn.execute(
+            """
+            UPDATE users u
+            SET autotrade_enabled=TRUE,
+                autotrade_stop_after_close=TRUE
+            WHERE COALESCE(u.autotrade_enabled,FALSE)=TRUE
+              AND EXISTS (
+                SELECT 1
+                FROM autotrade_positions p
+                WHERE p.user_id=u.telegram_id AND p.status='OPEN'
+              );
+            """
+        )
+        # OFF: enabled users without open positions
+        await conn.execute(
+            """
+            UPDATE users u
+            SET autotrade_enabled=FALSE,
+                autotrade_stop_after_close=FALSE
+            WHERE COALESCE(u.autotrade_enabled,FALSE)=TRUE
+              AND NOT EXISTS (
+                SELECT 1
+                FROM autotrade_positions p
+                WHERE p.user_id=u.telegram_id AND p.status='OPEN'
+              );
+            """
+        )
+
+
 async def ensure_user_signal_trial(user_id: int) -> None:
     """Create user row if missing and grant 24h Signal trial ONCE.
 
