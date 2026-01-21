@@ -200,6 +200,7 @@ SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', 'cryptoarb_web_bot_admin').lstr
 
 
 def tr(uid: int, key: str) -> str:
+    lang = get_lang(uid)
     tmpl = I18N.get(lang, I18N['en']).get(key, I18N['en'].get(key, key))
     # Allow using @{support} placeholder in i18n texts, configured via SUPPORT_USERNAME env
     if isinstance(tmpl, str) and '{support}' in tmpl:
@@ -837,6 +838,48 @@ def _autotrade_gate_text(uid: int) -> Optional[str]:
         return tr(uid, "at_pause_block")
     return None
 
+
+
+async def _autotrade_access_status(uid: int) -> str:
+    """Auto-trade access status from admin subscription flags (users table).
+    Returns: ok | blocked | expired | disabled | no_user
+    """
+    if not uid:
+        return "no_user"
+    try:
+        acc = await db_store.get_autotrade_access(uid)
+    except Exception:
+        acc = None
+    if not acc:
+        return "no_user"
+    try:
+        if bool(acc.get("is_blocked")):
+            return "blocked"
+    except Exception:
+        pass
+    enabled = bool(acc.get("autotrade_enabled"))
+    exp = acc.get("autotrade_expires_at")
+    if not enabled:
+        return "disabled"
+    if exp is None:
+        return "ok"
+    try:
+        now = dt.datetime.now(dt.timezone.utc)
+        if exp < now:
+            return "expired"
+    except Exception:
+        return "expired"
+    return "ok"
+
+async def _autotrade_unavailable_text(uid: int) -> str:
+    st = await _autotrade_access_status(uid)
+    if st == "ok":
+        return ""
+    if st == "blocked":
+        return tr(uid, "access_blocked")
+    if st == "expired":
+        return tr(uid, "at_unavailable_expired")
+    return tr(uid, "at_unavailable")
 
 async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str, error_text: str) -> None:
     import time
@@ -1829,6 +1872,11 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         if gt:
             await safe_edit(call.message, gt, menu_kb(uid))
             return
+        # Per-user subscription gate (admin: autotrade_enabled / autotrade_expires_at)
+        ut = await _autotrade_unavailable_text(uid)
+        if ut:
+            await safe_edit(call.message, ut, menu_kb(uid))
+            return
 
         try:
             st = await db_store.get_autotrade_settings(uid)
@@ -2054,6 +2102,11 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
         await safe_edit(call.message, gt, menu_kb(uid))
         return
 
+    ut = await _autotrade_unavailable_text(uid)
+    if ut:
+        await safe_edit(call.message, ut, menu_kb(uid))
+        return
+
     parts = (call.data or "").split(":")
     # at:toggle:spot | at:toggle:futures | at:set:* | at:ex:* | at:keys | at:keys:set:EX:MT
     action = parts[1] if len(parts) > 1 else ""
@@ -2144,6 +2197,11 @@ async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
     gt = _autotrade_gate_text(uid)
     if gt:
         await safe_edit(call.message, gt, menu_kb(uid))
+        return
+
+    ut = await _autotrade_unavailable_text(uid)
+    if ut:
+        await safe_edit(call.message, ut, menu_kb(uid))
         return
 
     action = (call.data or "").split(":", 1)[1]
@@ -2762,6 +2820,199 @@ async def main() -> None:
         async def health(_: web.Request) -> web.Response:
             return web.json_response({"ok": True, "service": "crypto-signal"})
 
+        # ---------------- BOT ADMIN (legacy subscriptions: expires_at + sub_*/notify_*) ----------------
+
+        async def bot_list_users(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            q = (request.query.get("query") or request.query.get("q") or "").strip()
+            flt = (request.query.get("filter") or "all").strip().lower()
+
+            async with pool.acquire() as conn:
+                where = []
+                args = []
+                if q:
+                    where.append("CAST(telegram_id AS TEXT) ILIKE $%d" % (len(args) + 1))
+                    args.append(f"%{q}%")
+                if flt == "active":
+                    where.append("COALESCE(is_blocked,FALSE)=FALSE")
+                    where.append("(expires_at IS NULL OR expires_at > now())")
+                elif flt == "expired":
+                    where.append("COALESCE(is_blocked,FALSE)=FALSE")
+                    where.append("expires_at IS NOT NULL")
+                    where.append("expires_at <= now()")
+                elif flt == "blocked":
+                    where.append("COALESCE(is_blocked,FALSE)=TRUE")
+                where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+                try:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT telegram_id, expires_at, COALESCE(is_blocked,FALSE) AS is_blocked,
+                               COALESCE(sub_spreads,FALSE) AS sub_spreads,
+                               COALESCE(sub_basis,FALSE) AS sub_basis,
+                               COALESCE(sub_dex_cex, COALESCE(sub_dexcex, FALSE)) AS sub_dex_cex,
+                               COALESCE(notify_spreads, FALSE) AS notify_spreads,
+                               COALESCE(notify_basis, FALSE) AS notify_basis,
+                               COALESCE(notify_dex_cex, COALESCE(notify_dexcex, FALSE)) AS notify_dex_cex
+                        FROM users
+                        {where_sql}
+                        ORDER BY telegram_id DESC
+                        LIMIT 500
+                        """,
+                        *args,
+                    )
+                except Exception:
+                    rows = await conn.fetch(
+                        f"""
+                        SELECT telegram_id, expires_at, COALESCE(is_blocked,FALSE) AS is_blocked
+                        FROM users
+                        {where_sql}
+                        ORDER BY telegram_id DESC
+                        LIMIT 500
+                        """,
+                        *args,
+                    )
+
+            items = []
+            for r in rows:
+                items.append({
+                    "telegram_id": int(r.get("telegram_id") or 0),
+                    "expires_at": (r.get("expires_at").isoformat() if r.get("expires_at") else None),
+                    "is_blocked": bool(r.get("is_blocked") or False),
+                    "sub_spreads": bool(r.get("sub_spreads") or False),
+                    "sub_basis": bool(r.get("sub_basis") or False),
+                    "sub_dex_cex": bool(r.get("sub_dex_cex") or False),
+                    "notify_spreads": bool(r.get("notify_spreads") or False),
+                    "notify_basis": bool(r.get("notify_basis") or False),
+                    "notify_dex_cex": bool(r.get("notify_dex_cex") or False),
+                })
+            return web.json_response({"ok": True, "items": items})
+
+        async def bot_create_user(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            data = await request.json()
+            tid = int(data.get("telegram_id") or 0)
+            if not tid:
+                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
+            expires = _parse_iso_dt(data.get("expires_at"))
+            sub_spreads = bool(data.get("sub_spreads", True))
+            sub_basis = bool(data.get("sub_basis", True))
+            sub_dex = bool(data.get("sub_dex_cex", data.get("sub_dexcex", True)))
+            notify_spreads = bool(data.get("notify_spreads", sub_spreads))
+            notify_basis = bool(data.get("notify_basis", sub_basis))
+            notify_dex = bool(data.get("notify_dex_cex", data.get("notify_dexcex", sub_dex)))
+
+            await ensure_user(tid)
+            async with pool.acquire() as conn:
+                try:
+                    await conn.execute(
+                        """
+                        UPDATE users
+                           SET expires_at=$2::timestamptz,
+                               sub_spreads=$3,
+                               sub_basis=$4,
+                               sub_dex_cex=$5,
+                               notify_spreads=$6,
+                               notify_basis=$7,
+                               notify_dex_cex=$8
+                         WHERE telegram_id=$1
+                        """,
+                        tid, expires, sub_spreads, sub_basis, sub_dex, notify_spreads, notify_basis, notify_dex
+                    )
+                except Exception:
+                    await conn.execute(
+                        "UPDATE users SET expires_at=$2::timestamptz WHERE telegram_id=$1",
+                        tid, expires
+                    )
+            return web.json_response({"ok": True})
+
+        async def bot_patch_user(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            tid = int(request.match_info.get("telegram_id") or 0)
+            if not tid:
+                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
+            data = await request.json()
+            data = data or {}
+            await ensure_user(tid)
+
+            expires = _parse_iso_dt(data.get("expires_at")) if ("expires_at" in data) else None
+            is_blocked = data.get("is_blocked")
+
+            sub_spreads = data.get("sub_spreads")
+            sub_basis = data.get("sub_basis")
+            sub_dex = data.get("sub_dex_cex", data.get("sub_dexcex"))
+            notify_spreads = data.get("notify_spreads")
+            notify_basis = data.get("notify_basis")
+            notify_dex = data.get("notify_dex_cex", data.get("notify_dexcex"))
+
+            async with pool.acquire() as conn:
+                if expires is not None:
+                    await conn.execute("UPDATE users SET expires_at=$2::timestamptz WHERE telegram_id=$1", tid, expires)
+                if is_blocked is not None:
+                    await conn.execute("UPDATE users SET is_blocked=$2 WHERE telegram_id=$1", tid, bool(is_blocked))
+                try:
+                    sets = []
+                    args = [tid]
+
+                    def add_set(col, val):
+                        nonlocal sets, args
+                        sets.append(f"{col}=$%d" % (len(args) + 1))
+                        args.append(bool(val))
+
+                    if sub_spreads is not None:
+                        add_set("sub_spreads", sub_spreads)
+                    if sub_basis is not None:
+                        add_set("sub_basis", sub_basis)
+                    if sub_dex is not None:
+                        add_set("sub_dex_cex", sub_dex)
+                    if notify_spreads is not None:
+                        add_set("notify_spreads", notify_spreads)
+                    if notify_basis is not None:
+                        add_set("notify_basis", notify_basis)
+                    if notify_dex is not None:
+                        add_set("notify_dex_cex", notify_dex)
+
+                    if sets:
+                        await conn.execute("UPDATE users SET " + ", ".join(sets) + " WHERE telegram_id=$1", *args)
+                except Exception:
+                    pass
+
+            return web.json_response({"ok": True})
+
+        async def bot_user_action(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            tid = int(request.match_info.get("telegram_id") or 0)
+            act = (request.match_info.get("action") or "").strip().lower()
+            if not tid or not act:
+                return web.json_response({"ok": False, "error": "bad request"}, status=400)
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+
+            await ensure_user(tid)
+            async with pool.acquire() as conn:
+                if act == "extend":
+                    days = int((data or {}).get("days") or 30)
+                    await conn.execute(
+                        "UPDATE users SET expires_at = COALESCE(expires_at, now()) + make_interval(days => $2) WHERE telegram_id=$1",
+                        tid, days
+                    )
+                elif act == "block":
+                    await conn.execute("UPDATE users SET is_blocked=TRUE WHERE telegram_id=$1", tid)
+                elif act == "unblock":
+                    await conn.execute("UPDATE users SET is_blocked=FALSE WHERE telegram_id=$1", tid)
+                elif act == "delete":
+                    await conn.execute("DELETE FROM users WHERE telegram_id=$1", tid)
+                else:
+                    return web.json_response({"ok": False, "error": "unknown action"}, status=400)
+
+            return web.json_response({"ok": True})
+
         async def list_users(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -3175,6 +3426,10 @@ async def main() -> None:
 
         # Routes
         app.router.add_route("GET", "/health", health)
+        app.router.add_route("GET", "/api/infra/admin/bot/users", bot_list_users)
+        app.router.add_route("POST", "/api/infra/admin/bot/users", bot_create_user)
+        app.router.add_route("PATCH", "/api/infra/admin/bot/users/{telegram_id}", bot_patch_user)
+        app.router.add_route("POST", "/api/infra/admin/bot/users/{telegram_id}/{action}", bot_user_action)
         app.router.add_route("GET", "/api/infra/admin/signal/settings", signal_get_settings)
         app.router.add_route("POST", "/api/infra/admin/signal/settings", signal_save_settings)
         app.router.add_route("POST", "/api/infra/admin/signal/broadcast", signal_broadcast_text)
