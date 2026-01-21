@@ -6,7 +6,7 @@ import os
 import logging
 import re
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Optional
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -601,16 +601,6 @@ async def init_db() -> None:
     await db_store.ensure_schema()
     # Users table migrations (signal access columns) live in db_store
     await db_store.ensure_users_columns()
-    # Warm up cached auto-trade global settings (pause/maintenance)
-    try:
-        st = await db_store.get_autotrade_bot_settings()
-        AUTOTRADE_BOT_SETTINGS_CACHE.update({
-            "pause_autotrade": bool(st.get("pause_autotrade")),
-            "maintenance_mode": bool(st.get("maintenance_mode")),
-            "updated_at": st.get("updated_at"),
-        })
-    except Exception:
-        pass
 
 async def ensure_user(user_id: int) -> None:
     if not pool or not user_id:
@@ -778,11 +768,8 @@ def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     kb.button(text=tr(uid, "m_stats"), callback_data="menu:stats")
     kb.button(text=tr(uid, "m_spot"), callback_data="menu:spot")
     kb.button(text=tr(uid, "m_fut"), callback_data="menu:futures")
-    # Hide Auto-trade button in main menu when global Pause AUTO-TRADE is enabled
-    try:
-        if not bool(AUTOTRADE_BOT_SETTINGS_CACHE.get("pause_autotrade")):
-            kb.button(text=tr(uid, "m_autotrade"), callback_data="menu:autotrade")
-    except Exception:
+    # Hide Auto-trade button globally when auto-trade is paused (admin)
+    if not bool(AUTOTRADE_BOT_GLOBAL.get("pause_autotrade")):
         kb.button(text=tr(uid, "m_autotrade"), callback_data="menu:autotrade")
     kb.button(text=tr(uid, "m_trades"), callback_data="trades:page:0")
     kb.button(text=tr(uid, "m_notify"), callback_data="menu:notify")
@@ -803,95 +790,6 @@ def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-
-# ---------------- Auto-trade access gate ----------------
-
-async def _user_autotrade_access_ok(uid: int) -> bool:
-    """True if user has Auto-trade access in subscription (users.autotrade_enabled + not expired)."""
-    if not pool or not uid:
-        return False
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT COALESCE(autotrade_enabled, FALSE) AS autotrade_enabled,
-                   autotrade_expires_at
-            FROM users
-            WHERE telegram_id=$1
-            """,
-            int(uid),
-        )
-        if not row:
-            return False
-        if not bool(row.get("autotrade_enabled")):
-            return False
-        exp = row.get("autotrade_expires_at")
-        if exp is not None:
-            try:
-                # Treat naive datetime as UTC
-                if hasattr(exp, "tzinfo") and exp.tzinfo is None:
-                    import datetime as _dt
-                    exp = exp.replace(tzinfo=_dt.timezone.utc)
-                import datetime as _dt
-                if exp <= _dt.datetime.now(_dt.timezone.utc):
-                    return False
-            except Exception:
-                # If comparison fails, be safe and block
-                return False
-        return True
-
-
-async def autotrade_gate_text(uid: int) -> str | None:
-    """Return a localized block message if Auto-trade UI must be blocked; otherwise None."""
-    # 1) Global switches (admin)
-    gst = AUTOTRADE_BOT_SETTINGS_CACHE
-    try:
-        if pool:
-            gst = await db_store.get_autotrade_bot_settings()
-            # keep cache warm
-            try:
-                AUTOTRADE_BOT_SETTINGS_CACHE.update({
-                    "pause_autotrade": bool(gst.get("pause_autotrade")),
-                    "maintenance_mode": bool(gst.get("maintenance_mode")),
-                    "updated_at": gst.get("updated_at"),
-                })
-            except Exception:
-                pass
-    except Exception:
-        gst = AUTOTRADE_BOT_SETTINGS_CACHE
-
-    if bool(gst.get("maintenance_mode")):
-        return tr(uid, "at_maintenance_block")
-    if bool(gst.get("pause_autotrade")):
-        return tr(uid, "at_pause_block")
-
-    # 2) Per-user access (subscription)
-    try:
-        ok = await _user_autotrade_access_ok(uid)
-    except Exception:
-        ok = False
-    if not ok:
-        return tr(uid, "at_access_unavailable")
-
-    return None
-
-
-async def _autotrade_settings_refresh_loop() -> None:
-    """Background refresh to keep AUTOTRADE_BOT_SETTINGS_CACHE up to date."""
-    import asyncio as _asyncio
-    while True:
-        try:
-            if pool:
-                st = await db_store.get_autotrade_bot_settings()
-                AUTOTRADE_BOT_SETTINGS_CACHE.update({
-                    "pause_autotrade": bool(st.get("pause_autotrade")),
-                    "maintenance_mode": bool(st.get("maintenance_mode")),
-                    "updated_at": st.get("updated_at"),
-                })
-        except Exception:
-            pass
-        await _asyncio.sleep(10)
-
-
 # ---------------- Auto-trade UI + input state ----------------
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -905,9 +803,41 @@ AUTOTRADE_STATS_STATE: Dict[int, Dict[str, str]] = {}
 AUTOTRADE_API_ERR_LAST: Dict[tuple[int, str, str], float] = {}
 AUTOTRADE_API_ERR_COOLDOWN_SEC = 300
 
+# Global Auto-trade bot settings cache (admin panel)
+AUTOTRADE_BOT_GLOBAL: Dict[str, object] = {
+    "pause_autotrade": False,
+    "maintenance_mode": False,
+    "updated_at": None,
+}
 
-# Cached auto-trade global settings (pause/maintenance) for fast UI rendering.
-AUTOTRADE_BOT_SETTINGS_CACHE: dict = {"pause_autotrade": False, "maintenance_mode": False, "updated_at": None}
+async def _refresh_autotrade_bot_global_once() -> None:
+    """Load global auto-trade pause/maintenance flags from DB into in-memory cache."""
+    try:
+        st = await db_store.get_autotrade_bot_settings()
+        AUTOTRADE_BOT_GLOBAL["pause_autotrade"] = bool(st.get("pause_autotrade"))
+        AUTOTRADE_BOT_GLOBAL["maintenance_mode"] = bool(st.get("maintenance_mode"))
+        AUTOTRADE_BOT_GLOBAL["updated_at"] = st.get("updated_at")
+    except Exception:
+        # keep previous values
+        return
+
+async def _autotrade_bot_global_loop() -> None:
+    while True:
+        try:
+            await _refresh_autotrade_bot_global_once()
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+
+
+def _autotrade_gate_text(uid: int) -> Optional[str]:
+    """Return i18n text if autotrade is globally blocked (maintenance/pause)."""
+    if bool(AUTOTRADE_BOT_GLOBAL.get("maintenance_mode")):
+        return tr(uid, "at_maintenance_block")
+    if bool(AUTOTRADE_BOT_GLOBAL.get("pause_autotrade")):
+        return tr(uid, "at_pause_block")
+    return None
+
 
 async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str, error_text: str) -> None:
     import time
@@ -1896,10 +1826,12 @@ async def menu_handler(call: types.CallbackQuery) -> None:
 
     # ---- AUTO-TRADE ----
     if action == "autotrade":
-        gate = await autotrade_gate_text(uid)
-        if gate:
-            await safe_edit(call.message, gate, menu_kb(uid))
+        # Global auto-trade pause/maintenance (admin)
+        gt = _autotrade_gate_text(uid)
+        if gt:
+            await safe_edit(call.message, gt, menu_kb(uid))
             return
+
         try:
             st = await db_store.get_autotrade_settings(uid)
         except Exception:
@@ -1929,7 +1861,6 @@ async def notify_handler(call: types.CallbackQuery) -> None:
     if not uid:
         return
 
-
     parts = (call.data or "").split(":")
     # notify:set:on | notify:set:off | notify:back
     try:
@@ -1941,11 +1872,6 @@ async def notify_handler(call: types.CallbackQuery) -> None:
     access = await get_access_status(uid)
     if access != "ok":
         await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
-        return
-
-    gate = await autotrade_gate_text(uid)
-    if gate:
-        await safe_edit(call.message, gate, menu_kb(uid))
         return
 
     if action == "back":
@@ -2125,6 +2051,11 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
         await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
         return
 
+    gt = _autotrade_gate_text(uid)
+    if gt:
+        await safe_edit(call.message, gt, menu_kb(uid))
+        return
+
     parts = (call.data or "").split(":")
     # at:toggle:spot | at:toggle:futures | at:set:* | at:ex:* | at:keys | at:keys:set:EX:MT
     action = parts[1] if len(parts) > 1 else ""
@@ -2210,6 +2141,11 @@ async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
     access = await get_access_status(uid)
     if access != "ok":
         await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+        return
+
+    gt = _autotrade_gate_text(uid)
+    if gt:
+        await safe_edit(call.message, gt, menu_kb(uid))
         return
 
     action = (call.data or "").split(":", 1)[1]
@@ -2779,8 +2715,9 @@ async def main() -> None:
     await init_db()
     load_langs()
 
-    # Keep cached auto-trade settings in sync (needed to hide menu button on pause)
-    asyncio.create_task(_autotrade_settings_refresh_loop())
+    # Refresh global Auto-trade pause/maintenance flags in background
+    asyncio.create_task(_autotrade_bot_global_loop())
+    await _refresh_autotrade_bot_global_once()
 
     # --- Admin HTTP API for Status panel (Signal bot access) ---
     # NOTE: Railway public domain requires an HTTP server listening on $PORT.
@@ -3202,53 +3139,7 @@ async def main() -> None:
             autotrade_maintenance_mode = bool(data.get("autotrade_maintenance_mode"))
             await db_store.set_signal_bot_settings(pause_signals=pause_signals, maintenance_mode=maintenance_mode)
             await db_store.set_autotrade_bot_settings(pause_autotrade=pause_autotrade, maintenance_mode=autotrade_maintenance_mode)
-            try:
-                AUTOTRADE_BOT_SETTINGS_CACHE.update({
-                    "pause_autotrade": bool(pause_autotrade),
-                    "maintenance_mode": bool(autotrade_maintenance_mode),
-                })
-            except Exception:
-                pass
             return web.json_response({"ok": True})
-
-        # -------- Auto-trade global settings (admin) --------
-
-        async def autotrade_get_settings(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            def _iso(v):
-                try:
-                    return v.isoformat() if v else None
-                except Exception:
-                    return None
-            try:
-                st = await db_store.get_autotrade_bot_settings()
-            except Exception:
-                st = {"pause_autotrade": False, "maintenance_mode": False, "updated_at": None}
-            return web.json_response({
-                "ok": True,
-                "pause_autotrade": bool(st.get("pause_autotrade")),
-                "maintenance_mode": bool(st.get("maintenance_mode")),
-                "updated_at": _iso(st.get("updated_at")),
-            })
-
-        async def autotrade_save_settings(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            data = await request.json()
-            pause_autotrade = bool(data.get("pause_autotrade"))
-            maintenance_mode = bool(data.get("maintenance_mode"))
-            await db_store.set_autotrade_bot_settings(pause_autotrade=pause_autotrade, maintenance_mode=maintenance_mode)
-            # keep cache in sync for UI (menu button hide)
-            try:
-                AUTOTRADE_BOT_SETTINGS_CACHE.update({
-                    "pause_autotrade": bool(pause_autotrade),
-                    "maintenance_mode": bool(maintenance_mode),
-                })
-            except Exception:
-                pass
-            return web.json_response({"ok": True})
-
 
         async def signal_broadcast_text(request: web.Request) -> web.Response:
             if not _check_basic(request):
@@ -3289,8 +3180,6 @@ async def main() -> None:
         app.router.add_route("GET", "/health", health)
         app.router.add_route("GET", "/api/infra/admin/signal/settings", signal_get_settings)
         app.router.add_route("POST", "/api/infra/admin/signal/settings", signal_save_settings)
-        app.router.add_route("GET", "/api/infra/admin/autotrade/settings", autotrade_get_settings)
-        app.router.add_route("POST", "/api/infra/admin/autotrade/settings", autotrade_save_settings)
         app.router.add_route("POST", "/api/infra/admin/signal/broadcast", signal_broadcast_text)
         app.router.add_route("POST", "/api/infra/admin/signal/send/{telegram_id}", signal_send_text)
         app.router.add_route("GET", "/api/infra/admin/signal/stats", signal_stats)
