@@ -3101,7 +3101,23 @@ async def main() -> None:
                     pass
             return web.json_response({"ok": True, "sent": sent, "total": total})
 
-        
+        async def signal_send_text(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            tid = int(request.match_info.get("telegram_id") or 0)
+            if not tid:
+                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
+            data = await request.json()
+            text = str(data.get("text") or "").strip()
+            if not text:
+                return web.json_response({"ok": False, "error": "text required"}, status=400)
+            try:
+                await safe_send(tid, text)
+            except Exception as e:
+                return web.json_response({"ok": False, "error": str(e)}, status=500)
+            return web.json_response({"ok": True})
+
+
         # Routes
         app.router.add_route("GET", "/health", health)
         app.router.add_route("GET", "/api/infra/admin/signal/settings", signal_get_settings)
@@ -3142,26 +3158,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-async def signal_send_text(request: web.Request) -> web.Response:
-    try:
-        data = await request.json()
-        telegram_id = int(data.get("telegram_id"))
-        text = data.get("text", "").strip()
-
-        if not telegram_id or not text:
-            return web.json_response(
-                {"ok": False, "error": "telegram_id or text missing"},
-                status=400
-            )
-
-        await send_telegram_message(telegram_id, text)
-        return web.json_response({"ok": True})
-
-    except Exception as e:
-        return web.json_response(
-            {"ok": False, "error": str(e)},
-            status=500
-        )
