@@ -200,7 +200,6 @@ SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', 'cryptoarb_web_bot_admin').lstr
 
 
 def tr(uid: int, key: str) -> str:
-    lang = get_lang(uid)
     tmpl = I18N.get(lang, I18N['en']).get(key, I18N['en'].get(key, key))
     # Allow using @{support} placeholder in i18n texts, configured via SUPPORT_USERNAME env
     if isinstance(tmpl, str) and '{support}' in tmpl:
@@ -1529,7 +1528,6 @@ def _parse_report_lines(lines: list[str]) -> list[tuple[str,int,float,float]]:
 
 async def stats_text(uid: int) -> str:
     """Render trading statistics for the user from Postgres (backend-only)."""
-    lang = get_lang(uid)
     # IMPORTANT: use the bot's configured IANA timezone (TZ_NAME), not env "TZ".
     # Many servers/users set TZ to aliases like "MSK" which are not valid for Postgres AT TIME ZONE.
     tz_name = TZ_NAME
@@ -2185,7 +2183,6 @@ def autotrade_info_kb(uid: int) -> types.InlineKeyboardMarkup:
 
 def autotrade_faq_text(uid: int) -> str:
     """FAQ text from i18n."""
-    lang = get_lang(uid)
     title = tr(uid, 'at_faq_title')
     body = tr(uid, 'at_faq_text')
     # Optional support line
@@ -3129,53 +3126,6 @@ async def main() -> None:
                 "autotrade_maintenance_mode": bool(at.get("maintenance_mode")),
                 "autotrade_updated_at": _iso(at.get("updated_at")),
             })
-
-        # -------- Auto-trade bot: settings-only alias (admin) --------
-        # The status dashboard historically calls a dedicated endpoint:
-        #   POST /api/infra/admin/autotrade/settings
-        # Some deployments proxy the bot under a "/signal" prefix.
-
-        async def autotrade_get_settings(request: web.Request) -> web.Response:
-            """Return only auto-trade global toggles (backward compatible)."""
-            if not _check_basic(request):
-                return _unauthorized()
-
-            def _iso(v):
-                try:
-                    return v.isoformat() if v else None
-                except Exception:
-                    return None
-
-            try:
-                at = await db_store.get_autotrade_bot_settings()
-            except Exception:
-                at = {"pause_autotrade": False, "maintenance_mode": False, "updated_at": None}
-
-            return web.json_response({
-                "ok": True,
-                "pause_autotrade": bool(at.get("pause_autotrade")),
-                "maintenance_mode": bool(at.get("maintenance_mode")),
-                "updated_at": _iso(at.get("updated_at")),
-            })
-
-        async def autotrade_save_settings(request: web.Request) -> web.Response:
-            """Save auto-trade global toggles (backward compatible).
-
-            Expected JSON:
-              pause_autotrade: bool
-              maintenance_mode: bool
-            """
-            if not _check_basic(request):
-                return _unauthorized()
-
-            data = await request.json()
-            pause_autotrade = bool((data or {}).get("pause_autotrade"))
-            maintenance_mode = bool((data or {}).get("maintenance_mode"))
-            await db_store.set_autotrade_bot_settings(
-                pause_autotrade=pause_autotrade,
-                maintenance_mode=maintenance_mode,
-            )
-            return web.json_response({"ok": True})
         async def signal_save_settings(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -3227,14 +3177,6 @@ async def main() -> None:
         app.router.add_route("GET", "/health", health)
         app.router.add_route("GET", "/api/infra/admin/signal/settings", signal_get_settings)
         app.router.add_route("POST", "/api/infra/admin/signal/settings", signal_save_settings)
-
-        # Auto-trade settings alias endpoints (compat)
-        app.router.add_route("GET", "/api/infra/admin/autotrade/settings", autotrade_get_settings)
-        app.router.add_route("POST", "/api/infra/admin/autotrade/settings", autotrade_save_settings)
-        # Some reverse proxies mount this service under /signal
-        app.router.add_route("GET", "/signal/api/infra/admin/autotrade/settings", autotrade_get_settings)
-        app.router.add_route("POST", "/signal/api/infra/admin/autotrade/settings", autotrade_save_settings)
-
         app.router.add_route("POST", "/api/infra/admin/signal/broadcast", signal_broadcast_text)
         app.router.add_route("POST", "/api/infra/admin/signal/send/{telegram_id}", signal_send_text)
         app.router.add_route("GET", "/api/infra/admin/signal/stats", signal_stats)
