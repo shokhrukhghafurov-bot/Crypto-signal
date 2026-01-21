@@ -635,25 +635,48 @@ async def set_user_blocked(user_id: int, blocked: bool = True) -> None:
             )
 
 
+
 async def get_user_row(user_id: int):
     if not pool or not user_id:
         return None
     async with pool.acquire() as conn:
-        return await conn.fetchrow(
-            """
-            SELECT telegram_id,
-                   is_blocked,
-                   notify_signals,
-                   -- signal access (new)
-                   signal_enabled,
-                   signal_expires_at,
-                   -- legacy shared access (fallback for older DBs)
-                   expires_at
-              FROM users
-             WHERE telegram_id=$1
-            """,
-            user_id,
-        )
+        # Try to read auto-trade columns too. If the DB is older, fallback gracefully.
+        try:
+            return await conn.fetchrow(
+                """
+                SELECT telegram_id,
+                       is_blocked,
+                       notify_signals,
+                       -- signal access (new)
+                       signal_enabled,
+                       signal_expires_at,
+                       -- auto-trade access
+                       COALESCE(autotrade_enabled, FALSE) AS autotrade_enabled,
+                       autotrade_expires_at,
+                       -- legacy shared access (fallback for older DBs)
+                       expires_at
+                  FROM users
+                 WHERE telegram_id=$1
+                """,
+                user_id,
+            )
+        except Exception:
+            return await conn.fetchrow(
+                """
+                SELECT telegram_id,
+                       is_blocked,
+                       notify_signals,
+                       -- signal access (new)
+                       signal_enabled,
+                       signal_expires_at,
+                       -- legacy shared access (fallback for older DBs)
+                       expires_at
+                  FROM users
+                 WHERE telegram_id=$1
+                """,
+                user_id,
+            )
+
 
 def _access_status_from_row(row) -> str:
     # Global maintenance switch (Signal bot only).
@@ -701,6 +724,50 @@ def _access_status_from_row(row) -> str:
 async def get_access_status(user_id: int) -> str:
     row = await get_user_row(user_id)
     return _access_status_from_row(row)
+
+
+def _autotrade_access_status_from_row(row) -> str:
+    """Auto-trade availability is controlled by autotrade_enabled + optional expiry."""
+    if row is None:
+        return "no_user"
+    try:
+        if not bool(row.get("autotrade_enabled", False)):
+            return "disabled"
+    except Exception:
+        return "disabled"
+
+    exp = None
+    try:
+        exp = row.get("autotrade_expires_at")
+    except Exception:
+        exp = None
+
+    # NULL expiry means enabled without time limit
+    if exp is None:
+        return "ok"
+
+    try:
+        now = dt.datetime.now(dt.timezone.utc)
+        if exp < now:
+            return "expired"
+    except Exception:
+        return "expired"
+
+    return "ok"
+
+async def get_autotrade_access_status(user_id: int) -> str:
+    row = await get_user_row(user_id)
+    return _autotrade_access_status_from_row(row)
+
+def autotrade_locked_text(uid: int) -> str:
+    # Keep message exactly as requested (Russian), no i18n dependency.
+    return (
+        "🔒 Auto-trade недоступен\n\n"
+        "Авто-трейдинг не активирован в вашей подписке.\n"
+        "Вы продолжаете получать торговые сигналы в обычном режиме.\n\n"
+        "Для подключения Auto-trade свяжитесь с администратором."
+    )
+
 
 async def get_notify_signals(user_id: int) -> bool:
     row = await get_user_row(user_id)
@@ -1788,6 +1855,11 @@ async def menu_handler(call: types.CallbackQuery) -> None:
 
     # ---- AUTO-TRADE ----
     if action == "autotrade":
+        # Subscription check: Auto-trade can be disabled separately from Signals.
+        at_access = await get_autotrade_access_status(uid)
+        if at_access != "ok":
+            await safe_edit(call.message, autotrade_locked_text(uid), menu_kb(uid))
+            return
         try:
             st = await db_store.get_autotrade_settings(uid)
         except Exception:
@@ -1828,6 +1900,11 @@ async def notify_handler(call: types.CallbackQuery) -> None:
     access = await get_access_status(uid)
     if access != "ok":
         await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+        return
+
+    at_access = await get_autotrade_access_status(uid)
+    if at_access != "ok":
+        await safe_edit(call.message, autotrade_locked_text(uid), menu_kb(uid))
         return
 
     if action == "back":
