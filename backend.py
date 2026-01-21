@@ -865,6 +865,16 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     uid = int(user_id)
     market = (getattr(sig, "market", "") or "").upper()
     if market not in ("SPOT", "FUTURES"):
+    # Global Auto-trade pause/maintenance (controlled from admin dashboard)
+    try:
+        s = await db_store.get_autotrade_bot_settings()
+        if bool(s.get("maintenance_mode")) or bool(s.get("pause_autotrade")):
+            logger.info("autotrade_execute skipped: global pause/maintenance")
+            return
+    except Exception:
+        # If DB is temporarily unavailable, fail open (do not block trading by mistake)
+        pass
+
         return {"ok": False, "skipped": True, "api_error": None}
 
     st = await db_store.get_autotrade_settings(uid)
