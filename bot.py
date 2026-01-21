@@ -839,33 +839,6 @@ def _autotrade_gate_text(uid: int) -> Optional[str]:
     return None
 
 
-
-async def _autotrade_user_gate_text(uid: int) -> Optional[str]:
-    """Return i18n text if user has no Auto-trade access in subscription."""
-    try:
-        acc = await db_store.get_autotrade_access(uid)
-    except Exception:
-        # If we can't check access, do not block (fail-open).
-        return None
-
-    enabled = bool(acc.get("autotrade_enabled"))
-    exp = acc.get("autotrade_expires_at")
-
-    if exp:
-        try:
-            if isinstance(exp, dt.datetime):
-                if exp.tzinfo is None:
-                    exp = exp.replace(tzinfo=dt.timezone.utc)
-                if exp <= dt.datetime.now(dt.timezone.utc):
-                    enabled = False
-        except Exception:
-            pass
-
-    if not enabled:
-        return tr(uid, "at_locked_block")
-
-    return None
-
 async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str, error_text: str) -> None:
     import time
     key = (int(uid), str(exchange or '').lower(), str(market_type or '').lower())
@@ -1859,12 +1832,6 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             await safe_edit(call.message, gt, menu_kb(uid))
             return
 
-        # Per-user subscription gate (AUTO-TRADE not enabled / expired)
-        ut = await _autotrade_user_gate_text(uid)
-        if ut:
-            await safe_edit(call.message, ut, menu_kb(uid))
-            return
-
         try:
             st = await db_store.get_autotrade_settings(uid)
         except Exception:
@@ -2179,11 +2146,6 @@ async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
     gt = _autotrade_gate_text(uid)
     if gt:
         await safe_edit(call.message, gt, menu_kb(uid))
-        return
-
-    ut = await _autotrade_user_gate_text(uid)
-    if ut:
-        await safe_edit(call.message, ut, menu_kb(uid))
         return
 
     action = (call.data or "").split(":", 1)[1]
@@ -3167,6 +3129,53 @@ async def main() -> None:
                 "autotrade_maintenance_mode": bool(at.get("maintenance_mode")),
                 "autotrade_updated_at": _iso(at.get("updated_at")),
             })
+
+        # -------- Auto-trade bot: settings-only alias (admin) --------
+        # The status dashboard historically calls a dedicated endpoint:
+        #   POST /api/infra/admin/autotrade/settings
+        # Some deployments proxy the bot under a "/signal" prefix.
+
+        async def autotrade_get_settings(request: web.Request) -> web.Response:
+            """Return only auto-trade global toggles (backward compatible)."""
+            if not _check_basic(request):
+                return _unauthorized()
+
+            def _iso(v):
+                try:
+                    return v.isoformat() if v else None
+                except Exception:
+                    return None
+
+            try:
+                at = await db_store.get_autotrade_bot_settings()
+            except Exception:
+                at = {"pause_autotrade": False, "maintenance_mode": False, "updated_at": None}
+
+            return web.json_response({
+                "ok": True,
+                "pause_autotrade": bool(at.get("pause_autotrade")),
+                "maintenance_mode": bool(at.get("maintenance_mode")),
+                "updated_at": _iso(at.get("updated_at")),
+            })
+
+        async def autotrade_save_settings(request: web.Request) -> web.Response:
+            """Save auto-trade global toggles (backward compatible).
+
+            Expected JSON:
+              pause_autotrade: bool
+              maintenance_mode: bool
+            """
+            if not _check_basic(request):
+                return _unauthorized()
+
+            data = await request.json()
+            pause_autotrade = bool((data or {}).get("pause_autotrade"))
+            maintenance_mode = bool((data or {}).get("maintenance_mode"))
+            await db_store.set_autotrade_bot_settings(
+                pause_autotrade=pause_autotrade,
+                maintenance_mode=maintenance_mode,
+            )
+            return web.json_response({"ok": True})
         async def signal_save_settings(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -3218,6 +3227,14 @@ async def main() -> None:
         app.router.add_route("GET", "/health", health)
         app.router.add_route("GET", "/api/infra/admin/signal/settings", signal_get_settings)
         app.router.add_route("POST", "/api/infra/admin/signal/settings", signal_save_settings)
+
+        # Auto-trade settings alias endpoints (compat)
+        app.router.add_route("GET", "/api/infra/admin/autotrade/settings", autotrade_get_settings)
+        app.router.add_route("POST", "/api/infra/admin/autotrade/settings", autotrade_save_settings)
+        # Some reverse proxies mount this service under /signal
+        app.router.add_route("GET", "/signal/api/infra/admin/autotrade/settings", autotrade_get_settings)
+        app.router.add_route("POST", "/signal/api/infra/admin/autotrade/settings", autotrade_save_settings)
+
         app.router.add_route("POST", "/api/infra/admin/signal/broadcast", signal_broadcast_text)
         app.router.add_route("POST", "/api/infra/admin/signal/send/{telegram_id}", signal_send_text)
         app.router.add_route("GET", "/api/infra/admin/signal/stats", signal_stats)
