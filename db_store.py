@@ -340,11 +340,94 @@ async def ensure_users_columns() -> None:
         except Exception:
             logger.exception("ensure_users_columns: failed to add autotrade_expires_at")
 
+        # STOP mode for auto-trade: when admin disables auto-trade while the user
+        # still has OPEN autotrade positions, we enter a "STOP" state.
+        # In STOP: new positions are not opened, existing ones are managed until closed.
+        # When all positions close, bot flips the user to OFF automatically.
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS autotrade_stop_after_close BOOLEAN NOT NULL DEFAULT FALSE;
+                """
+            )
+        except Exception:
+            logger.exception("ensure_users_columns: failed to add autotrade_stop_after_close")
+
         # Helpful index; ignore failure on managed DBs.
         try:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
         except Exception:
             logger.exception("ensure_users_columns: failed to create idx_users_telegram_id")
+
+
+async def get_autotrade_access(user_id: int) -> Dict[str, Any]:
+    """Return per-user admin access flags for auto-trade.
+
+    Fields:
+      - is_blocked
+      - autotrade_enabled
+      - autotrade_expires_at
+      - autotrade_stop_after_close (STOP mode)
+    """
+    pool = get_pool()
+    uid = int(user_id)
+    async with pool.acquire() as conn:
+        r = await conn.fetchrow(
+            """
+            SELECT
+              telegram_id,
+              COALESCE(is_blocked,FALSE) AS is_blocked,
+              COALESCE(autotrade_enabled,FALSE) AS autotrade_enabled,
+              autotrade_expires_at,
+              COALESCE(autotrade_stop_after_close,FALSE) AS autotrade_stop_after_close
+            FROM users
+            WHERE telegram_id=$1
+            """,
+            uid,
+        )
+        return dict(r) if r else {
+            "telegram_id": uid,
+            "is_blocked": False,
+            "autotrade_enabled": False,
+            "autotrade_expires_at": None,
+            "autotrade_stop_after_close": False,
+        }
+
+
+async def count_open_autotrade_positions(user_id: int) -> int:
+    """Count OPEN autotrade positions for the user."""
+    pool = get_pool()
+    uid = int(user_id)
+    async with pool.acquire() as conn:
+        n = await conn.fetchval(
+            """
+            SELECT COUNT(1)
+            FROM autotrade_positions
+            WHERE user_id=$1 AND status='OPEN'
+            """,
+            uid,
+        )
+        try:
+            return int(n or 0)
+        except Exception:
+            return 0
+
+
+async def finalize_autotrade_disable(user_id: int) -> None:
+    """Finalize STOP -> OFF when all positions are closed."""
+    pool = get_pool()
+    uid = int(user_id)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE users
+            SET autotrade_enabled=FALSE,
+                autotrade_stop_after_close=FALSE
+            WHERE telegram_id=$1
+            """,
+            uid,
+        )
 
 
 async def ensure_user_signal_trial(user_id: int) -> None:
