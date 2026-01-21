@@ -2664,7 +2664,20 @@ async def main() -> None:
     # --- Admin HTTP API for Status panel (Signal bot access) ---
     # NOTE: Railway public domain requires an HTTP server listening on $PORT.
     # We run a tiny aiohttp server alongside the Telegram bot.
-    async def _admin_http_app() -> web.Application:
+    async 
+async def autotrade_get_settings(request):
+    # Global Auto-trade settings (pause/maintenance)
+    return web.json_response(await db_store.get_autotrade_bot_settings())
+
+async def autotrade_save_settings(request):
+    data = await request.json()
+    await db_store.set_autotrade_bot_settings(
+        pause_autotrade=bool(data.get("pause_autotrade")),
+        maintenance_mode=bool(data.get("maintenance_mode")),
+    )
+    return web.json_response({"ok": True})
+
+def _admin_http_app() -> web.Application:
         app = web.Application()
 
         # ---- Basic Auth ----
@@ -3122,6 +3135,8 @@ async def main() -> None:
         app.router.add_route("GET", "/health", health)
         app.router.add_route("GET", "/api/infra/admin/signal/settings", signal_get_settings)
         app.router.add_route("POST", "/api/infra/admin/signal/settings", signal_save_settings)
+    app.router.add_route("GET", "/api/infra/admin/autotrade/settings", autotrade_get_settings)
+    app.router.add_route("POST", "/api/infra/admin/autotrade/settings", autotrade_save_settings)
         app.router.add_route("POST", "/api/infra/admin/signal/broadcast", signal_broadcast_text)
         app.router.add_route("POST", "/api/infra/admin/signal/send/{telegram_id}", signal_send_text)
         app.router.add_route("GET", "/api/infra/admin/signal/stats", signal_stats)
