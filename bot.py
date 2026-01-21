@@ -2664,20 +2664,7 @@ async def main() -> None:
     # --- Admin HTTP API for Status panel (Signal bot access) ---
     # NOTE: Railway public domain requires an HTTP server listening on $PORT.
     # We run a tiny aiohttp server alongside the Telegram bot.
-    async 
-async def autotrade_get_settings(request):
-    # Global Auto-trade settings (pause/maintenance)
-    return web.json_response(await db_store.get_autotrade_bot_settings())
-
-async def autotrade_save_settings(request):
-    data = await request.json()
-    await db_store.set_autotrade_bot_settings(
-        pause_autotrade=bool(data.get("pause_autotrade")),
-        maintenance_mode=bool(data.get("maintenance_mode")),
-    )
-    return web.json_response({"ok": True})
-
-def _admin_http_app() -> web.Application:
+    async def _admin_http_app() -> web.Application:
         app = web.Application()
 
         # ---- Basic Auth ----
@@ -3096,6 +3083,29 @@ def _admin_http_app() -> web.Application:
             await db_store.set_autotrade_bot_settings(pause_autotrade=pause_autotrade, maintenance_mode=autotrade_maintenance_mode)
             return web.json_response({"ok": True})
 
+
+        async def autotrade_get_settings(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            try:
+                st = await db_store.get_autotrade_bot_settings()
+            except Exception:
+                st = {"pause_autotrade": False, "maintenance_mode": False, "updated_at": None}
+            return web.json_response({
+                "pause_autotrade": bool(st.get("pause_autotrade")),
+                "maintenance_mode": bool(st.get("maintenance_mode")),
+                "updated_at": (st.get("updated_at").isoformat() if st.get("updated_at") else None),
+            })
+
+        async def autotrade_save_settings(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            data = await request.json()
+            pause_autotrade = bool(data.get("pause_autotrade"))
+            maintenance_mode = bool(data.get("maintenance_mode"))
+            await db_store.set_autotrade_bot_settings(pause_autotrade=pause_autotrade, maintenance_mode=maintenance_mode)
+            return web.json_response({"ok": True})
+
         async def signal_broadcast_text(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -3135,41 +3145,6 @@ def _admin_http_app() -> web.Application:
         app.router.add_route("GET", "/health", health)
         app.router.add_route("GET", "/api/infra/admin/signal/settings", signal_get_settings)
         app.router.add_route("POST", "/api/infra/admin/signal/settings", signal_save_settings)
-    app.router.add_route("GET", "/api/infra/admin/autotrade/settings", autotrade_get_settings)
-    app.router.add_route("POST", "/api/infra/admin/autotrade/settings", autotrade_save_settings)
-        app.router.add_route("POST", "/api/infra/admin/signal/broadcast", signal_broadcast_text)
-        app.router.add_route("POST", "/api/infra/admin/signal/send/{telegram_id}", signal_send_text)
-        app.router.add_route("GET", "/api/infra/admin/signal/stats", signal_stats)
-        app.router.add_route("GET", "/api/infra/admin/signal/users", list_users)
-        app.router.add_route("POST", "/api/infra/admin/signal/users", save_user)
-        app.router.add_route("PATCH", "/api/infra/admin/signal/users/{telegram_id}", patch_user)
-        app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/block", block_user)
-        app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/unblock", unblock_user)
-        # Allow preflight
-        app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204))
-        return app
-
-    async def _start_http_server() -> None:
-        try:
-            port = int(os.getenv("PORT", "8080"))
-        except Exception:
-            port = 8080
-        app = await _admin_http_app()
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, host="0.0.0.0", port=port)
-        await site.start()
-        logger.info("Admin HTTP API started on 0.0.0.0:%s", port)
-
-    asyncio.create_task(_start_http_server())
-    logger.info("Starting track_loop")
-    asyncio.create_task(backend.track_loop(bot))
-    logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
-    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
-
-    # Auto-trade manager (SL/TP/BE) - runs in background.
-    asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        app.router.add_route("GET", "/api/infra/admin/autotrade/settings", autotrade_get_settings)
+        app.router.add_route("POST", "/api/infra/admin/autotrade/settings", autotrade_save_settings)
+ 
