@@ -601,6 +601,16 @@ async def init_db() -> None:
     await db_store.ensure_schema()
     # Users table migrations (signal access columns) live in db_store
     await db_store.ensure_users_columns()
+    # Warm up cached auto-trade global settings (pause/maintenance)
+    try:
+        st = await db_store.get_autotrade_bot_settings()
+        AUTOTRADE_BOT_SETTINGS_CACHE.update({
+            "pause_autotrade": bool(st.get("pause_autotrade")),
+            "maintenance_mode": bool(st.get("maintenance_mode")),
+            "updated_at": st.get("updated_at"),
+        })
+    except Exception:
+        pass
 
 async def ensure_user(user_id: int) -> None:
     if not pool or not user_id:
@@ -768,7 +778,12 @@ def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     kb.button(text=tr(uid, "m_stats"), callback_data="menu:stats")
     kb.button(text=tr(uid, "m_spot"), callback_data="menu:spot")
     kb.button(text=tr(uid, "m_fut"), callback_data="menu:futures")
-    kb.button(text=tr(uid, "m_autotrade"), callback_data="menu:autotrade")
+    # Hide Auto-trade button in main menu when global Pause AUTO-TRADE is enabled
+    try:
+        if not bool(AUTOTRADE_BOT_SETTINGS_CACHE.get("pause_autotrade")):
+            kb.button(text=tr(uid, "m_autotrade"), callback_data="menu:autotrade")
+    except Exception:
+        kb.button(text=tr(uid, "m_autotrade"), callback_data="menu:autotrade")
     kb.button(text=tr(uid, "m_trades"), callback_data="trades:page:0")
     kb.button(text=tr(uid, "m_notify"), callback_data="menu:notify")
     kb.adjust(2, 2, 2, 1)
@@ -788,6 +803,95 @@ def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+
+# ---------------- Auto-trade access gate ----------------
+
+async def _user_autotrade_access_ok(uid: int) -> bool:
+    """True if user has Auto-trade access in subscription (users.autotrade_enabled + not expired)."""
+    if not pool or not uid:
+        return False
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT COALESCE(autotrade_enabled, FALSE) AS autotrade_enabled,
+                   autotrade_expires_at
+            FROM users
+            WHERE telegram_id=$1
+            """,
+            int(uid),
+        )
+        if not row:
+            return False
+        if not bool(row.get("autotrade_enabled")):
+            return False
+        exp = row.get("autotrade_expires_at")
+        if exp is not None:
+            try:
+                # Treat naive datetime as UTC
+                if hasattr(exp, "tzinfo") and exp.tzinfo is None:
+                    import datetime as _dt
+                    exp = exp.replace(tzinfo=_dt.timezone.utc)
+                import datetime as _dt
+                if exp <= _dt.datetime.now(_dt.timezone.utc):
+                    return False
+            except Exception:
+                # If comparison fails, be safe and block
+                return False
+        return True
+
+
+async def autotrade_gate_text(uid: int) -> str | None:
+    """Return a localized block message if Auto-trade UI must be blocked; otherwise None."""
+    # 1) Global switches (admin)
+    gst = AUTOTRADE_BOT_SETTINGS_CACHE
+    try:
+        if pool:
+            gst = await db_store.get_autotrade_bot_settings()
+            # keep cache warm
+            try:
+                AUTOTRADE_BOT_SETTINGS_CACHE.update({
+                    "pause_autotrade": bool(gst.get("pause_autotrade")),
+                    "maintenance_mode": bool(gst.get("maintenance_mode")),
+                    "updated_at": gst.get("updated_at"),
+                })
+            except Exception:
+                pass
+    except Exception:
+        gst = AUTOTRADE_BOT_SETTINGS_CACHE
+
+    if bool(gst.get("maintenance_mode")):
+        return tr(uid, "at_maintenance_block")
+    if bool(gst.get("pause_autotrade")):
+        return tr(uid, "at_pause_block")
+
+    # 2) Per-user access (subscription)
+    try:
+        ok = await _user_autotrade_access_ok(uid)
+    except Exception:
+        ok = False
+    if not ok:
+        return tr(uid, "at_access_unavailable")
+
+    return None
+
+
+async def _autotrade_settings_refresh_loop() -> None:
+    """Background refresh to keep AUTOTRADE_BOT_SETTINGS_CACHE up to date."""
+    import asyncio as _asyncio
+    while True:
+        try:
+            if pool:
+                st = await db_store.get_autotrade_bot_settings()
+                AUTOTRADE_BOT_SETTINGS_CACHE.update({
+                    "pause_autotrade": bool(st.get("pause_autotrade")),
+                    "maintenance_mode": bool(st.get("maintenance_mode")),
+                    "updated_at": st.get("updated_at"),
+                })
+        except Exception:
+            pass
+        await _asyncio.sleep(10)
+
+
 # ---------------- Auto-trade UI + input state ----------------
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -800,6 +904,10 @@ AUTOTRADE_STATS_STATE: Dict[int, Dict[str, str]] = {}
 # Notify only on API errors (anti-spam)
 AUTOTRADE_API_ERR_LAST: Dict[tuple[int, str, str], float] = {}
 AUTOTRADE_API_ERR_COOLDOWN_SEC = 300
+
+
+# Cached auto-trade global settings (pause/maintenance) for fast UI rendering.
+AUTOTRADE_BOT_SETTINGS_CACHE: dict = {"pause_autotrade": False, "maintenance_mode": False, "updated_at": None}
 
 async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str, error_text: str) -> None:
     import time
@@ -1788,6 +1896,10 @@ async def menu_handler(call: types.CallbackQuery) -> None:
 
     # ---- AUTO-TRADE ----
     if action == "autotrade":
+        gate = await autotrade_gate_text(uid)
+        if gate:
+            await safe_edit(call.message, gate, menu_kb(uid))
+            return
         try:
             st = await db_store.get_autotrade_settings(uid)
         except Exception:
@@ -1817,6 +1929,7 @@ async def notify_handler(call: types.CallbackQuery) -> None:
     if not uid:
         return
 
+
     parts = (call.data or "").split(":")
     # notify:set:on | notify:set:off | notify:back
     try:
@@ -1828,6 +1941,11 @@ async def notify_handler(call: types.CallbackQuery) -> None:
     access = await get_access_status(uid)
     if access != "ok":
         await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+        return
+
+    gate = await autotrade_gate_text(uid)
+    if gate:
+        await safe_edit(call.message, gate, menu_kb(uid))
         return
 
     if action == "back":
@@ -2661,6 +2779,9 @@ async def main() -> None:
     await init_db()
     load_langs()
 
+    # Keep cached auto-trade settings in sync (needed to hide menu button on pause)
+    asyncio.create_task(_autotrade_settings_refresh_loop())
+
     # --- Admin HTTP API for Status panel (Signal bot access) ---
     # NOTE: Railway public domain requires an HTTP server listening on $PORT.
     # We run a tiny aiohttp server alongside the Telegram bot.
@@ -2733,9 +2854,7 @@ async def main() -> None:
                 rows = await conn.fetch(
                     f"""
                     SELECT telegram_id, signal_enabled, signal_expires_at, COALESCE(is_blocked,FALSE) AS is_blocked,
-                           COALESCE(autotrade_enabled,FALSE) AS autotrade_enabled,
-                           COALESCE(autotrade_stop_after_close,FALSE) AS autotrade_stop_after_close,
-                           autotrade_expires_at
+                           COALESCE(autotrade_enabled,FALSE) AS autotrade_enabled, autotrade_expires_at
                     FROM users
                     {where_sql}
                     ORDER BY telegram_id DESC
@@ -2751,9 +2870,7 @@ async def main() -> None:
                     "signal_expires_at": (r["signal_expires_at"].isoformat() if r["signal_expires_at"] else None),
                     "is_blocked": bool(r["is_blocked"]),
                     "autotrade_enabled": bool(r.get("autotrade_enabled", False)),
-                    "autotrade_stop_after_close": bool(r.get("autotrade_stop_after_close", False)),
                     "autotrade_expires_at": (r["autotrade_expires_at"].isoformat() if r.get("autotrade_expires_at") else None),
-                    "autotrade_status": ("STOP" if bool(r.get("autotrade_stop_after_close", False)) else ("ON" if bool(r.get("autotrade_enabled", False)) else "OFF")),
                 })
             return web.json_response({"items": out})
 
@@ -2914,64 +3031,26 @@ async def main() -> None:
                     await conn.execute(
                         """UPDATE users
                                SET autotrade_enabled = TRUE,
-                                   autotrade_stop_after_close = FALSE,
                                    autotrade_expires_at = COALESCE(autotrade_expires_at, now()) + make_interval(days => $2)
                              WHERE telegram_id=$1""",
                         tid, autotrade_add_days,
                     )
                 else:
-                    # STOP semantics:
-                    # - If admin enables auto-trade -> ON immediately (stop=false)
-                    # - If admin disables auto-trade:
-                    #     - no OPEN positions -> OFF immediately
-                    #     - has OPEN positions -> STOP (no new opens, manage existing until close)
-                    if autotrade_enabled:
-                        if autotrade_expires is not None:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=TRUE,
-                                           autotrade_stop_after_close=FALSE,
-                                           autotrade_expires_at=$2::timestamptz
-                                     WHERE telegram_id=$1""",
-                                tid, autotrade_expires,
-                            )
-                        else:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=TRUE,
-                                           autotrade_stop_after_close=FALSE
-                                     WHERE telegram_id=$1""",
-                                tid,
-                            )
+                    if autotrade_expires is not None:
+                        await conn.execute(
+                            """UPDATE users
+                                   SET autotrade_enabled=$2,
+                                       autotrade_expires_at=$3::timestamptz
+                                 WHERE telegram_id=$1""",
+                            tid, autotrade_enabled, autotrade_expires,
+                        )
                     else:
-                        # Disable request
-                        open_n = 0
-                        try:
-                            open_n = int(await conn.fetchval(
-                                """SELECT COUNT(*) FROM autotrade_positions WHERE user_id=$1 AND status='OPEN'""",
-                                tid,
-                            ) or 0)
-                        except Exception:
-                            open_n = 0
-
-                        stop_mode = (open_n > 0)
-                        if autotrade_expires is not None:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=FALSE,
-                                           autotrade_stop_after_close=$2,
-                                           autotrade_expires_at=$3::timestamptz
-                                     WHERE telegram_id=$1""",
-                                tid, stop_mode, autotrade_expires,
-                            )
-                        else:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=FALSE,
-                                           autotrade_stop_after_close=$2
-                                     WHERE telegram_id=$1""",
-                                tid, stop_mode,
-                            )
+                        await conn.execute(
+                            """UPDATE users
+                                   SET autotrade_enabled=$2
+                                 WHERE telegram_id=$1""",
+                            tid, autotrade_enabled,
+                        )
             
                 if is_blocked is not None:
                     try:
@@ -3038,57 +3117,24 @@ async def main() -> None:
                     await conn.execute(
                         """UPDATE users
                                SET autotrade_enabled = TRUE,
-                                   autotrade_stop_after_close = FALSE,
                                    autotrade_expires_at = COALESCE(autotrade_expires_at, now()) + make_interval(days => $2)
                              WHERE telegram_id=$1""",
                         tid, autotrade_add_days,
                     )
                 else:
-                    if autotrade_enabled:
-                        if autotrade_expires is not None:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=TRUE,
-                                           autotrade_stop_after_close=FALSE,
-                                           autotrade_expires_at=$2::timestamptz
-                                     WHERE telegram_id=$1""",
-                                tid, autotrade_expires,
-                            )
-                        else:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=TRUE,
-                                           autotrade_stop_after_close=FALSE
-                                     WHERE telegram_id=$1""",
-                                tid,
-                            )
+                    if autotrade_expires is not None:
+                        await conn.execute(
+                            """UPDATE users
+                                   SET autotrade_enabled=$2,
+                                       autotrade_expires_at=$3::timestamptz
+                                 WHERE telegram_id=$1""",
+                            tid, autotrade_enabled, autotrade_expires,
+                        )
                     else:
-                        open_n = 0
-                        try:
-                            open_n = int(await conn.fetchval(
-                                """SELECT COUNT(*) FROM autotrade_positions WHERE user_id=$1 AND status='OPEN'""",
-                                tid,
-                            ) or 0)
-                        except Exception:
-                            open_n = 0
-                        stop_mode = (open_n > 0)
-                        if autotrade_expires is not None:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=FALSE,
-                                           autotrade_stop_after_close=$2,
-                                           autotrade_expires_at=$3::timestamptz
-                                     WHERE telegram_id=$1""",
-                                tid, stop_mode, autotrade_expires,
-                            )
-                        else:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=FALSE,
-                                           autotrade_stop_after_close=$2
-                                     WHERE telegram_id=$1""",
-                                tid, stop_mode,
-                            )
+                        await conn.execute(
+                            "UPDATE users SET autotrade_enabled=$2 WHERE telegram_id=$1",
+                            tid, autotrade_enabled,
+                        )
             
                 if is_blocked is not None:
                     try:
@@ -3156,7 +3202,53 @@ async def main() -> None:
             autotrade_maintenance_mode = bool(data.get("autotrade_maintenance_mode"))
             await db_store.set_signal_bot_settings(pause_signals=pause_signals, maintenance_mode=maintenance_mode)
             await db_store.set_autotrade_bot_settings(pause_autotrade=pause_autotrade, maintenance_mode=autotrade_maintenance_mode)
+            try:
+                AUTOTRADE_BOT_SETTINGS_CACHE.update({
+                    "pause_autotrade": bool(pause_autotrade),
+                    "maintenance_mode": bool(autotrade_maintenance_mode),
+                })
+            except Exception:
+                pass
             return web.json_response({"ok": True})
+
+        # -------- Auto-trade global settings (admin) --------
+
+        async def autotrade_get_settings(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            def _iso(v):
+                try:
+                    return v.isoformat() if v else None
+                except Exception:
+                    return None
+            try:
+                st = await db_store.get_autotrade_bot_settings()
+            except Exception:
+                st = {"pause_autotrade": False, "maintenance_mode": False, "updated_at": None}
+            return web.json_response({
+                "ok": True,
+                "pause_autotrade": bool(st.get("pause_autotrade")),
+                "maintenance_mode": bool(st.get("maintenance_mode")),
+                "updated_at": _iso(st.get("updated_at")),
+            })
+
+        async def autotrade_save_settings(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            data = await request.json()
+            pause_autotrade = bool(data.get("pause_autotrade"))
+            maintenance_mode = bool(data.get("maintenance_mode"))
+            await db_store.set_autotrade_bot_settings(pause_autotrade=pause_autotrade, maintenance_mode=maintenance_mode)
+            # keep cache in sync for UI (menu button hide)
+            try:
+                AUTOTRADE_BOT_SETTINGS_CACHE.update({
+                    "pause_autotrade": bool(pause_autotrade),
+                    "maintenance_mode": bool(maintenance_mode),
+                })
+            except Exception:
+                pass
+            return web.json_response({"ok": True})
+
 
         async def signal_broadcast_text(request: web.Request) -> web.Response:
             if not _check_basic(request):
@@ -3197,6 +3289,8 @@ async def main() -> None:
         app.router.add_route("GET", "/health", health)
         app.router.add_route("GET", "/api/infra/admin/signal/settings", signal_get_settings)
         app.router.add_route("POST", "/api/infra/admin/signal/settings", signal_save_settings)
+        app.router.add_route("GET", "/api/infra/admin/autotrade/settings", autotrade_get_settings)
+        app.router.add_route("POST", "/api/infra/admin/autotrade/settings", autotrade_save_settings)
         app.router.add_route("POST", "/api/infra/admin/signal/broadcast", signal_broadcast_text)
         app.router.add_route("POST", "/api/infra/admin/signal/send/{telegram_id}", signal_send_text)
         app.router.add_route("GET", "/api/infra/admin/signal/stats", signal_stats)
