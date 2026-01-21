@@ -839,6 +839,33 @@ def _autotrade_gate_text(uid: int) -> Optional[str]:
     return None
 
 
+
+async def _autotrade_user_gate_text(uid: int) -> Optional[str]:
+    """Return i18n text if user has no Auto-trade access in subscription."""
+    try:
+        acc = await db_store.get_autotrade_access(uid)
+    except Exception:
+        # If we can't check access, do not block (fail-open).
+        return None
+
+    enabled = bool(acc.get("autotrade_enabled"))
+    exp = acc.get("autotrade_expires_at")
+
+    if exp:
+        try:
+            if isinstance(exp, dt.datetime):
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=dt.timezone.utc)
+                if exp <= dt.datetime.now(dt.timezone.utc):
+                    enabled = False
+        except Exception:
+            pass
+
+    if not enabled:
+        return tr(uid, "at_locked_block")
+
+    return None
+
 async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str, error_text: str) -> None:
     import time
     key = (int(uid), str(exchange or '').lower(), str(market_type or '').lower())
@@ -1832,6 +1859,12 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             await safe_edit(call.message, gt, menu_kb(uid))
             return
 
+        # Per-user subscription gate (AUTO-TRADE not enabled / expired)
+        ut = await _autotrade_user_gate_text(uid)
+        if ut:
+            await safe_edit(call.message, ut, menu_kb(uid))
+            return
+
         try:
             st = await db_store.get_autotrade_settings(uid)
         except Exception:
@@ -2146,6 +2179,11 @@ async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
     gt = _autotrade_gate_text(uid)
     if gt:
         await safe_edit(call.message, gt, menu_kb(uid))
+        return
+
+    ut = await _autotrade_user_gate_text(uid)
+    if ut:
+        await safe_edit(call.message, ut, menu_kb(uid))
         return
 
     action = (call.data or "").split(":", 1)[1]
