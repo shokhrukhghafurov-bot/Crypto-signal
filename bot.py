@@ -1779,6 +1779,9 @@ async def menu_handler(call: types.CallbackQuery) -> None:
 
         lines.append(trf(uid, "status_next_macro", value=(next_macro or tr(uid, "lbl_none"))))
 
+        # --- Signals / notifications block ---
+        lines.append("━━━━━━━━━━━━")
+
         # Signal bot global state (pause / maintenance) from admin dashboard
         try:
             sb = await db_store.get_signal_bot_settings()
