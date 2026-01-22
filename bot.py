@@ -574,8 +574,12 @@ async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKe
             text=parts[0],
             reply_markup=kb if len(parts) == 1 else None,
         )
-    except Exception:
-        # If we can't edit (old message, same text, etc.) - just send new
+    except Exception as e:
+        # If the message content is identical, Telegram returns "message is not modified".
+        # In that case we do nothing (avoid spamming a new message).
+        if "message is not modified" in str(e).lower():
+            return
+        # If we can't edit (old message, etc.) - just send new
         try:
             await safe_send(chat_id, parts[0], reply_markup=kb if len(parts) == 1 else None)
         except Exception:
@@ -836,6 +840,16 @@ def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
 from cryptography.fernet import Fernet, InvalidToken
 
 AUTOTRADE_INPUT: Dict[int, Dict[str, str]] = {}
+
+# Per-user locks to prevent race conditions on rapid button presses / concurrent inputs
+_USER_LOCKS: Dict[int, asyncio.Lock] = {}
+def _user_lock(uid: int) -> asyncio.Lock:
+    lock = _USER_LOCKS.get(int(uid))
+    if lock is None:
+        lock = asyncio.Lock()
+        _USER_LOCKS[int(uid)] = lock
+    return lock
+
 
 # Auto-trade stats UI state
 AUTOTRADE_STATS_STATE: Dict[int, Dict[str, str]] = {}
@@ -2160,97 +2174,94 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
     uid = call.from_user.id if call.from_user else 0
     if not uid:
         return
+    async with _user_lock(uid):
 
-    # Shared access control
-    access = await get_access_status(uid)
-    if access != "ok":
-        await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
-        return
-
-    gt = _autotrade_gate_text(uid)
-    if gt:
-        await safe_edit(call.message, gt, menu_kb(uid))
-        return
-
-    ut = await _autotrade_unavailable_text(uid)
-    if ut:
-        await safe_edit(call.message, ut, menu_kb(uid))
-        return
-
-    parts = (call.data or "").split(":")
-    # at:toggle:spot | at:toggle:futures | at:set:* | at:ex:* | at:keys | at:keys:set:EX:MT
-    action = parts[1] if len(parts) > 1 else ""
-
-    # Load current state
-    st = await db_store.get_autotrade_settings(uid)
-    keys = await db_store.get_autotrade_keys_status(uid)
-
-    if action == "toggle" and len(parts) >= 3:
-        mt = parts[2]
-        if mt == "spot":
-            await db_store.set_autotrade_toggle(uid, "spot", not bool(st.get("spot_enabled")))
-        elif mt == "futures":
-            await db_store.set_autotrade_toggle(uid, "futures", not bool(st.get("futures_enabled")))
-        st = await db_store.get_autotrade_settings(uid)
-        await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
-        return
-
-    if action == "keys":
-        # at:keys or at:keys:set:ex:mt
-        if len(parts) == 2:
-            await safe_edit(call.message, tr(uid, "at_keys_screen"), autotrade_keys_kb(uid))
+        # Shared access control
+        access = await get_access_status(uid)
+        if access != "ok":
+            await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
             return
-        if len(parts) >= 5 and parts[2] == "set":
+
+        gt = _autotrade_gate_text(uid)
+        if gt:
+            await safe_edit(call.message, gt, menu_kb(uid))
+            return
+
+        ut = await _autotrade_unavailable_text(uid)
+        if ut:
+            await safe_edit(call.message, ut, menu_kb(uid))
+            return
+
+        parts = (call.data or "").split(":")
+        # at:toggle:spot | at:toggle:futures | at:set:* | at:ex:* | at:keys | at:keys:set:EX:MT
+        action = parts[1] if len(parts) > 1 else ""
+
+        # Load current state
+        st = await db_store.get_autotrade_settings(uid)
+        keys = await db_store.get_autotrade_keys_status(uid)
+
+        if action == "toggle" and len(parts) >= 3:
+            mt = parts[2]
+            if mt in ("spot", "futures"):
+                await db_store.toggle_autotrade_toggle(uid, mt)
+            st = await db_store.get_autotrade_settings(uid)
+            await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
+            return
+        if action == "keys":
+            # at:keys or at:keys:set:ex:mt
+            if len(parts) == 2:
+                await safe_edit(call.message, tr(uid, "at_keys_screen"), autotrade_keys_kb(uid))
+                return
+            if len(parts) >= 5 and parts[2] == "set":
+                ex = parts[3]
+                mt = parts[4]
+                AUTOTRADE_INPUT[uid] = {"mode": "keys", "exchange": ex, "market_type": mt, "step": "api_key"}
+                await safe_send(uid, trf(uid, "at_enter_api_key", exchange=ex.upper(), market=mt.upper()))
+                return
+
+        if action == "set" and len(parts) >= 3:
+            field = parts[2]
+            if field == "spot_amount":
+                AUTOTRADE_INPUT[uid] = {"mode": "set", "field": "spot_amount"}
+                await safe_send(uid, tr(uid, "at_enter_spot_amount"))
+                return
+            if field == "fut_margin":
+                AUTOTRADE_INPUT[uid] = {"mode": "set", "field": "fut_margin"}
+                await safe_send(uid, tr(uid, "at_enter_fut_margin"))
+                return
+            if field == "fut_leverage":
+                AUTOTRADE_INPUT[uid] = {"mode": "set", "field": "fut_leverage"}
+                await safe_send(uid, tr(uid, "at_enter_fut_leverage"))
+                return
+            if field == "fut_cap":
+                AUTOTRADE_INPUT[uid] = {"mode": "set", "field": "fut_cap"}
+                await safe_send(uid, tr(uid, "at_enter_fut_cap"))
+                return
+
+        if action == "ex" and len(parts) >= 3:
+            mt = parts[2]
+            # show exchange choices
+            kb = InlineKeyboardBuilder()
+            kb.button(text="Binance", callback_data=f"at:exset:{mt}:binance")
+            kb.button(text="Bybit", callback_data=f"at:exset:{mt}:bybit")
+            kb.adjust(2)
+            kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
+            kb.adjust(1)
+            await safe_edit(call.message, tr(uid, "at_choose_exchange"), kb.as_markup())
+            return
+
+        if action == "exset" and len(parts) >= 4:
+            mt = parts[2]
             ex = parts[3]
-            mt = parts[4]
-            AUTOTRADE_INPUT[uid] = {"mode": "keys", "exchange": ex, "market_type": mt, "step": "api_key"}
-            await safe_send(uid, trf(uid, "at_enter_api_key", exchange=ex.upper(), market=mt.upper()))
+            await db_store.set_autotrade_exchange(uid, "spot" if mt == "spot" else "futures", ex)
+            st = await db_store.get_autotrade_settings(uid)
+            await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
             return
 
-    if action == "set" and len(parts) >= 3:
-        field = parts[2]
-        if field == "spot_amount":
-            AUTOTRADE_INPUT[uid] = {"mode": "set", "field": "spot_amount"}
-            await safe_send(uid, tr(uid, "at_enter_spot_amount"))
-            return
-        if field == "fut_margin":
-            AUTOTRADE_INPUT[uid] = {"mode": "set", "field": "fut_margin"}
-            await safe_send(uid, tr(uid, "at_enter_fut_margin"))
-            return
-        if field == "fut_leverage":
-            AUTOTRADE_INPUT[uid] = {"mode": "set", "field": "fut_leverage"}
-            await safe_send(uid, tr(uid, "at_enter_fut_leverage"))
-            return
-        if field == "fut_cap":
-            AUTOTRADE_INPUT[uid] = {"mode": "set", "field": "fut_cap"}
-            await safe_send(uid, tr(uid, "at_enter_fut_cap"))
-            return
-
-    if action == "ex" and len(parts) >= 3:
-        mt = parts[2]
-        # show exchange choices
-        kb = InlineKeyboardBuilder()
-        kb.button(text="Binance", callback_data=f"at:exset:{mt}:binance")
-        kb.button(text="Bybit", callback_data=f"at:exset:{mt}:bybit")
-        kb.adjust(2)
-        kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
-        kb.adjust(1)
-        await safe_edit(call.message, tr(uid, "at_choose_exchange"), kb.as_markup())
-        return
-
-    if action == "exset" and len(parts) >= 4:
-        mt = parts[2]
-        ex = parts[3]
-        await db_store.set_autotrade_exchange(uid, "spot" if mt == "spot" else "futures", ex)
+        # default: return to autotrade screen
         st = await db_store.get_autotrade_settings(uid)
+        keys = await db_store.get_autotrade_keys_status(uid)
         await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
-        return
-
-    # default: return to autotrade screen
-    st = await db_store.get_autotrade_settings(uid)
-    keys = await db_store.get_autotrade_keys_status(uid)
-    await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
-
 
 @dp.callback_query(lambda c: (c.data or "").startswith("atmenu:"))
 async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
@@ -2391,171 +2402,204 @@ async def autotrade_input_handler(message: types.Message) -> None:
     uid = message.from_user.id if message.from_user else 0
     if not uid:
         return
-    state = AUTOTRADE_INPUT.get(uid)
-    if not state:
-        return
-
-    # Access check
-    access = await get_access_status(uid)
-    if access != "ok":
-        AUTOTRADE_INPUT.pop(uid, None)
-        await message.answer(tr(uid, f"access_{access}"), reply_markup=menu_kb(uid))
-        return
-
-    text = (message.text or "").strip()
-    if not text:
-        return
-
-    if state.get("mode") == "set":
-        field = state.get("field") or ""
-        success = False
-        try:
-            if field in ("spot_amount", "fut_margin", "fut_cap"):
-                val = float(text.replace(",", "."))
-                if val < 0:
-                    raise ValueError
-                if field == "spot_amount":
-                    # Hard minimum: SPOT amount per trade must be >= 10 USDT
-                    if val < 10:
-                        await message.answer(tr(uid, "at_min_spot_amount"))
-                        return
-                    await db_store.set_autotrade_amount(uid, "spot", val)
-                elif field == "fut_margin":
-                    # Hard minimum: FUTURES margin per trade must be >= 5 USDT
-                    if val < 5:
-                        await message.answer(tr(uid, "at_min_fut_margin"))
-                        return
-                    await db_store.set_autotrade_amount(uid, "futures", val)
-                elif field == "fut_cap":
-                    await db_store.set_autotrade_futures_cap(uid, val)
-            elif field == "fut_leverage":
-                lev = int(float(text.replace(",", ".")))
-                if lev < 1 or lev > 125:
-                    raise ValueError
-                await db_store.set_autotrade_futures_leverage(uid, lev)
-            else:
-                # unknown field
-                return
-            success = True
-        except Exception:
-            # Keep simple: ask again
-            await message.answer(tr(uid, "bad_number"))
+    async with _user_lock(uid):
+        state = AUTOTRADE_INPUT.get(uid)
+        if not state:
             return
 
-        if success:
+        # Access check
+        access = await get_access_status(uid)
+        if access != "ok":
             AUTOTRADE_INPUT.pop(uid, None)
-
-        st = await db_store.get_autotrade_settings(uid)
-        keys = await db_store.get_autotrade_keys_status(uid)
-        await message.answer(autotrade_text(uid, st, keys), reply_markup=autotrade_kb(uid, st, keys))
-        return
-
-    if state.get("mode") == "keys":
-        ex = (state.get("exchange") or "binance").lower()
-        mt = (state.get("market_type") or "spot").lower()
-        step = state.get("step") or "api_key"
-
-        if step == "api_key":
-            state["api_key"] = text
-            state["step"] = "api_secret"
-            AUTOTRADE_INPUT[uid] = state
-            await message.answer(tr(uid, "at_enter_api_secret"))
+            await message.answer(tr(uid, f"access_{access}"), reply_markup=menu_kb(uid))
             return
 
-        if step == "api_secret":
-            api_key = (state.get("api_key") or "").strip()
-            api_secret = text
-            AUTOTRADE_INPUT.pop(uid, None)
+        text = (message.text or "").strip()
+        if not text:
+            return
 
-            # Basic pre-validation to avoid confusing raw exchange errors when
-            # user pastes a wrong value (e.g. random short text). Exchange key
-            # lengths differ, so keep it permissive for Bybit (their API key can
-            # be < 20 chars) while still blocking obvious junk.
-            api_key_s = api_key.strip()
-            api_secret_s = str(api_secret).strip()
-            if ex == "bybit":
-                bad_format = (len(api_key_s) < 8) or (len(api_secret_s) < 20)
-            else:
-                bad_format = (len(api_key_s) < 20) or (len(api_secret_s) < 20)
-
-            if bad_format:
-                try:
-                    await db_store.mark_autotrade_key_error(
-                        user_id=uid,
-                        exchange=ex,
-                        market_type=mt,
-                        error="bad_format",
-                        deactivate=True,
-                    )
-                except Exception:
-                    pass
-                await message.answer(trf(uid, "at_keys_bad_format", exchange=ex.upper(), market=mt.upper()))
-
-                st = await db_store.get_autotrade_settings(uid)
-                keys = await db_store.get_autotrade_keys_status(uid)
-                await message.answer(autotrade_text(uid, st, keys), reply_markup=autotrade_kb(uid, st, keys))
-                return
-
-            # Validate (READ + TRADE). If TRADE missing -> reject.
+        if state.get("mode") == "set":
+            field = state.get("field") or ""
+            success = False
             try:
-                res = await validate_autotrade_keys(exchange=ex, market_type=mt, api_key=api_key, api_secret=api_secret)
-            except Exception as e:
-                res = {"ok": False, "read_ok": False, "trade_ok": False, "error": str(e)}
-
-            if not res.get("ok"):
-                raw_err = str(res.get("error") or "API error")
-
-                # Map raw exchange errors to user-friendly messages.
-                raw_low = raw_err.lower()
-                if ex == "binance" and ("api-key format invalid" in raw_low or "-2014" in raw_low):
-                    user_key = "at_keys_binance_format"
-                elif ex == "binance" and ("-2015" in raw_low or "invalid api-key" in raw_low):
-                    user_key = "at_keys_binance_invalid"
-                elif ex == "bybit" and ("10003" in raw_low or "api key is invalid" in raw_low):
-                    user_key = "at_keys_bybit_invalid"
-                elif ("whitelist" in raw_low) or ("ip" in raw_low and "not" in raw_low and "allowed" in raw_low) or ("restricted" in raw_low and "ip" in raw_low):
-                    user_key = "at_keys_ip_restricted"
+                if field in ("spot_amount", "fut_margin", "fut_cap"):
+                    val = float(text.replace(",", "."))
+                    if val < 0:
+                        raise ValueError
+                    if field == "spot_amount":
+                        # Hard minimum: SPOT amount per trade must be >= 10 USDT
+                        if val < 10:
+                            await message.answer(tr(uid, "at_min_spot_amount"))
+                            return
+                        await db_store.set_autotrade_amount(uid, "spot", val)
+                    elif field == "fut_margin":
+                        # Hard minimum: FUTURES margin per trade must be >= 5 USDT
+                        if val < 5:
+                            await message.answer(tr(uid, "at_min_fut_margin"))
+                            return
+                        await db_store.set_autotrade_amount(uid, "futures", val)
+                    elif field == "fut_cap":
+                        await db_store.set_autotrade_futures_cap(uid, val)
+                elif field == "fut_leverage":
+                    lev = int(float(text.replace(",", ".")))
+                    if lev < 1 or lev > 125:
+                        raise ValueError
+                    await db_store.set_autotrade_futures_leverage(uid, lev)
                 else:
-                    user_key = "at_keys_api_error"
+                    # unknown field
+                    return
+                success = True
+            except Exception:
+                # Keep simple: ask again
+                await message.answer(tr(uid, "bad_number"))
+                return
 
-                # Store raw error (inactive) so UI shows ❌ and for troubleshooting.
-                try:
-                    await db_store.mark_autotrade_key_error(user_id=uid, exchange=ex, market_type=mt, error=raw_err, deactivate=True)
-                except Exception:
-                    pass
-                await message.answer(trf(uid, user_key, exchange=ex.upper(), market=mt.upper()))
-            elif not res.get("trade_ok"):
-                try:
-                    await db_store.mark_autotrade_key_error(user_id=uid, exchange=ex, market_type=mt, error="trade_permission_missing", deactivate=True)
-                except Exception:
-                    pass
-                await message.answer(tr(uid, "at_keys_trade_missing"))
-            else:
-                # Encrypt + store active
-                try:
-                    f = _fernet()
-                except Exception:
-                    await message.answer(tr(uid, "at_master_key_missing"))
-                else:
-                    api_key_enc = f.encrypt(api_key.encode("utf-8")).decode("utf-8")
-                    api_secret_enc = f.encrypt(api_secret.encode("utf-8")).decode("utf-8")
-                    await db_store.upsert_autotrade_keys(
-                        user_id=uid,
-                        exchange=ex,
-                        market_type=mt,
-                        api_key_enc=api_key_enc,
-                        api_secret_enc=api_secret_enc,
-                        passphrase_enc=None,
-                        is_active=True,
-                        last_error=None,
-                    )
-                    await message.answer(tr(uid, "at_keys_ok"))
+            if success:
+                AUTOTRADE_INPUT.pop(uid, None)
 
             st = await db_store.get_autotrade_settings(uid)
             keys = await db_store.get_autotrade_keys_status(uid)
             await message.answer(autotrade_text(uid, st, keys), reply_markup=autotrade_kb(uid, st, keys))
             return
 
+        if state.get("mode") == "keys":
+            ex = (state.get("exchange") or "binance").lower()
+            mt = (state.get("market_type") or "spot").lower()
+            step = state.get("step") or "api_key"
+
+            if step == "api_key":
+                state["api_key"] = text
+                state["step"] = "api_secret"
+                AUTOTRADE_INPUT[uid] = state
+                await message.answer(tr(uid, "at_enter_api_secret"))
+                return
+
+            if step == "api_secret":
+                api_key = (state.get("api_key") or "").strip()
+                api_secret = text
+                AUTOTRADE_INPUT.pop(uid, None)
+
+                # Basic pre-validation to avoid confusing raw exchange errors when
+                # user pastes a wrong value (e.g. random short text). Exchange key
+                # lengths differ, so keep it permissive for Bybit (their API key can
+                # be < 20 chars) while still blocking obvious junk.
+                api_key_s = api_key.strip()
+                api_secret_s = str(api_secret).strip()
+                if ex == "bybit":
+                    bad_format = (len(api_key_s) < 8) or (len(api_secret_s) < 20)
+                else:
+                    bad_format = (len(api_key_s) < 20) or (len(api_secret_s) < 20)
+
+                if bad_format:
+                    try:
+                        await db_store.mark_autotrade_key_error(
+                            user_id=uid,
+                            exchange=ex,
+                            market_type=mt,
+                            error="bad_format",
+                            deactivate=True,
+                        )
+                    except Exception:
+                        pass
+                    await message.answer(trf(uid, "at_keys_bad_format", exchange=ex.upper(), market=mt.upper()))
+
+                    st = await db_store.get_autotrade_settings(uid)
+                    keys = await db_store.get_autotrade_keys_status(uid)
+                    await message.answer(autotrade_text(uid, st, keys), reply_markup=autotrade_kb(uid, st, keys))
+                    return
+
+                # Validate (READ + TRADE). If TRADE missing -> reject.
+                try:
+                    res = await validate_autotrade_keys(exchange=ex, market_type=mt, api_key=api_key, api_secret=api_secret)
+                except Exception as e:
+                    res = {"ok": False, "read_ok": False, "trade_ok": False, "error": str(e)}
+
+                if not res.get("ok"):
+                    raw_err = str(res.get("error") or "API error")
+
+                    # Map raw exchange errors to user-friendly messages.
+                    raw_low = raw_err.lower()
+                    if ex == "binance" and ("api-key format invalid" in raw_low or "-2014" in raw_low):
+                        user_key = "at_keys_binance_format"
+                    elif ex == "binance" and ("-2015" in raw_low or "invalid api-key" in raw_low):
+                        user_key = "at_keys_binance_invalid"
+                    elif ex == "bybit" and ("10003" in raw_low or "api key is invalid" in raw_low):
+                        user_key = "at_keys_bybit_invalid"
+                    elif ("whitelist" in raw_low) or ("ip" in raw_low and "not" in raw_low and "allowed" in raw_low) or ("restricted" in raw_low and "ip" in raw_low):
+                        user_key = "at_keys_ip_restricted"
+                    else:
+                        user_key = "at_keys_api_error"
+
+                    # Store raw error (inactive) so UI shows ❌ and for troubleshooting.
+                    try:
+                        await db_store.mark_autotrade_key_error(user_id=uid, exchange=ex, market_type=mt, error=raw_err, deactivate=True)
+                    except Exception:
+                        pass
+                    await message.answer(trf(uid, user_key, exchange=ex.upper(), market=mt.upper()))
+                elif not res.get("trade_ok"):
+                    try:
+                        await db_store.mark_autotrade_key_error(user_id=uid, exchange=ex, market_type=mt, error="trade_permission_missing", deactivate=True)
+                    except Exception:
+                        pass
+                    await message.answer(tr(uid, "at_keys_trade_missing"))
+                else:
+                    # Encrypt + store active
+                    try:
+                        f = _fernet()
+                    except Exception:
+                        await message.answer(tr(uid, "at_master_key_missing"))
+                    else:
+                        api_key_enc = f.encrypt(api_key.encode("utf-8")).decode("utf-8")
+                        api_secret_enc = f.encrypt(api_secret.encode("utf-8")).decode("utf-8")
+                        await db_store.upsert_autotrade_keys(
+                            user_id=uid,
+                            exchange=ex,
+                            market_type=mt,
+                            api_key_enc=api_key_enc,
+                            api_secret_enc=api_secret_enc,
+                            passphrase_enc=None,
+                            is_active=True,
+                            last_error=None,
+                                                )
+                        # Validate keys against the exchange right away (prevents "green" status for invalid keys)
+                        try:
+                            v = await backend.validate_autotrade_keys(
+                                exchange=ex,
+                                market_type=mt,
+                                api_key=api_key,
+                                api_secret=api_secret,
+                                passphrase=None,
+                            )
+                        except Exception as e:
+                            # Network/temporary error: keep keys active but inform user
+                            await message.answer(tr(uid, "at_keys_api_error") + "\n\n" + str(e)[:200])
+                        else:
+                            if not bool(v.get("ok")):
+                                err = str(v.get("error") or "invalid").strip()
+                                # Deactivate on credential/permission issues
+                                await db_store.mark_autotrade_key_error(
+                                    user_id=uid,
+                                    exchange=ex,
+                                    market_type=mt,
+                                    error=err,
+                                    deactivate=True,
+                                )
+                                low = err.lower()
+                                if "ip" in low and "restrict" in low:
+                                    await message.answer(tr(uid, "at_keys_ip_restricted"))
+                                elif ex == "binance":
+                                    await message.answer(tr(uid, "at_keys_binance_invalid"))
+                                elif ex == "bybit":
+                                    await message.answer(tr(uid, "at_keys_bybit_invalid"))
+                                else:
+                                    await message.answer(tr(uid, "at_keys_invalid"))
+                            else:
+                                await message.answer(tr(uid, "at_keys_ok"))
+
+                st = await db_store.get_autotrade_settings(uid)
+                keys = await db_store.get_autotrade_keys_status(uid)
+                await message.answer(autotrade_text(uid, st, keys), reply_markup=autotrade_kb(uid, st, keys))
+                return
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trades:page:"))
 async def trades_page(call: types.CallbackQuery) -> None:
