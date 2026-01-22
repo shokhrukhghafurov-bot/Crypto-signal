@@ -1,4 +1,3 @@
-from i18n.ru import TEXT
 from __future__ import annotations
 
 import asyncio
@@ -1205,7 +1204,7 @@ def _open_card_text(uid: int, sig: Signal) -> str:
     base = sym_disp.split("/")[0].strip().replace(" ", "") if sym_disp else "SYMBOL"
     exchanges = (getattr(sig, "confirmations", "") or "").replace("+", " • ")
     if not exchanges:
-        exchanges = tr(uid, "lbl_none")
+        exchanges = tr(uid, "status_next_macro_none")
 
     # backend-only metrics (profit/leverage/rr computed in backend.py)
     mx = open_metrics(sig)
@@ -1613,7 +1612,7 @@ async def status_text(uid: int, *, include_subscribed: bool = False, include_hin
     # and "alignment with spaces" will always drift between clients.
     news_icon = "🟢" if _is_allow(news_stat.get("action")) else "🔴"
     out_lines.append(f"{trf(uid, 'status_news', state=news_state)}{news_icon}")
-    out_lines.append(f"{trf(uid, 'status_macro', state=macro_state)} {macro_icon}")
+    out_lines.append(trf(uid, 'status_macro', state=macro_state, icon=macro_icon))
 
     # News details when blocked
     if not _is_allow(news_stat.get("action")):
@@ -1650,7 +1649,7 @@ async def status_text(uid: int, *, include_subscribed: bool = False, include_hin
         except Exception:
             pass
 
-    out_lines.append(trf(uid, "status_next_macro", value=(next_macro or tr(uid, "lbl_none"))))
+    out_lines.append(trf(uid, "status_next_macro", value=(next_macro or tr(uid, "status_next_macro_none"))))
 
     # Signal bot global state (pause / maintenance) from admin dashboard
     try:
