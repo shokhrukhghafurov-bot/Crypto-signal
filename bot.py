@@ -2925,11 +2925,16 @@ async def main() -> None:
         # ---- CORS (for browser-based Status panel) ----
         @web.middleware
         async def cors_mw(request: web.Request, handler):
+            """CORS middleware + request-level error logging."""
             # Preflight
             if request.method == "OPTIONS":
                 resp = web.Response(status=204)
             else:
-                resp = await handler(request)
+                try:
+                    resp = await handler(request)
+                except Exception:
+                    logger.exception("HTTP handler error: %s %s", request.method, request.path_qs)
+                    raise
             origin = request.headers.get("Origin")
             resp.headers["Access-Control-Allow-Origin"] = origin or "*"
             resp.headers["Vary"] = "Origin"
@@ -2937,6 +2942,7 @@ async def main() -> None:
             resp.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type"
             resp.headers["Access-Control-Max-Age"] = "86400"
             return resp
+
 
         app.middlewares.append(cors_mw)
 
