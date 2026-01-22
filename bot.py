@@ -1,3 +1,4 @@
+from i18n.ru import TEXT
 from __future__ import annotations
 
 import asyncio
