@@ -1375,7 +1375,13 @@ async def upsert_autotrade_keys(
             """
             INSERT INTO autotrade_keys(user_id, exchange, market_type, api_key_enc, api_secret_enc, passphrase_enc,
                                       is_active, last_ok_at, last_error, last_error_at, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7, CASE WHEN $7 THEN NOW() ELSE NULL END, $8, CASE WHEN $8 IS NULL THEN NULL ELSE NOW() END, NOW())
+            -- NOTE: asyncpg cannot infer the type of a NULL parameter when it's only used in an IS NULL check.
+            -- Cast $8 to TEXT so passing last_error=None doesn't raise AmbiguousParameterError.
+            VALUES ($1,$2,$3,$4,$5,$6,$7,
+                    CASE WHEN $7 THEN NOW() ELSE NULL END,
+                    $8::TEXT,
+                    CASE WHEN $8::TEXT IS NULL THEN NULL ELSE NOW() END,
+                    NOW())
             ON CONFLICT (user_id, exchange, market_type)
             DO UPDATE SET api_key_enc=EXCLUDED.api_key_enc,
                           api_secret_enc=EXCLUDED.api_secret_enc,
