@@ -1629,7 +1629,11 @@ async def status_text(uid: int, *, include_subscribed: bool = False, include_hin
 
     out_lines.append("")
     out_lines.append(trf(uid, "status_scanner", state=scanner_state))
-    out_lines.append(trf(uid, "status_news", state=news_state))
+    # Keep "News" and "Macro" on the same line. Avoid padding/alignment tricks
+    # (Telegram uses proportional fonts), use a simple separator instead.
+    news_line = trf(uid, "status_news", state=news_state)
+    macro_line = trf(uid, "status_macro", icon=macro_icon, state=macro_state)
+    out_lines.append(f"{news_line}   {macro_line}")
 
     # News details when blocked
     if not _is_allow(news_stat.get("action")):
@@ -1641,7 +1645,7 @@ async def status_text(uid: int, *, include_subscribed: bool = False, include_hin
             left = _fmt_countdown(float(until_ts) - time.time())
             out_lines.append(trf(uid, "status_news_timer", left=left))
 
-    out_lines.append(trf(uid, "status_macro", icon=macro_icon, state=macro_state))
+    # (macro line is already included above)
 
     # Macro details when blocked
     if not _is_allow(macro_action):
@@ -1867,7 +1871,8 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             tr(uid, "status_title"),
             "",
             trf(uid, "status_scanner", state=scanner_state),
-            trf(uid, "status_news", state=news_state),
+            # Keep News + Macro on one line (stable across Telegram clients).
+            f"{trf(uid, 'status_news', state=news_state)}   {trf(uid, 'status_macro', icon=macro_icon, state=macro_state)}",
         ]
 
         # News details when blocked
@@ -1880,7 +1885,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 left = _fmt_countdown(float(until_ts) - time.time())
                 lines.append(trf(uid, "status_news_timer", left=left))
 
-        lines.append(trf(uid, "status_macro", icon=macro_icon, state=macro_state))
+        # (macro line is already included above)
 
         # Macro details when blocked
         if not _is_allow(macro_action):
