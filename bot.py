@@ -3321,7 +3321,52 @@ async def main() -> None:
             
                 if is_blocked is not None:
                     try:
-                        await conn.execute("UPDATE users SET is_blocked=$2 WHERE telegram_id=$1", tid, bool(is_blocked))
+                        if bool(is_blocked):
+                            # Admin blocks the bot for this user: persist block and disable auto-trade toggles.
+                            await conn.execute("UPDATE users SET is_blocked=TRUE WHERE telegram_id=$1", tid)
+                            try:
+                                await conn.execute(
+                                    """
+                                    INSERT INTO autotrade_settings(user_id, spot_enabled, futures_enabled, updated_at)
+                                    VALUES ($1, FALSE, FALSE, NOW())
+                                    ON CONFLICT (user_id) DO UPDATE
+                                      SET spot_enabled=FALSE, futures_enabled=FALSE, updated_at=NOW();
+                                    """,
+                                    tid,
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                open_cnt = await conn.fetchval(
+                                    "SELECT COUNT(1) FROM autotrade_positions WHERE user_id=$1 AND status='OPEN'",
+                                    tid,
+                                )
+                                open_cnt = int(open_cnt or 0)
+                            except Exception:
+                                open_cnt = 0
+                            if open_cnt > 0:
+                                await conn.execute(
+                                    """
+                                    UPDATE users
+                                       SET autotrade_enabled=TRUE,
+                                           autotrade_stop_after_close=TRUE
+                                     WHERE telegram_id=$1
+                                    """,
+                                    tid,
+                                )
+                            else:
+                                await conn.execute(
+                                    """
+                                    UPDATE users
+                                       SET autotrade_enabled=FALSE,
+                                           autotrade_stop_after_close=FALSE
+                                     WHERE telegram_id=$1
+                                    """,
+                                    tid,
+                                )
+                        else:
+                            # Unblock only affects bot access; auto-trade remains as configured.
+                            await conn.execute("UPDATE users SET is_blocked=FALSE WHERE telegram_id=$1", tid)
                     except Exception:
                         pass
             
@@ -3463,69 +3508,75 @@ async def main() -> None:
                         pass
             
             return web.json_response({"ok": True})
-async def block_user(request: web.Request) -> web.Response:
-    if not _check_basic(request):
-        return _unauthorized()
-    tid = int(request.match_info.get("telegram_id") or 0)
-    if not tid:
-        return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
+        async def block_user(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            tid = int(request.match_info.get("telegram_id") or 0)
+            if not tid:
+                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
 
-    await ensure_user(tid)
+            async with pool.acquire() as conn:
+                # 1) Block bot for the user (admin action)
+                await conn.execute("UPDATE users SET is_blocked=TRUE WHERE telegram_id=$1", tid)
 
-    async with pool.acquire() as conn:
-        # 1) Block user in admin sense (bot must stay blocked even if user clicks buttons)
-        await conn.execute("UPDATE users SET is_blocked=TRUE WHERE telegram_id=$1", tid)
+                # 2) Disable auto-trade toggles (so new positions cannot be opened)
+                try:
+                    await conn.execute(
+                        """
+                        INSERT INTO autotrade_settings(user_id, spot_enabled, futures_enabled, updated_at)
+                        VALUES ($1, FALSE, FALSE, NOW())
+                        ON CONFLICT (user_id) DO UPDATE
+                          SET spot_enabled=FALSE, futures_enabled=FALSE, updated_at=NOW();
+                        """,
+                        tid,
+                    )
+                except Exception:
+                    # If autotrade tables are not available for some reason, ignore.
+                    pass
 
-        # 2) Also stop auto-trade for the user:
-        #    - Disable per-market toggles immediately
-        try:
-            await conn.execute(
-                "UPDATE autotrade_settings SET spot_enabled=FALSE, futures_enabled=FALSE, updated_at=NOW() WHERE user_id=$1",
-                tid,
-            )
-        except Exception:
-            pass
+                # 3) If there are open autotrade positions, switch to STOP mode:
+                #    let the engine manage closing, but prevent new trades.
+                try:
+                    open_cnt = await conn.fetchval(
+                        "SELECT COUNT(1) FROM autotrade_positions WHERE user_id=$1 AND status='OPEN'",
+                        tid,
+                    )
+                    open_cnt = int(open_cnt or 0)
+                except Exception:
+                    open_cnt = 0
 
-        #    - Disable admin auto-trade access. If there are OPEN positions -> STOP mode.
-        open_n = 0
-        try:
-            open_n = int(await conn.fetchval(
-                "SELECT COUNT(1) FROM autotrade_positions WHERE user_id=$1 AND status='OPEN'",
-                tid,
-            ) or 0)
-        except Exception:
-            open_n = 0
+                if open_cnt > 0:
+                    await conn.execute(
+                        """
+                        UPDATE users
+                           SET autotrade_enabled=TRUE,
+                               autotrade_stop_after_close=TRUE
+                         WHERE telegram_id=$1
+                        """,
+                        tid,
+                    )
+                else:
+                    await conn.execute(
+                        """
+                        UPDATE users
+                           SET autotrade_enabled=FALSE,
+                               autotrade_stop_after_close=FALSE
+                         WHERE telegram_id=$1
+                        """,
+                        tid,
+                    )
 
-        if open_n > 0:
-            # STOP: no new positions; let manager close existing ones, then it will finalize OFF.
-            try:
-                await conn.execute(
-                    "UPDATE users SET autotrade_enabled=TRUE, autotrade_stop_after_close=TRUE WHERE telegram_id=$1",
-                    tid,
-                )
-            except Exception:
-                pass
-        else:
-            # OFF immediately
-            try:
-                await conn.execute(
-                    "UPDATE users SET autotrade_enabled=FALSE, autotrade_stop_after_close=FALSE WHERE telegram_id=$1",
-                    tid,
-                )
-            except Exception:
-                pass
+            return web.json_response({"ok": True})
 
-    return web.json_response({"ok": True})
-async def unblock_user(request: web.Request) -> web.Response:
-    if not _check_basic(request):
-        return _unauthorized()
-    tid = int(request.match_info.get("telegram_id") or 0)
-    if not tid:
-        return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-    await ensure_user(tid)
-    async with pool.acquire() as conn:
-        await conn.execute("UPDATE users SET is_blocked=FALSE WHERE telegram_id=$1", tid)
-    return web.json_response({"ok": True})
+        async def unblock_user(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            tid = int(request.match_info.get("telegram_id") or 0)
+            if not tid:
+                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
+            async with pool.acquire() as conn:
+                await conn.execute("UPDATE users SET is_blocked=FALSE WHERE telegram_id=$1", tid)
+            return web.json_response({"ok": True})
 
 
         # -------- Signal bot: messages & settings (admin) --------
