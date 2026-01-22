@@ -3638,6 +3638,7 @@ async def main() -> None:
                 "pause_autotrade": bool(at.get("pause_autotrade")),
                 "autotrade_maintenance_mode": bool(at.get("maintenance_mode")),
                 "autotrade_updated_at": _iso(at.get("updated_at")),
+                "support_username": (st.get("support_username") or SUPPORT_USERNAME),
             })
         async def signal_save_settings(request: web.Request) -> web.Response:
             if not _check_basic(request):
@@ -3647,7 +3648,11 @@ async def main() -> None:
             maintenance_mode = bool(data.get("maintenance_mode"))
             pause_autotrade = bool(data.get("pause_autotrade"))
             autotrade_maintenance_mode = bool(data.get("autotrade_maintenance_mode"))
-            await db_store.set_signal_bot_settings(pause_signals=pause_signals, maintenance_mode=maintenance_mode)
+            await db_store.set_signal_bot_settings(pause_signals=pause_signals, maintenance_mode=maintenance_mode, support_username=support_username)
+            # Apply immediately without restart
+            if support_username is not None:
+                global SUPPORT_USERNAME
+                SUPPORT_USERNAME = str(support_username).lstrip('@').strip()
             await db_store.set_autotrade_bot_settings(pause_autotrade=pause_autotrade, maintenance_mode=autotrade_maintenance_mode)
             return web.json_response({"ok": True})
 
@@ -3748,4 +3753,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
