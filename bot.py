@@ -199,14 +199,77 @@ I18N = load_i18n()
 SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', 'cryptoarb_web_bot_admin').lstrip('@')
 
 
+
 def tr(uid: int, key: str) -> str:
+    """Translate key for user's language.
+
+    Strict mode:
+      - if STRICT_I18N=1 (default), missing keys raise KeyError to force adding them to i18n.json.
+      - if STRICT_I18N=0, missing keys fall back to EN, then to the key itself (legacy behavior).
+    """
     lang = get_lang(uid)
-    tmpl = I18N.get(lang, I18N['en']).get(key, I18N['en'].get(key, key))
-    # Allow using @{support} placeholder in i18n texts, configured via SUPPORT_USERNAME env
-    if isinstance(tmpl, str) and '{support}' in tmpl:
-        return tmpl.replace('{support}', SUPPORT_USERNAME)
+    strict = os.getenv("STRICT_I18N", "1").lower() not in ("0", "false", "no", "off")
+    # prefer requested lang, then EN
+    if lang in I18N and key in I18N.get(lang, {}):
+        tmpl = I18N[lang][key]
+    elif "en" in I18N and key in I18N.get("en", {}):
+        tmpl = I18N["en"][key]
+    else:
+        if strict:
+            raise KeyError(f"i18n key not found: {key!r} (lang={lang!r}). Add it to {I18N_FILE.name}.")
+        tmpl = key
+
+    # Allow using {support} placeholder in i18n texts, configured via SUPPORT_USERNAME env
+    if isinstance(tmpl, str) and "{support}" in tmpl:
+        tmpl = tmpl.replace("{support}", SUPPORT_USERNAME)
     return tmpl
 
+
+def trf(uid: int, key: str, **kwargs) -> str:
+    """Translate + safe-format (missing placeholders stay visible)."""
+    tmpl = tr(uid, key)
+    if not kwargs:
+        return tmpl
+    try:
+        return str(tmpl).format_map(_SafeDict(**kwargs))
+    except Exception as e:
+        # In strict mode, formatting errors must be visible immediately.
+        strict = os.getenv("STRICT_I18N", "1").lower() not in ("0", "false", "no", "off")
+        if strict:
+            raise
+        logger.exception("i18n format error: key=%s kwargs=%s", key, kwargs)
+        return str(tmpl)
+
+
+def audit_i18n_keys(strict: bool | None = None) -> None:
+    """Static audit: ensure every tr()/trf() key referenced in bot.py exists in i18n.json."""
+    if strict is None:
+        strict = os.getenv("STRICT_I18N", "1").lower() not in ("0", "false", "no", "off")
+
+    try:
+        src = Path(__file__).read_text(encoding="utf-8")
+    except Exception:
+        logger.exception("i18n audit: failed to read source")
+        return
+
+    keys = set(re.findall(r"\btrf?\(\s*[^,]+,\s*['\"]([^'\"]+)['\"]\s*\)", src))
+    missing = []
+    for k in sorted(keys):
+        for lang in ("ru", "en"):
+            if k not in I18N.get(lang, {}):
+                missing.append((lang, k))
+
+    if missing:
+        # Log a compact report
+        lines = ["i18n audit: missing keys:"]
+        for lang, k in missing[:200]:
+            lines.append(f"- {lang}: {k}")
+        if len(missing) > 200:
+            lines.append(f"... and {len(missing)-200} more")
+        msg = "\n".join(lines)
+        if strict:
+            raise RuntimeError(msg)
+        logger.error(msg)
 
 
 
@@ -1500,23 +1563,26 @@ async def lang_choose(call: types.CallbackQuery) -> None:
     await safe_send(uid, await status_text(uid, include_subscribed=True, include_hint=True), reply_markup=menu_kb(uid))
 
 # ---------------- menu callbacks ----------------
-def _fmt_stats_block_ru(title: str, b: dict | None = None) -> str:
+def _fmt_stats_block_ru(uid: int, title: str, b: dict | None = None) -> str:
     b = b or {}
     trades = int(b.get("trades", 0))
     wins = int(b.get("wins", 0))
     losses = int(b.get("losses", 0))
     be = int(b.get("be", 0))
     tp1 = int(b.get("tp1_hits", 0))
-    # WinRate should be based on WIN/(WIN+LOSS). BE does not affect WinRate.
-    denom = (wins + losses)
-    wr = (wins / denom * 100.0) if denom else 0.0
-    pnl = float(b.get("sum_pnl_pct", 0.0))
+    # WinRate: WIN/(WIN+LOSS)
+    denom = max(1, wins + losses)
+    wr = (wins / denom) * 100.0
+    pnl = float(b.get("pnl_pct", 0.0))
+
     return (
         f"{title}\n"
-        f"Сделки: {trades} | Плюс: {wins} | Минус: {losses} | BE: {be} | TP1: {tp1}\n"
-        f"Процент побед: {wr:.1f}%\n"
-        f"PnL: {pnl:+.2f}%"
+        f"{tr(uid, 'lbl_trades')}: {trades} | {tr(uid, 'lbl_wins')}: {wins} | {tr(uid, 'lbl_losses')}: {losses} | "
+        f"{tr(uid, 'lbl_be')}: {be} | {tr(uid, 'lbl_tp1')}: {tp1}\n"
+        f"{tr(uid, 'lbl_winrate')}: {wr:.1f}%\n"
+        f"{tr(uid, 'lbl_pnl')}: {pnl:+.2f}%"
     )
+
 
 def _fmt_stats_block_en(title: str, b: dict | None = None) -> str:
     b = b or {}
@@ -1702,7 +1768,7 @@ async def stats_text(uid: int) -> str:
     def fmt_block(title: str, b: dict) -> str:
         if lang == "en":
             return _fmt_stats_block_en(title, b)
-        return _fmt_stats_block_ru(title, b)
+        return _fmt_stats_block_ru(uid, title, b)
 
     def fmt_lines(rows: list[dict]) -> list[str]:
         out: list[str] = []
@@ -2570,7 +2636,7 @@ def _trade_card_text(uid: int, t: dict) -> str:
 
     # Opened datetime (MSK)
     opened_at = _fmt_dt_msk(t.get('opened_at'))
-    opened_lbl = tr(uid, 'trade_opened_at') if 'trade_opened_at' in I18N.get(get_lang(uid), {}) else "Открыта"
+    opened_lbl = tr(uid, 'trade_opened_at')
     opened_line = f"🕒 {opened_lbl}: {opened_at} (MSK)"
     if opened_at and opened_at != "—":
         parts.append(opened_line)
