@@ -785,7 +785,7 @@ def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
     else:
         kb.button(text=tr(uid, "btn_notify_on"), callback_data="notify:set:on")
     kb.adjust(1)
-    kb.button(text=tr(uid, "btn_back"), callback_data="notify:back")
+    kb.button(text=tr(uid, "btn_back"), callback_data="menu:back")
     kb.adjust(1)
     return kb.as_markup()
 
