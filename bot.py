@@ -200,7 +200,7 @@ SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', 'cryptoarb_web_bot_admin').lstr
 
 
 
-def tr(uid: int, key: str) -> str:
+def tr(uid: int, key: str, **kwargs) -> str:
     """Translate key for user's language.
 
     Strict mode:
@@ -222,6 +222,11 @@ def tr(uid: int, key: str) -> str:
     # Allow using {support} placeholder in i18n texts, configured via SUPPORT_USERNAME env
     if isinstance(tmpl, str) and "{support}" in tmpl:
         tmpl = tmpl.replace("{support}", SUPPORT_USERNAME)
+    if kwargs and isinstance(tmpl, str):
+        try:
+            tmpl = tmpl.format(**kwargs)
+        except Exception:
+            pass
     return tmpl
 
 
@@ -998,14 +1003,7 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
     km = _key_status_map(keys)
     def ks(ex: str, mt: str) -> str:
         r = km.get(f"{ex}:{mt}")
-        if not r or not bool(r.get("is_active")):
-            return "❌"
-        # "✅" only when keys were validated successfully and there is no current error.
-        if r.get("last_error"):
-            return "⚠️"
-        if r.get("last_ok_at") is None:
-            return "⚠️"
-        return "✅"
+        return "✅" if (r and bool(r.get("is_active"))) else "❌"
     spot_ex = str(s.get("spot_exchange") or "binance")
     fut_ex = str(s.get("futures_exchange") or "binance")
     spot_amt = float(s.get("spot_amount_per_trade") or 0.0)
@@ -2565,14 +2563,12 @@ async def autotrade_input_handler(message: types.Message) -> None:
                             api_key_enc=api_key_enc,
                             api_secret_enc=api_secret_enc,
                             passphrase_enc=None,
-                            # Keep active, but mark as "pending" until we validate.
                             is_active=True,
-                            last_error="pending_validation",
-                        )
-
+                            last_error=None,
+                                                )
                         # Validate keys against the exchange right away (prevents "green" status for invalid keys)
                         try:
-                            v = await backend.validate_autotrade_keys(
+                            v = await validate_autotrade_keys(
                                 exchange=ex,
                                 market_type=mt,
                                 api_key=api_key,
@@ -2580,37 +2576,22 @@ async def autotrade_input_handler(message: types.Message) -> None:
                                 passphrase=None,
                             )
                         except Exception as e:
-                            # Network/temporary error: keep keys active but show warning + store the error (do not deactivate).
-                            try:
-                                await db_store.mark_autotrade_key_error(
-                                    user_id=uid,
-                                    exchange=ex,
-                                    market_type=mt,
-                                    error="network_error",
-                                    deactivate=False,
-                                )
-                            except Exception:
-                                pass
-                            await message.answer(tr(uid, "at_keys_api_error") + "\n\n" + str(e)[:200])
+                            # Network/temporary error: keep keys active but inform user
+                            await message.answer(tr(uid, "at_keys_api_error", exchange=ex, market=mt) + "\n\n" + str(e)[:200])
                         else:
                             if not bool(v.get("ok")):
                                 err = str(v.get("error") or "invalid").strip()
                                 # Deactivate on credential/permission issues
-                                try:
-                                    await db_store.mark_autotrade_key_error(
-                                        user_id=uid,
-                                        exchange=ex,
-                                        market_type=mt,
-                                        error=err,
-                                        deactivate=True,
-                                    )
-                                except Exception:
-                                    pass
+                                await db_store.mark_autotrade_key_error(
+                                    user_id=uid,
+                                    exchange=ex,
+                                    market_type=mt,
+                                    error=err,
+                                    deactivate=True,
+                                )
                                 low = err.lower()
                                 if "ip" in low and "restrict" in low:
                                     await message.answer(tr(uid, "at_keys_ip_restricted"))
-                                elif err == "trade_permission_missing":
-                                    await message.answer(tr(uid, "at_keys_trade_missing"))
                                 elif ex == "binance":
                                     await message.answer(tr(uid, "at_keys_binance_invalid"))
                                 elif ex == "bybit":
@@ -2618,15 +2599,6 @@ async def autotrade_input_handler(message: types.Message) -> None:
                                 else:
                                     await message.answer(tr(uid, "at_keys_invalid"))
                             else:
-                                # Mark as verified OK in DB (last_ok_at set, last_error cleared)
-                                try:
-                                    await db_store.mark_autotrade_key_ok(
-                                        user_id=uid,
-                                        exchange=ex,
-                                        market_type=mt,
-                                    )
-                                except Exception:
-                                    pass
                                 await message.answer(tr(uid, "at_keys_ok"))
 
                 st = await db_store.get_autotrade_settings(uid)
