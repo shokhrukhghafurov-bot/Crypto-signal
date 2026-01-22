@@ -1003,7 +1003,12 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
     km = _key_status_map(keys)
     def ks(ex: str, mt: str) -> str:
         r = km.get(f"{ex}:{mt}")
-        return "✅" if (r and bool(r.get("is_active"))) else "❌"
+        if not r or not bool(r.get("is_active")):
+            return "❌"
+        # Active key: show ✅ only if we have a successful validation timestamp and no error.
+        if r.get("last_ok_at") and not r.get("last_error"):
+            return "✅"
+        return "⚠️"
     spot_ex = str(s.get("spot_exchange") or "binance")
     fut_ex = str(s.get("futures_exchange") or "binance")
     spot_amt = float(s.get("spot_amount_per_trade") or 0.0)
