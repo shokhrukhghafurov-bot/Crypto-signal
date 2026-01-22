@@ -1070,6 +1070,32 @@ async def set_autotrade_toggle(user_id: int, market_type: str, enabled: bool) ->
         )
 
 
+async def toggle_autotrade_toggle(user_id: int, market_type: str) -> bool:
+    """Atomically toggle spot/futures enabled flag.
+
+    Prevents race conditions on rapid button presses by avoiding read-then-write in app code.
+    Returns the new value.
+    """
+    pool = get_pool()
+    uid = int(user_id)
+    m = (market_type or "").lower().strip()
+    if m not in ("spot", "futures"):
+        m = "spot"
+    col = "spot_enabled" if m == "spot" else "futures_enabled"
+    async with pool.acquire() as conn:
+        new_val = await conn.fetchval(
+            f"""
+            INSERT INTO autotrade_settings(user_id, {col}, updated_at)
+            VALUES ($1, TRUE, NOW())
+            ON CONFLICT (user_id) DO UPDATE
+              SET {col} = NOT COALESCE(autotrade_settings.{col}, FALSE),
+                  updated_at = NOW()
+            RETURNING {col};
+            """,
+            uid,
+        )
+    return bool(new_val)
+
 async def set_autotrade_exchange(user_id: int, market_type: str, exchange: str) -> None:
     pool = get_pool()
     uid = int(user_id)
@@ -1375,13 +1401,7 @@ async def upsert_autotrade_keys(
             """
             INSERT INTO autotrade_keys(user_id, exchange, market_type, api_key_enc, api_secret_enc, passphrase_enc,
                                       is_active, last_ok_at, last_error, last_error_at, updated_at)
-            -- NOTE: asyncpg cannot infer the type of a NULL parameter when it's only used in an IS NULL check.
-            -- Cast $8 to TEXT so passing last_error=None doesn't raise AmbiguousParameterError.
-            VALUES ($1,$2,$3,$4,$5,$6,$7,
-                    CASE WHEN $7 THEN NOW() ELSE NULL END,
-                    $8::TEXT,
-                    CASE WHEN $8::TEXT IS NULL THEN NULL ELSE NOW() END,
-                    NOW())
+            VALUES ($1,$2,$3,$4,$5,$6,$7, CASE WHEN $7 THEN NOW() ELSE NULL END, $8::TEXT, CASE WHEN $8::TEXT IS NULL THEN NULL ELSE NOW() END, NOW())
             ON CONFLICT (user_id, exchange, market_type)
             DO UPDATE SET api_key_enc=EXCLUDED.api_key_enc,
                           api_secret_enc=EXCLUDED.api_secret_enc,
