@@ -1629,11 +1629,21 @@ async def status_text(uid: int, *, include_subscribed: bool = False, include_hin
 
     out_lines.append("")
     out_lines.append(trf(uid, "status_scanner", state=scanner_state))
-    # Keep "News" and "Macro" on the same line. Avoid padding/alignment tricks
-    # (Telegram uses proportional fonts), use a simple separator instead.
+    # Put News and Macro on one line without space-padding.
+    # Padding with spaces is unreliable in Telegram (proportional fonts) and often
+    # causes wraps that leave the macro icon hanging on its own line.
     news_line = trf(uid, "status_news", state=news_state)
-    macro_line = trf(uid, "status_macro", icon=macro_icon, state=macro_state)
-    out_lines.append(f"{news_line}   {macro_line}")
+
+    # Build an inline macro line where the status icon goes *after* the label,
+    # so if it wraps it stays meaningful.
+    macro_base = trf(uid, "status_macro", icon="", state=macro_state).strip()
+    if ":" in macro_base:
+        left, right = macro_base.split(":", 1)
+        macro_inline = f"{left}: {macro_icon}{right}".replace("  ", " ").strip()
+    else:
+        macro_inline = f"{macro_icon} {macro_base}".strip()
+
+    out_lines.append(f"{news_line} | {macro_inline}")
 
     # News details when blocked
     if not _is_allow(news_stat.get("action")):
@@ -1867,12 +1877,19 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             hhmm = _fmt_hhmm(getattr(ev, "start_ts_utc", time.time()))
             next_macro = f"{name} {hhmm}"
 
+        # Inline macro line where the icon comes after the label (prevents ugly wraps).
+        macro_base = trf(uid, "status_macro", icon="", state=macro_state).strip()
+        if ":" in macro_base:
+            left, right = macro_base.split(":", 1)
+            macro_inline = f"{left}: {macro_icon}{right}".replace("  ", " ").strip()
+        else:
+            macro_inline = f"{macro_icon} {macro_base}".strip()
+
         lines = [
             tr(uid, "status_title"),
             "",
             trf(uid, "status_scanner", state=scanner_state),
-            # Keep News + Macro on one line (stable across Telegram clients).
-            f"{trf(uid, 'status_news', state=news_state)}   {trf(uid, 'status_macro', icon=macro_icon, state=macro_state)}",
+            f"{trf(uid, 'status_news', state=news_state)} | {macro_inline}",
         ]
 
         # News details when blocked
