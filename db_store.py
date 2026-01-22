@@ -65,6 +65,12 @@ async def ensure_schema() -> None:
         INSERT INTO signal_bot_settings(id) VALUES (1)
         ON CONFLICT (id) DO NOTHING;
         """)
+        # Ensure support_username column exists
+        await conn.execute("""
+        ALTER TABLE signal_bot_settings
+        ADD COLUMN IF NOT EXISTS support_username TEXT;
+        """)
+
         
 
 
@@ -916,7 +922,7 @@ async def get_signal_bot_settings() -> Dict[str, Any]:
     async with pool.acquire() as conn:
         try:
             row = await conn.fetchrow(
-                "SELECT pause_signals, maintenance_mode, updated_at FROM signal_bot_settings WHERE id=1"
+                "SELECT pause_signals, maintenance_mode, updated_at, support_username FROM signal_bot_settings WHERE id=1"
             )
             if not row:
                 return {"pause_signals": False, "maintenance_mode": False, "updated_at": None}
@@ -930,14 +936,14 @@ async def get_signal_bot_settings() -> Dict[str, Any]:
             return {"pause_signals": False, "maintenance_mode": False, "updated_at": None}
 
 
-async def set_signal_bot_settings(*, pause_signals: bool, maintenance_mode: bool) -> None:
+async def set_signal_bot_settings(*, pause_signals: bool, maintenance_mode: bool, support_username: str | None = None) -> None:
     """Persist signal bot settings."""
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO signal_bot_settings(id, pause_signals, maintenance_mode, updated_at)
-            VALUES (1, $1, $2, NOW())
+            INSERT INTO signal_bot_settings(id, pause_signals, maintenance_mode, support_username, updated_at)
+            VALUES (1, $1, $2, $3, NOW())
             ON CONFLICT (id)
             DO UPDATE SET pause_signals=EXCLUDED.pause_signals, maintenance_mode=EXCLUDED.maintenance_mode, updated_at=NOW();
             """,
