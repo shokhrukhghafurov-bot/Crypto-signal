@@ -1401,13 +1401,13 @@ async def upsert_autotrade_keys(
             """
             INSERT INTO autotrade_keys(user_id, exchange, market_type, api_key_enc, api_secret_enc, passphrase_enc,
                                       is_active, last_ok_at, last_error, last_error_at, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7, CASE WHEN $7 AND $8::TEXT IS NULL THEN NOW() ELSE NULL END, $8::TEXT, CASE WHEN $8::TEXT IS NULL THEN NULL ELSE NOW() END, NOW())
+            VALUES ($1,$2,$3,$4,$5,$6,$7, CASE WHEN $7 THEN NOW() ELSE NULL END, $8::TEXT, CASE WHEN $8::TEXT IS NULL THEN NULL ELSE NOW() END, NOW())
             ON CONFLICT (user_id, exchange, market_type)
             DO UPDATE SET api_key_enc=EXCLUDED.api_key_enc,
                           api_secret_enc=EXCLUDED.api_secret_enc,
                           passphrase_enc=EXCLUDED.passphrase_enc,
                           is_active=EXCLUDED.is_active,
-                          last_ok_at=CASE WHEN EXCLUDED.is_active AND EXCLUDED.last_error IS NULL THEN NOW() ELSE autotrade_keys.last_ok_at END,
+                          last_ok_at=EXCLUDED.last_ok_at,
                           last_error=EXCLUDED.last_error,
                           last_error_at=EXCLUDED.last_error_at,
                           updated_at=NOW();
@@ -1464,41 +1464,6 @@ async def mark_autotrade_key_error(
                 mt,
                 (error or "API error")[:500],
             )
-
-async def mark_autotrade_key_ok(
-    *,
-    user_id: int,
-    exchange: str,
-    market_type: str,
-) -> None:
-    """Mark stored keys as verified/working.
-
-    Sets last_ok_at=NOW(), clears last_error/last_error_at, keeps is_active=TRUE.
-    """
-    pool = get_pool()
-    uid = int(user_id)
-    ex = (exchange or "binance").lower().strip()
-    mt = (market_type or "spot").lower().strip()
-    if ex not in ("binance", "bybit"):
-        ex = "binance"
-    if mt not in ("spot", "futures"):
-        mt = "spot"
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO autotrade_keys(user_id, exchange, market_type, is_active, last_ok_at, last_error, last_error_at, updated_at)
-            VALUES ($1,$2,$3,TRUE,NOW(),NULL,NULL,NOW())
-            ON CONFLICT (user_id, exchange, market_type)
-            DO UPDATE SET is_active=TRUE,
-                          last_ok_at=NOW(),
-                          last_error=NULL,
-                          last_error_at=NULL,
-                          updated_at=NOW();
-            """,
-            uid,
-            ex,
-            mt,
-        )
 
 async def get_autotrade_used_usdt(user_id: int, market_type: str) -> float:
     pool = get_pool()
