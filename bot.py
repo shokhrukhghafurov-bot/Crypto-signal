@@ -546,29 +546,7 @@ def _fmt_perf(uid: int, b: dict) -> str:
     )
 
 async def _build_status_text(uid: int = 0) -> str:
-    next_macro = backend.get_next_macro()
-    macro_action = (backend.last_macro_action or "ALLOW").upper()
-    macro_prefix = "🟢" if macro_action == "ALLOW" else "🔴"
-
-    macro_line = tr(uid, "next_macro").format(v=tr(uid, "lbl_none"))
-    if next_macro:
-        ev, (w0, w1) = next_macro
-        secs = max(0, w0 - time.time())
-        macro_line = f"🟡 {ev}: {_fmt_hhmm(w0)}–{_fmt_hhmm(w1)} | {tr(uid, 'lbl_in')} {_fmt_countdown(secs)}"
-
-    scan_line = tr(uid, "scanner_run")
-    news_line = tr(uid, "news_action").format(v=tr_action(uid, backend.last_news_action))
-    macro_line2 = tr(uid, "macro_action").format(v=tr_action(uid, macro_action))
-
-    enabled = True
-    try:
-        enabled = await get_notify_signals(uid) if uid else True
-    except Exception:
-        enabled = True
-    state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
-    notif_line = tr(uid, "status_notify").format(v=state)
-
-    return "\n".join([scan_line, news_line, f"{macro_prefix} {macro_line2}", macro_line, notif_line])
+    return await status_text(uid, include_subscribed=False, include_hint=False)
 
 async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: int = 120, interval: int = 5) -> None:
     # Refresh countdown + macro status for a short window to avoid spam/rate limits
@@ -1629,21 +1607,12 @@ async def status_text(uid: int, *, include_subscribed: bool = False, include_hin
 
     out_lines.append("")
     out_lines.append(trf(uid, "status_scanner", state=scanner_state))
-    # Put News and Macro on one line without space-padding.
-    # Padding with spaces is unreliable in Telegram (proportional fonts) and often
-    # causes wraps that leave the macro icon hanging on its own line.
-    news_line = trf(uid, "status_news", state=news_state)
 
-    # Build an inline macro line where the status icon goes *after* the label,
-    # so if it wraps it stays meaningful.
-    macro_base = trf(uid, "status_macro", icon="", state=macro_state).strip()
-    if ":" in macro_base:
-        left, right = macro_base.split(":", 1)
-        macro_inline = f"{left}: {macro_icon}{right}".replace("  ", " ").strip()
-    else:
-        macro_inline = f"{macro_icon} {macro_base}".strip()
-
-    out_lines.append(f"{news_line} | {macro_inline}")
+    # News and Macro each on its own line. No space-padding: Telegram uses proportional fonts,
+    # and "alignment with spaces" will always drift between clients.
+    news_icon = "🟢" if _is_allow(news_stat.get("action")) else "🔴"
+    out_lines.append(f"{trf(uid, 'status_news', state=news_state)}{news_icon}")
+    out_lines.append(f"{trf(uid, 'status_macro', state=macro_state)} {macro_icon}")
 
     # News details when blocked
     if not _is_allow(news_stat.get("action")):
@@ -1830,122 +1799,12 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         await ensure_user(uid)
         # NOTE: do not auto-unblock user on status view
 
-        # Notifications toggle state (per user)
-        enabled = None
-        try:
-            import asyncio as _asyncio
-            enabled = await _asyncio.wait_for(get_notify_signals(uid), timeout=2.5)
-        except Exception:
-            enabled = None
-
-        # Global states
-        try:
-            scanner_on = bool(getattr(backend, "scanner_running", True))
-        except Exception:
-            scanner_on = True
-
-        # News / Macro status with reason + timer
-        try:
-            news_stat = backend.get_news_status()
-        except Exception:
-            news_stat = {"action": "ALLOW", "reason": None, "until_ts": None}
-
-        try:
-            macro_stat = backend.get_macro_status()
-        except Exception:
-            macro_stat = {"action": "ALLOW", "reason": None, "until_ts": None, "event": None, "window": None}
-
-        def _is_allow(action: str) -> bool:
-            return (action or "").upper() == "ALLOW"
-
-        scanner_state = tr(uid, "status_scanner_on") if scanner_on else tr(uid, "status_scanner_off")
-        news_state = tr(uid, "status_allow") if _is_allow(news_stat.get("action")) else tr(uid, "status_block")
-        macro_action = (macro_stat.get("action") or "ALLOW").upper()
-        macro_state = tr(uid, "status_allow") if _is_allow(macro_action) else tr(uid, "status_block")
-        macro_icon = "🟢" if _is_allow(macro_action) else "🔴"
-        notif_state = tr(uid, "status_notif_on") if enabled is True else (tr(uid, "status_notif_off") if enabled is False else tr(uid, "status_unknown"))
-
-        # Next macro (if known)
-        next_macro = tr(uid, "status_next_macro_none")
-        try:
-            nm = backend.get_next_macro()
-        except Exception:
-            nm = None
-        if nm:
-            ev, (w0, w1) = nm
-            name = getattr(ev, "name", None) or getattr(ev, "type", None) or "-"
-            hhmm = _fmt_hhmm(getattr(ev, "start_ts_utc", time.time()))
-            next_macro = f"{name} {hhmm}"
-
-        # Inline macro line where the icon comes after the label (prevents ugly wraps).
-        macro_base = trf(uid, "status_macro", icon="", state=macro_state).strip()
-        if ":" in macro_base:
-            left, right = macro_base.split(":", 1)
-            macro_inline = f"{left}: {macro_icon}{right}".replace("  ", " ").strip()
-        else:
-            macro_inline = f"{macro_icon} {macro_base}".strip()
-
-        lines = [
-            tr(uid, "status_title"),
-            "",
-            trf(uid, "status_scanner", state=scanner_state),
-            f"{trf(uid, 'status_news', state=news_state)} | {macro_inline}",
-        ]
-
-        # News details when blocked
-        if not _is_allow(news_stat.get("action")):
-            reason = news_stat.get("reason")
-            if reason:
-                lines.append(trf(uid, "status_news_reason", reason=reason))
-            until_ts = news_stat.get("until_ts")
-            if until_ts:
-                left = _fmt_countdown(float(until_ts) - time.time())
-                lines.append(trf(uid, "status_news_timer", left=left))
-
-        # (macro line is already included above)
-
-        # Macro details when blocked
-        if not _is_allow(macro_action):
-            reason = macro_stat.get("reason")
-            if reason:
-                lines.append(trf(uid, "status_macro_reason", reason=reason))
-            win = macro_stat.get("window")
-            if win and isinstance(win, (tuple, list)) and len(win) == 2:
-                w0, w1 = float(win[0]), float(win[1])
-                lines.append(trf(uid, "status_macro_window", before=_fmt_hhmm(w0), after=_fmt_hhmm(w1)))
-            until_ts = macro_stat.get("until_ts")
-            if until_ts:
-                left = _fmt_countdown(float(until_ts) - time.time())
-                lines.append(trf(uid, "status_macro_timer", left=left))
-            # Timer to end of blackout window (more explicit)
-            if not until_ts and win and isinstance(win, (tuple, list)) and len(win) == 2:
-                until_ts = float(win[1])
-            if until_ts:
-                left_end = _fmt_countdown(float(until_ts) - time.time())
-                lines.append(trf(uid, "status_macro_blackout_timer", left=left_end))
-
-        lines.append(trf(uid, "status_next_macro", value=(next_macro or tr(uid, "lbl_none"))))
-
-        # Signal bot global state (pause / maintenance) from admin dashboard
-        try:
-            sb = await db_store.get_signal_bot_settings()
-            if bool(sb.get('maintenance_mode')):
-                sig_state = tr(uid, 'sig_state_maintenance')
-            elif bool(sb.get('pause_signals')):
-                sig_state = tr(uid, 'sig_state_paused')
-            else:
-                sig_state = tr(uid, 'sig_state_on')
-            lines.append(trf(uid, 'status_signals', state=sig_state))
-        except Exception:
-            pass
-
-        lines.append(trf(uid, "status_notifications", state=notif_state))
-
-        txt = "\n".join(lines)
+        txt = await status_text(uid, include_subscribed=False, include_hint=False)
         await safe_edit(call.message, txt, menu_kb(uid))
         return
 
-# ---- STATS ----
+
+    # ---- STATS ----
     if action == "stats":
         t = STATUS_TASKS.pop(uid, None)
         if t:
