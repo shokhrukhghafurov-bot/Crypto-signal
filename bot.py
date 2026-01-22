@@ -1484,8 +1484,6 @@ async def start(message: types.Message) -> None:
     uid = message.from_user.id if message.from_user else 0
     if uid:
         await ensure_user(uid)
-        await set_user_blocked(uid, blocked=False)
-
     # If language not chosen yet, ask first
     if uid and uid not in LANG:
         kb = InlineKeyboardBuilder()
@@ -1693,8 +1691,6 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 pass
 
         await ensure_user(uid)
-        await set_user_blocked(uid, blocked=False)
-
         # Notifications toggle state (per user)
         enabled = None
         try:
@@ -1859,7 +1855,6 @@ async def menu_handler(call: types.CallbackQuery) -> None:
     if action == "notify":
         if uid:
             await ensure_user(uid)
-            await set_user_blocked(uid, blocked=False)
             enabled = await get_notify_signals(uid)
             state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
             desc = tr(uid, "notify_desc_on") if enabled else tr(uid, "notify_desc_off")
@@ -1931,7 +1926,6 @@ async def notify_handler(call: types.CallbackQuery) -> None:
         # Explicit ON/OFF
         value = (parts[2] if len(parts) > 2 else "").lower()
         await ensure_user(uid)
-        await set_user_blocked(uid, blocked=False)
         if value == "on":
             enabled = await set_notify_signals(uid, True)
         elif value == "off":
@@ -3469,25 +3463,69 @@ async def main() -> None:
                         pass
             
             return web.json_response({"ok": True})
-        async def block_user(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            tid = int(request.match_info.get("telegram_id") or 0)
-            if not tid:
-                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-            async with pool.acquire() as conn:
-                await conn.execute("UPDATE users SET is_blocked=TRUE WHERE telegram_id=$1", tid)
-            return web.json_response({"ok": True})
+async def block_user(request: web.Request) -> web.Response:
+    if not _check_basic(request):
+        return _unauthorized()
+    tid = int(request.match_info.get("telegram_id") or 0)
+    if not tid:
+        return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
 
-        async def unblock_user(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            tid = int(request.match_info.get("telegram_id") or 0)
-            if not tid:
-                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-            async with pool.acquire() as conn:
-                await conn.execute("UPDATE users SET is_blocked=FALSE WHERE telegram_id=$1", tid)
-            return web.json_response({"ok": True})
+    await ensure_user(tid)
+
+    async with pool.acquire() as conn:
+        # 1) Block user in admin sense (bot must stay blocked even if user clicks buttons)
+        await conn.execute("UPDATE users SET is_blocked=TRUE WHERE telegram_id=$1", tid)
+
+        # 2) Also stop auto-trade for the user:
+        #    - Disable per-market toggles immediately
+        try:
+            await conn.execute(
+                "UPDATE autotrade_settings SET spot_enabled=FALSE, futures_enabled=FALSE, updated_at=NOW() WHERE user_id=$1",
+                tid,
+            )
+        except Exception:
+            pass
+
+        #    - Disable admin auto-trade access. If there are OPEN positions -> STOP mode.
+        open_n = 0
+        try:
+            open_n = int(await conn.fetchval(
+                "SELECT COUNT(1) FROM autotrade_positions WHERE user_id=$1 AND status='OPEN'",
+                tid,
+            ) or 0)
+        except Exception:
+            open_n = 0
+
+        if open_n > 0:
+            # STOP: no new positions; let manager close existing ones, then it will finalize OFF.
+            try:
+                await conn.execute(
+                    "UPDATE users SET autotrade_enabled=TRUE, autotrade_stop_after_close=TRUE WHERE telegram_id=$1",
+                    tid,
+                )
+            except Exception:
+                pass
+        else:
+            # OFF immediately
+            try:
+                await conn.execute(
+                    "UPDATE users SET autotrade_enabled=FALSE, autotrade_stop_after_close=FALSE WHERE telegram_id=$1",
+                    tid,
+                )
+            except Exception:
+                pass
+
+    return web.json_response({"ok": True})
+async def unblock_user(request: web.Request) -> web.Response:
+    if not _check_basic(request):
+        return _unauthorized()
+    tid = int(request.match_info.get("telegram_id") or 0)
+    if not tid:
+        return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
+    await ensure_user(tid)
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE users SET is_blocked=FALSE WHERE telegram_id=$1", tid)
+    return web.json_response({"ok": True})
 
 
         # -------- Signal bot: messages & settings (admin) --------
