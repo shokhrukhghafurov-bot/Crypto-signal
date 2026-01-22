@@ -237,10 +237,29 @@ async def validate_autotrade_keys(
                         api_secret=api_secret,
                         params={"recvWindow": "5000"},
                     )
-                    can_trade = acc.get("canTrade")
-                    if can_trade is not None and not bool(can_trade):
-                        return {"ok": False, "read_ok": True, "trade_ok": False, "error": "trade_permission_missing"}
-                    # READ ok; if canTrade absent, treat as ok and rely on runtime errors.
+
+                    # READ is OK if we can call a signed account endpoint.
+                    # TRADE permission must be inferred from the response. For Binance, `/api/v3/account`
+                    # includes `permissions` describing what this API key is allowed to do.
+                    perms = acc.get("permissions")
+                    perms_set = set()
+                    if isinstance(perms, (list, tuple)):
+                        perms_set = {str(x).upper() for x in perms}
+                    elif isinstance(perms, str):
+                        # Some clients may return a comma-separated string.
+                        perms_set = {p.strip().upper() for p in perms.split(",") if p.strip()}
+
+                    # Spot trading requires SPOT (or MARGIN) permission. If we can't see permissions,
+                    # fall back to `canTrade` (less strict, but better than blocking all keys).
+                    if perms_set:
+                        trade_ok = ("SPOT" in perms_set) or ("MARGIN" in perms_set) or ("TRADE" in perms_set)
+                    else:
+                        can_trade = acc.get("canTrade")
+                        trade_ok = True if (can_trade is None) else bool(can_trade)
+
+                    if not trade_ok:
+                        return {"ok": True, "read_ok": True, "trade_ok": False, "error": "trade_permission_missing"}
+
                     return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
 
                 acc = await _binance_signed_request(
@@ -254,7 +273,7 @@ async def validate_autotrade_keys(
                 )
                 can_trade = acc.get("canTrade")
                 if can_trade is not None and not bool(can_trade):
-                    return {"ok": False, "read_ok": True, "trade_ok": False, "error": "trade_permission_missing"}
+                    return {"ok": True, "read_ok": True, "trade_ok": False, "error": "trade_permission_missing"}
                 return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
 
             # Bybit: query key info (best-effort)
