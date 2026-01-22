@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -6,6 +7,7 @@ import logging
 import re
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -13,14 +15,20 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import datetime as dt
+
 import asyncpg
 from aiohttp import web
+
 import db_store
+
 from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop
+
 load_dotenv()
+
 # --- time parsing helpers ---
 def _parse_iso_dt(v):
     """Parse ISO datetime string to tz-aware datetime (UTC).
+
     Accepts values like "2026-02-15T20:55:00.000Z" or with offset.
     Returns dt.datetime or None.
     """
@@ -40,6 +48,7 @@ def _parse_iso_dt(v):
             return None
         return d if d.tzinfo is not None else d.replace(tzinfo=dt.timezone.utc)
     return None
+
 # ---- logging to stdout (Railway Deploy Logs) ----
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -47,8 +56,10 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("bot")
+
 # --- i18n template safety guard (prevents leaking {placeholders} to users) ---
 _UNFILLED_RE = re.compile(r'(?<!\{)\{[a-zA-Z0-9_]+\}(?!\})')
+
 def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
     """Guard against unfilled {placeholders} leaking to users."""
     if not text:
@@ -60,6 +71,7 @@ def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
         text = re.sub(r"[ \t]{2,}", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
+
 async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
     # Never recurse. Send via bot API.
@@ -74,16 +86,23 @@ async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
             # Chat does not exist / user never started the bot
             await set_user_blocked(chat_id, blocked=True)
         raise
+
 async def safe_edit_text(chat_id: int, message_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
     return await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, **kwargs)
+
+
 # -----------------------------------------------
+
+
 def _must_env(name: str) -> str:
     v = os.getenv(name, "").strip()
     if not v:
         raise RuntimeError(f"{name} is missing. Put it into Railway Variables or .env.")
     return v
+
 BOT_TOKEN = _must_env("BOT_TOKEN")
+
 ADMIN_IDS: List[int] = []
 _raw_admins = os.getenv("ADMIN_IDS", "").strip()
 if _raw_admins:
@@ -91,13 +110,16 @@ if _raw_admins:
         part = part.strip()
         if part:
             ADMIN_IDS.append(int(part))
+
 def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
 # Timezone
 # NOTE: "MSK" is a common shorthand, but it's not a valid IANA tz database key.
 # Use "Europe/Moscow" (MSK / UTC+3) instead.
 # Default to Moscow time for the bot (can be overridden via TZ_NAME env).
 _tz_raw = (os.getenv("TZ_NAME", "Europe/Moscow") or "").strip()
+
 _TZ_ALIASES = {
     "MSK": "Europe/Moscow",
     "MOSCOW": "Europe/Moscow",
@@ -106,6 +128,7 @@ _TZ_ALIASES = {
     "UTC+3": "Europe/Moscow",
     "GMT+3": "Europe/Moscow",
 }
+
 TZ_NAME = _TZ_ALIASES.get(_tz_raw.upper(), _tz_raw) or "Europe/Moscow"
 try:
     TZ = ZoneInfo(TZ_NAME)
@@ -118,15 +141,20 @@ except (ZoneInfoNotFoundError, FileNotFoundError):
     except Exception:
         TZ_NAME = "UTC"
         TZ = ZoneInfo("UTC")
+
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 backend = Backend()
+
 # Keep last broadcast signals for 'Spot live' / 'Futures live' buttons
 LAST_SIGNAL_BY_MARKET = {"SPOT": None, "FUTURES": None}
+
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 pool: asyncpg.Pool | None = None
+
 LANG_FILE = Path("langs.json")
 LANG: Dict[int, str] = {}  # user_id -> "ru" | "en"
+
 def load_langs() -> None:
     global LANG
     if LANG_FILE.exists():
@@ -136,18 +164,24 @@ def load_langs() -> None:
                 LANG = {int(k): str(v) for k, v in data.items()}
         except Exception:
             LANG = {}
+
 def save_langs() -> None:
     try:
         LANG_FILE.write_text(json.dumps({str(k): v for k, v in LANG.items()}, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     except Exception:
         pass
+
 def get_lang(uid: int) -> str:
     v = (LANG.get(uid) or "").lower().strip()
     return "en" if v == "en" else "ru"
+
 def set_lang(uid: int, lang: str) -> None:
     LANG[uid] = "en" if (lang or "").lower().startswith("en") else "ru"
     save_langs()
+
+
 I18N_FILE = Path(__file__).with_name("i18n.json")
+
 def load_i18n() -> dict:
     # Load i18n from external file (preferred). Fall back to embedded defaults if needed.
     try:
@@ -158,9 +192,13 @@ def load_i18n() -> dict:
     except Exception:
         pass
     return {"ru": {}, "en": {}}
+
 I18N = load_i18n()
+
 # Support username (without @) is configurable via env
 SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', 'cryptoarb_web_bot_admin').lstrip('@')
+
+
 def tr(uid: int, key: str) -> str:
     lang = get_lang(uid)
     tmpl = I18N.get(lang, I18N['en']).get(key, I18N['en'].get(key, key))
@@ -168,9 +206,14 @@ def tr(uid: int, key: str) -> str:
     if isinstance(tmpl, str) and '{support}' in tmpl:
         return tmpl.replace('{support}', SUPPORT_USERNAME)
     return tmpl
+
+
+
+
 class _SafeDict(dict):
     def __missing__(self, key):
         return "{" + key + "}"
+
 def trf(uid: int, key: str, **kwargs) -> str:
     # Inject support placeholder for templates using @{support}
     kwargs.setdefault('support', SUPPORT_USERNAME)
@@ -179,6 +222,7 @@ def trf(uid: int, key: str, **kwargs) -> str:
         return str(tmpl).format_map(_SafeDict(**kwargs))
     except Exception:
         return str(tmpl)
+
 def tr_action(uid: int, v: str) -> str:
     vv = (v or "").upper().strip()
     if vv == "ALLOW":
@@ -186,19 +230,25 @@ def tr_action(uid: int, v: str) -> str:
     if vv in {"PAUSE", "PAUSED", "STOP", "BLOCK"}:
         return tr(uid, "action_pause")
     return v
+
 def tr_market(uid: int, market: str) -> str:
     return tr(uid, "lbl_spot") if (market or "").upper().strip() == "SPOT" else tr(uid, "lbl_futures")
+
 SIGNALS: Dict[int, Signal] = {}
 ORIGINAL_SIGNAL_TEXT: Dict[tuple[int,int], str] = {}  # (uid, signal_id) -> text
+
 # Anti-duplicate protection for broadcasted signals.
 # Some scanners can emit the same signal multiple times (sometimes with different IDs).
 _SENT_SIG_CACHE: Dict[str, float] = {}  # signature -> last_sent_ts
 _SENT_SIG_TTL_SEC = int(os.getenv("SENT_SIG_TTL_SEC", "600"))  # default 10 minutes
+
 # ---------------- signal stats (daily/weekly) ----------------
 STATS_FILE = Path("signal_stats.json")
 SIGNAL_STATS: Dict[str, Dict[str, int]] = {"days": {}, "weeks": {}}
+
 # Trade stats file (written by backend.py). We expose READ-ONLY aggregates via admin HTTP.
 TRADE_STATS_FILE = Path("trade_stats.json")
+
 def load_signal_stats() -> None:
     global SIGNAL_STATS
     if STATS_FILE.exists():
@@ -214,16 +264,20 @@ def load_signal_stats() -> None:
                     }
         except Exception:
             SIGNAL_STATS = {"days": {}, "weeks": {}}
+
 def save_signal_stats() -> None:
     try:
         STATS_FILE.write_text(json.dumps(SIGNAL_STATS, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     except Exception:
         pass
+
 def _day_key(d: dt.date) -> str:
     return d.isoformat()
+
 def _week_key(d: dt.date) -> str:
     y, w, _ = d.isocalendar()
     return f"{y}-W{int(w):02d}"
+
 def bump_signal_stats() -> None:
     # Counts are global (for all users) and respect TZ_NAME
     now = dt.datetime.now(TZ)
@@ -232,12 +286,15 @@ def bump_signal_stats() -> None:
     SIGNAL_STATS["days"][dk] = int(SIGNAL_STATS["days"].get(dk, 0)) + 1
     SIGNAL_STATS["weeks"][wk] = int(SIGNAL_STATS["weeks"].get(wk, 0)) + 1
     save_signal_stats()
+
 def _signals_today() -> int:
     dk = _day_key(dt.datetime.now(TZ).date())
     return int(SIGNAL_STATS["days"].get(dk, 0))
+
 def _signals_this_week() -> int:
     wk = _week_key(dt.datetime.now(TZ).date())
     return int(SIGNAL_STATS["weeks"].get(wk, 0))
+
 def _signals_this_month() -> int:
     """Return number of signals sent in current month (based on SIGNAL_STATS['days'])."""
     today = dt.datetime.now(TZ).date()
@@ -250,6 +307,7 @@ def _signals_this_month() -> int:
             except Exception:
                 pass
     return int(total)
+
 def _safe_load_json(path: Path) -> dict:
     try:
         if path.exists():
@@ -259,6 +317,7 @@ def _safe_load_json(path: Path) -> dict:
     except Exception:
         pass
     return {}
+
 def _sum_trade_buckets(days_map: dict, keys: list[str]) -> dict:
     """Sum trade buckets (wins/losses/be/trades/tp1_hits/sum_pnl_pct) across given day keys."""
     out = {"trades": 0, "wins": 0, "losses": 0, "be": 0, "tp1_hits": 0, "sum_pnl_pct": 0.0}
@@ -274,6 +333,7 @@ def _sum_trade_buckets(days_map: dict, keys: list[str]) -> dict:
         except Exception:
             continue
     return out
+
 def _trade_stats_agg() -> dict:
     """Aggregate trade stats by market for day/week/month. Read-only."""
     store = _safe_load_json(TRADE_STATS_FILE)
@@ -281,12 +341,14 @@ def _trade_stats_agg() -> dict:
     dayk = _day_key(today)
     weekk = _week_key(today)
     prefix = f"{today.year:04d}-{today.month:02d}-"
+
     out: dict[str, dict] = {}
     for mk in ("spot", "futures"):
         mroot = store.get(mk) if isinstance(store, dict) else None
         mroot = mroot if isinstance(mroot, dict) else {"days": {}, "weeks": {}}
         days = mroot.get("days") if isinstance(mroot.get("days"), dict) else {}
         weeks = mroot.get("weeks") if isinstance(mroot.get("weeks"), dict) else {}
+
         # day
         day_b = days.get(dayk) if isinstance(days.get(dayk), dict) else {"trades": 0, "wins": 0, "losses": 0, "be": 0, "tp1_hits": 0, "sum_pnl_pct": 0.0}
         # week
@@ -294,12 +356,14 @@ def _trade_stats_agg() -> dict:
         # month = sum days in current month
         month_keys = [k for k in days.keys() if isinstance(k, str) and k.startswith(prefix)]
         month_b = _sum_trade_buckets(days, month_keys)
+
         out[mk] = {
             "day": day_b,
             "week": week_b,
             "month": month_b,
         }
     return out
+
 def _daily_report_lines(days: int = 7) -> list[str]:
     today = dt.datetime.now(TZ).date()
     out: list[str] = []
@@ -309,6 +373,7 @@ def _daily_report_lines(days: int = 7) -> list[str]:
         cnt = int(SIGNAL_STATS["days"].get(k, 0))
         out.append(f"{k}: {cnt}")
     return out
+
 def _weekly_report_lines(weeks: int = 4) -> list[str]:
     today = dt.datetime.now(TZ).date()
     # go back (weeks-1) weeks and build iso week keys
@@ -323,24 +388,32 @@ def _weekly_report_lines(weeks: int = 4) -> list[str]:
         cnt = int(SIGNAL_STATS["weeks"].get(k, 0))
         out.append(f"{k}: {cnt}")
     return out
+
 # Status auto-refresh (per user)
 STATUS_TASKS: Dict[int, asyncio.Task] = {}
+
 CURRENT_VIEW: dict[int, str] = {}
+
 def _nav_enter(user_id: int, view: str) -> None:
     prev = CURRENT_VIEW.get(user_id)
     if view != "back":
         if prev and prev != view:
             PREV_VIEW[user_id] = prev
         CURRENT_VIEW[user_id] = view
+
 def _nav_back(user_id: int, default: str = "status") -> str:
     return PREV_VIEW.get(user_id) or default
+
 PREV_VIEW: dict[int, str] = {}
+
+
 async def safe_edit_markup(chat_id: int, message_id: int, reply_markup, *, ctx: str = ""):
     """Edit message reply_markup only (e.g., remove inline keyboard)."""
     try:
         return await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
     except Exception:
         return None
+
 async def _send_long(chat_id: int, text: str, reply_markup=None) -> None:
     # Telegram message limit ~4096 chars. Send in chunks if needed.
     max_len = 3800
@@ -356,6 +429,9 @@ async def _send_long(chat_id: int, text: str, reply_markup=None) -> None:
         cur += line
     if cur:
         parts.append(cur)
+
+
+
 async def safe_edit(message: types.Message | None, txt: str, kb: types.InlineKeyboardMarkup) -> None:
     """Edit message text if possible; otherwise send a new message."""
     try:
@@ -370,11 +446,14 @@ async def safe_edit(message: types.Message | None, txt: str, kb: types.InlineKey
     except Exception:
         # message may be too old/not modified/etc. Fall back to send.
         pass
+
     try:
         if message:
             await safe_send(message.chat.id, txt, reply_markup=kb)
     except Exception:
         pass
+
+
 async def _render_in_place(call: types.CallbackQuery, txt: str, kb: types.InlineKeyboardMarkup) -> types.Message:
     """Prefer editing the message that contains the pressed button."""
     try:
@@ -384,17 +463,24 @@ async def _render_in_place(call: types.CallbackQuery, txt: str, kb: types.Inline
     except Exception:
         pass
     return await safe_send(call.from_user.id, txt, reply_markup=kb)
+
+
 async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKeyboardMarkup | None = None) -> None:
     """Safely update an existing bot message.
+
     Telegram has a 4096 char limit for message text. This helper:
     - tries to edit the existing message (best UX)
     - if edit fails (or text is too long), sends new message(s)
+
     IMPORTANT: never raise from here; menu callbacks must not crash the bot.
     """
+
     if not message:
         return
+
     chat_id = message.chat.id
     msg_id = message.message_id
+
     def _split_text(s: str, limit: int = 3900) -> list[str]:
         s = s or ""
         if len(s) <= limit:
@@ -414,7 +500,9 @@ async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKe
         if buf:
             out.append("".join(buf).rstrip("\n"))
         return out
+
     parts = _split_text(text)
+
     # Try to edit with the first chunk
     try:
         await bot.edit_message_text(
@@ -429,6 +517,7 @@ async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKe
             await safe_send(chat_id, parts[0], reply_markup=kb if len(parts) == 1 else None)
         except Exception:
             logger.exception("safe_edit: failed to edit/send first chunk")
+
     # Send remaining chunks (if any)
     if len(parts) > 1:
         for i, part in enumerate(parts[1:], start=1):
@@ -436,6 +525,7 @@ async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKe
                 await safe_send(chat_id, part, reply_markup=kb if i == len(parts) - 1 else None)
             except Exception:
                 logger.exception("safe_edit: failed to send chunk %s/%s", i + 1, len(parts))
+
 def _fmt_perf(uid: int, b: dict) -> str:
     trades = int(b.get("trades", 0))
     wins = int(b.get("wins", 0))
@@ -444,6 +534,7 @@ def _fmt_perf(uid: int, b: dict) -> str:
     tp1 = int(b.get("tp1_hits", 0))
     pnl = float(b.get("sum_pnl_pct", 0.0))
     wr = (wins / trades * 100.0) if trades else 0.0
+
     return (
         f"{tr(uid, 'lbl_trades')}: {trades} | "
         f"{tr(uid, 'lbl_wins')}: {wins} | "
@@ -453,18 +544,22 @@ def _fmt_perf(uid: int, b: dict) -> str:
         f"{tr(uid, 'lbl_winrate')}: {wr:.1f}%\n"
         f"{tr(uid, 'lbl_pnl')}: {pnl:+.2f}%"
     )
+
 async def _build_status_text(uid: int = 0) -> str:
     next_macro = backend.get_next_macro()
     macro_action = (backend.last_macro_action or "ALLOW").upper()
     macro_prefix = "🟢" if macro_action == "ALLOW" else "🔴"
+
     macro_line = tr(uid, "next_macro").format(v=tr(uid, "lbl_none"))
     if next_macro:
         ev, (w0, w1) = next_macro
         secs = max(0, w0 - time.time())
         macro_line = f"🟡 {ev}: {_fmt_hhmm(w0)}–{_fmt_hhmm(w1)} | {tr(uid, 'lbl_in')} {_fmt_countdown(secs)}"
+
     scan_line = tr(uid, "scanner_run")
     news_line = tr(uid, "news_action").format(v=tr_action(uid, backend.last_news_action))
     macro_line2 = tr(uid, "macro_action").format(v=tr_action(uid, macro_action))
+
     enabled = True
     try:
         enabled = await get_notify_signals(uid) if uid else True
@@ -472,35 +567,9 @@ async def _build_status_text(uid: int = 0) -> str:
         enabled = True
     state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
     notif_line = tr(uid, "status_notify").format(v=state)
-    sep = "━━━━━━━━━━━━"
-    # Signals subscription status (access control)
-    access = "ok"
-    try:
-        access = await get_access_status(uid) if uid else "ok"
-    except Exception:
-        access = "ok"
-    sig_state = tr(uid, "signals_status_on") if access == "ok" else tr(uid, "signals_status_off")
-    signals_line = tr(uid, "status_signals").format(v=sig_state)
-    return "\n".join([
-        scan_line,
-        news_line,
-        f"{macro_prefix} {macro_line2}",
-        macro_line,
-        sep,
-        signals_line,
-        notif_line,
-    ])
-async def _build_welcome_text(uid: int = 0) -> str:
-    # Combine welcome header + live status summary in one neat message
-    try:
-        status = await _build_status_text(uid)
-    except Exception:
-        status = ""
-    parts = [tr(uid, "welcome")]
-    if status:
-        parts.append(status)
-    parts.append(tr(uid, "welcome_hint"))
-    return "\n\n".join(parts)
+
+    return "\n".join([scan_line, news_line, f"{macro_prefix} {macro_line2}", macro_line, notif_line])
+
 async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: int = 120, interval: int = 5) -> None:
     # Refresh countdown + macro status for a short window to avoid spam/rate limits
     end = time.time() + max(10, seconds)
@@ -515,7 +584,10 @@ async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: 
             last_txt = txt
         except Exception:
             return
+
+
 # ---------------- DB helpers ----------------
+
 async def init_db() -> None:
     """Init Postgres pool and ensure required columns exist."""
     global pool
@@ -529,6 +601,7 @@ async def init_db() -> None:
     await db_store.ensure_schema()
     # Users table migrations (signal access columns) live in db_store
     await db_store.ensure_users_columns()
+
 async def ensure_user(user_id: int) -> None:
     if not pool or not user_id:
         return
@@ -538,6 +611,8 @@ async def ensure_user(user_id: int) -> None:
         await db_store.ensure_user_signal_trial(int(user_id))
     except Exception:
         logger.exception("ensure_user: failed")
+
+
 async def set_user_blocked(user_id: int, blocked: bool = True) -> None:
     """Disable broadcasts for users who blocked the bot / never started it (prevents spammy 'chat not found')."""
     if not pool or not user_id:
@@ -558,6 +633,8 @@ async def set_user_blocked(user_id: int, blocked: bool = True) -> None:
                     WHERE telegram_id = $1;""",
                 user_id,
             )
+
+
 async def get_user_row(user_id: int):
     if not pool or not user_id:
         return None
@@ -577,6 +654,7 @@ async def get_user_row(user_id: int):
             """,
             user_id,
         )
+
 def _access_status_from_row(row) -> str:
     # Global maintenance switch (Signal bot only).
     # Enable via env: SIGNAL_MAINTENANCE=1 or MAINTENANCE_MODE=1
@@ -587,6 +665,7 @@ def _access_status_from_row(row) -> str:
             return "maintenance"
     except Exception:
         pass
+
     if row is None:
         return "no_user"
     try:
@@ -599,15 +678,18 @@ def _access_status_from_row(row) -> str:
     # It is used to control whether the user receives new signals (broadcast),
     # not whether the user can open the bot/menu.
     signal_expires_at = row.get("signal_expires_at")
+
     # Backward compatibility: if signal_expires_at is missing but legacy expires_at exists,
     # treat legacy expiry as signal access to avoid locking out existing users.
     if signal_expires_at is None:
         legacy_exp = row.get("expires_at")
         if legacy_exp is not None:
             signal_expires_at = legacy_exp
+
     # NULL expiry means "lifetime" access
     if signal_expires_at is None:
         return "ok"
+
     try:
         now = dt.datetime.now(dt.timezone.utc)
         if signal_expires_at < now:
@@ -615,15 +697,18 @@ def _access_status_from_row(row) -> str:
     except Exception:
         return "expired"
     return "ok"
+
 async def get_access_status(user_id: int) -> str:
     row = await get_user_row(user_id)
     return _access_status_from_row(row)
+
 async def get_notify_signals(user_id: int) -> bool:
     row = await get_user_row(user_id)
     if row is None:
         return True
     v = row.get("notify_signals")
     return True if v is None else bool(v)
+
 async def toggle_notify_signals(user_id: int) -> bool:
     if not pool or not user_id:
         return True
@@ -639,6 +724,8 @@ async def toggle_notify_signals(user_id: int) -> bool:
             await ensure_user(user_id)
             return True
         return bool(row["notify_signals"])
+
+
 async def set_notify_signals(user_id: int, value: bool) -> bool:
     """Set notify_signals explicitly. Returns the saved value."""
     if not pool or not user_id:
@@ -656,6 +743,7 @@ async def set_notify_signals(user_id: int, value: bool) -> bool:
             # if user row didn't exist for some reason, ensure_user created it with TRUE
             return bool(value)
         return bool(row["notify_signals"])
+
 async def get_broadcast_user_ids() -> List[int]:
     """Users allowed to receive signals."""
     if not pool:
@@ -670,7 +758,10 @@ async def get_broadcast_user_ids() -> List[int]:
                    AND COALESCE(notify_signals, TRUE) = TRUE"""
         )
         return [int(r["telegram_id"]) for r in rows if r and r.get("telegram_id") is not None]
+
+
 # ---------------- UI helpers ----------------
+
 def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(uid, "m_status"), callback_data="menu:status")
@@ -684,6 +775,8 @@ def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     kb.button(text=tr(uid, "m_notify"), callback_data="menu:notify")
     kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
+
+
 def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     # Show only one toggle button to keep UI clean
@@ -695,20 +788,28 @@ def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
     kb.button(text=tr(uid, "btn_back"), callback_data="notify:back")
     kb.adjust(1)
     return kb.as_markup()
+
+
 # ---------------- Auto-trade UI + input state ----------------
+
 from cryptography.fernet import Fernet, InvalidToken
+
 AUTOTRADE_INPUT: Dict[int, Dict[str, str]] = {}
+
 # Auto-trade stats UI state
 AUTOTRADE_STATS_STATE: Dict[int, Dict[str, str]] = {}
+
 # Notify only on API errors (anti-spam)
 AUTOTRADE_API_ERR_LAST: Dict[tuple[int, str, str], float] = {}
 AUTOTRADE_API_ERR_COOLDOWN_SEC = 300
+
 # Global Auto-trade bot settings cache (admin panel)
 AUTOTRADE_BOT_GLOBAL: Dict[str, object] = {
     "pause_autotrade": False,
     "maintenance_mode": False,
     "updated_at": None,
 }
+
 async def _refresh_autotrade_bot_global_once() -> None:
     """Load global auto-trade pause/maintenance flags from DB into in-memory cache."""
     try:
@@ -719,6 +820,7 @@ async def _refresh_autotrade_bot_global_once() -> None:
     except Exception:
         # keep previous values
         return
+
 async def _autotrade_bot_global_loop() -> None:
     while True:
         try:
@@ -726,6 +828,8 @@ async def _autotrade_bot_global_loop() -> None:
         except Exception:
             pass
         await asyncio.sleep(5)
+
+
 def _autotrade_gate_text(uid: int) -> Optional[str]:
     """Return i18n text if autotrade is globally blocked (maintenance/pause)."""
     if bool(AUTOTRADE_BOT_GLOBAL.get("maintenance_mode")):
@@ -733,6 +837,9 @@ def _autotrade_gate_text(uid: int) -> Optional[str]:
     if bool(AUTOTRADE_BOT_GLOBAL.get("pause_autotrade")):
         return tr(uid, "at_pause_block")
     return None
+
+
+
 async def _autotrade_access_status(uid: int) -> str:
     """Auto-trade access status from admin subscription flags (users table).
     Returns: ok | blocked | expired | disabled | no_user
@@ -763,6 +870,7 @@ async def _autotrade_access_status(uid: int) -> str:
     except Exception:
         return "expired"
     return "ok"
+
 async def _autotrade_unavailable_text(uid: int) -> str:
     st = await _autotrade_access_status(uid)
     if st == "ok":
@@ -772,6 +880,7 @@ async def _autotrade_unavailable_text(uid: int) -> str:
     if st == "expired":
         return tr(uid, "at_unavailable_expired")
     return tr(uid, "at_unavailable")
+
 async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str, error_text: str) -> None:
     import time
     key = (int(uid), str(exchange or '').lower(), str(market_type or '').lower())
@@ -789,11 +898,13 @@ async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str,
         await safe_send(uid, msg)
     except Exception:
         pass
+
 def _fernet() -> Fernet:
     k = (os.getenv("AUTOTRADE_MASTER_KEY") or "").strip()
     if not k:
         raise RuntimeError("AUTOTRADE_MASTER_KEY env is missing")
     return Fernet(k.encode("utf-8"))
+
 def _key_status_map(keys: List[Dict[str, any]]) -> Dict[str, Dict[str, any]]:
     out: Dict[str, Dict[str, any]] = {}
     for r in keys or []:
@@ -801,6 +912,7 @@ def _key_status_map(keys: List[Dict[str, any]]) -> Dict[str, Dict[str, any]]:
         mt = str(r.get("market_type") or "").lower()
         out[f"{ex}:{mt}"] = r
     return out
+
 def autotrade_kb(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     spot_on = bool(s.get("spot_enabled"))
@@ -808,6 +920,7 @@ def autotrade_kb(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> typ
     kb.button(text=(tr(uid, "at_spot_on") if spot_on else tr(uid, "at_spot_off")), callback_data="at:toggle:spot")
     kb.button(text=(tr(uid, "at_fut_on") if fut_on else tr(uid, "at_fut_off")), callback_data="at:toggle:futures")
     kb.adjust(2)
+
     # Settings
     kb.button(text=tr(uid, "at_spot_exchange"), callback_data="at:ex:spot")
     kb.button(text=tr(uid, "at_fut_exchange"), callback_data="at:ex:futures")
@@ -818,11 +931,14 @@ def autotrade_kb(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> typ
     kb.button(text=tr(uid, "at_fut_leverage"), callback_data="at:set:fut_leverage")
     kb.button(text=tr(uid, "at_fut_cap"), callback_data="at:set:fut_cap")
     kb.adjust(2)
+
     kb.button(text=tr(uid, "at_keys"), callback_data="at:keys")
     # Back to Auto-trade main screen
     kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
     kb.adjust(1)
     return kb.as_markup()
+
+
 def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> str:
     km = _key_status_map(keys)
     def ks(ex: str, mt: str) -> str:
@@ -834,6 +950,7 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
     fut_margin = float(s.get("futures_margin_per_trade") or 0.0)
     fut_lev = int(s.get("futures_leverage") or 1)
     fut_cap = float(s.get("futures_cap") or 0.0)
+
     return trf(
         uid,
         "at_screen",
@@ -850,6 +967,8 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
         y_spot=ks("bybit","spot"),
         y_fut=ks("bybit","futures"),
     )
+
+
 def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
     """Compact Auto-trade screen (main), per UX request."""
     spot_ex = str(s.get("spot_exchange") or "binance").capitalize()
@@ -860,6 +979,7 @@ def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
     fut_cap = float(s.get("futures_cap") or 0.0)
     spot_state = tr(uid, "at_state_on") if s.get("spot_enabled") else tr(uid, "at_state_off")
     fut_state = tr(uid, "at_state_on") if s.get("futures_enabled") else tr(uid, "at_state_off")
+
     title = tr(uid, "at_title")
     spot_header = tr(uid, "at_spot_header")
     fut_header = tr(uid, "at_futures_header")
@@ -869,6 +989,7 @@ def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
     lbl_lev = tr(uid, "at_label_leverage")
     lbl_cap = tr(uid, "at_label_cap")
     cap_auto_spot = tr(uid, "at_cap_auto_spot")
+
     return (
         f"{title}\n\n"
         f"{spot_header}: {spot_state}\n"
@@ -881,6 +1002,8 @@ def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
         f"{lbl_lev}: {fut_lev}x\n"
         f"{lbl_cap}: {fut_cap:g} USDT"
     )
+
+
 def autotrade_main_kb(uid: int) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(uid, "at_menu_settings"), callback_data="atmenu:settings")
@@ -891,11 +1014,15 @@ def autotrade_main_kb(uid: int) -> types.InlineKeyboardMarkup:
     kb.button(text=tr(uid, "btn_back"), callback_data="menu:status")
     kb.adjust(1)
     return kb.as_markup()
+
+
 def autotrade_info_kb(uid: int) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
     kb.adjust(1)
     return kb.as_markup()
+
+
 def autotrade_stats_kb(uid: int, *, market_type: str, period: str) -> types.InlineKeyboardMarkup:
     mt = (market_type or "all").lower()
     pr = (period or "today").lower()
@@ -912,10 +1039,14 @@ def autotrade_stats_kb(uid: int, *, market_type: str, period: str) -> types.Inli
     kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
     kb.adjust(1)
     return kb.as_markup()
+
+
 def _fmt_pnl_line(pnl: float, roi: float) -> str:
     sign = "+" if pnl > 0 else ("" if pnl < 0 else "")
     roi_sign = "+" if roi > 0 else ("" if roi < 0 else "")
     return f"{sign}{pnl:.2f} USDT ({roi_sign}{roi:.2f}%)"
+
+
 def autotrade_keys_kb(uid: int) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     # 4 sets (exchange+market)
@@ -926,17 +1057,24 @@ def autotrade_keys_kb(uid: int) -> types.InlineKeyboardMarkup:
     kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
     kb.adjust(1)
     return kb.as_markup()
+
+
+
+
 def _signal_text(uid: int, s: Signal) -> str:
     header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
     market_banner = tr(uid, 'sig_spot_new') if s.market == 'SPOT' else tr(uid, 'sig_fut_new')
+
     # Visual marker near symbol (kept simple to avoid hard-depending on any exchange)
     symbol_emoji = "🟢" if s.market == 'SPOT' else "🌕"
+
     # Direction should be shown only for FUTURES.
     # For SPOT it's always "buy/long" and printing "ЛОНГ" confuses users.
     direction_line = ""
     if s.market != 'SPOT':
         arrow = tr(uid, 'sig_long') if s.direction == 'LONG' else tr(uid, 'sig_short')
         direction_line = arrow + "\n"
+
     def _fmt_exchanges(raw: str) -> str:
         xs = [x.strip() for x in (raw or '').replace(',', '+').split('+') if x.strip()]
         pretty = []
@@ -955,6 +1093,7 @@ def _signal_text(uid: int, s: Signal) -> str:
             if p not in out:
                 out.append(p)
         return ' • '.join(out)
+
     def _tp_lines() -> List[str]:
         tps_obj = getattr(s, 'tps', None)
         if isinstance(tps_obj, (list, tuple)) and len(tps_obj) > 0:
@@ -969,6 +1108,7 @@ def _signal_text(uid: int, s: Signal) -> str:
                 lines.append(f"TP{i}: {fv:.6f}")
             if lines:
                 return lines
+
         lines: List[str] = []
         lines.append(f"TP1: {s.tp1:.6f}")
         try:
@@ -990,16 +1130,21 @@ def _signal_text(uid: int, s: Signal) -> str:
         except Exception:
             logger.exception("Failed to send message to uid=%s", uid)
         return lines
+
     ex_line_raw = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
     exchanges_line = f"{tr(uid, 'sig_exchanges')}: {ex_line_raw}\n" if ex_line_raw else ""
     # Keep TF on its own line; timeframe string already like 15m/1h/4h
     tf_line = f"{tr(uid, 'sig_tf')}: {s.timeframe}"
+
     tp_lines = "\n".join(_tp_lines())
+
     rr_line = f"{tr(uid, 'sig_rr')}: 1:{s.rr:.2f}"
     conf_line = f"{tr(uid, 'sig_confidence')}: {s.confidence}/100"
     confirm_line = f"{tr(uid, 'sig_confirm')}: {s.confirmations}"
+
     risk_note = (s.risk_note or '').strip()
     risk_block = f"\n\n{risk_note}" if risk_note else ""
+
     return trf(uid, "msg_open_card",
         market_banner=market_banner,
         header=header,
@@ -1018,9 +1163,11 @@ def _signal_text(uid: int, s: Signal) -> str:
         risk_block=risk_block,
         open_prompt=tr(uid, 'sig_open_prompt')
     )
+
 def _fmt_hhmm(ts_utc: float) -> str:
     d = dt.datetime.fromtimestamp(ts_utc, tz=ZoneInfo("UTC")).astimezone(TZ)
     return d.strftime("%H:%M")
+
 def _fmt_dt_msk(v) -> str:
     """Format datetime as Moscow time (TZ / Europe/Moscow)."""
     try:
@@ -1037,18 +1184,21 @@ def _fmt_dt_msk(v) -> str:
             d = dt.datetime.fromisoformat(s)
         else:
             return "—"
+
         if d.tzinfo is None:
             d = d.replace(tzinfo=dt.timezone.utc)
         d = d.astimezone(TZ)
         return d.strftime("%d.%m.%Y %H:%M")
     except Exception:
         return "—"
+
 def _fmt_symbol(sym: str) -> str:
     s = (sym or "").strip().upper()
     if "/" in s:
         a, b = s.split("/", 1)
         return f"{a.strip()} / {b.strip()}"
     return s
+
 def _fmt_price(v) -> str:
     try:
         if v is None:
@@ -1056,6 +1206,7 @@ def _fmt_price(v) -> str:
         return f"{float(v):.6f}".rstrip("0").rstrip(".")
     except Exception:
         return str(v) if v is not None else "—"
+
 def _calc_profit_pct(sig: Signal) -> float:
     """Model expected profit % using TP2 if available, otherwise TP1."""
     try:
@@ -1069,20 +1220,24 @@ def _calc_profit_pct(sig: Signal) -> float:
         return (tp - entry) / entry * 100.0
     except Exception:
         return 0.0
+
 def _open_card_text(uid: int, sig: Signal) -> str:
     sym_disp = _fmt_symbol(sig.symbol)
     base = sym_disp.split("/")[0].strip().replace(" ", "") if sym_disp else "SYMBOL"
     exchanges = (getattr(sig, "confirmations", "") or "").replace("+", " • ")
     if not exchanges:
         exchanges = tr(uid, "lbl_none")
+
     # backend-only metrics (profit/leverage/rr computed in backend.py)
     mx = open_metrics(sig)
     profit = mx.get("profit", 0.0)
     hhmm = _fmt_hhmm(float(getattr(sig, "ts", 0.0) or 0.0))
+
     side = mx.get("side", (sig.direction or "LONG")).upper().strip()
     mkt = mx.get("market", (sig.market or "FUTURES")).upper().strip()
     lev = str(mx.get("lev", "5"))
     rr = mx.get("rr", getattr(sig, "rr", 0.0))
+
     if mkt == "SPOT":
         return trf(
             uid,
@@ -1097,6 +1252,7 @@ def _open_card_text(uid: int, sig: Signal) -> str:
             time=hhmm,
             tag=base,
         )
+
     return trf(
         uid,
         "open_futures",
@@ -1113,6 +1269,7 @@ def _open_card_text(uid: int, sig: Signal) -> str:
         time=hhmm,
         tag=base,
     )
+
 def _too_late_reason_key(reason: str) -> str:
     return {
         "TP2": "sig_too_late_reason_tp2",
@@ -1122,6 +1279,8 @@ def _too_late_reason_key(reason: str) -> str:
         "ERROR": "sig_too_late_reason_error",
         "OK": "sig_too_late_reason_error",
     }.get((reason or "").upper(), "sig_too_late_reason_error")
+
+
 async def _expire_signal_message(call: types.CallbackQuery, sig: Signal, reason: str, price: float) -> None:
     """Remove the OPEN button and mark the signal as expired in-place."""
     uid = call.from_user.id
@@ -1142,12 +1301,16 @@ async def _expire_signal_message(call: types.CallbackQuery, sig: Signal, reason:
             await call.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
+
+
 def _too_late_text(uid: int, sig: Signal, reason: str, price: float) -> str:
     mkt = (sig.market or "FUTURES").upper()
     mkt_emoji = "🟢" if mkt == "SPOT" else "🔴"
     sym = _fmt_symbol(sig.symbol)
     hhmm = _fmt_hhmm(float(getattr(sig, "ts", 0.0) or 0.0))
+
     reason_key = _too_late_reason_key(reason)
+
     return tr(uid, "sig_too_late_body").format(
         market_emoji=mkt_emoji,
         market=mkt,
@@ -1159,6 +1322,8 @@ def _too_late_text(uid: int, sig: Signal, reason: str, price: float) -> str:
         sl=_fmt_price(getattr(sig, "sl", None)),
         time=hhmm,
     )
+
+
 def _fmt_countdown(seconds: float) -> str:
     if seconds < 0:
         seconds = 0
@@ -1168,6 +1333,7 @@ def _fmt_countdown(seconds: float) -> str:
     if h > 0:
         return f"{h}h {m}m"
     return f"{m}m"
+
 def _trade_status_emoji(status: str) -> str:
     return {
         "ACTIVE": "🟢",
@@ -1177,6 +1343,7 @@ def _trade_status_emoji(status: str) -> str:
         "BE": "⚪",
         "CLOSED": "✅",
     }.get(status, "⏳")
+
 # ---------------- broadcasting ----------------
 async def broadcast_signal(sig: Signal) -> None:
     # Global pause/maintenance for sending NEW signals (Signal Bot admin setting)
@@ -1194,18 +1361,21 @@ async def broadcast_signal(sig: Signal) -> None:
     except Exception:
         # best effort: if settings table not ready, don't block
         pass
+
     # Deduplicate: avoid sending the same signal twice (common when scanner emits duplicates).
     import time, hashlib
     now = time.time()
     for k, ts in list(_SENT_SIG_CACHE.items()):
         if now - ts > _SENT_SIG_TTL_SEC:
             _SENT_SIG_CACHE.pop(k, None)
+
     sig_raw = f"{sig.market}|{sig.symbol}|{sig.direction}|{sig.timeframe}|{sig.entry}|{sig.sl}|{sig.tp1}|{sig.tp2}|{sig.confirmations}"
     sig_key = hashlib.sha1(sig_raw.encode('utf-8')).hexdigest()
     if sig_key in _SENT_SIG_CACHE:
         logger.info("Skip duplicate signal %s %s %s (within ttl)", sig.market, sig.symbol, sig.direction)
         return
     _SENT_SIG_CACHE[sig_key] = now
+
     # Assign a globally unique signal_id from DB sequence (survives restarts).
     # This prevents collisions that cause "already opened" for unrelated signals after container restart.
     try:
@@ -1218,6 +1388,7 @@ async def broadcast_signal(sig: Signal) -> None:
         LAST_SIGNAL_BY_MARKET["SPOT" if sig.market == "SPOT" else "FUTURES"] = sig
     except Exception:
         pass
+
     logger.info("Broadcast signal id=%s %s %s %s conf=%s rr=%.2f", sig.signal_id, sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr))
     SIGNALS[sig.signal_id] = sig
     # Persist 'signals sent' counters in Postgres (dedup by sig_key)
@@ -1228,6 +1399,7 @@ async def broadcast_signal(sig: Signal) -> None:
     ORIGINAL_SIGNAL_TEXT[(0, sig.signal_id)] = _signal_text(0, sig)
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+
     uids = await get_broadcast_user_ids()
     for uid in uids:
         try:
@@ -1235,6 +1407,7 @@ async def broadcast_signal(sig: Signal) -> None:
             kb_u = InlineKeyboardBuilder()
             kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
             await safe_send(uid, _signal_text(uid, sig), reply_markup=kb_u.as_markup())
+
             # Auto-trade: execute real orders asynchronously, without affecting broadcast.
             async def _run_autotrade(_uid: int, _sig: Signal):
                 try:
@@ -1246,6 +1419,7 @@ async def broadcast_signal(sig: Signal) -> None:
                             return
                     except Exception:
                         pass
+
                     res = await autotrade_execute(_uid, _sig)
                     err = res.get("api_error") if isinstance(res, dict) else None
                     if err:
@@ -1260,6 +1434,7 @@ async def broadcast_signal(sig: Signal) -> None:
                     mt = "spot" if _sig.market == "SPOT" else "futures"
                     ex = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "").lower()
                     await _notify_autotrade_api_error(_uid, ex, mt, f"{type(e).__name__}: {e}"[:500])
+
             asyncio.create_task(_run_autotrade(uid, sig))
         except (TelegramForbiddenError, TelegramBadRequest) as e:
             # Do not spam stack traces for common delivery issues
@@ -1276,6 +1451,8 @@ async def broadcast_signal(sig: Signal) -> None:
                 logger.exception("Failed to send message to uid=%s", uid)
         except Exception:
             logger.exception("Failed to send message to uid=%s", uid)
+
+
 async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, float], tz_name: str) -> None:
     w0, w1 = win
     uids = await get_broadcast_user_ids()
@@ -1300,12 +1477,15 @@ async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, f
                 logger.exception("Failed to send message to uid=%s", uid)
         except Exception:
             logger.exception("Failed to send message to uid=%s", uid)
+
 # ---------------- commands ----------------
 @dp.message(Command("start"))
 async def start(message: types.Message) -> None:
     uid = message.from_user.id if message.from_user else 0
     if uid:
         await ensure_user(uid)
+        # NOTE: do not auto-unblock user on status view
+
     # If language not chosen yet, ask first
     if uid and uid not in LANG:
         kb = InlineKeyboardBuilder()
@@ -1314,12 +1494,16 @@ async def start(message: types.Message) -> None:
         kb.adjust(2)
         await message.answer(tr(uid, "choose_lang"), reply_markup=kb.as_markup())
         return
+
     # Shared access control (Postgres)
     access = await get_access_status(uid) if uid else "no_user"
     if access != "ok":
         await message.answer(tr(uid, f"access_{access}"), reply_markup=menu_kb(uid))
         return
-    await message.answer(await _build_welcome_text(uid), reply_markup=menu_kb(uid))
+
+    await message.answer(await status_text(uid, include_subscribed=True, include_hint=True), reply_markup=menu_kb(uid))
+
+
 # ---------------- language selection ----------------
 @dp.callback_query(lambda c: (c.data or "").startswith("lang:"))
 async def lang_choose(call: types.CallbackQuery) -> None:
@@ -1331,11 +1515,12 @@ async def lang_choose(call: types.CallbackQuery) -> None:
     # show welcome + menu in-place
     try:
         if call.message:
-            await bot.edit_message_text(chat_id=uid, message_id=call.message.message_id, text=await _build_welcome_text(uid), reply_markup=menu_kb(uid))
+            await bot.edit_message_text(chat_id=uid, message_id=call.message.message_id, text=await status_text(uid, include_subscribed=True, include_hint=True), reply_markup=menu_kb(uid))
             return
     except Exception:
         pass
-    await safe_send(uid, await _build_welcome_text(uid), reply_markup=menu_kb(uid))
+    await safe_send(uid, await status_text(uid, include_subscribed=True, include_hint=True), reply_markup=menu_kb(uid))
+
 # ---------------- menu callbacks ----------------
 def _fmt_stats_block_ru(title: str, b: dict | None = None) -> str:
     b = b or {}
@@ -1354,6 +1539,7 @@ def _fmt_stats_block_ru(title: str, b: dict | None = None) -> str:
         f"Процент побед: {wr:.1f}%\n"
         f"PnL: {pnl:+.2f}%"
     )
+
 def _fmt_stats_block_en(title: str, b: dict | None = None) -> str:
     b = b or {}
     trades = int(b.get("trades", 0))
@@ -1371,6 +1557,7 @@ def _fmt_stats_block_en(title: str, b: dict | None = None) -> str:
         f"Win rate: {wr:.1f}%\n"
         f"PnL: {pnl:+.2f}%"
     )
+
 def _parse_report_lines(lines: list[str]) -> list[tuple[str,int,float,float]]:
     # returns (key, trades, winrate, pnl)
     out = []
@@ -1381,6 +1568,128 @@ def _parse_report_lines(lines: list[str]) -> list[tuple[str,int,float,float]]:
             continue
         out.append((m.group("k"), int(m.group("t")), float(m.group("wr")), float(m.group("pnl"))))
     return out
+
+async def status_text(uid: int, *, include_subscribed: bool = False, include_hint: bool = False) -> str:
+    """Build a pretty status text used both on /start and on the 'Status' screen."""
+    # Notifications toggle state (per user)
+    enabled: Optional[bool] = None
+    try:
+        import asyncio as _asyncio
+        enabled = await _asyncio.wait_for(get_notify_signals(uid), timeout=2.5)
+    except Exception:
+        enabled = None
+
+    # Global states
+    try:
+        scanner_on = bool(getattr(backend, "scanner_running", True))
+    except Exception:
+        scanner_on = True
+
+    # News / Macro status with reason + timer
+    try:
+        news_stat = backend.get_news_status()
+    except Exception:
+        news_stat = {"action": "ALLOW", "reason": None, "until_ts": None}
+
+    try:
+        macro_stat = backend.get_macro_status()
+    except Exception:
+        macro_stat = {"action": "ALLOW", "reason": None, "until_ts": None, "event": None, "window": None}
+
+    def _is_allow(action: str) -> bool:
+        return (action or "").upper() == "ALLOW"
+
+    scanner_state = tr(uid, "status_scanner_on") if scanner_on else tr(uid, "status_scanner_off")
+    news_state = tr(uid, "status_allow") if _is_allow(news_stat.get("action")) else tr(uid, "status_block")
+    macro_action = (macro_stat.get("action") or "ALLOW").upper()
+    macro_state = tr(uid, "status_allow") if _is_allow(macro_action) else tr(uid, "status_block")
+    macro_icon = "🟢" if _is_allow(macro_action) else "🔴"
+    notif_state = tr(uid, "status_notif_on") if enabled is True else (tr(uid, "status_notif_off") if enabled is False else tr(uid, "status_unknown"))
+
+    # Next macro (if known)
+    next_macro = tr(uid, "status_next_macro_none")
+    try:
+        nm = backend.get_next_macro()
+    except Exception:
+        nm = None
+    if nm:
+        try:
+            ev, (w0, w1) = nm
+            name = getattr(ev, "name", None) or getattr(ev, "type", None) or "-"
+            hhmm = _fmt_hhmm(getattr(ev, "start_ts_utc", time.time()))
+            next_macro = f"{name} {hhmm}"
+        except Exception:
+            pass
+
+    out_lines: List[str] = [tr(uid, "status_title")]
+
+    if include_subscribed:
+        out_lines.append("")
+        out_lines.append(tr(uid, "welcome_subscribed"))
+
+    out_lines.append("")
+    out_lines.append(trf(uid, "status_scanner", state=scanner_state))
+    out_lines.append(trf(uid, "status_news", state=news_state))
+
+    # News details when blocked
+    if not _is_allow(news_stat.get("action")):
+        reason = news_stat.get("reason")
+        if reason:
+            out_lines.append(trf(uid, "status_news_reason", reason=reason))
+        until_ts = news_stat.get("until_ts")
+        if until_ts:
+            left = _fmt_countdown(float(until_ts) - time.time())
+            out_lines.append(trf(uid, "status_news_timer", left=left))
+
+    out_lines.append(trf(uid, "status_macro", icon=macro_icon, state=macro_state))
+
+    # Macro details when blocked
+    if not _is_allow(macro_action):
+        try:
+            reason = macro_stat.get("reason")
+            if reason:
+                out_lines.append(trf(uid, "status_macro_reason", reason=reason))
+            win = macro_stat.get("window")
+            if win and isinstance(win, (tuple, list)) and len(win) == 2:
+                w0, w1 = float(win[0]), float(win[1])
+                out_lines.append(trf(uid, "status_macro_window", before=_fmt_hhmm(w0), after=_fmt_hhmm(w1)))
+            until_ts = macro_stat.get("until_ts")
+            if until_ts:
+                left = _fmt_countdown(float(until_ts) - time.time())
+                out_lines.append(trf(uid, "status_macro_timer", left=left))
+            # Timer to end of blackout window (more explicit)
+            if not until_ts and win and isinstance(win, (tuple, list)) and len(win) == 2:
+                until_ts = float(win[1])
+            if until_ts:
+                left_end = _fmt_countdown(float(until_ts) - time.time())
+                out_lines.append(trf(uid, "status_macro_blackout_timer", left=left_end))
+        except Exception:
+            pass
+
+    out_lines.append(trf(uid, "status_next_macro", value=(next_macro or tr(uid, "lbl_none"))))
+
+    # Signal bot global state (pause / maintenance) from admin dashboard
+    try:
+        sb = await db_store.get_signal_bot_settings()
+        if bool(sb.get("maintenance_mode")):
+            sig_state = tr(uid, "sig_state_maintenance")
+        elif bool(sb.get("pause_signals")):
+            sig_state = tr(uid, "sig_state_paused")
+        else:
+            sig_state = tr(uid, "sig_state_on")
+        out_lines.append(trf(uid, "status_signals", state=sig_state))
+    except Exception:
+        # If settings are unavailable, just skip the line
+        pass
+
+    out_lines.append(trf(uid, "status_notifications", state=notif_state))
+
+    if include_hint:
+        out_lines.append("")
+        out_lines.append(tr(uid, "welcome_hint"))
+
+    return "\n".join(out_lines)
+
 async def stats_text(uid: int) -> str:
     """Render trading statistics for the user from Postgres (backend-only)."""
     # Used by nested helpers below
@@ -1388,24 +1697,30 @@ async def stats_text(uid: int) -> str:
     # IMPORTANT: use the bot's configured IANA timezone (TZ_NAME), not env "TZ".
     # Many servers/users set TZ to aliases like "MSK" which are not valid for Postgres AT TIME ZONE.
     tz_name = TZ_NAME
+
     # ---- buckets ----
     spot_today = await backend.perf_today(uid, "SPOT")
     fut_today = await backend.perf_today(uid, "FUTURES")
     spot_week = await backend.perf_week(uid, "SPOT")
     fut_week = await backend.perf_week(uid, "FUTURES")
+
     spot_days = await backend.report_daily(uid, "SPOT", 7, tz=tz_name)
     fut_days = await backend.report_daily(uid, "FUTURES", 7, tz=tz_name)
+
     spot_weeks = await backend.report_weekly(uid, "SPOT", 4, tz=tz_name)
     fut_weeks = await backend.report_weekly(uid, "FUTURES", 4, tz=tz_name)
+
     # ---- formatting helpers ----
     def block_title(market: str) -> str:
         if market == "SPOT":
             return f"🟢 {tr(uid, 'lbl_spot')}"
         return f"🔴 {tr(uid, 'lbl_futures')}"
+
     def fmt_block(title: str, b: dict) -> str:
         if lang == "en":
             return _fmt_stats_block_en(title, b)
         return _fmt_stats_block_ru(title, b)
+
     def fmt_lines(rows: list[dict]) -> list[str]:
         out: list[str] = []
         for r in rows:
@@ -1426,7 +1741,9 @@ async def stats_text(uid: int) -> str:
             else:
                 out.append(f"{k}: Сделки {trades} | Победы {wr:.1f}% | PnL {pnl:+.2f}%")
         return out
+
     no_closed = tr(uid, "no_closed")
+
     parts: list[str] = []
     parts.append(tr(uid, "stats_title"))
     parts.append("")
@@ -1469,6 +1786,7 @@ async def stats_text(uid: int) -> str:
     hint = tr(uid, "stats_hint") if "stats_hint" in I18N.get(lang, {}) else ""
     if hint:
         parts.append(hint)
+
     return "\n".join(parts).strip()
 @dp.callback_query(lambda c: (c.data or "").startswith("menu:"))
 async def menu_handler(call: types.CallbackQuery) -> None:
@@ -1477,12 +1795,15 @@ async def menu_handler(call: types.CallbackQuery) -> None:
     _nav_enter(uid, action)
     if action == "back":
         action = _nav_back(uid, "status")
+
     await call.answer()
+
     # Shared access control (Postgres)
     access = await get_access_status(uid) if uid else "no_user"
     if action not in ("status", "notify") and access != "ok":
         await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
         return
+
     # ---- STATUS (main screen) ----
     if action == "status":
         t = STATUS_TASKS.pop(uid, None)
@@ -1491,7 +1812,10 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 t.cancel()
             except Exception:
                 pass
+
         await ensure_user(uid)
+        # NOTE: do not auto-unblock user on status view
+
         # Notifications toggle state (per user)
         enabled = None
         try:
@@ -1499,28 +1823,34 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             enabled = await _asyncio.wait_for(get_notify_signals(uid), timeout=2.5)
         except Exception:
             enabled = None
+
         # Global states
         try:
             scanner_on = bool(getattr(backend, "scanner_running", True))
         except Exception:
             scanner_on = True
+
         # News / Macro status with reason + timer
         try:
             news_stat = backend.get_news_status()
         except Exception:
             news_stat = {"action": "ALLOW", "reason": None, "until_ts": None}
+
         try:
             macro_stat = backend.get_macro_status()
         except Exception:
             macro_stat = {"action": "ALLOW", "reason": None, "until_ts": None, "event": None, "window": None}
+
         def _is_allow(action: str) -> bool:
             return (action or "").upper() == "ALLOW"
+
         scanner_state = tr(uid, "status_scanner_on") if scanner_on else tr(uid, "status_scanner_off")
         news_state = tr(uid, "status_allow") if _is_allow(news_stat.get("action")) else tr(uid, "status_block")
         macro_action = (macro_stat.get("action") or "ALLOW").upper()
         macro_state = tr(uid, "status_allow") if _is_allow(macro_action) else tr(uid, "status_block")
         macro_icon = "🟢" if _is_allow(macro_action) else "🔴"
-        notif_state = (tr(uid, "status_notif_on") if enabled is True else (tr(uid, "status_notif_off") if enabled is False else tr(uid, "status_unknown")))
+        notif_state = tr(uid, "status_notif_on") if enabled is True else (tr(uid, "status_notif_off") if enabled is False else tr(uid, "status_unknown"))
+
         # Next macro (if known)
         next_macro = tr(uid, "status_next_macro_none")
         try:
@@ -1532,12 +1862,14 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             name = getattr(ev, "name", None) or getattr(ev, "type", None) or "-"
             hhmm = _fmt_hhmm(getattr(ev, "start_ts_utc", time.time()))
             next_macro = f"{name} {hhmm}"
+
         lines = [
             tr(uid, "status_title"),
             "",
             trf(uid, "status_scanner", state=scanner_state),
             trf(uid, "status_news", state=news_state),
         ]
+
         # News details when blocked
         if not _is_allow(news_stat.get("action")):
             reason = news_stat.get("reason")
@@ -1547,7 +1879,9 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             if until_ts:
                 left = _fmt_countdown(float(until_ts) - time.time())
                 lines.append(trf(uid, "status_news_timer", left=left))
+
         lines.append(trf(uid, "status_macro", icon=macro_icon, state=macro_state))
+
         # Macro details when blocked
         if not _is_allow(macro_action):
             reason = macro_stat.get("reason")
@@ -1567,9 +1901,9 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             if until_ts:
                 left_end = _fmt_countdown(float(until_ts) - time.time())
                 lines.append(trf(uid, "status_macro_blackout_timer", left=left_end))
+
         lines.append(trf(uid, "status_next_macro", value=(next_macro or tr(uid, "lbl_none"))))
-        # --- Signals / notifications block ---
-        lines.append("━━━━━━━━━━━━")
+
         # Signal bot global state (pause / maintenance) from admin dashboard
         try:
             sb = await db_store.get_signal_bot_settings()
@@ -1582,10 +1916,13 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             lines.append(trf(uid, 'status_signals', state=sig_state))
         except Exception:
             pass
+
         lines.append(trf(uid, "status_notifications", state=notif_state))
+
         txt = "\n".join(lines)
         await safe_edit(call.message, txt, menu_kb(uid))
         return
+
 # ---- STATS ----
     if action == "stats":
         t = STATUS_TASKS.pop(uid, None)
@@ -1594,6 +1931,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 t.cancel()
             except Exception:
                 pass
+
         try:
             txt = await stats_text(uid)
         except Exception as e:
@@ -1604,9 +1942,11 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 txt += f"\n\nERR: {type(e).__name__}: {e}"
         await safe_edit(call.message, txt, menu_kb(uid))
         return
+
     # ---- LIVE SIGNALS ----
     if action in ("spot", "futures"):
         market = "SPOT" if action == "spot" else "FUTURES"
+
         # If maintenance mode is enabled, do not show live signal cards.
         # Users should see a clear explanation instead of confusing "no live".
         try:
@@ -1616,10 +1956,12 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 return
         except Exception:
             pass
+
         sig = LAST_SIGNAL_BY_MARKET.get(market)
         if not sig:
             await safe_edit(call.message, tr(uid, "no_live_signals"), menu_kb(uid))
             return
+
         allowed, reason, price = await backend.check_signal_openable(sig)
         if not allowed:
             # Drop stale signal from Live caches
@@ -1627,21 +1969,25 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 LAST_SIGNAL_BY_MARKET[market] = None
             await safe_edit(call.message, tr(uid, "no_live_signals"), menu_kb(uid))
             return
+
         kb = InlineKeyboardBuilder()
         kb.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
         kb.adjust(1)
         await safe_edit(call.message, _signal_text(uid, sig), kb.as_markup())
         return
+
     # ---- NOTIFICATIONS ----
     if action == "notify":
         if uid:
             await ensure_user(uid)
+            # NOTE: do not auto-unblock user on /start
             enabled = await get_notify_signals(uid)
             state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
             desc = tr(uid, "notify_desc_on") if enabled else tr(uid, "notify_desc_off")
             txt = trf(uid, "notify_screen", title=tr(uid, "notify_title"), state=state, desc=desc)
             await safe_send(uid, txt, reply_markup=notify_kb(uid, enabled))
         return
+
     # ---- AUTO-TRADE ----
     if action == "autotrade":
         # Global auto-trade pause/maintenance (admin)
@@ -1654,6 +2000,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         if ut:
             await safe_edit(call.message, ut, menu_kb(uid))
             return
+
         try:
             st = await db_store.get_autotrade_settings(uid)
         except Exception:
@@ -1669,8 +2016,11 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             }
         await safe_edit(call.message, autotrade_main_text(uid, st), autotrade_main_kb(uid))
         return
+
     # fallback
-    await safe_edit(call.message, await _build_welcome_text(uid), menu_kb(uid))
+    await safe_edit(call.message, await status_text(uid, include_subscribed=True, include_hint=True), menu_kb(uid))
+
+
 # ---------------- notifications callbacks ----------------
 @dp.callback_query(lambda c: (c.data or "").startswith("notify:"))
 async def notify_handler(call: types.CallbackQuery) -> None:
@@ -1679,36 +2029,43 @@ async def notify_handler(call: types.CallbackQuery) -> None:
     uid = call.from_user.id if call.from_user else 0
     if not uid:
         return
+
     parts = (call.data or "").split(":")
     # notify:set:on | notify:set:off | notify:back
     try:
         action = parts[1]
     except Exception:
         action = ""
+
     # shared access check (same as menu)
     access = await get_access_status(uid)
     if access != "ok":
         await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
         return
+
     if action == "back":
         # Return to main menu (do not delete messages)
-        await safe_edit(call.message, await _build_welcome_text(uid), menu_kb(uid))
+        await safe_edit(call.message, await status_text(uid, include_subscribed=True, include_hint=True), menu_kb(uid))
         return
+
     if action == "set":
         # Explicit ON/OFF
         value = (parts[2] if len(parts) > 2 else "").lower()
         await ensure_user(uid)
+        # NOTE: do not auto-unblock user on /start
         if value == "on":
             enabled = await set_notify_signals(uid, True)
         elif value == "off":
             enabled = await set_notify_signals(uid, False)
         else:
             enabled = await get_notify_signals(uid)
+
         state = tr(uid, "notify_status_on") if enabled else tr(uid, "notify_status_off")
         desc = tr(uid, "notify_desc_on") if enabled else tr(uid, "notify_desc_off")
         txt = trf(uid, "notify_screen", title=tr(uid, "notify_title"), state=state, desc=desc)
         await safe_edit(call.message, txt, notify_kb(uid, enabled))
         return
+
     if action == "status":
         # cancel previous auto-refresh task (if any)
         uid = call.from_user.id if call.from_user else 0
@@ -1718,6 +2075,7 @@ async def notify_handler(call: types.CallbackQuery) -> None:
                 t.cancel()
             except Exception:
                 pass
+
         try:
             txt = await _build_status_text(uid)
         except Exception as e:
@@ -1726,11 +2084,14 @@ async def notify_handler(call: types.CallbackQuery) -> None:
             ls = backend.last_signal
             extra_dir = f" {ls.direction}" if getattr(ls, 'market', '') != 'SPOT' else ""
             txt += f"\nLast signal: {ls.symbol} {ls.market}{extra_dir} conf={ls.confidence}"
+
         msg = await _render_in_place(call, txt, menu_kb(call.from_user.id))
+
         # auto-refresh countdown for a short window
         task = asyncio.create_task(_status_autorefresh(uid, msg.chat.id, msg.message_id))
         STATUS_TASKS[uid] = task
         return
+
     if action == "stats":
         # cancel previous auto-refresh task (if any)
         uid = call.from_user.id if call.from_user else 0
@@ -1740,11 +2101,13 @@ async def notify_handler(call: types.CallbackQuery) -> None:
                 t.cancel()
             except Exception:
                 pass
+
         # performance (separate Spot / Futures)
         spot_today = await backend.perf_today("SPOT")
         fut_today = await backend.perf_today("FUTURES")
         spot_week = await backend.perf_week("SPOT")
         fut_week = await backend.perf_week("FUTURES")
+
         try:
             spot_daily = backend.report_daily("SPOT", 7)
             fut_daily = backend.report_daily("FUTURES", 7)
@@ -1752,10 +2115,12 @@ async def notify_handler(call: types.CallbackQuery) -> None:
             fut_weekly = backend.report_weekly("FUTURES", 4)
         except Exception:
             spot_daily, fut_daily, spot_weekly, fut_weekly = [], [], [], []
+
         spot_daily_nz = [x for x in spot_daily if "trades=0" not in x]
         fut_daily_nz = [x for x in fut_daily if "trades=0" not in x]
         spot_weekly_nz = [x for x in spot_weekly if "trades=0" not in x]
         fut_weekly_nz = [x for x in fut_weekly if "trades=0" not in x]
+
         parts = []
         parts.append(tr(uid, "stats_title"))
         parts.append("")
@@ -1789,18 +2154,22 @@ async def notify_handler(call: types.CallbackQuery) -> None:
         parts.append("")
         parts.append(tr(uid, "tip_closed"))
         txt = "\n".join(parts)
+
         kb = InlineKeyboardBuilder()
         kb.button(text=tr(uid, "refresh"), callback_data="menu:stats")
         kb.button(text=tr(uid, "back"), callback_data="menu:back")
         kb.adjust(2)
         await _render_in_place(call, txt, kb.as_markup())
         return
+
     if action == "back":
         prev = _get_last_view(call.from_user.id, "status")
         # fallback to status
         call.data = f"menu:{prev}"
         await menu_handler(call)
         return
+
+
     if action in ("spot", "futures"):
         sig = backend.last_spot_signal if action == "spot" else backend.last_futures_signal
         if not sig:
@@ -1810,8 +2179,11 @@ async def notify_handler(call: types.CallbackQuery) -> None:
         kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
         await safe_send(call.from_user.id, _signal_text(sig), reply_markup=kb.as_markup())
         return
+
+
 # ---------------- trades list (with buttons) ----------------
 PAGE_SIZE = 10
+
 def _trades_page_kb(uid: int, trades: list[dict], offset: int) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for t in trades:
@@ -1832,6 +2204,8 @@ def _trades_page_kb(uid: int, trades: list[dict], offset: int) -> types.InlineKe
         kb.row(*[b for b in nav.buttons])
     kb.row(types.InlineKeyboardButton(text=tr(uid, "m_menu"), callback_data="menu:status"))
     return kb.as_markup()
+
+
 # ---------------- auto-trade callbacks ----------------
 @dp.callback_query(lambda c: (c.data or "").startswith("at:"))
 async def autotrade_callback(call: types.CallbackQuery) -> None:
@@ -1839,25 +2213,31 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
     uid = call.from_user.id if call.from_user else 0
     if not uid:
         return
+
     # Shared access control
     access = await get_access_status(uid)
     if access != "ok":
         await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
         return
+
     gt = _autotrade_gate_text(uid)
     if gt:
         await safe_edit(call.message, gt, menu_kb(uid))
         return
+
     ut = await _autotrade_unavailable_text(uid)
     if ut:
         await safe_edit(call.message, ut, menu_kb(uid))
         return
+
     parts = (call.data or "").split(":")
     # at:toggle:spot | at:toggle:futures | at:set:* | at:ex:* | at:keys | at:keys:set:EX:MT
     action = parts[1] if len(parts) > 1 else ""
+
     # Load current state
     st = await db_store.get_autotrade_settings(uid)
     keys = await db_store.get_autotrade_keys_status(uid)
+
     if action == "toggle" and len(parts) >= 3:
         mt = parts[2]
         if mt == "spot":
@@ -1867,6 +2247,7 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
         st = await db_store.get_autotrade_settings(uid)
         await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
         return
+
     if action == "keys":
         # at:keys or at:keys:set:ex:mt
         if len(parts) == 2:
@@ -1878,6 +2259,7 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
             AUTOTRADE_INPUT[uid] = {"mode": "keys", "exchange": ex, "market_type": mt, "step": "api_key"}
             await safe_send(uid, trf(uid, "at_enter_api_key", exchange=ex.upper(), market=mt.upper()))
             return
+
     if action == "set" and len(parts) >= 3:
         field = parts[2]
         if field == "spot_amount":
@@ -1896,6 +2278,7 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
             AUTOTRADE_INPUT[uid] = {"mode": "set", "field": "fut_cap"}
             await safe_send(uid, tr(uid, "at_enter_fut_cap"))
             return
+
     if action == "ex" and len(parts) >= 3:
         mt = parts[2]
         # show exchange choices
@@ -1907,6 +2290,7 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
         kb.adjust(1)
         await safe_edit(call.message, tr(uid, "at_choose_exchange"), kb.as_markup())
         return
+
     if action == "exset" and len(parts) >= 4:
         mt = parts[2]
         ex = parts[3]
@@ -1914,34 +2298,42 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
         st = await db_store.get_autotrade_settings(uid)
         await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
         return
+
     # default: return to autotrade screen
     st = await db_store.get_autotrade_settings(uid)
     keys = await db_store.get_autotrade_keys_status(uid)
     await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
+
+
 @dp.callback_query(lambda c: (c.data or "").startswith("atmenu:"))
 async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
     await call.answer()
     uid = call.from_user.id if call.from_user else 0
     if not uid:
         return
+
     access = await get_access_status(uid)
     if access != "ok":
         await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
         return
+
     gt = _autotrade_gate_text(uid)
     if gt:
         await safe_edit(call.message, gt, menu_kb(uid))
         return
+
     ut = await _autotrade_unavailable_text(uid)
     if ut:
         await safe_edit(call.message, ut, menu_kb(uid))
         return
+
     action = (call.data or "").split(":", 1)[1]
     if action == "settings":
         st = await db_store.get_autotrade_settings(uid)
         keys = await db_store.get_autotrade_keys_status(uid)
         await safe_edit(call.message, autotrade_text(uid, st, keys), autotrade_kb(uid, st, keys))
         return
+
     if action == "stats":
         # initialize state
         AUTOTRADE_STATS_STATE.setdefault(uid, {"market_type": "all", "period": "today"})
@@ -1950,19 +2342,26 @@ async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
         txt = _render_autotrade_stats_text(uid, state["market_type"], state["period"], stats)
         await safe_edit(call.message, txt, autotrade_stats_kb(uid, market_type=state["market_type"], period=state["period"]))
         return
+
     if action == "info":
         await safe_edit(call.message, tr(uid, "at_info_text"), autotrade_info_kb(uid))
         return
+
     if action == "faq":
         await safe_edit(call.message, autotrade_faq_text(uid), autotrade_faq_kb(uid))
         return
-    await safe_edit(call.message, await _build_welcome_text(uid), menu_kb(uid))
+
+    await safe_edit(call.message, await status_text(uid, include_subscribed=True, include_hint=True), menu_kb(uid))
+
+
 def autotrade_info_kb(uid: int) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(uid, "at_menu_faq"), callback_data="atmenu:faq")
     kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
     kb.adjust(1)
     return kb.as_markup()
+
+
 def autotrade_faq_text(uid: int) -> str:
     """FAQ text from i18n."""
     title = tr(uid, 'at_faq_title')
@@ -1970,22 +2369,28 @@ def autotrade_faq_text(uid: int) -> str:
     # Optional support line
     support = f"\n\n@{SUPPORT_USERNAME}" if SUPPORT_USERNAME else ''
     return f"{title}\n\n{body}{support}"
+
+
 def autotrade_faq_kb(uid: int) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(uid, "btn_back"), callback_data="atmenu:info")
     kb.adjust(1)
     return kb.as_markup()
+
+
 def _render_autotrade_stats_text(uid: int, market_type: str, period: str, stats: Dict[str, any]) -> str:
     mt = (market_type or "all").lower()
     pr = (period or "today").lower()
     mt_label = "🌕 SPOT" if mt == "spot" else ("⚡ FUTURES" if mt == "futures" else "📊 ВСЕ")
     pr_label = "Сегодня" if pr == "today" else ("Неделя" if pr == "week" else "Месяц")
+
     opened = int(stats.get("opened") or 0)
     closed_plus = int(stats.get("closed_plus") or 0)
     closed_minus = int(stats.get("closed_minus") or 0)
     active = int(stats.get("active") or 0)
     pnl_total = float(stats.get("pnl_total") or 0.0)
     roi = float(stats.get("roi_percent") or 0.0)
+
     return (
         "📊 Auto-trade | Статистика\n"
         f"🔍 Тип: {mt_label}\n"
@@ -1997,16 +2402,20 @@ def _render_autotrade_stats_text(uid: int, market_type: str, period: str, stats:
         "💰 PnL (USDT / %):\n"
         f"• Итог: {_fmt_pnl_line(pnl_total, roi)}"
     )
+
+
 @dp.callback_query(lambda c: (c.data or "").startswith("atstats:"))
 async def autotrade_stats_callback(call: types.CallbackQuery) -> None:
     await call.answer()
     uid = call.from_user.id if call.from_user else 0
     if not uid:
         return
+
     access = await get_access_status(uid)
     if access != "ok":
         await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
         return
+
     state = AUTOTRADE_STATS_STATE.setdefault(uid, {"market_type": "all", "period": "today"})
     parts = (call.data or "").split(":")
     # atstats:type:spot | atstats:period:today | atstats:refresh
@@ -2020,12 +2429,16 @@ async def autotrade_stats_callback(call: types.CallbackQuery) -> None:
             if pr in ("today", "week", "month"):
                 state["period"] = pr
         # refresh -> no state change
+
     stats = await db_store.get_autotrade_stats(user_id=uid, market_type=state["market_type"], period=state["period"])
     txt = _render_autotrade_stats_text(uid, state["market_type"], state["period"], stats)
     await safe_edit(call.message, txt, autotrade_stats_kb(uid, market_type=state["market_type"], period=state["period"]))
+
+
 @dp.message()
 async def autotrade_input_handler(message: types.Message) -> None:
     """Handle text input for Auto-trade configuration.
+
     We only consume messages when the user is in AUTOTRADE_INPUT state.
     """
     uid = message.from_user.id if message.from_user else 0
@@ -2034,15 +2447,18 @@ async def autotrade_input_handler(message: types.Message) -> None:
     state = AUTOTRADE_INPUT.get(uid)
     if not state:
         return
+
     # Access check
     access = await get_access_status(uid)
     if access != "ok":
         AUTOTRADE_INPUT.pop(uid, None)
         await message.answer(tr(uid, f"access_{access}"), reply_markup=menu_kb(uid))
         return
+
     text = (message.text or "").strip()
     if not text:
         return
+
     if state.get("mode") == "set":
         field = state.get("field") or ""
         success = False
@@ -2078,26 +2494,32 @@ async def autotrade_input_handler(message: types.Message) -> None:
             # Keep simple: ask again
             await message.answer(tr(uid, "bad_number"))
             return
+
         if success:
             AUTOTRADE_INPUT.pop(uid, None)
+
         st = await db_store.get_autotrade_settings(uid)
         keys = await db_store.get_autotrade_keys_status(uid)
         await message.answer(autotrade_text(uid, st, keys), reply_markup=autotrade_kb(uid, st, keys))
         return
+
     if state.get("mode") == "keys":
         ex = (state.get("exchange") or "binance").lower()
         mt = (state.get("market_type") or "spot").lower()
         step = state.get("step") or "api_key"
+
         if step == "api_key":
             state["api_key"] = text
             state["step"] = "api_secret"
             AUTOTRADE_INPUT[uid] = state
             await message.answer(tr(uid, "at_enter_api_secret"))
             return
+
         if step == "api_secret":
             api_key = (state.get("api_key") or "").strip()
             api_secret = text
             AUTOTRADE_INPUT.pop(uid, None)
+
             # Basic pre-validation to avoid confusing raw exchange errors when
             # user pastes a wrong value (e.g. random short text). Exchange key
             # lengths differ, so keep it permissive for Bybit (their API key can
@@ -2108,6 +2530,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
                 bad_format = (len(api_key_s) < 8) or (len(api_secret_s) < 20)
             else:
                 bad_format = (len(api_key_s) < 20) or (len(api_secret_s) < 20)
+
             if bad_format:
                 try:
                     await db_store.mark_autotrade_key_error(
@@ -2120,17 +2543,21 @@ async def autotrade_input_handler(message: types.Message) -> None:
                 except Exception:
                     pass
                 await message.answer(trf(uid, "at_keys_bad_format", exchange=ex.upper(), market=mt.upper()))
+
                 st = await db_store.get_autotrade_settings(uid)
                 keys = await db_store.get_autotrade_keys_status(uid)
                 await message.answer(autotrade_text(uid, st, keys), reply_markup=autotrade_kb(uid, st, keys))
                 return
+
             # Validate (READ + TRADE). If TRADE missing -> reject.
             try:
                 res = await validate_autotrade_keys(exchange=ex, market_type=mt, api_key=api_key, api_secret=api_secret)
             except Exception as e:
                 res = {"ok": False, "read_ok": False, "trade_ok": False, "error": str(e)}
+
             if not res.get("ok"):
                 raw_err = str(res.get("error") or "API error")
+
                 # Map raw exchange errors to user-friendly messages.
                 raw_low = raw_err.lower()
                 if ex == "binance" and ("api-key format invalid" in raw_low or "-2014" in raw_low):
@@ -2143,6 +2570,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
                     user_key = "at_keys_ip_restricted"
                 else:
                     user_key = "at_keys_api_error"
+
                 # Store raw error (inactive) so UI shows ❌ and for troubleshooting.
                 try:
                     await db_store.mark_autotrade_key_error(user_id=uid, exchange=ex, market_type=mt, error=raw_err, deactivate=True)
@@ -2175,10 +2603,13 @@ async def autotrade_input_handler(message: types.Message) -> None:
                         last_error=None,
                     )
                     await message.answer(tr(uid, "at_keys_ok"))
+
             st = await db_store.get_autotrade_settings(uid)
             keys = await db_store.get_autotrade_keys_status(uid)
             await message.answer(autotrade_text(uid, st, keys), reply_markup=autotrade_kb(uid, st, keys))
             return
+
+
 @dp.callback_query(lambda c: (c.data or "").startswith("trades:page:"))
 async def trades_page(call: types.CallbackQuery) -> None:
     await call.answer()
@@ -2186,26 +2617,33 @@ async def trades_page(call: types.CallbackQuery) -> None:
         offset = int((call.data or "").split(":")[-1])
     except Exception:
         offset = 0
+
     all_trades = await backend.get_user_trades(call.from_user.id)
     if not all_trades:
         await safe_send(call.from_user.id, tr(call.from_user.id, "my_trades_empty"), reply_markup=menu_kb(call.from_user.id))
         return
+
     page = all_trades[offset:offset+PAGE_SIZE]
     txt = tr(call.from_user.id, "my_trades_title").format(a=offset+1, b=min(offset+PAGE_SIZE, len(all_trades)), n=len(all_trades))
     await safe_send(call.from_user.id, txt, reply_markup=_trades_page_kb(call.from_user.id, page, offset))
+
 # ---------------- trade card ----------------
+
 def _trade_card_text(uid: int, t: dict) -> str:
     symbol = str(t.get("symbol") or "")
     market = str(t.get("market") or "FUTURES").upper()
     side = str(t.get("side") or "LONG").upper()
     status = str(t.get("status") or "ACTIVE").upper()
+
     entry = float(t.get("entry") or 0.0)
     tp1 = t.get("tp1")
     tp2 = t.get("tp2")
     sl = t.get("sl")
+
     head = f"🪙 {symbol} | {tr_market(uid, market)}"
     if market != "SPOT":
         head += f" | {side}"
+
     parts = [
         "📌 " + tr(uid, "m_trades"),
         "",
@@ -2219,6 +2657,7 @@ def _trade_card_text(uid: int, t: dict) -> str:
         parts.append(f"TP1: {float(tp1):.6f}")
     if tp2 is not None and float(tp2) > 0 and (tp1 is None or abs(float(tp2) - float(tp1)) > 1e-12):
         parts.append(f"TP2: {float(tp2):.6f}")
+
     # Live price info (shown when loaded via get_trade_live)
     had_live_block = False
     if t.get('price_f') is not None:
@@ -2234,6 +2673,7 @@ def _trade_card_text(uid: int, t: dict) -> str:
             hit_sl = bool(t.get('hit_sl')) or st in ('LOSS',)
             hit_tp1 = bool(t.get('hit_tp1')) or st in ('TP1','WIN','TP2')
             hit_tp2 = bool(t.get('hit_tp2')) or st in ('WIN','TP2')
+
             checks = []
             if t.get('sl') is not None:
                 checks.append(f"SL: {'✅' if hit_sl else '❌'}")
@@ -2246,23 +2686,28 @@ def _trade_card_text(uid: int, t: dict) -> str:
             had_live_block = True
         except Exception:
             pass
+
     # Opened datetime (MSK)
     opened_at = _fmt_dt_msk(t.get('opened_at'))
     opened_lbl = tr(uid, 'trade_opened_at') if 'trade_opened_at' in I18N.get(get_lang(uid), {}) else "Открыта"
     opened_line = f"🕒 {opened_lbl}: {opened_at} (MSK)"
     if opened_at and opened_at != "—":
         parts.append(opened_line)
+
     parts += [
         "",
         f"{tr(uid, 'sig_status')}: {status} {_trade_status_emoji(status)}",
     ]
+
     pnl = t.get("pnl_total_pct")
     if pnl is not None and status in ("WIN","LOSS","BE","CLOSED"):
         try:
             parts.append(f"PnL: {float(pnl):+.2f}%")
         except Exception:
             pass
+
     return "\n".join(parts)
+
 def _trade_card_kb(uid: int, trade_id: int, back_offset: int = 0) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(uid, "sig_btn_refresh"), callback_data=f"trade:refresh:{trade_id}:{back_offset}")
@@ -2271,6 +2716,7 @@ def _trade_card_kb(uid: int, trade_id: int, back_offset: int = 0) -> types.Inlin
     kb.button(text=tr(uid, "sig_btn_back"), callback_data=f"trades:page:{back_offset}")
     kb.adjust(2, 2)
     return kb.as_markup()
+
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:view:"))
 async def trade_view(call: types.CallbackQuery) -> None:
     await call.answer()
@@ -2285,6 +2731,7 @@ async def trade_view(call: types.CallbackQuery) -> None:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
         return
     await safe_send(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, trade_id, back_offset))
+
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:refresh:"))
 async def trade_refresh(call: types.CallbackQuery) -> None:
     await call.answer()
@@ -2299,6 +2746,7 @@ async def trade_refresh(call: types.CallbackQuery) -> None:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
         return
     await safe_send(call.from_user.id, _trade_card_text(call.from_user.id, t), reply_markup=_trade_card_kb(call.from_user.id, trade_id, back_offset))
+
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:close:"))
 async def trade_close(call: types.CallbackQuery) -> None:
     await call.answer()
@@ -2313,6 +2761,7 @@ async def trade_close(call: types.CallbackQuery) -> None:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_removed"), reply_markup=menu_kb(call.from_user.id))
     else:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_removed_fail"), reply_markup=menu_kb(call.from_user.id))
+
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:orig:"))
 async def trade_orig(call: types.CallbackQuery) -> None:
     await call.answer()
@@ -2322,17 +2771,21 @@ async def trade_orig(call: types.CallbackQuery) -> None:
         back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
+
     t = await backend.get_trade_live_by_id(call.from_user.id, trade_id)
     text = (t.get("orig_text") if isinstance(t, dict) else None) if t else None
     if not text:
         await safe_send(call.from_user.id, tr(call.from_user.id, "sig_orig_title") + ": " + tr(call.from_user.id, "lbl_none"), reply_markup=menu_kb(call.from_user.id))
         return
+
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(call.from_user.id, "sig_btn_back_trade"), callback_data=f"trade:view:{trade_id}:{back_offset}")
     kb.button(text=tr(call.from_user.id, "sig_btn_my_trades"), callback_data=f"trades:page:{back_offset}")
     kb.button(text=tr(call.from_user.id, "m_menu"), callback_data="menu:status")
     kb.adjust(1, 2)
+
     await safe_send(call.from_user.id, "📌 Original signal (1:1)\n\n" + text, reply_markup=kb.as_markup())
+
 # ---------------- open signal ----------------
 @dp.callback_query(lambda c: (c.data or "").startswith("open:"))
 async def opened(call: types.CallbackQuery) -> None:
@@ -2341,10 +2794,12 @@ async def opened(call: types.CallbackQuery) -> None:
     except Exception:
         await call.answer("Error", show_alert=True)
         return
+
     sig = SIGNALS.get(signal_id)
     if not sig:
         await call.answer("Signal not available", show_alert=True)
         return
+
     allowed, reason, price = await backend.check_signal_openable(sig)
     if not allowed:
         # remove stale from Live cache
@@ -2355,6 +2810,7 @@ async def opened(call: types.CallbackQuery) -> None:
         await call.answer(tr(call.from_user.id, "sig_too_late_toast"), show_alert=True)
         await safe_send(call.from_user.id, _too_late_text(call.from_user.id, sig, reason, price), reply_markup=menu_kb(call.from_user.id))
         return
+
     opened_ok = await backend.open_trade(call.from_user.id, sig, orig_text=_signal_text(call.from_user.id, sig))
     if not opened_ok:
         # IMPORTANT:
@@ -2365,6 +2821,7 @@ async def opened(call: types.CallbackQuery) -> None:
             row = await backend.get_trade(call.from_user.id, int(sig.signal_id))
         except Exception:
             row = None
+
         st = str((row or {}).get('status') or '').upper() if isinstance(row, dict) else ''
         if row and st in ("ACTIVE", "TP1"):
             # Already opened -> remove button to prevent retries
@@ -2376,6 +2833,7 @@ async def opened(call: types.CallbackQuery) -> None:
             await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
             await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
             return
+
         # No ACTIVE trade found, but insert was blocked.
         # Re-try with a fresh unique signal_id (prevents "phantom already opened" situations).
         try:
@@ -2383,18 +2841,23 @@ async def opened(call: types.CallbackQuery) -> None:
         except Exception:
             import time as _time
             new_sid = int(_time.time() * 1000)
+
         try:
             SIGNALS.pop(int(signal_id), None)
         except Exception:
             pass
+
         from dataclasses import replace as _dc_replace
+
         new_sig = sig
         try:
             new_sig = _dc_replace(sig, signal_id=int(new_sid))
         except Exception:
             new_sig = sig
+
         SIGNALS[int(new_sid)] = new_sig
         sig = new_sig
+
         opened_ok = await backend.open_trade(call.from_user.id, sig, orig_text=_signal_text(call.from_user.id, sig))
         if not opened_ok:
             # Fallback: show message if still blocked
@@ -2406,12 +2869,14 @@ async def opened(call: types.CallbackQuery) -> None:
             await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
             await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
             return
+
     # Remove the ✅ ОТКРЫЛ СДЕЛКУ button from the original NEW SIGNAL message
     try:
         if call.message:
             await safe_edit_markup(call.from_user.id, call.message.message_id, None)
     except Exception:
         pass
+
     await call.answer(tr(call.from_user.id, "trade_opened_toast"))
     # IMPORTANT: send OPEN card only after user pressed ✅ ОТКРЫЛ СДЕЛКУ
     await safe_send(
@@ -2419,25 +2884,32 @@ async def opened(call: types.CallbackQuery) -> None:
         _open_card_text(call.from_user.id, sig),
         reply_markup=menu_kb(call.from_user.id),
     )
+
 async def main() -> None:
     import time
     globals()["time"] = time
+
     logger.info("Bot starting; TZ=%s", TZ_NAME)
     await init_db()
     load_langs()
+
     # Refresh global Auto-trade pause/maintenance flags in background
     asyncio.create_task(_autotrade_bot_global_loop())
     await _refresh_autotrade_bot_global_once()
+
     # --- Admin HTTP API for Status panel (Signal bot access) ---
     # NOTE: Railway public domain requires an HTTP server listening on $PORT.
     # We run a tiny aiohttp server alongside the Telegram bot.
     async def _admin_http_app() -> web.Application:
         app = web.Application()
+
         # ---- Basic Auth ----
         ADMIN_USER = os.getenv("SIGNAL_ADMIN_USER") or os.getenv("ADMIN_USER") or "admin"
         ADMIN_PASS = os.getenv("SIGNAL_ADMIN_PASS") or os.getenv("ADMIN_PASS") or "password"
+
         def _unauthorized() -> web.Response:
             return web.Response(status=401, headers={"WWW-Authenticate": 'Basic realm="signal-admin"'})
+
         def _check_basic(request: web.Request) -> bool:
             auth = request.headers.get("Authorization", "")
             if not auth.startswith("Basic "):
@@ -2449,6 +2921,7 @@ async def main() -> None:
                 return (u == ADMIN_USER) and (p == ADMIN_PASS)
             except Exception:
                 return False
+
         # ---- CORS (for browser-based Status panel) ----
         @web.middleware
         async def cors_mw(request: web.Request, handler):
@@ -2464,10 +2937,14 @@ async def main() -> None:
             resp.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type"
             resp.headers["Access-Control-Max-Age"] = "86400"
             return resp
+
         app.middlewares.append(cors_mw)
+
         async def health(_: web.Request) -> web.Response:
             return web.json_response({"ok": True, "service": "crypto-signal"})
+
         # ---------------- AUTO-TRADE GLOBAL SETTINGS (pause/maintenance) ----------------
+
         async def autotrade_get_settings(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -2477,6 +2954,7 @@ async def main() -> None:
                 "maintenance_mode": bool(st.get("maintenance_mode")),
                 "updated_at": (st.get("updated_at").isoformat() if st.get("updated_at") else None),
             })
+
         async def autotrade_save_settings(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -2488,12 +2966,15 @@ async def main() -> None:
             AUTOTRADE_BOT_GLOBAL["pause_autotrade"] = pause
             AUTOTRADE_BOT_GLOBAL["maintenance_mode"] = maint
             return web.json_response({"ok": True})
+
         # ---------------- BOT ADMIN (legacy subscriptions: expires_at + sub_*/notify_*) ----------------
+
         async def bot_list_users(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
             q = (request.query.get("query") or request.query.get("q") or "").strip()
             flt = (request.query.get("filter") or "all").strip().lower()
+
             async with pool.acquire() as conn:
                 where = []
                 args = []
@@ -2510,6 +2991,7 @@ async def main() -> None:
                 elif flt == "blocked":
                     where.append("COALESCE(is_blocked,FALSE)=TRUE")
                 where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
                 try:
                     rows = await conn.fetch(
                         f"""
@@ -2538,6 +3020,7 @@ async def main() -> None:
                         """,
                         *args,
                     )
+
             items = []
             for r in rows:
                 items.append({
@@ -2552,6 +3035,7 @@ async def main() -> None:
                     "notify_dex_cex": bool(r.get("notify_dex_cex") or False),
                 })
             return web.json_response({"ok": True, "items": items})
+
         async def bot_create_user(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -2566,6 +3050,7 @@ async def main() -> None:
             notify_spreads = bool(data.get("notify_spreads", sub_spreads))
             notify_basis = bool(data.get("notify_basis", sub_basis))
             notify_dex = bool(data.get("notify_dex_cex", data.get("notify_dexcex", sub_dex)))
+
             await ensure_user(tid)
             async with pool.acquire() as conn:
                 try:
@@ -2589,6 +3074,7 @@ async def main() -> None:
                         tid, expires
                     )
             return web.json_response({"ok": True})
+
         async def bot_patch_user(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -2598,14 +3084,17 @@ async def main() -> None:
             data = await request.json()
             data = data or {}
             await ensure_user(tid)
+
             expires = _parse_iso_dt(data.get("expires_at")) if ("expires_at" in data) else None
             is_blocked = data.get("is_blocked")
+
             sub_spreads = data.get("sub_spreads")
             sub_basis = data.get("sub_basis")
             sub_dex = data.get("sub_dex_cex", data.get("sub_dexcex"))
             notify_spreads = data.get("notify_spreads")
             notify_basis = data.get("notify_basis")
             notify_dex = data.get("notify_dex_cex", data.get("notify_dexcex"))
+
             async with pool.acquire() as conn:
                 if expires is not None:
                     await conn.execute("UPDATE users SET expires_at=$2::timestamptz WHERE telegram_id=$1", tid, expires)
@@ -2614,10 +3103,12 @@ async def main() -> None:
                 try:
                     sets = []
                     args = [tid]
+
                     def add_set(col, val):
                         nonlocal sets, args
                         sets.append(f"{col}=$%d" % (len(args) + 1))
                         args.append(bool(val))
+
                     if sub_spreads is not None:
                         add_set("sub_spreads", sub_spreads)
                     if sub_basis is not None:
@@ -2630,11 +3121,14 @@ async def main() -> None:
                         add_set("notify_basis", notify_basis)
                     if notify_dex is not None:
                         add_set("notify_dex_cex", notify_dex)
+
                     if sets:
                         await conn.execute("UPDATE users SET " + ", ".join(sets) + " WHERE telegram_id=$1", *args)
                 except Exception:
                     pass
+
             return web.json_response({"ok": True})
+
         async def bot_user_action(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -2646,6 +3140,7 @@ async def main() -> None:
                 data = await request.json()
             except Exception:
                 data = {}
+
             await ensure_user(tid)
             async with pool.acquire() as conn:
                 if act == "extend":
@@ -2662,7 +3157,9 @@ async def main() -> None:
                     await conn.execute("DELETE FROM users WHERE telegram_id=$1", tid)
                 else:
                     return web.json_response({"ok": False, "error": "unknown action"}, status=400)
+
             return web.json_response({"ok": True})
+
         async def list_users(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -2714,25 +3211,32 @@ async def main() -> None:
                     "autotrade_expires_at": (r["autotrade_expires_at"].isoformat() if r.get("autotrade_expires_at") else None),
                 })
             return web.json_response({"items": out})
+
         async def signal_stats(request: web.Request) -> web.Response:
             """Read-only aggregated statistics for the admin panel.
+
             Returns counts for:
               - signals sent: day/week/month
               - trade outcomes & real pnl%: day/week/month per market (SPOT/FUTURES)
+
             Trade stats are computed from Postgres trade_events (WIN/LOSS/BE/CLOSE + TP1).
             This gives correct PnL% that matches how positions were closed.
             """
             if not _check_basic(request):
                 return _unauthorized()
+
             now_tz = dt.datetime.now(TZ)
+
             def _to_utc(d: dt.datetime) -> dt.datetime:
                 if d.tzinfo is None:
                     d = d.replace(tzinfo=TZ)
                 return d.astimezone(dt.timezone.utc)
+
             # Period boundaries in bot TZ (MSK by default)
             day_start = now_tz.replace(hour=0, minute=0, second=0, microsecond=0)
             week_start = (now_tz - dt.timedelta(days=now_tz.isoweekday() - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
             month_start = now_tz.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
             ranges = {
                 "day": (_to_utc(day_start), _to_utc(now_tz)),
                 "week": (_to_utc(week_start), _to_utc(now_tz)),
@@ -2759,6 +3263,7 @@ async def main() -> None:
                 signals[f"{k}_total"] = total_n
                 signals[f"{k}_spot"] = spot_n
                 signals[f"{k}_futures"] = fut_n
+
             async def _mk(market: str) -> dict:
                 out: dict[str, dict] = {}
                 for k, (since, until) in ranges.items():
@@ -2783,15 +3288,18 @@ async def main() -> None:
                         "avg_pnl_pct": avg_pnl,
                     }
                 return out
+
             perf = {
                 "spot": await _mk('SPOT'),
                 "futures": await _mk('FUTURES'),
             }
+
             return web.json_response({
                 "ok": True,
                 "signals": signals,
                 "perf": perf,
             })
+
         async def save_user(request: web.Request) -> web.Response:
             """Create/update Signal + Auto-trade access for a user.
             
@@ -2878,6 +3386,7 @@ async def main() -> None:
                         ) or 0)
                     except Exception:
                         open_n = 0
+
                     if not bool(autotrade_enabled):
                         if open_n > 0:
                             # STOP
@@ -2939,52 +3448,7 @@ async def main() -> None:
             
                 if is_blocked is not None:
                     try:
-                        if bool(is_blocked):
-                            # Admin blocks the bot for this user: persist block and disable auto-trade toggles.
-                            await conn.execute("UPDATE users SET is_blocked=TRUE WHERE telegram_id=$1", tid)
-                            try:
-                                await conn.execute(
-                                    """
-                                    INSERT INTO autotrade_settings(user_id, spot_enabled, futures_enabled, updated_at)
-                                    VALUES ($1, FALSE, FALSE, NOW())
-                                    ON CONFLICT (user_id) DO UPDATE
-                                      SET spot_enabled=FALSE, futures_enabled=FALSE, updated_at=NOW();
-                                    """,
-                                    tid,
-                                )
-                            except Exception:
-                                pass
-                            try:
-                                open_cnt = await conn.fetchval(
-                                    "SELECT COUNT(1) FROM autotrade_positions WHERE user_id=$1 AND status='OPEN'",
-                                    tid,
-                                )
-                                open_cnt = int(open_cnt or 0)
-                            except Exception:
-                                open_cnt = 0
-                            if open_cnt > 0:
-                                await conn.execute(
-                                    """
-                                    UPDATE users
-                                       SET autotrade_enabled=TRUE,
-                                           autotrade_stop_after_close=TRUE
-                                     WHERE telegram_id=$1
-                                    """,
-                                    tid,
-                                )
-                            else:
-                                await conn.execute(
-                                    """
-                                    UPDATE users
-                                       SET autotrade_enabled=FALSE,
-                                           autotrade_stop_after_close=FALSE
-                                     WHERE telegram_id=$1
-                                    """,
-                                    tid,
-                                )
-                        else:
-                            # Unblock only affects bot access; auto-trade remains as configured.
-                            await conn.execute("UPDATE users SET is_blocked=FALSE WHERE telegram_id=$1", tid)
+                        await conn.execute("UPDATE users SET is_blocked=$2 WHERE telegram_id=$1", tid, bool(is_blocked))
                     except Exception:
                         pass
             
@@ -3062,6 +3526,7 @@ async def main() -> None:
                         ) or 0)
                     except Exception:
                         open_n = 0
+
                     if not bool(autotrade_enabled):
                         if open_n > 0:
                             if autotrade_expires is not None:
@@ -3132,53 +3597,9 @@ async def main() -> None:
             if not tid:
                 return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
             async with pool.acquire() as conn:
-                # 1) Block bot for the user (admin action)
                 await conn.execute("UPDATE users SET is_blocked=TRUE WHERE telegram_id=$1", tid)
-                # 2) Disable auto-trade toggles (so new positions cannot be opened)
-                try:
-                    await conn.execute(
-                        """
-                        INSERT INTO autotrade_settings(user_id, spot_enabled, futures_enabled, updated_at)
-                        VALUES ($1, FALSE, FALSE, NOW())
-                        ON CONFLICT (user_id) DO UPDATE
-                          SET spot_enabled=FALSE, futures_enabled=FALSE, updated_at=NOW();
-                        """,
-                        tid,
-                    )
-                except Exception:
-                    # If autotrade tables are not available for some reason, ignore.
-                    pass
-                # 3) If there are open autotrade positions, switch to STOP mode:
-                #    let the engine manage closing, but prevent new trades.
-                try:
-                    open_cnt = await conn.fetchval(
-                        "SELECT COUNT(1) FROM autotrade_positions WHERE user_id=$1 AND status='OPEN'",
-                        tid,
-                    )
-                    open_cnt = int(open_cnt or 0)
-                except Exception:
-                    open_cnt = 0
-                if open_cnt > 0:
-                    await conn.execute(
-                        """
-                        UPDATE users
-                           SET autotrade_enabled=TRUE,
-                               autotrade_stop_after_close=TRUE
-                         WHERE telegram_id=$1
-                        """,
-                        tid,
-                    )
-                else:
-                    await conn.execute(
-                        """
-                        UPDATE users
-                           SET autotrade_enabled=FALSE,
-                               autotrade_stop_after_close=FALSE
-                         WHERE telegram_id=$1
-                        """,
-                        tid,
-                    )
             return web.json_response({"ok": True})
+
         async def unblock_user(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -3188,7 +3609,10 @@ async def main() -> None:
             async with pool.acquire() as conn:
                 await conn.execute("UPDATE users SET is_blocked=FALSE WHERE telegram_id=$1", tid)
             return web.json_response({"ok": True})
+
+
         # -------- Signal bot: messages & settings (admin) --------
+
         async def signal_get_settings(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -3226,6 +3650,7 @@ async def main() -> None:
             await db_store.set_signal_bot_settings(pause_signals=pause_signals, maintenance_mode=maintenance_mode)
             await db_store.set_autotrade_bot_settings(pause_autotrade=pause_autotrade, maintenance_mode=autotrade_maintenance_mode)
             return web.json_response({"ok": True})
+
         async def signal_broadcast_text(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -3243,6 +3668,7 @@ async def main() -> None:
                 except Exception:
                     pass
             return web.json_response({"ok": True, "sent": sent, "total": total})
+
         async def signal_send_text(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -3258,6 +3684,8 @@ async def main() -> None:
             except Exception as e:
                 return web.json_response({"ok": False, "error": str(e)}, status=500)
             return web.json_response({"ok": True})
+
+
         # Routes
         app.router.add_route("GET", "/health", health)
         app.router.add_route("GET", "/api/infra/admin/bot/users", bot_list_users)
@@ -3279,6 +3707,7 @@ async def main() -> None:
         # Allow preflight
         app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204))
         return app
+
     async def _start_http_server() -> None:
         try:
             port = int(os.getenv("PORT", "8080"))
@@ -3290,7 +3719,9 @@ async def main() -> None:
         site = web.TCPSite(runner, host="0.0.0.0", port=port)
         await site.start()
         logger.info("Admin HTTP API started on 0.0.0.0:%s", port)
+
     asyncio.create_task(_start_http_server())
+
     # --- Single-instance guard (prevents Telegram getUpdates conflict) ---
     # If multiple containers start simultaneously, only one should run polling & loops.
     async def _try_acquire_singleton_lock() -> bool:
@@ -3301,15 +3732,19 @@ async def main() -> None:
         except Exception:
             # If lock query fails, do not block startup.
             return True
+
     if not await _try_acquire_singleton_lock():
         logger.warning("Another bot instance holds the polling lock; running HTTP server only (no polling/loops)")
         await asyncio.Event().wait()
+
     logger.info("Starting track_loop")
     asyncio.create_task(backend.track_loop(bot))
     logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+
     # Auto-trade manager (SL/TP/BE) - runs in background.
     asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
     await dp.start_polling(bot)
+
 if __name__ == "__main__":
     asyncio.run(main())
