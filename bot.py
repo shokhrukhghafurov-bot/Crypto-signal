@@ -3646,31 +3646,40 @@ async def main() -> None:
             data = await request.json()
             pause_signals = bool(data.get("pause_signals"))
             maintenance_mode = bool(data.get("maintenance_mode"))
-                # Support username (admin contact). Accept several key variants from UI.
-    support_username = (
-        data.get("support_username")
-        or data.get("SUPPORT_USERNAME")
-        or data.get("supportUsername")
-        or data.get("support")
-        or ""
-    )
-    if support_username is None:
-        support_username = ""
-    support_username = str(support_username).strip()
-    # Normalize: store without leading '@'
-    if support_username.startswith("@"): 
-        support_username = support_username[1:].strip()
-    if not support_username:
-        support_username = None
+            # Support username (admin contact). Accept several key variants from UI.
+            support_username = (
+                data.get("support_username")
+                or data.get("SUPPORT_USERNAME")
+                or data.get("supportUsername")
+                or data.get("support")
+                or ""
+            )
+            if support_username is None:
+                support_username = ""
+            support_username = str(support_username).strip()
+            # Normalize: store without leading '@'
+            if support_username.startswith("@"):
+                support_username = support_username[1:].strip()
+            if not support_username:
+                support_username = None
 
-pause_autotrade = bool(data.get("pause_autotrade"))
-    autotrade_maintenance_mode = bool(data.get("autotrade_maintenance_mode"))
-            await db_store.set_signal_bot_settings(pause_signals=pause_signals, maintenance_mode=maintenance_mode, support_username=support_username)
+            pause_autotrade = bool(data.get("pause_autotrade"))
+            autotrade_maintenance_mode = bool(data.get("autotrade_maintenance_mode"))
+
+            await db_store.set_signal_bot_settings(
+                pause_signals=pause_signals,
+                maintenance_mode=maintenance_mode,
+                support_username=support_username,
+            )
             # Apply immediately without restart
             if support_username is not None:
                 global SUPPORT_USERNAME
-                SUPPORT_USERNAME = str(support_username).lstrip('@').strip()
-            await db_store.set_autotrade_bot_settings(pause_autotrade=pause_autotrade, maintenance_mode=autotrade_maintenance_mode)
+                SUPPORT_USERNAME = str(support_username).lstrip("@").strip()
+
+            await db_store.set_autotrade_bot_settings(
+                pause_autotrade=pause_autotrade,
+                maintenance_mode=autotrade_maintenance_mode,
+            )
             return web.json_response({"ok": True})
 
         async def signal_broadcast_text(request: web.Request) -> web.Response:
