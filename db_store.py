@@ -940,15 +940,28 @@ async def set_signal_bot_settings(*, pause_signals: bool, maintenance_mode: bool
     """Persist signal bot settings."""
     pool = get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO signal_bot_settings(id, pause_signals, maintenance_mode, support_username, updated_at)
-            VALUES (1, $1, $2, $3, NOW())
-            ON CONFLICT (id)
-            DO UPDATE SET pause_signals=EXCLUDED.pause_signals, maintenance_mode=EXCLUDED.maintenance_mode, updated_at=NOW();
-            """,
-            bool(pause_signals), bool(maintenance_mode),
-        )
+        try:
+            await conn.execute(
+                """
+                INSERT INTO signal_bot_settings(id, pause_signals, maintenance_mode, support_username, updated_at)
+                VALUES (1, $1, $2, $3, NOW())
+                ON CONFLICT (id)
+                DO UPDATE SET
+                    pause_signals = EXCLUDED.pause_signals,
+                    maintenance_mode = EXCLUDED.maintenance_mode,
+                    support_username = EXCLUDED.support_username,
+                    updated_at = NOW();
+                """,
+                bool(pause_signals),
+                bool(maintenance_mode),
+                support_username,
+            )
+        except Exception:
+            logger.exception(
+                "set_signal_bot_settings failed (pause_signals=%s maintenance_mode=%s support_username=%r)",
+                pause_signals, maintenance_mode, support_username
+            )
+            raise
 
 # ---------------- Auto-trade global settings (admin) ----------------
 
