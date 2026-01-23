@@ -836,98 +836,6 @@ async def _binance_futures_stop_market_close_all(
         )
 
 
-
-async def _binance_futures_algo_conditional_stop_market_close_all(
-    *,
-    api_key: str,
-    api_secret: str,
-    symbol: str,
-    side: str,
-    trigger_price: float,
-    client_algo_id: str | None = None,
-    working_type: str = "CONTRACT_PRICE",
-) -> dict:
-    """Place Futures conditional STOP_MARKET as Algo Order (required since 2025-12-09 migration).
-
-    Uses closePosition=true to close the whole position when triggered (One-way mode).
-    """
-    params = {
-        "algoType": "CONDITIONAL",
-        "symbol": symbol.upper(),
-        "side": side.upper(),
-        "type": "STOP_MARKET",
-        "triggerPrice": f"{trigger_price:.8f}",
-        "closePosition": "true",
-        "workingType": working_type,
-        "recvWindow": "5000",
-    }
-    if client_algo_id:
-        params["clientAlgoId"] = client_algo_id
-
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
-        return await _binance_signed_request(
-            s,
-            base_url="https://fapi.binance.com",
-            path="/fapi/v1/algoOrder",
-            method="POST",
-            api_key=api_key,
-            api_secret=api_secret,
-            params=params,
-        )
-
-
-async def _binance_futures_algo_order_status(
-    *,
-    api_key: str,
-    api_secret: str,
-    algo_id: int | None = None,
-    client_algo_id: str | None = None,
-) -> dict:
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
-        params = {"timestamp": str(int(time.time() * 1000)), "recvWindow": "5000"}
-        # _binance_signed_request will add timestamp if missing; but query requires it, so include for clarity.
-        if algo_id is not None:
-            params["algoId"] = str(int(algo_id))
-        if client_algo_id:
-            params["clientAlgoId"] = str(client_algo_id)
-        return await _binance_signed_request(
-            s,
-            base_url="https://fapi.binance.com",
-            path="/fapi/v1/algoOrder",
-            method="GET",
-            api_key=api_key,
-            api_secret=api_secret,
-            params=params,
-        )
-
-
-async def _binance_futures_cancel_algo_order(
-    *,
-    api_key: str,
-    api_secret: str,
-    algo_id: int | None = None,
-    client_algo_id: str | None = None,
-) -> dict:
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
-        params = {"recvWindow": "5000"}
-        if algo_id is not None:
-            params["algoId"] = str(int(algo_id))
-        if client_algo_id:
-            params["clientAlgoId"] = str(client_algo_id)
-        return await _binance_signed_request(
-            s,
-            base_url="https://fapi.binance.com",
-            path="/fapi/v1/algoOrder",
-            method="DELETE",
-            api_key=api_key,
-            api_secret=api_secret,
-            params=params,
-        )
-
-
 async def _binance_order_status(
     *,
     api_key: str,
@@ -1106,8 +1014,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             order_id = ((entry_res.get("result") or {}).get("orderId") or (entry_res.get("result") or {}).get("orderId"))
 
             has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
-            tp1_frac = (float(_tp1_partial_close_pct("FUTURES")) / 100.0) if mt == "futures" else 0.5
-            qty1 = _round_step(qty * (tp1_frac if has_tp2 else 1.0), qty_step)
+            qty1 = _round_step(qty * (0.5 if has_tp2 else 1.0), qty_step)
             qty2 = _round_step(qty - qty1, qty_step) if has_tp2 else 0.0
             if has_tp2 and min_qty > 0 and qty2 < min_qty:
                 has_tp2 = False
@@ -1214,8 +1121,6 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 "be_price": float(entry or 0.0),
                 "be_moved": False,
                 "qty": qty,
-                "tp1_qty": float(qty1),
-                "tp2_qty": float(qty2),
                 "tp1": tp1,
                 "tp2": tp2,
                 "sl": sl,
@@ -1325,8 +1230,6 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 "be_price": float(entry or 0.0),
                 "be_moved": False,
                 "qty": exec_qty,
-                "tp1_qty": qty1,
-                "tp2_qty": qty2,
                 "tp1": tp1,
                 "tp2": tp2,
                 "sl": sl,
@@ -1391,8 +1294,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
         # TP reduce-only limits (respect LOT_SIZE)
         has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
-        tp1_frac = float(_tp1_partial_close_pct("FUTURES")) / 100.0
-        qty1 = _round_step(qty * (tp1_frac if has_tp2 else 1.0), step)
+        qty1 = _round_step(qty * (0.5 if has_tp2 else 1.0), step)
         qty2 = _round_step(qty - qty1, step) if has_tp2 else 0.0
         if min_qty > 0 and qty1 < min_qty:
             # Not enough size for strategy
@@ -1413,7 +1315,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
         except Exception:
             # Cancel SL and close to avoid half-configured strategy
             try:
-                await _binance_futures_cancel_algo_order(api_key=api_key, api_secret=api_secret, algo_id=int(sl_res.get("algoId") or 0))
+                await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_res.get("orderId") or 0), futures=True)
             except Exception:
                 pass
             try:
@@ -1435,17 +1337,13 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             "side": side,
             "close_side": close_side,
             "entry_order_id": entry_res.get("orderId"),
-            "sl_order_id": (sl_res.get("actualOrderId") or None),
-            "sl_algo_id": sl_res.get("algoId"),
-            "sl_is_algo": True,
+            "sl_order_id": sl_res.get("orderId"),
             "tp1_order_id": tp1_res.get("orderId"),
             "tp2_order_id": (tp2_res.get("orderId") if isinstance(tp2_res, dict) else None),
             "entry_price": float(entry or 0.0),
             "be_price": float(entry or 0.0),
             "be_moved": False,
             "qty": qty,
-            "tp1_qty": float(qty1),
-            "tp2_qty": float(qty2),
             "tp1": tp1,
             "tp2": tp2,
             "sl": sl,
@@ -1590,8 +1488,6 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 tp1_id = ref.get("tp1_order_id")
                 tp2_id = ref.get("tp2_order_id")
                 sl_id = ref.get("sl_order_id")
-                sl_algo_id = ref.get("sl_algo_id")
-                sl_is_algo = bool(ref.get("sl_is_algo")) and futures and (ex == "binance")
                 be_moved = bool(ref.get("be_moved"))
                 be_price = float(ref.get("be_price") or 0.0)
                 close_side = str(ref.get("close_side") or ("SELL" if str(ref.get("side")) == "BUY" else "BUY")).upper()
@@ -1623,12 +1519,9 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             continue
                     if tp1_filled:
                         try:
-                            if sl_id or sl_algo_id:
+                            if sl_id:
                                 if ex == "binance":
-                                    if sl_is_algo and sl_algo_id:
-                                        await _binance_futures_cancel_algo_order(api_key=api_key, api_secret=api_secret, algo_id=int(sl_algo_id))
-                                    elif sl_id:
-                                        await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_id), futures=futures)
+                                    await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_id), futures=futures)
                                 else:
                                     category = str(ref.get("category") or ("spot" if mt == "spot" else "linear"))
                                     await _bybit_cancel_order(api_key=api_key, api_secret=api_secret, category=category, symbol=symbol, order_id=str(sl_id))
@@ -1636,31 +1529,11 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             pass
 
                         # Place new SL at BE
-                        # IMPORTANT: after TP1 partial fill we must protect ONLY the remaining position size.
-                        remaining_qty = float(ref.get("tp2_qty") or 0.0)
-                        if remaining_qty <= 0 and tp2_id:
-                            # fallback if older ref doesn't have tp2_qty
-                            if futures:
-                                remaining_qty = float(remaining_qty) * max(0.0, 1.0 - float(_tp1_partial_close_pct("FUTURES")) / 100.0)
-                            else:
-                                remaining_qty = 0.0
-                        if remaining_qty <= 0:
-                            # nothing left to protect (no TP2 leg / fully closed)
-                            ref["be_moved"] = True
-                            await db_store.update_autotrade_order_ref(row_id=int(r.get("id")), api_order_ref=json.dumps(ref))
-                            continue
-
                         if ex == "binance":
                             if futures:
-                                new_sl = await _binance_futures_algo_conditional_stop_market_close_all(
-                                    api_key=api_key,
-                                    api_secret=api_secret,
-                                    symbol=symbol,
-                                    side=close_side,
-                                    trigger_price=float(be_price),
-                                )
+                                new_sl = await _binance_futures_stop_market_close_all(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, stop_price=be_price)
                             else:
-                                qty = float(remaining_qty)
+                                qty = float(ref.get("qty") or 0.0)
                                 new_sl = await _binance_spot_stop_loss_limit_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=qty, stop_price=be_price)
                         else:
                             category = str(ref.get("category") or ("spot" if mt == "spot" else "linear"))
@@ -1679,12 +1552,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             )
 
                         if ex == "binance":
-                            if futures:
-                                ref["sl_order_id"] = (new_sl.get("actualOrderId") or None)
-                                ref["sl_algo_id"] = new_sl.get("algoId")
-                                ref["sl_is_algo"] = True
-                            else:
-                                ref["sl_order_id"] = new_sl.get("orderId")
+                            ref["sl_order_id"] = new_sl.get("orderId")
                         else:
                             ref["sl_order_id"] = str(((new_sl.get("result") or {}).get("orderId") or "")) or None
                         ref["be_moved"] = True
@@ -1692,48 +1560,11 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
 
                 # Close detection: SL filled OR (TP2 filled if exists else TP1 filled)
                 # If SL FILLED -> closed
-                if (sl_id or sl_algo_id):
+                if sl_id:
                     if ex == "binance":
                         try:
-                            if sl_is_algo and sl_algo_id:
-                                a = await _binance_futures_algo_order_status(
-                                    api_key=api_key,
-                                    api_secret=api_secret,
-                                    algo_id=int(sl_algo_id),
-                                )
-                                st = str(a.get("algoStatus") or "")
-                                if st == "FINISHED":
-                                    sl_filled = True
-                                    actual_id = str(a.get("actualOrderId") or "")
-                                    if actual_id:
-                                        try:
-                                            o_sl = await _binance_order_status(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(actual_id), futures=True)
-                                        except Exception:
-                                            o_sl = {}
-                                    else:
-                                        o_sl = {}
-                                elif st == "TRIGGERED":
-                                    actual_id = str(a.get("actualOrderId") or "")
-                                    if actual_id:
-                                        try:
-                                            o_sl = await _binance_order_status(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(actual_id), futures=True)
-                                            sl_filled = (str(o_sl.get("status")) == "FILLED")
-                                        except Exception:
-                                            o_sl = {}
-                                            sl_filled = True
-                                    else:
-                                        o_sl = {}
-                                        sl_filled = True
-                                else:
-                                    sl_filled = False
-                                    # keep actualOrderId in ref if present
-                                    actual_id = str(a.get("actualOrderId") or "")
-                                    if actual_id and not ref.get("sl_order_id"):
-                                        ref["sl_order_id"] = actual_id
-                                        await db_store.update_autotrade_order_ref(row_id=int(r.get("id")), api_order_ref=json.dumps(ref))
-                            else:
-                                o_sl = await _binance_order_status(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_id), futures=futures)
-                                sl_filled = (str(o_sl.get("status")) == "FILLED")
+                            o_sl = await _binance_order_status(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_id), futures=futures)
+                            sl_filled = (str(o_sl.get("status")) == "FILLED")
                         except ExchangeAPIError as e:
                             try:
                                 notify_api_error(uid, f"⚠️ Auto-trade ERROR ({ex} {mt})\n{str(e)[:200]}")
@@ -1789,41 +1620,6 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         except Exception:
                             pnl_usdt = None
                             roi_percent = None
-
-                        # Best-effort cleanup: cancel remaining protective/TP orders (ignore errors).
-                        try:
-                            if ex == "binance":
-                                if futures and sl_is_algo and sl_algo_id:
-                                    try:
-                                        await _binance_futures_cancel_algo_order(api_key=api_key, api_secret=api_secret, algo_id=int(sl_algo_id))
-                                    except Exception:
-                                        pass
-                                if sl_id and (not (futures and sl_is_algo)):
-                                    try:
-                                        await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_id), futures=futures)
-                                    except Exception:
-                                        pass
-                                if tp1_id:
-                                    try:
-                                        await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(tp1_id), futures=futures)
-                                    except Exception:
-                                        pass
-                                if tp2_id:
-                                    try:
-                                        await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(tp2_id), futures=futures)
-                                    except Exception:
-                                        pass
-                            else:
-                                category = str(ref.get("category") or ("spot" if mt == "spot" else "linear"))
-                                for oid in (sl_id, tp1_id, tp2_id):
-                                    if oid:
-                                        try:
-                                            await _bybit_cancel_order(api_key=api_key, api_secret=api_secret, category=category, symbol=symbol, order_id=str(oid))
-                                        except Exception:
-                                            pass
-                        except Exception:
-                            pass
-
                         await db_store.close_autotrade_position(
                             user_id=uid,
                             signal_id=r.get("signal_id"),
@@ -1903,41 +1699,6 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         except Exception:
                             pnl_usdt = None
                             roi_percent = None
-
-                        # Best-effort cleanup: cancel remaining protective/TP orders (ignore errors).
-                        try:
-                            if ex == "binance":
-                                if futures and sl_is_algo and sl_algo_id:
-                                    try:
-                                        await _binance_futures_cancel_algo_order(api_key=api_key, api_secret=api_secret, algo_id=int(sl_algo_id))
-                                    except Exception:
-                                        pass
-                                if sl_id and (not (futures and sl_is_algo)):
-                                    try:
-                                        await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_id), futures=futures)
-                                    except Exception:
-                                        pass
-                                if tp1_id:
-                                    try:
-                                        await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(tp1_id), futures=futures)
-                                    except Exception:
-                                        pass
-                                if tp2_id:
-                                    try:
-                                        await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(tp2_id), futures=futures)
-                                    except Exception:
-                                        pass
-                            else:
-                                category = str(ref.get("category") or ("spot" if mt == "spot" else "linear"))
-                                for oid in (sl_id, tp1_id, tp2_id):
-                                    if oid:
-                                        try:
-                                            await _bybit_cancel_order(api_key=api_key, api_secret=api_secret, category=category, symbol=symbol, order_id=str(oid))
-                                        except Exception:
-                                            pass
-                        except Exception:
-                            pass
-
                         await db_store.close_autotrade_position(
                             user_id=uid,
                             signal_id=r.get("signal_id"),
@@ -2230,7 +1991,7 @@ TP1_PARTIAL_CLOSE_PCT = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT", 50)))
 
 # New per-market settings
 TP1_PARTIAL_CLOSE_PCT_SPOT = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT_SPOT", TP1_PARTIAL_CLOSE_PCT)))
-TP1_PARTIAL_CLOSE_PCT_FUTURES = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT_FUTURES", 70)))  # default: futures 70/30
+TP1_PARTIAL_CLOSE_PCT_FUTURES = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT_FUTURES", TP1_PARTIAL_CLOSE_PCT)))
 
 BE_AFTER_TP1_SPOT = _env_bool("BE_AFTER_TP1_SPOT", True)
 BE_AFTER_TP1_FUTURES = _env_bool("BE_AFTER_TP1_FUTURES", True)
