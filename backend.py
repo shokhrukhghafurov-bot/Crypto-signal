@@ -4079,8 +4079,6 @@ class Backend:
                         self._price_fail_since.pop(trade_id, None)
                         continue
 
-                    dbg = _price_debug_block(uid, price=price_f, source=price_src, side=side, sl=(float(s.sl) if s.sl else None), tp1=(float(s.tp1) if s.tp1 else None), tp2=(float(s.tp2) if s.tp2 else None))
-
                     def hit_tp(lvl: float) -> bool:
                         return price_f >= lvl if side == "LONG" else price_f <= lvl
 
@@ -4090,6 +4088,19 @@ class Backend:
                     status = str(row.get("status") or "ACTIVE").upper()
                     tp1_hit = bool(row.get("tp1_hit"))
                     be_price = float(row.get("be_price") or 0.0) if row.get("be_price") is not None else 0.0
+
+                    # After TP1 we move protection SL to BE (entry +/- fee buffer).
+                    # The debug block should reflect the *active* protective level, not the original signal SL.
+                    effective_sl = (be_price if (tp1_hit and _be_enabled(market) and be_price > 0) else (float(s.sl) if s.sl else None))
+                    dbg = _price_debug_block(
+                        uid,
+                        price=price_f,
+                        source=price_src,
+                        side=side,
+                        sl=effective_sl,
+                        tp1=(float(s.tp1) if s.tp1 else None),
+                        tp2=(float(s.tp2) if s.tp2 else None),
+                    )
                     # 1) Before TP1: TP2 (gap) -> WIN
                     if not tp1_hit and s.tp2 and hit_tp(float(s.tp2)):
                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
