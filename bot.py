@@ -1597,11 +1597,13 @@ def _fmt_stats_block_ru(uid: int, title: str, b: dict | None = None) -> str:
     # WinRate: WIN/(WIN+LOSS)
     denom = max(1, wins + losses)
     wr = (wins / denom) * 100.0
-    pnl = float(b.get("pnl_pct", 0.0))
+    # NOTE: stats buckets use 'sum_pnl_pct' (sum of per-trade PnL%),
+    # not 'pnl_pct'. Using the wrong key makes PnL always show 0.00%.
+    pnl = float(b.get("sum_pnl_pct", 0.0))
 
     return (
         f"{title}\n"
-        f"{tr(uid, 'lbl_trades')}: {trades} | {tr(uid, 'lbl_wins')}: {wins} | {tr(uid, 'lbl_losses')}: {losses} | "
+        f"{tr(uid, 'lbl_trades')}: {trades} | {tr(uid, 'lbl_tp2')}: {wins} | {tr(uid, 'lbl_sl')}: {losses} | "
         f"{tr(uid, 'lbl_be')}: {be} | {tr(uid, 'lbl_tp1')}: {tp1}\n"
         f"{tr(uid, 'lbl_winrate')}: {wr:.1f}%\n"
         f"{tr(uid, 'lbl_pnl')}: {pnl:+.2f}%"
@@ -1621,7 +1623,7 @@ def _fmt_stats_block_en(title: str, b: dict | None = None) -> str:
     pnl = float(b.get("sum_pnl_pct", 0.0))
     return (
         f"{title}\n"
-        f"Trades: {trades} | Wins: {wins} | Losses: {losses} | BE: {be} | TP1: {tp1}\n"
+        f"Trades: {trades} | TP2: {wins} | SL: {losses} | BE: {be} | TP1: {tp1}\n"
         f"Win rate: {wr:.1f}%\n"
         f"PnL: {pnl:+.2f}%"
     )
