@@ -1106,7 +1106,8 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             order_id = ((entry_res.get("result") or {}).get("orderId") or (entry_res.get("result") or {}).get("orderId"))
 
             has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
-            qty1 = _round_step(qty * (0.5 if has_tp2 else 1.0), qty_step)
+            tp1_frac = (float(_tp1_partial_close_pct("FUTURES")) / 100.0) if mt == "futures" else 0.5
+            qty1 = _round_step(qty * (tp1_frac if has_tp2 else 1.0), qty_step)
             qty2 = _round_step(qty - qty1, qty_step) if has_tp2 else 0.0
             if has_tp2 and min_qty > 0 and qty2 < min_qty:
                 has_tp2 = False
@@ -1213,6 +1214,8 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 "be_price": float(entry or 0.0),
                 "be_moved": False,
                 "qty": qty,
+                "tp1_qty": float(qty1),
+                "tp2_qty": float(qty2),
                 "tp1": tp1,
                 "tp2": tp2,
                 "sl": sl,
@@ -1322,6 +1325,8 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 "be_price": float(entry or 0.0),
                 "be_moved": False,
                 "qty": exec_qty,
+                "tp1_qty": qty1,
+                "tp2_qty": qty2,
                 "tp1": tp1,
                 "tp2": tp2,
                 "sl": sl,
@@ -1386,7 +1391,8 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
         # TP reduce-only limits (respect LOT_SIZE)
         has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
-        qty1 = _round_step(qty * (0.5 if has_tp2 else 1.0), step)
+        tp1_frac = float(_tp1_partial_close_pct("FUTURES")) / 100.0
+        qty1 = _round_step(qty * (tp1_frac if has_tp2 else 1.0), step)
         qty2 = _round_step(qty - qty1, step) if has_tp2 else 0.0
         if min_qty > 0 and qty1 < min_qty:
             # Not enough size for strategy
@@ -1438,6 +1444,8 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             "be_price": float(entry or 0.0),
             "be_moved": False,
             "qty": qty,
+            "tp1_qty": float(qty1),
+            "tp2_qty": float(qty2),
             "tp1": tp1,
             "tp2": tp2,
             "sl": sl,
@@ -1628,6 +1636,20 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             pass
 
                         # Place new SL at BE
+                        # IMPORTANT: after TP1 partial fill we must protect ONLY the remaining position size.
+                        remaining_qty = float(ref.get("tp2_qty") or 0.0)
+                        if remaining_qty <= 0 and tp2_id:
+                            # fallback if older ref doesn't have tp2_qty
+                            if futures:
+                                remaining_qty = float(remaining_qty) * max(0.0, 1.0 - float(_tp1_partial_close_pct("FUTURES")) / 100.0)
+                            else:
+                                remaining_qty = 0.0
+                        if remaining_qty <= 0:
+                            # nothing left to protect (no TP2 leg / fully closed)
+                            ref["be_moved"] = True
+                            await db_store.update_autotrade_order_ref(row_id=int(r.get("id")), api_order_ref=json.dumps(ref))
+                            continue
+
                         if ex == "binance":
                             if futures:
                                 new_sl = await _binance_futures_algo_conditional_stop_market_close_all(
@@ -1638,7 +1660,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                     trigger_price=float(be_price),
                                 )
                             else:
-                                qty = float(ref.get("qty") or 0.0)
+                                qty = float(remaining_qty)
                                 new_sl = await _binance_spot_stop_loss_limit_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=qty, stop_price=be_price)
                         else:
                             category = str(ref.get("category") or ("spot" if mt == "spot" else "linear"))
@@ -2208,7 +2230,7 @@ TP1_PARTIAL_CLOSE_PCT = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT", 50)))
 
 # New per-market settings
 TP1_PARTIAL_CLOSE_PCT_SPOT = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT_SPOT", TP1_PARTIAL_CLOSE_PCT)))
-TP1_PARTIAL_CLOSE_PCT_FUTURES = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT_FUTURES", TP1_PARTIAL_CLOSE_PCT)))
+TP1_PARTIAL_CLOSE_PCT_FUTURES = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT_FUTURES", 70)))  # default: futures 70/30
 
 BE_AFTER_TP1_SPOT = _env_bool("BE_AFTER_TP1_SPOT", True)
 BE_AFTER_TP1_FUTURES = _env_bool("BE_AFTER_TP1_FUTURES", True)
