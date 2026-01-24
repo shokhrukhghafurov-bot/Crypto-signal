@@ -931,9 +931,9 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
     need_usdt = spot_amt if mt == "spot" else fut_margin
     # Hard minimums (validated in bot UI and DB, but re-checked here for safety)
-    if mt == "spot" and 0 < need_usdt < 15:
+    if mt == "spot" and 0 < need_usdt < 10:
         return {"ok": False, "skipped": True, "api_error": None}
-    if mt == "futures" and 0 < need_usdt < 10:
+    if mt == "futures" and 0 < need_usdt < 5:
         return {"ok": False, "skipped": True, "api_error": None}
     if need_usdt <= 0:
         return {"ok": False, "skipped": True, "api_error": None}
@@ -1170,8 +1170,11 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
             # Split for TP1/TP2 (respect LOT_SIZE)
             has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
-            qty1 = exec_qty * (0.5 if has_tp2 else 1.0)
-            qty2 = exec_qty - qty1 if has_tp2 else 0.0
+            # Partial close % is configurable via env (TP1_PARTIAL_CLOSE_PCT_SPOT)
+            p = max(0.0, min(100.0, float(_tp1_partial_close_pct('SPOT'))))
+            a = p / 100.0
+            qty1 = exec_qty * (a if has_tp2 else 1.0)
+            qty2 = (exec_qty - qty1) if has_tp2 else 0.0
             qty1 = _round_step(qty1, qty_step)
             qty2 = _round_step(qty2, qty_step)
             exec_qty = _round_step(exec_qty, qty_step)
