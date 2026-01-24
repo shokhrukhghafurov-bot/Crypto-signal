@@ -170,9 +170,9 @@ ON CONFLICT (id) DO NOTHING;
 
           -- Amounts are validated both in bot UI and DB. 0 means "not set".
           spot_amount_per_trade NUMERIC(18,8) NOT NULL DEFAULT 0
-            CHECK (spot_amount_per_trade = 0 OR spot_amount_per_trade >= 10),
+            CHECK (spot_amount_per_trade = 0 OR spot_amount_per_trade >= 15),
           futures_margin_per_trade NUMERIC(18,8) NOT NULL DEFAULT 0
-            CHECK (futures_margin_per_trade = 0 OR futures_margin_per_trade >= 5),
+            CHECK (futures_margin_per_trade = 0 OR futures_margin_per_trade >= 10),
           futures_leverage INT NOT NULL DEFAULT 1,
           futures_cap NUMERIC(18,8) NOT NULL DEFAULT 0,
 
@@ -184,16 +184,20 @@ ON CONFLICT (id) DO NOTHING;
         await conn.execute("""
         DO $$
         BEGIN
-          IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_spot_min') THEN
-            ALTER TABLE autotrade_settings
-              ADD CONSTRAINT ck_autotrade_spot_min
-              CHECK (spot_amount_per_trade = 0 OR spot_amount_per_trade >= 10);
+          -- Ensure updated minimum constraints (drop old ones if present)
+          IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_spot_min') THEN
+            ALTER TABLE autotrade_settings DROP CONSTRAINT ck_autotrade_spot_min;
           END IF;
-          IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_futures_min') THEN
-            ALTER TABLE autotrade_settings
-              ADD CONSTRAINT ck_autotrade_futures_min
-              CHECK (futures_margin_per_trade = 0 OR futures_margin_per_trade >= 5);
+          ALTER TABLE autotrade_settings
+            ADD CONSTRAINT ck_autotrade_spot_min
+            CHECK (spot_amount_per_trade = 0 OR spot_amount_per_trade >= 15);
+
+          IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_futures_min') THEN
+            ALTER TABLE autotrade_settings DROP CONSTRAINT ck_autotrade_futures_min;
           END IF;
+          ALTER TABLE autotrade_settings
+            ADD CONSTRAINT ck_autotrade_futures_min
+            CHECK (futures_margin_per_trade = 0 OR futures_margin_per_trade >= 10);
         END $$;
         """)
 
@@ -1128,10 +1132,10 @@ async def set_autotrade_amount(user_id: int, market_type: str, amount_usdt: floa
     # Hard minimums (also enforced in DB schema):
     # - SPOT amount per trade >= 10 USDT (or 0 when unset)
     # - FUTURES margin per trade >= 5 USDT (or 0 when unset)
-    if m == "spot" and 0 < amt < 10:
-        raise ValueError("SPOT amount per trade must be >= 10")
-    if m != "spot" and 0 < amt < 5:
-        raise ValueError("FUTURES margin per trade must be >= 5")
+    if m == "spot" and 0 < amt < 15:
+        raise ValueError("SPOT amount per trade must be >= 15")
+    if m != "spot" and 0 < amt < 10:
+        raise ValueError("FUTURES margin per trade must be >= 10")
     async with pool.acquire() as conn:
         await conn.execute(
             f"""
