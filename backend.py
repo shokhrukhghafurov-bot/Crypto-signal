@@ -4731,30 +4731,33 @@ class Backend:
                             except Exception:
                                 return name, None
 
-                        results = await asyncio.gather(fetch_exchange("BINANCE"), fetch_exchange("BYBIT"), fetch_exchange("OKX"))
-                        good = [(name, r) for (name, r) in results if r is not None]
-                        if len(good) < 2:
-                            continue
+                        results = await asyncio.gather(
+    fetch_exchange("BINANCE"),
+    fetch_exchange("BYBIT"),
+    fetch_exchange("OKX"),
+)
+good = [(name, r) for (name, r) in results if r is not None]
+if not good:
+    continue
 
-                        dirs: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
-                        for name, r in good:
-                            dirs.setdefault(r["direction"], []).append((name, r))
-                        best_dir, supporters = max(dirs.items(), key=lambda kv: len(kv[1]))
-                        if len(supporters) < 2:
-                            continue
+# NEW: allow signal from a single exchange.
+# Pick the best exchange by confidence (fallback: rr).
+best_name, best_r = max(
+    good,
+    key=lambda x: (int((x[1] or {}).get("confidence", 0) or 0), float((x[1] or {}).get("rr", 0.0) or 0.0)),
+)
+best_dir = best_r.get("direction") or "LONG"
+supporters = [(best_name, best_r)]
 
-                        entry = float(np.median([s[1]["entry"] for s in supporters]))
-                        sl = float(np.median([s[1]["sl"] for s in supporters]))
-                        tp1 = float(np.median([s[1]["tp1"] for s in supporters]))
-                        tp2 = float(np.median([s[1]["tp2"] for s in supporters]))
-                        rr = float(np.median([s[1]["rr"] for s in supporters]))
-                        conf = int(np.median([s[1]["confidence"] for s in supporters]))
-                        
-                        market = choose_market(float(np.nanmax([s[1]["adx1"] for s in supporters])),
-                                              float(np.nanmax([s[1]["atr_pct"] for s in supporters])))
-                        
-                        min_conf = TA_MIN_SCORE_FUTURES if market == "FUTURES" else TA_MIN_SCORE_SPOT
+entry = float(best_r["entry"])
+sl = float(best_r["sl"])
+tp1 = float(best_r["tp1"])
+tp2 = float(best_r["tp2"])
+rr = float(best_r["rr"])
+conf = int(best_r["confidence"])
 
+market = choose_market(float(best_r.get("adx1", 0.0)), float(best_r.get("atr_pct", 0.0)))
+min_conf = TA_MIN_SCORE_FUTURES if market == "FUTURES" else TA_MIN_SCORE_SPOT
 # Orderbook confirmation (FUTURES only, enabled via ENV)
                         if USE_ORDERBOOK and (not ORDERBOOK_FUTURES_ONLY or market == "FUTURES"):
                             ob_allows: List[bool] = []
@@ -4818,7 +4821,32 @@ class Backend:
                                 sym,
                             )
 
-                        conf_names = "+".join([s[0] for s in supporters])
+                        # NEW: confirmations = exchanges where the pair exists (has a public price)
+async def _pair_exists_on(ex: str) -> bool:
+    try:
+        exu = (ex or "").upper().strip()
+        if exu == "BINANCE":
+            p = await self._fetch_rest_price("SPOT", sym)
+        elif exu == "BYBIT":
+            p = await self._fetch_bybit_price("SPOT", sym)
+        elif exu == "OKX":
+            p = await self._fetch_okx_price("SPOT", sym)
+        elif exu == "MEXC":
+            p = await _mexc_public_price(sym)
+        elif exu in ("GATE", "GATEIO"):
+            p = await _gateio_public_price(sym)
+        else:
+            return False
+        return bool(p and float(p) > 0)
+    except Exception:
+        return False
+
+ex_order = ["GATEIO", "BINANCE", "OKX", "BYBIT", "MEXC"]
+checks = await asyncio.gather(*[_pair_exists_on(ex) for ex in ex_order])
+pair_exchanges = [ex for ex, ok in zip(ex_order, checks) if ok]
+if not pair_exchanges:
+    pair_exchanges = [best_name]
+conf_names = "+".join(pair_exchanges)
 
                         sid = self.next_signal_id()
                         sig = Signal(
