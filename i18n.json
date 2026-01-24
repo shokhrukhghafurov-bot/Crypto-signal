@@ -44,8 +44,8 @@
     "at_menu_settings": "⚙️ Settings",
     "at_menu_stats": "📊 Statistics",
     "at_menu_info": "ℹ️ Info",
-    "at_min_fut_margin": "❌ Minimum for FUTURES: 10 USDT",
-    "at_min_spot_amount": "❌ Minimum for SPOT: 15 USDT",
+    "at_min_fut_margin": "❌ Minimum for FUTURES: 5 USDT",
+    "at_min_spot_amount": "❌ Minimum for SPOT: 10 USDT",
     "at_screen": "🤖 Auto-trade\n\n🪙 SPOT: {spot_state}\n🏦 Exchange: {spot_ex}\n💰 Amount per trade: {spot_amt} USDT\n📌 Cap: Auto (Spot balance)\n\n⚡ FUTURES: {fut_state}\n🏦 Exchange: {fut_ex}\n💰 Margin per trade: {fut_margin} USDT\n🎚 Leverage: {fut_lev}x\n📌 Cap: {fut_cap} USDT\n\n🔑 Keys status:\nBinance SPOT: {b_spot} | Binance FUTURES: {b_fut}\nBybit SPOT: {y_spot} | Bybit FUTURES: {y_fut}",
     "at_spot_amount": "💰 SPOT amount",
     "at_spot_exchange": "🏦 SPOT exchange",
@@ -226,7 +226,8 @@
     "at_unavailable": "🔒 Auto-trade unavailable\n\nAuto-trading is not enabled in your subscription.\nYou will continue receiving trading signals as usual.\n\nTo enable Auto-trade, contact the administrator:\n👉 @{support}",
     "at_unavailable_expired": "🔒 Auto-trade unavailable\n\nYour Auto-trade access has expired.\nYou will continue receiving trading signals as usual.\n\nTo renew Auto-trade, contact the administrator.",
     "welcome_subscribed": "✅ You are subscribed to signals.",
-    "welcome_hint": "Use the buttons below:"
+    "welcome_hint": "Use the buttons below:",
+    "bad_number": "❌ Please enter a number."
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -273,8 +274,8 @@
     "at_menu_settings": "⚙️ Настройка",
     "at_menu_stats": "📊 Статистика",
     "at_menu_info": "ℹ️ Инфо",
-    "at_min_fut_margin": "❌ Минимум для FUTURES: 10 USDT",
-    "at_min_spot_amount": "❌ Минимум для SPOT: 15 USDT",
+    "at_min_fut_margin": "❌ Минимум для FUTURES: 5 USDT",
+    "at_min_spot_amount": "❌ Минимум для SPOT: 10 USDT",
     "at_screen": "🤖 Auto-trade\n\n🪙 SPOT: {spot_state}\n🏦 Биржа: {spot_ex}\n💰 Сумма на сделку: {spot_amt} USDT\n📌 Cap: Авто (баланс Spot)\n\n⚡ FUTURES: {fut_state}\n🏦 Биржа: {fut_ex}\n💰 Маржа на сделку: {fut_margin} USDT\n🎚 Плечо: {fut_lev}x\n📌 Cap: {fut_cap} USDT\n\n🔑 Статус ключей:\nBinance SPOT: {b_spot} | Binance FUTURES: {b_fut}\nBybit SPOT: {y_spot} | Bybit FUTURES: {y_fut}",
     "at_spot_amount": "💰 Сумма SPOT",
     "at_spot_exchange": "🏦 Биржа SPOT",
@@ -455,6 +456,7 @@
     "at_unavailable": "🔒 Auto-trade недоступен\n\nАвто-трейдинг не активирован в вашей подписке.\nВы продолжаете получать торговые сигналы в обычном режиме.\n\nДля подключения Auto-trade свяжитесь с администратором:\n👉 @{support}",
     "at_unavailable_expired": "🔒 Auto-trade недоступен\n\nСрок доступа к Auto-trade истёк.\nВы продолжаете получать торговые сигналы в обычном режиме.\n\nДля продления доступа свяжитесь с администратором.",
     "welcome_subscribed": "✅ Ты подписан на сигналы.",
-    "welcome_hint": "Нажимай кнопки ниже:"
+    "welcome_hint": "Нажимай кнопки ниже:",
+    "bad_number": "❌ Введите число."
   }
 }
