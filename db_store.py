@@ -87,6 +87,24 @@ CREATE TABLE IF NOT EXISTS autotrade_bot_settings (
         INSERT INTO autotrade_bot_settings(id) VALUES (1)
 ON CONFLICT (id) DO NOTHING;
 """)
+
+        # --- users table (fresh installs) ---
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+          telegram_id BIGINT PRIMARY KEY,
+          is_blocked BOOLEAN NOT NULL DEFAULT FALSE,
+          notify_signals BOOLEAN NOT NULL DEFAULT TRUE,
+          signal_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+          signal_expires_at TIMESTAMPTZ,
+          expires_at TIMESTAMPTZ,
+          autotrade_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+          autotrade_expires_at TIMESTAMPTZ,
+          autotrade_stop_after_close BOOLEAN NOT NULL DEFAULT FALSE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+
         # --- schema compat: allow many users to open same signal ---
         # Older DBs could have UNIQUE(signal_id) which blocks other users.
         await conn.execute("""
@@ -184,18 +202,6 @@ ON CONFLICT (id) DO NOTHING;
         await conn.execute("""
         DO $$
         BEGIN
-          -- Drop legacy constraints so new minimums can be enforced
-          BEGIN
-            ALTER TABLE autotrade_settings DROP CONSTRAINT IF EXISTS ck_autotrade_spot_min;
-          EXCEPTION WHEN undefined_object THEN
-            NULL;
-          END;
-          BEGIN
-            ALTER TABLE autotrade_settings DROP CONSTRAINT IF EXISTS ck_autotrade_futures_min;
-          EXCEPTION WHEN undefined_object THEN
-            NULL;
-          END;
-
           IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_spot_min') THEN
             ALTER TABLE autotrade_settings
               ADD CONSTRAINT ck_autotrade_spot_min
@@ -207,7 +213,25 @@ ON CONFLICT (id) DO NOTHING;
               CHECK (futures_margin_per_trade = 0 OR futures_margin_per_trade >= 10);
           END IF;
         END $$;
-        """)
+        
+        -- Ensure updated minimum constraints (upgrade from legacy 10/5 -> 15/10)
+        DO $$
+        BEGIN
+          IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_spot_min') THEN
+            ALTER TABLE autotrade_settings DROP CONSTRAINT ck_autotrade_spot_min;
+          END IF;
+          ALTER TABLE autotrade_settings
+            ADD CONSTRAINT ck_autotrade_spot_min
+            CHECK (spot_amount_per_trade = 0 OR spot_amount_per_trade >= 15);
+
+          IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_futures_min') THEN
+            ALTER TABLE autotrade_settings DROP CONSTRAINT ck_autotrade_futures_min;
+          END IF;
+          ALTER TABLE autotrade_settings
+            ADD CONSTRAINT ck_autotrade_futures_min
+            CHECK (futures_margin_per_trade = 0 OR futures_margin_per_trade >= 10);
+        END $$;
+""")
 
         # Exchange keys are stored encrypted (ciphertext only).
         await conn.execute("""
