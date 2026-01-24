@@ -373,6 +373,7 @@ async def _gateio_public_price(symbol: str) -> float:
         return float(data[0].get("last") or 0.0)
     return 0.0
 
+
 async def validate_autotrade_keys(
     *,
     exchange: str,
@@ -381,20 +382,18 @@ async def validate_autotrade_keys(
     api_secret: str,
     passphrase: str | None = None,
 ) -> dict:
-    """Validate keys for READ + TRADE permissions.
-
-    We avoid placing real orders. For Binance we use `canTrade` field
-    from signed account endpoints when available.
+    """Validate keys for READ + TRADE permissions (best-effort, no real orders).
 
     Returns:
       {"ok": bool, "read_ok": bool, "trade_ok": bool, "error": str|None}
     """
     ex = (exchange or "binance").lower().strip()
     mt = (market_type or "spot").lower().strip()
-    if ex not in ("binance","bybit","okx","mexc","gateio"):
-        ex = "binance"
+    if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
+        return {"ok": False, "read_ok": False, "trade_ok": False, "error": "unsupported_exchange"}
     if mt not in ("spot", "futures"):
         mt = "spot"
+
     api_key = (api_key or "").strip()
     api_secret = (api_secret or "").strip()
     if not api_key or not api_secret:
@@ -403,6 +402,7 @@ async def validate_autotrade_keys(
     try:
         timeout = aiohttp.ClientTimeout(total=8)
         async with aiohttp.ClientSession(timeout=timeout) as s:
+            # ---------------- Binance ----------------
             if ex == "binance":
                 if mt == "spot":
                     acc = await _binance_signed_request(
@@ -414,20 +414,13 @@ async def validate_autotrade_keys(
                         api_secret=api_secret,
                         params={"recvWindow": "5000"},
                     )
-
-                    # READ is OK if we can call a signed account endpoint.
-                    # TRADE permission must be inferred from the response. For Binance, `/api/v3/account`
-                    # includes `permissions` describing what this API key is allowed to do.
                     perms = acc.get("permissions")
-                    perms_set = set()
+                    perms_set: set[str] = set()
                     if isinstance(perms, (list, tuple)):
                         perms_set = {str(x).upper() for x in perms}
                     elif isinstance(perms, str):
-                        # Some clients may return a comma-separated string.
                         perms_set = {p.strip().upper() for p in perms.split(",") if p.strip()}
 
-                    # Spot trading requires SPOT (or MARGIN) permission. If we can't see permissions,
-                    # fall back to `canTrade` (less strict, but better than blocking all keys).
                     if perms_set:
                         trade_ok = ("SPOT" in perms_set) or ("MARGIN" in perms_set) or ("TRADE" in perms_set)
                     else:
@@ -436,9 +429,9 @@ async def validate_autotrade_keys(
 
                     if not trade_ok:
                         return {"ok": True, "read_ok": True, "trade_ok": False, "error": "trade_permission_missing"}
-
                     return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
 
+                # futures
                 acc = await _binance_signed_request(
                     s,
                     base_url="https://fapi.binance.com",
@@ -453,72 +446,73 @@ async def validate_autotrade_keys(
                     return {"ok": True, "read_ok": True, "trade_ok": False, "error": "trade_permission_missing"}
                 return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
 
-            
-if ex == "bybit":
-    # Bybit: query key info (best-effort)
-    data = await _bybit_signed_request(
-        s,
-        base_url="https://api.bybit.com",
-        path="/v5/user/query-api",
-        method="GET",
-        api_key=api_key,
-        api_secret=api_secret,
-        params={},
-    )
-    res = data.get("result") or {}
-    if isinstance(res, dict):
-        # readOnly=1 typically means no trading
-        ro = res.get("readOnly")
-        if ro is not None and int(ro) == 1:
-            return {"ok": False, "read_ok": True, "trade_ok": False, "error": "trade_permission_missing"}
-        perm = res.get("permissions") or res.get("permission")
-        if isinstance(perm, dict):
-            trade_flag = perm.get("Trade") or perm.get("trade") or perm.get("SpotTrade") or perm.get("ContractTrade")
-            if trade_flag is not None and not bool(trade_flag):
-                return {"ok": False, "read_ok": True, "trade_ok": False, "error": "trade_permission_missing"}
-    return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
+            # ---------------- Bybit ----------------
+            if ex == "bybit":
+                data = await _bybit_signed_request(
+                    s,
+                    base_url="https://api.bybit.com",
+                    path="/v5/user/query-api",
+                    method="GET",
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    params={},
+                )
+                res = data.get("result") or {}
+                if isinstance(res, dict):
+                    ro = res.get("readOnly")
+                    if ro is not None and int(ro) == 1:
+                        return {"ok": True, "read_ok": True, "trade_ok": False, "error": "trade_permission_missing"}
+                    perm = res.get("permissions") or res.get("permission")
+                    if isinstance(perm, dict):
+                        trade_flag = perm.get("Trade") or perm.get("trade") or perm.get("SpotTrade") or perm.get("ContractTrade")
+                        if trade_flag is not None and not bool(trade_flag):
+                            return {"ok": True, "read_ok": True, "trade_ok": False, "error": "trade_permission_missing"}
+                return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
 
-if ex == "okx":
-    if not passphrase:
-        return {"ok": False, "read_ok": False, "trade_ok": False, "error": "missing_passphrase"}
-    data = await _okx_signed_request(
-        s,
-        base_url="https://www.okx.com",
-        path="/api/v5/account/balance",
-        method="GET",
-        api_key=api_key,
-        api_secret=api_secret,
-        passphrase=passphrase,
-        params={"ccy": "USDT"},
-    )
-    # if request succeeded, consider both read and trade OK (best-effort)
-    return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
+            # ---------------- OKX ----------------
+            if ex == "okx":
+                if not passphrase:
+                    return {"ok": False, "read_ok": False, "trade_ok": False, "error": "missing_passphrase"}
+                await _okx_signed_request(
+                    s,
+                    base_url="https://www.okx.com",
+                    path="/api/v5/account/balance",
+                    method="GET",
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    passphrase=passphrase,
+                    params={"ccy": "USDT"},
+                )
+                return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
 
-if ex == "mexc":
-    data = await _mexc_signed_request(
-        s,
-        base_url="https://api.mexc.com",
-        path="/api/v3/account",
-        method="GET",
-        api_key=api_key,
-        api_secret=api_secret,
-        params={},
-    )
-    return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
+            # ---------------- MEXC ----------------
+            if ex == "mexc":
+                await _mexc_signed_request(
+                    s,
+                    base_url="https://api.mexc.com",
+                    path="/api/v3/account",
+                    method="GET",
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    params={},
+                )
+                return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
 
-if ex == "gateio":
-    data = await _gateio_signed_request(
-        s,
-        base_url="https://api.gateio.ws",
-        path="/api/v4/spot/accounts",
-        method="GET",
-        api_key=api_key,
-        api_secret=api_secret,
-        params={},
-    )
-    return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
+            # ---------------- Gate.io ----------------
+            if ex == "gateio":
+                await _gateio_signed_request(
+                    s,
+                    base_url="https://api.gateio.ws",
+                    path="/api/v4/spot/accounts",
+                    method="GET",
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    params={},
+                )
+                return {"ok": True, "read_ok": True, "trade_ok": True, "error": None}
 
-return {"ok": False, "read_ok": False, "trade_ok": False, "error": "unsupported_exchange"}
+        return {"ok": False, "read_ok": False, "trade_ok": False, "error": "unsupported_exchange"}
+
     except ExchangeAPIError as e:
         return {"ok": False, "read_ok": False, "trade_ok": False, "error": str(e)}
 
@@ -1140,22 +1134,9 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     if not enabled:
         return {"ok": False, "skipped": True, "api_error": None}
 
-    # Exchange selection:
-# - SPOT: prefer the signal confirmations order (first available key wins)
-# - FUTURES: only one exchange can be selected (binance/bybit)
-spot_candidates: list[str] = []
-if mt == "spot":
-    conf_raw = str(getattr(sig, "confirmations", "") or "")
-    cand = [x.strip().lower() for x in conf_raw.replace(",", "+").split("+") if x.strip()]
-    if not cand:
-        cand = [str(st.get("spot_exchange") or "binance").lower()]
-    allowed = {"binance", "bybit", "okx", "mexc", "gateio"}
-    spot_candidates = [c for c in cand if c in allowed]
-    if not spot_candidates:
-        spot_candidates = [str(st.get("spot_exchange") or "binance").lower()]
-exchange = str(st.get("futures_exchange") or "binance").lower() if mt != "spot" else (spot_candidates[0] if spot_candidates else "binance")
-if mt != "spot" and exchange not in ("binance", "bybit"):
-    exchange = "binance"
+    exchange = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "binance").lower()
+    if exchange not in ("binance", "bybit"):
+        exchange = "binance"
 
     # amounts
     spot_amt = float(st.get("spot_amount_per_trade") or 0.0)
@@ -1172,25 +1153,13 @@ if mt != "spot" and exchange not in ("binance", "bybit"):
     if need_usdt <= 0:
         return {"ok": False, "skipped": True, "api_error": None}
 
-
-# fetch keys (SPOT: try confirmations in order, fallback to next/third if needed)
-row = None
-if mt == "spot":
-    for ex_try in (spot_candidates or [exchange]):
-        r = await db_store.get_autotrade_keys_row(user_id=uid, exchange=ex_try, market_type=mt)
-        if r and bool(r.get("is_active")):
-            row = r
-            exchange = ex_try
-            break
-else:
+    # fetch keys
     row = await db_store.get_autotrade_keys_row(user_id=uid, exchange=exchange, market_type=mt)
-
-if not row or not bool(row.get("is_active")):
-    return {"ok": False, "skipped": True, "api_error": None}
+    if not row or not bool(row.get("is_active")):
+        return {"ok": False, "skipped": True, "api_error": None}
     try:
         api_key = _decrypt_token(row.get("api_key_enc"))
         api_secret = _decrypt_token(row.get("api_secret_enc"))
-        passphrase = _decrypt_token(row.get("passphrase_enc"))
     except Exception as e:
         await db_store.mark_autotrade_key_error(
             user_id=uid,
@@ -1212,49 +1181,6 @@ if not row or not bool(row.get("is_active")):
     tp2 = float(getattr(sig, "tp2", 0.0) or 0.0)
 
     try:
-
-if exchange in ("okx", "mexc", "gateio") and mt == "spot":
-    # Virtual TP/SL management for non-Binance/Bybit spot exchanges:
-    # we open a market BUY now, then autotrade_manager_loop will monitor price and market-sell on TP/SL levels.
-    try:
-        if exchange == "okx":
-            pp = (passphrase or "").strip()
-            if not pp:
-                return {"ok": False, "skipped": True, "api_error": "missing_passphrase"}
-            o = await _okx_spot_market_buy(api_key=api_key, api_secret=api_secret, passphrase=pp, symbol=symbol, quote_usdt=need_usdt)
-        elif exchange == "mexc":
-            o = await _mexc_spot_market_buy(api_key=api_key, api_secret=api_secret, symbol=symbol, quote_usdt=need_usdt)
-        else:
-            o = await _gateio_spot_market_buy(api_key=api_key, api_secret=api_secret, symbol=symbol, quote_usdt=need_usdt)
-    except Exception as e:
-        raise
-
-    # Best-effort filled base qty estimate (many APIs return it differently).
-    qty_est = (need_usdt / entry) if entry > 0 else 0.0
-    ref = {
-        "mode": "virtual_spot",
-        "exchange": exchange,
-        "entry_px": float(entry),
-        "qty": float(qty_est),
-        "tp1": float(tp1) if tp1 else 0.0,
-        "tp2": float(tp2) if tp2 else 0.0,
-        "sl": float(sl) if sl else 0.0,
-        "tp1_hit": False,
-        "tp1_qty": float(qty_est) * (_partial_close_pct("SPOT") / 100.0),
-        "order_raw": o,
-    }
-    await db_store.create_autotrade_position(
-        user_id=uid,
-        signal_id=int(getattr(sig, "signal_id", 0) or 0),
-        exchange=exchange,
-        market_type=mt,
-        symbol=symbol,
-        side="BUY",
-        allocated_usdt=float(need_usdt),
-        api_order_ref=json.dumps(ref),
-    )
-    return {"ok": True, "skipped": False, "api_error": None}
-
         if exchange == "bybit":
             category = "spot" if mt == "spot" else "linear"
             # Futures cap is user-defined (by margin). Spot cap is implicit (wallet balance).
@@ -1759,7 +1685,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 except Exception:
                     continue
                 ex = str(ref.get("exchange") or r.get("exchange") or "").lower()
-                if ex not in ("binance","bybit","okx","mexc","gateio"):
+                if ex not in ("binance", "bybit"):
                     continue
 
                 uid = int(r.get("user_id"))
@@ -1774,81 +1700,9 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 try:
                     api_key = _decrypt_token(row.get("api_key_enc"))
                     api_secret = _decrypt_token(row.get("api_secret_enc"))
-                    passphrase = _decrypt_token(row.get("passphrase_enc"))
                 except Exception:
                     continue
 
-
-# Virtual spot TP/SL management for okx/mexc/gateio (market-close on levels).
-if str(ref.get("mode") or "") == "virtual_spot" and mt == "spot":
-    try:
-        entry_px = float(ref.get("entry_px") or 0.0)
-        qty = float(ref.get("qty") or 0.0)
-        if qty <= 0 and entry_px > 0:
-            qty = float(r.get("allocated_usdt") or 0.0) / entry_px
-        tp1 = float(ref.get("tp1") or 0.0)
-        tp2 = float(ref.get("tp2") or 0.0)
-        sl = float(ref.get("sl") or 0.0)
-        tp1_hit = bool(ref.get("tp1_hit"))
-        qty_tp1 = float(ref.get("tp1_qty") or (qty * 0.5))
-        qty_rem = float(ref.get("qty_rem") or max(0.0, qty - qty_tp1))
-        # price
-        if ex == "okx":
-            px = await _okx_public_price(symbol)
-        elif ex == "mexc":
-            px = await _mexc_public_price(symbol)
-        else:
-            px = await _gateio_public_price(symbol)
-        px = float(px or 0.0)
-        if px <= 0:
-            continue
-
-        async def _sell(amount: float) -> None:
-            a = float(amount or 0.0)
-            if a <= 0:
-                return
-            if ex == "okx":
-                pp = (passphrase or "").strip()
-                if not pp:
-                    raise ExchangeAPIError("OKX passphrase missing")
-                await _okx_spot_market_sell(api_key=api_key, api_secret=api_secret, passphrase=pp, symbol=symbol, base_qty=a)
-            elif ex == "mexc":
-                await _mexc_spot_market_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, base_qty=a)
-            else:
-                await _gateio_spot_market_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, base_qty=a)
-
-        # Before TP1: check TP2 gap, SL, TP1
-        if not tp1_hit:
-            if tp2 > 0 and px >= tp2:
-                await _sell(qty)
-                await db_store.close_autotrade_position(user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED")
-                continue
-            if sl > 0 and px <= sl:
-                await _sell(qty)
-                await db_store.close_autotrade_position(user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED")
-                continue
-            if tp1 > 0 and px >= tp1:
-                await _sell(qty_tp1)
-                ref["tp1_hit"] = True
-                ref["qty_rem"] = qty_rem
-                ref["be"] = entry_px
-                await db_store.update_autotrade_order_ref(row_id=int(r.get("id")), api_order_ref=json.dumps(ref))
-                continue
-        else:
-            be = float(ref.get("be") or entry_px)
-            if be > 0 and px <= be:
-                await _sell(qty_rem)
-                await db_store.close_autotrade_position(user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED")
-                continue
-            if tp2 > 0 and px >= tp2:
-                await _sell(qty_rem)
-                await db_store.close_autotrade_position(user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED")
-                continue
-    except ExchangeAPIError as e:
-        logger.warning("virtual_spot manage error ex=%s sym=%s: %s", ex, symbol, str(e)[:200])
-    except Exception:
-        logger.exception("virtual_spot manage error")
-    continue
                 tp1_id = ref.get("tp1_order_id")
                 tp2_id = ref.get("tp2_order_id")
                 sl_id = ref.get("sl_order_id")
