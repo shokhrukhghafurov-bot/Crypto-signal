@@ -621,7 +621,7 @@ async def open_trade_once(
                 ex_market = str(existing.get("market") or "").upper()
                 st = str(existing.get("status") or "").upper()
                 closed_at = existing.get("closed_at")
-                ex_symbol = str(existing.get(\"symbol\") or \"\").upper()
+                ex_symbol = str(existing.get('symbol') or '').upper()
                 # Truly active -> treat as already opened
                 if (
                     ex_market == str(market or "").upper()
