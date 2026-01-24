@@ -204,6 +204,8 @@ ON CONFLICT (id) DO NOTHING;
           spot_enabled BOOLEAN NOT NULL DEFAULT FALSE,
           futures_enabled BOOLEAN NOT NULL DEFAULT FALSE,
 
+          spot_exchange_priority TEXT NOT NULL DEFAULT 'binance,bybit,okx,mexc,gateio',
+
           spot_exchange TEXT NOT NULL DEFAULT 'binance' CHECK (spot_exchange IN ('binance','bybit','okx','mexc','gateio')),
           futures_exchange TEXT NOT NULL DEFAULT 'binance' CHECK (futures_exchange IN ('binance','bybit','okx','mexc','gateio')),
 
@@ -220,8 +222,17 @@ ON CONFLICT (id) DO NOTHING;
         """)
 
         # Add constraints for existing installations (CREATE TABLE IF NOT EXISTS won't update old schema).
-        await conn.execute("""
-        DO $$
+        # Ensure spot_exchange_priority column exists (priority order for SPOT auto-trade)
+        try:
+            await conn.execute("""
+            ALTER TABLE autotrade_settings
+              ADD COLUMN IF NOT EXISTS spot_exchange_priority TEXT NOT NULL DEFAULT 'binance,bybit,okx,mexc,gateio';
+            """)
+        except Exception:
+            pass
+
+        # Add constraints for existing installations (CREATE TABLE IF NOT EXISTS won't update old schema).
+        await conn.execute("""DO $$
         BEGIN
           IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_spot_min') THEN
             ALTER TABLE autotrade_settings
@@ -1080,6 +1091,7 @@ async def get_autotrade_settings(user_id: int) -> Dict[str, Any]:
         row = await conn.fetchrow(
             """
             SELECT user_id, spot_enabled, futures_enabled,
+                   spot_exchange_priority,
                    spot_exchange, futures_exchange,
                    spot_amount_per_trade, futures_margin_per_trade,
                    futures_leverage, futures_cap
@@ -1101,6 +1113,7 @@ async def get_autotrade_settings(user_id: int) -> Dict[str, Any]:
                 "user_id": uid,
                 "spot_enabled": False,
                 "futures_enabled": False,
+                "spot_exchange_priority": "binance,bybit,okx,mexc,gateio",
                 "spot_exchange": "binance",
                 "futures_exchange": "binance",
                 "spot_amount_per_trade": 0.0,
@@ -1112,6 +1125,7 @@ async def get_autotrade_settings(user_id: int) -> Dict[str, Any]:
             "user_id": uid,
             "spot_enabled": bool(row.get("spot_enabled")),
             "futures_enabled": bool(row.get("futures_enabled")),
+            "spot_exchange_priority": str(row.get("spot_exchange_priority") or "binance,bybit,okx,mexc,gateio"),
             "spot_exchange": str(row.get("spot_exchange") or "binance"),
             "futures_exchange": str(row.get("futures_exchange") or "binance"),
             "spot_amount_per_trade": float(row.get("spot_amount_per_trade") or 0.0),
@@ -1258,6 +1272,61 @@ async def set_autotrade_futures_cap(user_id: int, cap_usdt: float) -> None:
             uid,
             cap,
         )
+
+
+
+async def set_spot_exchange_priority(user_id: int, priority: list[str] | str) -> None:
+    """Set SPOT exchange priority order for auto-trade.
+
+    Stores a comma-separated list in autotrade_settings.spot_exchange_priority.
+    Also updates autotrade_settings.spot_exchange to the first item for UI compatibility.
+    """
+    pool = get_pool()
+    uid = int(user_id)
+    # Normalize input
+    if isinstance(priority, str):
+        items = [p.strip().lower() for p in priority.split(",") if p.strip()]
+    else:
+        items = [str(p).strip().lower() for p in (priority or []) if str(p).strip()]
+    allowed = ["binance", "bybit", "okx", "mexc", "gateio"]
+    # keep allowed, unique, preserve order
+    out = []
+    for x in items:
+        if x in allowed and x not in out:
+            out.append(x)
+    # append missing allowed at end
+    for x in allowed:
+        if x not in out:
+            out.append(x)
+    csv = ",".join(out)
+    first = out[0] if out else "binance"
+
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO autotrade_settings(user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING;", uid)
+        await conn.execute(
+            """
+            UPDATE autotrade_settings
+            SET spot_exchange_priority=$2,
+                spot_exchange=$3,
+                updated_at=NOW()
+            WHERE user_id=$1
+            """,
+            uid,
+            csv,
+            first,
+        )
+
+async def get_spot_exchange_priority(user_id: int) -> list[str]:
+    """Get SPOT exchange priority order."""
+    st = await get_autotrade_settings(int(user_id))
+    csv = str(st.get("spot_exchange_priority") or "binance,bybit,okx,mexc,gateio")
+    items = [p.strip().lower() for p in csv.split(",") if p.strip()]
+    allowed = ["binance", "bybit", "okx", "mexc", "gateio"]
+    out = [x for x in items if x in allowed]
+    for x in allowed:
+        if x not in out:
+            out.append(x)
+    return out
 
 
 async def get_autotrade_keys_status(user_id: int) -> List[Dict[str, Any]]:
