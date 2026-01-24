@@ -75,7 +75,7 @@ def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
 async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
     # Never recurse. Send via bot API.
-    try:
+try:
         return await bot.send_message(chat_id, text, **kwargs)
     except TelegramForbiddenError:
         # User blocked the bot or cannot be contacted
@@ -135,7 +135,7 @@ try:
 except (ZoneInfoNotFoundError, FileNotFoundError):
     # If tzdata isn't installed or the key is invalid, fall back safely.
     # Prefer Moscow for your bot (as requested), otherwise UTC.
-    try:
+try:
         TZ_NAME = "Europe/Moscow"
         TZ = ZoneInfo(TZ_NAME)
     except Exception:
@@ -184,7 +184,7 @@ I18N_FILE = Path(__file__).with_name("i18n.json")
 
 def load_i18n() -> dict:
     # Load i18n from external file (preferred). Fall back to embedded defaults if needed.
-    try:
+try:
         if I18N_FILE.exists():
             data = json.loads(I18N_FILE.read_text(encoding="utf-8"))
             if isinstance(data, dict) and "en" in data:
@@ -251,7 +251,7 @@ def audit_i18n_keys(strict: bool | None = None) -> None:
     if strict is None:
         strict = os.getenv("STRICT_I18N", "1").lower() not in ("0", "false", "no", "off")
 
-    try:
+try:
         src = Path(__file__).read_text(encoding="utf-8")
     except Exception:
         logger.exception("i18n audit: failed to read source")
@@ -515,7 +515,7 @@ async def safe_edit(message: types.Message | None, txt: str, kb: types.InlineKey
         # message may be too old/not modified/etc. Fall back to send.
         pass
 
-    try:
+try:
         if message:
             await safe_send(message.chat.id, txt, reply_markup=kb)
     except Exception:
@@ -572,7 +572,7 @@ async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKe
     parts = _split_text(text)
 
     # Try to edit with the first chunk
-    try:
+try:
         await bot.edit_message_text(
             chat_id=chat_id,
             message_id=msg_id,
@@ -657,7 +657,7 @@ async def ensure_user(user_id: int) -> None:
         return
     # Create user row if missing and grant 24h Signal trial ONCE.
     # IMPORTANT: does NOT touch Arbitrage access.
-    try:
+try:
         await db_store.ensure_user_signal_trial(int(user_id))
     except Exception:
         logger.exception("ensure_user: failed")
@@ -708,7 +708,7 @@ async def get_user_row(user_id: int):
 def _access_status_from_row(row) -> str:
     # Global maintenance switch (Signal bot only).
     # Enable via env: SIGNAL_MAINTENANCE=1 or MAINTENANCE_MODE=1
-    try:
+try:
         import os
         mm = (os.getenv("SIGNAL_MAINTENANCE") or os.getenv("MAINTENANCE_MODE") or "").strip().lower()
         if mm in {"1", "true", "yes", "on"}:
@@ -740,7 +740,7 @@ def _access_status_from_row(row) -> str:
     if signal_expires_at is None:
         return "ok"
 
-    try:
+try:
         now = dt.datetime.now(dt.timezone.utc)
         if signal_expires_at < now:
             return "expired"
@@ -1524,7 +1524,7 @@ def _trade_status_emoji(status: str) -> str:
 # ---------------- broadcasting ----------------
 async def broadcast_signal(sig: Signal) -> None:
     # Global pause/maintenance for sending NEW signals (Signal Bot admin setting)
-    try:
+try:
         st = await db_store.get_signal_bot_settings()
         if bool(st.get('pause_signals')):
             logger.info("Signal broadcasting is paused (pause_signals=true). Skipping new signal %s %s", sig.market, sig.symbol)
@@ -1555,14 +1555,14 @@ async def broadcast_signal(sig: Signal) -> None:
 
     # Assign a globally unique signal_id from DB sequence (survives restarts).
     # This prevents collisions that cause "already opened" for unrelated signals after container restart.
-    try:
+try:
         sid = await db_store.next_signal_id()
         sig = replace(sig, signal_id=sid)
     except Exception as e:
         # Fallback to existing id if DB is unavailable; still log for visibility.
         logger.error("Failed to allocate signal_id from DB sequence: %s", e)
     # Save as last live signal for menu buttons
-    try:
+try:
         LAST_SIGNAL_BY_MARKET["SPOT" if sig.market == "SPOT" else "FUTURES"] = sig
     except Exception:
         pass
@@ -1570,7 +1570,7 @@ async def broadcast_signal(sig: Signal) -> None:
     logger.info("Broadcast signal id=%s %s %s %s conf=%s rr=%.2f", sig.signal_id, sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr))
     SIGNALS[sig.signal_id] = sig
     # Persist 'signals sent' counters in Postgres (dedup by sig_key)
-    try:
+try:
         await db_store.record_signal_sent(sig_key=sig_key, market=str(sig.market).upper(), signal_id=int(sig.signal_id or 0))
     except Exception:
         pass
@@ -1691,7 +1691,7 @@ async def lang_choose(call: types.CallbackQuery) -> None:
     if uid:
         set_lang(uid, lang)
     # show welcome + menu in-place
-    try:
+try:
         if call.message:
             await bot.edit_message_text(chat_id=uid, message_id=call.message.message_id, text=await status_text(uid, include_subscribed=True, include_hint=True), reply_markup=menu_kb(uid))
             return
@@ -1763,18 +1763,18 @@ async def status_text(uid: int, *, include_subscribed: bool = False, include_hin
         enabled = None
 
     # Global states
-    try:
+try:
         scanner_on = bool(getattr(backend, "scanner_running", True))
     except Exception:
         scanner_on = True
 
     # News / Macro status with reason + timer
-    try:
+try:
         news_stat = backend.get_news_status()
     except Exception:
         news_stat = {"action": "ALLOW", "reason": None, "until_ts": None}
 
-    try:
+try:
         macro_stat = backend.get_macro_status()
     except Exception:
         macro_stat = {"action": "ALLOW", "reason": None, "until_ts": None, "event": None, "window": None}
@@ -1857,7 +1857,7 @@ async def status_text(uid: int, *, include_subscribed: bool = False, include_hin
     out_lines.append(trf(uid, "status_next_macro", value=(next_macro or tr(uid, "status_next_macro_none"))))
 
     # Signal bot global state (pause / maintenance) from admin dashboard
-    try:
+try:
         sb = await db_store.get_signal_bot_settings()
         if bool(sb.get("maintenance_mode")):
             sig_state = tr(uid, "sig_state_maintenance")
@@ -2118,7 +2118,7 @@ async def notify_handler(call: types.CallbackQuery) -> None:
 
     parts = (call.data or "").split(":")
     # notify:set:on | notify:set:off | notify:back
-    try:
+try:
         action = parts[1]
     except Exception:
         action = ""
@@ -3127,7 +3127,7 @@ async def opened(call: types.CallbackQuery) -> None:
             return
 
     # Remove the ✅ ОТКРЫЛ СДЕЛКУ button from the original NEW SIGNAL message
-    try:
+try:
         if call.message:
             await safe_edit_markup(call.from_user.id, call.message.message_id, None)
     except Exception:
