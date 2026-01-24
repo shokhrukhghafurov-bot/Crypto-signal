@@ -2301,6 +2301,28 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
             await safe_edit(call.message, tr(uid, "at_choose_exchange"), kb.as_markup())
             return
 
+        # SPOT exchange priority move (up/down) for 5 exchanges
+        # callback: at:prmove:spot:up:<exchange> or at:prmove:spot:down:<exchange>
+        if action == "prmove" and len(parts) >= 5:
+            mt = parts[2]
+            direction = parts[3]
+            ex = parts[4]
+            if mt != "spot":
+                return
+            pr = await db_store.get_spot_exchange_priority(uid)
+            ex = (ex or "").lower().strip()
+            if ex in pr:
+                i = pr.index(ex)
+                if direction == "up" and i > 0:
+                    pr[i - 1], pr[i] = pr[i], pr[i - 1]
+                elif direction == "down" and i < len(pr) - 1:
+                    pr[i + 1], pr[i] = pr[i], pr[i + 1]
+                await db_store.set_spot_exchange_priority(uid, pr)
+            # re-render
+            pr2 = await db_store.get_spot_exchange_priority(uid)
+            await safe_edit(call.message, spot_priority_text(uid, pr2), spot_priority_kb(uid, pr2))
+            return
+
         if action == "exset" and len(parts) >= 4:
             mt = parts[2]
             ex = parts[3]
