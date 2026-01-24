@@ -204,8 +204,8 @@ ON CONFLICT (id) DO NOTHING;
           spot_enabled BOOLEAN NOT NULL DEFAULT FALSE,
           futures_enabled BOOLEAN NOT NULL DEFAULT FALSE,
 
-          spot_exchange TEXT NOT NULL DEFAULT 'binance' CHECK (spot_exchange IN ('binance','bybit')),
-          futures_exchange TEXT NOT NULL DEFAULT 'binance' CHECK (futures_exchange IN ('binance','bybit')),
+          spot_exchange TEXT NOT NULL DEFAULT 'binance' CHECK (spot_exchange IN ('binance','bybit','okx','mexc','gateio')),
+          futures_exchange TEXT NOT NULL DEFAULT 'binance' CHECK (futures_exchange IN ('binance','bybit','okx','mexc','gateio')),
 
           -- Amounts are validated both in bot UI and DB. 0 means "not set".
           spot_amount_per_trade NUMERIC(18,8) NOT NULL DEFAULT 0
@@ -241,7 +241,7 @@ ON CONFLICT (id) DO NOTHING;
         CREATE TABLE IF NOT EXISTS autotrade_keys (
           id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
           user_id BIGINT NOT NULL,
-          exchange TEXT NOT NULL CHECK (exchange IN ('binance','bybit')),
+          exchange TEXT NOT NULL CHECK (exchange IN ('binance','bybit','okx','mexc','gateio')),
           market_type TEXT NOT NULL CHECK (market_type IN ('spot','futures')),
           api_key_enc TEXT,
           api_secret_enc TEXT,
@@ -256,13 +256,43 @@ ON CONFLICT (id) DO NOTHING;
         );
         """)
 
+        # --- widen exchange CHECK constraints for spot (migrations) ---
+        # Older installations may have CHECK(exchange IN ('binance','bybit')) which blocks new exchanges.
+        # Attempt to drop and recreate standard check constraints (best-effort).
+        try:
+            await conn.execute("ALTER TABLE autotrade_keys DROP CONSTRAINT IF EXISTS autotrade_keys_exchange_check;")
+        except Exception:
+            pass
+        try:
+            await conn.execute("ALTER TABLE autotrade_keys ADD CONSTRAINT autotrade_keys_exchange_check CHECK (exchange IN ('binance','bybit','okx','mexc','gateio'));")
+        except Exception:
+            pass
+
+        try:
+            await conn.execute("ALTER TABLE autotrade_positions DROP CONSTRAINT IF EXISTS autotrade_positions_exchange_check;")
+        except Exception:
+            pass
+        try:
+            await conn.execute("ALTER TABLE autotrade_positions ADD CONSTRAINT autotrade_positions_exchange_check CHECK (exchange IN ('binance','bybit','okx','mexc','gateio'));")
+        except Exception:
+            pass
+
+        try:
+            await conn.execute("ALTER TABLE autotrade_settings DROP CONSTRAINT IF EXISTS autotrade_settings_spot_exchange_check;")
+        except Exception:
+            pass
+        try:
+            await conn.execute("ALTER TABLE autotrade_settings ADD CONSTRAINT autotrade_settings_spot_exchange_check CHECK (spot_exchange IN ('binance','bybit','okx','mexc','gateio'));")
+        except Exception:
+            pass
+
         # Stores allocated amounts for open autotrade positions (used to count "used" caps).
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS autotrade_positions (
           id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
           user_id BIGINT NOT NULL,
           signal_id BIGINT,
-          exchange TEXT NOT NULL CHECK (exchange IN ('binance','bybit')),
+          exchange TEXT NOT NULL CHECK (exchange IN ('binance','bybit','okx','mexc','gateio')),
           market_type TEXT NOT NULL CHECK (market_type IN ('spot','futures')),
           symbol TEXT NOT NULL,
           side TEXT NOT NULL,
@@ -1140,8 +1170,14 @@ async def set_autotrade_exchange(user_id: int, market_type: str, exchange: str) 
     uid = int(user_id)
     m = (market_type or "").lower().strip()
     ex = (exchange or "binance").lower().strip()
-    if ex not in ("binance", "bybit"):
-        ex = "binance"
+    if mt == "futures":
+        # Futures keys are supported only for Binance/Bybit
+        if ex not in ("binance", "bybit"):
+            ex = "binance"
+    else:
+        # Spot keys can be stored for multiple exchanges
+        if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
+            ex = "binance"
     col = "spot_exchange" if m == "spot" else "futures_exchange"
     async with pool.acquire() as conn:
         await conn.execute(
@@ -1262,8 +1298,12 @@ async def get_autotrade_keys_row(*, user_id: int, exchange: str, market_type: st
     uid = int(user_id)
     ex = (exchange or "binance").lower().strip()
     mt = (market_type or "spot").lower().strip()
-    if ex not in ("binance", "bybit"):
-        ex = "binance"
+    if mt == "futures":
+        if ex not in ("binance", "bybit"):
+            ex = "binance"
+    else:
+        if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
+            ex = "binance"
     if mt not in ("spot", "futures"):
         mt = "spot"
     async with pool.acquire() as conn:
@@ -1299,8 +1339,12 @@ async def create_autotrade_position(
     mt = (market_type or "spot").lower().strip()
     sym = str(symbol or "").upper().strip()
     side = str(side or "").upper().strip()
-    if ex not in ("binance", "bybit"):
-        ex = "binance"
+    if mt == "futures":
+        if ex not in ("binance", "bybit"):
+            ex = "binance"
+    else:
+        if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
+            ex = "binance"
     if mt not in ("spot", "futures"):
         mt = "spot"
     if not sym:
