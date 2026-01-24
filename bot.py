@@ -2440,13 +2440,13 @@ async def autotrade_input_handler(message: types.Message) -> None:
                         raise ValueError
                     if field == "spot_amount":
                         # Hard minimum: SPOT amount per trade must be >= 15 USDT
-                        if val < 10:
+                        if val < 15:
                             await message.answer(tr(uid, "at_min_spot_amount"))
                             return
                         await db_store.set_autotrade_amount(uid, "spot", val)
                     elif field == "fut_margin":
                         # Hard minimum: FUTURES margin per trade must be >= 10 USDT
-                        if val < 5:
+                        if val < 10:
                             await message.answer(tr(uid, "at_min_fut_margin"))
                             return
                         await db_store.set_autotrade_amount(uid, "futures", val)
