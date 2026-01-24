@@ -988,7 +988,8 @@ def spot_priority_text(uid: int, pr: list[str]) -> str:
     lines.append("")
     lines.append("Бот откроет сделку на первой бирже из вашего списка, которая:")
     lines.append("• есть в подтверждении сигнала (confirmations)")
-    lines.append("• имеет активные API ключи SPOT")
+    lines.append("• подключена у вас (есть API ключи SPOT)")
+    lines.append("• ключи активны (проверены)")
     return "\n".join(lines)
 
 def spot_priority_kb(uid: int, pr: list[str]) -> types.InlineKeyboardMarkup:
