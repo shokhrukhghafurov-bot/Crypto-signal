@@ -184,20 +184,28 @@ ON CONFLICT (id) DO NOTHING;
         await conn.execute("""
         DO $$
         BEGIN
-          -- Ensure updated minimum constraints (drop old ones if present)
-          IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_spot_min') THEN
-            ALTER TABLE autotrade_settings DROP CONSTRAINT ck_autotrade_spot_min;
-          END IF;
-          ALTER TABLE autotrade_settings
-            ADD CONSTRAINT ck_autotrade_spot_min
-            CHECK (spot_amount_per_trade = 0 OR spot_amount_per_trade >= 15);
+          -- Drop legacy constraints so new minimums can be enforced
+          BEGIN
+            ALTER TABLE autotrade_settings DROP CONSTRAINT IF EXISTS ck_autotrade_spot_min;
+          EXCEPTION WHEN undefined_object THEN
+            NULL;
+          END;
+          BEGIN
+            ALTER TABLE autotrade_settings DROP CONSTRAINT IF EXISTS ck_autotrade_futures_min;
+          EXCEPTION WHEN undefined_object THEN
+            NULL;
+          END;
 
-          IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_futures_min') THEN
-            ALTER TABLE autotrade_settings DROP CONSTRAINT ck_autotrade_futures_min;
+          IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_spot_min') THEN
+            ALTER TABLE autotrade_settings
+              ADD CONSTRAINT ck_autotrade_spot_min
+              CHECK (spot_amount_per_trade = 0 OR spot_amount_per_trade >= 15);
           END IF;
-          ALTER TABLE autotrade_settings
-            ADD CONSTRAINT ck_autotrade_futures_min
-            CHECK (futures_margin_per_trade = 0 OR futures_margin_per_trade >= 10);
+          IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_futures_min') THEN
+            ALTER TABLE autotrade_settings
+              ADD CONSTRAINT ck_autotrade_futures_min
+              CHECK (futures_margin_per_trade = 0 OR futures_margin_per_trade >= 10);
+          END IF;
         END $$;
         """)
 
@@ -1130,8 +1138,8 @@ async def set_autotrade_amount(user_id: int, market_type: str, amount_usdt: floa
     if amt < 0:
         amt = 0.0
     # Hard minimums (also enforced in DB schema):
-    # - SPOT amount per trade >= 10 USDT (or 0 when unset)
-    # - FUTURES margin per trade >= 5 USDT (or 0 when unset)
+    # - SPOT amount per trade >= 15 USDT (or 0 when unset)
+    # - FUTURES margin per trade >= 10 USDT (or 0 when unset)
     if m == "spot" and 0 < amt < 15:
         raise ValueError("SPOT amount per trade must be >= 15")
     if m != "spot" and 0 < amt < 10:
