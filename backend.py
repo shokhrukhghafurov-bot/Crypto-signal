@@ -3056,61 +3056,37 @@ class MultiExchangeData:
             r.raise_for_status()
             return await r.json()
 
-def _df_from_ohlcv(self, rows: List[List[Any]], order: str) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame()
+    def _df_from_ohlcv(self, rows: List[List[Any]], order: str) -> pd.DataFrame:
+        if not rows:
+            return pd.DataFrame()
 
-    # Binance-like: [open_time_ms, open, high, low, close, volume, close_time_ms, quote_volume, ...]
-    if order == "binance":
-        df = pd.DataFrame(rows, columns=[
-            "open_time","open","high","low","close","volume",
-            "close_time","quote_volume","n_trades","taker_base","taker_quote","ignore"
-        ])
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-        for col in ("open","high","low","close","volume","quote_volume"):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        if order == "binance":
+            df = pd.DataFrame(rows, columns=[
+                "open_time","open","high","low","close","volume",
+                "close_time","quote_volume","n_trades","taker_base","taker_quote","ignore"
+            ])
+            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+            for col in ("open","high","low","close","volume","quote_volume"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        elif order == "bybit":
+            df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","turnover"])
+            df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="ms")
+            for col in ("open","high","low","close","volume","turnover"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        elif order == "gateio":
+            # Expected rows: [open_time_sec, open, high, low, close, volume]
+            df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume"])
+            df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="s")
+            for col in ("open","high","low","close","volume"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","vol_ccy","vol_quote","confirm"])
+            df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="ms")
+            for col in ("open","high","low","close","volume","vol_ccy","vol_quote"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # MEXC spot v3: same layout as Binance but returns only the first 8 fields
-    elif order == "mexc":
-        df = pd.DataFrame(rows, columns=[
-            "open_time","open","high","low","close","volume",
-            "close_time","quote_volume"
-        ])
-        df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="ms")
-        for col in ("open","high","low","close","volume","quote_volume"):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Bybit: [open_time_ms, open, high, low, close, volume, turnover]
-    elif order == "bybit":
-        df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","turnover"])
-        df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="ms")
-        for col in ("open","high","low","close","volume","turnover"):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Gate spot candlesticks: [ts_sec, quote_vol, close, high, low, open, base_amt]
-    elif order == "gateio":
-        norm = []
-        for r in rows:
-            if not isinstance(r, (list, tuple)):
-                continue
-            rr = list(r)
-            if len(rr) == 6:
-                rr.append("0")
-            norm.append(rr[:7])
-        df = pd.DataFrame(norm, columns=["open_time","quote_volume","close","high","low","open","volume"])
-        df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="s")
-        for col in ("open","high","low","close","volume","quote_volume"):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # OKX: [open_time_ms, open, high, low, close, volume, vol_ccy, vol_quote, confirm]
-    else:
-        df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","vol_ccy","vol_quote","confirm"])
-        df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="ms")
-        for col in ("open","high","low","close","volume","vol_ccy","vol_quote"):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna(subset=["open","high","low","close"]).sort_values("open_time").reset_index(drop=True)
-    return df
+        df = df.dropna(subset=["open","high","low","close"]).sort_values("open_time").reset_index(drop=True)
+        return df
 
     async def klines_binance(self, symbol: str, interval: str, limit: int = 250) -> pd.DataFrame:
         url = f"{self.BINANCE_SPOT}/api/v3/klines"
@@ -3157,18 +3133,49 @@ def _df_from_ohlcv(self, rows: List[List[Any]], order: str) -> pd.DataFrame:
         rows = list(reversed(rows))
         return self._df_from_ohlcv(rows, "okx")
 
-async def klines_mexc(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-    url = f"{self.MEXC}/api/v3/klines"
-    params = {"symbol": symbol.upper(), "interval": interval, "limit": str(limit)}
-    raw = await self._get_json(url, params=params)
-    return self._df_from_ohlcv(raw, "mexc")
 
-async def klines_gateio(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-    pair = _gate_pair(symbol)
-    url = f"{self.GATEIO}/api/v4/spot/candlesticks"
-    params = {"currency_pair": pair, "interval": interval, "limit": str(limit)}
-    raw = await self._get_json(url, params=params)
-    return self._df_from_ohlcv(raw, "gateio")
+    async def klines_mexc(self, symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
+        """MEXC spot klines (same format as Binance /api/v3/klines)."""
+        url = f"{self.MEXC}/api/v3/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
+        raw = await self._get_json(url, params=params)
+        # MEXC spot klines response indices match Binance: [open_time, open, high, low, close, volume, ...]
+        return self._df_from_ohlcv(raw, "binance")
+
+    def gate_pair(self, symbol: str) -> str:
+        s = symbol.upper()
+        if s.endswith("USDT"):
+            return f"{s[:-4]}_USDT"
+        return s
+
+    async def klines_gateio(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+        """Gate.io spot candlesticks.
+
+        Gate returns rows like: [t, v, c, h, l, o] where t is unix seconds.
+        We normalize to [t, open, high, low, close, volume].
+        """
+        # Gate intervals are like: 15m, 1h, 4h
+        itv = interval if interval in ("15m", "1h", "4h") else "15m"
+        pair = self.gate_pair(symbol)
+        url = f"{self.GATEIO}/api/v4/spot/candlesticks"
+        params = {"currency_pair": pair, "interval": itv, "limit": str(limit)}
+        data = await self._get_json(url, params=params)
+        rows = data if isinstance(data, list) else []
+        out: list[list[Any]] = []
+        for r in rows:
+            try:
+                # Gate docs: [t, v, c, h, l, o]
+                t = float(r[0])
+                v = float(r[1])
+                c = float(r[2])
+                h = float(r[3])
+                l = float(r[4])
+                o = float(r[5])
+                out.append([t, o, h, l, c, v])
+            except Exception:
+                continue
+        out = list(reversed(out))  # oldest->newest
+        return self._df_from_ohlcv(out, "gateio")
 
 # ------------------ Indicators / engine ------------------
 def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -4756,7 +4763,8 @@ class Backend:
                         self.last_news_action = news_act
                         if news_act == "PAUSE_ALL":
                             continue
-                        async def fetch_exchange(name: str):
+
+                                                async def fetch_exchange(name: str):
                             try:
                                 if name == "BINANCE":
                                     df15 = await api.klines_binance(sym, "15m", 250)
@@ -4770,40 +4778,37 @@ class Backend:
                                     df15 = await api.klines_okx(sym, "15m", 200)
                                     df1h = await api.klines_okx(sym, "1h", 200)
                                     df4h = await api.klines_okx(sym, "4h", 200)
-                                elif name == "GATEIO":
+                                elif name == "MEXC":
+                                    df15 = await api.klines_mexc(sym, "15m", 250)
+                                    df1h = await api.klines_mexc(sym, "1h", 250)
+                                    df4h = await api.klines_mexc(sym, "4h", 250)
+                                else:
+                                    # GATEIO
                                     df15 = await api.klines_gateio(sym, "15m", 200)
                                     df1h = await api.klines_gateio(sym, "1h", 200)
                                     df4h = await api.klines_gateio(sym, "4h", 200)
-                                else:  # MEXC
-                                    df15 = await api.klines_mexc(sym, "15m", 200)
-                                    df1h = await api.klines_mexc(sym, "1h", 200)
-                                    df4h = await api.klines_mexc(sym, "4h", 200)
-
                                 res = evaluate_on_exchange(df15, df1h, df4h)
                                 return name, res
                             except Exception:
                                 return name, None
+
                         results = await asyncio.gather(
                             fetch_exchange("BINANCE"),
                             fetch_exchange("BYBIT"),
                             fetch_exchange("OKX"),
-                            fetch_exchange("GATEIO"),
                             fetch_exchange("MEXC"),
+                            fetch_exchange("GATEIO"),
                         )
                         good = [(name, r) for (name, r) in results if r is not None]
                         if not good:
                             continue
 
-                        # NEW: allow signal from a single exchange.
-                        # Pick the best exchange by confidence (fallback: rr).
+                        # Pick the best single exchange result (no 2-of-N requirement)
                         best_name, best_r = max(
                             good,
-                            key=lambda x: (
-                                int((x[1] or {}).get("confidence", 0) or 0),
-                                float((x[1] or {}).get("rr", 0.0) or 0.0),
-                            ),
+                            key=lambda x: (int(x[1].get("confidence", 0) or 0), float(x[1].get("rr", 0.0) or 0.0)),
                         )
-                        best_dir = best_r.get("direction") or "LONG"
+                        best_dir = str(best_r.get("direction") or "LONG").upper().strip()
                         supporters = [(best_name, best_r)]
 
                         entry = float(best_r["entry"])
@@ -4811,11 +4816,12 @@ class Backend:
                         tp1 = float(best_r["tp1"])
                         tp2 = float(best_r["tp2"])
                         rr = float(best_r["rr"])
-                        conf = int(best_r["confidence"])
+                        conf = int(best_r.get("confidence", 0) or 0)
 
-                        market = choose_market(float(best_r.get("adx1", 0.0)), float(best_r.get("atr_pct", 0.0)))
+                        market = choose_market(float(best_r.get("adx1", np.nan)), float(best_r.get("atr_pct", np.nan)))
                         min_conf = TA_MIN_SCORE_FUTURES if market == "FUTURES" else TA_MIN_SCORE_SPOT
-# Orderbook confirmation (FUTURES only, enabled via ENV)
+
+                        # Orderbook confirmation (FUTURES only, enabled via ENV)
                         if USE_ORDERBOOK and (not ORDERBOOK_FUTURES_ONLY or market == "FUTURES"):
                             ob_allows: List[bool] = []
                             ob_notes: List[str] = []
@@ -4825,26 +4831,22 @@ class Backend:
                                 ok, note = await orderbook_filter(api, ex, sym, best_dir)
                                 ob_allows.append(bool(ok))
                                 ob_notes.append(note)
-                            # If we checked at least one exchange and none allowed -> block signal
                             if ob_allows and not any(ob_allows):
-                                # keep a short reason in logs
                                 logger.info("[orderbook] block %s %s %s notes=%s", sym, market, best_dir, "; ".join(ob_notes)[:200])
                                 continue
-                        
+
                         if conf < min_conf or rr < 2.0:
                             continue
-                        
+
                         risk_notes = []
 
-                        # Add TA summary (real indicators) to the signal card
+                        # Add TA summary to the signal card (from best exchange)
                         try:
-                            best_supporter = max(supporters, key=lambda s: int(s[1].get("confidence", 0)))
-                            ta_block = str(best_supporter[1].get("ta_block", "") or "").strip()
+                            ta_block = str(best_r.get("ta_block", "") or "").strip()
                             if ta_block:
                                 risk_notes.append(ta_block)
                         except Exception:
                             pass
-
 
                         if news_act == "FUTURES_OFF" and market == "FUTURES":
                             market = "SPOT"
@@ -4853,58 +4855,44 @@ class Backend:
                             market = "SPOT"
                             risk_notes.append("⚠️ Futures signals are temporarily disabled (macro)")
 
-                        # Policy: SPOT + SHORT is confusing for most users. Default behavior:
-                        # auto-convert SPOT SHORT -> FUTURES SHORT (keeps Entry/SL/TP intact).
-                        # Exception: if futures signals are currently forced OFF (news/macro), we cannot convert,
-                        # so we skip such signals to avoid sending a non-executable SPOT SHORT.
-                        if market == "SPOT" and str(best_dir).upper() == "SHORT":
-                            fut_forced_off = any(
-                                ("Futures paused" in n) or ("Futures signals are temporarily disabled" in n)
-                                for n in risk_notes
-                            )
-                            if fut_forced_off:
-                                logger.info(
-                                    "[signal] skip %s %s %s reason=spot_short_but_futures_forced_off",
-                                    sym,
-                                    market,
-                                    best_dir,
-                                )
-                                continue
-
+                        # Policy: SPOT + SHORT is confusing for most users.
+                                                # Policy: SPOT + SHORT is confusing for most users.
+                        if market == "SPOT" and best_dir == "SHORT":
                             market = "FUTURES"
                             risk_notes.append("ℹ️ Auto-converted: SPOT SHORT → FUTURES")
-                            logger.info(
-                                "[signal] convert %s SPOT/SHORT -> FUTURES/SHORT",
-                                sym,
-                            )
+                            logger.info("[signal] convert %s SPOT/SHORT -> FUTURES/SHORT", sym)
 
-                        # NEW: confirmations = exchanges where the pair exists (has a public price)
-                        async def _pair_exists_on(ex: str) -> bool:
+                        # confirmations = list of exchanges where this pair exists (so Auto-trade can use any of them)
+                        async def _pair_exists(ex_name: str) -> bool:
                             try:
-                                exu = (ex or "").upper().strip()
+                                exu = (ex_name or "").upper().strip()
                                 if exu == "BINANCE":
                                     p = await self._fetch_rest_price("SPOT", sym)
-                                elif exu == "BYBIT":
+                                    return bool(p and float(p) > 0)
+                                if exu == "BYBIT":
                                     p = await self._fetch_bybit_price("SPOT", sym)
-                                elif exu == "OKX":
+                                    return bool(p and float(p) > 0)
+                                if exu == "OKX":
                                     p = await self._fetch_okx_price("SPOT", sym)
-                                elif exu == "MEXC":
+                                    return bool(p and float(p) > 0)
+                                if exu == "MEXC":
                                     p = await _mexc_public_price(sym)
-                                elif exu in ("GATE", "GATEIO"):
+                                    return bool(p and float(p) > 0)
+                                if exu == "GATEIO":
                                     p = await _gateio_public_price(sym)
-                                else:
-                                    return False
-                                return bool(p and float(p) > 0)
+                                    return bool(p and float(p) > 0)
+                                return False
                             except Exception:
                                 return False
 
-                        ex_list = ["GATEIO", "BINANCE", "OKX", "BYBIT", "MEXC"]
-                        checks = await asyncio.gather(*[_pair_exists_on(ex) for ex in ex_list])
-                        pair_exchanges = [ex for ex, ok in zip(ex_list, checks) if ok]
+                        ex_order = ["GATEIO", "BINANCE", "OKX", "BYBIT", "MEXC"]
+                        exists_flags = await asyncio.gather(*[_pair_exists(x) for x in ex_order])
+                        pair_exchanges = [x for x, ok in zip(ex_order, exists_flags) if ok]
                         if not pair_exchanges:
                             pair_exchanges = [best_name]
                         conf_names = "+".join(pair_exchanges)
-                        sid = self.next_signal_id()
+
+sid = self.next_signal_id()
                         sig = Signal(
                             signal_id=sid,
                             market=market,
