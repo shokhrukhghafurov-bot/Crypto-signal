@@ -2731,19 +2731,69 @@ async def autotrade_input_handler(message: types.Message) -> None:
                     raw_err = str(res.get("error") or "API error")
 
                     # Map raw exchange errors to user-friendly messages.
-                    raw_low = raw_err.lower()
-                    if ex == "binance" and ("api-key format invalid" in raw_low or "-2014" in raw_low):
-                        user_key = "at_keys_binance_format"
-                    elif ex == "binance" and ("-2015" in raw_low or "invalid api-key" in raw_low):
-                        user_key = "at_keys_binance_invalid"
-                    elif ex == "bybit" and ("10003" in raw_low or "api key is invalid" in raw_low):
-                        user_key = "at_keys_bybit_invalid"
-                    elif ex == "okx" and ("50111" in raw_low or "invalid ok-access-key" in raw_low):
-                        user_key = "at_keys_okx_invalid"
-                    elif ("whitelist" in raw_low) or ("ip" in raw_low and "not" in raw_low and "allowed" in raw_low) or ("restricted" in raw_low and "ip" in raw_low):
-                        user_key = "at_keys_ip_restricted"
-                    else:
-                        user_key = "at_keys_api_error"
+raw_low = raw_err.lower()
+
+# --- BINANCE ---
+if ex == "binance" and ("api-key format invalid" in raw_low or "-2014" in raw_low):
+    user_key = "at_keys_binance_format"
+elif ex == "binance" and ("-2015" in raw_low or "invalid api-key" in raw_low or "invalid api-key, ip, or permissions" in raw_low):
+    user_key = "at_keys_binance_invalid"
+elif ex == "binance" and ("-1021" in raw_low or "timestamp" in raw_low):
+    user_key = "at_keys_binance_time"
+elif ex == "binance" and ("-1003" in raw_low or "too many requests" in raw_low or "rate limit" in raw_low):
+    user_key = "at_keys_binance_rate"
+elif ex == "binance" and ("permission" in raw_low or "not authorized" in raw_low or "unauthorized" in raw_low):
+    user_key = "at_keys_binance_perm"
+
+# --- BYBIT ---
+elif ex == "bybit" and ("10003" in raw_low or "api key is invalid" in raw_low or "invalid api key" in raw_low):
+    user_key = "at_keys_bybit_invalid"
+elif ex == "bybit" and ("invalid signature" in raw_low or "error sign" in raw_low or "signature" in raw_low and "invalid" in raw_low):
+    user_key = "at_keys_bybit_signature"
+elif ex == "bybit" and ("permission" in raw_low or "not authorized" in raw_low or "forbidden" in raw_low or "denied" in raw_low):
+    user_key = "at_keys_bybit_perm"
+elif ex == "bybit" and ("timestamp" in raw_low or "time window" in raw_low or "recv_window" in raw_low):
+    user_key = "at_keys_bybit_time"
+elif ex == "bybit" and ("too many requests" in raw_low or "rate limit" in raw_low):
+    user_key = "at_keys_bybit_rate"
+
+# --- OKX ---
+elif ex == "okx" and ("50111" in raw_low or "invalid ok-access-key" in raw_low):
+    user_key = "at_keys_okx_invalid"
+elif ex == "okx" and ("passphrase" in raw_low and "invalid" in raw_low):
+    user_key = "at_keys_okx_passphrase"
+elif ex == "okx" and ("whitelist" in raw_low or ("ip" in raw_low and "not" in raw_low and "allowed" in raw_low)):
+    user_key = "at_keys_okx_ip"
+
+# --- MEXC ---
+elif ex == "mexc" and ("invalid api key" in raw_low or "api key not exists" in raw_low or "api key information invalid" in raw_low or "apikey information invalid" in raw_low):
+    user_key = "at_keys_mexc_invalid"
+elif ex == "mexc" and ("invalid signature" in raw_low or ("signature" in raw_low and "invalid" in raw_low)):
+    user_key = "at_keys_mexc_signature"
+elif ex == "mexc" and ("whitelist" in raw_low or ("ip" in raw_low and "not" in raw_low and "allowed" in raw_low)):
+    user_key = "at_keys_mexc_ip"
+elif ex == "mexc" and ("permission" in raw_low or "forbidden" in raw_low or "not authorized" in raw_low):
+    user_key = "at_keys_mexc_perm"
+elif ex == "mexc" and ("too many requests" in raw_low or "rate limit" in raw_low):
+    user_key = "at_keys_mexc_rate"
+
+# --- GATE.IO ---
+elif ex == "gateio" and ("invalid key" in raw_low or "invalid api key" in raw_low or "authentication failed" in raw_low):
+    user_key = "at_keys_gate_invalid"
+elif ex == "gateio" and ("invalid signature" in raw_low or ("signature" in raw_low and "invalid" in raw_low)):
+    user_key = "at_keys_gate_signature"
+elif ex == "gateio" and ("whitelist" in raw_low or ("ip" in raw_low and "not" in raw_low and "allowed" in raw_low)):
+    user_key = "at_keys_gate_ip"
+elif ex == "gateio" and ("permission" in raw_low or "forbidden" in raw_low or "not authorized" in raw_low):
+    user_key = "at_keys_gate_perm"
+elif ex == "gateio" and ("too many requests" in raw_low or "rate limit" in raw_low):
+    user_key = "at_keys_gate_rate"
+
+# --- Generic IP restriction fallback ---
+elif ("whitelist" in raw_low) or (("restricted" in raw_low) and ("ip" in raw_low)):
+    user_key = "at_keys_ip_restricted"
+else:
+    user_key = "at_keys_api_error"
 
                     # Store raw error (inactive) so UI shows ❌ and for troubleshooting.
                     try:
