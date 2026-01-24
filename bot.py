@@ -2872,15 +2872,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trades:page:"))
 async def trades_page(call: types.CallbackQuery) -> None:
-    # CallbackQuery must be answered quickly; old buttons (or slow handlers) can raise:
-    # "query is too old and response timeout expired or query ID is invalid".
-    try:
-        await call.answer()
-    except TelegramBadRequest as e:
-        if "query is too old" in str(e).lower() or "response timeout" in str(e).lower() or "query id is invalid" in str(e).lower():
-            # Ignore stale callback; proceed with sending a new message.
-            pass
-        raise
+    await call.answer()
     try:
         offset = int((call.data or "").split(":")[-1])
     except Exception:
@@ -3091,7 +3083,12 @@ async def opened(call: types.CallbackQuery) -> None:
             row = None
 
         st = str((row or {}).get('status') or '').upper() if isinstance(row, dict) else ''
-        if row and st in ("ACTIVE", "TP1"):
+        row_sym = str((row or {}).get('symbol') or '').upper() if isinstance(row, dict) else ''
+        row_mkt = str((row or {}).get('market') or '').upper() if isinstance(row, dict) else ''
+        sig_sym = str(getattr(sig, 'symbol', '') or '').upper()
+        sig_mkt = str(getattr(sig, 'market', '') or '').upper()
+        same_trade = bool(row) and st in ("ACTIVE", "TP1") and row_sym == sig_sym and row_mkt == sig_mkt
+        if same_trade:
             # Already opened -> remove button to prevent retries
             try:
                 if call.message:
@@ -3101,6 +3098,14 @@ async def opened(call: types.CallbackQuery) -> None:
             await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
             await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
             return
+        # If we found an ACTIVE trade for this signal_id but it belongs to another signal (symbol/market mismatch),
+        # treat it as a signal_id collision and retry with a fresh signal_id below.
+        if row and st in ("ACTIVE", "TP1") and not same_trade:
+            try:
+                logger.warning("signal_id collision: uid=%s signal_id=%s row=%s/%s sig=%s/%s", call.from_user.id, sig.signal_id, row_mkt, row_sym, sig_mkt, sig_sym)
+            except Exception:
+                pass
+            row = None
 
         # No ACTIVE trade found, but insert was blocked.
         # Re-try with a fresh unique signal_id (prevents "phantom already opened" situations).
