@@ -621,8 +621,14 @@ async def open_trade_once(
                 ex_market = str(existing.get("market") or "").upper()
                 st = str(existing.get("status") or "").upper()
                 closed_at = existing.get("closed_at")
+                ex_symbol = str(existing.get(\"symbol\") or \"\").upper()
                 # Truly active -> treat as already opened
-                if ex_market == str(market or "").upper() and st in ("ACTIVE", "TP1") and closed_at is None:
+                if (
+                    ex_market == str(market or "").upper()
+                    and ex_symbol == str(symbol or "").upper()
+                    and st in ("ACTIVE", "TP1")
+                    and closed_at is None
+                ):
                     return False, None
 
             # 3) Reopen fallback: generate a new callback-safe signal_id and insert.
