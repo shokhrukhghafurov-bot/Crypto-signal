@@ -931,9 +931,9 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
     need_usdt = spot_amt if mt == "spot" else fut_margin
     # Hard minimums (validated in bot UI and DB, but re-checked here for safety)
-    if mt == "spot" and 0 < need_usdt < 10:
+    if mt == "spot" and 0 < need_usdt < 15:
         return {"ok": False, "skipped": True, "api_error": None}
-    if mt == "futures" and 0 < need_usdt < 5:
+    if mt == "futures" and 0 < need_usdt < 10:
         return {"ok": False, "skipped": True, "api_error": None}
     if need_usdt <= 0:
         return {"ok": False, "skipped": True, "api_error": None}
