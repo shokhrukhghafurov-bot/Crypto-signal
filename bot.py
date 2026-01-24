@@ -303,7 +303,9 @@ def tr_market(uid: int, market: str) -> str:
     return tr(uid, "lbl_spot") if (market or "").upper().strip() == "SPOT" else tr(uid, "lbl_futures")
 
 SIGNALS: Dict[int, Signal] = {}
+SIGNALS_BY_KEY: Dict[str, Signal] = {}
 ORIGINAL_SIGNAL_TEXT: Dict[tuple[int,int], str] = {}  # (uid, signal_id) -> text
+ORIGINAL_SIGNAL_TEXT_BY_KEY: Dict[tuple[int,str], str] = {}  # (uid, sig_key) -> text
 
 # Anti-duplicate protection for broadcasted signals.
 # Some scanners can emit the same signal multiple times (sometimes with different IDs).
@@ -1570,21 +1572,24 @@ async def broadcast_signal(sig: Signal) -> None:
 
     logger.info("Broadcast signal id=%s %s %s %s conf=%s rr=%.2f", sig.signal_id, sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr))
     SIGNALS[sig.signal_id] = sig
+    SIGNALS_BY_KEY[sig_key] = sig
     # Persist 'signals sent' counters in Postgres (dedup by sig_key)
     try:
         await db_store.record_signal_sent(sig_key=sig_key, market=str(sig.market).upper(), signal_id=int(sig.signal_id or 0))
     except Exception:
         pass
     ORIGINAL_SIGNAL_TEXT[(0, sig.signal_id)] = _signal_text(0, sig)
+    ORIGINAL_SIGNAL_TEXT_BY_KEY[(0, sig_key)] = _signal_text(0, sig)
     kb = InlineKeyboardBuilder()
-    kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+    kb.button(text=tr(0, "btn_opened"), callback_data=f"openk:{sig_key}")
 
     uids = await get_broadcast_user_ids()
     for uid in uids:
         try:
             ORIGINAL_SIGNAL_TEXT[(uid, sig.signal_id)] = _signal_text(uid, sig)
+            ORIGINAL_SIGNAL_TEXT_BY_KEY[(uid, sig_key)] = _signal_text(uid, sig)
             kb_u = InlineKeyboardBuilder()
-            kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+            kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"openk:{sig_key}")
             await safe_send(uid, _signal_text(uid, sig), reply_markup=kb_u.as_markup())
 
             # Auto-trade: execute real orders asynchronously, without affecting broadcast.
@@ -2058,7 +2063,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             return
 
         kb = InlineKeyboardBuilder()
-        kb.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+        kb.button(text=tr(uid, "btn_opened"), callback_data=f"openk:{sig_key}")
         kb.adjust(1)
         await safe_edit(call.message, _signal_text(uid, sig), kb.as_markup())
         return
@@ -2263,7 +2268,7 @@ async def notify_handler(call: types.CallbackQuery) -> None:
             await _render_in_place(call, tr(uid, "no_live"), menu_kb(uid))
             return
         kb = InlineKeyboardBuilder()
-        kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+        kb.button(text=tr(0, "btn_opened"), callback_data=f"openk:{sig_key}")
         await safe_send(call.from_user.id, _signal_text(sig), reply_markup=kb.as_markup())
         return
 
@@ -3046,6 +3051,69 @@ async def trade_orig(call: types.CallbackQuery) -> None:
 
     await safe_send(call.from_user.id, "📌 Original signal (1:1)\n\n" + text, reply_markup=kb.as_markup())
 
+@dp.callback_query(lambda c: (c.data or "").startswith("openk:"))
+async def opened_key(call: types.CallbackQuery) -> None:
+    sig_key = ""
+    try:
+        sig_key = str((call.data or "").split(":", 1)[1]).strip()
+    except Exception:
+        await call.answer("Error", show_alert=True)
+        return
+
+    sig = SIGNALS_BY_KEY.get(sig_key)
+    if not sig:
+        await call.answer("Signal not available", show_alert=True)
+        return
+
+    allowed, reason, price = await backend.check_signal_openable(sig)
+    if not allowed:
+        mkt = (sig.market or "FUTURES").upper()
+        if LAST_SIGNAL_BY_MARKET.get(mkt) and LAST_SIGNAL_BY_MARKET[mkt].signal_id == sig.signal_id:
+            LAST_SIGNAL_BY_MARKET[mkt] = None
+        await _expire_signal_message(call, sig, reason, price)
+        await call.answer(tr(call.from_user.id, "sig_too_late_toast"), show_alert=True)
+        await safe_send(call.from_user.id, _too_late_text(call.from_user.id, sig, reason, price), reply_markup=menu_kb(call.from_user.id))
+        return
+
+    opened_ok = await backend.open_trade(call.from_user.id, sig, orig_text=_signal_text(call.from_user.id, sig), signal_key=sig_key)
+    if not opened_ok:
+        row = None
+        try:
+            row = await backend.get_trade_by_key(call.from_user.id, sig_key)
+        except Exception:
+            row = None
+
+        st = str((row or {}).get("status") or "").upper() if isinstance(row, dict) else ""
+        if row and st in ("ACTIVE", "TP1"):
+            try:
+                if call.message:
+                    await safe_edit_markup(call.from_user.id, call.message.message_id, None)
+            except Exception:
+                pass
+            await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
+            await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
+            return
+
+        # Most likely: same symbol+market already active
+        await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
+        await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
+        return
+
+    # Success: remove inline button to prevent retries
+    try:
+        if call.message:
+            await safe_edit_markup(call.from_user.id, call.message.message_id, None)
+    except Exception:
+        pass
+
+    await call.answer(tr(call.from_user.id, "trade_opened_toast"), show_alert=True)
+    await safe_send(
+        call.from_user.id,
+        trf(call.from_user.id, "trade_opened_msg", sym=sig.symbol, mkt=tr_market(call.from_user.id, (sig.market or "FUTURES").upper())),
+        reply_markup=menu_kb(call.from_user.id),
+    )
+
+
 # ---------------- open signal ----------------
 @dp.callback_query(lambda c: (c.data or "").startswith("open:"))
 async def opened(call: types.CallbackQuery) -> None:
@@ -3060,9 +3128,14 @@ async def opened(call: types.CallbackQuery) -> None:
         await call.answer("Signal not available", show_alert=True)
         return
 
+    # Compute stable key and store for future lookups
+    import hashlib
+    sig_raw = f"{sig.market}|{sig.symbol}|{sig.direction}|{sig.timeframe}|{sig.entry}|{sig.sl}|{sig.tp1}|{sig.tp2}|{sig.confirmations}"
+    sig_key = hashlib.sha1(sig_raw.encode("utf-8")).hexdigest()
+    SIGNALS_BY_KEY[sig_key] = sig
+
     allowed, reason, price = await backend.check_signal_openable(sig)
     if not allowed:
-        # remove stale from Live cache
         mkt = (sig.market or "FUTURES").upper()
         if LAST_SIGNAL_BY_MARKET.get(mkt) and LAST_SIGNAL_BY_MARKET[mkt].signal_id == sig.signal_id:
             LAST_SIGNAL_BY_MARKET[mkt] = None
@@ -3071,20 +3144,16 @@ async def opened(call: types.CallbackQuery) -> None:
         await safe_send(call.from_user.id, _too_late_text(call.from_user.id, sig, reason, price), reply_markup=menu_kb(call.from_user.id))
         return
 
-    opened_ok = await backend.open_trade(call.from_user.id, sig, orig_text=_signal_text(call.from_user.id, sig))
+    opened_ok = await backend.open_trade(call.from_user.id, sig, orig_text=_signal_text(call.from_user.id, sig), signal_key=sig_key)
     if not opened_ok:
-        # IMPORTANT:
-        # Treat as "already opened" ONLY if the user has an ACTIVE/TP1 trade for this signal_id.
-        # This also protects from rare signal_id collisions after restarts / legacy DB constraints.
         row = None
         try:
-            row = await backend.get_trade(call.from_user.id, int(sig.signal_id))
+            row = await backend.get_trade_by_key(call.from_user.id, sig_key)
         except Exception:
             row = None
 
-        st = str((row or {}).get('status') or '').upper() if isinstance(row, dict) else ''
+        st = str((row or {}).get("status") or "").upper() if isinstance(row, dict) else ""
         if row and st in ("ACTIVE", "TP1"):
-            # Already opened -> remove button to prevent retries
             try:
                 if call.message:
                     await safe_edit_markup(call.from_user.id, call.message.message_id, None)
@@ -3094,954 +3163,20 @@ async def opened(call: types.CallbackQuery) -> None:
             await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
             return
 
-        # No ACTIVE trade found, but insert was blocked.
-        # Re-try with a fresh unique signal_id (prevents "phantom already opened" situations).
-        try:
-            new_sid = await db_store.next_signal_id()
-        except Exception:
-            import time as _time
-            new_sid = int(_time.time() * 1000)
+        await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
+        await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
+        return
 
-        try:
-            SIGNALS.pop(int(signal_id), None)
-        except Exception:
-            pass
-
-        from dataclasses import replace as _dc_replace
-
-        new_sig = sig
-        try:
-            new_sig = _dc_replace(sig, signal_id=int(new_sid))
-        except Exception:
-            new_sig = sig
-
-        SIGNALS[int(new_sid)] = new_sig
-        sig = new_sig
-
-        opened_ok = await backend.open_trade(call.from_user.id, sig, orig_text=_signal_text(call.from_user.id, sig))
-        if not opened_ok:
-            # Fallback: show message if still blocked
-            try:
-                if call.message:
-                    await safe_edit_markup(call.from_user.id, call.message.message_id, None)
-            except Exception:
-                pass
-            await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
-            await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
-            return
-
-    # Remove the ✅ ОТКРЫЛ СДЕЛКУ button from the original NEW SIGNAL message
     try:
         if call.message:
             await safe_edit_markup(call.from_user.id, call.message.message_id, None)
     except Exception:
         pass
 
-    await call.answer(tr(call.from_user.id, "trade_opened_toast"))
-    # IMPORTANT: send OPEN card only after user pressed ✅ ОТКРЫЛ СДЕЛКУ
+    await call.answer(tr(call.from_user.id, "trade_opened_toast"), show_alert=True)
     await safe_send(
         call.from_user.id,
-        _open_card_text(call.from_user.id, sig),
+        trf(call.from_user.id, "trade_opened_msg", sym=sig.symbol, mkt=tr_market(call.from_user.id, (sig.market or "FUTURES").upper())),
         reply_markup=menu_kb(call.from_user.id),
     )
 
-async def main() -> None:
-    import time
-    globals()["time"] = time
-
-    logger.info("Bot starting; TZ=%s", TZ_NAME)
-    await init_db()
-    load_langs()
-
-    # Refresh global Auto-trade pause/maintenance flags in background
-    asyncio.create_task(_autotrade_bot_global_loop())
-    await _refresh_autotrade_bot_global_once()
-
-    # --- Admin HTTP API for Status panel (Signal bot access) ---
-    # NOTE: Railway public domain requires an HTTP server listening on $PORT.
-    # We run a tiny aiohttp server alongside the Telegram bot.
-    async def _admin_http_app() -> web.Application:
-        app = web.Application()
-
-        # ---- Basic Auth ----
-        ADMIN_USER = os.getenv("SIGNAL_ADMIN_USER") or os.getenv("ADMIN_USER") or "admin"
-        ADMIN_PASS = os.getenv("SIGNAL_ADMIN_PASS") or os.getenv("ADMIN_PASS") or "password"
-
-        def _unauthorized() -> web.Response:
-            return web.Response(status=401, headers={"WWW-Authenticate": 'Basic realm="signal-admin"'})
-
-        def _check_basic(request: web.Request) -> bool:
-            auth = request.headers.get("Authorization", "")
-            if not auth.startswith("Basic "):
-                return False
-            import base64
-            try:
-                raw = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8")
-                u, p = raw.split(":", 1)
-                return (u == ADMIN_USER) and (p == ADMIN_PASS)
-            except Exception:
-                return False
-
-        # ---- CORS (for browser-based Status panel) ----
-        @web.middleware
-        async def cors_mw(request: web.Request, handler):
-            """CORS middleware + request-level error logging."""
-            # Preflight
-            if request.method == "OPTIONS":
-                resp = web.Response(status=204)
-            else:
-                try:
-                    resp = await handler(request)
-                except Exception:
-                    logger.exception("HTTP handler error: %s %s", request.method, request.path_qs)
-                    raise
-            origin = request.headers.get("Origin")
-            resp.headers["Access-Control-Allow-Origin"] = origin or "*"
-            resp.headers["Vary"] = "Origin"
-            resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PATCH,OPTIONS"
-            resp.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type"
-            resp.headers["Access-Control-Max-Age"] = "86400"
-            return resp
-
-
-        app.middlewares.append(cors_mw)
-
-        async def health(_: web.Request) -> web.Response:
-            return web.json_response({"ok": True, "service": "crypto-signal"})
-
-        # ---------------- AUTO-TRADE GLOBAL SETTINGS (pause/maintenance) ----------------
-
-        async def autotrade_get_settings(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            st = await db_store.get_autotrade_bot_settings()
-            return web.json_response({
-                "pause_autotrade": bool(st.get("pause_autotrade")),
-                "maintenance_mode": bool(st.get("maintenance_mode")),
-                "updated_at": (st.get("updated_at").isoformat() if st.get("updated_at") else None),
-            })
-
-        async def autotrade_save_settings(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            data = await request.json()
-            pause = bool(data.get("pause_autotrade", data.get("pauseAutotrade", False)))
-            maint = bool(data.get("maintenance_mode", data.get("maintenanceMode", False)))
-            await db_store.set_autotrade_bot_settings(pause_autotrade=pause, maintenance_mode=maint)
-            # refresh in-memory cache ASAP
-            AUTOTRADE_BOT_GLOBAL["pause_autotrade"] = pause
-            AUTOTRADE_BOT_GLOBAL["maintenance_mode"] = maint
-            return web.json_response({"ok": True})
-
-        # ---------------- BOT ADMIN (legacy subscriptions: expires_at + sub_*/notify_*) ----------------
-
-        async def bot_list_users(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            q = (request.query.get("query") or request.query.get("q") or "").strip()
-            flt = (request.query.get("filter") or "all").strip().lower()
-
-            async with pool.acquire() as conn:
-                where = []
-                args = []
-                if q:
-                    where.append("CAST(telegram_id AS TEXT) ILIKE $%d" % (len(args) + 1))
-                    args.append(f"%{q}%")
-                if flt == "active":
-                    where.append("COALESCE(is_blocked,FALSE)=FALSE")
-                    where.append("(expires_at IS NULL OR expires_at > now())")
-                elif flt == "expired":
-                    where.append("COALESCE(is_blocked,FALSE)=FALSE")
-                    where.append("expires_at IS NOT NULL")
-                    where.append("expires_at <= now()")
-                elif flt == "blocked":
-                    where.append("COALESCE(is_blocked,FALSE)=TRUE")
-                where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-
-                try:
-                    rows = await conn.fetch(
-                        f"""
-                        SELECT telegram_id, expires_at, COALESCE(is_blocked,FALSE) AS is_blocked,
-                               COALESCE(sub_spreads,FALSE) AS sub_spreads,
-                               COALESCE(sub_basis,FALSE) AS sub_basis,
-                               COALESCE(sub_dex_cex, COALESCE(sub_dexcex, FALSE)) AS sub_dex_cex,
-                               COALESCE(notify_spreads, FALSE) AS notify_spreads,
-                               COALESCE(notify_basis, FALSE) AS notify_basis,
-                               COALESCE(notify_dex_cex, COALESCE(notify_dexcex, FALSE)) AS notify_dex_cex
-                        FROM users
-                        {where_sql}
-                        ORDER BY telegram_id DESC
-                        LIMIT 500
-                        """,
-                        *args,
-                    )
-                except Exception:
-                    rows = await conn.fetch(
-                        f"""
-                        SELECT telegram_id, expires_at, COALESCE(is_blocked,FALSE) AS is_blocked
-                        FROM users
-                        {where_sql}
-                        ORDER BY telegram_id DESC
-                        LIMIT 500
-                        """,
-                        *args,
-                    )
-
-            items = []
-            for r in rows:
-                items.append({
-                    "telegram_id": int(r.get("telegram_id") or 0),
-                    "expires_at": (r.get("expires_at").isoformat() if r.get("expires_at") else None),
-                    "is_blocked": bool(r.get("is_blocked") or False),
-                    "sub_spreads": bool(r.get("sub_spreads") or False),
-                    "sub_basis": bool(r.get("sub_basis") or False),
-                    "sub_dex_cex": bool(r.get("sub_dex_cex") or False),
-                    "notify_spreads": bool(r.get("notify_spreads") or False),
-                    "notify_basis": bool(r.get("notify_basis") or False),
-                    "notify_dex_cex": bool(r.get("notify_dex_cex") or False),
-                })
-            return web.json_response({"ok": True, "items": items})
-
-        async def bot_create_user(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            data = await request.json()
-            tid = int(data.get("telegram_id") or 0)
-            if not tid:
-                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-            expires = _parse_iso_dt(data.get("expires_at"))
-            sub_spreads = bool(data.get("sub_spreads", True))
-            sub_basis = bool(data.get("sub_basis", True))
-            sub_dex = bool(data.get("sub_dex_cex", data.get("sub_dexcex", True)))
-            notify_spreads = bool(data.get("notify_spreads", sub_spreads))
-            notify_basis = bool(data.get("notify_basis", sub_basis))
-            notify_dex = bool(data.get("notify_dex_cex", data.get("notify_dexcex", sub_dex)))
-
-            await ensure_user(tid)
-            async with pool.acquire() as conn:
-                try:
-                    await conn.execute(
-                        """
-                        UPDATE users
-                           SET expires_at=$2::timestamptz,
-                               sub_spreads=$3,
-                               sub_basis=$4,
-                               sub_dex_cex=$5,
-                               notify_spreads=$6,
-                               notify_basis=$7,
-                               notify_dex_cex=$8
-                         WHERE telegram_id=$1
-                        """,
-                        tid, expires, sub_spreads, sub_basis, sub_dex, notify_spreads, notify_basis, notify_dex
-                    )
-                except Exception:
-                    await conn.execute(
-                        "UPDATE users SET expires_at=$2::timestamptz WHERE telegram_id=$1",
-                        tid, expires
-                    )
-            return web.json_response({"ok": True})
-
-        async def bot_patch_user(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            tid = int(request.match_info.get("telegram_id") or 0)
-            if not tid:
-                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-            data = await request.json()
-            data = data or {}
-            await ensure_user(tid)
-
-            expires = _parse_iso_dt(data.get("expires_at")) if ("expires_at" in data) else None
-            is_blocked = data.get("is_blocked")
-
-            sub_spreads = data.get("sub_spreads")
-            sub_basis = data.get("sub_basis")
-            sub_dex = data.get("sub_dex_cex", data.get("sub_dexcex"))
-            notify_spreads = data.get("notify_spreads")
-            notify_basis = data.get("notify_basis")
-            notify_dex = data.get("notify_dex_cex", data.get("notify_dexcex"))
-
-            async with pool.acquire() as conn:
-                if expires is not None:
-                    await conn.execute("UPDATE users SET expires_at=$2::timestamptz WHERE telegram_id=$1", tid, expires)
-                if is_blocked is not None:
-                    await conn.execute("UPDATE users SET is_blocked=$2 WHERE telegram_id=$1", tid, bool(is_blocked))
-                try:
-                    sets = []
-                    args = [tid]
-
-                    def add_set(col, val):
-                        nonlocal sets, args
-                        sets.append(f"{col}=$%d" % (len(args) + 1))
-                        args.append(bool(val))
-
-                    if sub_spreads is not None:
-                        add_set("sub_spreads", sub_spreads)
-                    if sub_basis is not None:
-                        add_set("sub_basis", sub_basis)
-                    if sub_dex is not None:
-                        add_set("sub_dex_cex", sub_dex)
-                    if notify_spreads is not None:
-                        add_set("notify_spreads", notify_spreads)
-                    if notify_basis is not None:
-                        add_set("notify_basis", notify_basis)
-                    if notify_dex is not None:
-                        add_set("notify_dex_cex", notify_dex)
-
-                    if sets:
-                        await conn.execute("UPDATE users SET " + ", ".join(sets) + " WHERE telegram_id=$1", *args)
-                except Exception:
-                    pass
-
-            return web.json_response({"ok": True})
-
-        async def bot_user_action(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            tid = int(request.match_info.get("telegram_id") or 0)
-            act = (request.match_info.get("action") or "").strip().lower()
-            if not tid or not act:
-                return web.json_response({"ok": False, "error": "bad request"}, status=400)
-            try:
-                data = await request.json()
-            except Exception:
-                data = {}
-
-            await ensure_user(tid)
-            async with pool.acquire() as conn:
-                if act == "extend":
-                    days = int((data or {}).get("days") or 30)
-                    await conn.execute(
-                        "UPDATE users SET expires_at = COALESCE(expires_at, now()) + make_interval(days => $2) WHERE telegram_id=$1",
-                        tid, days
-                    )
-                elif act == "block":
-                    await conn.execute("UPDATE users SET is_blocked=TRUE WHERE telegram_id=$1", tid)
-                elif act == "unblock":
-                    await conn.execute("UPDATE users SET is_blocked=FALSE WHERE telegram_id=$1", tid)
-                elif act == "delete":
-                    await conn.execute("DELETE FROM users WHERE telegram_id=$1", tid)
-                else:
-                    return web.json_response({"ok": False, "error": "unknown action"}, status=400)
-
-            return web.json_response({"ok": True})
-
-        async def list_users(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            q = (request.query.get("q") or "").strip()
-            flt = (request.query.get("filter") or "all").strip().lower()
-            async with pool.acquire() as conn:
-                where = []
-                args = []
-                if q:
-                    where.append("CAST(telegram_id AS TEXT) ILIKE $%d" % (len(args)+1))
-                    args.append(f"%{q}%")
-                if flt == "active":
-                    # Access is determined ONLY by expiry time + block, NOT by signal_enabled.
-                    where.append("COALESCE(is_blocked,FALSE)=FALSE")
-                    where.append("(signal_expires_at IS NULL OR signal_expires_at > now())")
-                elif flt == "expired":
-                    # Expired access (but not blocked). signal_enabled does not matter here.
-                    where.append("COALESCE(is_blocked,FALSE)=FALSE")
-                    where.append("signal_expires_at IS NOT NULL")
-                    where.append("signal_expires_at <= now()")
-                elif flt == "blocked":
-                    where.append("COALESCE(is_blocked,FALSE)=TRUE")
-                where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-                rows = await conn.fetch(
-                    f"""
-                    SELECT telegram_id, signal_enabled, signal_expires_at, COALESCE(is_blocked,FALSE) AS is_blocked,
-                           COALESCE(autotrade_enabled,FALSE) AS autotrade_enabled, autotrade_expires_at,
-                           COALESCE(autotrade_stop_after_close,FALSE) AS autotrade_stop_after_close
-                    FROM users
-                    {where_sql}
-                    ORDER BY telegram_id DESC
-                    LIMIT 500
-                    """,
-                    *args,
-                )
-            out = []
-            for r in rows:
-                stop_flag = bool(r.get("autotrade_stop_after_close", False))
-                enabled_flag = bool(r.get("autotrade_enabled", False))
-                at_state = "STOP" if stop_flag else ("ON" if enabled_flag else "OFF")
-                out.append({
-                    "telegram_id": int(r["telegram_id"]),
-                    "signal_enabled": bool(r["signal_enabled"]),
-                    "signal_expires_at": (r["signal_expires_at"].isoformat() if r["signal_expires_at"] else None),
-                    "is_blocked": bool(r["is_blocked"]),
-                    "autotrade_enabled": bool(r.get("autotrade_enabled", False)),
-                    "autotrade_stop_after_close": stop_flag,
-                    "autotrade_state": at_state,
-                    "autotrade_expires_at": (r["autotrade_expires_at"].isoformat() if r.get("autotrade_expires_at") else None),
-                })
-            return web.json_response({"items": out})
-
-        async def signal_stats(request: web.Request) -> web.Response:
-            """Read-only aggregated statistics for the admin panel.
-
-            Returns counts for:
-              - signals sent: day/week/month
-              - trade outcomes & real pnl%: day/week/month per market (SPOT/FUTURES)
-
-            Trade stats are computed from Postgres trade_events (WIN/LOSS/BE/CLOSE + TP1).
-            This gives correct PnL% that matches how positions were closed.
-            """
-            if not _check_basic(request):
-                return _unauthorized()
-
-            now_tz = dt.datetime.now(TZ)
-
-            def _to_utc(d: dt.datetime) -> dt.datetime:
-                if d.tzinfo is None:
-                    d = d.replace(tzinfo=TZ)
-                return d.astimezone(dt.timezone.utc)
-
-            # Period boundaries in bot TZ (MSK by default)
-            day_start = now_tz.replace(hour=0, minute=0, second=0, microsecond=0)
-            week_start = (now_tz - dt.timedelta(days=now_tz.isoweekday() - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            month_start = now_tz.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-            ranges = {
-                "day": (_to_utc(day_start), _to_utc(now_tz)),
-                "week": (_to_utc(week_start), _to_utc(now_tz)),
-                "month": (_to_utc(month_start), _to_utc(now_tz)),
-            }
-            # Signals sent counters are stored in Postgres (signal_sent_events).
-            # Backward compatible fields: day/week/month totals + split day_spot/day_futures/...
-            signals: dict = {}
-            for k, (since, until) in ranges.items():
-                spot_n = 0
-                fut_n = 0
-                if pool is not None:
-                    try:
-                        counts = await db_store.count_signal_sent_by_market(since=since, until=until)
-                        spot_n = int(counts.get('SPOT') or 0)
-                        fut_n = int(counts.get('FUTURES') or 0)
-                    except Exception:
-                        spot_n = 0
-                        fut_n = 0
-                total_n = spot_n + fut_n
-                # legacy totals
-                signals[k] = total_n
-                # explicit totals + split
-                signals[f"{k}_total"] = total_n
-                signals[f"{k}_spot"] = spot_n
-                signals[f"{k}_futures"] = fut_n
-
-            async def _mk(market: str) -> dict:
-                out: dict[str, dict] = {}
-                for k, (since, until) in ranges.items():
-                    b = await db_store.perf_bucket_global(market, since=since, until=until)
-                    trades = int(b.get('trades') or 0)
-                    wins = int(b.get('wins') or 0)      # TP2 hits (WIN)
-                    losses = int(b.get('losses') or 0)  # SL hits (LOSS)
-                    be = int(b.get('be') or 0)          # BE hits
-                    tp1 = int(b.get('tp1_hits') or 0)   # TP1 hits (partial)
-                    closes = int(b.get('closes') or 0)  # manual CLOSE
-                    manual = max(0, closes)
-                    sum_pnl = float(b.get('sum_pnl_pct') or 0.0)
-                    avg_pnl = (sum_pnl / trades) if trades else 0.0
-                    out[k] = {
-                        "trades": trades,
-                        "tp2": wins,
-                        "sl": losses,
-                        "be": be,
-                        "tp1": tp1,
-                        "manual": manual,
-                        "sum_pnl_pct": sum_pnl,
-                        "avg_pnl_pct": avg_pnl,
-                    }
-                return out
-
-            perf = {
-                "spot": await _mk('SPOT'),
-                "futures": await _mk('FUTURES'),
-            }
-
-            return web.json_response({
-                "ok": True,
-                "signals": signals,
-                "perf": perf,
-            })
-
-        async def save_user(request: web.Request) -> web.Response:
-            """Create/update Signal + Auto-trade access for a user.
-
-            Expected JSON:
-              telegram_id (required)
-              signal_enabled (optional bool)
-              signal_expires_at (optional ISO)
-              add_days (optional int)  # +days for SIGNAL
-              autotrade_enabled (optional bool)
-              autotrade_expires_at (optional ISO)
-              autotrade_add_days (optional int)  # +days for AUTO-TRADE
-              is_blocked (optional bool)
-            """
-            if not _check_basic(request):
-                return _unauthorized()
-            data = await request.json()
-            tid = int(data.get("telegram_id") or 0)
-            if not tid:
-                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-
-            signal_enabled = bool(data.get("signal_enabled", True))
-            signal_expires_raw = data.get("signal_expires_at")
-            signal_expires = _parse_iso_dt(signal_expires_raw)
-            if signal_expires_raw and (signal_expires is None):
-                return web.json_response({"ok": False, "error": "bad signal_expires_at"}, status=400)
-            signal_add_days = int(data.get("add_days") or 0)
-
-            autotrade_enabled = bool(data.get("autotrade_enabled", False))
-            autotrade_expires_raw = data.get("autotrade_expires_at")
-            autotrade_expires = _parse_iso_dt(autotrade_expires_raw)
-            if autotrade_expires_raw and (autotrade_expires is None):
-                return web.json_response({"ok": False, "error": "bad autotrade_expires_at"}, status=400)
-            autotrade_add_days = int(data.get("autotrade_add_days") or 0)
-
-            is_blocked = data.get("is_blocked")
-
-            await ensure_user(tid)
-            async with pool.acquire() as conn:
-                # SIGNAL
-                if signal_add_days:
-                    await conn.execute(
-                        """UPDATE users
-                               SET signal_enabled = TRUE,
-                                   signal_expires_at = COALESCE(signal_expires_at, now()) + make_interval(days => $2)
-                             WHERE telegram_id=$1""",
-                        tid, signal_add_days,
-                    )
-                else:
-                    if signal_expires is not None:
-                        await conn.execute(
-                            """UPDATE users
-                                   SET signal_enabled=$2,
-                                       signal_expires_at=$3::timestamptz
-                                 WHERE telegram_id=$1""",
-                            tid, signal_enabled, signal_expires,
-                        )
-                    else:
-                        await conn.execute(
-                            """UPDATE users
-                                   SET signal_enabled=$2
-                                 WHERE telegram_id=$1""",
-                            tid, signal_enabled,
-                        )
-
-                # AUTO-TRADE
-                if autotrade_add_days:
-                    await conn.execute(
-                        """UPDATE users
-                               SET autotrade_enabled = TRUE,
-                                   autotrade_stop_after_close = FALSE,
-                                   autotrade_expires_at = COALESCE(autotrade_expires_at, now()) + make_interval(days => $2)
-                             WHERE telegram_id=$1""",
-                        tid, autotrade_add_days,
-                    )
-                else:
-                    # Admin OFF logic:
-                    #  - if no OPEN deals -> OFF immediately
-                    #  - if there are OPEN deals -> STOP (no new positions, wait for closes, then finalize -> OFF)
-                    open_n = 0
-                    try:
-                        open_n = int(await conn.fetchval(
-                            "SELECT COUNT(1) FROM autotrade_positions WHERE user_id=$1 AND status='OPEN'",
-                            tid,
-                        ) or 0)
-                    except Exception:
-                        open_n = 0
-
-                    if not bool(autotrade_enabled):
-                        if open_n > 0:
-                            # STOP
-                            if autotrade_expires is not None:
-                                await conn.execute(
-                                    """UPDATE users
-                                           SET autotrade_enabled=TRUE,
-                                               autotrade_stop_after_close=TRUE,
-                                               autotrade_expires_at=$2::timestamptz
-                                         WHERE telegram_id=$1""",
-                                    tid, autotrade_expires,
-                                )
-                            else:
-                                await conn.execute(
-                                    """UPDATE users
-                                           SET autotrade_enabled=TRUE,
-                                               autotrade_stop_after_close=TRUE
-                                         WHERE telegram_id=$1""",
-                                    tid,
-                                )
-                        else:
-                            # OFF
-                            if autotrade_expires is not None:
-                                await conn.execute(
-                                    """UPDATE users
-                                           SET autotrade_enabled=FALSE,
-                                               autotrade_stop_after_close=FALSE,
-                                               autotrade_expires_at=$2::timestamptz
-                                         WHERE telegram_id=$1""",
-                                    tid, autotrade_expires,
-                                )
-                            else:
-                                await conn.execute(
-                                    """UPDATE users
-                                           SET autotrade_enabled=FALSE,
-                                               autotrade_stop_after_close=FALSE
-                                         WHERE telegram_id=$1""",
-                                    tid,
-                                )
-                    else:
-                        # ON
-                        if autotrade_expires is not None:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=TRUE,
-                                           autotrade_stop_after_close=FALSE,
-                                           autotrade_expires_at=$2::timestamptz
-                                     WHERE telegram_id=$1""",
-                                tid, autotrade_expires,
-                            )
-                        else:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=TRUE,
-                                           autotrade_stop_after_close=FALSE
-                                     WHERE telegram_id=$1""",
-                                tid,
-                            )
-
-                if is_blocked is not None:
-                    try:
-                        await conn.execute("UPDATE users SET is_blocked=$2 WHERE telegram_id=$1", tid, bool(is_blocked))
-                    except Exception:
-                        pass
-
-            return web.json_response({"ok": True})
-        async def patch_user(request: web.Request) -> web.Response:
-            """Compat endpoint: PATCH /api/infra/admin/signal/users/{telegram_id}
-            Supports SIGNAL + AUTO-TRADE fields."""
-            if not _check_basic(request):
-                return _unauthorized()
-            tid = int(request.match_info.get("telegram_id") or 0)
-            if not tid:
-                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-            data = await request.json()
-            data = data or {}
-            data["telegram_id"] = tid
-
-            # Reuse the same logic as save_user by performing the updates here
-            signal_enabled = bool(data.get("signal_enabled", True))
-            signal_expires_raw = data.get("signal_expires_at")
-            signal_expires = _parse_iso_dt(signal_expires_raw)
-            if signal_expires_raw and (signal_expires is None):
-                return web.json_response({"ok": False, "error": "bad signal_expires_at"}, status=400)
-            signal_add_days = int(data.get("add_days") or 0)
-
-            autotrade_enabled = bool(data.get("autotrade_enabled", False))
-            autotrade_expires_raw = data.get("autotrade_expires_at")
-            autotrade_expires = _parse_iso_dt(autotrade_expires_raw)
-            if autotrade_expires_raw and (autotrade_expires is None):
-                return web.json_response({"ok": False, "error": "bad autotrade_expires_at"}, status=400)
-            autotrade_add_days = int(data.get("autotrade_add_days") or 0)
-
-            is_blocked = data.get("is_blocked")
-
-            await ensure_user(tid)
-            async with pool.acquire() as conn:
-                if signal_add_days:
-                    await conn.execute(
-                        """UPDATE users
-                               SET signal_enabled = TRUE,
-                                   signal_expires_at = COALESCE(signal_expires_at, now()) + make_interval(days => $2)
-                             WHERE telegram_id=$1""",
-                        tid, signal_add_days,
-                    )
-                else:
-                    if signal_expires is not None:
-                        await conn.execute(
-                            """UPDATE users
-                                   SET signal_enabled=$2,
-                                       signal_expires_at=$3::timestamptz
-                                 WHERE telegram_id=$1""",
-                            tid, signal_enabled, signal_expires,
-                        )
-                    else:
-                        await conn.execute(
-                            "UPDATE users SET signal_enabled=$2 WHERE telegram_id=$1",
-                            tid, signal_enabled,
-                        )
-
-                if autotrade_add_days:
-                    await conn.execute(
-                        """UPDATE users
-                               SET autotrade_enabled = TRUE,
-                                   autotrade_stop_after_close = FALSE,
-                                   autotrade_expires_at = COALESCE(autotrade_expires_at, now()) + make_interval(days => $2)
-                             WHERE telegram_id=$1""",
-                        tid, autotrade_add_days,
-                    )
-                else:
-                    # same STOP/OFF logic as save_user
-                    open_n = 0
-                    try:
-                        open_n = int(await conn.fetchval(
-                            "SELECT COUNT(1) FROM autotrade_positions WHERE user_id=$1 AND status='OPEN'",
-                            tid,
-                        ) or 0)
-                    except Exception:
-                        open_n = 0
-
-                    if not bool(autotrade_enabled):
-                        if open_n > 0:
-                            if autotrade_expires is not None:
-                                await conn.execute(
-                                    """UPDATE users
-                                           SET autotrade_enabled=TRUE,
-                                               autotrade_stop_after_close=TRUE,
-                                               autotrade_expires_at=$2::timestamptz
-                                         WHERE telegram_id=$1""",
-                                    tid, autotrade_expires,
-                                )
-                            else:
-                                await conn.execute(
-                                    """UPDATE users
-                                           SET autotrade_enabled=TRUE,
-                                               autotrade_stop_after_close=TRUE
-                                         WHERE telegram_id=$1""",
-                                    tid,
-                                )
-                        else:
-                            if autotrade_expires is not None:
-                                await conn.execute(
-                                    """UPDATE users
-                                           SET autotrade_enabled=FALSE,
-                                               autotrade_stop_after_close=FALSE,
-                                               autotrade_expires_at=$2::timestamptz
-                                         WHERE telegram_id=$1""",
-                                    tid, autotrade_expires,
-                                )
-                            else:
-                                await conn.execute(
-                                    """UPDATE users
-                                           SET autotrade_enabled=FALSE,
-                                               autotrade_stop_after_close=FALSE
-                                         WHERE telegram_id=$1""",
-                                    tid,
-                                )
-                    else:
-                        if autotrade_expires is not None:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=TRUE,
-                                           autotrade_stop_after_close=FALSE,
-                                           autotrade_expires_at=$2::timestamptz
-                                     WHERE telegram_id=$1""",
-                                tid, autotrade_expires,
-                            )
-                        else:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=TRUE,
-                                           autotrade_stop_after_close=FALSE
-                                     WHERE telegram_id=$1""",
-                                tid,
-                            )
-
-                if is_blocked is not None:
-                    try:
-                        await conn.execute("UPDATE users SET is_blocked=$2 WHERE telegram_id=$1", tid, bool(is_blocked))
-                    except Exception:
-                        pass
-
-            return web.json_response({"ok": True})
-        async def block_user(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            tid = int(request.match_info.get("telegram_id") or 0)
-            if not tid:
-                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-            async with pool.acquire() as conn:
-                await conn.execute("UPDATE users SET is_blocked=TRUE WHERE telegram_id=$1", tid)
-            return web.json_response({"ok": True})
-
-        async def unblock_user(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            tid = int(request.match_info.get("telegram_id") or 0)
-            if not tid:
-                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-            async with pool.acquire() as conn:
-                await conn.execute("UPDATE users SET is_blocked=FALSE WHERE telegram_id=$1", tid)
-            return web.json_response({"ok": True})
-
-
-        # -------- Signal bot: messages & settings (admin) --------
-
-        async def signal_get_settings(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            def _iso(v):
-                try:
-                    return v.isoformat() if v else None
-                except Exception:
-                    return None
-            try:
-                st = await db_store.get_signal_bot_settings()
-            except Exception:
-                st = {"pause_signals": False, "maintenance_mode": False, "updated_at": None}
-            try:
-                at = await db_store.get_autotrade_bot_settings()
-            except Exception:
-                at = {"pause_autotrade": False, "maintenance_mode": False, "updated_at": None}
-            return web.json_response({
-                "ok": True,
-                "pause_signals": bool(st.get("pause_signals")),
-                "maintenance_mode": bool(st.get("maintenance_mode")),
-                "updated_at": _iso(st.get("updated_at")),
-                # Auto-trade global toggles (admin)
-                "pause_autotrade": bool(at.get("pause_autotrade")),
-                "autotrade_maintenance_mode": bool(at.get("maintenance_mode")),
-                "autotrade_updated_at": _iso(at.get("updated_at")),
-                "support_username": (st.get("support_username") or SUPPORT_USERNAME),
-            })
-        async def signal_save_settings(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            data = await request.json()
-            pause_signals = bool(data.get("pause_signals"))
-            maintenance_mode = bool(data.get("maintenance_mode"))
-            # Support username (admin contact). Accept several key variants from UI.
-            support_username = (
-                data.get("support_username")
-                or data.get("SUPPORT_USERNAME")
-                or data.get("supportUsername")
-                or data.get("support")
-                or ""
-            )
-            if support_username is None:
-                support_username = ""
-            support_username = str(support_username).strip()
-            # Normalize: store without leading '@'
-            if support_username.startswith("@"):
-                support_username = support_username[1:].strip()
-            if not support_username:
-                support_username = None
-
-            pause_autotrade = bool(data.get("pause_autotrade"))
-            autotrade_maintenance_mode = bool(data.get("autotrade_maintenance_mode"))
-
-            await db_store.set_signal_bot_settings(
-                pause_signals=pause_signals,
-                maintenance_mode=maintenance_mode,
-                support_username=support_username,
-            )
-            # Apply immediately without restart
-            if support_username is not None:
-                global SUPPORT_USERNAME
-                SUPPORT_USERNAME = str(support_username).lstrip("@").strip()
-
-            await db_store.set_autotrade_bot_settings(
-                pause_autotrade=pause_autotrade,
-                maintenance_mode=autotrade_maintenance_mode,
-            )
-            return web.json_response({"ok": True})
-
-        async def signal_broadcast_text(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            data = await request.json()
-            text = str(data.get("text") or "").strip()
-            if not text:
-                return web.json_response({"ok": False, "error": "text required"}, status=400)
-            uids = await get_broadcast_user_ids()
-            total = len(uids)
-            sent = 0
-            for uid in uids:
-                try:
-                    await safe_send(int(uid), text)
-                    sent += 1
-                except Exception:
-                    pass
-            return web.json_response({"ok": True, "sent": sent, "total": total})
-
-        async def signal_send_text(request: web.Request) -> web.Response:
-            if not _check_basic(request):
-                return _unauthorized()
-            tid = int(request.match_info.get("telegram_id") or 0)
-            if not tid:
-                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-            data = await request.json()
-            text = str(data.get("text") or "").strip()
-            if not text:
-                return web.json_response({"ok": False, "error": "text required"}, status=400)
-            try:
-                await safe_send(tid, text)
-            except Exception as e:
-                return web.json_response({"ok": False, "error": str(e)}, status=500)
-            return web.json_response({"ok": True})
-
-
-        # Routes
-        app.router.add_route("GET", "/health", health)
-        app.router.add_route("GET", "/api/infra/admin/bot/users", bot_list_users)
-        app.router.add_route("POST", "/api/infra/admin/bot/users", bot_create_user)
-        app.router.add_route("PATCH", "/api/infra/admin/bot/users/{telegram_id}", bot_patch_user)
-        app.router.add_route("POST", "/api/infra/admin/bot/users/{telegram_id}/{action}", bot_user_action)
-        app.router.add_route("GET", "/api/infra/admin/signal/settings", signal_get_settings)
-        app.router.add_route("POST", "/api/infra/admin/signal/settings", signal_save_settings)
-        app.router.add_route("GET", "/api/infra/admin/autotrade/settings", autotrade_get_settings)
-        app.router.add_route("POST", "/api/infra/admin/autotrade/settings", autotrade_save_settings)
-        app.router.add_route("POST", "/api/infra/admin/signal/broadcast", signal_broadcast_text)
-        app.router.add_route("POST", "/api/infra/admin/signal/send/{telegram_id}", signal_send_text)
-        app.router.add_route("GET", "/api/infra/admin/signal/stats", signal_stats)
-        app.router.add_route("GET", "/api/infra/admin/signal/users", list_users)
-        app.router.add_route("POST", "/api/infra/admin/signal/users", save_user)
-        app.router.add_route("PATCH", "/api/infra/admin/signal/users/{telegram_id}", patch_user)
-        app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/block", block_user)
-        app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/unblock", unblock_user)
-        # Allow preflight
-        app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204))
-        return app
-
-    async def _start_http_server() -> None:
-        try:
-            port = int(os.getenv("PORT", "8080"))
-        except Exception:
-            port = 8080
-        app = await _admin_http_app()
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, host="0.0.0.0", port=port)
-        await site.start()
-        logger.info("Admin HTTP API started on 0.0.0.0:%s", port)
-
-    asyncio.create_task(_start_http_server())
-
-    # --- Single-instance guard (prevents Telegram getUpdates conflict) ---
-    # If multiple containers start simultaneously, only one should run polling & loops.
-    async def _try_acquire_singleton_lock() -> bool:
-        try:
-            async with pool.acquire() as conn:
-                v = await conn.fetchval("SELECT pg_try_advisory_lock(8313103750)")
-                return bool(v)
-        except Exception:
-            # If lock query fails, do not block startup.
-            return True
-
-    if not await _try_acquire_singleton_lock():
-        logger.warning("Another bot instance holds the polling lock; running HTTP server only (no polling/loops)")
-        await asyncio.Event().wait()
-
-    logger.info("Starting track_loop")
-    asyncio.create_task(backend.track_loop(bot))
-    logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
-    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
-
-    # Auto-trade manager (SL/TP/BE) - runs in background.
-    asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
