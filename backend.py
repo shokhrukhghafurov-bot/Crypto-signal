@@ -3012,8 +3012,8 @@ class MultiExchangeData:
     BINANCE_FUTURES = "https://fapi.binance.com"
     BYBIT = "https://api.bybit.com"
     OKX = "https://www.okx.com"
-    MEXC_SPOT = "https://api.mexc.com"
-    GATEIO = "https://api.gateio.ws"
+    MEXC = "https://api.mexc.com"
+    GATEIO = "https://api.gateio.ws/api/v4"
 
     def __init__(self) -> None:
         self.session: Optional[aiohttp.ClientSession] = None
@@ -3128,49 +3128,83 @@ class MultiExchangeData:
         return self._df_from_ohlcv(rows, "okx")
 
 
+    async def klines_mexc(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+        """Fetch klines from MEXC Spot (Binance-compatible /api/v3/klines).
 
-    def _gate_pair(self, symbol: str) -> str:
-        s = symbol.upper()
-        if s.endswith("USDT"):
-            return f"{s[:-4]}_USDT"
-        return s.replace("-", "_")
-
-    async def klines_mexc(self, symbol: str, interval: str, limit: int = 250) -> pd.DataFrame:
-        # MEXC Spot klines are Binance-compatible
-        url = f"{self.MEXC_SPOT}/api/v3/klines"
+        MEXC returns rows with 8 fields: [openTime, open, high, low, close, volume, closeTime, quoteVolume].
+        We normalize into the same OHLCV DataFrame shape used by Binance.
+        """
+        url = f"{self.MEXC}/api/v3/klines"
         params = {"symbol": symbol.upper(), "interval": interval, "limit": str(limit)}
         raw = await self._get_json(url, params=params)
-        return self._df_from_ohlcv(raw, "binance")
+        rows = raw if isinstance(raw, list) else []
+        norm: list[list] = []
+        for r in rows:
+            if not isinstance(r, (list, tuple)) or len(r) < 6:
+                continue
+            # Pad to Binance 12-col layout
+            open_t = r[0]
+            o = r[1]
+            h = r[2] if len(r) > 2 else None
+            l = r[3] if len(r) > 3 else None
+            c = r[4] if len(r) > 4 else None
+            v = r[5] if len(r) > 5 else None
+            close_t = r[6] if len(r) > 6 else None
+            quote_v = r[7] if len(r) > 7 else None
+            norm.append([open_t, o, h, l, c, v, close_t, quote_v, 0, 0, 0, 0])
+        return self._df_from_ohlcv(norm, "binance")
+
 
     async def klines_gateio(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        # Gate.io Spot candlesticks
-        pair = self._gate_pair(symbol)
-        url = f"{self.GATEIO}/api/v4/spot/candlesticks"
+        """Fetch klines from Gate.io Spot API v4 /spot/candlesticks.
+
+        Gate returns a list of arrays (most commonly 6 fields):
+          [t, v, c, h, l, o] where t is unix seconds.
+        We normalize to the same OHLCV DataFrame shape.
+        """
+        pair = _gate_pair(symbol)
+        url = f"{self.GATEIO}/spot/candlesticks"
         params = {"currency_pair": pair, "interval": interval, "limit": str(limit)}
         raw = await self._get_json(url, params=params)
-        # Gate returns list like: [t, v, c, h, l, o] (strings). t is in seconds.
-        if not raw:
-            return pd.DataFrame()
-        rows = []
-        for r in raw:
+        rows = raw if isinstance(raw, list) else []
+        norm: list[list] = []
+
+        # Convert interval to ms for a synthetic close_time
+        def _interval_ms(iv: str) -> int:
+            s = (iv or "").strip().lower()
             try:
-                t = int(float(r[0])) * 1000
-                v = float(r[1])
-                c = float(r[2])
-                h = float(r[3])
-                l = float(r[4])
-                o = float(r[5])
-                rows.append([t, o, h, l, c, v])
+                if s.endswith("m"):
+                    return int(float(s[:-1]) * 60_000)
+                if s.endswith("h"):
+                    return int(float(s[:-1]) * 3_600_000)
+                if s.endswith("d"):
+                    return int(float(s[:-1]) * 86_400_000)
+            except Exception:
+                return 0
+            return 0
+
+        step_ms = _interval_ms(interval)
+
+        for r in rows:
+            if not isinstance(r, (list, tuple)) or len(r) < 6:
+                continue
+            # Typical Gate: [t, v, c, h, l, o]
+            t_s = r[0]
+            v = r[1]
+            c = r[2]
+            h = r[3]
+            l = r[4]
+            o = r[5]
+            try:
+                t_ms = int(float(t_s) * 1000.0)
             except Exception:
                 continue
-        if not rows:
-            return pd.DataFrame()
-        df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume"])
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-        for col in ("open","high","low","close","volume"):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["open","high","low","close"]).sort_values("open_time").reset_index(drop=True)
-        return df
+            close_ms = t_ms + step_ms if step_ms > 0 else t_ms
+            # Pad to Binance 12-col layout
+            norm.append([t_ms, o, h, l, c, v, close_ms, 0, 0, 0, 0, 0])
+
+        return self._df_from_ohlcv(norm, "binance")
+
 
 # ------------------ Indicators / engine ------------------
 def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -4778,9 +4812,9 @@ class Backend:
                                     df1h = await api.klines_gateio(sym, "1h", 200)
                                     df4h = await api.klines_gateio(sym, "4h", 200)
                                 else:  # MEXC
-                                    df15 = await api.klines_mexc(sym, "15m", 250)
-                                    df1h = await api.klines_mexc(sym, "1h", 250)
-                                    df4h = await api.klines_mexc(sym, "4h", 250)
+                                    df15 = await api.klines_mexc(sym, "15m", 200)
+                                    df1h = await api.klines_mexc(sym, "1h", 200)
+                                    df4h = await api.klines_mexc(sym, "4h", 200)
                                 res = evaluate_on_exchange(df15, df1h, df4h)
                                 return name, res
                             except Exception:
@@ -4797,16 +4831,13 @@ class Backend:
                         if not good:
                             continue
 
+                        # Signal can be produced from a single exchange result.
                         best_name, best_r = max(
                             good,
-                            key=lambda x: (
-                                int(x[1].get("confidence", 0) or 0),
-                                float(x[1].get("rr", 0.0) or 0.0),
-                            ),
+                            key=lambda x: (int((x[1] or {}).get("confidence", 0) or 0), float((x[1] or {}).get("rr", 0.0) or 0.0)),
                         )
-
-                        best_dir = str(best_r["direction"])
-                        supporters: List[Tuple[str, Dict[str, Any]]] = [(best_name, best_r)]
+                        best_dir = best_r["direction"]
+                        supporters = [(best_name, best_r)]
 
                         entry = float(best_r["entry"])
                         sl = float(best_r["sl"])
@@ -4817,7 +4848,7 @@ class Backend:
 
                         market = choose_market(float(best_r.get("adx1", 0.0) or 0.0),
                                               float(best_r.get("atr_pct", 0.0) or 0.0))
-
+                        
                         min_conf = TA_MIN_SCORE_FUTURES if market == "FUTURES" else TA_MIN_SCORE_SPOT
 
 # Orderbook confirmation (FUTURES only, enabled via ENV)
@@ -4883,6 +4914,7 @@ class Backend:
                                 sym,
                             )
 
+# List exchanges where the symbol exists (public price available).
                         async def _pair_exists(ex: str) -> bool:
                             try:
                                 exu = (ex or "").upper().strip()
@@ -4891,7 +4923,7 @@ class Backend:
                                 elif exu == "BYBIT":
                                     p = await self._fetch_bybit_price("SPOT", sym)
                                 elif exu == "OKX":
-                                    p = await self._fetch_okx_price("SPOT", sym)
+                                    p = await _okx_public_price(sym)
                                 elif exu == "MEXC":
                                     p = await _mexc_public_price(sym)
                                 else:  # GATEIO
@@ -4900,12 +4932,13 @@ class Backend:
                             except Exception:
                                 return False
 
-                        ex_order = ["GATEIO", "BINANCE", "OKX", "BYBIT", "MEXC"]
-                        exists = await asyncio.gather(*[_pair_exists(ex) for ex in ex_order])
-                        pair_exchanges = [ex for ex, ok in zip(ex_order, exists) if ok]
-                        if not pair_exchanges:
-                            pair_exchanges = [best_name]
-                        conf_names = "+".join(pair_exchanges)
+                        _ex_order = ["GATEIO", "BINANCE", "OKX", "BYBIT", "MEXC"]
+                        _oks = await asyncio.gather(*[_pair_exists(x) for x in _ex_order])
+                        _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
+                        if not _pair_exchanges:
+                            _pair_exchanges = [best_name]
+                        conf_names = "+".join(_pair_exchanges)
+
 
                         sid = self.next_signal_id()
                         sig = Signal(
