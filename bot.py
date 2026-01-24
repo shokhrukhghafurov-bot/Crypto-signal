@@ -257,7 +257,7 @@ def audit_i18n_keys(strict: bool | None = None) -> None:
         logger.exception("i18n audit: failed to read source")
         return
 
-    keys = set(re.findall(r"\btrf?\(\s*[^,]+,\s*['"]([^'"]+)['"]\s*\)", src))
+    keys = set(re.findall(r'\btrf?\(\s*[^,]+,\s*["\']([^"\']+)["\']\s*\)', src))
     missing = []
     for k in sorted(keys):
         for lang in ("ru", "en"):
