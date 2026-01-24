@@ -2738,6 +2738,8 @@ async def autotrade_input_handler(message: types.Message) -> None:
                         user_key = "at_keys_binance_invalid"
                     elif ex == "bybit" and ("10003" in raw_low or "api key is invalid" in raw_low):
                         user_key = "at_keys_bybit_invalid"
+                    elif ex == "okx" and ("50111" in raw_low or "invalid ok-access-key" in raw_low):
+                        user_key = "at_keys_okx_invalid"
                     elif ("whitelist" in raw_low) or ("ip" in raw_low and "not" in raw_low and "allowed" in raw_low) or ("restricted" in raw_low and "ip" in raw_low):
                         user_key = "at_keys_ip_restricted"
                     else:
