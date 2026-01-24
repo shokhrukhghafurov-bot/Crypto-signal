@@ -1114,11 +1114,14 @@ def _fmt_pnl_line(pnl: float, roi: float) -> str:
 
 def autotrade_keys_kb(uid: int) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    # 4 sets (exchange+market)
-    for ex in ("binance", "bybit"):
+    # SPOT supports multiple exchanges
+    for ex in ("binance", "bybit", "okx", "mexc", "gateio"):
         kb.button(text=f"{ex.upper()} SPOT", callback_data=f"at:keys:set:{ex}:spot")
-        kb.button(text=f"{ex.upper()} FUTURES", callback_data=f"at:keys:set:{ex}:futures")
-        kb.adjust(2)
+        kb.adjust(1)
+    # FUTURES only Binance / Bybit
+    kb.button(text="BINANCE FUTURES", callback_data="at:keys:set:binance:futures")
+    kb.button(text="BYBIT FUTURES", callback_data="at:keys:set:bybit:futures")
+    kb.adjust(2)
     kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
     kb.adjust(1)
     return kb.as_markup()
@@ -2480,6 +2483,59 @@ async def autotrade_input_handler(message: types.Message) -> None:
             mt = (state.get("market_type") or "spot").lower()
             step = state.get("step") or "api_key"
 
+            if step == "passphrase":
+                api_key = (state.get("api_key") or "").strip()
+                api_secret = (state.get("api_secret") or "").strip()
+                passphrase = text
+                AUTOTRADE_INPUT.pop(uid, None)
+
+                # Validate (READ + TRADE). If TRADE missing -> reject.
+                try:
+                    res = await validate_autotrade_keys(exchange=ex, market_type=mt, api_key=api_key, api_secret=api_secret, passphrase=passphrase)
+                except Exception as e:
+                    res = {"ok": False, "read_ok": False, "trade_ok": False, "error": str(e)}
+
+                raw_err = str(res.get("error") or "")
+                if not bool(res.get("ok")):
+                    # map error
+                    await message.answer(trf(uid, "at_keys_api_error", exchange=ex.upper(), market=mt.upper()) + ("\n\n" + raw_err[:200] if raw_err else ""))
+                    try:
+                        await db_store.mark_autotrade_key_error(user_id=uid, exchange=ex, market_type=mt, error=raw_err or "invalid", deactivate=True)
+                    except Exception:
+                        pass
+                elif not bool(res.get("trade_ok")):
+                    await message.answer(tr(uid, "at_keys_trade_missing"))
+                    try:
+                        await db_store.mark_autotrade_key_error(user_id=uid, exchange=ex, market_type=mt, error="trade_permission_missing", deactivate=True)
+                    except Exception:
+                        pass
+                else:
+                    # Encrypt + store active
+                    try:
+                        f = _fernet()
+                    except Exception:
+                        await message.answer(tr(uid, "at_master_key_missing"))
+                    else:
+                        api_key_enc = f.encrypt(api_key.encode("utf-8")).decode("utf-8")
+                        api_secret_enc = f.encrypt(api_secret.encode("utf-8")).decode("utf-8")
+                        passphrase_enc = f.encrypt(passphrase.encode("utf-8")).decode("utf-8")
+                        await db_store.upsert_autotrade_keys(
+                            user_id=uid,
+                            exchange=ex,
+                            market_type=mt,
+                            api_key_enc=api_key_enc,
+                            api_secret_enc=api_secret_enc,
+                            passphrase_enc=passphrase_enc,
+                            is_active=True,
+                            last_error=None,
+                        )
+                    await message.answer(tr(uid, "at_keys_ok"))
+
+                st = await db_store.get_autotrade_settings(uid)
+                keys = await db_store.get_autotrade_keys_status(uid)
+                await message.answer(autotrade_text(uid, st, keys), reply_markup=autotrade_kb(uid, st, keys))
+                return
+
             if step == "api_key":
                 state["api_key"] = text
                 state["step"] = "api_secret"
@@ -2490,6 +2546,15 @@ async def autotrade_input_handler(message: types.Message) -> None:
             if step == "api_secret":
                 api_key = (state.get("api_key") or "").strip()
                 api_secret = text
+
+                # OKX requires an extra passphrase
+                if ex == "okx":
+                    state["api_secret"] = api_secret
+                    state["step"] = "passphrase"
+                    AUTOTRADE_INPUT[uid] = state
+                    await message.answer(tr(uid, "at_enter_passphrase", exchange=ex.upper(), market=mt.upper()))
+                    return
+
                 AUTOTRADE_INPUT.pop(uid, None)
 
                 # Basic pre-validation to avoid confusing raw exchange errors when
