@@ -91,13 +91,6 @@ async def ensure_schema() -> None:
         );
         """)
 
-        # Add signal_key column for stable callback identity (sig_key)
-        try:
-            await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS signal_key TEXT;")
-        except Exception:
-            pass
-
-
         # --- Signal bot global settings (single row) ---
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS signal_bot_settings (
@@ -175,11 +168,6 @@ ON CONFLICT (id) DO NOTHING;
         CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_user_signal_active
         ON trades (user_id, signal_id)
         WHERE status IN ('ACTIVE','TP1');
-
-        -- New: stable uniqueness by signal_key (preferred)
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_user_sigkey_active
-        ON trades (user_id, signal_key)
-        WHERE status IN ('ACTIVE','TP1') AND signal_key IS NOT NULL;
 """)
 
         await conn.execute("""
@@ -553,78 +541,6 @@ async def next_signal_id() -> int:
         v = await conn.fetchval("SELECT nextval('signal_seq');")
         return int(v) if v is not None else int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
 
-async def open_trade_once_key(
-    *,
-    user_id: int,
-    signal_key: str,
-    signal_id: int,
-    market: str,
-    symbol: str,
-    side: str,
-    entry: float,
-    tp1: float | None,
-    tp2: float | None,
-    sl: float | None,
-    orig_text: str,
-) -> Tuple[bool, Optional[int]]:
-    """Insert a new trade keyed by stable signal_key (preferred).
-
-    Falls back to signal_id-based insert if signal_key is empty.
-    """
-    sk = (signal_key or "").strip()
-    if not sk:
-        return await open_trade_once(
-            user_id=user_id, signal_id=signal_id, market=market, symbol=symbol, side=side,
-            entry=entry, tp1=tp1, tp2=tp2, sl=sl, orig_text=orig_text
-        )
-
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        # Prevent duplicate open trades per symbol+market for the same user.
-        existing_sym = await conn.fetchval(
-            """
-            SELECT id
-            FROM trades
-            WHERE user_id=$1
-              AND UPPER(market)=UPPER($2)
-              AND UPPER(symbol)=UPPER($3)
-              AND status IN ('ACTIVE','TP1')
-              AND closed_at IS NULL
-            ORDER BY opened_at DESC
-            LIMIT 1;
-            """,
-            int(user_id), str(market or ''), str(symbol or '')
-        )
-        if existing_sym is not None:
-            return False, None
-
-        async def _insert(with_signal_id: int) -> Optional[int]:
-            r = await conn.fetchrow(
-                """
-                INSERT INTO trades (user_id, signal_id, signal_key, market, symbol, side, entry, tp1, tp2, sl, status, orig_text)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'ACTIVE',$11)
-                ON CONFLICT (user_id, signal_key) WHERE status IN ('ACTIVE','TP1') DO NOTHING
-                RETURNING id;
-                """,
-                int(user_id), int(with_signal_id), sk, market, symbol, side, float(entry),
-                (float(tp1) if tp1 is not None else None),
-                (float(tp2) if tp2 is not None else None),
-                (float(sl) if sl is not None else None),
-                orig_text or "",
-            )
-            return int(r["id"]) if (r and r.get("id") is not None) else None
-
-        # Use provided signal_id (still stored for legacy)
-        trade_id = await _insert(int(signal_id))
-        if trade_id is not None:
-            await conn.execute("INSERT INTO trade_events (trade_id, event_type) VALUES ($1,'OPEN');", trade_id)
-            return True, trade_id
-
-        # If blocked, treat as already opened (by key)
-        return False, None
-
-
-
 async def open_trade_once(
     *,
     user_id: int,
@@ -705,8 +621,14 @@ async def open_trade_once(
                 ex_market = str(existing.get("market") or "").upper()
                 st = str(existing.get("status") or "").upper()
                 closed_at = existing.get("closed_at")
+                ex_symbol = str(existing.get('symbol') or '').upper()
                 # Truly active -> treat as already opened
-                if ex_market == str(market or "").upper() and st in ("ACTIVE", "TP1") and closed_at is None:
+                if (
+                    ex_market == str(market or "").upper()
+                    and ex_symbol == str(symbol or "").upper()
+                    and st in ("ACTIVE", "TP1")
+                    and closed_at is None
+                ):
                     return False, None
 
             # 3) Reopen fallback: generate a new callback-safe signal_id and insert.
@@ -734,7 +656,7 @@ async def list_user_trades(user_id: int, *, include_closed: bool = True, limit: 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
-            SELECT id, user_id, signal_id, signal_key, market, symbol, side, entry, tp1, tp2, sl,
+            SELECT id, user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl,
                    status, tp1_hit, be_price, opened_at, closed_at, pnl_total_pct, orig_text
             FROM trades
             WHERE {where}
@@ -750,33 +672,14 @@ async def get_trade_by_user_signal(user_id: int, signal_id: int) -> Optional[Dic
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id, user_id, signal_id, signal_key, market, symbol, side, entry, tp1, tp2, sl,
+            SELECT id, user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl,
                    status, tp1_hit, be_price, opened_at, closed_at, pnl_total_pct, orig_text
             FROM trades
             WHERE user_id=$1 AND signal_id=$2
             """,
             int(user_id), int(signal_id)
         )
-        
-async def get_trade_by_user_key(user_id: int, signal_key: str) -> Optional[Dict[str, Any]]:
-    pool = get_pool()
-    sk = (signal_key or "").strip()
-    if not sk:
-        return None
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            SELECT id, user_id, signal_id, signal_key, market, symbol, side, entry, tp1, tp2, sl,
-                   status, tp1_hit, be_price, opened_at, closed_at, pnl_total_pct, orig_text
-            FROM trades
-            WHERE user_id=$1 AND signal_key=$2
-            ORDER BY opened_at DESC
-            LIMIT 1
-            """,
-            int(user_id), sk
-        )
         return dict(row) if row else None
-
 
 
 async def get_trade_by_id(user_id: int, trade_id: int) -> Optional[Dict[str, Any]]:
@@ -785,7 +688,7 @@ async def get_trade_by_id(user_id: int, trade_id: int) -> Optional[Dict[str, Any
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id, user_id, signal_id, signal_key, market, symbol, side, entry, tp1, tp2, sl,
+            SELECT id, user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl,
                    status, tp1_hit, be_price, opened_at, closed_at, pnl_total_pct, orig_text
             FROM trades
             WHERE user_id=$1 AND id=$2
@@ -799,7 +702,7 @@ async def list_active_trades(limit: int = 500) -> List[Dict[str, Any]]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, user_id, signal_id, signal_key, market, symbol, side, entry, tp1, tp2, sl,
+            SELECT id, user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl,
                    status, tp1_hit, be_price, opened_at, closed_at, pnl_total_pct, orig_text
             FROM trades
             WHERE status IN ('ACTIVE','TP1')
