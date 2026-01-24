@@ -1444,7 +1444,8 @@ async def broadcast_signal(sig: Signal) -> None:
     # Assign a globally unique signal_id from DB sequence (survives restarts).
     # This prevents collisions that cause "already opened" for unrelated signals after container restart.
     try:
-        sig.signal_id = await db_store.next_signal_id()
+        sid = await db_store.next_signal_id()
+        sig = replace(sig, signal_id=sid)
     except Exception as e:
         # Fallback to existing id if DB is unavailable; still log for visibility.
         logger.error("Failed to allocate signal_id from DB sequence: %s", e)
@@ -2440,13 +2441,13 @@ async def autotrade_input_handler(message: types.Message) -> None:
                         raise ValueError
                     if field == "spot_amount":
                         # Hard minimum: SPOT amount per trade must be >= 15 USDT
-                        if val < 15:
+                        if val < 10:
                             await message.answer(tr(uid, "at_min_spot_amount"))
                             return
                         await db_store.set_autotrade_amount(uid, "spot", val)
                     elif field == "fut_margin":
                         # Hard minimum: FUTURES margin per trade must be >= 10 USDT
-                        if val < 10:
+                        if val < 5:
                             await message.answer(tr(uid, "at_min_fut_margin"))
                             return
                         await db_store.set_autotrade_amount(uid, "futures", val)
