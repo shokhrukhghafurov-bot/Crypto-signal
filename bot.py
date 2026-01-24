@@ -257,7 +257,7 @@ def audit_i18n_keys(strict: bool | None = None) -> None:
         logger.exception("i18n audit: failed to read source")
         return
 
-    keys = set(re.findall(r"\btrf?\(\s*[^,]+,\s*['\"]([^'\"]+)['\"]\s*\)", src))
+    keys = set(re.findall(r"\btrf?\(\s*[^,]+,\s*['"]([^'"]+)['"]\s*\)", src))
     missing = []
     for k in sorted(keys):
         for lang in ("ru", "en"):
@@ -2440,14 +2440,14 @@ async def autotrade_input_handler(message: types.Message) -> None:
                         raise ValueError
                     if field == "spot_amount":
                         # Hard minimum: SPOT amount per trade must be >= 15 USDT
-                        if val < 15:
-                            await message.answer(tr(uid, \"at_min_spot_amount\"))
+                        if val < 10:
+                            await message.answer(tr(uid, "at_min_spot_amount"))
                             return
                         await db_store.set_autotrade_amount(uid, "spot", val)
                     elif field == "fut_margin":
                         # Hard minimum: FUTURES margin per trade must be >= 10 USDT
-                        if val < 10:
-                            await message.answer(tr(uid, \"at_min_fut_margin\"))
+                        if val < 5:
+                            await message.answer(tr(uid, "at_min_fut_margin"))
                             return
                         await db_store.set_autotrade_amount(uid, "futures", val)
                     elif field == "fut_cap":
