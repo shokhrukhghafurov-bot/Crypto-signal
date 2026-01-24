@@ -1165,8 +1165,8 @@ async def set_autotrade_amount(user_id: int, market_type: str, amount_usdt: floa
     if amt < 0:
         amt = 0.0
     # Hard minimums (also enforced in DB schema):
-    # - SPOT amount per trade >= 15 USDT (or 0 when unset)
-    # - FUTURES margin per trade >= 10 USDT (or 0 when unset)
+    # - SPOT amount per trade >= 10 USDT (or 0 when unset)
+    # - FUTURES margin per trade >= 5 USDT (or 0 when unset)
     if m == "spot" and 0 < amt < 15:
         raise ValueError("SPOT amount per trade must be >= 15")
     if m != "spot" and 0 < amt < 10:
