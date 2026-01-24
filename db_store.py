@@ -18,6 +18,43 @@ def get_pool() -> asyncpg.Pool:
         raise RuntimeError("DB pool is not initialized. Call set_pool() first.")
     return _pool
 
+
+async def ensure_users_table() -> None:
+    """Create users table for fresh installations (new Postgres).
+
+    Some deployments used a shared users table created by another service.
+    When we move to a dedicated Postgres for this bot, we must create it here.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+          telegram_id BIGINT PRIMARY KEY,
+          is_blocked BOOLEAN NOT NULL DEFAULT FALSE,
+
+          notify_signals BOOLEAN NOT NULL DEFAULT TRUE,
+
+          -- Signal bot access flags
+          signal_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+          signal_expires_at TIMESTAMPTZ,
+
+          -- Legacy shared access (compat)
+          expires_at TIMESTAMPTZ,
+
+          -- Auto-trade access (admin-managed)
+          autotrade_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+          autotrade_expires_at TIMESTAMPTZ,
+          autotrade_stop_after_close BOOLEAN NOT NULL DEFAULT FALSE,
+
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
+        except Exception:
+            pass
+
 async def ensure_schema() -> None:
     """
     Creates tables needed for persistent trades/statistics.
@@ -25,6 +62,8 @@ async def ensure_schema() -> None:
     """
     pool = get_pool()
     async with pool.acquire() as conn:
+        await ensure_users_table()
+
         # Persistent sequence for bot callback signal_id (survives restarts)
         await conn.execute("""
         CREATE SEQUENCE IF NOT EXISTS signal_seq START 1;
@@ -87,24 +126,6 @@ CREATE TABLE IF NOT EXISTS autotrade_bot_settings (
         INSERT INTO autotrade_bot_settings(id) VALUES (1)
 ON CONFLICT (id) DO NOTHING;
 """)
-
-        # --- users table (fresh installs) ---
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-          telegram_id BIGINT PRIMARY KEY,
-          is_blocked BOOLEAN NOT NULL DEFAULT FALSE,
-          notify_signals BOOLEAN NOT NULL DEFAULT TRUE,
-          signal_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-          signal_expires_at TIMESTAMPTZ,
-          expires_at TIMESTAMPTZ,
-          autotrade_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-          autotrade_expires_at TIMESTAMPTZ,
-          autotrade_stop_after_close BOOLEAN NOT NULL DEFAULT FALSE,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        """)
-
         # --- schema compat: allow many users to open same signal ---
         # Older DBs could have UNIQUE(signal_id) which blocks other users.
         await conn.execute("""
@@ -213,25 +234,7 @@ ON CONFLICT (id) DO NOTHING;
               CHECK (futures_margin_per_trade = 0 OR futures_margin_per_trade >= 10);
           END IF;
         END $$;
-        
-        -- Ensure updated minimum constraints (upgrade from legacy 10/5 -> 15/10)
-        DO $$
-        BEGIN
-          IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_spot_min') THEN
-            ALTER TABLE autotrade_settings DROP CONSTRAINT ck_autotrade_spot_min;
-          END IF;
-          ALTER TABLE autotrade_settings
-            ADD CONSTRAINT ck_autotrade_spot_min
-            CHECK (spot_amount_per_trade = 0 OR spot_amount_per_trade >= 15);
-
-          IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ck_autotrade_futures_min') THEN
-            ALTER TABLE autotrade_settings DROP CONSTRAINT ck_autotrade_futures_min;
-          END IF;
-          ALTER TABLE autotrade_settings
-            ADD CONSTRAINT ck_autotrade_futures_min
-            CHECK (futures_margin_per_trade = 0 OR futures_margin_per_trade >= 10);
-        END $$;
-""")
+        """)
 
         # Exchange keys are stored encrypted (ciphertext only).
         await conn.execute("""
@@ -1162,12 +1165,12 @@ async def set_autotrade_amount(user_id: int, market_type: str, amount_usdt: floa
     if amt < 0:
         amt = 0.0
     # Hard minimums (also enforced in DB schema):
-    # - SPOT amount per trade >= 15 USDT (or 0 when unset)
-    # - FUTURES margin per trade >= 10 USDT (or 0 when unset)
-    if m == "spot" and 0 < amt < 15:
-        raise ValueError("SPOT amount per trade must be >= 15")
-    if m != "spot" and 0 < amt < 10:
-        raise ValueError("FUTURES margin per trade must be >= 10")
+    # - SPOT amount per trade >= 10 USDT (or 0 when unset)
+    # - FUTURES margin per trade >= 5 USDT (or 0 when unset)
+    if m == "spot" and 0 < amt < 10:
+        raise ValueError("SPOT amount per trade must be >= 10")
+    if m != "spot" and 0 < amt < 5:
+        raise ValueError("FUTURES margin per trade must be >= 5")
     async with pool.acquire() as conn:
         await conn.execute(
             f"""
