@@ -2872,7 +2872,15 @@ async def autotrade_input_handler(message: types.Message) -> None:
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trades:page:"))
 async def trades_page(call: types.CallbackQuery) -> None:
-    await call.answer()
+    # CallbackQuery must be answered quickly; old buttons (or slow handlers) can raise:
+    # "query is too old and response timeout expired or query ID is invalid".
+    try:
+        await call.answer()
+    except TelegramBadRequest as e:
+        if "query is too old" in str(e).lower() or "response timeout" in str(e).lower() or "query id is invalid" in str(e).lower():
+            # Ignore stale callback; proceed with sending a new message.
+            pass
+        raise
     try:
         offset = int((call.data or "").split(":")[-1])
     except Exception:
