@@ -75,7 +75,7 @@ def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
 async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
     # Never recurse. Send via bot API.
-try:
+    try:
         return await bot.send_message(chat_id, text, **kwargs)
     except TelegramForbiddenError:
         # User blocked the bot or cannot be contacted
@@ -135,7 +135,7 @@ try:
 except (ZoneInfoNotFoundError, FileNotFoundError):
     # If tzdata isn't installed or the key is invalid, fall back safely.
     # Prefer Moscow for your bot (as requested), otherwise UTC.
-try:
+    try:
         TZ_NAME = "Europe/Moscow"
         TZ = ZoneInfo(TZ_NAME)
     except Exception:
@@ -184,7 +184,7 @@ I18N_FILE = Path(__file__).with_name("i18n.json")
 
 def load_i18n() -> dict:
     # Load i18n from external file (preferred). Fall back to embedded defaults if needed.
-try:
+    try:
         if I18N_FILE.exists():
             data = json.loads(I18N_FILE.read_text(encoding="utf-8"))
             if isinstance(data, dict) and "en" in data:
@@ -251,7 +251,7 @@ def audit_i18n_keys(strict: bool | None = None) -> None:
     if strict is None:
         strict = os.getenv("STRICT_I18N", "1").lower() not in ("0", "false", "no", "off")
 
-try:
+    try:
         src = Path(__file__).read_text(encoding="utf-8")
     except Exception:
         logger.exception("i18n audit: failed to read source")
@@ -515,7 +515,7 @@ async def safe_edit(message: types.Message | None, txt: str, kb: types.InlineKey
         # message may be too old/not modified/etc. Fall back to send.
         pass
 
-try:
+    try:
         if message:
             await safe_send(message.chat.id, txt, reply_markup=kb)
     except Exception:
@@ -572,7 +572,7 @@ async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKe
     parts = _split_text(text)
 
     # Try to edit with the first chunk
-try:
+    try:
         await bot.edit_message_text(
             chat_id=chat_id,
             message_id=msg_id,
@@ -657,7 +657,7 @@ async def ensure_user(user_id: int) -> None:
         return
     # Create user row if missing and grant 24h Signal trial ONCE.
     # IMPORTANT: does NOT touch Arbitrage access.
-try:
+    try:
         await db_store.ensure_user_signal_trial(int(user_id))
     except Exception:
         logger.exception("ensure_user: failed")
@@ -708,7 +708,7 @@ async def get_user_row(user_id: int):
 def _access_status_from_row(row) -> str:
     # Global maintenance switch (Signal bot only).
     # Enable via env: SIGNAL_MAINTENANCE=1 or MAINTENANCE_MODE=1
-try:
+    try:
         import os
         mm = (os.getenv("SIGNAL_MAINTENANCE") or os.getenv("MAINTENANCE_MODE") or "").strip().lower()
         if mm in {"1", "true", "yes", "on"}:
@@ -740,7 +740,7 @@ try:
     if signal_expires_at is None:
         return "ok"
 
-try:
+    try:
         now = dt.datetime.now(dt.timezone.utc)
         if signal_expires_at < now:
             return "expired"
@@ -1524,7 +1524,7 @@ def _trade_status_emoji(status: str) -> str:
 # ---------------- broadcasting ----------------
 async def broadcast_signal(sig: Signal) -> None:
     # Global pause/maintenance for sending NEW signals (Signal Bot admin setting)
-try:
+    try:
         st = await db_store.get_signal_bot_settings()
         if bool(st.get('pause_signals')):
             logger.info("Signal broadcasting is paused (pause_signals=true). Skipping new signal %s %s", sig.market, sig.symbol)
@@ -1555,14 +1555,14 @@ try:
 
     # Assign a globally unique signal_id from DB sequence (survives restarts).
     # This prevents collisions that cause "already opened" for unrelated signals after container restart.
-try:
+    try:
         sid = await db_store.next_signal_id()
         sig = replace(sig, signal_id=sid)
     except Exception as e:
         # Fallback to existing id if DB is unavailable; still log for visibility.
         logger.error("Failed to allocate signal_id from DB sequence: %s", e)
     # Save as last live signal for menu buttons
-try:
+    try:
         LAST_SIGNAL_BY_MARKET["SPOT" if sig.market == "SPOT" else "FUTURES"] = sig
     except Exception:
         pass
@@ -1570,7 +1570,7 @@ try:
     logger.info("Broadcast signal id=%s %s %s %s conf=%s rr=%.2f", sig.signal_id, sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr))
     SIGNALS[sig.signal_id] = sig
     # Persist 'signals sent' counters in Postgres (dedup by sig_key)
-try:
+    try:
         await db_store.record_signal_sent(sig_key=sig_key, market=str(sig.market).upper(), signal_id=int(sig.signal_id or 0))
     except Exception:
         pass
@@ -1691,7 +1691,7 @@ async def lang_choose(call: types.CallbackQuery) -> None:
     if uid:
         set_lang(uid, lang)
     # show welcome + menu in-place
-try:
+    try:
         if call.message:
             await bot.edit_message_text(chat_id=uid, message_id=call.message.message_id, text=await status_text(uid, include_subscribed=True, include_hint=True), reply_markup=menu_kb(uid))
             return
@@ -1763,18 +1763,18 @@ async def status_text(uid: int, *, include_subscribed: bool = False, include_hin
         enabled = None
 
     # Global states
-try:
+    try:
         scanner_on = bool(getattr(backend, "scanner_running", True))
     except Exception:
         scanner_on = True
 
     # News / Macro status with reason + timer
-try:
+    try:
         news_stat = backend.get_news_status()
     except Exception:
         news_stat = {"action": "ALLOW", "reason": None, "until_ts": None}
 
-try:
+    try:
         macro_stat = backend.get_macro_status()
     except Exception:
         macro_stat = {"action": "ALLOW", "reason": None, "until_ts": None, "event": None, "window": None}
@@ -1857,7 +1857,7 @@ try:
     out_lines.append(trf(uid, "status_next_macro", value=(next_macro or tr(uid, "status_next_macro_none"))))
 
     # Signal bot global state (pause / maintenance) from admin dashboard
-try:
+    try:
         sb = await db_store.get_signal_bot_settings()
         if bool(sb.get("maintenance_mode")):
             sig_state = tr(uid, "sig_state_maintenance")
@@ -2118,7 +2118,7 @@ async def notify_handler(call: types.CallbackQuery) -> None:
 
     parts = (call.data or "").split(":")
     # notify:set:on | notify:set:off | notify:back
-try:
+    try:
         action = parts[1]
     except Exception:
         action = ""
@@ -2731,70 +2731,73 @@ async def autotrade_input_handler(message: types.Message) -> None:
                     raw_err = str(res.get("error") or "API error")
 
                     # Map raw exchange errors to user-friendly messages.
-raw_low = raw_err.lower()
+                    raw_low = raw_err.lower()
+                    user_key = "at_keys_api_error"
 
-# --- BINANCE ---
-if ex == "binance" and ("api-key format invalid" in raw_low or "-2014" in raw_low):
-    user_key = "at_keys_binance_format"
-elif ex == "binance" and ("-2015" in raw_low or "invalid api-key" in raw_low or "invalid api-key, ip, or permissions" in raw_low):
-    user_key = "at_keys_binance_invalid"
-elif ex == "binance" and ("-1021" in raw_low or "timestamp" in raw_low):
-    user_key = "at_keys_binance_time"
-elif ex == "binance" and ("-1003" in raw_low or "too many requests" in raw_low or "rate limit" in raw_low):
-    user_key = "at_keys_binance_rate"
-elif ex == "binance" and ("permission" in raw_low or "not authorized" in raw_low or "unauthorized" in raw_low):
-    user_key = "at_keys_binance_perm"
+                    if ex == "binance":
+                        if ("api-key format invalid" in raw_low) or ("api key format invalid" in raw_low) or ("-2014" in raw_low):
+                            user_key = "at_keys_binance_format"
+                        elif ("-1021" in raw_low) or ("timestamp" in raw_low):
+                            user_key = "at_keys_binance_time"
+                        elif ("-1003" in raw_low) or ("too many requests" in raw_low) or ("rate limit" in raw_low):
+                            user_key = "at_keys_binance_rate"
+                        elif ("permission" in raw_low) or ("not authorized" in raw_low) or ("unauthorized" in raw_low):
+                            user_key = "at_keys_binance_perm"
+                        elif ("-2015" in raw_low) or ("invalid api-key" in raw_low) or ("invalid api key" in raw_low):
+                            user_key = "at_keys_binance_invalid"
 
-# --- BYBIT ---
-elif ex == "bybit" and ("10003" in raw_low or "api key is invalid" in raw_low or "invalid api key" in raw_low):
-    user_key = "at_keys_bybit_invalid"
-elif ex == "bybit" and ("invalid signature" in raw_low or "error sign" in raw_low or "signature" in raw_low and "invalid" in raw_low):
-    user_key = "at_keys_bybit_signature"
-elif ex == "bybit" and ("permission" in raw_low or "not authorized" in raw_low or "forbidden" in raw_low or "denied" in raw_low):
-    user_key = "at_keys_bybit_perm"
-elif ex == "bybit" and ("timestamp" in raw_low or "time window" in raw_low or "recv_window" in raw_low):
-    user_key = "at_keys_bybit_time"
-elif ex == "bybit" and ("too many requests" in raw_low or "rate limit" in raw_low):
-    user_key = "at_keys_bybit_rate"
+                    elif ex == "bybit":
+                        if ("10003" in raw_low) or ("api key is invalid" in raw_low) or ("invalid api key" in raw_low):
+                            user_key = "at_keys_bybit_invalid"
+                        elif ("invalid signature" in raw_low) or (("signature" in raw_low) and ("invalid" in raw_low)) or ("error sign" in raw_low):
+                            user_key = "at_keys_bybit_signature"
+                        elif ("permission" in raw_low) or ("not authorized" in raw_low) or ("forbidden" in raw_low) or ("denied" in raw_low):
+                            user_key = "at_keys_bybit_perm"
+                        elif ("timestamp" in raw_low) or ("time window" in raw_low) or ("recv_window" in raw_low):
+                            user_key = "at_keys_bybit_time"
+                        elif ("too many requests" in raw_low) or ("rate limit" in raw_low):
+                            user_key = "at_keys_bybit_rate"
 
-# --- OKX ---
-elif ex == "okx" and ("50111" in raw_low or "invalid ok-access-key" in raw_low):
-    user_key = "at_keys_okx_invalid"
-elif ex == "okx" and ("passphrase" in raw_low and "invalid" in raw_low):
-    user_key = "at_keys_okx_passphrase"
-elif ex == "okx" and ("whitelist" in raw_low or ("ip" in raw_low and "not" in raw_low and "allowed" in raw_low)):
-    user_key = "at_keys_okx_ip"
+                    elif ex == "okx":
+                        if ("50111" in raw_low) or ("invalid ok-access-key" in raw_low):
+                            user_key = "at_keys_okx_invalid"
+                        elif ("passphrase" in raw_low) and ("invalid" in raw_low):
+                            user_key = "at_keys_okx_passphrase"
+                        elif ("whitelist" in raw_low) or (("ip" in raw_low) and ("not" in raw_low) and ("allowed" in raw_low)):
+                            user_key = "at_keys_okx_ip"
+                        elif ("permission" in raw_low) or ("forbidden" in raw_low) or ("not authorized" in raw_low):
+                            user_key = "at_keys_okx_perm"
+                        elif ("too many requests" in raw_low) or ("rate limit" in raw_low):
+                            user_key = "at_keys_okx_rate"
 
-# --- MEXC ---
-elif ex == "mexc" and ("invalid api key" in raw_low or "api key not exists" in raw_low or "api key information invalid" in raw_low or "apikey information invalid" in raw_low):
-    user_key = "at_keys_mexc_invalid"
-elif ex == "mexc" and ("invalid signature" in raw_low or ("signature" in raw_low and "invalid" in raw_low)):
-    user_key = "at_keys_mexc_signature"
-elif ex == "mexc" and ("whitelist" in raw_low or ("ip" in raw_low and "not" in raw_low and "allowed" in raw_low)):
-    user_key = "at_keys_mexc_ip"
-elif ex == "mexc" and ("permission" in raw_low or "forbidden" in raw_low or "not authorized" in raw_low):
-    user_key = "at_keys_mexc_perm"
-elif ex == "mexc" and ("too many requests" in raw_low or "rate limit" in raw_low):
-    user_key = "at_keys_mexc_rate"
+                    elif ex == "mexc":
+                        if ("invalid api key" in raw_low) or ("api key not exists" in raw_low) or ("api key information invalid" in raw_low):
+                            user_key = "at_keys_mexc_invalid"
+                        elif ("invalid signature" in raw_low) or (("signature" in raw_low) and ("invalid" in raw_low)):
+                            user_key = "at_keys_mexc_signature"
+                        elif ("whitelist" in raw_low) or (("ip" in raw_low) and ("not" in raw_low) and ("allowed" in raw_low)):
+                            user_key = "at_keys_mexc_ip"
+                        elif ("permission" in raw_low) or ("forbidden" in raw_low) or ("not authorized" in raw_low):
+                            user_key = "at_keys_mexc_perm"
+                        elif ("too many requests" in raw_low) or ("rate limit" in raw_low):
+                            user_key = "at_keys_mexc_rate"
 
-# --- GATE.IO ---
-elif ex == "gateio" and ("invalid key" in raw_low or "invalid api key" in raw_low or "authentication failed" in raw_low):
-    user_key = "at_keys_gate_invalid"
-elif ex == "gateio" and ("invalid signature" in raw_low or ("signature" in raw_low and "invalid" in raw_low)):
-    user_key = "at_keys_gate_signature"
-elif ex == "gateio" and ("whitelist" in raw_low or ("ip" in raw_low and "not" in raw_low and "allowed" in raw_low)):
-    user_key = "at_keys_gate_ip"
-elif ex == "gateio" and ("permission" in raw_low or "forbidden" in raw_low or "not authorized" in raw_low):
-    user_key = "at_keys_gate_perm"
-elif ex == "gateio" and ("too many requests" in raw_low or "rate limit" in raw_low):
-    user_key = "at_keys_gate_rate"
+                    elif ex == "gateio":
+                        if ("invalid key" in raw_low) or ("invalid api key" in raw_low) or ("authentication failed" in raw_low):
+                            user_key = "at_keys_gate_invalid"
+                        elif ("invalid signature" in raw_low) or (("signature" in raw_low) and ("invalid" in raw_low)):
+                            user_key = "at_keys_gate_signature"
+                        elif ("whitelist" in raw_low) or (("ip" in raw_low) and ("not" in raw_low) and ("allowed" in raw_low)):
+                            user_key = "at_keys_gate_ip"
+                        elif ("permission" in raw_low) or ("forbidden" in raw_low) or ("not authorized" in raw_low):
+                            user_key = "at_keys_gate_perm"
+                        elif ("too many requests" in raw_low) or ("rate limit" in raw_low):
+                            user_key = "at_keys_gate_rate"
 
-# --- Generic IP restriction fallback ---
-elif ("whitelist" in raw_low) or (("restricted" in raw_low) and ("ip" in raw_low)):
-    user_key = "at_keys_ip_restricted"
-else:
-    user_key = "at_keys_api_error"
-
+                    # Generic IP restriction fallback
+                    if user_key == "at_keys_api_error":
+                        if ("whitelist" in raw_low) or (("restricted" in raw_low) and ("ip" in raw_low)):
+                            user_key = "at_keys_ip_restricted"
                     # Store raw error (inactive) so UI shows ❌ and for troubleshooting.
                     try:
                         await db_store.mark_autotrade_key_error(user_id=uid, exchange=ex, market_type=mt, error=raw_err, deactivate=True)
@@ -2825,7 +2828,7 @@ else:
                             passphrase_enc=None,
                             is_active=True,
                             last_error=None,
-                                                )
+                        )
                         # Validate keys against the exchange right away (prevents "green" status for invalid keys)
                         try:
                             v = await validate_autotrade_keys(
@@ -3127,7 +3130,7 @@ async def opened(call: types.CallbackQuery) -> None:
             return
 
     # Remove the ✅ ОТКРЫЛ СДЕЛКУ button from the original NEW SIGNAL message
-try:
+    try:
         if call.message:
             await safe_edit_markup(call.from_user.id, call.message.message_id, None)
     except Exception:
@@ -3564,7 +3567,7 @@ async def main() -> None:
 
         async def save_user(request: web.Request) -> web.Response:
             """Create/update Signal + Auto-trade access for a user.
-            
+
             Expected JSON:
               telegram_id (required)
               signal_enabled (optional bool)
@@ -3581,23 +3584,23 @@ async def main() -> None:
             tid = int(data.get("telegram_id") or 0)
             if not tid:
                 return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-            
+
             signal_enabled = bool(data.get("signal_enabled", True))
             signal_expires_raw = data.get("signal_expires_at")
             signal_expires = _parse_iso_dt(signal_expires_raw)
             if signal_expires_raw and (signal_expires is None):
                 return web.json_response({"ok": False, "error": "bad signal_expires_at"}, status=400)
             signal_add_days = int(data.get("add_days") or 0)
-            
+
             autotrade_enabled = bool(data.get("autotrade_enabled", False))
             autotrade_expires_raw = data.get("autotrade_expires_at")
             autotrade_expires = _parse_iso_dt(autotrade_expires_raw)
             if autotrade_expires_raw and (autotrade_expires is None):
                 return web.json_response({"ok": False, "error": "bad autotrade_expires_at"}, status=400)
             autotrade_add_days = int(data.get("autotrade_add_days") or 0)
-            
+
             is_blocked = data.get("is_blocked")
-            
+
             await ensure_user(tid)
             async with pool.acquire() as conn:
                 # SIGNAL
@@ -3625,7 +3628,7 @@ async def main() -> None:
                                  WHERE telegram_id=$1""",
                             tid, signal_enabled,
                         )
-            
+
                 # AUTO-TRADE
                 if autotrade_add_days:
                     await conn.execute(
@@ -3707,13 +3710,13 @@ async def main() -> None:
                                      WHERE telegram_id=$1""",
                                 tid,
                             )
-            
+
                 if is_blocked is not None:
                     try:
                         await conn.execute("UPDATE users SET is_blocked=$2 WHERE telegram_id=$1", tid, bool(is_blocked))
                     except Exception:
                         pass
-            
+
             return web.json_response({"ok": True})
         async def patch_user(request: web.Request) -> web.Response:
             """Compat endpoint: PATCH /api/infra/admin/signal/users/{telegram_id}
@@ -3726,7 +3729,7 @@ async def main() -> None:
             data = await request.json()
             data = data or {}
             data["telegram_id"] = tid
-            
+
             # Reuse the same logic as save_user by performing the updates here
             signal_enabled = bool(data.get("signal_enabled", True))
             signal_expires_raw = data.get("signal_expires_at")
@@ -3734,16 +3737,16 @@ async def main() -> None:
             if signal_expires_raw and (signal_expires is None):
                 return web.json_response({"ok": False, "error": "bad signal_expires_at"}, status=400)
             signal_add_days = int(data.get("add_days") or 0)
-            
+
             autotrade_enabled = bool(data.get("autotrade_enabled", False))
             autotrade_expires_raw = data.get("autotrade_expires_at")
             autotrade_expires = _parse_iso_dt(autotrade_expires_raw)
             if autotrade_expires_raw and (autotrade_expires is None):
                 return web.json_response({"ok": False, "error": "bad autotrade_expires_at"}, status=400)
             autotrade_add_days = int(data.get("autotrade_add_days") or 0)
-            
+
             is_blocked = data.get("is_blocked")
-            
+
             await ensure_user(tid)
             async with pool.acquire() as conn:
                 if signal_add_days:
@@ -3768,7 +3771,7 @@ async def main() -> None:
                             "UPDATE users SET signal_enabled=$2 WHERE telegram_id=$1",
                             tid, signal_enabled,
                         )
-            
+
                 if autotrade_add_days:
                     await conn.execute(
                         """UPDATE users
@@ -3844,13 +3847,13 @@ async def main() -> None:
                                      WHERE telegram_id=$1""",
                                 tid,
                             )
-            
+
                 if is_blocked is not None:
                     try:
                         await conn.execute("UPDATE users SET is_blocked=$2 WHERE telegram_id=$1", tid, bool(is_blocked))
                     except Exception:
                         pass
-            
+
             return web.json_response({"ok": True})
         async def block_user(request: web.Request) -> web.Response:
             if not _check_basic(request):
