@@ -973,6 +973,37 @@ def _key_status_map(keys: List[Dict[str, any]]) -> Dict[str, Dict[str, any]]:
         out[f"{ex}:{mt}"] = r
     return out
 
+
+def spot_priority_text(uid: int, pr: list[str]) -> str:
+    names = {
+        "binance": "Binance",
+        "bybit": "Bybit",
+        "okx": "OKX",
+        "mexc": "MEXC",
+        "gateio": "Gate.io",
+    }
+    lines = [tr(uid, "at_spot_header"), "", "🏦 Приоритет бирж SPOT (1 → 5):"]
+    for i, ex in enumerate(pr, 1):
+        lines.append(f"{i}) {names.get(ex, ex)}")
+    lines.append("")
+    lines.append("Бот откроет сделку на первой бирже из вашего списка, которая:")
+    lines.append("• есть в подтверждении сигнала (confirmations)")
+    lines.append("• имеет активные API ключи SPOT")
+    return "\n".join(lines)
+
+def spot_priority_kb(uid: int, pr: list[str]) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    # Up/Down buttons for each exchange
+    label = {"binance":"Binance","bybit":"Bybit","okx":"OKX","mexc":"MEXC","gateio":"Gate.io"}
+    for ex in pr:
+        kb.button(text=f"⬆️ {label.get(ex, ex)}", callback_data=f"at:prmove:spot:up:{ex}")
+        kb.button(text=f"⬇️ {label.get(ex, ex)}", callback_data=f"at:prmove:spot:down:{ex}")
+    kb.adjust(2)
+    kb.button(text=tr(uid, "btn_back"), callback_data="at:back")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
 def autotrade_kb(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     spot_on = bool(s.get("spot_enabled"))
@@ -2256,7 +2287,11 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
 
         if action == "ex" and len(parts) >= 3:
             mt = parts[2]
-            # show exchange choices
+            if mt == "spot":
+                pr = await db_store.get_spot_exchange_priority(uid)
+                await safe_edit(call.message, spot_priority_text(uid, pr), spot_priority_kb(uid, pr))
+                return
+            # futures exchange choices (only Binance/Bybit)
             kb = InlineKeyboardBuilder()
             kb.button(text="Binance", callback_data=f"at:exset:{mt}:binance")
             kb.button(text="Bybit", callback_data=f"at:exset:{mt}:bybit")
