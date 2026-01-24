@@ -1134,9 +1134,68 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     if not enabled:
         return {"ok": False, "skipped": True, "api_error": None}
 
-    exchange = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "binance").lower()
-    if exchange not in ("binance", "bybit"):
-        exchange = "binance"
+    
+    exchange = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "binance").lower().strip()
+
+    # SPOT: choose exchange based on user's priority intersecting with signal confirmations.
+    # Fallback order is user-defined (1->2->3...), and we ONLY trade on exchanges that confirmed the signal.
+    if mt == "spot":
+        # Parse confirmations like "BYBIT+OKX" to {"bybit","okx"}
+        conf_raw = str(getattr(sig, "confirmations", "") or "")
+        conf_set: set[str] = set()
+        for part in re.split(r"[+ ,;/|]+", conf_raw.strip()):
+            p = part.strip().lower()
+            if not p:
+                continue
+            # normalize common labels
+            if p in ("binance", "bnb"):
+                conf_set.add("binance")
+            elif p in ("bybit", "byb"):
+                conf_set.add("bybit")
+            elif p in ("okx",):
+                conf_set.add("okx")
+            elif p in ("mexc",):
+                conf_set.add("mexc")
+            elif p in ("gateio", "gate", "gate.io", "gateio.ws"):
+                conf_set.add("gateio")
+
+        # Priority list from DB (comma-separated)
+        pr_csv = str(st.get("spot_exchange_priority") or "binance,bybit,okx,mexc,gateio")
+        pr = [x.strip().lower() for x in pr_csv.split(",") if x.strip()]
+        allowed = ["binance", "bybit", "okx", "mexc", "gateio"]
+        pr2: list[str] = []
+        for x in pr:
+            if x in allowed and x not in pr2:
+                pr2.append(x)
+        for x in allowed:
+            if x not in pr2:
+                pr2.append(x)
+
+        chosen = None
+        # iterate user priority, but only those that confirmed signal
+        for ex in pr2:
+            if conf_set and ex not in conf_set:
+                continue
+            row = await db_store.get_autotrade_keys_row(user_id=uid, exchange=ex, market_type="spot")
+            if not row or not bool(row.get("is_active")):
+                continue
+            # require both key and secret
+            if not (row.get("api_key_enc") and row.get("api_secret_enc")):
+                continue
+            if ex == "okx" and not row.get("passphrase_enc"):
+                # okx needs passphrase
+                continue
+            chosen = ex
+            break
+
+        if not chosen:
+            return {"ok": True, "skipped": True, "api_error": None}
+        exchange = chosen
+
+    # FUTURES: only Binance/Bybit supported
+    if mt == "futures":
+        if exchange not in ("binance", "bybit"):
+            exchange = "binance"
 
     # amounts
     spot_amt = float(st.get("spot_amount_per_trade") or 0.0)
