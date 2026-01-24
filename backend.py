@@ -34,6 +34,23 @@ from cryptography.fernet import Fernet
 
 logger = logging.getLogger("crypto-signal")
 
+def make_sig_key(sig: object) -> str:
+    """Stable hash identifier for a signal (collision-proof for callbacks)."""
+    try:
+        market = getattr(sig, "market", "") or ""
+        symbol = getattr(sig, "symbol", "") or ""
+        direction = getattr(sig, "direction", "") or ""
+        tf = getattr(sig, "timeframe", "") or ""
+        entry = getattr(sig, "entry", "")
+        sl = getattr(sig, "sl", "")
+        tp1 = getattr(sig, "tp1", "")
+        tp2 = getattr(sig, "tp2", "")
+        conf = getattr(sig, "confirmations", "") or ""
+        raw = f"{market}|{symbol}|{direction}|{tf}|{entry}|{sl}|{tp1}|{tp2}|{conf}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
 
 # ------------------ Auto-trade exchange API helpers ------------------
 
@@ -4028,12 +4045,16 @@ class Backend:
 
     def mark_emitted(self, symbol: str) -> None:
         self._last_signal_ts[symbol.upper()] = time.time()
+    async def open_trade(self, user_id: int, signal: Signal, orig_text: str, *, signal_key: str | None = None) -> bool:
+        """Persist trade in Postgres. Returns False if already opened.
 
-    async def open_trade(self, user_id: int, signal: Signal, orig_text: str) -> bool:
-        """Persist trade in Postgres. Returns False if already opened."""
-        inserted, _tid = await db_store.open_trade_once(
+        signal_key is the stable identifier used for callbacks (sig_key). If not provided, it's computed.
+        """
+        sk = (signal_key or make_sig_key(signal) or "").strip()
+        inserted, _tid = await db_store.open_trade_once_key(
             user_id=int(user_id),
-            signal_id=int(signal.signal_id),
+            signal_key=sk,
+            signal_id=int(getattr(signal, "signal_id", 0) or 0),
             market=(signal.market or "FUTURES").upper(),
             symbol=signal.symbol,
             side=(signal.direction or "LONG").upper(),
@@ -4044,6 +4065,7 @@ class Backend:
             orig_text=orig_text or "",
         )
         return bool(inserted)
+
 
 
     async def remove_trade(self, user_id: int, signal_id: int) -> bool:
@@ -4126,6 +4148,9 @@ class Backend:
 
     async def get_trade(self, user_id: int, signal_id: int) -> Optional[dict]:
         return await db_store.get_trade_by_user_signal(int(user_id), int(signal_id))
+async def get_trade_by_key(self, user_id: int, signal_key: str) -> Optional[Dict[str, Any]]:
+    return await db_store.get_trade_by_user_key(int(user_id), str(signal_key or ""))
+
 
     async def get_trade_live(self, user_id: int, signal_id: int) -> Optional[dict]:
         """Return trade row with live price + price source + hit checks."""
