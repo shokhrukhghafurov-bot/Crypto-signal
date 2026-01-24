@@ -1047,6 +1047,83 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
     fut_lev = int(s.get("futures_leverage") or 1)
     fut_cap = float(s.get("futures_cap") or 0.0)
 
+    # Build keys status block based on last signal confirmations (if available)
+    lang = (LANG.get(int(uid), "ru") if isinstance(uid, int) else "ru")
+    def _conf_set(sig_obj: Any) -> set[str]:
+        if not sig_obj:
+            return set()
+        conf = str(getattr(sig_obj, "confirmations", "") or "").strip()
+        if not conf:
+            return set()
+        return {p.strip().lower() for p in conf.split("+") if p.strip()}
+
+    allowed_spot = ["binance", "bybit", "okx", "mexc", "gateio"]
+    allowed_fut = ["binance", "bybit"]
+
+    last_spot_sig = getattr(backend, "last_spot_signal", None) or LAST_SIGNAL_BY_MARKET.get("SPOT")
+    last_fut_sig = getattr(backend, "last_futures_signal", None) or LAST_SIGNAL_BY_MARKET.get("FUTURES")
+
+    spot_conf = _conf_set(last_spot_sig)
+    fut_conf = _conf_set(last_fut_sig)
+
+    # Parse user SPOT priority from settings (already stored as csv)
+    csv_prio = str(s.get("spot_exchange_priority") or "binance,bybit,okx,mexc,gateio")
+    prio = [p.strip().lower() for p in csv_prio.split(",") if p.strip()]
+    prio = [x for x in prio if x in allowed_spot]
+    for x in allowed_spot:
+        if x not in prio:
+            prio.append(x)
+
+    def _eligible(ex: str, mt: str) -> bool:
+        # Eligible for trading if key is active (✅ or ⚠️). ❌ means missing/inactive.
+        return ks(ex, mt) != "❌"
+
+    def _pick_spot_exchange() -> str | None:
+        if not spot_conf:
+            return None
+        for ex in prio:
+            if ex in spot_conf and _eligible(ex, "spot"):
+                return ex
+        return None
+
+    def _pick_fut_exchange() -> str | None:
+        if not fut_conf:
+            return None
+        ex = fut_ex.lower().strip()
+        if ex in fut_conf and _eligible(ex, "futures"):
+            return ex
+        return None
+
+    # Render block
+    parts: list[str] = []
+    if spot_conf:
+        items = [ex for ex in allowed_spot if ex in spot_conf]
+        items_txt = " | ".join([f"{ex.upper()}: {ks(ex,'spot')}" for ex in items])
+        parts.append(("SPOT подтверждение: " if lang == "ru" else "SPOT confirmed: ") + items_txt)
+        chosen = _pick_spot_exchange()
+        if chosen and bool(s.get("spot_enabled")):
+            parts.append(("SPOT будет открыт на: " if lang == "ru" else "SPOT will open on: ") + chosen.upper())
+        elif bool(s.get("spot_enabled")):
+            parts.append(("SPOT: пропуск (нет ключей по confirmations)" if lang == "ru" else "SPOT: skipped (no keys for confirmations)"))
+    else:
+        items_txt = " | ".join([f"{ex.upper()}: {ks(ex,'spot')}" for ex in allowed_spot])
+        parts.append(("SPOT ключи: " if lang == "ru" else "SPOT keys: ") + items_txt)
+
+    if fut_conf:
+        items = [ex for ex in allowed_fut if ex in fut_conf]
+        items_txt = " | ".join([f"{ex.upper()}: {ks(ex,'futures')}" for ex in items])
+        parts.append(("FUTURES подтверждение: " if lang == "ru" else "FUTURES confirmed: ") + items_txt)
+        chosen = _pick_fut_exchange()
+        if chosen and bool(s.get("futures_enabled")):
+            parts.append(("FUTURES будет открыт на: " if lang == "ru" else "FUTURES will open on: ") + chosen.upper())
+        elif bool(s.get("futures_enabled")):
+            parts.append(("FUTURES: пропуск (нет ключей/не совпало подтверждение)" if lang == "ru" else "FUTURES: skipped (no keys/not confirmed)"))
+    else:
+        items_txt = " | ".join([f"{ex.upper()}: {ks(ex,'futures')}" for ex in allowed_fut])
+        parts.append(("FUTURES ключи: " if lang == "ru" else "FUTURES keys: ") + items_txt)
+
+    keys_status_block = "\n".join(parts).strip()
+
     return trf(
         uid,
         "at_screen",
@@ -1058,6 +1135,7 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
         fut_margin=f"{fut_margin:g}",
         fut_lev=str(fut_lev),
         fut_cap=f"{fut_cap:g}",
+        keys_status_block=keys_status_block,
         b_spot=ks("binance","spot"),
         b_fut=ks("binance","futures"),
         y_spot=ks("bybit","spot"),
