@@ -227,7 +227,8 @@
     "at_unavailable_expired": "🔒 Auto-trade unavailable\n\nYour Auto-trade access has expired.\nYou will continue receiving trading signals as usual.\n\nTo renew Auto-trade, contact the administrator.",
     "welcome_subscribed": "✅ You are subscribed to signals.",
     "welcome_hint": "Use the buttons below:",
-    "bad_number": "❌ Please enter a number."
+    "bad_number": "❌ Please enter a number.",
+    "at_enter_passphrase": "Enter OKX Passphrase:"
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -457,6 +458,7 @@
     "at_unavailable_expired": "🔒 Auto-trade недоступен\n\nСрок доступа к Auto-trade истёк.\nВы продолжаете получать торговые сигналы в обычном режиме.\n\nДля продления доступа свяжитесь с администратором.",
     "welcome_subscribed": "✅ Ты подписан на сигналы.",
     "welcome_hint": "Нажимай кнопки ниже:",
-    "bad_number": "❌ Введите число."
+    "bad_number": "❌ Введите число.",
+    "at_enter_passphrase": "Введи OKX Passphrase:"
   }
 }
