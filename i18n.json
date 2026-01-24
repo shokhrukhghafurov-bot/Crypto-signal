@@ -228,7 +228,8 @@
     "welcome_subscribed": "✅ You are subscribed to signals.",
     "welcome_hint": "Use the buttons below:",
     "bad_number": "❌ Please enter a number.",
-    "at_enter_passphrase": "Enter OKX Passphrase:"
+    "at_enter_passphrase": "Enter OKX Passphrase:",
+    "at_keys_okx_invalid": "❌ Couldn't connect to OKX ({market}).\n\nThe API key looks invalid or was entered incorrectly.\n\nTry this:\n• Make sure the API Key is copied fully (no extra spaces)\n• Ensure the key wasn't deleted/rotated on OKX\n• Check key permissions: Read + Trade\n• Check Passphrase (if set)\n\n💡 Creating a new OKX API key and adding it again often fixes it."
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -459,6 +460,7 @@
     "welcome_subscribed": "✅ Ты подписан на сигналы.",
     "welcome_hint": "Нажимай кнопки ниже:",
     "bad_number": "❌ Введите число.",
-    "at_enter_passphrase": "Введи OKX Passphrase:"
+    "at_enter_passphrase": "Введи OKX Passphrase:",
+    "at_keys_okx_invalid": "❌ Не удалось подключиться к OKX ({market}).\n\nПохоже, API-ключ недействителен или введён с ошибкой.\n\nЧто сделать:\n• Проверь, что API Key скопирован полностью (без пробелов)\n• Убедись, что ключ не удалён/не перевыпущен в OKX\n• Проверь права ключа: Read + Trade\n• Проверь Passphrase (если задан)\n\n💡 Часто помогает создать новый API-ключ в OKX и добавить его заново."
   }
 }
