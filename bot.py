@@ -1561,10 +1561,7 @@ async def broadcast_signal(sig: Signal) -> None:
         sig = replace(sig, signal_id=sid)
     except Exception as e:
         # Fallback to existing id if DB is unavailable; still log for visibility.
-        import time, random
-        sid = int(time.time() * 1000) * 1000 + random.randint(0, 999)
-        sig = replace(sig, signal_id=sid)
-        logger.error("Failed to allocate signal_id from DB sequence: %s. Fallback sid=%s", e, sid)
+        logger.error("Failed to allocate signal_id from DB sequence: %s", e)
     # Save as last live signal for menu buttons
     try:
         LAST_SIGNAL_BY_MARKET["SPOT" if sig.market == "SPOT" else "FUTURES"] = sig
