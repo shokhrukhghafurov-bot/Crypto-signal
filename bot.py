@@ -1154,7 +1154,7 @@ def _calc_effective_futures_cap(ui_cap: float, winrate: float | None) -> float:
         return 0.0
     wr = 50.0 if winrate is None else float(winrate)
 
-    base = cap * 0.65
+    base = cap * 0.70
     if wr < 40:
         k = 0.6
     elif wr < 50:
