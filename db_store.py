@@ -1847,6 +1847,30 @@ async def mark_autotrade_key_error(
                 (error or "API error")[:500],
             )
 
+
+async def disable_autotrade_key(*, user_id: int, exchange: str, market_type: str) -> None:
+    """User-initiated disconnect: mark a stored key as inactive (keeps ciphertext for future re-enable)."""
+    pool = get_pool()
+    uid = int(user_id)
+    ex = (exchange or "binance").lower().strip()
+    mt = (market_type or "spot").lower().strip()
+    if mt == "futures" and ex not in ("binance", "bybit"):
+        ex = "binance"
+    if mt == "spot" and ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
+        ex = "binance"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO autotrade_keys(user_id, exchange, market_type, is_active, last_error, last_error_at, updated_at)
+            VALUES ($1,$2,$3,FALSE,'disabled_by_user',NOW(),NOW())
+            ON CONFLICT (user_id, exchange, market_type)
+            DO UPDATE SET is_active=FALSE, last_error='disabled_by_user', last_error_at=NOW(), updated_at=NOW();
+            """,
+            uid,
+            ex,
+            mt,
+        )
+
 async def get_autotrade_used_usdt(user_id: int, market_type: str) -> float:
     pool = get_pool()
     uid = int(user_id)
