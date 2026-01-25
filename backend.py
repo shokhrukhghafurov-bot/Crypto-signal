@@ -75,36 +75,6 @@ def _should_deactivate_key(err_text: str) -> bool:
     return any(n in t for n in needles)
 
 
-
-# ------------------ Virtual SL/TP/BE mode ------------------
-# When enabled, the bot does NOT place SL/TP orders on the exchange.
-# It tracks price and closes positions via MARKET when levels are reached.
-_VIRTUAL_SLTP_ALL = (os.getenv("VIRTUAL_SLTP_ALL", "1") or "").strip().lower() not in ("0","false","no","off")
-
-# Smart BE: after TP1 hit, move to BE only after price confirms continuation.
-# Confirm threshold (percent) beyond TP1. Example 0.2 => +0.2% above TP1 for LONG.
-_SMART_BE_CONFIRM_PCT = float((os.getenv("SMART_BE_CONFIRM_PCT", "0.2") or "0.2").strip() or 0.2)
-
-def _virtual_ref(*, exchange: str, market_type: str, symbol: str, side: str, close_side: str,
-                 entry_price: float, qty: float, tp1: float, tp2: float, sl: float) -> dict:
-    return {
-        "virtual": True,
-        "exchange": str(exchange),
-        "market_type": str(market_type),
-        "symbol": str(symbol),
-        "side": str(side),
-        "close_side": str(close_side),
-        "entry_price": float(entry_price or 0.0),
-        "be_price": float(entry_price or 0.0),
-        "be_moved": False,
-        "be_pending": False,   # waiting for smart-confirm after TP1
-        "tp1_hit": False,
-        "qty": float(qty or 0.0),
-        "tp1": float(tp1 or 0.0),
-        "tp2": float(tp2 or 0.0),
-        "sl": float(sl or 0.0),
-    }
-
 # ------------------ Smart FUTURES Cap (effective cap) ------------------
 # In-memory cache: last effective cap per user (resets on restart).
 _LAST_EFFECTIVE_FUT_CAP: dict[int, float] = {}
@@ -129,6 +99,28 @@ _SMARTCAP_COOLDOWN_SEC = max(60, _smartcap_env_int("EFF_CAP_NOTIFY_COOLDOWN_SEC"
 _SMARTCAP_DECREASE_MIN_USDT = max(0.0, _smartcap_env_float("EFF_CAP_DECREASE_MIN_USDT", 10.0))
 _SMARTCAP_BASE_PCT = min(0.95, max(0.1, _smartcap_env_float("EFF_CAP_BASE_PCT", 0.65)))  # base cap = balance * 0.65
 _SMARTCAP_HARD_MAX_PCT = min(0.98, max(0.3, _smartcap_env_float("EFF_CAP_HARD_MAX_PCT", 0.85)))  # never use >85% of balance
+
+# ------------------ Virtual SL/TP mode (price-watched) ------------------
+# When enabled, the bot does NOT place TP/SL orders on the exchange.
+# It opens an entry MARKET order and then manages TP/SL/BE virtually by watching price and sending MARKET closes.
+_VIRTUAL_SLTP_ALL = (os.getenv("VIRTUAL_SLTP_ALL", "1").strip().lower() not in ("0","false","no","off"))
+
+# Break-even fee buffer (percent). Example: 0.05 means +0.05% for LONG, -0.05% for SHORT.
+_BE_FEE_BUFFER_PCT = float(os.getenv("BE_FEE_BUFFER_PCT", "0.05") or 0.05)
+
+def _be_with_fee_buffer(entry_price: float, *, direction: str) -> float:
+    """Return BE price adjusted by fee buffer."""
+    try:
+        ep = float(entry_price or 0.0)
+        if ep <= 0:
+            return 0.0
+        buf = max(0.0, float(_BE_FEE_BUFFER_PCT)) / 100.0
+        d = (direction or "").upper().strip()
+        if d == "SHORT":
+            return ep * (1.0 - buf)
+        return ep * (1.0 + buf)
+    except Exception:
+        return float(entry_price or 0.0)
 
 def _smartcap_floor_step(x: float, step: float) -> float:
     try:
@@ -1438,33 +1430,26 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 qty1 = qty
                 qty2 = 0.0
 
-
+            # --- VIRTUAL mode: do not place SL/TP orders on exchange ---
             if _VIRTUAL_SLTP_ALL:
-                # Virtual mode: do not place SL/TP orders on the exchange.
-                ref = _virtual_ref(exchange="binance", market_type="spot", symbol=symbol, side="BUY", close_side="SELL",
-                                   entry_price=float(entry or 0.0), qty=float(exec_qty),
-                                   tp1=float(tp1 or 0.0), tp2=float(tp2 or 0.0), sl=float(sl or 0.0))
-                sig_id = _extract_signal_id(sig)
-                if sig_id <= 0:
-                    raise ExchangeAPIError("missing signal_id")
-                await db_store.create_autotrade_position(
-                    user_id=uid,
-                    signal_id=sig_id,
-                    exchange="binance",
-                    market_type="spot",
-                    symbol=symbol,
-                    side="BUY",
-                    allocated_usdt=need_usdt,
-                    api_order_ref=json.dumps(ref),
-                )
-                return {"ok": True, "skipped": False, "api_error": None}
-
-
-            if _VIRTUAL_SLTP_ALL:
-                # Virtual mode: do not place SL/TP orders on the exchange.
-                ref = _virtual_ref(exchange="bybit", market_type=mt, symbol=symbol, side=side.upper(), close_side=close_side.upper(),
-                                   entry_price=float(entry or 0.0), qty=float(qty),
-                                   tp1=float(tp1 or 0.0), tp2=float(tp2 or 0.0), sl=float(sl or 0.0))
+                entry_p = float(entry or 0.0)
+                ref = {
+                    "virtual": True,
+                    "exchange": "bybit",
+                    "market_type": mt,
+                    "symbol": symbol,
+                    "direction": direction,
+                    "side": side,
+                    "close_side": ("SELL" if str(side).upper() == "BUY" else "BUY"),
+                    "entry_price": entry_p,
+                    "qty": float(qty),
+                    "tp1": float(tp1 or 0.0),
+                    "tp2": float(tp2 or 0.0),
+                    "sl": float(sl or 0.0),
+                    "tp1_hit": False,
+                    "be_moved": False,
+                    "be_price": 0.0,
+                }
                 sig_id = _extract_signal_id(sig)
                 if sig_id <= 0:
                     raise ExchangeAPIError("missing signal_id")
@@ -1474,11 +1459,12 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                     exchange="bybit",
                     market_type=mt,
                     symbol=symbol,
-                    side=side.upper(),
+                    side=side,
                     allocated_usdt=need_usdt,
                     api_order_ref=json.dumps(ref),
                 )
                 return {"ok": True, "skipped": False, "api_error": None}
+
 
             # Place SL first; if SL fails, immediately close to avoid unprotected exposure.
             try:
@@ -1642,7 +1628,21 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 entry_order = await _gateio_spot_market_buy(api_key=api_key, api_secret=api_secret, symbol=symbol, quote_usdt=need_usdt)
 
             # Store a virtual manager ref (virtual SL/TP + BE after TP1)
-            ref = _virtual_ref(exchange=exchange, market_type="spot", symbol=symbol, side="BUY", close_side="SELL", entry_price=float(px), qty=float(est_qty), tp1=float(tp1 or 0.0), tp2=float(tp2 or 0.0), sl=float(sl or 0.0))
+            ref = {
+                "exchange": exchange,
+                "market_type": "spot",
+                "symbol": symbol,
+                "side": "BUY",
+                "close_side": "SELL",
+                "entry_price": float(px),
+                "be_price": float(px),
+                "be_moved": False,
+                "tp1_hit": False,
+                "qty": float(est_qty),
+                "tp1": float(tp1 or 0.0),
+                "tp2": float(tp2 or 0.0),
+                "sl": float(sl or 0.0),
+            }
 
             sig_id = _extract_signal_id(sig)
             if sig_id <= 0:
@@ -1707,6 +1707,43 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 has_tp2 = False
                 qty1 = exec_qty
                 qty2 = 0.0
+
+            # --- VIRTUAL mode: do not place SL/TP orders on exchange ---
+            if _VIRTUAL_SLTP_ALL:
+                # Use actual executed qty from entry as the managed base qty.
+                entry_p = float(entry or 0.0)
+                ref = {
+                    "virtual": True,
+                    "exchange": "binance",
+                    "market_type": "spot",
+                    "symbol": symbol,
+                    "direction": direction,
+                    "side": "BUY",
+                    "close_side": "SELL",
+                    "entry_price": entry_p,
+                    "qty": float(exec_qty),
+                    "tp1": float(tp1 or 0.0),
+                    "tp2": float(tp2 or 0.0),
+                    "sl": float(sl or 0.0),
+                    "tp1_hit": False,
+                    "be_moved": False,
+                    "be_price": 0.0,
+                }
+                sig_id = _extract_signal_id(sig)
+                if sig_id <= 0:
+                    raise ExchangeAPIError("missing signal_id")
+                await db_store.create_autotrade_position(
+                    user_id=uid,
+                    signal_id=sig_id,
+                    exchange="binance",
+                    market_type="spot",
+                    symbol=symbol,
+                    side="BUY",
+                    allocated_usdt=need_usdt,
+                    api_order_ref=json.dumps(ref),
+                )
+                return {"ok": True, "skipped": False, "api_error": None}
+
 
             # Place SL first; if SL fails, immediately close (sell) to avoid an unprotected position.
             try:
@@ -1801,13 +1838,26 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
         close_side = "SELL" if side == "BUY" else "BUY"
         entry_res = await _binance_futures_market_open(api_key=api_key, api_secret=api_secret, symbol=symbol, side=side, qty=qty)
 
-        # Place SL first; if SL fails, immediately close position to avoid unprotected exposure.
-
+        # --- VIRTUAL mode: do not place SL/TP orders on exchange ---
         if _VIRTUAL_SLTP_ALL:
-            # Virtual mode: do not place SL/TP orders on the exchange.
-            ref = _virtual_ref(exchange="binance", market_type="futures", symbol=symbol, side=side.upper(), close_side=close_side.upper(),
-                               entry_price=float(entry or 0.0), qty=float(qty),
-                               tp1=float(tp1 or 0.0), tp2=float(tp2 or 0.0), sl=float(sl or 0.0))
+            entry_p = float(entry or 0.0)
+            ref = {
+                "virtual": True,
+                "exchange": "binance",
+                "market_type": "futures",
+                "symbol": symbol,
+                "direction": direction,
+                "side": side.upper(),
+                "close_side": ("SELL" if side.upper() == "BUY" else "BUY"),
+                "entry_price": entry_p,
+                "qty": float(qty),
+                "tp1": float(tp1 or 0.0),
+                "tp2": float(tp2 or 0.0),
+                "sl": float(sl or 0.0),
+                "tp1_hit": False,
+                "be_moved": False,
+                "be_price": 0.0,
+            }
             sig_id = _extract_signal_id(sig)
             if sig_id <= 0:
                 raise ExchangeAPIError("missing signal_id")
@@ -1817,12 +1867,14 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 exchange="binance",
                 market_type="futures",
                 symbol=symbol,
-                side=side.upper(),
+                side=side,
                 allocated_usdt=need_usdt,
                 api_order_ref=json.dumps(ref),
             )
             return {"ok": True, "skipped": False, "api_error": None}
 
+
+        # Place SL first; if SL fails, immediately close position to avoid unprotected exposure.
         try:
             sl_res = await _binance_futures_stop_market_close_all(
                 api_key=api_key,
@@ -2069,195 +2121,6 @@ async def _futures_position_size(*, ex: str, api_key: str, api_secret: str, symb
             return 0.0
     return 0.0
 
-async def _manage_virtual_position(
-    *,
-    uid: int,
-    row_id: int,
-    ex: str,
-    mt: str,
-    symbol: str,
-    api_key: str,
-    api_secret: str,
-    passphrase: str,
-    allocated_usdt: float,
-    ref: dict,
-) -> bool:
-    """Return True if position was updated/closed (virtual SL/TP/BE manager)."""
-    futures = (mt == "futures")
-    side = str(ref.get("side") or "").upper()  # BUY/SELL
-    close_side = str(ref.get("close_side") or ("SELL" if side == "BUY" else "BUY")).upper()
-    entry = float(ref.get("entry_price") or 0.0)
-    tp1 = float(ref.get("tp1") or 0.0)
-    tp2 = float(ref.get("tp2") or 0.0)
-    sl = float(ref.get("sl") or 0.0)
-    qty = float(ref.get("qty") or 0.0)
-    be_price = float(ref.get("be_price") or entry or 0.0)
-
-    if qty <= 0 or entry <= 0:
-        return False
-
-    # price fetch
-    try:
-        if ex == "binance":
-            px = await _binance_price(symbol, futures=futures)
-        elif ex == "bybit":
-            px = await _bybit_price(symbol, category=("linear" if futures else "spot"))
-        elif ex == "okx":
-            px = await _okx_public_price(symbol)
-        elif ex == "mexc":
-            px = await _mexc_public_price(symbol)
-        else:
-            px = await _gateio_public_price(symbol)
-    except Exception:
-        return False
-    if not px:
-        return False
-
-    is_long = (side == "BUY")  # futures: BUY=LONG, SELL=SHORT
-    def reached_tp(level: float) -> bool:
-        if level <= 0:
-            return False
-        return (px >= level) if is_long else (px <= level)
-
-    def reached_sl(level: float) -> bool:
-        if level <= 0:
-            return False
-        return (px <= level) if is_long else (px >= level)
-
-    async def _close_market(q: float) -> None:
-        q = float(max(0.0, q))
-        if q <= 0:
-            return
-        if futures:
-            if ex == "binance":
-                await _binance_futures_reduce_market(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=q)
-            elif ex == "bybit":
-                await _bybit_order_create(api_key=api_key, api_secret=api_secret, category="linear", symbol=symbol,
-                                          side=close_side, order_type="Market", qty=q, reduce_only=True)
-            else:
-                raise ExchangeAPIError("unsupported futures exchange for virtual mode")
-        else:
-            if ex == "binance":
-                await _binance_spot_market_sell_base(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=q)
-            elif ex == "bybit":
-                await _bybit_order_create(api_key=api_key, api_secret=api_secret, category="spot", symbol=symbol,
-                                          side=close_side, order_type="Market", qty=q, reduce_only=None)
-            elif ex == "okx":
-                await _okx_spot_market_sell(api_key=api_key, api_secret=api_secret, passphrase=passphrase, symbol=symbol, base_qty=q)
-            elif ex == "mexc":
-                await _mexc_spot_market_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, base_qty=q)
-            else:
-                await _gateio_spot_market_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, base_qty=q)
-
-    # 1) Stop-loss (full close)
-    if reached_sl(sl):
-        await _close_market(qty)
-        # compute pnl
-        pnl_usdt = None
-        roi_percent = None
-        try:
-            if futures:
-                pnl_usdt = (px - entry) * qty if is_long else (entry - px) * qty
-                if allocated_usdt:
-                    roi_percent = (pnl_usdt / float(allocated_usdt)) * 100.0
-            else:
-                pnl_usdt = (px - entry) * qty if is_long else (entry - px) * qty
-                if allocated_usdt:
-                    roi_percent = (pnl_usdt / float(allocated_usdt)) * 100.0
-        except Exception:
-            pnl_usdt = None
-            roi_percent = None
-        await db_store.close_autotrade_position(user_id=uid, signal_id=int(ref.get("signal_id") or 0) or None,
-                                               exchange=ex, market_type=mt, status="CLOSED",
-                                               pnl_usdt=pnl_usdt, roi_percent=roi_percent)
-        return True
-
-    tp1_hit = bool(ref.get("tp1_hit"))
-    be_moved = bool(ref.get("be_moved"))
-    be_pending = bool(ref.get("be_pending"))
-
-    # 2) TP2 (close remainder if already took TP1 or single-target mode)
-    if tp2 > 0 and reached_tp(tp2):
-        await _close_market(qty)
-        pnl_usdt = None
-        roi_percent = None
-        try:
-            pnl_usdt = (px - entry) * qty if is_long else (entry - px) * qty
-            roi_percent = (pnl_usdt / float(allocated_usdt)) * 100.0 if allocated_usdt else None
-        except Exception:
-            pnl_usdt = None
-            roi_percent = None
-        await db_store.close_autotrade_position(user_id=uid, signal_id=int(ref.get("signal_id") or 0) or None,
-                                               exchange=ex, market_type=mt, status="CLOSED",
-                                               pnl_usdt=pnl_usdt, roi_percent=roi_percent)
-        return True
-
-    # 3) TP1 (partial close if TP2 exists, otherwise full close)
-    if (not tp1_hit) and tp1 > 0 and reached_tp(tp1):
-        has_tp2 = (tp2 > 0 and abs(tp2 - tp1) > 1e-12)
-        close_qty = qty * (0.5 if has_tp2 else 1.0)
-        await _close_market(close_qty)
-        remaining = max(0.0, qty - close_qty)
-        if not has_tp2 or remaining <= 0:
-            pnl_usdt = None
-            roi_percent = None
-            try:
-                pnl_usdt = (px - entry) * qty if is_long else (entry - px) * qty
-                roi_percent = (pnl_usdt / float(allocated_usdt)) * 100.0 if allocated_usdt else None
-            except Exception:
-                pnl_usdt = None
-                roi_percent = None
-            await db_store.close_autotrade_position(user_id=uid, signal_id=int(ref.get("signal_id") or 0) or None,
-                                                   exchange=ex, market_type=mt, status="CLOSED",
-                                                   pnl_usdt=pnl_usdt, roi_percent=roi_percent)
-            return True
-
-        # update ref for remainder
-        ref["tp1_hit"] = True
-        ref["qty"] = float(remaining)
-        ref["be_price"] = float(be_price or entry or 0.0)
-        # smart BE: wait for continuation beyond TP1
-        if _SMART_BE_CONFIRM_PCT > 0:
-            ref["be_pending"] = True
-            ref["be_moved"] = False
-        else:
-            ref["be_pending"] = False
-            ref["be_moved"] = True
-
-        await db_store.update_autotrade_order_ref(row_id=row_id, api_order_ref=json.dumps(ref))
-        return True
-
-    # 4) Smart BE confirm (only after TP1)
-    if tp1_hit and (not be_moved) and be_pending and tp1 > 0:
-        pct = float(max(0.0, _SMART_BE_CONFIRM_PCT))
-        if pct > 0:
-            confirm_px = (tp1 * (1.0 + pct/100.0)) if is_long else (tp1 * (1.0 - pct/100.0))
-            if (px >= confirm_px) if is_long else (px <= confirm_px):
-                ref["be_moved"] = True
-                ref["be_pending"] = False
-                await db_store.update_autotrade_order_ref(row_id=row_id, api_order_ref=json.dumps(ref))
-                return True
-
-    # 5) BE trigger (close remainder at entry if price returns)
-    if tp1_hit and be_moved and be_price > 0:
-        if (px <= be_price) if is_long else (px >= be_price):
-            await _close_market(qty)
-            pnl_usdt = None
-            roi_percent = None
-            try:
-                pnl_usdt = (px - entry) * qty if is_long else (entry - px) * qty
-                roi_percent = (pnl_usdt / float(allocated_usdt)) * 100.0 if allocated_usdt else None
-            except Exception:
-                pnl_usdt = None
-                roi_percent = None
-            await db_store.close_autotrade_position(user_id=uid, signal_id=int(ref.get("signal_id") or 0) or None,
-                                                   exchange=ex, market_type=mt, status="CLOSED",
-                                                   pnl_usdt=pnl_usdt, roi_percent=roi_percent)
-            return True
-
-    return False
-
-
 async def autotrade_manager_loop(*, notify_api_error) -> None:
     """Background loop to manage SL/TP/BE for real orders.
 
@@ -2339,7 +2202,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 except Exception:
                     continue
                 ex = str(ref.get("exchange") or r.get("exchange") or "").lower()
-                if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
+                if ex not in ("binance", "bybit"):
                     continue
 
                 uid = int(r.get("user_id"))
@@ -2356,35 +2219,6 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     api_secret = _decrypt_token(row.get("api_secret_enc"))
                 except Exception:
                     continue
-
-                passphrase = ""
-                if ex == "okx":
-                    try:
-                        passphrase = _decrypt_token(row.get("passphrase_enc"))
-                    except Exception:
-                        passphrase = ""
-
-                # Virtual SL/TP/BE manager (single logic for all exchanges)
-                if bool(ref.get("virtual")) or _VIRTUAL_SLTP_ALL:
-                    try:
-                        updated = await _manage_virtual_position(
-                            uid=uid,
-                            row_id=int(r.get("id")),
-                            ex=ex,
-                            mt=mt,
-                            symbol=symbol,
-                            api_key=api_key,
-                            api_secret=api_secret,
-                            passphrase=passphrase,
-                            allocated_usdt=float(r.get("allocated_usdt") or 0.0),
-                            ref=ref,
-                        )
-                        if updated:
-                            continue
-                    except Exception:
-                        # If virtual manager errors, fall back to legacy logic (if any)
-                        pass
-
 
                 # --- Soft reconcile: detect manual close and close stale OPEN rows ---
                 # If user closed manually on exchange, SL/TP may never be FILLED -> DB can remain OPEN forever.
@@ -2493,10 +2327,22 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 be_price = float(ref.get("be_price") or 0.0)
                 close_side = str(ref.get("close_side") or ("SELL" if str(ref.get("side")) == "BUY" else "BUY")).upper()
 
-                # -------- Virtual SPOT management for OKX/MEXC/Gate.io --------
-                if mt == "spot" and ex in ("okx", "mexc", "gateio"):
+                
+                # -------- Virtual management (ALL exchanges / SPOT+FUTURES) --------
+                # If ref["virtual"] is True, we manage by watching price and sending MARKET closes.
+                if bool(ref.get("virtual")):
                     try:
-                        if ex == "okx":
+                        # --- price ---
+                        if ex == "binance":
+                            if mt == "futures":
+                                data = await _http_json("GET", "https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
+                                px = float(data.get("price") or 0.0)
+                            else:
+                                data = await _http_json("GET", "https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
+                                px = float(data.get("price") or 0.0)
+                        elif ex == "bybit":
+                            px = await _bybit_price(symbol, category=("linear" if mt == "futures" else "spot"))
+                        elif ex == "okx":
                             px = await _okx_public_price(symbol)
                         elif ex == "mexc":
                             px = await _mexc_public_price(symbol)
@@ -2513,33 +2359,82 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     tp1 = float(ref.get("tp1") or 0.0)
                     tp2 = float(ref.get("tp2") or 0.0)
                     sl = float(ref.get("sl") or 0.0)
-                    be_price = float(ref.get("be_price") or entry_p or 0.0)
                     tp1_hit = bool(ref.get("tp1_hit"))
                     be_moved = bool(ref.get("be_moved"))
+                    direction = str(ref.get("direction") or ("LONG" if str(ref.get("side")).upper() in ("BUY","LONG") else "SHORT")).upper()
+                    # If BE is active, be_price is stored; otherwise computed at TP1.
+                    be_price = float(ref.get("be_price") or 0.0)
 
                     if qty <= 0:
-                        # Nothing to manage; close silently
                         await db_store.close_autotrade_position(
                             user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
                         )
                         continue
 
-                    async def _do_sell(q: float) -> None:
+                    async def _close_market(q: float) -> None:
                         q2 = max(0.0, float(q))
                         if q2 <= 0:
                             return
-                        if ex == "okx":
-                            passphrase = _decrypt_token(row.get("passphrase_enc"))
-                            await _okx_spot_market_sell(api_key=api_key, api_secret=api_secret, passphrase=passphrase, symbol=symbol, base_qty=q2)
-                        elif ex == "mexc":
-                            await _mexc_spot_market_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, base_qty=q2)
-                        else:
-                            await _gateio_spot_market_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, base_qty=q2)
+                        # Spot short is not supported in this bot; virtual logic assumes LONG for spot.
+                        if mt == "spot":
+                            if ex == "binance":
+                                await _binance_spot_market_sell_base(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=q2)
+                            elif ex == "bybit":
+                                await _bybit_order_create(
+                                    api_key=api_key,
+                                    api_secret=api_secret,
+                                    category="spot",
+                                    symbol=symbol,
+                                    side="Sell",
+                                    order_type="Market",
+                                    qty=q2,
+                                )
+                            elif ex == "okx":
+                                await _okx_spot_market_sell(api_key=api_key, api_secret=api_secret, passphrase=passphrase or "", symbol=symbol, base_qty=q2)
+                            elif ex == "mexc":
+                                await _mexc_spot_market_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, base_qty=q2)
+                            else:
+                                await _gateio_spot_market_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, base_qty=q2)
+                            return
 
-                    # SL before TP1
-                    if (not tp1_hit) and sl > 0 and px <= sl:
+                        # Futures
+                        close_side = "SELL" if direction == "LONG" else "BUY"
+                        if ex == "binance":
+                            await _binance_futures_reduce_market(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=q2)
+                        elif ex == "bybit":
+                            await _bybit_order_create(
+                                api_key=api_key,
+                                api_secret=api_secret,
+                                category="linear",
+                                symbol=symbol,
+                                side=("Sell" if close_side == "SELL" else "Buy"),
+                                order_type="Market",
+                                qty=q2,
+                                reduce_only=True,
+                            )
+                        else:
+                            # Other futures exchanges aren't supported in this bot; close silently
+                            raise ExchangeAPIError("unsupported futures exchange in virtual mode")
+
+                    def _hit_sl() -> bool:
+                        if sl <= 0:
+                            return False
+                        return (px <= sl) if direction == "LONG" else (px >= sl)
+
+                    def _hit_tp(level: float) -> bool:
+                        if level <= 0:
+                            return False
+                        return (px >= level) if direction == "LONG" else (px <= level)
+
+                    def _hit_be() -> bool:
+                        if be_price <= 0:
+                            return False
+                        return (px <= be_price) if direction == "LONG" else (px >= be_price)
+
+                    # --- SL before TP1 ---
+                    if (not tp1_hit) and _hit_sl():
                         try:
-                            await _do_sell(qty)
+                            await _close_market(qty)
                         except Exception:
                             pass
                         await db_store.close_autotrade_position(
@@ -2547,27 +2442,25 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         )
                         continue
 
-                    # TP1: partial close 50% + move to BE (virtual)
-                    if (not tp1_hit) and tp1 > 0 and px >= tp1:
+                    # --- TP1: close 50% and move to BE immediately (entry + fee buffer) ---
+                    if (not tp1_hit) and _hit_tp(tp1):
                         q_close = qty * 0.5
                         try:
-                            await _do_sell(q_close)
+                            await _close_market(q_close)
                         except Exception:
-                            # If partial close fails, don't change state
                             continue
                         qty = max(0.0, qty - q_close)
                         ref["qty"] = qty
                         ref["tp1_hit"] = True
                         ref["be_moved"] = True
-                        ref["be_price"] = float(be_price or entry_p or px)
+                        ref["be_price"] = float(_be_with_fee_buffer(entry_p, direction=direction))
                         await db_store.update_autotrade_order_ref(row_id=int(r.get("id")), api_order_ref=json.dumps(ref))
-                        # Continue managing remaining position on next loop
                         continue
 
-                    # After TP1: BE close if retrace to entry
-                    if tp1_hit and be_moved and be_price > 0 and _be_is_armed(side=side_str, price=px, tp1=tp1, tp2=tp2) and px <= be_price:
+                    # --- After TP1: BE close if retrace to BE price ---
+                    if tp1_hit and be_moved and _hit_be():
                         try:
-                            await _do_sell(qty)
+                            await _close_market(qty)
                         except Exception:
                             pass
                         await db_store.close_autotrade_position(
@@ -2575,10 +2468,10 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         )
                         continue
 
-                    # TP2: close remaining
-                    if tp1_hit and tp2 > 0 and px >= tp2:
+                    # --- TP2: close remaining ---
+                    if tp1_hit and _hit_tp(tp2):
                         try:
-                            await _do_sell(qty)
+                            await _close_market(qty)
                         except Exception:
                             pass
                         await db_store.close_autotrade_position(
@@ -2586,10 +2479,10 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         )
                         continue
 
-                    # SL after TP1 (protective)
-                    if tp1_hit and sl > 0 and px <= sl:
+                    # --- Protective SL after TP1 (optional) ---
+                    if tp1_hit and _hit_sl():
                         try:
-                            await _do_sell(qty)
+                            await _close_market(qty)
                         except Exception:
                             pass
                         await db_store.close_autotrade_position(
@@ -2599,8 +2492,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
 
                     continue
 
-
-                # If TP1 filled and BE not moved: cancel SL and place new SL at entry (BE)
+# If TP1 filled and BE not moved: cancel SL and place new SL at entry (BE)
                 if tp1_id and (not be_moved) and be_price > 0:
                     if ex == "binance":
                         try:
