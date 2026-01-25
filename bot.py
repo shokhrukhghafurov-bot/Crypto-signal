@@ -3235,6 +3235,33 @@ _SIG_WATCH_INTERVAL_SEC = max(5, int(os.getenv("SIG_WATCH_INTERVAL_SEC", "15")))
 _BE_BUFFER_PCT = float(os.getenv("BE_BUFFER_PCT", "0.001") or 0.001)  # 0.1% default
 _BE_CONFIRM_SEC = max(0, int(os.getenv("BE_CONFIRM_SEC", "60") or 60))  # require staying past BE trigger for N seconds
 _SIG_TP1_PARTIAL_PCT = float(os.getenv("SIG_TP1_PARTIAL_CLOSE_PCT", "50") or 50)  # model partial close at TP1
+_SIG_BE_ARM_PCT_TO_TP2 = max(0.0, min(1.0, float(os.getenv('BE_ARM_PCT_TO_TP2', '0') or 0.0)))
+
+def _be_is_armed_sig(side: str, price: float, tp1: float | None, tp2: float | None) -> bool:
+    """Delayed BE arming: arm BE only after price moves from TP1 towards TP2 by BE_ARM_PCT_TO_TP2 fraction."""
+    pct = float(_SIG_BE_ARM_PCT_TO_TP2 or 0.0)
+    if pct <= 0:
+        return True
+    try:
+        tp1f = float(tp1 or 0.0)
+        tp2f = float(tp2 or 0.0)
+        pf = float(price or 0.0)
+    except Exception:
+        return True
+    if tp1f <= 0 or tp2f <= 0:
+        return True
+    side_u = (side or 'LONG').upper()
+    if side_u == 'LONG':
+        if tp2f <= tp1f:
+            return True
+        thr = tp1f + (tp2f - tp1f) * pct
+        return pf >= thr
+    else:
+        if tp2f >= tp1f:
+            return True
+        thr = tp1f - (tp1f - tp2f) * pct
+        return pf <= thr
+
 
 async def _fetch_binance_price(symbol: str, *, futures: bool) -> float:
     """Best-effort public price from Binance (spot or futures)."""
@@ -3343,6 +3370,12 @@ async def signal_outcome_loop() -> None:
                         if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
                             pnl = (part * _pnl_pct(side, entry, eff_tp1) + (1.0 - part) * _pnl_pct(side, entry, eff_tp2)) if eff_tp1 > 0 else _pnl_pct(side, entry, eff_tp2)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            continue
+
+                        if not _be_is_armed_sig(side, px, eff_tp1, eff_tp2):
+                            # Not armed yet: don't allow BE close; reset pending BE timer if any.
+                            if t.get('be_crossed_at'):
+                                await db_store.set_signal_be_crossed_at(signal_id=sid, crossed_at=None)
                             continue
 
                         # Strict BE confirmation
