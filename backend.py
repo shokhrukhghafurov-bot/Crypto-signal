@@ -2164,7 +2164,10 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 roi_percent = None
 
                             await db_store.close_autotrade_position(
-                                pos_id,
+                                user_id=uid,
+                                signal_id=r.get("signal_id"),
+                                exchange=ex,
+                                market_type=mt,
                                 status="CLOSED",
                                 pnl_usdt=pnl_usdt,
                                 roi_percent=roi_percent,
