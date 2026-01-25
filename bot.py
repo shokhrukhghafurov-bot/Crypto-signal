@@ -1257,9 +1257,6 @@ def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
     fut_on = bool(s.get("futures_enabled"))
     spot_state = tr(uid, "at_state_on") if spot_on else tr(uid, "at_state_off")
     fut_state = tr(uid, "at_state_on") if fut_on else tr(uid, "at_state_off")
-    spot_icon = "🟢" if spot_on else "🔴"
-    fut_icon = "🟢" if fut_on else "🔴"
-
     title = tr(uid, "at_title")
     spot_header = tr(uid, "at_spot_header")
     fut_header = tr(uid, "at_futures_header")
@@ -1280,9 +1277,9 @@ def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
         f"{lbl_ex}: {fut_ex}\n"
         f"{lbl_fut_margin}: {fut_margin:g} USDT\n"
         f"{lbl_lev}: {fut_lev}x\n"
-        f"📌 Cap (настройка): {fut_cap:g} USDT\n"
+        f"{tr(uid, 'at_label_cap_setting')}: {fut_cap:g} USDT\n"
 
-        f"🧠 Effective Cap (сейчас): {fut_cap_eff:g} USDT"
+        f"{tr(uid, 'at_label_effective_cap_now')}: {fut_cap_eff:g} USDT"
     )
 
 
