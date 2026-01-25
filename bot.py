@@ -1207,6 +1207,15 @@ def _calc_effective_futures_cap(ui_cap: float, winrate: float | None) -> float:
 
 def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
     """Compact Auto-trade screen (main), per UX request."""
+    # Keys list may be injected into state dict by the caller. Keep it optional.
+    # We must NOT reference a free variable here (caused NameError in v4).
+    keys: List[Dict[str, any]] = []
+    try:
+        v = s.get("keys") or s.get("autotrade_keys") or []
+        if isinstance(v, list):
+            keys = v
+    except Exception:
+        keys = []
     # SPOT: show connected exchanges in priority order (user may connect multiple).
     prio_csv = str(s.get("spot_exchange_priority") or "binance,bybit,okx,mexc,gateio")
     prio_all = [p.strip().lower() for p in prio_csv.split(",") if p.strip()]
@@ -2217,6 +2226,13 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 st["futures_winrate"] = await fn(user_id=uid, market_type="futures", last_n=10)
         except Exception:
             st["futures_winrate"] = None
+
+        # Attach autotrade keys status so the main screen can show connected SPOT exchanges.
+        # This is best-effort; UI should still render if DB query fails.
+        try:
+            st["keys"] = await db_store.get_autotrade_keys_status(uid)
+        except Exception:
+            st["keys"] = []
 
         await safe_edit(call.message, autotrade_main_text(uid, st), autotrade_main_kb(uid))
         return
