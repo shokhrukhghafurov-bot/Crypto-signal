@@ -85,7 +85,6 @@ async def ensure_schema() -> None:
           tp1_hit BOOLEAN NOT NULL DEFAULT FALSE,
           be_price NUMERIC(18,8),
           opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           closed_at TIMESTAMPTZ,
           pnl_total_pct NUMERIC(10,4),
           orig_text TEXT NOT NULL
@@ -355,7 +354,16 @@ ON CONFLICT (id) DO NOTHING;
           UNIQUE (sig_key)
         );
         """)
-        
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_signal_sent_events_time
+        ON signal_sent_events (created_at DESC);
+        """)
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_signal_sent_events_market_time
+        ON signal_sent_events (market, created_at DESC);
+        """)
+
+
         # --- bot-level signal outcome tracking (independent from users) ---
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS signal_tracks (
@@ -380,29 +388,23 @@ ON CONFLICT (id) DO NOTHING;
           pnl_total_pct NUMERIC(10,4)
         );
         """)
-        try:
-            
+
         # Backward-compatible migrations for existing DBs
         try:
-            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS tp1_hit_at TIMESTAMPTZ;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS be_armed_at TIMESTAMPTZ;")
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS be_crossed_at TIMESTAMPTZ;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS pnl_total_pct NUMERIC(10,4);")
         except Exception:
             pass
-await conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_tracks_market_status ON signal_tracks(market, status);")
+
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_tracks_market_status ON signal_tracks(market, status);")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_tracks_closed_at ON signal_tracks(closed_at);")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_tracks_tp1_hit_at ON signal_tracks(tp1_hit_at);")
         except Exception:
             pass
-
-await conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_signal_sent_events_time
-        ON signal_sent_events (created_at DESC);
-        """)
-        await conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_signal_sent_events_market_time
-        ON signal_sent_events (market, created_at DESC);
-        """)
 
 
 async def ensure_users_columns() -> None:
@@ -1035,11 +1037,17 @@ async def count_signal_sent_by_market(*, since: dt.datetime, until: dt.datetime)
             for r in rows or []:
                 mk = str(r.get('market') or '').upper()
                 if mk in out:
-                    out[mk] = int(r.get('n') 
+                    out[mk] = int(r.get('n') or 0)
+        except Exception:
+            logger.exception('count_signal_sent_by_market failed')
+    return out
+
+
+
 
 # ---------------- bot-level signal outcome tracking ----------------
 
-async def create_signal_track(
+async def upsert_signal_track(
     *,
     signal_id: int,
     sig_key: str,
@@ -1050,177 +1058,171 @@ async def create_signal_track(
     tp1: float | None,
     tp2: float | None,
     sl: float | None,
-) -> bool:
-    """Create a bot-level signal track row (independent from users). Dedup by signal_id/sig_key."""
+) -> None:
+    """Create/update a bot-level signal tracking row.
+
+    This is independent from user trades. Used for signal performance stats.
+    """
     if not signal_id:
-        return False
+        return
     market = str(market or "").upper()
+    side = str(side or "").upper()
     if market not in ("SPOT", "FUTURES"):
-        return False
-    side_u = str(side or "").upper()
-    if side_u not in ("LONG", "SHORT"):
-        # SPOT signals are normally LONG, but keep strictness.
-        side_u = "LONG"
+        market = "SPOT"
+    if side not in ("LONG", "SHORT"):
+        side = "LONG"
     pool = get_pool()
     async with pool.acquire() as conn:
-        try:
-            r = await conn.fetchrow(
-                """
-                INSERT INTO signal_tracks(signal_id, sig_key, market, symbol, side, entry, tp1, tp2, sl)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-                ON CONFLICT (signal_id) DO NOTHING
-                RETURNING signal_id;
-                """,
-                int(signal_id),
-                (sig_key or None),
-                market,
-                str(symbol or "").upper(),
-                side_u,
-                float(entry),
-                (float(tp1) if tp1 is not None else None),
-                (float(tp2) if tp2 is not None else None),
-                (float(sl) if sl is not None else None),
-            )
-            return bool(r)
-        except Exception:
-            logger.exception("create_signal_track failed")
-            return False
+        await conn.execute(
+            """
+            INSERT INTO signal_tracks (signal_id, sig_key, market, symbol, side, entry, tp1, tp2, sl, status, opened_at, updated_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'ACTIVE', NOW(), NOW())
+            ON CONFLICT (signal_id)
+            DO UPDATE SET
+              sig_key=EXCLUDED.sig_key,
+              market=EXCLUDED.market,
+              symbol=EXCLUDED.symbol,
+              side=EXCLUDED.side,
+              entry=EXCLUDED.entry,
+              tp1=EXCLUDED.tp1,
+              tp2=EXCLUDED.tp2,
+              sl=EXCLUDED.sl,
+              updated_at=NOW();
+            """,
+            int(signal_id),
+            str(sig_key or ""),
+            market,
+            str(symbol or "").upper(),
+            side,
+            float(entry or 0.0),
+            (float(tp1) if tp1 is not None else None),
+            (float(tp2) if tp2 is not None else None),
+            (float(sl) if sl is not None else None),
+        )
 
 
-async def list_open_signal_tracks(*, market: str | None = None, limit: int = 500) -> List[Dict[str, Any]]:
-    """Return ACTIVE/TP1 tracks for watcher loop."""
+async def list_open_signal_tracks(*, limit: int = 500) -> List[dict]:
+    """Return ACTIVE/TP1 bot-level signal tracks."""
     pool = get_pool()
-    market_u = (str(market).upper() if market else None)
-    if market_u and market_u not in ("SPOT", "FUTURES"):
-        market_u = None
     async with pool.acquire() as conn:
-        try:
-            if market_u:
-                rows = await conn.fetch(
-                    """
-                    SELECT * FROM signal_tracks
-                    WHERE market=$1 AND status IN ('ACTIVE','TP1')
-                    ORDER BY opened_at ASC
-                    LIMIT $2;
-                    """,
-                    market_u, int(limit)
-                )
-            else:
-                rows = await conn.fetch(
-                    """
-                    SELECT * FROM signal_tracks
-                    WHERE status IN ('ACTIVE','TP1')
-                    ORDER BY opened_at ASC
-                    LIMIT $1;
-                    """,
-                    int(limit)
-                )
-            return [dict(r) for r in (rows or [])]
-        except Exception:
-            logger.exception("list_open_signal_tracks failed")
-            return []
+        rows = await conn.fetch(
+            """
+            SELECT *
+            FROM signal_tracks
+            WHERE status IN ('ACTIVE','TP1')
+            ORDER BY opened_at ASC
+            LIMIT $1;
+            """,
+            int(limit),
+        )
+    return [dict(r) for r in rows]
 
 
-async def mark_signal_tp1(*, signal_id: int, be_price: float) -> None:
+async def mark_signal_tp1(*, signal_id: int, be_price: float | None = None) -> None:
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
             UPDATE signal_tracks
-               SET tp1_hit=TRUE,
-                   status='TP1',
-                   tp1_hit_at=COALESCE(tp1_hit_at, NOW()),
-                   be_price=$2,
-                   be_armed_at=COALESCE(be_armed_at, NOW()),
-                   updated_at = NOW()
-             WHERE signal_id=$1;
+            SET status='TP1',
+                tp1_hit=TRUE,
+                tp1_hit_at=COALESCE(tp1_hit_at, NOW()),
+                be_price=COALESCE($2, be_price),
+                be_armed_at=COALESCE(be_armed_at, NOW()),
+                updated_at=NOW()
+            WHERE signal_id=$1 AND status='ACTIVE';
             """,
-            int(signal_id), float(be_price),
+            int(signal_id),
+            (float(be_price) if be_price is not None else None),
         )
 
 
-async def set_signal_be_crossed_at(*, signal_id: int, crossed_at: dt.datetime | None) -> None:
+async def mark_signal_be_crossed(*, signal_id: int) -> None:
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE signal_tracks SET be_crossed_at=$2, updated_at=NOW() WHERE signal_id=$1;",
+            """
+            UPDATE signal_tracks
+            SET be_crossed_at=COALESCE(be_crossed_at, NOW()),
+                updated_at=NOW()
+            WHERE signal_id=$1 AND status='TP1';
+            """,
             int(signal_id),
-            crossed_at,
         )
 
 
-async def close_signal_track(*, signal_id: int, status: str, pnl_total_pct: float) -> None:
-    st = str(status or "CLOSED").upper()
-    if st not in ("WIN","LOSS","BE","CLOSED"):
+async def clear_signal_be_crossed(*, signal_id: int) -> None:
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE signal_tracks
+            SET be_crossed_at=NULL,
+                updated_at=NOW()
+            WHERE signal_id=$1 AND status='TP1';
+            """,
+            int(signal_id),
+        )
+
+
+async def close_signal_track(*, signal_id: int, status: str, pnl_total_pct: float | None = None) -> None:
+    """Close a signal track with final status WIN/LOSS/BE/CLOSED and store pnl."""
+    st = str(status or "").upper()
+    if st not in ("WIN", "LOSS", "BE", "CLOSED"):
         st = "CLOSED"
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
             UPDATE signal_tracks
-               SET status=$2,
-                   closed_at=NOW(),
-                   pnl_total_pct=$3,
-                   updated_at=NOW()
-             WHERE signal_id=$1;
+            SET status=$2,
+                closed_at=NOW(),
+                updated_at=NOW(),
+                pnl_total_pct=$3
+            WHERE signal_id=$1;
             """,
             int(signal_id),
             st,
-            float(pnl_total_pct),
+            (float(pnl_total_pct) if pnl_total_pct is not None else None),
         )
 
 
 async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
-    """Aggregate BOT signal outcomes in [since, until). Counts come from signal_tracks.closed_at/tp1_hit_at."""
-    market_u = str(market or "").upper()
-    if market_u not in ("SPOT","FUTURES"):
-        market_u = "SPOT"
+    """Aggregate bot-level signal outcomes in [since, until)."""
+    market = str(market or "").upper()
+    if market not in ("SPOT", "FUTURES"):
+        market = "SPOT"
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            WITH closed AS (
-              SELECT signal_id, status, COALESCE(pnl_total_pct,0)::float AS pnl
-              FROM signal_tracks
-              WHERE market=$1
-                AND closed_at >= $2 AND closed_at < $3
-                AND status IN ('WIN','LOSS','BE','CLOSED')
-            ),
-            tp1 AS (
-              SELECT COUNT(*)::int AS tp1_hits
-              FROM signal_tracks
-              WHERE market=$1
-                AND tp1_hit_at >= $2 AND tp1_hit_at < $3
-            )
             SELECT
-              COUNT(*)::int AS trades,
-              SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END)::int AS wins,
-              SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END)::int AS losses,
-              SUM(CASE WHEN status='BE' THEN 1 ELSE 0 END)::int AS be,
-              (SELECT tp1_hits FROM tp1)::int AS tp1_hits,
-              COALESCE(SUM(pnl), 0)::float AS sum_pnl_pct
-            FROM closed;
+              COUNT(*) FILTER (WHERE status IN ('WIN','LOSS','BE','CLOSED')
+                               AND closed_at >= $2 AND closed_at < $3)::int AS trades,
+              COUNT(*) FILTER (WHERE status='WIN'  AND closed_at >= $2 AND closed_at < $3)::int AS wins,
+              COUNT(*) FILTER (WHERE status='LOSS' AND closed_at >= $2 AND closed_at < $3)::int AS losses,
+              COUNT(*) FILTER (WHERE status='BE'   AND closed_at >= $2 AND closed_at < $3)::int AS be,
+              COUNT(*) FILTER (WHERE tp1_hit=TRUE  AND tp1_hit_at >= $2 AND tp1_hit_at < $3)::int AS tp1_hits,
+              COALESCE(SUM(CASE WHEN status IN ('WIN','LOSS','BE','CLOSED')
+                                AND closed_at >= $2 AND closed_at < $3
+                                THEN COALESCE(pnl_total_pct,0) ELSE 0 END),0)::float AS sum_pnl_pct
+            FROM signal_tracks
+            WHERE market=$1;
             """,
-            market_u, since, until
+            market,
+            since,
+            until,
         )
-        base = {"trades":0,"wins":0,"losses":0,"be":0,"tp1_hits":0,"sum_pnl_pct":0.0}
-        if not row:
-            return base
-        d=dict(row)
-        return {
-            "trades": int(d.get("trades") or 0),
-            "wins": int(d.get("wins") or 0),
-            "losses": int(d.get("losses") or 0),
-            "be": int(d.get("be") or 0),
-            "tp1_hits": int(d.get("tp1_hits") or 0),
-            "sum_pnl_pct": float(d.get("sum_pnl_pct") or 0.0),
-        }
-
-or 0)
-        except Exception:
-            logger.exception('count_signal_sent_by_market failed')
-    return out
-
+    if not row:
+        return {"trades": 0, "wins": 0, "losses": 0, "be": 0, "tp1_hits": 0, "sum_pnl_pct": 0.0}
+    return {
+        "trades": int(row.get("trades") or 0),
+        "wins": int(row.get("wins") or 0),
+        "losses": int(row.get("losses") or 0),
+        "be": int(row.get("be") or 0),
+        "tp1_hits": int(row.get("tp1_hits") or 0),
+        "sum_pnl_pct": float(row.get("sum_pnl_pct") or 0.0),
+    }
 
 # ---------------- Signal bot settings (global) ----------------
 
