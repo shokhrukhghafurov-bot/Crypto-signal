@@ -975,7 +975,11 @@ def _key_status_map(keys: List[Dict[str, any]]) -> Dict[str, Dict[str, any]]:
     return out
 
 
-def spot_priority_text(uid: int, pr: list[str]) -> str:
+def spot_priority_text(uid: int, pr: list[str], keys: list[dict] | None = None) -> str:
+    """Render SPOT exchange priority screen.
+
+    Shows priority order and whether keys are connected (active) per exchange.
+    """
     names = {
         "binance": "Binance",
         "bybit": "Bybit",
@@ -983,23 +987,35 @@ def spot_priority_text(uid: int, pr: list[str]) -> str:
         "mexc": "MEXC",
         "gateio": "Gate.io",
     }
+    km = _key_status_map(keys or [])
+    def _conn_mark(ex: str) -> str:
+        r = km.get(f"{ex}:spot") or {}
+        return "✅" if bool(r.get("is_active")) else "➕"
+
     lines = [tr(uid, "at_spot_header"), "", "🏦 Приоритет бирж SPOT (1 → 5):"]
     for i, ex in enumerate(pr, 1):
-        lines.append(f"{i}) {names.get(ex, ex)}")
+        lines.append(f"{i}) {names.get(ex, ex)} {_conn_mark(ex)}")
     lines.append("")
     lines.append("Бот откроет сделку на первой бирже из вашего списка, которая:")
     lines.append("• есть в подтверждении сигнала (confirmations)")
     lines.append("• подключена у вас (есть API ключи SPOT)")
     lines.append("• ключи активны (проверены)")
-    return "\n".join(lines)
+    return "
+".join(lines)
 
-def spot_priority_kb(uid: int, pr: list[str]) -> types.InlineKeyboardMarkup:
+def spot_priority_kb(uid: int, pr: list[str], keys: list[dict] | None = None) -> types.InlineKeyboardMarkup:
+    """Keyboard for SPOT priority: per exchange shows (UP/DOWN) then (CONNECT/DISCONNECT)."""
     kb = InlineKeyboardBuilder()
-    # Up/Down buttons for each exchange
     label = {"binance":"Binance","bybit":"Bybit","okx":"OKX","mexc":"MEXC","gateio":"Gate.io"}
+    km = _key_status_map(keys or [])
     for ex in pr:
+        # Row 1: priority
         kb.button(text=f"⬆️ {label.get(ex, ex)}", callback_data=f"at:prmove:spot:up:{ex}")
         kb.button(text=f"⬇️ {label.get(ex, ex)}", callback_data=f"at:prmove:spot:down:{ex}")
+        # Row 2: connect/disconnect
+        active = bool((km.get(f"{ex}:spot") or {}).get("is_active"))
+        kb.button(text=f"✅ {label.get(ex, ex)}" if active else f"➕ {label.get(ex, ex)}", callback_data=f"at:keys:set:{ex}:spot")
+        kb.button(text=tr(uid, "at_btn_disconnect"), callback_data=f"at:keysoff:spot:{ex}" if active else "at:noop")
     kb.adjust(2)
     kb.button(text=tr(uid, "btn_back"), callback_data="at:back")
     kb.adjust(2)
@@ -1042,7 +1058,24 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
         if r.get("last_ok_at") and not r.get("last_error"):
             return "✅"
         return "⚠️"
-    spot_ex = str(s.get("spot_exchange") or "binance")
+    # SPOT: show connected exchanges in priority order (user may connect multiple).
+    prio_csv = str(s.get("spot_exchange_priority") or "binance,bybit,okx,mexc,gateio")
+    prio_all = [p.strip().lower() for p in prio_csv.split(",") if p.strip()]
+    allowed_spot_all = ["binance","bybit","okx","mexc","gateio"]
+    prio = [x for x in prio_all if x in allowed_spot_all]
+    for x in allowed_spot_all:
+        if x not in prio:
+            prio.append(x)
+
+    km2 = _key_status_map(keys)
+    connected = [ex for ex in prio if bool((km2.get(f"{ex}:spot") or {}).get("is_active"))]
+    # Render: if nothing connected -> keep legacy single exchange for clarity.
+    if connected:
+        pretty = {"binance":"Binance","bybit":"Bybit","okx":"OKX","mexc":"MEXC","gateio":"Gate.io"}
+        spot_ex = " > ".join([pretty.get(ex, ex) for ex in connected])
+    else:
+        spot_ex = str(s.get("spot_exchange") or "binance")
+
     fut_ex = str(s.get("futures_exchange") or "binance")
     spot_amt = float(s.get("spot_amount_per_trade") or 0.0)
     fut_margin = float(s.get("futures_margin_per_trade") or 0.0)
@@ -1173,55 +1206,27 @@ def _calc_effective_futures_cap(ui_cap: float, winrate: float | None) -> float:
 
 
 
-def autotrade_main_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]] | None = None) -> str:
+def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
     """Compact Auto-trade screen (main), per UX request."""
-    _EX_NAMES = {
-        "binance": "Binance",
-        "bybit": "Bybit",
-        "okx": "OKX",
-        "mexc": "MEXC",
-        "gateio": "Gate.io",
-    }
+    # SPOT: show connected exchanges in priority order (user may connect multiple).
+    prio_csv = str(s.get("spot_exchange_priority") or "binance,bybit,okx,mexc,gateio")
+    prio_all = [p.strip().lower() for p in prio_csv.split(",") if p.strip()]
+    allowed_spot_all = ["binance","bybit","okx","mexc","gateio"]
+    prio = [x for x in prio_all if x in allowed_spot_all]
+    for x in allowed_spot_all:
+        if x not in prio:
+            prio.append(x)
 
-    def _ex_disp(v: str) -> str:
-        vv = (v or "").lower().strip()
-        return _EX_NAMES.get(vv, (v or "").strip().upper() or "—")
-
-    spot_ex = _ex_disp(str(s.get("spot_exchange") or "binance"))
-    fut_ex = _ex_disp(str(s.get("futures_exchange") or "binance"))
-
-    prio_raw = str(s.get("spot_exchange_priority") or "binance,bybit,okx,mexc,gateio")
-    prio_list = [p.strip().lower() for p in prio_raw.split(",") if p.strip()]
-    # keep only known exchanges, preserve order, remove duplicates
-    seen = set()
-    prio_clean = []
-    for p in prio_list:
-        if p in _EX_NAMES and p not in seen:
-            prio_clean.append(p)
-            seen.add(p)
-    if not prio_clean:
-        prio_clean = ["binance"]
-    # Show priority only for exchanges the user actually connected (active SPOT keys),
-    # and keep it short (top 3) to avoid clutter on the main screen.
-    active_spot: set[str] = set()
-    if isinstance(keys, list):
-        for r in keys:
-            try:
-                if str(r.get("market_type") or "").lower().strip() == "spot" and bool(r.get("is_active")):
-                    ex = str(r.get("exchange") or "").lower().strip()
-                    if ex:
-                        active_spot.add(ex)
-            except Exception:
-                continue
-
-    prio_view = [ex for ex in prio_clean if (not active_spot or ex in active_spot)]
-    if not prio_view:
-        prio_view = prio_clean
-
-    show = prio_view[:3]
-    spot_prio = "Auto → " + " > ".join(_EX_NAMES[p] for p in show)
-    if len(prio_view) > 3:
-        spot_prio += " …
+    km2 = _key_status_map(keys)
+    connected = [ex for ex in prio if bool((km2.get(f"{ex}:spot") or {}).get("is_active"))]
+    # Render: if nothing connected -> keep legacy single exchange for clarity.
+    if connected:
+        pretty = {"binance":"Binance","bybit":"Bybit","okx":"OKX","mexc":"MEXC","gateio":"Gate.io"}
+        spot_ex = " > ".join([pretty.get(ex, ex) for ex in connected])
+    else:
+        spot_ex = str(s.get("spot_exchange") or "binance")
+.capitalize()
+    fut_ex = str(s.get("futures_exchange") or "binance").capitalize()
     spot_amt = float(s.get("spot_amount_per_trade") or 0.0)
     fut_margin = float(s.get("futures_margin_per_trade") or 0.0)
     fut_lev = int(s.get("futures_leverage") or 1)
@@ -1247,7 +1252,6 @@ def autotrade_main_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]] 
     spot_header = tr(uid, "at_spot_header")
     fut_header = tr(uid, "at_futures_header")
     lbl_ex = tr(uid, "at_label_exchange")
-    lbl_spot_prio = tr(uid, "at_label_spot_priority")
     lbl_spot_amt = tr(uid, "at_label_spot_amount")
     lbl_fut_margin = tr(uid, "at_label_futures_margin")
     lbl_lev = tr(uid, "at_label_leverage")
@@ -1258,7 +1262,6 @@ def autotrade_main_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]] 
         f"{title}\n\n"
         f"{spot_header}: {spot_state}\n"
         f"{lbl_ex}: {spot_ex}\n"
-        f"{lbl_spot_prio}: {spot_prio}\n"
         f"{lbl_spot_amt}: {spot_amt:g} USDT\n"
         f"{lbl_cap}: {cap_auto_spot}\n\n"
         f"{fut_header}: {fut_state}\n"
@@ -2217,8 +2220,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         except Exception:
             st["futures_winrate"] = None
 
-        keys = await db_store.get_autotrade_keys_status(uid)
-        await safe_edit(call.message, autotrade_main_text(uid, st, keys), autotrade_main_kb(uid))
+        await safe_edit(call.message, autotrade_main_text(uid, st), autotrade_main_kb(uid))
         return
 
     # fallback
@@ -2485,7 +2487,8 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
             mt = parts[2]
             if mt == "spot":
                 pr = await db_store.get_spot_exchange_priority(uid)
-                await safe_edit(call.message, spot_priority_text(uid, pr), spot_priority_kb(uid, pr))
+                keys2 = await db_store.get_autotrade_keys_status(uid)
+                await safe_edit(call.message, spot_priority_text(uid, pr, keys2), spot_priority_kb(uid, pr, keys2))
                 return
             # futures exchange choices (only Binance/Bybit)
             kb = InlineKeyboardBuilder()
@@ -2516,7 +2519,28 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
                 await db_store.set_spot_exchange_priority(uid, pr)
             # re-render
             pr2 = await db_store.get_spot_exchange_priority(uid)
-            await safe_edit(call.message, spot_priority_text(uid, pr2), spot_priority_kb(uid, pr2))
+            keys2 = await db_store.get_autotrade_keys_status(uid)
+            await safe_edit(call.message, spot_priority_text(uid, pr2, keys2), spot_priority_kb(uid, pr2, keys2))
+            return
+
+        # Disable (disconnect) SPOT keys for a specific exchange (user action)
+        # callback: at:keysoff:spot:<exchange>
+        if action == "keysoff" and len(parts) >= 4:
+            mt = parts[2]
+            ex = (parts[3] if len(parts) > 3 else "").lower().strip()
+            if mt != "spot":
+                return
+            try:
+                await db_store.disable_autotrade_key(user_id=uid, exchange=ex, market_type="spot")
+            except Exception:
+                pass
+            pr2 = await db_store.get_spot_exchange_priority(uid)
+            keys2 = await db_store.get_autotrade_keys_status(uid)
+            await safe_edit(call.message, spot_priority_text(uid, pr2, keys2), spot_priority_kb(uid, pr2, keys2))
+            return
+
+        # No-op button (used when "disconnect" is pressed for not-connected exchange)
+        if action == "noop":
             return
 
         if action == "exset" and len(parts) >= 4:
