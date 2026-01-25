@@ -41,6 +41,52 @@ class ExchangeAPIError(RuntimeError):
     """Raised when an exchange API call fails (network / auth / rate limit / etc.)."""
 
 
+async def _smart_futures_cap(*, user_id: int, balance_usdt: float, user_cap_usdt: float) -> float:
+    """Compute an effective FUTURES cap (USDT margin) based on balance + recent winrate.
+
+    - Base cap: 65% of available margin.
+    - Winrate is computed on last closed auto-trade FUTURES positions.
+    - Hard clamp: never allow cap above 85% of available margin.
+    - If user_cap_usdt > 0: effective cap is min(user_cap_usdt, smart_cap).
+
+    This is a safety layer to prevent the bot from allocating ~100% of a small
+    futures balance when a user sets cap equal to balance.
+    """
+    bal = float(balance_usdt or 0.0)
+    if bal <= 0:
+        return float(user_cap_usdt or 0.0)
+
+    base = bal * 0.65
+    mult = 1.0
+    try:
+        st = await db_store.get_autotrade_winrate(int(user_id), "futures", limit=20)
+        n = int(st.get("n") or 0)
+        wr = float(st.get("winrate") or 0.0)
+        # If we don't have enough history, don't boost risk.
+        if n >= 10:
+            if wr < 40:
+                mult = 0.6
+            elif wr < 50:
+                mult = 0.8
+            elif wr < 60:
+                mult = 1.0
+            elif wr < 70:
+                mult = 1.1
+            else:
+                mult = 1.25
+        else:
+            mult = 1.0
+    except Exception:
+        mult = 1.0
+
+    smart = base * mult
+    smart = min(smart, bal * 0.85)
+    cap = smart
+    if float(user_cap_usdt or 0.0) > 0:
+        cap = min(float(user_cap_usdt), smart)
+    return max(0.0, float(cap))
+
+
 def _extract_signal_id(sig: object) -> int:
     """Extract a stable, non-null signal id from a signal object."""
     try:
@@ -1246,14 +1292,16 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     try:
         if exchange == "bybit":
             category = "spot" if mt == "spot" else "linear"
-            # Futures cap is user-defined (by margin). Spot cap is implicit (wallet balance).
-            if mt == "futures":
-                used = await db_store.get_autotrade_used_usdt(uid, "futures")
-                if fut_cap > 0 and used + need_usdt > fut_cap:
-                    return {"ok": False, "skipped": True, "api_error": None}
             free = await _bybit_available_usdt(api_key, api_secret)
             if free < need_usdt:
                 return {"ok": False, "skipped": True, "api_error": None}
+
+            # Futures cap (margin limit) with extra safety: smart cap based on balance + winrate.
+            if mt == "futures":
+                eff_cap = await _smart_futures_cap(user_id=uid, balance_usdt=free, user_cap_usdt=fut_cap)
+                used = await db_store.get_autotrade_used_usdt(uid, "futures")
+                if eff_cap > 0 and used + need_usdt > eff_cap:
+                    return {"ok": False, "skipped": True, "api_error": None}
 
             direction_local = direction
             if mt == "spot":
@@ -1607,12 +1655,14 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             return {"ok": True, "skipped": False, "api_error": None}
 
         # futures
-        used = await db_store.get_autotrade_used_usdt(uid, "futures")
-        if fut_cap > 0 and used + need_usdt > fut_cap:
-            return {"ok": False, "skipped": True, "api_error": None}
-
         avail = await _binance_futures_available_margin(api_key, api_secret)
         if avail < need_usdt:
+            return {"ok": False, "skipped": True, "api_error": None}
+
+        # Futures cap (margin limit) with extra safety: smart cap based on balance + winrate.
+        eff_cap = await _smart_futures_cap(user_id=uid, balance_usdt=avail, user_cap_usdt=fut_cap)
+        used = await db_store.get_autotrade_used_usdt(uid, "futures")
+        if eff_cap > 0 and used + need_usdt > eff_cap:
             return {"ok": False, "skipped": True, "api_error": None}
 
         await _binance_futures_set_leverage(api_key=api_key, api_secret=api_secret, symbol=symbol, leverage=fut_lev)
