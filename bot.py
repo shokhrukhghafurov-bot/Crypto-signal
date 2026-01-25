@@ -1253,8 +1253,12 @@ def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
     # Variant B: after 5 closed FUTURES autotrade deals, minimum effective cap is 40
     if closed_n >= 5 and fut_cap_eff < 40.0:
         fut_cap_eff = 40.0
-    spot_state = tr(uid, "at_state_on") if s.get("spot_enabled") else tr(uid, "at_state_off")
-    fut_state = tr(uid, "at_state_on") if s.get("futures_enabled") else tr(uid, "at_state_off")
+    spot_on = bool(s.get("spot_enabled"))
+    fut_on = bool(s.get("futures_enabled"))
+    spot_state = tr(uid, "at_state_on") if spot_on else tr(uid, "at_state_off")
+    fut_state = tr(uid, "at_state_on") if fut_on else tr(uid, "at_state_off")
+    spot_icon = "🟢" if spot_on else "🔴"
+    fut_icon = "🟢" if fut_on else "🔴"
 
     title = tr(uid, "at_title")
     spot_header = tr(uid, "at_spot_header")
@@ -1268,11 +1272,11 @@ def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
 
     return (
         f"{title}\n\n"
-        f"{spot_header}: {spot_state}\n"
+        f"{spot_header}: {spot_icon} {spot_state}\n"
         f"{lbl_ex}: {spot_ex}\n"
         f"{lbl_spot_amt}: {spot_amt:g} USDT\n"
         f"{lbl_cap}: {cap_auto_spot}\n\n"
-        f"{fut_header}: {fut_state}\n"
+        f"{fut_header}: {fut_icon} {fut_state}\n"
         f"{lbl_ex}: {fut_ex}\n"
         f"{lbl_fut_margin}: {fut_margin:g} USDT\n"
         f"{lbl_lev}: {fut_lev}x\n"
