@@ -1762,45 +1762,29 @@ async def get_autotrade_stats(
         "invested_closed": invested_closed,
     }
 
-# ---------------- Auto-trade helpers ----------------
 
-async def get_autotrade_winrate(*, user_id: int, market_type: str = "futures", last_n: int = 20) -> float | None:
-    """Return winrate (%) for last_n CLOSED autotrade positions.
-
-    Win = roi_percent >= 0 (includes BE)
-    Loss = roi_percent < 0
-    Returns None if not enough data.
+async def count_closed_autotrade_positions(*, user_id: int, market_type: str = "futures", last_n: int = 5) -> int:
+    """Return count of CLOSED autotrade positions for user (up to last_n most recent).
+    Used for UI gating: after 5 closed deals we allow higher minimum effective cap.
     """
+    pool = get_pool()
+    uid = int(user_id)
     mt = (market_type or "futures").lower().strip()
-    if mt not in ("spot", "futures"):
-        mt = "futures"
     n = int(last_n or 0)
     if n <= 0:
-        n = 20
-    pool = get_pool()
+        n = 5
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT roi_percent
-            FROM autotrade_positions
-            WHERE user_id=$1 AND market_type=$2 AND status='CLOSED' AND roi_percent IS NOT NULL
-            ORDER BY closed_at DESC NULLS LAST, id DESC
-            LIMIT $3
-            """,
-            int(user_id), mt, n
-        )
-    if not rows:
-        return None
-    wins = 0
-    total = 0
-    for r in rows:
         try:
-            roi = float(r.get("roi_percent"))
+            rows = await conn.fetch(
+                """
+                SELECT 1
+                FROM autotrade_positions
+                WHERE user_id=$1 AND market_type=$2 AND status='CLOSED'
+                ORDER BY closed_at DESC NULLS LAST, id DESC
+                LIMIT $3
+                """,
+                uid, mt, n
+            )
+            return int(len(rows))
         except Exception:
-            continue
-        total += 1
-        if roi >= 0:
-            wins += 1
-    if total == 0:
-        return None
-    return round((wins / total) * 100.0, 2)
+            return 0
