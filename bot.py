@@ -1175,8 +1175,33 @@ def _calc_effective_futures_cap(ui_cap: float, winrate: float | None) -> float:
 
 def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
     """Compact Auto-trade screen (main), per UX request."""
-    spot_ex = str(s.get("spot_exchange") or "binance").capitalize()
-    fut_ex = str(s.get("futures_exchange") or "binance").capitalize()
+    _EX_NAMES = {
+        "binance": "Binance",
+        "bybit": "Bybit",
+        "okx": "OKX",
+        "mexc": "MEXC",
+        "gateio": "Gate.io",
+    }
+
+    def _ex_disp(v: str) -> str:
+        vv = (v or "").lower().strip()
+        return _EX_NAMES.get(vv, (v or "").strip().upper() or "—")
+
+    spot_ex = _ex_disp(str(s.get("spot_exchange") or "binance"))
+    fut_ex = _ex_disp(str(s.get("futures_exchange") or "binance"))
+
+    prio_raw = str(s.get("spot_exchange_priority") or "binance,bybit,okx,mexc,gateio")
+    prio_list = [p.strip().lower() for p in prio_raw.split(",") if p.strip()]
+    # keep only known exchanges, preserve order, remove duplicates
+    seen = set()
+    prio_clean = []
+    for p in prio_list:
+        if p in _EX_NAMES and p not in seen:
+            prio_clean.append(p)
+            seen.add(p)
+    if not prio_clean:
+        prio_clean = ["binance"]
+    spot_prio = "Auto → " + " > ".join(_EX_NAMES[p] for p in prio_clean)
     spot_amt = float(s.get("spot_amount_per_trade") or 0.0)
     fut_margin = float(s.get("futures_margin_per_trade") or 0.0)
     fut_lev = int(s.get("futures_leverage") or 1)
@@ -1202,6 +1227,7 @@ def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
     spot_header = tr(uid, "at_spot_header")
     fut_header = tr(uid, "at_futures_header")
     lbl_ex = tr(uid, "at_label_exchange")
+    lbl_spot_prio = tr(uid, "at_label_spot_priority")
     lbl_spot_amt = tr(uid, "at_label_spot_amount")
     lbl_fut_margin = tr(uid, "at_label_futures_margin")
     lbl_lev = tr(uid, "at_label_leverage")
@@ -1212,6 +1238,7 @@ def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
         f"{title}\n\n"
         f"{spot_header}: {spot_state}\n"
         f"{lbl_ex}: {spot_ex}\n"
+        f"{lbl_spot_prio}: {spot_prio}\n"
         f"{lbl_spot_amt}: {spot_amt:g} USDT\n"
         f"{lbl_cap}: {cap_auto_spot}\n\n"
         f"{fut_header}: {fut_state}\n"
