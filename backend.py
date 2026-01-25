@@ -2188,6 +2188,11 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 tp2_id = ref.get("tp2_order_id")
                 sl_id = ref.get("sl_order_id")
                 be_moved = bool(ref.get("be_moved"))
+                side_str = 'LONG' if str(ref.get('side','BUY')).upper() in ('BUY','LONG') else 'SHORT'
+                if side_str != 'LONG':
+                    # Spot manager supports LONG only (no short spot). Mark as ERROR to avoid wrong closes.
+                    await db_store.close_autotrade_position(user_id=uid, signal_id=r.get('signal_id'), exchange=ex, market_type=mt, status='ERROR')
+                    continue
                 be_price = float(ref.get("be_price") or 0.0)
                 close_side = str(ref.get("close_side") or ("SELL" if str(ref.get("side")) == "BUY" else "BUY")).upper()
 
@@ -2263,7 +2268,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         continue
 
                     # After TP1: BE close if retrace to entry
-                    if tp1_hit and be_moved and be_price > 0 and _be_is_armed(side='LONG' if str(ref.get('side','BUY')).upper() in ('BUY','LONG') else 'SHORT', price=px, tp1=tp1, tp2=tp2) and px <= be_price:
+                    if tp1_hit and be_moved and be_price > 0 and _be_is_armed(side=side_str, price=px, tp1=tp1, tp2=tp2) and px <= be_price:
                         try:
                             await _do_sell(qty)
                         except Exception:
@@ -4162,6 +4167,7 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     last15 = df15i.iloc[-1]
     last1h = df1hi.iloc[-1]
     last4h = df4hi.iloc[-1]
+    adx1 = float(last1h.get("adx", np.nan))
 
     entry = float(last15["close"])
     atr = float(last1h.get("atr", np.nan))
@@ -4176,7 +4182,6 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     rsi15 = float(last15.get("rsi", np.nan))
     macd_hist15 = float(last15.get("macd_hist", np.nan))
     adx4 = float(last4h.get("adx", np.nan))
-    adx1 = float(last1h.get("adx", np.nan))
 
     bb_low = float(last15.get("bb_low", np.nan))
     bb_mid = float(last15.get("bb_mavg", np.nan))
@@ -5030,7 +5035,8 @@ class Backend:
 
                     # After TP1 we move protection SL to BE (entry +/- fee buffer).
                     # The debug block should reflect the *active* protective level, not the original signal SL.
-                    effective_sl = (be_price if (tp1_hit and _be_enabled(market) and be_price > 0 and _be_is_armed(side=side, price=price_f, tp1=getattr(s,'tp1',None), tp2=getattr(s,'tp2',None))) else (float(s.sl) if s.sl else None))
+                    be_armed = _be_is_armed(side=side, price=price_f, tp1=(float(s.tp1) if s.tp1 else None), tp2=(float(s.tp2) if s.tp2 else None))
+                    effective_sl = (be_price if (tp1_hit and _be_enabled(market) and be_price > 0 and be_armed) else (float(s.sl) if s.sl else None))
                     dbg = _price_debug_block(
                         uid,
                         price=price_f,
