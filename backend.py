@@ -616,6 +616,232 @@ async def _gateio_spot_balance(*, api_key: str, api_secret: str, coin: str) -> f
         pass
     return 0.0
 
+
+
+# ------------------ Auto-trade trade history helpers (exact PnL) ------------------
+
+def _quote_coin(symbol: str) -> str:
+    s = (symbol or "").upper().strip()
+    if s.endswith("USDT"):
+        return "USDT"
+    if "-" in s:
+        return s.split("-")[-1]
+    if "_" in s:
+        return s.split("_")[-1]
+    return "USDT"
+
+async def _binance_spot_mytrades(*, api_key: str, api_secret: str, symbol: str, start_ms: int) -> list[dict]:
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _binance_signed_request(
+            s,
+            base_url="https://api.binance.com",
+            path="/api/v3/myTrades",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"symbol": symbol.upper(), "startTime": str(int(start_ms)), "recvWindow": "5000", "limit": "1000"},
+        )
+        # Binance returns a list
+        if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+            return data["data"]
+        if isinstance(data, list):
+            return data
+        return data.get("data") if isinstance(data, dict) else []
+
+async def _binance_futures_user_trades(*, api_key: str, api_secret: str, symbol: str, start_ms: int) -> list[dict]:
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _binance_signed_request(
+            s,
+            base_url="https://fapi.binance.com",
+            path="/fapi/v1/userTrades",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"symbol": symbol.upper(), "startTime": str(int(start_ms)), "recvWindow": "5000", "limit": "1000"},
+        )
+        if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+            return data["data"]
+        if isinstance(data, list):
+            return data
+        return data.get("data") if isinstance(data, dict) else []
+
+async def _mexc_spot_mytrades(*, api_key: str, api_secret: str, symbol: str, start_ms: int) -> list[dict]:
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _mexc_signed_request(
+            s,
+            base_url="https://api.mexc.com",
+            path="/api/v3/myTrades",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"symbol": symbol.upper(), "startTime": str(int(start_ms)), "limit": "1000"},
+        )
+        if isinstance(data, list):
+            return data
+        return data.get("data") if isinstance(data, dict) else []
+
+async def _okx_spot_fills(*, api_key: str, api_secret: str, passphrase: str, symbol: str, start_ms: int) -> list[dict]:
+    inst = _okx_inst(symbol)
+    # OKX expects timestamps in ms and uses "begin" for pagination
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _okx_signed_request(
+            s,
+            base_url="https://www.okx.com",
+            path="/api/v5/trade/fills",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            passphrase=passphrase,
+            params={"instType": "SPOT", "instId": inst, "begin": str(int(start_ms))},
+        )
+        lst = data.get("data") if isinstance(data, dict) else None
+        return lst if isinstance(lst, list) else []
+
+async def _gateio_spot_mytrades(*, api_key: str, api_secret: str, symbol: str, start_s: int) -> list[dict]:
+    pair = _gate_pair(symbol)
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _gateio_signed_request(
+            s,
+            base_url="https://api.gateio.ws",
+            path="/api/v4/spot/my_trades",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"currency_pair": pair, "from": str(int(start_s)), "limit": "1000"},
+        )
+        return data if isinstance(data, list) else (data.get("data") if isinstance(data, dict) else [])
+
+async def _bybit_executions(*, api_key: str, api_secret: str, category: str, symbol: str, start_ms: int) -> list[dict]:
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _bybit_v5_request(
+            s,
+            method="GET",
+            path="/v5/execution/list",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"category": category, "symbol": symbol.upper(), "startTime": str(int(start_ms)), "limit": "200"},
+        )
+        lst = ((data.get("result") or {}).get("list") or [])
+        return lst if isinstance(lst, list) else []
+
+def _sum_spot_pnl_from_trades(symbol: str, trades: list[dict]) -> tuple[float, float]:
+    """Return (pnl_usdt, invested_usdt) from spot trade list. Best-effort.
+
+    Assumes USDT-quoted pair. Invested is sum of BUY quote spent.
+    """
+    quote = _quote_coin(symbol)
+    buy_q = 0.0
+    sell_q = 0.0
+    fee_q = 0.0
+    for t in trades or []:
+        try:
+            side = (t.get("side") or ("BUY" if t.get("isBuyer") else "SELL") if "isBuyer" in t else "").upper()
+            price = float(t.get("price") or t.get("fillPx") or t.get("avgPrice") or 0.0)
+            qty = float(t.get("qty") or t.get("fillSz") or t.get("amount") or t.get("size") or 0.0)
+            quote_qty = float(t.get("quoteQty") or 0.0)
+            if quote_qty <= 0 and price > 0 and qty > 0:
+                quote_qty = price * qty
+            # fees
+            fee = float(t.get("commission") or t.get("fee") or 0.0)
+            fee_ccy = (t.get("commissionAsset") or t.get("feeCcy") or t.get("fee_currency") or "").upper()
+            if fee and fee_ccy == quote:
+                fee_q += abs(fee)
+            if side == "BUY":
+                buy_q += quote_qty
+            elif side == "SELL":
+                sell_q += quote_qty
+        except Exception:
+            continue
+    invested = max(0.0, buy_q)
+    pnl = (sell_q - buy_q - fee_q)
+    return float(pnl), float(invested)
+
+def _sum_futures_realized_pnl(symbol: str, trades: list[dict]) -> tuple[float, float]:
+    """Return (pnl_usdt, fees_usdt) from futures executions/userTrades. Best-effort."""
+    pnl = 0.0
+    fee = 0.0
+    for t in trades or []:
+        try:
+            # Binance: realizedPnl, commission
+            if "realizedPnl" in t:
+                pnl += float(t.get("realizedPnl") or 0.0)
+                if (t.get("commissionAsset") or "").upper() == "USDT":
+                    fee += abs(float(t.get("commission") or 0.0))
+            # Bybit: execPnl, execFee
+            elif "execPnl" in t:
+                pnl += float(t.get("execPnl") or 0.0)
+                fee += abs(float(t.get("execFee") or 0.0))
+        except Exception:
+            continue
+    return float(pnl - fee), float(fee)
+
+async def _exact_pnl_for_closed_position(
+    *,
+    exchange: str,
+    market_type: str,
+    api_key: str,
+    api_secret: str,
+    passphrase: str | None,
+    symbol: str,
+    opened_at: dt.datetime | None,
+) -> tuple[float | None, float | None, str | None]:
+    """Try to compute exact realized PnL using fills/executions history.
+
+    Returns (pnl_usdt, invested_usdt, err_code). If cannot compute -> (None,None,reason).
+    """
+    ex = (exchange or "").lower().strip()
+    mt = (market_type or "").lower().strip()
+    if opened_at is None:
+        return None, None, "no_open_time"
+    try:
+        # subtract a small buffer to include the entry fill
+        start_ms = int(opened_at.timestamp() * 1000) - 120_000
+        start_s = int(opened_at.timestamp()) - 120
+    except Exception:
+        start_ms = int(time.time() * 1000) - 600_000
+        start_s = int(time.time()) - 600
+
+    try:
+        if mt == "spot":
+            trades: list[dict] = []
+            if ex == "binance":
+                trades = await _binance_spot_mytrades(api_key=api_key, api_secret=api_secret, symbol=symbol, start_ms=start_ms)
+            elif ex == "bybit":
+                trades = await _bybit_executions(api_key=api_key, api_secret=api_secret, category="spot", symbol=symbol, start_ms=start_ms)
+            elif ex == "okx":
+                if not passphrase:
+                    return None, None, "missing_passphrase"
+                trades = await _okx_spot_fills(api_key=api_key, api_secret=api_secret, passphrase=passphrase, symbol=symbol, start_ms=start_ms)
+            elif ex == "mexc":
+                trades = await _mexc_spot_mytrades(api_key=api_key, api_secret=api_secret, symbol=symbol, start_ms=start_ms)
+            elif ex == "gateio":
+                trades = await _gateio_spot_mytrades(api_key=api_key, api_secret=api_secret, symbol=symbol, start_s=start_s)
+
+            pnl, invested = _sum_spot_pnl_from_trades(symbol, trades)
+            if invested <= 0:
+                return None, None, "no_invested"
+            return pnl, invested, None
+
+        # futures
+        trades_f: list[dict] = []
+        if ex == "binance":
+            trades_f = await _binance_futures_user_trades(api_key=api_key, api_secret=api_secret, symbol=symbol, start_ms=start_ms)
+            pnl, _fee = _sum_futures_realized_pnl(symbol, trades_f)
+            return pnl, 0.0, None
+        if ex == "bybit":
+            trades_f = await _bybit_executions(api_key=api_key, api_secret=api_secret, category="linear", symbol=symbol, start_ms=start_ms)
+            pnl, _fee = _sum_futures_realized_pnl(symbol, trades_f)
+            return pnl, 0.0, None
+        return None, None, "unsupported_exchange"
+    except Exception as e:
+        return None, None, f"err:{e}"
+
 async def _binance_futures_position_amt(*, api_key: str, api_secret: str, symbol: str) -> float:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
@@ -2548,28 +2774,56 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                     closed_manual = (bal <= eps)
 
                                 if closed_manual:
-                                    # Approximate PnL by current market price (best-effort).
-                                    px = 0.0
-                                    if ex == "binance":
-                                        px = await _binance_public_price(symbol)
-                                    elif ex == "bybit":
-                                        px = await _bybit_public_price(symbol, category=("linear" if mt == "futures" else "spot"))
-                                    elif ex == "okx":
-                                        px = await _okx_public_price(symbol)
-                                    elif ex == "mexc":
-                                        px = await _mexc_public_price(symbol)
-                                    elif ex == "gateio":
-                                        px = await _gateio_public_price(symbol)
+                                    # Exact PnL via fills/executions history (preferred). Fallback to price-based estimate.
+                                    opened_at = r.get("opened_at")
+                                    passph = None
+                                    if ex == "okx":
+                                        passph = _decrypt_token(row.get("passphrase_enc"))
+                                    pnl_usdt = None
+                                    invested = None
+                                    try:
+                                        pnl_usdt, invested, _reason = await _exact_pnl_for_closed_position(
+                                            exchange=ex,
+                                            market_type=mt,
+                                            api_key=api_key,
+                                            api_secret=api_secret,
+                                            passphrase=passph,
+                                            symbol=symbol,
+                                            opened_at=opened_at,
+                                        )
+                                    except Exception:
+                                        pnl_usdt, invested = None, None
 
-                                    entry_p = float(ref.get("entry_price") or 0.0)
-                                    qty = float(ref.get("qty") or 0.0)
-                                    if qty <= 0 and entry_p > 0:
-                                        qty = float(r.get("allocated_usdt") or 0.0) / entry_p
+                                    if pnl_usdt is None:
+                                        # Fallback: approximate PnL by current market price (best-effort).
+                                        px = 0.0
+                                        if ex == "binance":
+                                            px = await _binance_public_price(symbol)
+                                        elif ex == "bybit":
+                                            px = await _bybit_public_price(symbol, category=("linear" if mt == "futures" else "spot"))
+                                        elif ex == "okx":
+                                            px = await _okx_public_price(symbol)
+                                        elif ex == "mexc":
+                                            px = await _mexc_public_price(symbol)
+                                        elif ex == "gateio":
+                                            px = await _gateio_public_price(symbol)
 
-                                    pnl_usdt = _pnl_from_entry_px(side=ref.get("side") or r.get("side") or "BUY",
-                                                                  entry_price=entry_p, exit_price=px, qty=qty)
+                                        entry_p = float(ref.get("entry_price") or 0.0)
+                                        qty = float(ref.get("qty") or 0.0)
+                                        if qty <= 0 and entry_p > 0:
+                                            qty = float(r.get("allocated_usdt") or 0.0) / entry_p
+
+                                        pnl_usdt = _pnl_from_entry_px(
+                                            side=ref.get("side") or r.get("side") or "BUY",
+                                            entry_price=entry_p,
+                                            exit_price=px,
+                                            qty=qty,
+                                        )
+                                        invested = float(r.get("allocated_usdt") or 0.0)
+
                                     alloc = float(r.get("allocated_usdt") or 0.0)
-                                    roi_percent = (pnl_usdt / alloc * 100.0) if alloc > 0 else 0.0
+                                    denom = alloc if alloc > 0 else float(invested or 0.0)
+                                    roi_percent = (float(pnl_usdt) / denom * 100.0) if denom > 0 else 0.0
 
                                     await db_store.close_autotrade_position(
                                         user_id=uid,
