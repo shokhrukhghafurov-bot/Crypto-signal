@@ -1187,12 +1187,12 @@ def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
     except Exception:
         wr = None
     fut_cap_eff = _calc_effective_futures_cap(fut_cap, wr)
-    closed_n = s.get(\"futures_closed_n\")
+    closed_n = s.get('futures_closed_n', 0)
     try:
-        closed_n = int(closed_n) if closed_n is not None else 0
+        closed_n = int(closed_n)
     except Exception:
         closed_n = 0
-    # Anti-noise: after 5 closed FUTURES autotrade deals, do not allow effective cap below 40
+    # Variant B: after 5 closed FUTURES autotrade deals, minimum effective cap is 40
     if closed_n >= 5 and fut_cap_eff < 40.0:
         fut_cap_eff = 40.0
     spot_state = tr(uid, "at_state_on") if s.get("spot_enabled") else tr(uid, "at_state_off")
@@ -2150,16 +2150,9 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         try:
             fn = getattr(db_store, "get_autotrade_winrate", None)
             if fn:
-                                st["futures_winrate"] = await fn(user_id=uid, market_type="futures", last_n=10)
-                # For anti-noise gating: count of last 5 CLOSED futures autotrade positions
-                fn2 = getattr(db_store, "count_closed_autotrade_positions", None)
-                if fn2:
-                    st["futures_closed_n"] = await fn2(user_id=uid, market_type="futures", last_n=5)
-                else:
-                    st["futures_closed_n"] = 0
+                st["futures_winrate"] = await fn(user_id=uid, market_type="futures", last_n=10)
         except Exception:
             st["futures_winrate"] = None
-            st["futures_closed_n"] = 0
 
         await safe_edit(call.message, autotrade_main_text(uid, st), autotrade_main_kb(uid))
         return
