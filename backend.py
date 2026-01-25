@@ -2263,7 +2263,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         continue
 
                     # After TP1: BE close if retrace to entry
-                    if tp1_hit and be_moved and be_price > 0 and px <= be_price:
+                    if tp1_hit and be_moved and be_price > 0 and _be_is_armed(side='LONG' if str(ref.get('side','BUY')).upper() in ('BUY','LONG') else 'SHORT', price=px, tp1=tp1, tp2=tp2) and px <= be_price:
                         try:
                             await _do_sell(qty)
                         except Exception:
@@ -2810,6 +2810,17 @@ FEE_BUFFER_MULTIPLIER = max(0.0, _env_float("FEE_BUFFER_MULTIPLIER", 2.0))  # 2 
 ATR_MULT_SL = max(0.5, _env_float("ATR_MULT_SL", 1.5))
 TP1_R = max(0.5, _env_float("TP1_R", 1.5))
 TP2_R = max(1.0, _env_float("TP2_R", 3.0))
+# --- Upgrades: Adaptive TP2 + delayed BE arming (optional) ---
+ADAPTIVE_TP2 = _env_bool("ADAPTIVE_TP2", False)
+ADAPTIVE_TP2_ADX_STRONG = _env_float("ADAPTIVE_TP2_ADX_STRONG", 30.0)
+ADAPTIVE_TP2_ADX_MED = _env_float("ADAPTIVE_TP2_ADX_MED", 25.0)
+ADAPTIVE_TP2_R_STRONG = _env_float("ADAPTIVE_TP2_R_STRONG", 2.8)
+ADAPTIVE_TP2_R_MED = _env_float("ADAPTIVE_TP2_R_MED", 2.45)
+ADAPTIVE_TP2_R_WEAK = _env_float("ADAPTIVE_TP2_R_WEAK", 2.2)
+
+# When >0, BE (SL->BE) becomes "armed" only after price moves from TP1 towards TP2 by this fraction.
+# Helps TP2 by reducing BE whipsaws after TP1. 0 = immediate BE (legacy behavior).
+BE_ARM_PCT_TO_TP2 = max(0.0, min(1.0, _env_float("BE_ARM_PCT_TO_TP2", 0.0)))
 
 # News filter
 NEWS_FILTER = _env_bool("NEWS_FILTER", False)
@@ -3722,16 +3733,56 @@ def _trigger_15m(direction: str, df15i: pd.DataFrame) -> bool:
     return True
 
 
-def _build_levels(direction: str, entry: float, atr: float) -> Tuple[float, float, float, float]:
+def _adaptive_tp2_r(adx1: float | None) -> float:
+    """Return TP2_R multiplier adapted to trend strength (ADX 1H).
+    Enabled via ADAPTIVE_TP2=1.
+    """
+    try:
+        if not ADAPTIVE_TP2:
+            return float(TP2_R)
+        if adx1 is None:
+            return float(ADAPTIVE_TP2_R_WEAK)
+        v = float(adx1)
+        if np.isnan(v):
+            return float(ADAPTIVE_TP2_R_WEAK)
+        if v >= float(ADAPTIVE_TP2_ADX_STRONG):
+            return float(ADAPTIVE_TP2_R_STRONG)
+        if v >= float(ADAPTIVE_TP2_ADX_MED):
+            return float(ADAPTIVE_TP2_R_MED)
+        return float(ADAPTIVE_TP2_R_WEAK)
+    except Exception:
+        return float(TP2_R)
+
+
+def _be_is_armed(*, side: str, price: float, tp1: float | None, tp2: float | None) -> bool:
+    """If BE_ARM_PCT_TO_TP2>0, arm BE only after price moves from TP1 towards TP2 by that fraction."""
+    try:
+        pct = float(BE_ARM_PCT_TO_TP2)
+    except Exception:
+        pct = 0.0
+    if pct <= 0:
+        return True
+    try:
+        tp1f = float(tp1 or 0.0)
+        tp2f = float(tp2 or 0.0)
+        px = float(price)
+        if tp1f <= 0 or tp2f <= 0 or abs(tp2f - tp1f) < 1e-12:
+            return True
+        arm_lvl = tp1f + pct * (tp2f - tp1f)  # works for LONG and SHORT (tp2<tp1)
+        s = (side or "LONG").upper()
+        return (px >= arm_lvl) if s == "LONG" else (px <= arm_lvl)
+    except Exception:
+        return True
+def _build_levels(direction: str, entry: float, atr: float, *, tp2_r: float | None = None) -> Tuple[float, float, float, float]:
     R = max(1e-9, ATR_MULT_SL * atr)
     if direction == "LONG":
         sl = entry - R
         tp1 = entry + TP1_R * R
-        tp2 = entry + TP2_R * R
+        tp2 = entry + (float(tp2_r) if tp2_r is not None else TP2_R) * R
     else:
         sl = entry + R
         tp1 = entry - TP1_R * R
-        tp2 = entry - TP2_R * R
+        tp2 = entry - (float(tp2_r) if tp2_r is not None else TP2_R) * R
     rr = abs(tp2 - entry) / abs(entry - sl)
     return sl, tp1, tp2, rr
 
@@ -4118,7 +4169,8 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
         return None
 
     atr_pct = (atr / entry) * 100.0 if entry > 0 else 0.0
-    sl, tp1, tp2, rr = _build_levels(dir1, entry, atr)
+    tp2_r = _adaptive_tp2_r(adx1)
+    sl, tp1, tp2, rr = _build_levels(dir1, entry, atr, tp2_r=tp2_r)
 
     # Snapshot values
     rsi15 = float(last15.get("rsi", np.nan))
@@ -4978,7 +5030,7 @@ class Backend:
 
                     # After TP1 we move protection SL to BE (entry +/- fee buffer).
                     # The debug block should reflect the *active* protective level, not the original signal SL.
-                    effective_sl = (be_price if (tp1_hit and _be_enabled(market) and be_price > 0) else (float(s.sl) if s.sl else None))
+                    effective_sl = (be_price if (tp1_hit and _be_enabled(market) and be_price > 0 and _be_is_armed(side=side, price=price_f, tp1=getattr(s,'tp1',None), tp2=getattr(s,'tp2',None))) else (float(s.sl) if s.sl else None))
                     dbg = _price_debug_block(
                         uid,
                         price=price_f,
@@ -5051,7 +5103,7 @@ class Backend:
                     # 3) After TP1: BE close
                     if tp1_hit and _be_enabled(market):
                         be_lvl = be_price if be_price else _be_exit_price(s.entry, side, market)
-                        if hit_sl(float(be_lvl)):
+                        if _be_is_armed(side=side, price=price_f, tp1=getattr(s,'tp1',None), tp2=getattr(s,'tp2',None)) and hit_sl(float(be_lvl)):
                             import datetime as _dt
                             now_utc = _dt.datetime.now(_dt.timezone.utc)
                             txt = _trf(uid, "msg_auto_be",
