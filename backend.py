@@ -448,6 +448,227 @@ async def _gateio_public_price(symbol: str) -> float:
     return 0.0
 
 
+# ------------------ Auto-trade reconcile helpers (manual close detection) ------------------
+
+_AUTOTRADE_RECONCILE_SEC = max(10, int(os.getenv("AUTOTRADE_RECONCILE_SEC", "30") or 30))
+_LAST_RECONCILE_AT: dict[tuple[int, int], float] = {}
+
+def _base_coin(symbol: str) -> str:
+    s = (symbol or "").upper().strip()
+    if s.endswith("USDT") and len(s) > 4:
+        return s[:-4]
+    # fallback: take leading letters
+    return s
+
+async def _binance_public_price(symbol: str) -> float:
+    data = await _http_json("GET", "https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
+    try:
+        return float(data.get("price") or 0.0)
+    except Exception:
+        return 0.0
+
+async def _bybit_public_price(symbol: str, *, category: str = "spot") -> float:
+    cat = category if category in ("spot", "linear") else "spot"
+    data = await _http_json("GET", "https://api.bybit.com/v5/market/tickers", params={"category": cat, "symbol": symbol.upper()}, timeout_s=8)
+    try:
+        lst = ((data.get("result") or {}).get("list") or [])
+        if lst and isinstance(lst, list) and isinstance(lst[0], dict):
+            return float(lst[0].get("lastPrice") or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+async def _binance_spot_balance(*, api_key: str, api_secret: str, coin: str) -> float:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        acc = await _binance_signed_request(
+            s,
+            base_url="https://api.binance.com",
+            path="/api/v3/account",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"recvWindow": "5000"},
+        )
+    bal = 0.0
+    c = (coin or "").upper().strip()
+    for b in (acc.get("balances") or []):
+        if isinstance(b, dict) and str(b.get("asset", "")).upper() == c:
+            try:
+                bal = float(b.get("free") or 0.0) + float(b.get("locked") or 0.0)
+            except Exception:
+                bal = 0.0
+            break
+    return float(bal)
+
+async def _bybit_spot_balance(*, api_key: str, api_secret: str, coin: str) -> float:
+    # Bybit V5 SPOT balance (best-effort).
+    # Different Bybit account modes expose balances via different endpoints; we try two.
+    c = (coin or "").upper().strip()
+
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        # 1) wallet-balance (some accounts)
+        try:
+            data = await _bybit_v5_request(
+                s,
+                method="GET",
+                path="/v5/account/wallet-balance",
+                api_key=api_key,
+                api_secret=api_secret,
+                params={"accountType": "SPOT", "coin": c},
+            )
+            res = data.get("result") or {}
+            lst = res.get("list") or []
+            if lst and isinstance(lst, list) and isinstance(lst[0], dict):
+                coins = lst[0].get("coin") or []
+                for cc in coins:
+                    if isinstance(cc, dict) and str(cc.get("coin", "")).upper() == c:
+                        return float(cc.get("walletBalance") or 0.0)
+        except Exception:
+            pass
+
+        # 2) query-account-coins (fallback)
+        try:
+            data = await _bybit_v5_request(
+                s,
+                method="GET",
+                path="/v5/asset/transfer/query-account-coins",
+                api_key=api_key,
+                api_secret=api_secret,
+                params={"accountType": "SPOT", "coin": c},
+            )
+            res = data.get("result") or {}
+            coins = res.get("balance") or res.get("list") or []
+            for cc in coins:
+                if isinstance(cc, dict) and str(cc.get("coin", "")).upper() == c:
+                    return float(cc.get("walletBalance") or cc.get("transferBalance") or cc.get("available") or 0.0)
+        except Exception:
+            pass
+
+    return 0.0
+
+async def _okx_spot_balance(*, api_key: str, api_secret: str, passphrase: str, coin: str) -> float:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _okx_signed_request(
+            s,
+            base_url="https://www.okx.com",
+            path="/api/v5/account/balance",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            passphrase=passphrase,
+            params={"ccy": (coin or "").upper().strip()},
+        )
+    try:
+        lst = data.get("data") or []
+        if lst and isinstance(lst, list) and isinstance(lst[0], dict):
+            details = lst[0].get("details") or []
+            if details and isinstance(details, list) and isinstance(details[0], dict):
+                d0 = details[0]
+                # availBal + frozenBal
+                return float(d0.get("availBal") or 0.0) + float(d0.get("frozenBal") or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+async def _mexc_spot_balance(*, api_key: str, api_secret: str, coin: str) -> float:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _mexc_signed_request(
+            s,
+            base_url="https://api.mexc.com",
+            path="/api/v3/account",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"recvWindow": "5000"},
+        )
+    c = (coin or "").upper().strip()
+    try:
+        for b in (data.get("balances") or []):
+            if isinstance(b, dict) and str(b.get("asset", "")).upper() == c:
+                return float(b.get("free") or 0.0) + float(b.get("locked") or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+async def _gateio_spot_balance(*, api_key: str, api_secret: str, coin: str) -> float:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _gateio_signed_request(
+            s,
+            base_url="https://api.gateio.ws",
+            path="/api/v4/spot/accounts",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={},
+        )
+    c = (coin or "").upper().strip()
+    try:
+        if isinstance(data, list):
+            for b in data:
+                if isinstance(b, dict) and str(b.get("currency", "")).upper() == c:
+                    return float(b.get("available") or 0.0) + float(b.get("locked") or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+async def _binance_futures_position_amt(*, api_key: str, api_secret: str, symbol: str) -> float:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _binance_signed_request(
+            s,
+            base_url="https://fapi.binance.com",
+            path="/fapi/v2/positionRisk",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"symbol": symbol.upper(), "recvWindow": "5000"},
+        )
+    try:
+        # can be dict or list
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return float(data[0].get("positionAmt") or 0.0)
+        if isinstance(data, dict) and "positionAmt" in data:
+            return float(data.get("positionAmt") or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+async def _bybit_futures_position_size(*, api_key: str, api_secret: str, symbol: str) -> float:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _bybit_v5_request(
+            s,
+            method="GET",
+            path="/v5/position/list",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"category": "linear", "symbol": symbol.upper()},
+        )
+    try:
+        lst = ((data.get("result") or {}).get("list") or [])
+        if lst and isinstance(lst, list) and isinstance(lst[0], dict):
+            return float(lst[0].get("size") or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+def _pnl_from_entry_px(*, side: str, entry_price: float, exit_price: float, qty: float) -> float:
+    s = (side or "").upper().strip()
+    e = float(entry_price or 0.0)
+    x = float(exit_price or 0.0)
+    q = float(qty or 0.0)
+    if e <= 0 or x <= 0 or q <= 0:
+        return 0.0
+    if s == "SELL":
+        return (e - x) * q
+    return (x - e) * q
+
+
 async def validate_autotrade_keys(
     *,
     exchange: str,
@@ -2288,6 +2509,87 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 if await db_store.count_open_autotrade_positions(uid) <= 0:
                                     await db_store.finalize_autotrade_disable(uid)
                         except Exception:
+                            pass
+
+                        # -------- Reconcile: detect MANUAL close (no SL/TP fill) --------
+                        try:
+                            now_ts = time.time()
+                            key = (int(uid), int(r.get("id") or 0))
+                            last_ts = float(_LAST_RECONCILE_AT.get(key, 0.0))
+                            if now_ts - last_ts >= float(_AUTOTRADE_RECONCILE_SEC):
+                                _LAST_RECONCILE_AT[key] = now_ts
+
+                                # Determine if position still exists on exchange (best-effort).
+                                closed_manual = False
+                                if mt == "futures":
+                                    if ex == "binance":
+                                        pos_amt = await _binance_futures_position_amt(api_key=api_key, api_secret=api_secret, symbol=symbol)
+                                        closed_manual = (abs(float(pos_amt)) <= 1e-12)
+                                    elif ex == "bybit":
+                                        pos_sz = await _bybit_futures_position_size(api_key=api_key, api_secret=api_secret, symbol=symbol)
+                                        closed_manual = (abs(float(pos_sz)) <= 1e-12)
+                                else:
+                                    base = _base_coin(symbol)
+                                    bal = 0.0
+                                    if ex == "binance":
+                                        bal = await _binance_spot_balance(api_key=api_key, api_secret=api_secret, coin=base)
+                                    elif ex == "bybit":
+                                        bal = await _bybit_spot_balance(api_key=api_key, api_secret=api_secret, coin=base)
+                                    elif ex == "okx":
+                                        passphrase = _decrypt_token(row.get("passphrase_enc"))
+                                        bal = await _okx_spot_balance(api_key=api_key, api_secret=api_secret, passphrase=passphrase, coin=base)
+                                    elif ex == "mexc":
+                                        bal = await _mexc_spot_balance(api_key=api_key, api_secret=api_secret, coin=base)
+                                    elif ex == "gateio":
+                                        bal = await _gateio_spot_balance(api_key=api_key, api_secret=api_secret, coin=base)
+
+                                    ref_qty = float(ref.get("qty") or 0.0)
+                                    eps = max(ref_qty * 0.02, 1e-8)  # tolerate dust / rounding
+                                    closed_manual = (bal <= eps)
+
+                                if closed_manual:
+                                    # Approximate PnL by current market price (best-effort).
+                                    px = 0.0
+                                    if ex == "binance":
+                                        px = await _binance_public_price(symbol)
+                                    elif ex == "bybit":
+                                        px = await _bybit_public_price(symbol, category=("linear" if mt == "futures" else "spot"))
+                                    elif ex == "okx":
+                                        px = await _okx_public_price(symbol)
+                                    elif ex == "mexc":
+                                        px = await _mexc_public_price(symbol)
+                                    elif ex == "gateio":
+                                        px = await _gateio_public_price(symbol)
+
+                                    entry_p = float(ref.get("entry_price") or 0.0)
+                                    qty = float(ref.get("qty") or 0.0)
+                                    if qty <= 0 and entry_p > 0:
+                                        qty = float(r.get("allocated_usdt") or 0.0) / entry_p
+
+                                    pnl_usdt = _pnl_from_entry_px(side=ref.get("side") or r.get("side") or "BUY",
+                                                                  entry_price=entry_p, exit_price=px, qty=qty)
+                                    alloc = float(r.get("allocated_usdt") or 0.0)
+                                    roi_percent = (pnl_usdt / alloc * 100.0) if alloc > 0 else 0.0
+
+                                    await db_store.close_autotrade_position(
+                                        user_id=uid,
+                                        signal_id=r.get("signal_id"),
+                                        exchange=ex,
+                                        market_type=mt,
+                                        status="CLOSED",
+                                        pnl_usdt=float(pnl_usdt),
+                                        roi_percent=float(roi_percent),
+                                    )
+                                    # If user requested stop-after-close, apply here as well
+                                    try:
+                                        acc2 = await db_store.get_autotrade_access(uid)
+                                        if bool(acc2.get("autotrade_stop_after_close")):
+                                            if await db_store.count_open_autotrade_positions(uid) <= 0:
+                                                await db_store.finalize_autotrade_disable(uid)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            # Never break the manager loop on reconcile failures
                             pass
 
         except ExchangeAPIError as e:
