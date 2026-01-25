@@ -1141,6 +1141,68 @@ async def get_autotrade_settings(user_id: int) -> Dict[str, Any]:
         }
 
 
+
+async def get_autotrade_winrate(*, user_id: int, market_type: str = "futures", last_n: int = 20) -> float | None:
+    """Return winrate (WIN+BE) in percent for last N CLOSED autotrade positions.
+
+    WIN/BE: pnl_usdt >= 0 (or roi_percent >= 0 if pnl_usdt is NULL)
+    LOSS:   pnl_usdt < 0  (or roi_percent < 0 if pnl_usdt is NULL)
+
+    Returns None if not enough history.
+    """
+    mt = (market_type or "futures").lower().strip()
+    if mt not in ("spot", "futures"):
+        mt = "futures"
+    n = int(last_n or 20)
+    if n <= 0:
+        n = 20
+
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT pnl_usdt, roi_percent
+            FROM autotrade_positions
+            WHERE user_id=$1 AND market_type=$2 AND status='CLOSED'
+            ORDER BY COALESCE(closed_at, opened_at) DESC, id DESC
+            LIMIT $3
+            """,
+            int(user_id), mt, n
+        )
+
+    if not rows:
+        return None
+
+    wins = 0
+    losses = 0
+    for r in rows:
+        pnl = r.get("pnl_usdt", None)
+        roi = r.get("roi_percent", None)
+        v = None
+        if pnl is not None:
+            try:
+                v = float(pnl)
+            except Exception:
+                v = None
+        if v is None and roi is not None:
+            try:
+                v = float(roi)
+            except Exception:
+                v = None
+        if v is None:
+            continue
+        if v < 0:
+            losses += 1
+        else:
+            wins += 1
+
+    total = wins + losses
+    if total <= 0:
+        return None
+    return float(wins) * 100.0 / float(total)
+
+
+
 async def set_autotrade_toggle(user_id: int, market_type: str, enabled: bool) -> None:
     pool = get_pool()
     uid = int(user_id)
@@ -1622,52 +1684,6 @@ async def mark_autotrade_key_error(
                 mt,
                 (error or "API error")[:500],
             )
-
-async def get_autotrade_winrate(user_id: int, *, market_type: str = "futures", limit: int = 20) -> dict:
-    """Return winrate for last N CLOSED autotrade positions.
-
-    Uses autotrade_positions (status='CLOSED') where pnl_usdt is known.
-    WIN: pnl_usdt >= 0 (including BE)
-    LOSS: pnl_usdt < 0
-
-    Returns: {"n": int, "wins": int, "losses": int, "winrate": float}
-    """
-    mt = (market_type or "futures").lower().strip()
-    if mt not in ("spot", "futures"):
-        mt = "futures"
-    lim = max(1, min(int(limit or 20), 200))
-    pool = get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT pnl_usdt
-            FROM autotrade_positions
-            WHERE user_id=$1
-              AND market_type=$2
-              AND status='CLOSED'
-              AND pnl_usdt IS NOT NULL
-            ORDER BY closed_at DESC NULLS LAST, opened_at DESC
-            LIMIT $3;
-            """,
-            int(user_id),
-            mt,
-            lim,
-        )
-    wins = 0
-    losses = 0
-    for r in rows:
-        try:
-            pnl = float(r.get("pnl_usdt") if isinstance(r, dict) else r[0])
-        except Exception:
-            continue
-        if pnl >= 0:
-            wins += 1
-        else:
-            losses += 1
-    n = wins + losses
-    wr = (wins / n * 100.0) if n > 0 else 0.0
-    return {"n": int(n), "wins": int(wins), "losses": int(losses), "winrate": float(wr)}
-
 
 async def get_autotrade_used_usdt(user_id: int, market_type: str) -> float:
     pool = get_pool()
