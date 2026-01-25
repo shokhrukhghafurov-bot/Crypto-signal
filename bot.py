@@ -1682,7 +1682,7 @@ async def broadcast_signal(sig: Signal) -> None:
 
     # Persist bot-level signal tracker (independent from users) for outcomes (TP/SL/BE) statistics.
     try:
-        await db_store.create_signal_track(
+        await db_store.upsert_signal_track(
             signal_id=int(sig.signal_id or 0),
             sig_key=sig_key,
             market=str(sig.market).upper(),
