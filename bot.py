@@ -2854,10 +2854,14 @@ async def autotrade_input_handler(message: types.Message) -> None:
                 # be < 20 chars) while still blocking obvious junk.
                 api_key_s = api_key.strip()
                 api_secret_s = str(api_secret).strip()
-                if ex == "bybit":
-                    bad_format = (len(api_key_s) < 8) or (len(api_secret_s) < 20)
+                # Universal permissive validation (all exchanges):
+                # - no spaces / newlines / tabs inside key or secret
+                # - minimal length thresholds
+                # We rely on validate_autotrade_keys() for real API validation.
+                if (re.search(r"\s", api_key_s) is not None) or (re.search(r"\s", api_secret_s) is not None):
+                    bad_format = True
                 else:
-                    bad_format = (len(api_key_s) < 20) or (len(api_secret_s) < 20)
+                    bad_format = (len(api_key_s) < 8) or (len(api_secret_s) < 16)
 
                 if bad_format:
                     try:
