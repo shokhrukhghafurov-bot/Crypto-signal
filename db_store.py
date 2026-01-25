@@ -1414,7 +1414,7 @@ async def set_autotrade_exchange(user_id: int, market_type: str, exchange: str) 
     uid = int(user_id)
     m = (market_type or "").lower().strip()
     ex = (exchange or "binance").lower().strip()
-    if mt == "futures":
+    if m == "futures":
         # Futures keys are supported only for Binance/Bybit
         if ex not in ("binance", "bybit"):
             ex = "binance"
