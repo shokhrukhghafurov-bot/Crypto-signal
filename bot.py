@@ -1621,18 +1621,18 @@ async def broadcast_signal(sig: Signal) -> None:
     except Exception:
         pass
 
-    # Persist bot-level signal track (for outcome statistics independent from users)
+    # Persist bot-level signal tracker (independent from users) for outcomes (TP/SL/BE) statistics.
     try:
-        await db_store.record_signal_track(
-            sig_key=sig_key,
+        await db_store.create_signal_track(
             signal_id=int(sig.signal_id or 0),
+            sig_key=sig_key,
             market=str(sig.market).upper(),
-            symbol=str(sig.symbol).upper(),
-            direction=str(sig.direction).upper(),
+            symbol=str(sig.symbol),
+            side=str(sig.direction).upper(),
             entry=float(sig.entry or 0.0),
-            sl=float(sig.sl) if sig.sl is not None else None,
-            tp1=float(sig.tp1) if sig.tp1 is not None else None,
-            tp2=float(sig.tp2) if sig.tp2 is not None else None,
+            tp1=(float(sig.tp1) if sig.tp1 is not None else None),
+            tp2=(float(sig.tp2) if sig.tp2 is not None else None),
+            sl=(float(sig.sl) if sig.sl is not None else None),
         )
     except Exception:
         pass
@@ -3228,120 +3228,155 @@ async def opened(call: types.CallbackQuery) -> None:
     )
 
 
-# ---------------- Bot-level signal outcome tracking (independent from users) ----------------
 
-def _hit_tp(price: float, lvl: float, direction: str) -> bool:
-    if lvl is None or float(lvl) == 0.0:
-        return False
-    return price >= float(lvl) if direction == 'LONG' else price <= float(lvl)
+# ---------------- BOT-level signal outcome watcher (independent from users) ----------------
 
-def _hit_sl(price: float, lvl: float, direction: str) -> bool:
-    if lvl is None or float(lvl) == 0.0:
-        return False
-    return price <= float(lvl) if direction == 'LONG' else price >= float(lvl)
+_SIG_WATCH_INTERVAL_SEC = max(5, int(os.getenv("SIG_WATCH_INTERVAL_SEC", "15")))
+_BE_BUFFER_PCT = float(os.getenv("BE_BUFFER_PCT", "0.001") or 0.001)  # 0.1% default
+_BE_CONFIRM_SEC = max(0, int(os.getenv("BE_CONFIRM_SEC", "60") or 60))  # require staying past BE trigger for N seconds
+_SIG_TP1_PARTIAL_PCT = float(os.getenv("SIG_TP1_PARTIAL_CLOSE_PCT", "50") or 50)  # model partial close at TP1
 
-def _pnl_pct(entry: float, exit_price: float, direction: str) -> float:
+async def _fetch_binance_price(symbol: str, *, futures: bool) -> float:
+    """Best-effort public price from Binance (spot or futures)."""
+    symbol = str(symbol or "").upper().strip()
+    if not symbol:
+        return 0.0
+    url = ("https://fapi.binance.com/fapi/v1/ticker/price" if futures else "https://api.binance.com/api/v3/ticker/price")
     try:
-        e = float(entry)
-        x = float(exit_price)
-        if e <= 0:
-            return 0.0
-        raw = (x - e) / e * 100.0
-        return raw if direction == 'LONG' else (-raw)
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url, params={"symbol": symbol}) as r:
+                data = await r.json(content_type=None)
+                return float((data or {}).get("price") or 0.0)
     except Exception:
         return 0.0
 
+def _hit_tp(side: str, price: float, lvl: float) -> bool:
+    return price >= lvl if side == "LONG" else price <= lvl
+
+def _hit_sl(side: str, price: float, lvl: float) -> bool:
+    return price <= lvl if side == "LONG" else price >= lvl
+
+def _pnl_pct(side: str, entry: float, close: float) -> float:
+    if entry <= 0:
+        return 0.0
+    if side == "LONG":
+        return (close - entry) / entry * 100.0
+    return (entry - close) / entry * 100.0
+
+def _model_partial_pct() -> float:
+    try:
+        p = float(_SIG_TP1_PARTIAL_PCT)
+    except Exception:
+        p = 50.0
+    return max(0.0, min(100.0, p)) / 100.0
+
 async def signal_outcome_loop() -> None:
-    """Watch bot-level signal_tracks and close them on TP2/SL/BE.
+    """Close signal tracks by price: WIN/LOSS/TP1/BE with strict BE logic.
 
-    Rules (simple & deterministic):
-      - Before TP1: if SL hit -> LOSS; if TP2 hit -> WIN; if TP1 hit -> mark TP1
-      - After TP1: if TP2 hit -> WIN; else if price returns to entry -> BE (protect at BE)
+    Strict BE:
+      - BE can happen only AFTER TP1.
+      - After TP1, BE triggers when price crosses entry +/- buffer
+        AND stays beyond it for BE_CONFIRM_SEC seconds (anti-wick confirmation).
     """
-    interval = int(os.getenv("SIGNAL_OUTCOME_INTERVAL_SEC", "15") or 15)
-    interval = max(5, min(interval, 300))
-    batch = int(os.getenv("SIGNAL_OUTCOME_BATCH", "200") or 200)
-    batch = max(20, min(batch, 1000))
-    logger.info("Signal outcome loop started interval=%ss batch=%s", interval, batch)
-
+    import datetime as _dt
+    logger.info("Starting signal_outcome_loop interval=%ss buffer_pct=%s confirm_sec=%s", _SIG_WATCH_INTERVAL_SEC, _BE_BUFFER_PCT, _BE_CONFIRM_SEC)
     while True:
         try:
-            rows = await db_store.list_open_signal_tracks(limit=batch)
+            rows = await db_store.list_open_signal_tracks(limit=1000)
             if not rows:
-                await asyncio.sleep(interval)
+                await asyncio.sleep(_SIG_WATCH_INTERVAL_SEC)
                 continue
 
-            for r in rows:
-                sig_key = str(r.get("sig_key") or "")
-                if not sig_key:
-                    continue
-                market = str(r.get("market") or "SPOT").upper()
-                symbol = str(r.get("symbol") or "").upper()
-                direction = str(r.get("direction") or "").upper()
-                entry = float(r.get("entry") or 0.0)
-                sl = r.get("sl")
-                tp1 = r.get("tp1")
-                tp2 = r.get("tp2")
-                status = str(r.get("status") or "ACTIVE").upper()
-                tp1_hit = bool(r.get("tp1_hit") or False)
+            now = _dt.datetime.now(_dt.timezone.utc)
+            part = _model_partial_pct()
 
-                # Fetch price via Backend routing (median / best-effort)
+            for t in rows:
                 try:
-                    s = Signal(
-                        signal_id=int(r.get("signal_id") or 0),
-                        market=market,
-                        symbol=symbol,
-                        direction=direction,
-                        timeframe="",
-                        entry=float(entry or 0.0),
-                        sl=float(sl or 0.0) if sl is not None else 0.0,
-                        tp1=float(tp1 or 0.0) if tp1 is not None else 0.0,
-                        tp2=float(tp2 or 0.0) if tp2 is not None else 0.0,
-                        rr=0.0,
-                        confidence=0,
-                        confirmations="",
-                        risk_note="",
-                        ts=float(dt.datetime.now(dt.timezone.utc).timestamp()),
-                    )
-                    price, src = await backend._get_price_with_source(s)  # best-effort
-                    price_f = float(price or 0.0)
+                    sid = int(t.get("signal_id") or 0)
+                    market = str(t.get("market") or "SPOT").upper()
+                    symbol = str(t.get("symbol") or "").upper()
+                    side = str(t.get("side") or "LONG").upper()
+                    status = str(t.get("status") or "ACTIVE").upper()
+
+                    entry = float(t.get("entry") or 0.0)
+                    tp1 = float(t.get("tp1") or 0.0) if t.get("tp1") is not None else 0.0
+                    tp2 = float(t.get("tp2") or 0.0) if t.get("tp2") is not None else 0.0
+                    sl  = float(t.get("sl") or 0.0)  if t.get("sl")  is not None else 0.0
+
+                    if sid <= 0 or entry <= 0 or not symbol:
+                        continue
+
+                    px = await _fetch_binance_price(symbol, futures=(market == "FUTURES"))
+                    if px <= 0:
+                        continue
+
+                    # Prefer TPC: if tp2 missing but tp1 exists, treat tp1 as final target
+                    eff_tp2 = tp2 if (tp2 > 0 and (tp1 <= 0 or abs(tp2 - tp1) > 1e-12)) else 0.0
+                    eff_tp1 = tp1 if tp1 > 0 else 0.0
+
+                    # ACTIVE stage
+                    if status == "ACTIVE":
+                        # WIN by TP2 (or TP1 if no TP2)
+                        if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
+                            pnl = (part * _pnl_pct(side, entry, eff_tp1) + (1.0 - part) * _pnl_pct(side, entry, eff_tp2)) if (eff_tp1 > 0 and eff_tp2 > 0) else _pnl_pct(side, entry, eff_tp2)
+                            await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            continue
+                        if eff_tp2 <= 0 and eff_tp1 > 0 and _hit_tp(side, px, eff_tp1):
+                            # single-target win at TP1
+                            pnl = _pnl_pct(side, entry, eff_tp1)
+                            await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            continue
+                        # LOSS by SL (only before TP1 in strict mode)
+                        if sl > 0 and _hit_sl(side, px, sl):
+                            pnl = _pnl_pct(side, entry, sl)
+                            await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
+                            continue
+                        # TP1 hit -> arm BE
+                        if eff_tp1 > 0 and _hit_tp(side, px, eff_tp1):
+                            await db_store.mark_signal_tp1(signal_id=sid, be_price=float(entry))
+                            continue
+
+                    # TP1 stage (BE armed)
+                    if status == "TP1":
+                        # WIN by TP2 if exists
+                        if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
+                            pnl = (part * _pnl_pct(side, entry, eff_tp1) + (1.0 - part) * _pnl_pct(side, entry, eff_tp2)) if eff_tp1 > 0 else _pnl_pct(side, entry, eff_tp2)
+                            await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            continue
+
+                        # Strict BE confirmation
+                        trigger = entry * (1.0 - _BE_BUFFER_PCT) if side == "LONG" else entry * (1.0 + _BE_BUFFER_PCT)
+                        crossed = bool(px <= trigger) if side == "LONG" else bool(px >= trigger)
+
+                        crossed_at = t.get("be_crossed_at")
+                        crossed_at_dt = _parse_iso_dt(crossed_at) if isinstance(crossed_at, str) else crossed_at
+                        if crossed and crossed_at_dt is None:
+                            await db_store.set_signal_be_crossed_at(signal_id=sid, crossed_at=now)
+                            continue
+                        if not crossed and crossed_at_dt is not None:
+                            # reset if price went back (anti-wick)
+                            await db_store.set_signal_be_crossed_at(signal_id=sid, crossed_at=None)
+                            continue
+                        if crossed and crossed_at_dt is not None and _BE_CONFIRM_SEC > 0:
+                            if (now - crossed_at_dt).total_seconds() >= _BE_CONFIRM_SEC:
+                                pnl = part * _pnl_pct(side, entry, eff_tp1) if eff_tp1 > 0 else 0.0
+                                await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
+                                continue
+                        if crossed and crossed_at_dt is not None and _BE_CONFIRM_SEC == 0:
+                            pnl = part * _pnl_pct(side, entry, eff_tp1) if eff_tp1 > 0 else 0.0
+                            await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
+                            continue
+
                 except Exception:
+                    # keep loop alive
+                    logger.exception("signal_outcome_loop: item error")
                     continue
-
-                # save last seen price
-                try:
-                    await db_store.update_signal_track_price(sig_key=sig_key, price=price_f, src=src)
-                except Exception:
-                    pass
-
-                # Evaluate outcome
-                if status == "ACTIVE" and not tp1_hit:
-                    if _hit_sl(price_f, float(sl) if sl is not None else None, direction):
-                        await db_store.close_signal_track(sig_key=sig_key, outcome="LOSS", close_price=price_f,
-                                                         pnl_total_pct=_pnl_pct(entry, float(sl), direction) if sl is not None else _pnl_pct(entry, price_f, direction))
-                        continue
-                    if _hit_tp(price_f, float(tp2) if tp2 is not None else None, direction):
-                        await db_store.close_signal_track(sig_key=sig_key, outcome="WIN", close_price=price_f,
-                                                         pnl_total_pct=_pnl_pct(entry, float(tp2), direction) if tp2 is not None else _pnl_pct(entry, price_f, direction))
-                        continue
-                    if _hit_tp(price_f, float(tp1) if tp1 is not None else None, direction):
-                        await db_store.mark_signal_track_tp1(sig_key=sig_key)
-                        continue
-
-                # After TP1 protection: BE if return to entry
-                if status in ("TP1", "ACTIVE") and (tp1_hit or status == "TP1"):
-                    if _hit_tp(price_f, float(tp2) if tp2 is not None else None, direction):
-                        await db_store.close_signal_track(sig_key=sig_key, outcome="WIN", close_price=price_f,
-                                                         pnl_total_pct=_pnl_pct(entry, float(tp2), direction) if tp2 is not None else _pnl_pct(entry, price_f, direction))
-                        continue
-                    # BE when price crosses entry back
-                    if (price_f <= entry if direction == "LONG" else price_f >= entry):
-                        await db_store.close_signal_track(sig_key=sig_key, outcome="BE", close_price=price_f, pnl_total_pct=0.0)
-                        continue
 
         except Exception:
             logger.exception("signal_outcome_loop error")
-        await asyncio.sleep(interval)
+
+        await asyncio.sleep(_SIG_WATCH_INTERVAL_SEC)
 
 
 async def main() -> None:
@@ -3732,7 +3767,7 @@ async def main() -> None:
             async def _mk(market: str) -> dict:
                 out: dict[str, dict] = {}
                 for k, (since, until) in ranges.items():
-                    b = await db_store.signal_perf_bucket_global(market=market, since=since, until=until)
+                    b = await db_store.signal_perf_bucket_global(market, since=since, until=until)
                     trades = int(b.get('trades') or 0)
                     wins = int(b.get('wins') or 0)      # TP2 hits (WIN)
                     losses = int(b.get('losses') or 0)  # SL hits (LOSS)
@@ -4237,8 +4272,9 @@ async def main() -> None:
     asyncio.create_task(backend.track_loop(bot))
     logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+    logger.info("Starting signal_outcome_loop")
+    asyncio.create_task(signal_outcome_loop())
 
-    asyncio.create_task(signal_outcome_loop())  # bot-level signal outcomes for dashboard
     # Auto-trade manager (SL/TP/BE) - runs in background.
     asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
     await dp.start_polling(bot)
