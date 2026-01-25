@@ -1774,8 +1774,14 @@ async def upsert_autotrade_keys(
     uid = int(user_id)
     ex = (exchange or "binance").lower().strip()
     mt = (market_type or "spot").lower().strip()
-    if ex not in ("binance", "bybit"):
-        ex = "binance"
+    if mt == "futures":
+        # Futures keys are supported only for Binance/Bybit
+        if ex not in ("binance", "bybit"):
+            ex = "binance"
+    else:
+        # Spot keys can be stored for multiple exchanges
+        if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
+            ex = "binance"
     if mt not in ("spot", "futures"):
         mt = "spot"
     async with pool.acquire() as conn:
