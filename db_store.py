@@ -1761,3 +1761,57 @@ async def get_autotrade_stats(
         "roi_percent": roi,
         "invested_closed": invested_closed,
     }
+
+
+# ---------------- Auto-trade analytics helpers ----------------
+
+async def get_autotrade_winrate(user_id: int, market_type: str, *, limit: int = 20) -> Dict[str, Any]:
+    """Compute winrate on last CLOSED auto-trade positions.
+
+    WIN  := pnl_usdt > 0
+    LOSS := pnl_usdt < 0
+    BE   := pnl_usdt == 0 (treated as WIN for winrate)
+
+    Returns dict:
+      {"n": int, "wins": int, "losses": int, "be": int, "winrate": float}
+    """
+    pool = get_pool()
+    uid = int(user_id)
+    mt = (market_type or "all").lower().strip()
+    if mt not in ("spot", "futures", "all"):
+        mt = "all"
+    lim = max(1, min(int(limit or 20), 200))
+
+    where = "WHERE user_id=$1 AND status='CLOSED'"
+    args: list[Any] = [uid]
+    if mt != "all":
+        where += " AND market_type=$2"
+        args.append(mt)
+
+    q = f"""
+      SELECT pnl_usdt
+      FROM autotrade_positions
+      {where}
+      ORDER BY closed_at DESC NULLS LAST
+      LIMIT {lim}
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(q, *args)
+
+    wins = losses = be = 0
+    for r in rows or []:
+        try:
+            pnl = float(r.get("pnl_usdt") or 0.0)
+        except Exception:
+            pnl = 0.0
+        if pnl > 0:
+            wins += 1
+        elif pnl < 0:
+            losses += 1
+        else:
+            be += 1
+
+    n = int(len(rows or []))
+    win_like = wins + be
+    wr = (win_like / n * 100.0) if n > 0 else 0.0
+    return {"n": n, "wins": wins, "losses": losses, "be": be, "winrate": float(wr)}
