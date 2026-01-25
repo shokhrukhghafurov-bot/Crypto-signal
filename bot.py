@@ -1600,6 +1600,27 @@ async def broadcast_signal(sig: Signal) -> None:
                         pass
 
                     res = await autotrade_execute(_uid, _sig)
+
+# Notify user when smart Effective Cap decreases (risk reduction).
+try:
+    if isinstance(res, dict) and bool(res.get("cap_decreased")):
+        ui_cap = float(res.get("cap_ui") or 0.0)
+        new_cap = float(res.get("cap_effective") or 0.0)
+        prev_cap = res.get("cap_prev_effective")
+        prev_cap_f = float(prev_cap) if prev_cap is not None else None
+        wr = res.get("winrate")
+        wr_f = float(wr) if wr is not None else None
+        txt = trf(
+            _uid,
+            "at_cap_decreased",
+            ui_cap=f"{ui_cap:g}",
+            prev_cap=(f"{prev_cap_f:g}" if prev_cap_f is not None else "—"),
+            new_cap=f"{new_cap:g}",
+            winrate=(f"{wr_f:.1f}" if wr_f is not None else "—"),
+        )
+        await safe_send(_uid, txt, ctx="at_cap_decreased")
+except Exception:
+    pass
                     err = res.get("api_error") if isinstance(res, dict) else None
                     if err:
                         # notify ONLY for API errors
