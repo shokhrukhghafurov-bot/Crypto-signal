@@ -8,6 +8,7 @@ import re
 import math
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
+from dataclasses import replace
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
