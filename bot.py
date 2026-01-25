@@ -1154,7 +1154,7 @@ def _calc_effective_futures_cap(ui_cap: float, winrate: float | None) -> float:
         return 0.0
     wr = 50.0 if winrate is None else float(winrate)
 
-    base = cap * 0.70
+    base = cap * 0.65
     if wr < 40:
         k = 0.6
     elif wr < 50:
@@ -2142,7 +2142,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         try:
             fn = getattr(db_store, "get_autotrade_winrate", None)
             if fn:
-                st["futures_winrate"] = await fn(user_id=uid, market_type="futures", last_n=20)
+                st["futures_winrate"] = await fn(user_id=uid, market_type="futures", last_n=10)
         except Exception:
             st["futures_winrate"] = None
 
