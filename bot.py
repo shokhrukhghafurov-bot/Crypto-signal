@@ -1173,7 +1173,7 @@ def _calc_effective_futures_cap(ui_cap: float, winrate: float | None) -> float:
 
 
 
-def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
+def autotrade_main_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]] | None = None) -> str:
     """Compact Auto-trade screen (main), per UX request."""
     _EX_NAMES = {
         "binance": "Binance",
@@ -1201,7 +1201,27 @@ def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
             seen.add(p)
     if not prio_clean:
         prio_clean = ["binance"]
-    spot_prio = "Auto → " + " > ".join(_EX_NAMES[p] for p in prio_clean)
+    # Show priority only for exchanges the user actually connected (active SPOT keys),
+    # and keep it short (top 3) to avoid clutter on the main screen.
+    active_spot: set[str] = set()
+    if isinstance(keys, list):
+        for r in keys:
+            try:
+                if str(r.get("market_type") or "").lower().strip() == "spot" and bool(r.get("is_active")):
+                    ex = str(r.get("exchange") or "").lower().strip()
+                    if ex:
+                        active_spot.add(ex)
+            except Exception:
+                continue
+
+    prio_view = [ex for ex in prio_clean if (not active_spot or ex in active_spot)]
+    if not prio_view:
+        prio_view = prio_clean
+
+    show = prio_view[:3]
+    spot_prio = "Auto → " + " > ".join(_EX_NAMES[p] for p in show)
+    if len(prio_view) > 3:
+        spot_prio += " …
     spot_amt = float(s.get("spot_amount_per_trade") or 0.0)
     fut_margin = float(s.get("futures_margin_per_trade") or 0.0)
     fut_lev = int(s.get("futures_leverage") or 1)
@@ -2197,7 +2217,8 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         except Exception:
             st["futures_winrate"] = None
 
-        await safe_edit(call.message, autotrade_main_text(uid, st), autotrade_main_kb(uid))
+        keys = await db_store.get_autotrade_keys_status(uid)
+        await safe_edit(call.message, autotrade_main_text(uid, st, keys), autotrade_main_kb(uid))
         return
 
     # fallback
