@@ -1048,6 +1048,9 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
     fut_lev = int(s.get("futures_leverage") or 1)
     fut_cap = float(s.get("futures_cap") or 0.0)
 
+    fut_winrate = s.get("futures_winrate")
+    fut_cap_eff = _calc_effective_futures_cap(fut_cap, fut_winrate)
+
     # Build keys status block based on last signal confirmations (if available)
     lang = (LANG.get(int(uid), "ru") if isinstance(uid, int) else "ru")
     def _conf_set(sig_obj: Any) -> set[str]:
@@ -1144,6 +1147,47 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
     )
 
 
+
+def _calc_effective_futures_cap(ui_cap: float, winrate: float | None) -> float:
+    """Compute effective futures cap (USDT) based on UI cap and winrate.
+
+    Base = ui_cap * 0.65
+    Multiplier by winrate (last N auto-trades):
+      <40%  -> 0.6
+      40-49 -> 0.8
+      50-59 -> 1.0
+      60-69 -> 1.1
+      >=70  -> 1.25
+
+    Rounded DOWN to nearest 10 USDT and never exceeds ui_cap.
+    """
+    cap = float(ui_cap or 0.0)
+    if cap <= 0:
+        return 0.0
+
+    wr = 50.0 if winrate is None else float(winrate)
+    base = cap * 0.65
+
+    if wr < 40.0:
+        k = 0.6
+    elif wr < 50.0:
+        k = 0.8
+    elif wr < 60.0:
+        k = 1.0
+    elif wr < 70.0:
+        k = 1.1
+    else:
+        k = 1.25
+
+    eff = base * k
+    if eff > cap:
+        eff = cap
+
+    # round down to 10
+    eff = (eff // 10.0) * 10.0
+    return float(eff if eff > 0 else 0.0)
+
+
 def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
     """Compact Auto-trade screen (main), per UX request."""
     spot_ex = str(s.get("spot_exchange") or "binance").capitalize()
@@ -1175,7 +1219,8 @@ def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
         f"{lbl_ex}: {fut_ex}\n"
         f"{lbl_fut_margin}: {fut_margin:g} USDT\n"
         f"{lbl_lev}: {fut_lev}x\n"
-        f"{lbl_cap}: {fut_cap:g} USDT"
+        f"📌 Cap (настройка): {fut_cap:g} USDT\n"
+        f"🧠 Effective Cap (сейчас): {fut_cap_eff:g} USDT"
     )
 
 
@@ -1600,28 +1645,6 @@ async def broadcast_signal(sig: Signal) -> None:
                         pass
 
                     res = await autotrade_execute(_uid, _sig)
-
-                    # Notify user when smart Effective Cap decreases (risk reduction).
-                    if isinstance(res, dict) and bool(res.get("cap_decreased")):
-                        try:
-                            ui_cap = float(res.get("cap_ui") or 0.0)
-                            new_cap = float(res.get("cap_effective") or 0.0)
-                            prev_cap = res.get("cap_prev_effective")
-                            prev_cap_f = float(prev_cap) if prev_cap is not None else None
-                            wr = res.get("winrate")
-                            wr_f = float(wr) if wr is not None else None
-                            txt_msg = trf(
-                                _uid,
-                                "at_cap_decreased",
-                                ui_cap=f"{ui_cap:g}",
-                                prev_cap=(f"{prev_cap_f:g}" if prev_cap_f is not None else "—"),
-                                new_cap=f"{new_cap:g}",
-                                winrate=(f"{wr_f:.1f}" if wr_f is not None else "—"),
-                            )
-                            await safe_send(_uid, txt_msg, ctx="at_cap_decreased")
-                        except Exception:
-                            pass
-
                     err = res.get("api_error") if isinstance(res, dict) else None
                     if err:
                         # notify ONLY for API errors
@@ -2123,6 +2146,11 @@ async def menu_handler(call: types.CallbackQuery) -> None:
                 "futures_leverage": 1,
                 "futures_cap": 0.0,
             }
+        # compute winrate for FUTURES (last 20 closed auto-trades)
+        try:
+            st["futures_winrate"] = await db_store.get_autotrade_winrate(user_id=uid, market_type="futures", last_n=20)
+        except Exception:
+            st["futures_winrate"] = None
         await safe_edit(call.message, autotrade_main_text(uid, st), autotrade_main_kb(uid))
         return
 
