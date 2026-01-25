@@ -1620,6 +1620,22 @@ async def broadcast_signal(sig: Signal) -> None:
         await db_store.record_signal_sent(sig_key=sig_key, market=str(sig.market).upper(), signal_id=int(sig.signal_id or 0))
     except Exception:
         pass
+
+    # Persist bot-level signal track (for outcome statistics independent from users)
+    try:
+        await db_store.record_signal_track(
+            sig_key=sig_key,
+            signal_id=int(sig.signal_id or 0),
+            market=str(sig.market).upper(),
+            symbol=str(sig.symbol).upper(),
+            direction=str(sig.direction).upper(),
+            entry=float(sig.entry or 0.0),
+            sl=float(sig.sl) if sig.sl is not None else None,
+            tp1=float(sig.tp1) if sig.tp1 is not None else None,
+            tp2=float(sig.tp2) if sig.tp2 is not None else None,
+        )
+    except Exception:
+        pass
     ORIGINAL_SIGNAL_TEXT[(0, sig.signal_id)] = _signal_text(0, sig)
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
@@ -3211,6 +3227,123 @@ async def opened(call: types.CallbackQuery) -> None:
         reply_markup=menu_kb(call.from_user.id),
     )
 
+
+# ---------------- Bot-level signal outcome tracking (independent from users) ----------------
+
+def _hit_tp(price: float, lvl: float, direction: str) -> bool:
+    if lvl is None or float(lvl) == 0.0:
+        return False
+    return price >= float(lvl) if direction == 'LONG' else price <= float(lvl)
+
+def _hit_sl(price: float, lvl: float, direction: str) -> bool:
+    if lvl is None or float(lvl) == 0.0:
+        return False
+    return price <= float(lvl) if direction == 'LONG' else price >= float(lvl)
+
+def _pnl_pct(entry: float, exit_price: float, direction: str) -> float:
+    try:
+        e = float(entry)
+        x = float(exit_price)
+        if e <= 0:
+            return 0.0
+        raw = (x - e) / e * 100.0
+        return raw if direction == 'LONG' else (-raw)
+    except Exception:
+        return 0.0
+
+async def signal_outcome_loop() -> None:
+    """Watch bot-level signal_tracks and close them on TP2/SL/BE.
+
+    Rules (simple & deterministic):
+      - Before TP1: if SL hit -> LOSS; if TP2 hit -> WIN; if TP1 hit -> mark TP1
+      - After TP1: if TP2 hit -> WIN; else if price returns to entry -> BE (protect at BE)
+    """
+    interval = int(os.getenv("SIGNAL_OUTCOME_INTERVAL_SEC", "15") or 15)
+    interval = max(5, min(interval, 300))
+    batch = int(os.getenv("SIGNAL_OUTCOME_BATCH", "200") or 200)
+    batch = max(20, min(batch, 1000))
+    logger.info("Signal outcome loop started interval=%ss batch=%s", interval, batch)
+
+    while True:
+        try:
+            rows = await db_store.list_open_signal_tracks(limit=batch)
+            if not rows:
+                await asyncio.sleep(interval)
+                continue
+
+            for r in rows:
+                sig_key = str(r.get("sig_key") or "")
+                if not sig_key:
+                    continue
+                market = str(r.get("market") or "SPOT").upper()
+                symbol = str(r.get("symbol") or "").upper()
+                direction = str(r.get("direction") or "").upper()
+                entry = float(r.get("entry") or 0.0)
+                sl = r.get("sl")
+                tp1 = r.get("tp1")
+                tp2 = r.get("tp2")
+                status = str(r.get("status") or "ACTIVE").upper()
+                tp1_hit = bool(r.get("tp1_hit") or False)
+
+                # Fetch price via Backend routing (median / best-effort)
+                try:
+                    s = Signal(
+                        signal_id=int(r.get("signal_id") or 0),
+                        market=market,
+                        symbol=symbol,
+                        direction=direction,
+                        timeframe="",
+                        entry=float(entry or 0.0),
+                        sl=float(sl or 0.0) if sl is not None else 0.0,
+                        tp1=float(tp1 or 0.0) if tp1 is not None else 0.0,
+                        tp2=float(tp2 or 0.0) if tp2 is not None else 0.0,
+                        rr=0.0,
+                        confidence=0,
+                        confirmations="",
+                        risk_note="",
+                        ts=float(dt.datetime.now(dt.timezone.utc).timestamp()),
+                    )
+                    price, src = await backend._get_price_with_source(s)  # best-effort
+                    price_f = float(price or 0.0)
+                except Exception:
+                    continue
+
+                # save last seen price
+                try:
+                    await db_store.update_signal_track_price(sig_key=sig_key, price=price_f, src=src)
+                except Exception:
+                    pass
+
+                # Evaluate outcome
+                if status == "ACTIVE" and not tp1_hit:
+                    if _hit_sl(price_f, float(sl) if sl is not None else None, direction):
+                        await db_store.close_signal_track(sig_key=sig_key, outcome="LOSS", close_price=price_f,
+                                                         pnl_total_pct=_pnl_pct(entry, float(sl), direction) if sl is not None else _pnl_pct(entry, price_f, direction))
+                        continue
+                    if _hit_tp(price_f, float(tp2) if tp2 is not None else None, direction):
+                        await db_store.close_signal_track(sig_key=sig_key, outcome="WIN", close_price=price_f,
+                                                         pnl_total_pct=_pnl_pct(entry, float(tp2), direction) if tp2 is not None else _pnl_pct(entry, price_f, direction))
+                        continue
+                    if _hit_tp(price_f, float(tp1) if tp1 is not None else None, direction):
+                        await db_store.mark_signal_track_tp1(sig_key=sig_key)
+                        continue
+
+                # After TP1 protection: BE if return to entry
+                if status in ("TP1", "ACTIVE") and (tp1_hit or status == "TP1"):
+                    if _hit_tp(price_f, float(tp2) if tp2 is not None else None, direction):
+                        await db_store.close_signal_track(sig_key=sig_key, outcome="WIN", close_price=price_f,
+                                                         pnl_total_pct=_pnl_pct(entry, float(tp2), direction) if tp2 is not None else _pnl_pct(entry, price_f, direction))
+                        continue
+                    # BE when price crosses entry back
+                    if (price_f <= entry if direction == "LONG" else price_f >= entry):
+                        await db_store.close_signal_track(sig_key=sig_key, outcome="BE", close_price=price_f, pnl_total_pct=0.0)
+                        continue
+
+        except Exception:
+            logger.exception("signal_outcome_loop error")
+        await asyncio.sleep(interval)
+
+
 async def main() -> None:
     import time
     globals()["time"] = time
@@ -3599,7 +3732,7 @@ async def main() -> None:
             async def _mk(market: str) -> dict:
                 out: dict[str, dict] = {}
                 for k, (since, until) in ranges.items():
-                    b = await db_store.perf_bucket_global(market, since=since, until=until)
+                    b = await db_store.signal_perf_bucket_global(market=market, since=since, until=until)
                     trades = int(b.get('trades') or 0)
                     wins = int(b.get('wins') or 0)      # TP2 hits (WIN)
                     losses = int(b.get('losses') or 0)  # SL hits (LOSS)
@@ -4105,6 +4238,7 @@ async def main() -> None:
     logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
 
+    asyncio.create_task(signal_outcome_loop())  # bot-level signal outcomes for dashboard
     # Auto-trade manager (SL/TP/BE) - runs in background.
     asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
     await dp.start_polling(bot)
