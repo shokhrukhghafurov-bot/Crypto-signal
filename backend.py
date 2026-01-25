@@ -41,52 +41,6 @@ class ExchangeAPIError(RuntimeError):
     """Raised when an exchange API call fails (network / auth / rate limit / etc.)."""
 
 
-async def _smart_futures_cap(*, user_id: int, balance_usdt: float, user_cap_usdt: float) -> float:
-    """Compute an effective FUTURES cap (USDT margin) based on balance + recent winrate.
-
-    - Base cap: 65% of available margin.
-    - Winrate is computed on last closed auto-trade FUTURES positions.
-    - Hard clamp: never allow cap above 85% of available margin.
-    - If user_cap_usdt > 0: effective cap is min(user_cap_usdt, smart_cap).
-
-    This is a safety layer to prevent the bot from allocating ~100% of a small
-    futures balance when a user sets cap equal to balance.
-    """
-    bal = float(balance_usdt or 0.0)
-    if bal <= 0:
-        return float(user_cap_usdt or 0.0)
-
-    base = bal * 0.65
-    mult = 1.0
-    try:
-        st = await db_store.get_autotrade_winrate(int(user_id), "futures", limit=20)
-        n = int(st.get("n") or 0)
-        wr = float(st.get("winrate") or 0.0)
-        # If we don't have enough history, don't boost risk.
-        if n >= 10:
-            if wr < 40:
-                mult = 0.6
-            elif wr < 50:
-                mult = 0.8
-            elif wr < 60:
-                mult = 1.0
-            elif wr < 70:
-                mult = 1.1
-            else:
-                mult = 1.25
-        else:
-            mult = 1.0
-    except Exception:
-        mult = 1.0
-
-    smart = base * mult
-    smart = min(smart, bal * 0.85)
-    cap = smart
-    if float(user_cap_usdt or 0.0) > 0:
-        cap = min(float(user_cap_usdt), smart)
-    return max(0.0, float(cap))
-
-
 def _extract_signal_id(sig: object) -> int:
     """Extract a stable, non-null signal id from a signal object."""
     try:
@@ -119,6 +73,81 @@ def _should_deactivate_key(err_text: str) -> bool:
         "whitelist",
     )
     return any(n in t for n in needles)
+
+
+# ------------------ Smart FUTURES Cap (effective cap) ------------------
+# In-memory cache: last effective cap per user (resets on restart).
+_LAST_EFFECTIVE_FUT_CAP: dict[int, float] = {}
+_LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT: dict[int, float] = {}
+
+def _smartcap_env_float(name: str, default: float) -> float:
+    try:
+        v = (os.getenv(name) or "").strip()
+        return float(v) if v else float(default)
+    except Exception:
+        return float(default)
+
+def _smartcap_env_int(name: str, default: int) -> int:
+    try:
+        v = (os.getenv(name) or "").strip()
+        return int(v) if v else int(default)
+    except Exception:
+        return int(default)
+
+_SMARTCAP_STEP_USDT = max(1.0, _smartcap_env_float("EFF_CAP_STEP_USDT", 10.0))
+_SMARTCAP_COOLDOWN_SEC = max(60, _smartcap_env_int("EFF_CAP_NOTIFY_COOLDOWN_SEC", 1800))  # 30 min
+_SMARTCAP_DECREASE_MIN_USDT = max(0.0, _smartcap_env_float("EFF_CAP_DECREASE_MIN_USDT", 10.0))
+_SMARTCAP_BASE_PCT = min(0.95, max(0.1, _smartcap_env_float("EFF_CAP_BASE_PCT", 0.65)))  # base cap = balance * 0.65
+_SMARTCAP_HARD_MAX_PCT = min(0.98, max(0.3, _smartcap_env_float("EFF_CAP_HARD_MAX_PCT", 0.85)))  # never use >85% of balance
+
+def _smartcap_floor_step(x: float, step: float) -> float:
+    try:
+        x = float(x)
+        step = float(step)
+        if step <= 0:
+            return max(0.0, x)
+        return max(0.0, math.floor(x / step) * step)
+    except Exception:
+        return 0.0
+
+def _smartcap_multiplier(winrate: float | None) -> float:
+    try:
+        if winrate is None:
+            return 1.0
+        wr = float(winrate)
+    except Exception:
+        return 1.0
+    if wr < 40.0:
+        return 0.6
+    if wr < 50.0:
+        return 0.8
+    if wr < 60.0:
+        return 1.0
+    if wr < 70.0:
+        return 1.1
+    return 1.25
+
+def _calc_effective_futures_cap(*, balance_usdt: float, ui_cap_usdt: float, winrate: float | None) -> float:
+    """Compute effective futures cap (USDT margin limit) using balance + winrate.
+
+    - base = balance * _SMARTCAP_BASE_PCT
+    - multiply by winrate bucket
+    - rounded DOWN to _SMARTCAP_STEP_USDT
+    - capped by ui_cap (if >0)
+    - hard-capped by balance * _SMARTCAP_HARD_MAX_PCT (rounded down)
+    """
+    bal = max(0.0, float(balance_usdt or 0.0))
+    ui = max(0.0, float(ui_cap_usdt or 0.0))
+    base = bal * _SMARTCAP_BASE_PCT
+    eff = base * _smartcap_multiplier(winrate)
+    eff = _smartcap_floor_step(eff, _SMARTCAP_STEP_USDT)
+    hard = _smartcap_floor_step(bal * _SMARTCAP_HARD_MAX_PCT, _SMARTCAP_STEP_USDT)
+    if hard > 0:
+        eff = min(eff, hard)
+    if ui > 0:
+        eff = min(eff, ui)
+    return float(max(0.0, eff))
+
 
 
 async def _binance_signed_request(
@@ -1292,16 +1321,48 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     try:
         if exchange == "bybit":
             category = "spot" if mt == "spot" else "linear"
+            # Futures cap is user-defined (by margin). Spot cap is implicit (wallet balance).
             free = await _bybit_available_usdt(api_key, api_secret)
             if free < need_usdt:
                 return {"ok": False, "skipped": True, "api_error": None}
 
-            # Futures cap (margin limit) with extra safety: smart cap based on balance + winrate.
+            cap_decreased = False
+            prev_eff_val = None
+            winrate = None
+            eff_cap = float(fut_cap or 0.0)
+
             if mt == "futures":
-                eff_cap = await _smart_futures_cap(user_id=uid, balance_usdt=free, user_cap_usdt=fut_cap)
                 used = await db_store.get_autotrade_used_usdt(uid, "futures")
+
+                # Smart effective cap uses CURRENT available balance + winrate.
+                try:
+                    w = await db_store.get_autotrade_winrate(uid, market_type="futures", limit=20)
+                    if int(w.get("n") or 0) >= 5:
+                        winrate = float(w.get("winrate") or 0.0)
+                except Exception:
+                    winrate = None
+
+                eff_cap = _calc_effective_futures_cap(balance_usdt=float(free), ui_cap_usdt=float(fut_cap), winrate=winrate)
+
+                prev_eff = _LAST_EFFECTIVE_FUT_CAP.get(uid)
+                _LAST_EFFECTIVE_FUT_CAP[uid] = float(eff_cap)
+                if prev_eff is not None:
+                    prev_eff_val = float(prev_eff)
+                    if float(eff_cap) + 1e-9 < float(prev_eff):
+                        dec = float(prev_eff) - float(eff_cap)
+                        now_ts = time.time()
+                        last_ts = float(_LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT.get(uid) or 0.0)
+                        if dec >= _SMARTCAP_DECREASE_MIN_USDT and (now_ts - last_ts) >= _SMARTCAP_COOLDOWN_SEC:
+                            cap_decreased = True
+                            _LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT[uid] = now_ts
+
                 if eff_cap > 0 and used + need_usdt > eff_cap:
-                    return {"ok": False, "skipped": True, "api_error": None}
+                    return {
+                        "ok": False, "skipped": True, "api_error": None,
+                        "cap_ui": float(fut_cap), "cap_effective": float(eff_cap),
+                        "cap_decreased": cap_decreased, "cap_prev_effective": prev_eff_val,
+                        "winrate": (float(winrate) if winrate is not None else None),
+                    }
 
             direction_local = direction
             if mt == "spot":
@@ -1465,7 +1526,9 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 allocated_usdt=need_usdt,
                 api_order_ref=json.dumps(ref),
             )
-            return {"ok": True, "skipped": False, "api_error": None}
+            return {"ok": True, "skipped": False, "api_error": None,
+                    **({"cap_ui": float(fut_cap), "cap_effective": float(eff_cap), "cap_decreased": bool(cap_decreased), "cap_prev_effective": prev_eff_val, "winrate": (float(winrate) if winrate is not None else None)} if mt == "futures" else {})
+                    }
 
         
         # -------- OKX / MEXC / Gate.io (SPOT) --------
@@ -1655,14 +1718,12 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             return {"ok": True, "skipped": False, "api_error": None}
 
         # futures
-        avail = await _binance_futures_available_margin(api_key, api_secret)
-        if avail < need_usdt:
+        used = await db_store.get_autotrade_used_usdt(uid, "futures")
+        if fut_cap > 0 and used + need_usdt > fut_cap:
             return {"ok": False, "skipped": True, "api_error": None}
 
-        # Futures cap (margin limit) with extra safety: smart cap based on balance + winrate.
-        eff_cap = await _smart_futures_cap(user_id=uid, balance_usdt=avail, user_cap_usdt=fut_cap)
-        used = await db_store.get_autotrade_used_usdt(uid, "futures")
-        if eff_cap > 0 and used + need_usdt > eff_cap:
+        avail = await _binance_futures_available_margin(api_key, api_secret)
+        if avail < need_usdt:
             return {"ok": False, "skipped": True, "api_error": None}
 
         await _binance_futures_set_leverage(api_key=api_key, api_secret=api_secret, symbol=symbol, leverage=fut_lev)
