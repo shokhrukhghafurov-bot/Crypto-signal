@@ -1000,8 +1000,7 @@ def spot_priority_text(uid: int, pr: list[str], keys: list[dict] | None = None) 
     lines.append("• есть в подтверждении сигнала (confirmations)")
     lines.append("• подключена у вас (есть API ключи SPOT)")
     lines.append("• ключи активны (проверены)")
-    return "
-".join(lines)
+    return "\n".join(lines)
 
 def spot_priority_kb(uid: int, pr: list[str], keys: list[dict] | None = None) -> types.InlineKeyboardMarkup:
     """Keyboard for SPOT priority: per exchange shows (UP/DOWN) then (CONNECT/DISCONNECT)."""
@@ -1224,8 +1223,7 @@ def autotrade_main_text(uid: int, s: Dict[str, any]) -> str:
         pretty = {"binance":"Binance","bybit":"Bybit","okx":"OKX","mexc":"MEXC","gateio":"Gate.io"}
         spot_ex = " > ".join([pretty.get(ex, ex) for ex in connected])
     else:
-        spot_ex = str(s.get("spot_exchange") or "binance")
-.capitalize()
+        spot_ex = str(s.get("spot_exchange") or "binance").capitalize()
     fut_ex = str(s.get("futures_exchange") or "binance").capitalize()
     spot_amt = float(s.get("spot_amount_per_trade") or 0.0)
     fut_margin = float(s.get("futures_margin_per_trade") or 0.0)
