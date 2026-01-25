@@ -248,7 +248,8 @@
     "at_keys_gate_signature": "❌ Gate.io: wrong secret\n\nSignature mismatch.\n\nFix:\n• re-check the Secret Key\n• or create a new API key and re-add it",
     "at_keys_gate_ip": "⚠️ Gate.io: IP not allowed\n\nThis API key has an IP whitelist enabled, and the bot is using a different IP.\n\nFix:\n• add the bot server IP to the whitelist\n• or disable the whitelist for this key",
     "at_keys_gate_perm": "⚠️ Gate.io: missing trading permissions\n\nThe key works, but it doesn’t have Trade permission.\n\nFix:\n• enable Spot trading (and Futures if needed)\n• then try again",
-    "at_keys_gate_rate": "⏳ Gate.io: rate limit\n\nGate.io temporarily rate-limited requests.\n\nFix:\n• wait 1–2 minutes\n• try again"
+    "at_keys_gate_rate": "⏳ Gate.io: rate limit\n\nGate.io temporarily rate-limited requests.\n\nFix:\n• wait 1–2 minutes\n• try again",
+    "at_cap_decreased": "🧠 Effective Cap decreased (risk protection)\n\n📌 Cap (setting): {ui_cap} USDT\n⬇️ Was: {prev_cap} USDT\n✅ Now: {new_cap} USDT\n📊 Winrate(20): {winrate}%\n\nThe bot will open fewer trades to protect your balance."
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -499,6 +500,7 @@
     "at_keys_gate_signature": "❌ Gate.io: неверный Secret\n\nБиржа отклонила запрос — подпись не совпала.\n\nЧто сделать:\n• проверь Secret Key (без пробелов)\n• или создай новый API‑ключ и добавь заново",
     "at_keys_gate_ip": "⚠️ Gate.io: IP не разрешён\n\nУ ключа включён IP whitelist, а бот работает с другого IP.\n\nЧто сделать:\n• добавь IP сервера бота в whitelist\n• или отключи whitelist для этого ключа",
     "at_keys_gate_perm": "⚠️ Gate.io: нет прав на торговлю\n\nКлюч подключился, но у него нет разрешений на торговлю.\n\nЧто сделать:\n• включи права Spot trading (и Futures при необходимости)\n• затем проверь ещё раз",
-    "at_keys_gate_rate": "⏳ Gate.io: лимит запросов\n\nБиржа временно ограничила частоту запросов.\n\nЧто сделать:\n• подожди 1–2 минуты\n• попробуй снова"
+    "at_keys_gate_rate": "⏳ Gate.io: лимит запросов\n\nБиржа временно ограничила частоту запросов.\n\nЧто сделать:\n• подожди 1–2 минуты\n• попробуй снова",
+    "at_cap_decreased": "🧠 Effective Cap снижен (защита риска)\n\n📌 Cap (настройка): {ui_cap} USDT\n⬇️ Было: {prev_cap} USDT\n✅ Сейчас: {new_cap} USDT\n📊 Winrate(20): {winrate}%\n\nБот будет открывать меньше сделок, чтобы защитить депозит."
   }
 }
