@@ -3232,6 +3232,143 @@ async def _fetch_binance_price(symbol: str, *, futures: bool) -> float:
     except Exception:
         return 0.0
 
+
+def _okx_inst_spot(symbol: str) -> str:
+    s = (symbol or "").upper().strip()
+    if s.endswith("USDT"):
+        return f"{s[:-4]}-USDT"
+    return s
+
+
+def _okx_inst_futures(symbol: str) -> str:
+    # OKX USDT perpetual swap convention: BTC-USDT-SWAP
+    s = (symbol or "").upper().strip()
+    if s.endswith("USDT"):
+        return f"{s[:-4]}-USDT-SWAP"
+    return s
+
+
+def _gate_pair(symbol: str) -> str:
+    s = (symbol or "").upper().strip()
+    if s.endswith("USDT"):
+        return f"{s[:-4]}_USDT"
+    return s
+
+
+async def _fetch_bybit_price(symbol: str, *, market: str) -> float:
+    """Best-effort public last price from Bybit V5."""
+    symbol = str(symbol or "").upper().strip()
+    if not symbol:
+        return 0.0
+    category = "linear" if (market or "").upper().strip() == "FUTURES" else "spot"
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get("https://api.bybit.com/v5/market/tickers", params={"category": category, "symbol": symbol}) as r:
+                data = await r.json(content_type=None)
+        lst = (((data or {}).get("result") or {}).get("list") or [])
+        if lst and isinstance(lst, list):
+            return float((lst[0] or {}).get("lastPrice") or 0.0)
+    except Exception:
+        return 0.0
+    return 0.0
+
+
+async def _fetch_okx_price(symbol: str, *, market: str) -> float:
+    """Best-effort public last price from OKX."""
+    inst = _okx_inst_futures(symbol) if (market or "").upper().strip() == "FUTURES" else _okx_inst_spot(symbol)
+    if not inst:
+        return 0.0
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get("https://www.okx.com/api/v5/market/ticker", params={"instId": inst}) as r:
+                data = await r.json(content_type=None)
+        arr = (data or {}).get("data") or []
+        if arr and isinstance(arr, list):
+            return float((arr[0] or {}).get("last") or 0.0)
+    except Exception:
+        return 0.0
+    return 0.0
+
+
+async def _fetch_mexc_price(symbol: str) -> float:
+    """Best-effort public last price from MEXC (spot)."""
+    symbol = str(symbol or "").upper().strip()
+    if not symbol:
+        return 0.0
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get("https://api.mexc.com/api/v3/ticker/price", params={"symbol": symbol}) as r:
+                data = await r.json(content_type=None)
+        return float((data or {}).get("price") or 0.0)
+    except Exception:
+        return 0.0
+
+
+async def _fetch_gateio_price(symbol: str) -> float:
+    """Best-effort public last price from Gate.io (spot)."""
+    pair = _gate_pair(symbol)
+    if not pair:
+        return 0.0
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get("https://api.gateio.ws/api/v4/spot/tickers", params={"currency_pair": pair}) as r:
+                data = await r.json(content_type=None)
+        if isinstance(data, list) and data:
+            return float((data[0] or {}).get("last") or 0.0)
+    except Exception:
+        return 0.0
+    return 0.0
+
+
+async def _fetch_signal_price(symbol: str, *, market: str) -> float:
+    """Fetch a public last price with fallbacks across exchanges.
+
+    Why: if Binance is down / symbol missing, outcome tracking would stall.
+
+    Order can be controlled via env:
+      - SIG_PRICE_ORDER_SPOT (default: binance,bybit,okx,mexc,gateio)
+      - SIG_PRICE_ORDER_FUTURES (default: binance,bybit,okx)
+    """
+    m = (market or "").upper().strip()
+    if m == "FUTURES":
+        order = (os.getenv("SIG_PRICE_ORDER_FUTURES", "binance,bybit,okx") or "").strip()
+        exs = [x.strip().lower() for x in order.split(",") if x.strip()]
+        for ex in exs:
+            if ex == "binance":
+                px = await _fetch_binance_price(symbol, futures=True)
+            elif ex == "bybit":
+                px = await _fetch_bybit_price(symbol, market="FUTURES")
+            elif ex == "okx":
+                px = await _fetch_okx_price(symbol, market="FUTURES")
+            else:
+                px = 0.0
+            if px > 0:
+                return float(px)
+        return 0.0
+
+    order = (os.getenv("SIG_PRICE_ORDER_SPOT", "binance,bybit,okx,mexc,gateio") or "").strip()
+    exs = [x.strip().lower() for x in order.split(",") if x.strip()]
+    for ex in exs:
+        if ex == "binance":
+            px = await _fetch_binance_price(symbol, futures=False)
+        elif ex == "bybit":
+            px = await _fetch_bybit_price(symbol, market="SPOT")
+        elif ex == "okx":
+            px = await _fetch_okx_price(symbol, market="SPOT")
+        elif ex == "mexc":
+            px = await _fetch_mexc_price(symbol)
+        elif ex == "gateio":
+            px = await _fetch_gateio_price(symbol)
+        else:
+            px = 0.0
+        if px > 0:
+            return float(px)
+    return 0.0
+
 def _hit_tp(side: str, price: float, lvl: float) -> bool:
     return price >= lvl if side == "LONG" else price <= lvl
 
