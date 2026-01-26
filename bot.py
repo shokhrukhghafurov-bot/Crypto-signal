@@ -89,6 +89,313 @@ async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
             await set_user_blocked(chat_id, blocked=True)
         raise
 
+async def safe_edit_text(chat_id: int, message_id: int, text: str, *, ctx: str = "", **kwargs):
+    text = _sanitize_template_text(chat_id, text, ctx=ctx)
+    return await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, **kwargs)
+
+
+# -----------------------------------------------
+
+
+def _must_env(name: str) -> str:
+    v = os.getenv(name, "").strip()
+    if not v:
+        raise RuntimeError(f"{name} is missing. Put it into Railway Variables or .env.")
+    return v
+
+BOT_TOKEN = _must_env("BOT_TOKEN")
+
+ADMIN_IDS: List[int] = []
+_raw_admins = os.getenv("ADMIN_IDS", "").strip()
+if _raw_admins:
+    for part in _raw_admins.split(","):
+        part = part.strip()
+        if part:
+            ADMIN_IDS.append(int(part))
+
+def _is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+# Timezone
+# NOTE: "MSK" is a common shorthand, but it's not a valid IANA tz database key.
+# Use "Europe/Moscow" (MSK / UTC+3) instead.
+# Default to Moscow time for the bot (can be overridden via TZ_NAME env).
+_tz_raw = (os.getenv("TZ_NAME", "Europe/Moscow") or "").strip()
+
+_TZ_ALIASES = {
+    "MSK": "Europe/Moscow",
+    "MOSCOW": "Europe/Moscow",
+    "RUSSIA/MOSCOW": "Europe/Moscow",
+    "EUROPE/MOSCOW": "Europe/Moscow",
+    "UTC+3": "Europe/Moscow",
+    "GMT+3": "Europe/Moscow",
+}
+
+TZ_NAME = _TZ_ALIASES.get(_tz_raw.upper(), _tz_raw) or "Europe/Moscow"
+try:
+    TZ = ZoneInfo(TZ_NAME)
+except (ZoneInfoNotFoundError, FileNotFoundError):
+    # If tzdata isn't installed or the key is invalid, fall back safely.
+    # Prefer Moscow for your bot (as requested), otherwise UTC.
+    try:
+        TZ_NAME = "Europe/Moscow"
+        TZ = ZoneInfo(TZ_NAME)
+    except Exception:
+        TZ_NAME = "UTC"
+        TZ = ZoneInfo("UTC")
+
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+backend = Backend()
+
+# Keep last broadcast signals for 'Spot live' / 'Futures live' buttons
+LAST_SIGNAL_BY_MARKET = {"SPOT": None, "FUTURES": None}
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+pool: asyncpg.Pool | None = None
+
+LANG_FILE = Path("langs.json")
+LANG: Dict[int, str] = {}  # user_id -> "ru" | "en"
+
+def load_langs() -> None:
+    global LANG
+    if LANG_FILE.exists():
+        try:
+            data = json.loads(LANG_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                LANG = {int(k): str(v) for k, v in data.items()}
+        except Exception:
+            LANG = {}
+
+def save_langs() -> None:
+    try:
+        LANG_FILE.write_text(json.dumps({str(k): v for k, v in LANG.items()}, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
+
+def get_lang(uid: int) -> str:
+    v = (LANG.get(uid) or "").lower().strip()
+    return "en" if v == "en" else "ru"
+
+def set_lang(uid: int, lang: str) -> None:
+    LANG[uid] = "en" if (lang or "").lower().startswith("en") else "ru"
+    save_langs()
+
+
+I18N_FILE = Path(__file__).with_name("i18n.json")
+
+def load_i18n() -> dict:
+    # Load i18n from external file (preferred). Fall back to embedded defaults if needed.
+    try:
+        if I18N_FILE.exists():
+            data = json.loads(I18N_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "en" in data:
+                return data
+    except Exception:
+        pass
+    return {"ru": {}, "en": {}}
+
+I18N = load_i18n()
+
+# Support username (without @) is configurable via env
+SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', 'cryptoarb_web_bot_admin').lstrip('@')
+
+
+
+def tr(uid: int, key: str, **kwargs) -> str:
+    """Translate key for user's language.
+
+    Strict mode:
+      - if STRICT_I18N=1 (default), missing keys raise KeyError to force adding them to i18n.json.
+      - if STRICT_I18N=0, missing keys fall back to EN, then to the key itself (legacy behavior).
+    """
+    lang = get_lang(uid)
+    strict = os.getenv("STRICT_I18N", "1").lower() not in ("0", "false", "no", "off")
+    # prefer requested lang, then EN
+    if lang in I18N and key in I18N.get(lang, {}):
+        tmpl = I18N[lang][key]
+    elif "en" in I18N and key in I18N.get("en", {}):
+        tmpl = I18N["en"][key]
+    else:
+        if strict:
+            raise KeyError(f"i18n key not found: {key!r} (lang={lang!r}). Add it to {I18N_FILE.name}.")
+        tmpl = key
+
+    # Allow using {support} placeholder in i18n texts, configured via SUPPORT_USERNAME env
+    if isinstance(tmpl, str) and "{support}" in tmpl:
+        tmpl = tmpl.replace("{support}", SUPPORT_USERNAME)
+    if kwargs and isinstance(tmpl, str):
+        try:
+            tmpl = tmpl.format(**kwargs)
+        except Exception:
+            pass
+    return tmpl
+
+
+def trf_old(uid: int, key: str, **kwargs) -> str:
+    """Translate + safe-format (missing placeholders stay visible)."""
+    tmpl = tr(uid, key)
+    if not kwargs:
+        return tmpl
+    try:
+        return str(tmpl).format_map(_SafeDict(**kwargs))
+    except Exception as e:
+        # In strict mode, formatting errors must be visible immediately.
+        strict = os.getenv("STRICT_I18N", "1").lower() not in ("0", "false", "no", "off")
+        if strict:
+            raise
+        logger.exception("i18n format error: key=%s kwargs=%s", key, kwargs)
+        return str(tmpl)
+
+
+def audit_i18n_keys(strict: bool | None = None) -> None:
+    """Static audit: ensure every tr()/trf() key referenced in bot.py exists in i18n.json."""
+    if strict is None:
+        strict = os.getenv("STRICT_I18N", "1").lower() not in ("0", "false", "no", "off")
+
+    try:
+        src = Path(__file__).read_text(encoding="utf-8")
+    except Exception:
+        logger.exception("i18n audit: failed to read source")
+        return
+
+    keys = set(re.findall(r'\btrf?\(\s*[^,]+,\s*["\']([^"\']+)["\']\s*\)', src))
+    missing = []
+    for k in sorted(keys):
+        for lang in ("ru", "en"):
+            if k not in I18N.get(lang, {}):
+                missing.append((lang, k))
+
+    if missing:
+        # Log a compact report
+        lines = ["i18n audit: missing keys:"]
+        for lang, k in missing[:200]:
+            lines.append(f"- {lang}: {k}")
+        if len(missing) > 200:
+            lines.append(f"... and {len(missing)-200} more")
+        msg = "\n".join(lines)
+        if strict:
+            raise RuntimeError(msg)
+        logger.error(msg)
+
+
+
+class _SafeDict(dict):
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+def trf(uid: int, key: str, **kwargs) -> str:
+    # Inject support placeholder for templates using @{support}
+    kwargs.setdefault('support', SUPPORT_USERNAME)
+    tmpl = tr(uid, key)
+    try:
+        return str(tmpl).format_map(_SafeDict(**kwargs))
+    except Exception:
+        return str(tmpl)
+
+def tr_action(uid: int, v: str) -> str:
+    vv = (v or "").upper().strip()
+    if vv == "ALLOW":
+        return tr(uid, "action_allow")
+    if vv in {"PAUSE", "PAUSED", "STOP", "BLOCK"}:
+        return tr(uid, "action_pause")
+    return v
+
+def tr_market(uid: int, market: str) -> str:
+    return tr(uid, "lbl_spot") if (market or "").upper().strip() == "SPOT" else tr(uid, "lbl_futures")
+
+SIGNALS: Dict[int, Signal] = {}
+ORIGINAL_SIGNAL_TEXT: Dict[tuple[int,int], str] = {}  # (uid, signal_id) -> text
+
+# Anti-duplicate protection for broadcasted signals.
+# Some scanners can emit the same signal multiple times (sometimes with different IDs).
+_SENT_SIG_CACHE: Dict[str, float] = {}  # signature -> last_sent_ts
+_SENT_SIG_TTL_SEC = int(os.getenv("SENT_SIG_TTL_SEC", "600"))  # default 10 minutes
+
+# ---------------- bot statistics ----------------
+# NOTE: Statistics are stored ONLY in Postgres (signal_sent_events + signal_tracks).
+# No local JSON files are used.
+
+
+# (removed legacy weekly report based on local json stats)
+
+
+# Status auto-refresh (per user)
+STATUS_TASKS: Dict[int, asyncio.Task] = {}
+
+CURRENT_VIEW: dict[int, str] = {}
+
+def _nav_enter(user_id: int, view: str) -> None:
+    prev = CURRENT_VIEW.get(user_id)
+    if view != "back":
+        if prev and prev != view:
+            PREV_VIEW[user_id] = prev
+        CURRENT_VIEW[user_id] = view
+
+def _nav_back(user_id: int, default: str = "status") -> str:
+    return PREV_VIEW.get(user_id) or default
+
+PREV_VIEW: dict[int, str] = {}
+
+
+async def safe_edit_markup(chat_id: int, message_id: int, reply_markup, *, ctx: str = ""):
+    """Edit message reply_markup only (e.g., remove inline keyboard)."""
+    try:
+        return await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+    except Exception:
+        return None
+
+async def _send_long(chat_id: int, text: str, reply_markup=None) -> None:
+    # Telegram message limit ~4096 chars. Send in chunks if needed.
+    max_len = 3800
+    if len(text) <= max_len:
+        await safe_send(chat_id, text, reply_markup=reply_markup)
+        return
+    parts = []
+    cur = ""
+    for line in text.splitlines(True):
+        if len(cur) + len(line) > max_len and cur:
+            parts.append(cur)
+            cur = ""
+        cur += line
+    if cur:
+        parts.append(cur)
+
+
+
+async def safe_edit_old(message: types.Message | None, txt: str, kb: types.InlineKeyboardMarkup) -> None:
+    """Edit message text if possible; otherwise send a new message."""
+    try:
+        if message:
+            await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                text=txt,
+                reply_markup=kb,
+            )
+            return
+    except Exception:
+        # message may be too old/not modified/etc. Fall back to send.
+        pass
+
+    try:
+        if message:
+            await safe_send(message.chat.id, txt, reply_markup=kb)
+    except Exception:
+        pass
+
+
+async def _render_in_place(call: types.CallbackQuery, txt: str, kb: types.InlineKeyboardMarkup) -> types.Message:
+    """Prefer editing the message that contains the pressed button."""
+    try:
+        if call.message:
+            await bot.edit_message_text(chat_id=call.from_user.id, message_id=call.message.message_id, text=txt, reply_markup=kb)
+            return call.message
+    except Exception:
+        pass
+    return await safe_send(call.from_user.id, txt, reply_markup=kb)
+
+
 async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKeyboardMarkup | None = None) -> None:
     """Safely update an existing bot message.
 
