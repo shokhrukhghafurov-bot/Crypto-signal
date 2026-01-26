@@ -61,9 +61,8 @@ async def ensure_schema() -> None:
     Uses IDENTITY (auto increment) columns.
     """
     pool = get_pool()
+    await ensure_users_table()
     async with pool.acquire() as conn:
-        # ensure_users_table called separately to avoid nested acquire
-
 
         # Persistent sequence for bot callback signal_id (survives restarts)
         await conn.execute("""
