@@ -6,6 +6,7 @@ import os
 import logging
 import re
 import math
+import aiohttp
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
 from dataclasses import replace
@@ -3287,7 +3288,7 @@ async def signal_outcome_loop() -> None:
                     if sid <= 0 or entry <= 0 or not symbol:
                         continue
 
-                    px = await _fetch_binance_price(symbol, futures=(market == "FUTURES"))
+                    px = await _fetch_signal_price(symbol, market=market)
                     if px <= 0:
                         continue
 
@@ -3328,7 +3329,7 @@ async def signal_outcome_loop() -> None:
                         if not _be_is_armed_sig(side, px, eff_tp1, eff_tp2):
                             # Not armed yet: don't allow BE close; reset pending BE timer if any.
                             if t.get('be_crossed_at'):
-                                await db_store.set_signal_be_crossed_at(signal_id=sid, crossed_at=None)
+                                await db_store.clear_signal_be_crossed(signal_id=sid)
                             continue
 
                         # Strict BE confirmation
@@ -3338,11 +3339,11 @@ async def signal_outcome_loop() -> None:
                         crossed_at = t.get("be_crossed_at")
                         crossed_at_dt = _parse_iso_dt(crossed_at) if isinstance(crossed_at, str) else crossed_at
                         if crossed and crossed_at_dt is None:
-                            await db_store.set_signal_be_crossed_at(signal_id=sid, crossed_at=now)
+                            await db_store.mark_signal_be_crossed(signal_id=sid)
                             continue
                         if not crossed and crossed_at_dt is not None:
                             # reset if price went back (anti-wick)
-                            await db_store.set_signal_be_crossed_at(signal_id=sid, crossed_at=None)
+                            await db_store.clear_signal_be_crossed(signal_id=sid)
                             continue
                         if crossed and crossed_at_dt is not None and _BE_CONFIRM_SEC > 0:
                             if (now - crossed_at_dt).total_seconds() >= _BE_CONFIRM_SEC:
