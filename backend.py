@@ -2431,8 +2431,116 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             return False
                         return (px <= be_price) if direction == "LONG" else (px >= be_price)
 
-                    # --- SL before TP1 ---
-                    if (not tp1_hit) and _hit_sl():
+                    # --- SMART virtual manager (no immediate SL/TP; momentum-aware TP; delayed BE; reversal exit) ---
+                    now_ts = time.time()
+
+                    # Tunables (env)
+                    ARM_SL_AFTER_PCT = float(os.getenv("SMART_ARM_SL_AFTER_PCT", "0.25") or 0.25)          # arm normal SL after +0.25% move in favor
+                    HARD_SL_PCT      = float(os.getenv("SMART_HARD_SL_PCT", "3.00") or 3.00)              # emergency stop while SL is not armed
+                    TP1_PARTIAL_PCT  = float(os.getenv("SMART_TP1_PARTIAL_PCT", "0.50") or 0.50)          # partial close size at TP1 if momentum is weak
+                    STRONG_MOM_PCT   = float(os.getenv("SMART_STRONG_MOMENTUM_PCT", "0.25") or 0.25)      # if momentum >= this, skip TP1 and aim TP2
+                    MOM_WINDOW_SEC   = float(os.getenv("SMART_MOMENTUM_WINDOW_SEC", "30") or 30)          # compare to price N seconds ago
+                    BE_DELAY_SEC     = float(os.getenv("SMART_BE_DELAY_SEC", "20") or 20)                 # delay before arming BE after partial TP1
+                    PEAK_MIN_GAIN_PCT= float(os.getenv("SMART_PEAK_MIN_GAIN_PCT", "0.40") or 0.40)         # require at least +0.4% from entry to activate reversal exit
+                    REV_EXIT_PCT     = float(os.getenv("SMART_REVERSAL_EXIT_PCT", "0.35") or 0.35)         # close if retrace from peak is >= 0.35%
+
+                    # Persistent state in ref
+                    state = str(ref.get("sm_state") or "INIT").upper()
+                    armed_sl = bool(ref.get("armed_sl"))
+                    tp1_seen = bool(ref.get("tp1_seen"))
+                    tp1_partial = bool(ref.get("tp1_partial"))
+                    tp1_ts = float(ref.get("tp1_ts") or 0.0)
+                    be_pending = bool(ref.get("be_pending"))
+                    last_px = float(ref.get("last_px") or px)
+                    last_px_ts = float(ref.get("last_px_ts") or now_ts)
+                    best_px = float(ref.get("best_px") or px)
+                    hard_sl = float(ref.get("hard_sl") or 0.0)
+
+                    dirty = False
+
+                    # Initialize hard emergency SL once (while SL is not armed).
+                    if hard_sl <= 0 and entry_p > 0:
+                        if direction == "LONG":
+                            hard_sl = entry_p * (1.0 - (max(0.2, HARD_SL_PCT) / 100.0))
+                        else:
+                            hard_sl = entry_p * (1.0 + (max(0.2, HARD_SL_PCT) / 100.0))
+                        ref["hard_sl"] = float(hard_sl)
+                        dirty = True
+
+                    # Update best price (peak) in favorable direction
+                    if direction == "LONG":
+                        if px > best_px:
+                            best_px = px
+                            ref["best_px"] = float(best_px)
+                            dirty = True
+                    else:
+                        if px < best_px:
+                            best_px = px
+                            ref["best_px"] = float(best_px)
+                            dirty = True
+
+                    # Update momentum anchor price every MOM_WINDOW_SEC
+                    if (now_ts - last_px_ts) >= max(5.0, MOM_WINDOW_SEC):
+                        ref["last_px"] = float(px)
+                        ref["last_px_ts"] = float(now_ts)
+                        last_px = float(px)
+                        last_px_ts = float(now_ts)
+                        dirty = True
+
+                    # Arm normal SL only after a small move in favor (so we don't "arm into a dump")
+                    if (not armed_sl) and entry_p > 0:
+                        if direction == "LONG":
+                            if px >= entry_p * (1.0 + ARM_SL_AFTER_PCT / 100.0):
+                                armed_sl = True
+                        else:
+                            if px <= entry_p * (1.0 - ARM_SL_AFTER_PCT / 100.0):
+                                armed_sl = True
+                        if armed_sl:
+                            ref["armed_sl"] = True
+                            ref["sm_state"] = "PROTECT"
+                            dirty = True
+
+                    # Reversal exit (close near the top/bottom when retrace starts)
+                    if entry_p > 0 and best_px > 0:
+                        if direction == "LONG":
+                            gain_pct = (best_px / entry_p - 1.0) * 100.0
+                            retr_pct = (1.0 - (px / best_px)) * 100.0 if best_px > 0 else 0.0
+                            if gain_pct >= PEAK_MIN_GAIN_PCT and retr_pct >= REV_EXIT_PCT:
+                                try:
+                                    await _close_market(qty)
+                                except Exception:
+                                    pass
+                                await db_store.close_autotrade_position(
+                                    user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                                )
+                                continue
+                        else:
+                            gain_pct = (1.0 - (best_px / entry_p)) * 100.0
+                            retr_pct = ((px / best_px) - 1.0) * 100.0 if best_px > 0 else 0.0
+                            if gain_pct >= PEAK_MIN_GAIN_PCT and retr_pct >= REV_EXIT_PCT:
+                                try:
+                                    await _close_market(qty)
+                                except Exception:
+                                    pass
+                                await db_store.close_autotrade_position(
+                                    user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                                )
+                                continue
+
+                    # Effective SL: before arming -> HARD SL only; after arming -> original SL (fallback to HARD if missing)
+                    sl_eff = 0.0
+                    if armed_sl:
+                        sl_eff = float(sl or 0.0) if float(sl or 0.0) > 0 else float(hard_sl or 0.0)
+                    else:
+                        sl_eff = float(hard_sl or 0.0)
+
+                    def _hit_sl_eff() -> bool:
+                        if sl_eff <= 0:
+                            return False
+                        return (px <= sl_eff) if direction == "LONG" else (px >= sl_eff)
+
+                    # --- SL (emergency or armed) ---
+                    if _hit_sl_eff():
                         try:
                             await _close_market(qty)
                         except Exception:
@@ -2442,23 +2550,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         )
                         continue
 
-                    # --- TP1: close 50% and move to BE immediately (entry + fee buffer) ---
-                    if (not tp1_hit) and _hit_tp(tp1):
-                        q_close = qty * 0.5
-                        try:
-                            await _close_market(q_close)
-                        except Exception:
-                            continue
-                        qty = max(0.0, qty - q_close)
-                        ref["qty"] = qty
-                        ref["tp1_hit"] = True
-                        ref["be_moved"] = True
-                        ref["be_price"] = float(_be_with_fee_buffer(entry_p, direction=direction))
-                        await db_store.update_autotrade_order_ref(row_id=int(r.get("id")), api_order_ref=json.dumps(ref))
-                        continue
-
-                    # --- After TP1: BE close if retrace to BE price ---
-                    if tp1_hit and be_moved and _hit_be():
+                    # --- TP2: if reached, close 100% ---
+                    if tp2 > 0 and _hit_tp(tp2):
                         try:
                             await _close_market(qty)
                         except Exception:
@@ -2468,8 +2561,59 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         )
                         continue
 
-                    # --- TP2: close remaining ---
-                    if tp1_hit and _hit_tp(tp2):
+                    # --- TP1: don't close immediately; check momentum. If weak -> partial close; if strong -> wait TP2.
+                    if (tp1 > 0) and (not tp1_seen) and _hit_tp(tp1):
+                        # Favorable momentum in % over anchor
+                        mom_pct = 0.0
+                        if last_px > 0:
+                            if direction == "LONG":
+                                mom_pct = (px / last_px - 1.0) * 100.0
+                            else:
+                                mom_pct = (1.0 - (px / last_px)) * 100.0
+
+                        strong = (mom_pct >= STRONG_MOM_PCT)
+
+                        ref["tp1_seen"] = True
+                        tp1_seen = True
+                        dirty = True
+
+                        if (not strong) or (tp2 <= 0):
+                            # Weak impulse: partial close now
+                            q_close = max(0.0, qty * max(0.05, min(0.95, TP1_PARTIAL_PCT)))
+                            q_rem = max(0.0, qty - q_close)
+                            if q_close > 0:
+                                try:
+                                    await _close_market(q_close)
+                                except Exception:
+                                    pass
+                            # Store remaining qty for future management
+                            ref["qty"] = float(q_rem)
+                            qty = float(q_rem)
+                            ref["tp1_hit"] = True
+                            ref["tp1_partial"] = True
+                            ref["tp1_ts"] = float(now_ts)
+                            ref["be_pending"] = True
+                            dirty = True
+                        else:
+                            # Strong impulse: skip TP1 close, aim for TP2 (close 100%)
+                            ref["tp1_mode"] = "FULL_TO_TP2"
+                            dirty = True
+
+                    # --- Arm BE only AFTER partial TP1 and after a short delay + confirmation
+                    if bool(ref.get("tp1_partial")) and bool(ref.get("be_pending")) and (not be_moved) and entry_p > 0:
+                        if (now_ts - float(ref.get("tp1_ts") or 0.0)) >= max(0.0, BE_DELAY_SEC):
+                            # Confirm: still not below entry (for long) / not above entry (for short)
+                            ok_confirm = (px >= entry_p) if direction == "LONG" else (px <= entry_p)
+                            if ok_confirm:
+                                be_price = float(_be_with_fee_buffer(entry_p, direction=direction) or 0.0)
+                                ref["be_price"] = float(be_price)
+                                ref["be_moved"] = True
+                                ref["be_pending"] = False
+                                be_moved = True
+                                dirty = True
+
+                    # --- BE hit: close remaining ---
+                    if bool(ref.get("be_moved")) and _hit_be():
                         try:
                             await _close_market(qty)
                         except Exception:
@@ -2479,19 +2623,14 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         )
                         continue
 
-                    # --- Protective SL after TP1 (optional) ---
-                    if tp1_hit and _hit_sl():
+                    # Persist updated ref if changed
+                    if dirty:
                         try:
-                            await _close_market(qty)
+                            await db_store.update_autotrade_order_ref(row_id=int(r.get("id") or 0), api_order_ref=json.dumps(ref))
                         except Exception:
                             pass
-                        await db_store.close_autotrade_position(
-                            user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
-                        )
-                        continue
 
                     continue
-
 # If TP1 filled and BE not moved: cancel SL and place new SL at entry (BE)
                 if tp1_id and (not be_moved) and be_price > 0:
                     if ex == "binance":
@@ -5505,23 +5644,9 @@ class Backend:
                             )
 
 # List exchanges where the symbol exists (public price available).
-
                         async def _pair_exists(ex: str) -> bool:
                             try:
                                 exu = (ex or "").upper().strip()
-                                # FUTURES: confirm only real futures markets (Variant A)
-                                if market == "FUTURES":
-                                    if exu == "BINANCE":
-                                        p = await self._fetch_rest_price("FUTURES", sym)
-                                    elif exu == "BYBIT":
-                                        p = await self._fetch_bybit_price("FUTURES", sym)
-                                    elif exu == "OKX":
-                                        p = await self._fetch_okx_price("FUTURES", sym)
-                                    else:
-                                        return False
-                                    return bool(p and float(p) > 0)
-                        
-                                # SPOT: check price availability across spot sources
                                 if exu == "BINANCE":
                                     p = await self._fetch_rest_price("SPOT", sym)
                                 elif exu == "BYBIT":
@@ -5535,14 +5660,13 @@ class Backend:
                                 return bool(p and float(p) > 0)
                             except Exception:
                                 return False
-                        
-                        _ex_order = ["BINANCE", "OKX", "BYBIT"] if market == "FUTURES" else ["GATEIO", "BINANCE", "OKX", "BYBIT", "MEXC"]
+
+                        _ex_order = ["GATEIO", "BINANCE", "OKX", "BYBIT", "MEXC"]
                         _oks = await asyncio.gather(*[_pair_exists(x) for x in _ex_order])
                         _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
                         if not _pair_exchanges:
                             _pair_exchanges = [best_name]
                         conf_names = "+".join(_pair_exchanges)
-
 
 
                         sid = self.next_signal_id()
