@@ -4943,8 +4943,8 @@ class Backend:
         Sources:
           - BINANCE_WS / BINANCE_REST
           - BYBIT_REST
-          - MEDIAN(BINANCE+BYBIT) / BINANCE_ONLY / BYBIT_ONLY
-          - OKX_REST
+          - MEDIAN(...) / <EXCHANGE>_ONLY
+          - OKX_REST / MEXC_REST / GATEIO_REST (SPOT)
 
         Note: if all sources fail, raises PriceUnavailableError.
 
@@ -5025,6 +5025,24 @@ class Backend:
                 return float(p), "OKX_REST"
             return None, "OKX"
 
+        async def get_mexc() -> tuple[float | None, str]:
+            # SPOT public ticker (REST). FUTURES is not used here.
+            if market != "SPOT":
+                return None, "MEXC"
+            p = await _mexc_public_price(signal.symbol)
+            if _is_reasonable(p):
+                return float(p), "MEXC_REST"
+            return None, "MEXC"
+
+        async def get_gateio() -> tuple[float | None, str]:
+            # SPOT public ticker (REST). FUTURES is not used here.
+            if market != "SPOT":
+                return None, "GATEIO"
+            p = await _gateio_public_price(signal.symbol)
+            if _is_reasonable(p):
+                return float(p), "GATEIO_REST"
+            return None, "GATEIO"
+
         if mode == "BINANCE":
             b, bsrc = await get_binance()
             if b is not None:
@@ -5046,20 +5064,37 @@ class Backend:
             if b is not None:
                 return float(b), bsrc
         else:  # MEDIAN
-            b, bsrc = await get_binance()
-            y, ysrc = await get_bybit()
+            # For SPOT we aggregate Binance + Bybit + OKX + MEXC + Gate.io.
+            # For FUTURES we aggregate Binance + Bybit + OKX (as requested).
+            prices: list[tuple[str, float]] = []
 
-            b_ok = _is_reasonable(b)
-            y_ok = _is_reasonable(y)
+            b, _ = await get_binance()
+            if _is_reasonable(b):
+                prices.append(("BINANCE", float(b)))
 
-            if b_ok and y_ok:
-                fb = float(b)
-                fy = float(y)
-                # If one exchange suddenly returns a very different price
-                # (or we somehow got a stale tick), don't average it —
-                # it can create a fake mid-price and trigger TP/SL.
+            y, _ = await get_bybit()
+            if _is_reasonable(y):
+                prices.append(("BYBIT", float(y)))
+
+            o, _ = await get_okx()
+            if _is_reasonable(o):
+                prices.append(("OKX", float(o)))
+
+            if market == "SPOT":
+                m1, _ = await get_mexc()
+                if _is_reasonable(m1):
+                    prices.append(("MEXC", float(m1)))
+
+                g1, _ = await get_gateio()
+                if _is_reasonable(g1):
+                    prices.append(("GATEIO", float(g1)))
+
+            if len(prices) >= 2:
+                vals = [p for _, p in prices]
+                mn = min(vals)
+                mx = max(vals)
                 try:
-                    div = abs(fb - fy) / max(1e-12, min(fb, fy))
+                    div = abs(mx - mn) / max(1e-12, mn)
                 except Exception:
                     div = 0.0
 
@@ -5067,29 +5102,22 @@ class Backend:
                 if max_div < 0:
                     max_div = 0.0
 
-                if div > max_div:
-                    if base is not None and base > 0:
-                        # choose the one closer to entry
-                        if abs(fb - base) <= abs(fy - base):
-                            return fb, "BINANCE_ONLY(DIVERGE)"
-                        return fy, "BYBIT_ONLY(DIVERGE)"
-                    # default preference: Binance
-                    return fb, "BINANCE_ONLY(DIVERGE)"
+                # If the spread between sources is abnormally high,
+                # choose the price closest to entry (if known) to avoid false TP/SL.
+                if div > max_div and base is not None and base > 0:
+                    best_name, best_val = min(prices, key=lambda kv: abs(kv[1] - base))
+                    return float(best_val), f"{best_name}_ONLY(DIVERGE)"
 
-                price = float(np.median([fb, fy]))
-                return price, "MEDIAN(BINANCE+BYBIT)"
-            if b_ok:
-                return float(b), "BINANCE_ONLY"
-            if y_ok:
-                return float(y), "BYBIT_ONLY"
+                price = float(np.median(vals))
+                srcs = "+".join([name for name, _ in prices])
+                return price, f"MEDIAN({srcs})"
 
-
-            o, osrc = await get_okx()
-            if _is_reasonable(o):
-                return float(o), "OKX_ONLY"
+            if len(prices) == 1:
+                name, val = prices[0]
+                return float(val), f"{name}_ONLY"
 
         # All sources failed -> let caller decide (skip tick / forced CLOSE)
-        raise PriceUnavailableError(f"price unavailable market={market} symbol={signal.symbol} mode={mode}")
+        raise PriceUnavailableError(f"price unavailable market={market} symbol={signal.symbol} mode={mode}")(f"price unavailable market={market} symbol={signal.symbol} mode={mode}")
 
     async def _get_price(self, signal: Signal) -> float:
         price, _src = await self._get_price_with_source(signal)
