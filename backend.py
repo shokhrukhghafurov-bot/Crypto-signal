@@ -1629,6 +1629,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
             # Store a virtual manager ref (virtual SL/TP + BE after TP1)
             ref = {
+                "virtual": True,
                 "exchange": exchange,
                 "market_type": "spot",
                 "symbol": symbol,
