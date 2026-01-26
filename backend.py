@@ -1629,7 +1629,6 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
             # Store a virtual manager ref (virtual SL/TP + BE after TP1)
             ref = {
-                "virtual": True,
                 "exchange": exchange,
                 "market_type": "spot",
                 "symbol": symbol,
@@ -1990,6 +1989,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 # and the DB row in autotrade_positions can stay OPEN forever. We periodically reconcile
 # OPEN rows against real balances/positions and close them best-effort.
 _LAST_RECONCILE_TS: dict[int, float] = {}
+_SMART_TICK_TS: dict[int, float] = {}  # pos_id -> last log ts
 _RECONCILE_COOLDOWN_SEC = max(10, int(os.getenv("AUTOTRADE_RECONCILE_SEC", "60") or "60"))
 _DUST_PCT = float(os.getenv("AUTOTRADE_DUST_PCT", "0.01") or "0.01")   # 1% of original qty
 _DUST_MIN = float(os.getenv("AUTOTRADE_DUST_MIN", "1e-8") or "1e-8")
@@ -2209,6 +2209,23 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 uid = int(r.get("user_id"))
                 mt = str(ref.get("market_type") or r.get("market_type") or "").lower()
                 futures = (mt == "futures")
+
+                # --- SMART_TICK (Railway visibility): proves manager loop is running ---
+                try:
+                    pos_id_tick = int(r.get("id") or 0)
+                except Exception:
+                    pos_id_tick = 0
+                now_tick = time.time()
+                last_tick = _SMART_TICK_TS.get(pos_id_tick, 0.0) if pos_id_tick else 0.0
+                if (not pos_id_tick) or (now_tick - last_tick >= 60.0):
+                    if pos_id_tick:
+                        _SMART_TICK_TS[pos_id_tick] = now_tick
+                    sym_tick = str(ref.get("symbol") or r.get("symbol") or "")
+                    side_tick = str(ref.get("side") or r.get("side") or "")
+                    logger.info(
+                        "SMART_TICK uid=%s market=%s ex=%s sym=%s side=%s virtual=%s",
+                        uid, mt, ex, sym_tick, side_tick, bool(ref.get("virtual"))
+                    )
                 symbol = str(ref.get("symbol") or r.get("symbol") or "").upper()
 
                 # Load keys
