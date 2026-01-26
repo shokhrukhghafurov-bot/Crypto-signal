@@ -1634,6 +1634,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 "symbol": symbol,
                 "side": "BUY",
                 "close_side": "SELL",
+                "virtual": True,
                 "entry_price": float(px),
                 "be_price": float(px),
                 "be_moved": False,
@@ -2203,7 +2204,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 except Exception:
                     continue
                 ex = str(ref.get("exchange") or r.get("exchange") or "").lower()
-                if ex not in ("binance", "bybit"):
+                if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
                     continue
 
                 uid = int(r.get("user_id"))
@@ -5665,12 +5666,26 @@ class Backend:
                         async def _pair_exists(ex: str) -> bool:
                             try:
                                 exu = (ex or "").upper().strip()
+
+                                # FUTURES confirmations must be executable futures markets only
+                                if market == "FUTURES":
+                                    if exu == "BINANCE":
+                                        p = await self._fetch_rest_price("FUTURES", sym)
+                                    elif exu == "BYBIT":
+                                        p = await self._fetch_bybit_price("FUTURES", sym)
+                                    elif exu == "OKX":
+                                        p = await self._fetch_okx_price("FUTURES", sym)
+                                    else:
+                                        return False
+                                    return bool(p and float(p) > 0)
+
+                                # SPOT confirmations (supports all 5 exchanges)
                                 if exu == "BINANCE":
                                     p = await self._fetch_rest_price("SPOT", sym)
                                 elif exu == "BYBIT":
                                     p = await self._fetch_bybit_price("SPOT", sym)
                                 elif exu == "OKX":
-                                    p = await _okx_public_price(sym)
+                                    p = await self._fetch_okx_price("SPOT", sym)
                                 elif exu == "MEXC":
                                     p = await _mexc_public_price(sym)
                                 else:  # GATEIO
@@ -5679,7 +5694,7 @@ class Backend:
                             except Exception:
                                 return False
 
-                        _ex_order = ["GATEIO", "BINANCE", "OKX", "BYBIT", "MEXC"]
+                        _ex_order = ["BINANCE", "OKX", "BYBIT"] if market == "FUTURES" else ["GATEIO", "BINANCE", "OKX", "BYBIT", "MEXC"]
                         _oks = await asyncio.gather(*[_pair_exists(x) for x in _ex_order])
                         _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
                         if not _pair_exchanges:
