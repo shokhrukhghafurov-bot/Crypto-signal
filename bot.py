@@ -6,7 +6,6 @@ import os
 import logging
 import re
 import math
-import aiohttp
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
 from dataclasses import replace
@@ -3233,141 +3232,150 @@ async def _fetch_binance_price(symbol: str, *, futures: bool) -> float:
         return 0.0
 
 
-def _okx_inst_spot(symbol: str) -> str:
-    s = (symbol or "").upper().strip()
-    if s.endswith("USDT"):
-        return f"{s[:-4]}-USDT"
-    return s
-
-
-def _okx_inst_futures(symbol: str) -> str:
-    # OKX USDT perpetual swap convention: BTC-USDT-SWAP
-    s = (symbol or "").upper().strip()
-    if s.endswith("USDT"):
-        return f"{s[:-4]}-USDT-SWAP"
+def _okx_inst(symbol: str, *, futures: bool) -> str:
+    """Convert BTCUSDT -> BTC-USDT (spot) or BTC-USDT-SWAP (futures)."""
+    s = str(symbol or "").upper().replace("/", "").replace("-", "").strip()
+    if s.endswith("USDT") and len(s) > 4:
+        base = s[:-4]
+        return f"{base}-USDT-SWAP" if futures else f"{base}-USDT"
     return s
 
 
 def _gate_pair(symbol: str) -> str:
-    s = (symbol or "").upper().strip()
-    if s.endswith("USDT"):
+    """Convert BTCUSDT -> BTC_USDT for Gate.io."""
+    s = str(symbol or "").upper().replace("/", "").replace("-", "").strip()
+    if s.endswith("USDT") and len(s) > 4:
         return f"{s[:-4]}_USDT"
     return s
 
 
-async def _fetch_bybit_price(symbol: str, *, market: str) -> float:
-    """Best-effort public last price from Bybit V5."""
-    symbol = str(symbol or "").upper().strip()
+async def _fetch_bybit_price(symbol: str, *, futures: bool) -> float:
+    """Public last price from Bybit v5 market tickers."""
+    symbol = str(symbol or "").upper().replace("/", "").replace("-", "").strip()
     if not symbol:
         return 0.0
-    category = "linear" if (market or "").upper().strip() == "FUTURES" else "spot"
+    category = "linear" if futures else "spot"
+    url = "https://api.bybit.com/v5/market/tickers"
     try:
         timeout = aiohttp.ClientTimeout(total=6)
         async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get("https://api.bybit.com/v5/market/tickers", params={"category": category, "symbol": symbol}) as r:
+            async with s.get(url, params={"category": category, "symbol": symbol}) as r:
                 data = await r.json(content_type=None)
-        lst = (((data or {}).get("result") or {}).get("list") or [])
-        if lst and isinstance(lst, list):
-            return float((lst[0] or {}).get("lastPrice") or 0.0)
+                lst = (((data or {}).get("result") or {}).get("list") or [])
+                if lst and isinstance(lst, list):
+                    return float((lst[0] or {}).get("lastPrice") or 0.0)
     except Exception:
-        return 0.0
+        pass
     return 0.0
 
 
-async def _fetch_okx_price(symbol: str, *, market: str) -> float:
-    """Best-effort public last price from OKX."""
-    inst = _okx_inst_futures(symbol) if (market or "").upper().strip() == "FUTURES" else _okx_inst_spot(symbol)
+async def _fetch_okx_price(symbol: str, *, futures: bool) -> float:
+    """Public last price from OKX tickers."""
+    inst = _okx_inst(symbol, futures=futures)
     if not inst:
         return 0.0
+    url = "https://www.okx.com/api/v5/market/ticker"
     try:
         timeout = aiohttp.ClientTimeout(total=6)
         async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get("https://www.okx.com/api/v5/market/ticker", params={"instId": inst}) as r:
+            async with s.get(url, params={"instId": inst}) as r:
                 data = await r.json(content_type=None)
-        arr = (data or {}).get("data") or []
-        if arr and isinstance(arr, list):
-            return float((arr[0] or {}).get("last") or 0.0)
+                arr = (data or {}).get("data") or []
+                if arr and isinstance(arr, list):
+                    return float((arr[0] or {}).get("last") or 0.0)
     except Exception:
-        return 0.0
+        pass
     return 0.0
 
 
 async def _fetch_mexc_price(symbol: str) -> float:
-    """Best-effort public last price from MEXC (spot)."""
-    symbol = str(symbol or "").upper().strip()
+    """Public last price from MEXC spot."""
+    symbol = str(symbol or "").upper().replace("/", "").replace("-", "").strip()
     if not symbol:
         return 0.0
+    url = "https://api.mexc.com/api/v3/ticker/price"
     try:
         timeout = aiohttp.ClientTimeout(total=6)
         async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get("https://api.mexc.com/api/v3/ticker/price", params={"symbol": symbol}) as r:
+            async with s.get(url, params={"symbol": symbol}) as r:
                 data = await r.json(content_type=None)
-        return float((data or {}).get("price") or 0.0)
+                return float((data or {}).get("price") or 0.0)
     except Exception:
         return 0.0
 
 
 async def _fetch_gateio_price(symbol: str) -> float:
-    """Best-effort public last price from Gate.io (spot)."""
+    """Public last price from Gate.io spot."""
     pair = _gate_pair(symbol)
     if not pair:
         return 0.0
+    url = "https://api.gateio.ws/api/v4/spot/tickers"
     try:
         timeout = aiohttp.ClientTimeout(total=6)
         async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get("https://api.gateio.ws/api/v4/spot/tickers", params={"currency_pair": pair}) as r:
+            async with s.get(url, params={"currency_pair": pair}) as r:
                 data = await r.json(content_type=None)
-        if isinstance(data, list) and data:
-            return float((data[0] or {}).get("last") or 0.0)
+                if isinstance(data, list) and data:
+                    return float((data[0] or {}).get("last") or 0.0)
     except Exception:
-        return 0.0
+        pass
     return 0.0
 
 
-async def _fetch_signal_price(symbol: str, *, market: str) -> float:
-    """Fetch a public last price with fallbacks across exchanges.
+def _parse_price_order(env_name: str, default: str) -> list[str]:
+    raw = (os.getenv(env_name, default) or default).strip()
+    parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    return parts or [p.strip().lower() for p in default.split(",") if p.strip()]
 
-    Why: if Binance is down / symbol missing, outcome tracking would stall.
 
-    Order can be controlled via env:
-      - SIG_PRICE_ORDER_SPOT (default: binance,bybit,okx,mexc,gateio)
-      - SIG_PRICE_ORDER_FUTURES (default: binance,bybit,okx)
-    """
-    m = (market or "").upper().strip()
+async def _fetch_signal_price(symbol: str, *, market: str) -> tuple[float, str]:
+    """Get price with fallback sources. Returns (price, source)."""
+    m = (market or "SPOT").upper()
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return 0.0, ""
+
+    async def _safe(coro) -> float:
+        try:
+            v = await coro
+            v = float(v or 0.0)
+            return v if v > 0 else 0.0
+        except Exception:
+            return 0.0
+
     if m == "FUTURES":
-        order = (os.getenv("SIG_PRICE_ORDER_FUTURES", "binance,bybit,okx") or "").strip()
-        exs = [x.strip().lower() for x in order.split(",") if x.strip()]
-        for ex in exs:
-            if ex == "binance":
-                px = await _fetch_binance_price(symbol, futures=True)
-            elif ex == "bybit":
-                px = await _fetch_bybit_price(symbol, market="FUTURES")
-            elif ex == "okx":
-                px = await _fetch_okx_price(symbol, market="FUTURES")
+        order = _parse_price_order("SIG_PRICE_ORDER_FUTURES", "binance,bybit,okx")
+        for src in order:
+            if src == "binance":
+                px = await _safe(_fetch_binance_price(sym, futures=True))
+            elif src == "bybit":
+                px = await _safe(_fetch_bybit_price(sym, futures=True))
+            elif src == "okx":
+                px = await _safe(_fetch_okx_price(sym, futures=True))
             else:
                 px = 0.0
             if px > 0:
-                return float(px)
-        return 0.0
+                return px, src
+        return 0.0, ""
 
-    order = (os.getenv("SIG_PRICE_ORDER_SPOT", "binance,bybit,okx,mexc,gateio") or "").strip()
-    exs = [x.strip().lower() for x in order.split(",") if x.strip()]
-    for ex in exs:
-        if ex == "binance":
-            px = await _fetch_binance_price(symbol, futures=False)
-        elif ex == "bybit":
-            px = await _fetch_bybit_price(symbol, market="SPOT")
-        elif ex == "okx":
-            px = await _fetch_okx_price(symbol, market="SPOT")
-        elif ex == "mexc":
-            px = await _fetch_mexc_price(symbol)
-        elif ex == "gateio":
-            px = await _fetch_gateio_price(symbol)
+    # SPOT
+    order = _parse_price_order("SIG_PRICE_ORDER_SPOT", "binance,bybit,okx,mexc,gateio")
+    for src in order:
+        if src == "binance":
+            px = await _safe(_fetch_binance_price(sym, futures=False))
+        elif src == "bybit":
+            px = await _safe(_fetch_bybit_price(sym, futures=False))
+        elif src == "okx":
+            px = await _safe(_fetch_okx_price(sym, futures=False))
+        elif src == "mexc":
+            px = await _safe(_fetch_mexc_price(sym))
+        elif src in ("gate", "gateio"):
+            px = await _safe(_fetch_gateio_price(sym))
         else:
             px = 0.0
         if px > 0:
-            return float(px)
-    return 0.0
+            return px, src
+    return 0.0, ""
 
 def _hit_tp(side: str, price: float, lvl: float) -> bool:
     return price >= lvl if side == "LONG" else price <= lvl
@@ -3381,6 +3389,77 @@ def _pnl_pct(side: str, entry: float, close: float) -> float:
     if side == "LONG":
         return (close - entry) / entry * 100.0
     return (entry - close) / entry * 100.0
+
+
+# --- Exchange-like PnL model for SIGNAL outcomes (admin stats) ---
+# This is still an approximation (no funding / no orderbook slippage),
+# but it matches how exchanges compute ROI:
+#   - spot: %PnL on notional
+#   - futures: %ROI on margin = price_move% * leverage
+# Fees (taker) are applied on entry + exit notional.
+
+_SIG_SPOT_TAKER_FEE_PCT = float(os.getenv("SIG_SPOT_TAKER_FEE_PCT", "0.10") or 0.10)  # 0.10% default
+_SIG_FUT_TAKER_FEE_PCT = float(os.getenv("SIG_FUT_TAKER_FEE_PCT", "0.06") or 0.06)    # 0.06% default
+_SIG_FUT_LEVERAGE = float(os.getenv("SIG_FUT_LEVERAGE", "1") or 1)
+_SIG_SLIPPAGE_PCT = float(os.getenv("SIG_SLIPPAGE_PCT", "0.00") or 0.0)  # per fill, in %
+
+def _sig_leverage(market: str) -> float:
+    try:
+        if (market or "SPOT").upper() == "FUTURES":
+            return max(1.0, float(_SIG_FUT_LEVERAGE))
+    except Exception:
+        pass
+    return 1.0
+
+def _sig_fee_pct(market: str) -> float:
+    try:
+        return float(_SIG_FUT_TAKER_FEE_PCT) if (market or "SPOT").upper() == "FUTURES" else float(_SIG_SPOT_TAKER_FEE_PCT)
+    except Exception:
+        return 0.0
+
+def _sig_net_pnl_pct(*, market: str, side: str, entry: float, close: float, part_entry_to_close: float = 1.0) -> float:
+    """Net PnL% like exchange.
+
+    part_entry_to_close is a weight of notional closed at 'close'.
+    Use it for partial TP1 models.
+    """
+    if entry <= 0:
+        return 0.0
+    L = _sig_leverage(market)
+    fee = max(0.0, _sig_fee_pct(market))
+    slip = max(0.0, float(_SIG_SLIPPAGE_PCT))
+    # Price move component
+    move = _pnl_pct(side, entry, close) * L
+    # Fees/slippage: entry always on 100% notional; exit on part notional
+    # Convert fee% (of notional) into ROI% (of margin) for futures => multiply by L.
+    cost = (fee + slip) * L * (1.0 + max(0.0, min(1.0, float(part_entry_to_close))))
+    return float(move - cost)
+
+def _sig_net_pnl_two_targets(*, market: str, side: str, entry: float, tp1: float, tp2: float, part: float) -> float:
+    """Net PnL for partial TP1 then TP2. part in [0..1]."""
+    p = max(0.0, min(1.0, float(part)))
+    pnl1 = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=tp1, part_entry_to_close=p)
+    pnl2 = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=tp2, part_entry_to_close=(1.0 - p))
+    # Entry cost is counted twice above (once in each leg). Fix it:
+    # In reality: entry fee/slippage once on full notional.
+    # Here: entry cost included in pnl1 and pnl2. Remove one full entry cost.
+    L = _sig_leverage(market)
+    fee = max(0.0, _sig_fee_pct(market))
+    slip = max(0.0, float(_SIG_SLIPPAGE_PCT))
+    entry_cost = (fee + slip) * L  # full notional, once
+    return float(pnl1 + pnl2 + entry_cost)
+
+def _sig_net_pnl_tp1_then_be(*, market: str, side: str, entry: float, tp1: float, part: float) -> float:
+    """Net PnL for partial TP1 then close remainder at BE (entry)."""
+    p = max(0.0, min(1.0, float(part)))
+    pnl1 = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=tp1, part_entry_to_close=p)
+    pnl2 = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=(1.0 - p))
+    # Fix double-counted entry cost (same idea as _sig_net_pnl_two_targets)
+    L = _sig_leverage(market)
+    fee = max(0.0, _sig_fee_pct(market))
+    slip = max(0.0, float(_SIG_SLIPPAGE_PCT))
+    entry_cost = (fee + slip) * L
+    return float(pnl1 + pnl2 + entry_cost)
 
 def _model_partial_pct() -> float:
     try:
@@ -3425,7 +3504,7 @@ async def signal_outcome_loop() -> None:
                     if sid <= 0 or entry <= 0 or not symbol:
                         continue
 
-                    px = await _fetch_signal_price(symbol, market=market)
+                    px, _src = await _fetch_signal_price(symbol, market=market)
                     if px <= 0:
                         continue
 
@@ -3437,17 +3516,17 @@ async def signal_outcome_loop() -> None:
                     if status == "ACTIVE":
                         # WIN by TP2 (or TP1 if no TP2)
                         if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
-                            pnl = (part * _pnl_pct(side, entry, eff_tp1) + (1.0 - part) * _pnl_pct(side, entry, eff_tp2)) if (eff_tp1 > 0 and eff_tp2 > 0) else _pnl_pct(side, entry, eff_tp2)
+                            pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if (eff_tp1 > 0 and eff_tp2 > 0) else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
                             continue
                         if eff_tp2 <= 0 and eff_tp1 > 0 and _hit_tp(side, px, eff_tp1):
                             # single-target win at TP1
-                            pnl = _pnl_pct(side, entry, eff_tp1)
+                            pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp1, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
                             continue
                         # LOSS by SL (only before TP1 in strict mode)
                         if sl > 0 and _hit_sl(side, px, sl):
-                            pnl = _pnl_pct(side, entry, sl)
+                            pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
                             continue
                         # TP1 hit -> arm BE
@@ -3459,7 +3538,7 @@ async def signal_outcome_loop() -> None:
                     if status == "TP1":
                         # WIN by TP2 if exists
                         if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
-                            pnl = (part * _pnl_pct(side, entry, eff_tp1) + (1.0 - part) * _pnl_pct(side, entry, eff_tp2)) if eff_tp1 > 0 else _pnl_pct(side, entry, eff_tp2)
+                            pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
                             continue
 
@@ -3484,11 +3563,11 @@ async def signal_outcome_loop() -> None:
                             continue
                         if crossed and crossed_at_dt is not None and _BE_CONFIRM_SEC > 0:
                             if (now - crossed_at_dt).total_seconds() >= _BE_CONFIRM_SEC:
-                                pnl = part * _pnl_pct(side, entry, eff_tp1) if eff_tp1 > 0 else 0.0
+                                pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
                                 await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
                                 continue
                         if crossed and crossed_at_dt is not None and _BE_CONFIRM_SEC == 0:
-                            pnl = part * _pnl_pct(side, entry, eff_tp1) if eff_tp1 > 0 else 0.0
+                            pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
                             continue
 
