@@ -197,7 +197,7 @@ async def _binance_signed_request(
             return data if isinstance(data, dict) else {"data": data}
     except ExchangeAPIError:
         raise
-    # except Exception as e:
+    except Exception as e:
         raise ExchangeAPIError(f"Binance API error: {e}")
 
 
@@ -237,7 +237,7 @@ async def _bybit_signed_request(
             return data if isinstance(data, dict) else {"data": data}
     except ExchangeAPIError:
         raise
-    # except Exception as e:
+    except Exception as e:
         raise ExchangeAPIError(f"Bybit API error: {e}")
 
 
@@ -289,7 +289,7 @@ async def _bybit_v5_request(
             return data if isinstance(data, dict) else {"data": data}
     except ExchangeAPIError:
         raise
-    # except Exception as e:
+    except Exception as e:
         raise ExchangeAPIError(f"Bybit API error: {e}")
 
 
@@ -882,7 +882,7 @@ async def _normalize_close_qty(*, ex: str, mt: str, symbol: str, qty: float, px:
         else:
             qty_step, min_qty, _tick, mn = await _gate_symbol_filters(symbol)
             min_notional_ex = float(mn or 0.0)
-    # except Exception as e:
+    except Exception as e:
         _log_rate_limited(f"norm_filters:{ex}:{mt}:{symbol}", f"[SMART] filters fetch failed {ex}/{mt} {symbol}: {e}", every_s=300, level="debug")
 
     if qty_step and qty_step > 0:
@@ -1518,7 +1518,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     try:
         api_key = _decrypt_token(row.get("api_key_enc"))
         api_secret = _decrypt_token(row.get("api_secret_enc"))
-    # except Exception as e:
+    except Exception as e:
         await db_store.mark_autotrade_key_error(
             user_id=uid,
             exchange=exchange,
@@ -1953,7 +1953,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                     qty=exec_qty,
                     stop_price=_round_tick(sl, tick),
                 )
-            # except Exception as e:
+            except Exception as e:
                 # Emergency close
                 try:
                     await _binance_spot_market_sell_base(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=exec_qty)
@@ -2171,7 +2171,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             deactivate=_should_deactivate_key(err),
         )
         return {"ok": False, "skipped": False, "api_error": err}
-    # except Exception as e:
+    except Exception as e:
         err = f"{type(e).__name__}: {e}"
         await db_store.mark_autotrade_key_error(
             user_id=uid,
@@ -2735,8 +2735,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             if gain_pct >= PEAK_MIN_GAIN_PCT and retr_pct >= REV_EXIT_PCT:
                                 try:
                                     await _close_market(qty)
-                                    # except Exception as e:
-                                        _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                                except Exception as e:
+                                    _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                                 await db_store.close_autotrade_position(
                                     user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
                                 )
@@ -2747,8 +2747,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             if gain_pct >= PEAK_MIN_GAIN_PCT and retr_pct >= REV_EXIT_PCT:
                                 try:
                                     await _close_market(qty)
-                                    # except Exception as e:
-                                        _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                                except Exception as e:
+                                    _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                                 await db_store.close_autotrade_position(
                                     user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
                                 )
@@ -2770,8 +2770,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     if _hit_sl_eff():
                         try:
                             await _close_market(qty)
-                            # except Exception as e:
-                                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                        except Exception as e:
+                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                         await db_store.close_autotrade_position(
                             user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
                         )
@@ -2781,8 +2781,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     if tp2 > 0 and _hit_tp(tp2):
                         try:
                             await _close_market(qty)
-                            # except Exception as e:
-                                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                        except Exception as e:
+                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                         await db_store.close_autotrade_position(
                             user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
                         )
@@ -2811,8 +2811,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             if q_close > 0:
                                 try:
                                     await _close_market(q_close)
-                                    # except Exception as e:
-                                        _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                                except Exception as e:
+                                    _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                             # Store remaining qty for future management
                             ref["qty"] = float(q_rem)
                             qty = float(q_rem)
@@ -2843,8 +2843,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     if bool(ref.get("be_moved")) and _hit_be():
                         try:
                             await _close_market(qty)
-                            # except Exception as e:
-                                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                        except Exception as e:
+                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                         await db_store.close_autotrade_position(
                             user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
                         )
@@ -5947,3 +5947,25 @@ class Backend:
             elapsed = time.time() - start
             logger.info("SCAN tick done scanned=%s elapsed=%.1fs last_news=%s last_macro=%s", int(getattr(self, "scanned_symbols_last", 0) or 0), elapsed, getattr(self, "last_news_action", "?"), getattr(self, "last_macro_action", "?"))
             await asyncio.sleep(max(5, SCAN_INTERVAL_SECONDS - elapsed))
+
+
+# ------------------ Auto-trade diagnostics (admin) ------------------
+
+async def autotrade_healthcheck() -> dict:
+    """DB-only health snapshot for autotrade. Never places orders."""
+    try:
+        stale = int(os.getenv("AUTOTRADE_STALE_MINUTES", "10") or 10)
+    except Exception:
+        stale = 10
+    try:
+        return await db_store.autotrade_health_snapshot(stale_minutes=stale)
+    except Exception as e:
+        _log_rate_limited("autotrade_healthcheck", f"autotrade_healthcheck failed: {e}", every_s=60, level="warning")
+        return {"ok": False, "error": str(e)}
+
+async def autotrade_stress_test(*, user_id: int, symbol: str, market_type: str = "spot", n: int = 50) -> dict:
+    """SAFE placeholder.
+
+    This build keeps production stable: stress-test is disabled here to avoid accidental trading.
+    """
+    return {"ok": False, "error": "stress_test_disabled_in_production"}
