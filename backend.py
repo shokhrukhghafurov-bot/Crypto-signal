@@ -31,6 +31,42 @@ import logging
 import db_store
 
 from cryptography.fernet import Fernet
+# --- Auto-trade safety: in-process locks + idempotency keys ---
+_AUTOTRADE_LOCKS: dict[tuple[int, str, str], asyncio.Lock] = {}
+
+def _autotrade_lock_key(user_id: int, market_type: str, symbol: str) -> tuple[int, str, str]:
+    return (int(user_id), (market_type or "spot").lower().strip(), (symbol or "").upper().strip())
+
+def _get_autotrade_lock(user_id: int, market_type: str, symbol: str) -> asyncio.Lock:
+    k = _autotrade_lock_key(user_id, market_type, symbol)
+    lock = _AUTOTRADE_LOCKS.get(k)
+    if lock is None:
+        lock = asyncio.Lock()
+        _AUTOTRADE_LOCKS[k] = lock
+    return lock
+
+def _idem_key(
+    *,
+    user_id: int,
+    signal_id: int | None,
+    exchange: str,
+    market_type: str,
+    symbol: str,
+    side: str,
+    kind: str,
+    max_len: int = 36,
+) -> str:
+    """Deterministic idempotency key for order placement.
+
+    Fits common exchange limits (Binance newClientOrderId, Bybit orderLinkId).
+    """
+    raw = f"{int(user_id)}|{signal_id or 0}|{(exchange or '').lower()}|{(market_type or '').lower()}|{(symbol or '').upper()}|{(side or '').upper()}|{kind.upper()}"
+    h = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    k = f"AT-{kind.upper()[:4]}-{h}"
+    return k[:max_len]
+
+
+
 
 logger = logging.getLogger("crypto-signal")
 
@@ -804,6 +840,7 @@ async def _bybit_order_create(
     reduce_only: bool | None = None,
     trigger_price: float | None = None,
     close_on_trigger: bool | None = None,
+    order_link_id: str | None = None,
 ) -> dict:
     body: dict[str, Any] = {
         "category": category,
@@ -821,6 +858,8 @@ async def _bybit_order_create(
         body["triggerPrice"] = str(float(trigger_price))
     if close_on_trigger is not None:
         body["closeOnTrigger"] = bool(close_on_trigger)
+    if order_link_id:
+        body[\"orderLinkId\"] = str(order_link_id)[:36]
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _bybit_v5_request(
@@ -902,9 +941,20 @@ async def _binance_spot_market_buy_quote(
     api_secret: str,
     symbol: str,
     quote_usdt: float,
+    client_order_id: str | None = None,
 ) -> dict:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
+                params = {
+                "symbol": symbol.upper(),
+                "side": "BUY",
+                "type": "MARKET",
+                "quoteOrderQty": f"{quote_usdt:.8f}",
+                "newOrderRespType": "FULL",
+                "recvWindow": "5000",
+            }
+        if client_order_id:
+            params["newClientOrderId"] = str(client_order_id)[:36]
         return await _binance_signed_request(
             s,
             base_url="https://api.binance.com",
@@ -912,14 +962,7 @@ async def _binance_spot_market_buy_quote(
             method="POST",
             api_key=api_key,
             api_secret=api_secret,
-            params={
-                "symbol": symbol.upper(),
-                "side": "BUY",
-                "type": "MARKET",
-                "quoteOrderQty": f"{quote_usdt:.8f}",
-                "newOrderRespType": "FULL",
-                "recvWindow": "5000",
-            },
+            params=params,
         )
 
 
@@ -929,10 +972,21 @@ async def _binance_spot_market_sell_base(
     api_secret: str,
     symbol: str,
     qty: float,
+    client_order_id: str | None = None,
 ) -> dict:
     """Emergency spot close (SELL MARKET by base quantity)."""
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
+                params = {
+                "symbol": symbol.upper(),
+                "side": "SELL",
+                "type": "MARKET",
+                "quantity": f"{float(qty):.8f}",
+                "newOrderRespType": "FULL",
+                "recvWindow": "5000",
+            }
+        if client_order_id:
+            params["newClientOrderId"] = str(client_order_id)[:36]
         return await _binance_signed_request(
             s,
             base_url="https://api.binance.com",
@@ -940,14 +994,7 @@ async def _binance_spot_market_sell_base(
             method="POST",
             api_key=api_key,
             api_secret=api_secret,
-            params={
-                "symbol": symbol.upper(),
-                "side": "SELL",
-                "type": "MARKET",
-                "quantity": f"{float(qty):.8f}",
-                "newOrderRespType": "FULL",
-                "recvWindow": "5000",
-            },
+            params=params,
         )
 
 
@@ -958,17 +1005,11 @@ async def _binance_spot_limit_sell(
     symbol: str,
     qty: float,
     price: float,
+    client_order_id: str | None = None,
 ) -> dict:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
-        return await _binance_signed_request(
-            s,
-            base_url="https://api.binance.com",
-            path="/api/v3/order",
-            method="POST",
-            api_key=api_key,
-            api_secret=api_secret,
-            params={
+                params = {
                 "symbol": symbol.upper(),
                 "side": "SELL",
                 "type": "LIMIT",
@@ -976,7 +1017,17 @@ async def _binance_spot_limit_sell(
                 "quantity": f"{qty:.8f}",
                 "price": f"{price:.8f}",
                 "recvWindow": "5000",
-            },
+            }
+        if client_order_id:
+            params["newClientOrderId"] = str(client_order_id)[:36]
+        return await _binance_signed_request(
+            s,
+            base_url="https://api.binance.com",
+            path="/api/v3/order",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            params=params,
         )
 
 
@@ -987,19 +1038,13 @@ async def _binance_spot_stop_loss_limit_sell(
     symbol: str,
     qty: float,
     stop_price: float,
+    client_order_id: str | None = None,
 ) -> dict:
     # For STOP_LOSS_LIMIT, Binance requires both stopPrice and price.
     limit_price = stop_price * 0.999
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
-        return await _binance_signed_request(
-            s,
-            base_url="https://api.binance.com",
-            path="/api/v3/order",
-            method="POST",
-            api_key=api_key,
-            api_secret=api_secret,
-            params={
+                params = {
                 "symbol": symbol.upper(),
                 "side": "SELL",
                 "type": "STOP_LOSS_LIMIT",
@@ -1008,7 +1053,17 @@ async def _binance_spot_stop_loss_limit_sell(
                 "price": f"{limit_price:.8f}",
                 "stopPrice": f"{stop_price:.8f}",
                 "recvWindow": "5000",
-            },
+            }
+        if client_order_id:
+            params["newClientOrderId"] = str(client_order_id)[:36]
+        return await _binance_signed_request(
+            s,
+            base_url="https://api.binance.com",
+            path="/api/v3/order",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            params=params,
         )
 
 
@@ -1038,9 +1093,19 @@ async def _binance_futures_market_open(
     symbol: str,
     side: str,
     qty: float,
+    client_order_id: str | None = None,
 ) -> dict:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
+                params = {
+                "symbol": symbol.upper(),
+                "side": side.upper(),
+                "type": "MARKET",
+                "quantity": f"{qty:.8f}",
+                "recvWindow": "5000",
+            }
+        if client_order_id:
+            params["newClientOrderId"] = str(client_order_id)[:36]
         return await _binance_signed_request(
             s,
             base_url="https://fapi.binance.com",
@@ -1048,13 +1113,7 @@ async def _binance_futures_market_open(
             method="POST",
             api_key=api_key,
             api_secret=api_secret,
-            params={
-                "symbol": symbol.upper(),
-                "side": side.upper(),
-                "type": "MARKET",
-                "quantity": f"{qty:.8f}",
-                "recvWindow": "5000",
-            },
+            params=params,
         )
 
 
@@ -1066,17 +1125,11 @@ async def _binance_futures_reduce_limit(
     side: str,
     qty: float,
     price: float,
+    client_order_id: str | None = None,
 ) -> dict:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
-        return await _binance_signed_request(
-            s,
-            base_url="https://fapi.binance.com",
-            path="/fapi/v1/order",
-            method="POST",
-            api_key=api_key,
-            api_secret=api_secret,
-            params={
+                params = {
                 "symbol": symbol.upper(),
                 "side": side.upper(),
                 "type": "LIMIT",
@@ -1085,7 +1138,17 @@ async def _binance_futures_reduce_limit(
                 "quantity": f"{qty:.8f}",
                 "price": f"{price:.8f}",
                 "recvWindow": "5000",
-            },
+            }
+        if client_order_id:
+            params["newClientOrderId"] = str(client_order_id)[:36]
+        return await _binance_signed_request(
+            s,
+            base_url="https://fapi.binance.com",
+            path="/fapi/v1/order",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            params=params,
         )
 
 
@@ -1096,10 +1159,21 @@ async def _binance_futures_reduce_market(
     symbol: str,
     side: str,
     qty: float,
+    client_order_id: str | None = None,
 ) -> dict:
     """Reduce-only MARKET order (emergency close / partial close)."""
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
+                params = {
+                "symbol": symbol.upper(),
+                "side": side.upper(),
+                "type": "MARKET",
+                "reduceOnly": "true",
+                "quantity": f"{float(qty):.8f}",
+                "recvWindow": "5000",
+            }
+        if client_order_id:
+            params["newClientOrderId"] = str(client_order_id)[:36]
         return await _binance_signed_request(
             s,
             base_url="https://fapi.binance.com",
@@ -1107,14 +1181,7 @@ async def _binance_futures_reduce_market(
             method="POST",
             api_key=api_key,
             api_secret=api_secret,
-            params={
-                "symbol": symbol.upper(),
-                "side": side.upper(),
-                "type": "MARKET",
-                "reduceOnly": "true",
-                "quantity": f"{float(qty):.8f}",
-                "recvWindow": "5000",
-            },
+            params=params,
         )
 
 
@@ -1125,10 +1192,21 @@ async def _binance_futures_stop_market_close_all(
     symbol: str,
     side: str,
     stop_price: float,
+    client_order_id: str | None = None,
 ) -> dict:
     # side is the close side (opposite to entry): SELL closes long, BUY closes short.
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
+                params = {
+                "symbol": symbol.upper(),
+                "side": side.upper(),
+                "type": "STOP_MARKET",
+                "stopPrice": f"{stop_price:.8f}",
+                "closePosition": "true",
+                "recvWindow": "5000",
+            }
+        if client_order_id:
+            params["newClientOrderId"] = str(client_order_id)[:36]
         return await _binance_signed_request(
             s,
             base_url="https://fapi.binance.com",
@@ -1136,14 +1214,7 @@ async def _binance_futures_stop_market_close_all(
             method="POST",
             api_key=api_key,
             api_secret=api_secret,
-            params={
-                "symbol": symbol.upper(),
-                "side": side.upper(),
-                "type": "STOP_MARKET",
-                "stopPrice": f"{stop_price:.8f}",
-                "closePosition": "true",
-                "recvWindow": "5000",
-            },
+            params=params,
         )
 
 
@@ -1340,107 +1411,550 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     tp1 = float(getattr(sig, "tp1", 0.0) or 0.0)
     tp2 = float(getattr(sig, "tp2", 0.0) or 0.0)
 
-    try:
-        if exchange == "bybit":
-            category = "spot" if mt == "spot" else "linear"
-            # Futures cap is user-defined (by margin). Spot cap is implicit (wallet balance).
-            free = await _bybit_available_usdt(api_key, api_secret)
-            if free < need_usdt:
+    lock = _get_autotrade_lock(uid, mt, symbol)
+    async with lock:
+        sig_id = _extract_signal_id(sig)
+        if sig_id <= 0:
+            sig_id = 0
+        entry_idem = _idem_key(
+            user_id=uid,
+            signal_id=sig_id,
+            exchange=exchange,
+            market_type=mt,
+            symbol=symbol,
+            side=side,
+            kind="ENTRY",
+        )
+        reserved = await db_store.reserve_autotrade_position(
+            user_id=uid,
+            signal_id=sig_id,
+            exchange=exchange,
+            market_type=mt,
+            symbol=symbol,
+            side=side,
+            allocated_usdt=need_usdt,
+            reservation_ref=f"RESERVED:{entry_idem}",
+        )
+        if not reserved:
+            return {"ok": False, "skipped": True, "api_error": None}
+
+        try:
+            if exchange == "bybit":
+                category = "spot" if mt == "spot" else "linear"
+                # Futures cap is user-defined (by margin). Spot cap is implicit (wallet balance).
+                free = await _bybit_available_usdt(api_key, api_secret)
+                if free < need_usdt:
+                    return {"ok": False, "skipped": True, "api_error": None}
+
+                cap_decreased = False
+                prev_eff_val = None
+                winrate = None
+                eff_cap = float(fut_cap or 0.0)
+
+                if mt == "futures":
+                    used = await db_store.get_autotrade_used_usdt(uid, "futures")
+
+                    # Smart effective cap uses CURRENT available balance + winrate.
+                    try:
+                        w = await db_store.get_autotrade_winrate(uid, market_type="futures", limit=20)
+                        if int(w.get("n") or 0) >= 5:
+                            winrate = float(w.get("winrate") or 0.0)
+                    except Exception:
+                        winrate = None
+
+                    eff_cap = _calc_effective_futures_cap(balance_usdt=float(free), ui_cap_usdt=float(fut_cap), winrate=winrate)
+
+                    prev_eff = _LAST_EFFECTIVE_FUT_CAP.get(uid)
+                    _LAST_EFFECTIVE_FUT_CAP[uid] = float(eff_cap)
+                    if prev_eff is not None:
+                        prev_eff_val = float(prev_eff)
+                        if float(eff_cap) + 1e-9 < float(prev_eff):
+                            dec = float(prev_eff) - float(eff_cap)
+                            now_ts = time.time()
+                            last_ts = float(_LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT.get(uid) or 0.0)
+                            if dec >= _SMARTCAP_DECREASE_MIN_USDT and (now_ts - last_ts) >= _SMARTCAP_COOLDOWN_SEC:
+                                cap_decreased = True
+                                _LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT[uid] = now_ts
+
+                    if eff_cap > 0 and used + need_usdt > eff_cap:
+                        return {
+                            "ok": False, "skipped": True, "api_error": None,
+                            "cap_ui": float(fut_cap), "cap_effective": float(eff_cap),
+                            "cap_decreased": cap_decreased, "cap_prev_effective": prev_eff_val,
+                            "winrate": (float(winrate) if winrate is not None else None),
+                        }
+
+                direction_local = direction
+                if mt == "spot":
+                    # Spot: only long/buy is supported.
+                    side = "BUY"
+                else:
+                    side = "BUY" if direction_local == "LONG" else "SELL"
+                close_side = "SELL" if side == "BUY" else "BUY"
+
+                px = await _bybit_price(symbol, category=category)
+                if px <= 0:
+                    raise ExchangeAPIError("Bybit price=0")
+
+                qty_step, min_qty, tick = await _bybit_instrument_filters(category=category, symbol=symbol)
+
+                # Spot qty in base; Futures qty in contracts (approx via notional/price)
+                if mt == "spot":
+                    qty = max(0.0, need_usdt / px)
+                else:
+                    qty = max(0.0, (need_usdt * float(fut_lev)) / px)
+                if qty_step > 0:
+                    qty = _round_step(qty, qty_step)
+                if min_qty > 0 and qty < min_qty:
+                    raise ExchangeAPIError(f"Bybit qty<minQty after rounding: {qty} < {min_qty}")
+
+                entry_res = await _bybit_order_create(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    category=category,
+                    symbol=symbol,
+                    side=side,
+                    order_type="Market",
+                    qty=qty,
+                    reduce_only=False if mt == "futures" else None,
+                order_link_id=entry_idem,
+                )
+                order_id = ((entry_res.get("result") or {}).get("orderId") or (entry_res.get("result") or {}).get("orderId"))
+
+                has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
+                qty1 = _round_step(qty * (0.5 if has_tp2 else 1.0), qty_step)
+                qty2 = _round_step(qty - qty1, qty_step) if has_tp2 else 0.0
+                if has_tp2 and min_qty > 0 and qty2 < min_qty:
+                    has_tp2 = False
+                    qty1 = qty
+                    qty2 = 0.0
+
+                # --- VIRTUAL mode: do not place SL/TP orders on exchange ---
+                if _VIRTUAL_SLTP_ALL:
+                    entry_p = float(entry or 0.0)
+                    ref = {
+                        "virtual": True,
+                        "exchange": "bybit",
+                        "market_type": mt,
+                        "symbol": symbol,
+                        "direction": direction,
+                        "side": side,
+                        "close_side": ("SELL" if str(side).upper() == "BUY" else "BUY"),
+                        "entry_price": entry_p,
+                        "qty": float(qty),
+                        "tp1": float(tp1 or 0.0),
+                        "tp2": float(tp2 or 0.0),
+                        "sl": float(sl or 0.0),
+                        "tp1_hit": False,
+                        "be_moved": False,
+                        "be_price": 0.0,
+                    }
+                    sig_id = _extract_signal_id(sig)
+                    if sig_id <= 0:
+                        raise ExchangeAPIError("missing signal_id")
+                    await db_store.create_autotrade_position(
+                        user_id=uid,
+                        signal_id=sig_id,
+                        exchange="bybit",
+                        market_type=mt,
+                        symbol=symbol,
+                        side=side,
+                        allocated_usdt=need_usdt,
+                        api_order_ref=json.dumps(ref),
+                    )
+                    return {"ok": True, "skipped": False, "api_error": None}
+
+
+                # Place SL first; if SL fails, immediately close to avoid unprotected exposure.
+                try:
+                    sl_res = await _bybit_order_create(
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        category=category,
+                        symbol=symbol,
+                        side=close_side,
+                        order_type="Market",
+                        qty=qty,
+                        reduce_only=(True if mt == "futures" else None),
+                        trigger_price=_round_tick(sl, tick),
+                        close_on_trigger=(True if mt == "futures" else None),
+                        order_link_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind=\"SL\"),
+                    )
+                except Exception:
+                    try:
+                        await _bybit_order_create(
+                            api_key=api_key,
+                            api_secret=api_secret,
+                            category=category,
+                            symbol=symbol,
+                            side=close_side,
+                            order_type="Market",
+                            qty=qty,
+                            reduce_only=(True if mt == "futures" else None),
+                        )
+                    except Exception:
+                        pass
+                    raise
+
+                # TP(s) as limit reduce-only for futures; spot normal sell. If TP1 fails, close to avoid half-configured strategy.
+                try:
+                    tp1_res = await _bybit_order_create(
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        category=category,
+                        symbol=symbol,
+                        side=close_side,
+                        order_type="Limit",
+                        qty=qty1,
+                        price=_round_tick(tp1, tick),
+                        reduce_only=(True if mt == "futures" else None),
+                        order_link_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind=\"TP1\"),
+                    )
+                except Exception:
+                    try:
+                        await _bybit_cancel_order(api_key=api_key, api_secret=api_secret, category=category, symbol=symbol, order_id=str((sl_res.get("result") or {}).get("orderId") or ""))
+                    except Exception:
+                        pass
+                    try:
+                        await _bybit_order_create(
+                            api_key=api_key,
+                            api_secret=api_secret,
+                            category=category,
+                            symbol=symbol,
+                            side=close_side,
+                            order_type="Market",
+                            qty=qty,
+                            reduce_only=(True if mt == "futures" else None),
+                        )
+                    except Exception:
+                        pass
+                    raise
+
+                tp2_res = None
+                if has_tp2 and qty2 > 0:
+                    try:
+                        tp2_res = await _bybit_order_create(
+                            api_key=api_key,
+                            api_secret=api_secret,
+                            category=category,
+                            symbol=symbol,
+                            side=close_side,
+                            order_type="Limit",
+                            qty=qty2,
+                            price=_round_tick(tp2, tick),
+                            reduce_only=(True if mt == "futures" else None),
+                            order_link_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind=\"TP2\"),
+                        )
+                    except Exception:
+                        tp2_res = None
+
+                def _rid(x: dict | None) -> str | None:
+                    if not isinstance(x, dict):
+                        return None
+                    return str((x.get("result") or {}).get("orderId") or "") or None
+
+                ref = {
+                    "exchange": "bybit",
+                    "market_type": mt,
+                    "category": category,
+                    "symbol": symbol,
+                    "side": side,
+                    "close_side": close_side,
+                    "entry_order_id": str(order_id) if order_id else None,
+                    "sl_order_id": _rid(sl_res),
+                    "tp1_order_id": _rid(tp1_res),
+                    "tp2_order_id": _rid(tp2_res),
+                    "entry_price": float(entry or 0.0),
+                    "be_price": float(entry or 0.0),
+                    "be_moved": False,
+                    "qty": qty,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "sl": sl,
+                }
+
+                sig_id = _extract_signal_id(sig)
+                if sig_id <= 0:
+                    raise ExchangeAPIError("missing signal_id")
+                await db_store.create_autotrade_position(
+                    user_id=uid,
+                    signal_id=sig_id,
+                    exchange="bybit",
+                    market_type=mt,
+                    symbol=symbol,
+                    side=side,
+                    allocated_usdt=need_usdt,
+                    api_order_ref=json.dumps(ref),
+                )
+                return {"ok": True, "skipped": False, "api_error": None,
+                        **({"cap_ui": float(fut_cap), "cap_effective": float(eff_cap), "cap_decreased": bool(cap_decreased), "cap_prev_effective": prev_eff_val, "winrate": (float(winrate) if winrate is not None else None)} if mt == "futures" else {})
+                        }
+
+        
+            # -------- OKX / MEXC / Gate.io (SPOT) --------
+            if exchange in ("okx", "mexc", "gateio"):
+                if mt != "spot":
+                    return {"ok": False, "skipped": True, "api_error": None}
+
+                # Futures cap is irrelevant for SPOT; spot cap is wallet balance.
+                symbol = _normalize_symbol(getattr(sig, "symbol", "") or "")
+                if not symbol:
+                    raise ExchangeAPIError("missing symbol")
+
+                # Use public price to estimate base quantity for virtual SL/TP tracking
+                if exchange == "okx":
+                    px = await _okx_public_price(symbol)
+                elif exchange == "mexc":
+                    px = await _mexc_public_price(symbol)
+                else:
+                    px = await _gateio_public_price(symbol)
+
+                if not px or px <= 0:
+                    raise ExchangeAPIError("price_unavailable")
+
+                est_qty = (need_usdt / float(px)) if need_usdt > 0 else 0.0
+                if est_qty <= 0:
+                    raise ExchangeAPIError("qty_estimate_zero")
+
+                # Execute market entry
+                if direction == "SHORT":
+                    # Spot short is not supported in this bot (requires margin). Skip safely.
+                    return {"ok": False, "skipped": True, "api_error": None}
+
+                if exchange == "okx":
+                    passphrase = _decrypt_token(row.get("passphrase_enc"))
+                    entry_order = await _okx_spot_market_buy(api_key=api_key, api_secret=api_secret, passphrase=passphrase, symbol=symbol, quote_usdt=need_usdt)
+                elif exchange == "mexc":
+                    entry_order = await _mexc_spot_market_buy(api_key=api_key, api_secret=api_secret, symbol=symbol, quote_usdt=need_usdt)
+                else:
+                    entry_order = await _gateio_spot_market_buy(api_key=api_key, api_secret=api_secret, symbol=symbol, quote_usdt=need_usdt)
+
+                # Store a virtual manager ref (virtual SL/TP + BE after TP1)
+                ref = {
+                    "exchange": exchange,
+                    "market_type": "spot",
+                    "symbol": symbol,
+                    "side": "BUY",
+                    "close_side": "SELL",
+                    "virtual": True,
+                    "entry_price": float(px),
+                    "be_price": float(px),
+                    "be_moved": False,
+                    "tp1_hit": False,
+                    "qty": float(est_qty),
+                    "tp1": float(tp1 or 0.0),
+                    "tp2": float(tp2 or 0.0),
+                    "sl": float(sl or 0.0),
+                }
+
+                sig_id = _extract_signal_id(sig)
+                if sig_id <= 0:
+                    raise ExchangeAPIError("missing signal_id")
+                await db_store.create_autotrade_position(
+                    user_id=uid,
+                    signal_id=sig_id,
+                    exchange=exchange,
+                    market_type="spot",
+                    symbol=symbol,
+                    side="BUY",
+                    allocated_usdt=need_usdt,
+                    api_order_ref=json.dumps(ref),
+                )
+                return {"ok": True, "skipped": False, "api_error": None}
+
+            # Safety guard: never fall through into Binance execution for other exchanges
+            if exchange != "binance":
                 return {"ok": False, "skipped": True, "api_error": None}
 
-            cap_decreased = False
-            prev_eff_val = None
-            winrate = None
-            eff_cap = float(fut_cap or 0.0)
+    # -------- Binance --------
+            if mt == "spot":
+                free = await _binance_spot_free_usdt(api_key, api_secret)
+                if free < need_usdt:
+                    return {"ok": False, "skipped": True, "api_error": None}
 
-            if mt == "futures":
-                used = await db_store.get_autotrade_used_usdt(uid, "futures")
+                info = await _binance_exchange_info(futures=False)
+                qty_step, min_qty, tick, min_notional = _binance_symbol_filters(info, symbol)
 
-                # Smart effective cap uses CURRENT available balance + winrate.
-                try:
-                    w = await db_store.get_autotrade_winrate(uid, market_type="futures", limit=20)
-                    if int(w.get("n") or 0) >= 5:
-                        winrate = float(w.get("winrate") or 0.0)
-                except Exception:
-                    winrate = None
+                # Entry: market buy by quote amount (USDT)
+                entry_res = await _binance_spot_market_buy_quote(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    symbol=symbol,
+                    quote_usdt=need_usdt,
+                    client_order_id=entry_idem,
+                )
 
-                eff_cap = _calc_effective_futures_cap(balance_usdt=float(free), ui_cap_usdt=float(fut_cap), winrate=winrate)
+                exec_qty = float(entry_res.get("executedQty") or 0.0)
+                if exec_qty <= 0:
+                    # fallback: attempt to infer from fills
+                    q = 0.0
+                    for f in entry_res.get("fills", []) or []:
+                        q += float(f.get("qty") or 0.0)
+                    exec_qty = q
+                if exec_qty <= 0:
+                    raise ExchangeAPIError(f"Binance SPOT entry executedQty=0: {entry_res}")
 
-                prev_eff = _LAST_EFFECTIVE_FUT_CAP.get(uid)
-                _LAST_EFFECTIVE_FUT_CAP[uid] = float(eff_cap)
-                if prev_eff is not None:
-                    prev_eff_val = float(prev_eff)
-                    if float(eff_cap) + 1e-9 < float(prev_eff):
-                        dec = float(prev_eff) - float(eff_cap)
-                        now_ts = time.time()
-                        last_ts = float(_LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT.get(uid) or 0.0)
-                        if dec >= _SMARTCAP_DECREASE_MIN_USDT and (now_ts - last_ts) >= _SMARTCAP_COOLDOWN_SEC:
-                            cap_decreased = True
-                            _LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT[uid] = now_ts
+                # Split for TP1/TP2 (respect LOT_SIZE)
+                has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
+                # Partial close % is configurable via env (TP1_PARTIAL_CLOSE_PCT_SPOT)
+                p = max(0.0, min(100.0, float(_tp1_partial_close_pct('SPOT'))))
+                a = p / 100.0
+                qty1 = exec_qty * (a if has_tp2 else 1.0)
+                qty2 = (exec_qty - qty1) if has_tp2 else 0.0
+                qty1 = _round_step(qty1, qty_step)
+                qty2 = _round_step(qty2, qty_step)
+                exec_qty = _round_step(exec_qty, qty_step)
+                if exec_qty < min_qty:
+                    raise ExchangeAPIError(f"Binance SPOT qty<minQty after rounding: {exec_qty} < {min_qty}")
+                if has_tp2 and qty2 < min_qty:
+                    # If the second leg becomes too small, do a single TP.
+                    has_tp2 = False
+                    qty1 = exec_qty
+                    qty2 = 0.0
 
-                if eff_cap > 0 and used + need_usdt > eff_cap:
-                    return {
-                        "ok": False, "skipped": True, "api_error": None,
-                        "cap_ui": float(fut_cap), "cap_effective": float(eff_cap),
-                        "cap_decreased": cap_decreased, "cap_prev_effective": prev_eff_val,
-                        "winrate": (float(winrate) if winrate is not None else None),
+                # --- VIRTUAL mode: do not place SL/TP orders on exchange ---
+                if _VIRTUAL_SLTP_ALL:
+                    # Use actual executed qty from entry as the managed base qty.
+                    entry_p = float(entry or 0.0)
+                    ref = {
+                        "virtual": True,
+                        "exchange": "binance",
+                        "market_type": "spot",
+                        "symbol": symbol,
+                        "direction": direction,
+                        "side": "BUY",
+                        "close_side": "SELL",
+                        "entry_price": entry_p,
+                        "qty": float(exec_qty),
+                        "tp1": float(tp1 or 0.0),
+                        "tp2": float(tp2 or 0.0),
+                        "sl": float(sl or 0.0),
+                        "tp1_hit": False,
+                        "be_moved": False,
+                        "be_price": 0.0,
                     }
+                    sig_id = _extract_signal_id(sig)
+                    if sig_id <= 0:
+                        raise ExchangeAPIError("missing signal_id")
+                    await db_store.create_autotrade_position(
+                        user_id=uid,
+                        signal_id=sig_id,
+                        exchange="binance",
+                        market_type="spot",
+                        symbol=symbol,
+                        side="BUY",
+                        allocated_usdt=need_usdt,
+                        api_order_ref=json.dumps(ref),
+                    )
+                    return {"ok": True, "skipped": False, "api_error": None}
 
-            direction_local = direction
-            if mt == "spot":
-                # Spot: only long/buy is supported.
-                side = "BUY"
-            else:
-                side = "BUY" if direction_local == "LONG" else "SELL"
-            close_side = "SELL" if side == "BUY" else "BUY"
 
-            px = await _bybit_price(symbol, category=category)
+                # Place SL first; if SL fails, immediately close (sell) to avoid an unprotected position.
+                try:
+                    sl_res = await _binance_spot_stop_loss_limit_sell(
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        symbol=symbol,
+                        qty=exec_qty,
+                        stop_price=_round_tick(sl, tick),
+                        client_order_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side="SELL", kind="SL"),
+                    )
+                except Exception as e:
+                    # Emergency close
+                    try:
+                        await _binance_spot_market_sell_base(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=exec_qty)
+                    except Exception:
+                        pass
+                    raise
+
+                # Place TP(s). If TP1 fails, close to avoid keeping a half-configured strategy.
+                try:
+                    tp1_res = await _binance_spot_limit_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=qty1, price=_round_tick(tp1, tick))
+                except Exception:
+                    try:
+                        await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_res.get("orderId") or 0), futures=False)
+                    except Exception:
+                        pass
+                    try:
+                        await _binance_spot_market_sell_base(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=exec_qty)
+                    except Exception:
+                        pass
+                    raise
+                tp2_res = None
+                if has_tp2 and qty2 > 0:
+                    tp2_res = await _binance_spot_limit_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=qty2, price=_round_tick(tp2, tick))
+
+                ref = {
+                    "exchange": "binance",
+                    "market_type": "spot",
+                    "symbol": symbol,
+                    "side": "BUY",
+                    "entry_order_id": entry_res.get("orderId"),
+                    "sl_order_id": sl_res.get("orderId"),
+                    "tp1_order_id": tp1_res.get("orderId"),
+                    "tp2_order_id": (tp2_res.get("orderId") if isinstance(tp2_res, dict) else None),
+                    "entry_price": float(entry or 0.0),
+                    "be_price": float(entry or 0.0),
+                    "be_moved": False,
+                    "qty": exec_qty,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "sl": sl,
+                }
+
+                sig_id = _extract_signal_id(sig)
+                if sig_id <= 0:
+                    raise ExchangeAPIError("missing signal_id")
+                await db_store.create_autotrade_position(
+                    user_id=uid,
+                    signal_id=sig_id,
+                    exchange="binance",
+                    market_type="spot",
+                    symbol=symbol,
+                    side="BUY",
+                    allocated_usdt=need_usdt,
+                    api_order_ref=json.dumps(ref),
+                    client_order_id=entry_idem,
+                )
+                return {"ok": True, "skipped": False, "api_error": None}
+
+            # futures
+            used = await db_store.get_autotrade_used_usdt(uid, "futures")
+            if fut_cap > 0 and used + need_usdt > fut_cap:
+                return {"ok": False, "skipped": True, "api_error": None}
+
+            avail = await _binance_futures_available_margin(api_key, api_secret)
+            if avail < need_usdt:
+                return {"ok": False, "skipped": True, "api_error": None}
+
+            await _binance_futures_set_leverage(api_key=api_key, api_secret=api_secret, symbol=symbol, leverage=fut_lev)
+
+            # compute qty from margin*leverage/price
+            px = await _binance_price(symbol, futures=True)
             if px <= 0:
-                raise ExchangeAPIError("Bybit price=0")
-
-            qty_step, min_qty, tick = await _bybit_instrument_filters(category=category, symbol=symbol)
-
-            # Spot qty in base; Futures qty in contracts (approx via notional/price)
-            if mt == "spot":
-                qty = max(0.0, need_usdt / px)
-            else:
-                qty = max(0.0, (need_usdt * float(fut_lev)) / px)
-            if qty_step > 0:
-                qty = _round_step(qty, qty_step)
+                raise ExchangeAPIError("Binance futures price=0")
+            raw_qty = (need_usdt * float(fut_lev)) / px
+            info = await _binance_exchange_info(futures=True)
+            step, min_qty, tick, _mn = _binance_symbol_filters(info, symbol)
+            qty = _round_step(raw_qty, step) if step > 0 else raw_qty
             if min_qty > 0 and qty < min_qty:
-                raise ExchangeAPIError(f"Bybit qty<minQty after rounding: {qty} < {min_qty}")
+                qty = min_qty
 
-            entry_res = await _bybit_order_create(
-                api_key=api_key,
-                api_secret=api_secret,
-                category=category,
-                symbol=symbol,
-                side=side,
-                order_type="Market",
-                qty=qty,
-                reduce_only=False if mt == "futures" else None,
-            )
-            order_id = ((entry_res.get("result") or {}).get("orderId") or (entry_res.get("result") or {}).get("orderId"))
-
-            has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
-            qty1 = _round_step(qty * (0.5 if has_tp2 else 1.0), qty_step)
-            qty2 = _round_step(qty - qty1, qty_step) if has_tp2 else 0.0
-            if has_tp2 and min_qty > 0 and qty2 < min_qty:
-                has_tp2 = False
-                qty1 = qty
-                qty2 = 0.0
+            side = "BUY" if direction == "LONG" else "SELL"
+            close_side = "SELL" if side == "BUY" else "BUY"
+            entry_res = await _binance_futures_market_open(api_key=api_key, api_secret=api_secret, symbol=symbol, side=side, qty=qty)
 
             # --- VIRTUAL mode: do not place SL/TP orders on exchange ---
             if _VIRTUAL_SLTP_ALL:
                 entry_p = float(entry or 0.0)
                 ref = {
                     "virtual": True,
-                    "exchange": "bybit",
-                    "market_type": mt,
+                    "exchange": "binance",
+                    "market_type": "futures",
                     "symbol": symbol,
                     "direction": direction,
-                    "side": side,
-                    "close_side": ("SELL" if str(side).upper() == "BUY" else "BUY"),
+                    "side": side.upper(),
+                    "close_side": ("SELL" if side.upper() == "BUY" else "BUY"),
                     "entry_price": entry_p,
                     "qty": float(qty),
                     "tp1": float(tp1 or 0.0),
@@ -1456,112 +1970,83 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 await db_store.create_autotrade_position(
                     user_id=uid,
                     signal_id=sig_id,
-                    exchange="bybit",
-                    market_type=mt,
+                    exchange="binance",
+                    market_type="futures",
                     symbol=symbol,
                     side=side,
                     allocated_usdt=need_usdt,
                     api_order_ref=json.dumps(ref),
+                    client_order_id=entry_idem,
                 )
                 return {"ok": True, "skipped": False, "api_error": None}
 
 
-            # Place SL first; if SL fails, immediately close to avoid unprotected exposure.
+            # Place SL first; if SL fails, immediately close position to avoid unprotected exposure.
             try:
-                sl_res = await _bybit_order_create(
+                sl_res = await _binance_futures_stop_market_close_all(
                     api_key=api_key,
                     api_secret=api_secret,
-                    category=category,
                     symbol=symbol,
                     side=close_side,
-                    order_type="Market",
-                    qty=qty,
-                    reduce_only=(True if mt == "futures" else None),
-                    trigger_price=_round_tick(sl, tick),
-                    close_on_trigger=(True if mt == "futures" else None),
+                    stop_price=_round_tick(sl, tick),
+                    client_order_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind="SL"),
                 )
             except Exception:
                 try:
-                    await _bybit_order_create(
-                        api_key=api_key,
-                        api_secret=api_secret,
-                        category=category,
-                        symbol=symbol,
-                        side=close_side,
-                        order_type="Market",
-                        qty=qty,
-                        reduce_only=(True if mt == "futures" else None),
-                    )
+                    await _binance_futures_reduce_market(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=qty)
                 except Exception:
                     pass
                 raise
 
-            # TP(s) as limit reduce-only for futures; spot normal sell. If TP1 fails, close to avoid half-configured strategy.
+            # TP reduce-only limits (respect LOT_SIZE)
+            has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
+            qty1 = _round_step(qty * (0.5 if has_tp2 else 1.0), step)
+            qty2 = _round_step(qty - qty1, step) if has_tp2 else 0.0
+            if min_qty > 0 and qty1 < min_qty:
+                # Not enough size for strategy
+                raise ExchangeAPIError(f"Binance FUTURES qty<minQty after rounding: {qty1} < {min_qty}")
+            if has_tp2 and min_qty > 0 and qty2 < min_qty:
+                has_tp2 = False
+                qty1 = qty
+                qty2 = 0.0
             try:
-                tp1_res = await _bybit_order_create(
+                tp1_res = await _binance_futures_reduce_limit(
                     api_key=api_key,
                     api_secret=api_secret,
-                    category=category,
                     symbol=symbol,
                     side=close_side,
-                    order_type="Limit",
                     qty=qty1,
                     price=_round_tick(tp1, tick),
-                    reduce_only=(True if mt == "futures" else None),
+                    client_order_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind="TP2"),
                 )
             except Exception:
+                # Cancel SL and close to avoid half-configured strategy
                 try:
-                    await _bybit_cancel_order(api_key=api_key, api_secret=api_secret, category=category, symbol=symbol, order_id=str((sl_res.get("result") or {}).get("orderId") or ""))
+                    await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_res.get("orderId") or 0), futures=True)
                 except Exception:
                     pass
                 try:
-                    await _bybit_order_create(
-                        api_key=api_key,
-                        api_secret=api_secret,
-                        category=category,
-                        symbol=symbol,
-                        side=close_side,
-                        order_type="Market",
-                        qty=qty,
-                        reduce_only=(True if mt == "futures" else None),
-                    )
+                    await _binance_futures_reduce_market(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=qty)
                 except Exception:
                     pass
                 raise
-
             tp2_res = None
             if has_tp2 and qty2 > 0:
                 try:
-                    tp2_res = await _bybit_order_create(
-                        api_key=api_key,
-                        api_secret=api_secret,
-                        category=category,
-                        symbol=symbol,
-                        side=close_side,
-                        order_type="Limit",
-                        qty=qty2,
-                        price=_round_tick(tp2, tick),
-                        reduce_only=(True if mt == "futures" else None),
-                    )
+                    tp2_res = await _binance_futures_reduce_limit(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=qty2, price=_round_tick(tp2, tick))
                 except Exception:
                     tp2_res = None
 
-            def _rid(x: dict | None) -> str | None:
-                if not isinstance(x, dict):
-                    return None
-                return str((x.get("result") or {}).get("orderId") or "") or None
-
             ref = {
-                "exchange": "bybit",
-                "market_type": mt,
-                "category": category,
+                "exchange": "binance",
+                "market_type": "futures",
                 "symbol": symbol,
                 "side": side,
                 "close_side": close_side,
-                "entry_order_id": str(order_id) if order_id else None,
-                "sl_order_id": _rid(sl_res),
-                "tp1_order_id": _rid(tp1_res),
-                "tp2_order_id": _rid(tp2_res),
+                "entry_order_id": entry_res.get("orderId"),
+                "sl_order_id": sl_res.get("orderId"),
+                "tp1_order_id": tp1_res.get("orderId"),
+                "tp2_order_id": (tp2_res.get("orderId") if isinstance(tp2_res, dict) else None),
                 "entry_price": float(entry or 0.0),
                 "be_price": float(entry or 0.0),
                 "be_moved": False,
@@ -1577,430 +2062,54 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             await db_store.create_autotrade_position(
                 user_id=uid,
                 signal_id=sig_id,
-                exchange="bybit",
-                market_type=mt,
-                symbol=symbol,
-                side=side,
-                allocated_usdt=need_usdt,
-                api_order_ref=json.dumps(ref),
-            )
-            return {"ok": True, "skipped": False, "api_error": None,
-                    **({"cap_ui": float(fut_cap), "cap_effective": float(eff_cap), "cap_decreased": bool(cap_decreased), "cap_prev_effective": prev_eff_val, "winrate": (float(winrate) if winrate is not None else None)} if mt == "futures" else {})
-                    }
-
-        
-        # -------- OKX / MEXC / Gate.io (SPOT) --------
-        if exchange in ("okx", "mexc", "gateio"):
-            if mt != "spot":
-                return {"ok": False, "skipped": True, "api_error": None}
-
-            # Futures cap is irrelevant for SPOT; spot cap is wallet balance.
-            symbol = _normalize_symbol(getattr(sig, "symbol", "") or "")
-            if not symbol:
-                raise ExchangeAPIError("missing symbol")
-
-            # Use public price to estimate base quantity for virtual SL/TP tracking
-            if exchange == "okx":
-                px = await _okx_public_price(symbol)
-            elif exchange == "mexc":
-                px = await _mexc_public_price(symbol)
-            else:
-                px = await _gateio_public_price(symbol)
-
-            if not px or px <= 0:
-                raise ExchangeAPIError("price_unavailable")
-
-            est_qty = (need_usdt / float(px)) if need_usdt > 0 else 0.0
-            if est_qty <= 0:
-                raise ExchangeAPIError("qty_estimate_zero")
-
-            # Execute market entry
-            if direction == "SHORT":
-                # Spot short is not supported in this bot (requires margin). Skip safely.
-                return {"ok": False, "skipped": True, "api_error": None}
-
-            if exchange == "okx":
-                passphrase = _decrypt_token(row.get("passphrase_enc"))
-                entry_order = await _okx_spot_market_buy(api_key=api_key, api_secret=api_secret, passphrase=passphrase, symbol=symbol, quote_usdt=need_usdt)
-            elif exchange == "mexc":
-                entry_order = await _mexc_spot_market_buy(api_key=api_key, api_secret=api_secret, symbol=symbol, quote_usdt=need_usdt)
-            else:
-                entry_order = await _gateio_spot_market_buy(api_key=api_key, api_secret=api_secret, symbol=symbol, quote_usdt=need_usdt)
-
-            # Store a virtual manager ref (virtual SL/TP + BE after TP1)
-            ref = {
-                "exchange": exchange,
-                "market_type": "spot",
-                "symbol": symbol,
-                "side": "BUY",
-                "close_side": "SELL",
-                "virtual": True,
-                "entry_price": float(px),
-                "be_price": float(px),
-                "be_moved": False,
-                "tp1_hit": False,
-                "qty": float(est_qty),
-                "tp1": float(tp1 or 0.0),
-                "tp2": float(tp2 or 0.0),
-                "sl": float(sl or 0.0),
-            }
-
-            sig_id = _extract_signal_id(sig)
-            if sig_id <= 0:
-                raise ExchangeAPIError("missing signal_id")
-            await db_store.create_autotrade_position(
-                user_id=uid,
-                signal_id=sig_id,
-                exchange=exchange,
-                market_type="spot",
-                symbol=symbol,
-                side="BUY",
-                allocated_usdt=need_usdt,
-                api_order_ref=json.dumps(ref),
-            )
-            return {"ok": True, "skipped": False, "api_error": None}
-
-        # Safety guard: never fall through into Binance execution for other exchanges
-        if exchange != "binance":
-            return {"ok": False, "skipped": True, "api_error": None}
-
-# -------- Binance --------
-        if mt == "spot":
-            free = await _binance_spot_free_usdt(api_key, api_secret)
-            if free < need_usdt:
-                return {"ok": False, "skipped": True, "api_error": None}
-
-            info = await _binance_exchange_info(futures=False)
-            qty_step, min_qty, tick, min_notional = _binance_symbol_filters(info, symbol)
-
-            # Entry: market buy by quote amount (USDT)
-            entry_res = await _binance_spot_market_buy_quote(
-                api_key=api_key,
-                api_secret=api_secret,
-                symbol=symbol,
-                quote_usdt=need_usdt,
-            )
-
-            exec_qty = float(entry_res.get("executedQty") or 0.0)
-            if exec_qty <= 0:
-                # fallback: attempt to infer from fills
-                q = 0.0
-                for f in entry_res.get("fills", []) or []:
-                    q += float(f.get("qty") or 0.0)
-                exec_qty = q
-            if exec_qty <= 0:
-                raise ExchangeAPIError(f"Binance SPOT entry executedQty=0: {entry_res}")
-
-            # Split for TP1/TP2 (respect LOT_SIZE)
-            has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
-            # Partial close % is configurable via env (TP1_PARTIAL_CLOSE_PCT_SPOT)
-            p = max(0.0, min(100.0, float(_tp1_partial_close_pct('SPOT'))))
-            a = p / 100.0
-            qty1 = exec_qty * (a if has_tp2 else 1.0)
-            qty2 = (exec_qty - qty1) if has_tp2 else 0.0
-            qty1 = _round_step(qty1, qty_step)
-            qty2 = _round_step(qty2, qty_step)
-            exec_qty = _round_step(exec_qty, qty_step)
-            if exec_qty < min_qty:
-                raise ExchangeAPIError(f"Binance SPOT qty<minQty after rounding: {exec_qty} < {min_qty}")
-            if has_tp2 and qty2 < min_qty:
-                # If the second leg becomes too small, do a single TP.
-                has_tp2 = False
-                qty1 = exec_qty
-                qty2 = 0.0
-
-            # --- VIRTUAL mode: do not place SL/TP orders on exchange ---
-            if _VIRTUAL_SLTP_ALL:
-                # Use actual executed qty from entry as the managed base qty.
-                entry_p = float(entry or 0.0)
-                ref = {
-                    "virtual": True,
-                    "exchange": "binance",
-                    "market_type": "spot",
-                    "symbol": symbol,
-                    "direction": direction,
-                    "side": "BUY",
-                    "close_side": "SELL",
-                    "entry_price": entry_p,
-                    "qty": float(exec_qty),
-                    "tp1": float(tp1 or 0.0),
-                    "tp2": float(tp2 or 0.0),
-                    "sl": float(sl or 0.0),
-                    "tp1_hit": False,
-                    "be_moved": False,
-                    "be_price": 0.0,
-                }
-                sig_id = _extract_signal_id(sig)
-                if sig_id <= 0:
-                    raise ExchangeAPIError("missing signal_id")
-                await db_store.create_autotrade_position(
-                    user_id=uid,
-                    signal_id=sig_id,
-                    exchange="binance",
-                    market_type="spot",
-                    symbol=symbol,
-                    side="BUY",
-                    allocated_usdt=need_usdt,
-                    api_order_ref=json.dumps(ref),
-                )
-                return {"ok": True, "skipped": False, "api_error": None}
-
-
-            # Place SL first; if SL fails, immediately close (sell) to avoid an unprotected position.
-            try:
-                sl_res = await _binance_spot_stop_loss_limit_sell(
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    symbol=symbol,
-                    qty=exec_qty,
-                    stop_price=_round_tick(sl, tick),
-                )
-            except Exception as e:
-                # Emergency close
-                try:
-                    await _binance_spot_market_sell_base(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=exec_qty)
-                except Exception:
-                    pass
-                raise
-
-            # Place TP(s). If TP1 fails, close to avoid keeping a half-configured strategy.
-            try:
-                tp1_res = await _binance_spot_limit_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=qty1, price=_round_tick(tp1, tick))
-            except Exception:
-                try:
-                    await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_res.get("orderId") or 0), futures=False)
-                except Exception:
-                    pass
-                try:
-                    await _binance_spot_market_sell_base(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=exec_qty)
-                except Exception:
-                    pass
-                raise
-            tp2_res = None
-            if has_tp2 and qty2 > 0:
-                tp2_res = await _binance_spot_limit_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, qty=qty2, price=_round_tick(tp2, tick))
-
-            ref = {
-                "exchange": "binance",
-                "market_type": "spot",
-                "symbol": symbol,
-                "side": "BUY",
-                "entry_order_id": entry_res.get("orderId"),
-                "sl_order_id": sl_res.get("orderId"),
-                "tp1_order_id": tp1_res.get("orderId"),
-                "tp2_order_id": (tp2_res.get("orderId") if isinstance(tp2_res, dict) else None),
-                "entry_price": float(entry or 0.0),
-                "be_price": float(entry or 0.0),
-                "be_moved": False,
-                "qty": exec_qty,
-                "tp1": tp1,
-                "tp2": tp2,
-                "sl": sl,
-            }
-
-            sig_id = _extract_signal_id(sig)
-            if sig_id <= 0:
-                raise ExchangeAPIError("missing signal_id")
-            await db_store.create_autotrade_position(
-                user_id=uid,
-                signal_id=sig_id,
-                exchange="binance",
-                market_type="spot",
-                symbol=symbol,
-                side="BUY",
-                allocated_usdt=need_usdt,
-                api_order_ref=json.dumps(ref),
-            )
-            return {"ok": True, "skipped": False, "api_error": None}
-
-        # futures
-        used = await db_store.get_autotrade_used_usdt(uid, "futures")
-        if fut_cap > 0 and used + need_usdt > fut_cap:
-            return {"ok": False, "skipped": True, "api_error": None}
-
-        avail = await _binance_futures_available_margin(api_key, api_secret)
-        if avail < need_usdt:
-            return {"ok": False, "skipped": True, "api_error": None}
-
-        await _binance_futures_set_leverage(api_key=api_key, api_secret=api_secret, symbol=symbol, leverage=fut_lev)
-
-        # compute qty from margin*leverage/price
-        px = await _binance_price(symbol, futures=True)
-        if px <= 0:
-            raise ExchangeAPIError("Binance futures price=0")
-        raw_qty = (need_usdt * float(fut_lev)) / px
-        info = await _binance_exchange_info(futures=True)
-        step, min_qty, tick, _mn = _binance_symbol_filters(info, symbol)
-        qty = _round_step(raw_qty, step) if step > 0 else raw_qty
-        if min_qty > 0 and qty < min_qty:
-            qty = min_qty
-
-        side = "BUY" if direction == "LONG" else "SELL"
-        close_side = "SELL" if side == "BUY" else "BUY"
-        entry_res = await _binance_futures_market_open(api_key=api_key, api_secret=api_secret, symbol=symbol, side=side, qty=qty)
-
-        # --- VIRTUAL mode: do not place SL/TP orders on exchange ---
-        if _VIRTUAL_SLTP_ALL:
-            entry_p = float(entry or 0.0)
-            ref = {
-                "virtual": True,
-                "exchange": "binance",
-                "market_type": "futures",
-                "symbol": symbol,
-                "direction": direction,
-                "side": side.upper(),
-                "close_side": ("SELL" if side.upper() == "BUY" else "BUY"),
-                "entry_price": entry_p,
-                "qty": float(qty),
-                "tp1": float(tp1 or 0.0),
-                "tp2": float(tp2 or 0.0),
-                "sl": float(sl or 0.0),
-                "tp1_hit": False,
-                "be_moved": False,
-                "be_price": 0.0,
-            }
-            sig_id = _extract_signal_id(sig)
-            if sig_id <= 0:
-                raise ExchangeAPIError("missing signal_id")
-            await db_store.create_autotrade_position(
-                user_id=uid,
-                signal_id=sig_id,
                 exchange="binance",
                 market_type="futures",
                 symbol=symbol,
                 side=side,
                 allocated_usdt=need_usdt,
                 api_order_ref=json.dumps(ref),
+                client_order_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind="TP2"),
             )
             return {"ok": True, "skipped": False, "api_error": None}
 
-
-        # Place SL first; if SL fails, immediately close position to avoid unprotected exposure.
-        try:
-            sl_res = await _binance_futures_stop_market_close_all(
-                api_key=api_key,
-                api_secret=api_secret,
-                symbol=symbol,
-                side=close_side,
-                stop_price=_round_tick(sl, tick),
+        except ExchangeAPIError as e:
+            err = str(e)
+            await db_store.mark_autotrade_key_error(
+                user_id=uid,
+                exchange=exchange,
+                market_type=mt,
+                error=err,
+                deactivate=_should_deactivate_key(err),
             )
-        except Exception:
-            try:
-                await _binance_futures_reduce_market(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=qty)
-            except Exception:
-                pass
-            raise
-
-        # TP reduce-only limits (respect LOT_SIZE)
-        has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
-        qty1 = _round_step(qty * (0.5 if has_tp2 else 1.0), step)
-        qty2 = _round_step(qty - qty1, step) if has_tp2 else 0.0
-        if min_qty > 0 and qty1 < min_qty:
-            # Not enough size for strategy
-            raise ExchangeAPIError(f"Binance FUTURES qty<minQty after rounding: {qty1} < {min_qty}")
-        if has_tp2 and min_qty > 0 and qty2 < min_qty:
-            has_tp2 = False
-            qty1 = qty
-            qty2 = 0.0
-        try:
-            tp1_res = await _binance_futures_reduce_limit(
-                api_key=api_key,
-                api_secret=api_secret,
-                symbol=symbol,
-                side=close_side,
-                qty=qty1,
-                price=_round_tick(tp1, tick),
+            return {"ok": False, "skipped": False, "api_error": err}
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            await db_store.mark_autotrade_key_error(
+                user_id=uid,
+                exchange=exchange,
+                market_type=mt,
+                error=err,
+                deactivate=_should_deactivate_key(err),
             )
-        except Exception:
-            # Cancel SL and close to avoid half-configured strategy
-            try:
-                await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(sl_res.get("orderId") or 0), futures=True)
-            except Exception:
-                pass
-            try:
-                await _binance_futures_reduce_market(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=qty)
-            except Exception:
-                pass
-            raise
-        tp2_res = None
-        if has_tp2 and qty2 > 0:
-            try:
-                tp2_res = await _binance_futures_reduce_limit(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=qty2, price=_round_tick(tp2, tick))
-            except Exception:
-                tp2_res = None
-
-        ref = {
-            "exchange": "binance",
-            "market_type": "futures",
-            "symbol": symbol,
-            "side": side,
-            "close_side": close_side,
-            "entry_order_id": entry_res.get("orderId"),
-            "sl_order_id": sl_res.get("orderId"),
-            "tp1_order_id": tp1_res.get("orderId"),
-            "tp2_order_id": (tp2_res.get("orderId") if isinstance(tp2_res, dict) else None),
-            "entry_price": float(entry or 0.0),
-            "be_price": float(entry or 0.0),
-            "be_moved": False,
-            "qty": qty,
-            "tp1": tp1,
-            "tp2": tp2,
-            "sl": sl,
-        }
-
-        sig_id = _extract_signal_id(sig)
-        if sig_id <= 0:
-            raise ExchangeAPIError("missing signal_id")
-        await db_store.create_autotrade_position(
-            user_id=uid,
-            signal_id=sig_id,
-            exchange="binance",
-            market_type="futures",
-            symbol=symbol,
-            side=side,
-            allocated_usdt=need_usdt,
-            api_order_ref=json.dumps(ref),
-        )
-        return {"ok": True, "skipped": False, "api_error": None}
-
-    except ExchangeAPIError as e:
-        err = str(e)
-        await db_store.mark_autotrade_key_error(
-            user_id=uid,
-            exchange=exchange,
-            market_type=mt,
-            error=err,
-            deactivate=_should_deactivate_key(err),
-        )
-        return {"ok": False, "skipped": False, "api_error": err}
-    except Exception as e:
-        err = f"{type(e).__name__}: {e}"
-        await db_store.mark_autotrade_key_error(
-            user_id=uid,
-            exchange=exchange,
-            market_type=mt,
-            error=err,
-            deactivate=_should_deactivate_key(err),
-        )
-        return {"ok": False, "skipped": False, "api_error": err}
+            return {"ok": False, "skipped": False, "api_error": err}
 
 
-# ------------------ Auto-trade soft reconcile (manual close sync) ------------------
-# If a user closes a position manually on the exchange, SL/TP orders may never be FILLED,
-# and the DB row in autotrade_positions can stay OPEN forever. We periodically reconcile
-# OPEN rows against real balances/positions and close them best-effort.
-_LAST_RECONCILE_TS: dict[int, float] = {}
-_SMART_TICK_TS: dict[int, float] = {}  # pos_id -> last log ts
-_RECONCILE_COOLDOWN_SEC = max(10, int(os.getenv("AUTOTRADE_RECONCILE_SEC", "60") or "60"))
-_DUST_PCT = float(os.getenv("AUTOTRADE_DUST_PCT", "0.01") or "0.01")   # 1% of original qty
-_DUST_MIN = float(os.getenv("AUTOTRADE_DUST_MIN", "1e-8") or "1e-8")
+    # ------------------ Auto-trade soft reconcile (manual close sync) ------------------
+    # If a user closes a position manually on the exchange, SL/TP orders may never be FILLED,
+    # and the DB row in autotrade_positions can stay OPEN forever. We periodically reconcile
+    # OPEN rows against real balances/positions and close them best-effort.
+    _LAST_RECONCILE_TS: dict[int, float] = {}
+    _SMART_TICK_TS: dict[int, float] = {}  # pos_id -> last log ts
+    _RECONCILE_COOLDOWN_SEC = max(10, int(os.getenv("AUTOTRADE_RECONCILE_SEC", "60") or "60"))
+    _DUST_PCT = float(os.getenv("AUTOTRADE_DUST_PCT", "0.01") or "0.01")   # 1% of original qty
+    _DUST_MIN = float(os.getenv("AUTOTRADE_DUST_MIN", "1e-8") or "1e-8")
 
-def _base_asset(symbol: str) -> str:
-    s = (symbol or "").upper().strip()
-    for q in ("USDT","USDC","BUSD","USD"):
-        if s.endswith(q) and len(s) > len(q):
-            return s[:-len(q)]
-    return s
+    def _base_asset(symbol: str) -> str:
+        s = (symbol or "").upper().strip()
+        for q in ("USDT","USDC","BUSD","USD"):
+            if s.endswith(q) and len(s) > len(q):
+                return s[:-len(q)]
+        return s
 
 async def _spot_base_balance(*, ex: str, api_key: str, api_secret: str, passphrase: str | None, symbol: str) -> float:
     base = _base_asset(symbol)
@@ -2407,6 +2516,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                     side="Sell",
                                     order_type="Market",
                                     qty=q2,
+                                    client_order_id=entry_idem,
                                 )
                             elif ex == "okx":
                                 await _okx_spot_market_sell(api_key=api_key, api_secret=api_secret, passphrase=passphrase or "", symbol=symbol, base_qty=q2)
@@ -2707,6 +2817,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 trigger_price=be_price,
                                 reduce_only=(True if mt == "futures" else None),
                                 close_on_trigger=(True if mt == "futures" else None),
+                        order_link_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind=\"SL\"),
+                        client_order_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side="SELL", kind="SL"),
                             )
 
                         if ex == "binance":
