@@ -859,7 +859,7 @@ async def _bybit_order_create(
     if close_on_trigger is not None:
         body["closeOnTrigger"] = bool(close_on_trigger)
     if order_link_id:
-        body[\"orderLinkId\"] = str(order_link_id)[:36]
+        body["orderLinkId"] = str(order_link_id)[:36]
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _bybit_v5_request(
@@ -945,7 +945,7 @@ async def _binance_spot_market_buy_quote(
 ) -> dict:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
-                params = {
+        params = {
                 "symbol": symbol.upper(),
                 "side": "BUY",
                 "type": "MARKET",
@@ -977,7 +977,7 @@ async def _binance_spot_market_sell_base(
     """Emergency spot close (SELL MARKET by base quantity)."""
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
-                params = {
+        params = {
                 "symbol": symbol.upper(),
                 "side": "SELL",
                 "type": "MARKET",
@@ -1009,7 +1009,7 @@ async def _binance_spot_limit_sell(
 ) -> dict:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
-                params = {
+        params = {
                 "symbol": symbol.upper(),
                 "side": "SELL",
                 "type": "LIMIT",
@@ -1044,7 +1044,7 @@ async def _binance_spot_stop_loss_limit_sell(
     limit_price = stop_price * 0.999
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
-                params = {
+        params = {
                 "symbol": symbol.upper(),
                 "side": "SELL",
                 "type": "STOP_LOSS_LIMIT",
@@ -1097,7 +1097,7 @@ async def _binance_futures_market_open(
 ) -> dict:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
-                params = {
+        params = {
                 "symbol": symbol.upper(),
                 "side": side.upper(),
                 "type": "MARKET",
@@ -1129,7 +1129,7 @@ async def _binance_futures_reduce_limit(
 ) -> dict:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
-                params = {
+        params = {
                 "symbol": symbol.upper(),
                 "side": side.upper(),
                 "type": "LIMIT",
@@ -1164,7 +1164,7 @@ async def _binance_futures_reduce_market(
     """Reduce-only MARKET order (emergency close / partial close)."""
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
-                params = {
+        params = {
                 "symbol": symbol.upper(),
                 "side": side.upper(),
                 "type": "MARKET",
@@ -1197,7 +1197,7 @@ async def _binance_futures_stop_market_close_all(
     # side is the close side (opposite to entry): SELL closes long, BUY closes short.
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
-                params = {
+        params = {
                 "symbol": symbol.upper(),
                 "side": side.upper(),
                 "type": "STOP_MARKET",
@@ -1257,7 +1257,7 @@ async def _binance_cancel_order(*, api_key: str, api_secret: str, symbol: str, o
         )
 
 
-async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
+async def autotrade_execute(user_id: int, sig: "Signal", *, dry_run: bool | None = None) -> dict:
     """Execute real trading orders for a signal for a single user.
 
     Returns dict:
@@ -1438,6 +1438,24 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
         if not reserved:
             return {"ok": False, "skipped": True, "api_error": None}
 
+
+        # DRY-RUN: used for stress-testing idempotency/DB-reservation without placing real exchange orders.
+        # Effective dry_run is parameter override OR environment variable AUTOTRADE_DRY_RUN=1/true.
+        _env_dry = str(os.getenv("AUTOTRADE_DRY_RUN", "") or "").strip().lower() in ("1", "true", "yes", "y")
+        _dry = _env_dry if dry_run is None else bool(dry_run)
+        if _dry:
+            # Cleanup reservation so UI isn't polluted by test positions.
+            try:
+                await db_store.cleanup_autotrade_reservation(
+                    user_id=uid,
+                    market_type=mt,
+                    symbol=symbol,
+                    reservation_ref=f"RESERVED:{entry_idem}",
+                )
+            except Exception:
+                pass
+            return {"ok": True, "skipped": False, "api_error": None, "dry_run": True}
+
         try:
             if exchange == "bybit":
                 category = "spot" if mt == "spot" else "linear"
@@ -1578,7 +1596,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                         reduce_only=(True if mt == "futures" else None),
                         trigger_price=_round_tick(sl, tick),
                         close_on_trigger=(True if mt == "futures" else None),
-                        order_link_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind=\"SL\"),
+                        order_link_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind="SL"),
                     )
                 except Exception:
                     try:
@@ -1608,7 +1626,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                         qty=qty1,
                         price=_round_tick(tp1, tick),
                         reduce_only=(True if mt == "futures" else None),
-                        order_link_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind=\"TP1\"),
+                        order_link_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind="TP1"),
                     )
                 except Exception:
                     try:
@@ -1643,7 +1661,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                             qty=qty2,
                             price=_round_tick(tp2, tick),
                             reduce_only=(True if mt == "futures" else None),
-                            order_link_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind=\"TP2\"),
+                            order_link_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind="TP2"),
                         )
                     except Exception:
                         tp2_res = None
@@ -2232,6 +2250,83 @@ async def _futures_position_size(*, ex: str, api_key: str, api_secret: str, symb
             return 0.0
     return 0.0
 
+
+async def autotrade_healthcheck(*, stale_minutes: int | None = None) -> dict:
+    """Lightweight health snapshot for autotrade (DB only).
+
+    Returns dict with counts and a few sample stale reservations (if any).
+    """
+    try:
+        sm = int(stale_minutes or int(os.getenv("AUTOTRADE_STALE_MINUTES", "10") or 10))
+    except Exception:
+        sm = 10
+    snap = await db_store.autotrade_health_snapshot(stale_minutes=sm, sample_limit=10)
+    snap["stale_minutes"] = sm
+    snap["ts"] = time.time()
+    return snap
+
+
+async def autotrade_stress_test(
+    *,
+    admin_user_id: int,
+    symbol: str = "BTCUSDT",
+    market: str = "SPOT",
+    n: int = 50,
+) -> dict:
+    """SAFE race stress-test: runs N parallel autotrade_execute() calls in DRY-RUN.
+
+    It does NOT place real exchange orders. It validates that the DB reservation + locks prevent duplicates.
+    """
+    if n < 2:
+        n = 2
+    if n > 200:
+        n = 200
+
+    mk = _market_key(market)
+    # Build a synthetic signal (autotrade_execute reads signal fields even in dry-run up to reservation).
+    sig = Signal(
+        signal_id=int(time.time()) % 10_000_000 + 1,
+        market="SPOT" if mk == "spot" else "FUTURES",
+        symbol=str(symbol or "BTCUSDT").upper(),
+        direction="LONG",
+        timeframe="1H",
+        entry=1.0,
+        sl=0.9,
+        tp1=1.1,
+        tp2=1.2,
+        rr=1.0,
+        confidence=50,
+        confirmations="",
+        risk_note="stress-test",
+        ts=time.time(),
+    )
+
+    # Temporarily force dry-run for this stress test.
+    tasks = [autotrade_execute(int(admin_user_id), sig, dry_run=True) for _ in range(int(n))]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    ok = 0
+    errs: list[str] = []
+    for r in results:
+        if isinstance(r, Exception):
+            errs.append(f"{type(r).__name__}: {r}")
+        else:
+            if bool(r.get("ok")):
+                ok += 1
+
+    # Health snapshot after the run (should have zero stale reservations due to cleanup).
+    snap = await autotrade_healthcheck()
+    return {
+        "ok": True,
+        "symbol": sig.symbol,
+        "market": sig.market,
+        "n": int(n),
+        "ok_results": ok,
+        "errors": errs[:10],
+        "health": snap,
+    }
+
+
 async def autotrade_manager_loop(*, notify_api_error) -> None:
     """Background loop to manage SL/TP/BE for real orders.
 
@@ -2817,7 +2912,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 trigger_price=be_price,
                                 reduce_only=(True if mt == "futures" else None),
                                 close_on_trigger=(True if mt == "futures" else None),
-                        order_link_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind=\"SL\"),
+                        order_link_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side=close_side, kind="SL"),
                         client_order_id=_idem_key(user_id=uid, signal_id=sig_id, exchange=exchange, market_type=mt, symbol=symbol, side="SELL", kind="SL"),
                             )
 
