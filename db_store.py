@@ -1201,8 +1201,9 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
                                AND closed_at >= $2 AND closed_at < $3)::int AS trades,
               COUNT(*) FILTER (WHERE status='WIN'  AND closed_at >= $2 AND closed_at < $3)::int AS wins,
               COUNT(*) FILTER (WHERE status='LOSS' AND closed_at >= $2 AND closed_at < $3)::int AS losses,
-              COUNT(*) FILTER (WHERE status='BE'   AND closed_at >= $2 AND closed_at < $3)::int AS be,
-              COUNT(*) FILTER (WHERE tp1_hit=TRUE  AND tp1_hit_at >= $2 AND tp1_hit_at < $3)::int AS tp1_hits,
+                            COUNT(*) FILTER (WHERE status='BE'   AND closed_at >= $2 AND closed_at < $3)::int AS be,
+              COUNT(*) FILTER (WHERE status='CLOSED' AND closed_at >= $2 AND closed_at < $3)::int AS closes,
+                            COUNT(*) FILTER (WHERE tp1_hit=TRUE  AND tp1_hit_at >= $2 AND tp1_hit_at < $3)::int AS tp1_hits,
               COALESCE(SUM(CASE WHEN status IN ('WIN','LOSS','BE','CLOSED')
                                 AND closed_at >= $2 AND closed_at < $3
                                 THEN COALESCE(pnl_total_pct,0) ELSE 0 END),0)::float AS sum_pnl_pct
@@ -1214,12 +1215,13 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
             until,
         )
     if not row:
-        return {"trades": 0, "wins": 0, "losses": 0, "be": 0, "tp1_hits": 0, "sum_pnl_pct": 0.0}
+        return {"trades": 0, "wins": 0, "losses": 0, "be": 0, "closes": 0, "tp1_hits": 0, "sum_pnl_pct": 0.0}
     return {
         "trades": int(row.get("trades") or 0),
         "wins": int(row.get("wins") or 0),
         "losses": int(row.get("losses") or 0),
         "be": int(row.get("be") or 0),
+        "closes": int(row.get("closes") or 0),
         "tp1_hits": int(row.get("tp1_hits") or 0),
         "sum_pnl_pct": float(row.get("sum_pnl_pct") or 0.0),
     }
