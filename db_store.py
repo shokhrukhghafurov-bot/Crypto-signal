@@ -1789,6 +1789,87 @@ async def close_autotrade_position(
         )
 
 
+async def cleanup_autotrade_reservation(
+    *,
+    user_id: int,
+    market_type: str,
+    symbol: str,
+    reservation_ref: str,
+) -> bool:
+    """Delete a reserved/OPEN autotrade position created for dry-run/testing.
+
+    Returns True if something was deleted.
+    """
+    pool = get_pool()
+    uid = int(user_id)
+    mt = str(market_type or "spot").lower()
+    sym = str(symbol or "").upper().strip()
+    ref = str(reservation_ref or "").strip()
+    if not ref or not sym:
+        return False
+
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            """
+            DELETE FROM autotrade_positions
+            WHERE user_id=$1
+              AND market_type=$2
+              AND symbol=$3
+              AND api_order_ref=$4
+              AND status='OPEN'
+            """,
+            uid, mt, sym, ref,
+        )
+        # asyncpg returns like 'DELETE 1'
+        try:
+            n = int(str(res).split()[-1])
+        except Exception:
+            n = 0
+        return n > 0
+
+
+async def autotrade_health_snapshot(*, stale_minutes: int = 10, sample_limit: int = 10) -> dict:
+    """DB-only health snapshot for autotrade."""
+    pool = get_pool()
+    sm = int(stale_minutes or 10)
+    lim = int(sample_limit or 10)
+    if lim < 0:
+        lim = 0
+    async with pool.acquire() as conn:
+        open_cnt = await conn.fetchval(
+            """SELECT COUNT(*) FROM autotrade_positions WHERE status='OPEN'"""
+        )
+        stale_rows = await conn.fetch(
+            """
+            SELECT id, user_id, exchange, market_type, symbol, side, api_order_ref, opened_at
+            FROM autotrade_positions
+            WHERE status='OPEN'
+              AND api_order_ref LIKE 'RESERVED:%'
+              AND opened_at < (NOW() - ($1::int * INTERVAL '1 minute'))
+            ORDER BY opened_at ASC
+            LIMIT $2
+            """,
+            sm, lim,
+        )
+        stale_cnt = await conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM autotrade_positions
+            WHERE status='OPEN'
+              AND api_order_ref LIKE 'RESERVED:%'
+              AND opened_at < (NOW() - ($1::int * INTERVAL '1 minute'))
+            """,
+            sm,
+        )
+    stale = []
+    for r in stale_rows or []:
+        stale.append(dict(r))
+    return {
+        "open_positions": int(open_cnt or 0),
+        "stale_reserved_positions": int(stale_cnt or 0),
+        "stale_samples": stale,
+    }
+
 async def list_open_autotrade_positions(*, limit: int = 200) -> List[Dict[str, Any]]:
     pool = get_pool()
     lim = int(limit or 200)
