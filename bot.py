@@ -23,7 +23,7 @@ from aiohttp import web
 
 import db_store
 
-from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop
+from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test
 
 load_dotenv()
 
@@ -1665,6 +1665,63 @@ async def start(message: types.Message) -> None:
 
 
 # ---------------- language selection ----------------
+
+@dp.message(Command("autotrade_health"))
+async def cmd_autotrade_health(message: types.Message):
+    uid = int(message.from_user.id) if message.from_user else 0
+    if not is_admin(uid):
+        return
+    snap = await autotrade_healthcheck()
+    open_cnt = int(snap.get("open_positions") or 0)
+    stale_cnt = int(snap.get("stale_reserved_positions") or 0)
+    sm = int(snap.get("stale_minutes") or os.getenv("AUTOTRADE_STALE_MINUTES", "10") or 10)
+    lines = [
+        "🩺 *Autotrade health*",
+        f"Open positions: `{open_cnt}`",
+        f"Stale RESERVED (> {sm} min): `{stale_cnt}`",
+    ]
+    if stale_cnt and snap.get("stale_samples"):
+        lines.append("")
+        lines.append("*Samples:*")
+        for r in (snap.get("stale_samples") or [])[:5]:
+            lines.append(f"- id={r.get('id')} u={r.get('user_id')} {r.get('exchange')} {r.get('market_type')} {r.get('symbol')} {r.get('api_order_ref')}")
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@dp.message(Command("autotrade_stress"))
+async def cmd_autotrade_stress(message: types.Message):
+    uid = int(message.from_user.id) if message.from_user else 0
+    if not is_admin(uid):
+        return
+
+    # Usage: /autotrade_stress [SYMBOL] [spot|futures] [N]
+    parts = (message.text or "").strip().split()
+    symbol = parts[1] if len(parts) >= 2 else "BTCUSDT"
+    market = parts[2] if len(parts) >= 3 else "SPOT"
+    try:
+        n = int(parts[3]) if len(parts) >= 4 else 50
+    except Exception:
+        n = 50
+
+    await message.answer(f"⏱ Running stress-test (dry-run): {symbol} {market} x{n} ...")
+    res = await autotrade_stress_test(admin_user_id=uid, symbol=symbol, market=market, n=n)
+    health = res.get("health") or {}
+    errs = res.get("errors") or []
+    txt = [
+        "✅ *Stress-test finished (DRY-RUN)*",
+        f"symbol: `{res.get('symbol')}` market: `{res.get('market')}`",
+        f"tasks: `{res.get('n')}` ok_results: `{res.get('ok_results')}`",
+        f"errors: `{len(errs)}`",
+        f"health.open_positions: `{health.get('open_positions')}`",
+        f"health.stale_reserved_positions: `{health.get('stale_reserved_positions')}`",
+    ]
+    if errs:
+        txt.append("")
+        txt.append("*First errors:*")
+        for e in errs[:5]:
+            txt.append(f"- `{e}`")
+    await message.answer("\n".join(txt), parse_mode="Markdown")
+
 @dp.callback_query(lambda c: (c.data or "").startswith("lang:"))
 async def lang_choose(call: types.CallbackQuery) -> None:
     await call.answer()
