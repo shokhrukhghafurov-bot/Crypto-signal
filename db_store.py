@@ -1653,16 +1653,23 @@ async def create_autotrade_position(
     alloc = float(allocated_usdt or 0.0)
     async with pool.acquire() as conn:
         # Prevent duplicates: if there is already an OPEN position for this symbol, do nothing.
-        exists = await conn.fetchval(
+        row = await conn.fetchrow(
             """
-            SELECT 1 FROM autotrade_positions
+            SELECT signal_id, exchange FROM autotrade_positions
             WHERE user_id=$1 AND market_type=$2 AND symbol=$3 AND status='OPEN'
             LIMIT 1;
             """,
             uid, mt, sym,
         )
-        if exists:
-            return
+        if row:
+            # Allow updating the same reserved/active row (same unique identity),
+            # but skip if another OPEN position already exists for this symbol.
+            try:
+                if int(row.get("signal_id") or 0) != int(signal_id or 0) or str(row.get("exchange") or "").lower() != ex:
+                    return
+            except Exception:
+                return
+
 
         await conn.execute(
             """
@@ -1684,6 +1691,65 @@ async def create_autotrade_position(
             alloc,
             api_order_ref,
         )
+
+
+
+async def reserve_autotrade_position(
+    *,
+    user_id: int,
+    signal_id: Optional[int],
+    exchange: str,
+    market_type: str,
+    symbol: str,
+    side: str,
+    allocated_usdt: float,
+    reservation_ref: str,
+) -> bool:
+    """Atomically reserve an OPEN position row *before* placing orders.
+
+    Returns True if reservation inserted, False if an OPEN position already exists
+    (by symbol) or the (user_id, signal_id, exchange, market_type) uniqueness would conflict.
+    """
+    pool = get_pool()
+    uid = int(user_id)
+    ex = (exchange or "binance").lower().strip()
+    mt = (market_type or "spot").lower().strip()
+    sym = (symbol or "").upper().strip()
+    side = (side or "BUY").upper().strip()
+    alloc = float(allocated_usdt or 0.0)
+
+    if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
+        ex = "binance"
+    if mt not in ("spot", "futures"):
+        mt = "spot"
+    if not sym:
+        sym = "UNKNOWN"
+    if side not in ("BUY", "SELL"):
+        side = "BUY"
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            WITH ins AS (
+                INSERT INTO autotrade_positions(
+                    user_id, signal_id, exchange, market_type, symbol, side,
+                    allocated_usdt, status, api_order_ref, opened_at
+                )
+                SELECT $1,$2,$3,$4,$5,$6,$7,'OPEN',$8,NOW()
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM autotrade_positions
+                    WHERE user_id=$1 AND market_type=$4 AND symbol=$5 AND status='OPEN'
+                    LIMIT 1
+                )
+                ON CONFLICT (user_id, signal_id, exchange, market_type)
+                DO NOTHING
+                RETURNING 1
+            )
+            SELECT 1 AS ok FROM ins;
+            """,
+            uid, signal_id, ex, mt, sym, side, alloc, reservation_ref,
+        )
+        return bool(row)
 
 
 async def close_autotrade_position(
