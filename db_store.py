@@ -1235,6 +1235,7 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
         "wins": int(row.get("wins") or 0),
         "losses": int(row.get("losses") or 0),
         "be": int(row.get("be") or 0),
+        "closes": int(row.get("closes") or 0),
         "tp1_hits": int(row.get("tp1_hits") or 0),
         "sum_pnl_pct": float(row.get("sum_pnl_pct") or 0.0),
     }
