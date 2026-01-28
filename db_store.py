@@ -774,6 +774,20 @@ async def set_tp1(trade_id: int, *, be_price: float, price: float | None = None,
             (float(pnl_pct) if pnl_pct is not None else None),
         )
 
+
+async def set_trade_be_price(trade_id: int, *, be_price: float) -> None:
+    """Update BE price for an ACTIVE/TP1 trade (no status change)."""
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE trades
+            SET be_price=$2
+            WHERE id=$1;
+            """,
+            int(trade_id), float(be_price)
+        )
+
 async def close_trade(trade_id: int, *, status: str, price: float | None = None, pnl_total_pct: float | None = None) -> None:
     """
     status: BE / WIN / LOSS / CLOSED
