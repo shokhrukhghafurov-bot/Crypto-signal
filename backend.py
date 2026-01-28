@@ -3412,6 +3412,13 @@ TA_REQUIRE_1H_TREND = _env_bool("TA_REQUIRE_1H_TREND", True if SIGNAL_MODE == "s
 COOLDOWN_MINUTES = max(1, _env_int("COOLDOWN_MINUTES", 180))
 
 MICRO_ENABLE = _env_bool("MICRO_ENABLE", False)
+MICRO_COOLDOWN_MINUTES_ENV = _env_int("MICRO_COOLDOWN_MINUTES", 0)
+MICRO_COOLDOWN_SEC = max(10, _env_int("MICRO_COOLDOWN_SEC", 300))
+if MICRO_COOLDOWN_MINUTES_ENV > 0:
+    MICRO_COOLDOWN_SEC = max(10, int(MICRO_COOLDOWN_MINUTES_ENV) * 60)
+# Keep minutes value for UI/logs if needed
+MICRO_COOLDOWN_MINUTES = max(1, int(math.ceil(MICRO_COOLDOWN_SEC / 60)))
+
 SMART_BE_TRAIL_ENABLE = _env_bool("SMART_BE_TRAIL_ENABLE", False)
 SMART_BE_TRAIL_STEP_PCT = max(0.0, _env_float("SMART_BE_TRAIL_STEP_PCT", 0.15))  # percent
 SMART_BE_TRAIL_MIN_DELTA_PCT = max(0.0, _env_float("SMART_BE_TRAIL_MIN_DELTA_PCT", 0.02))  # percent
@@ -5054,7 +5061,7 @@ class Backend:
 
     def can_emit_micro(self, symbol: str) -> bool:
         ts = self._last_micro_signal_ts.get(symbol.upper(), 0.0)
-        return (time.time() - ts) >= (MICRO_COOLDOWN_MINUTES * 60)
+        return (time.time() - ts) >= float(MICRO_COOLDOWN_SEC)
 
     def mark_emitted(self, symbol: str) -> None:
         self._last_signal_ts[symbol.upper()] = time.time()
