@@ -1276,8 +1276,22 @@ def _signal_text(uid: int, s: Signal) -> str:
 
     ex_line_raw = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
     exchanges_line = f"{tr(uid, 'sig_exchanges')}: {ex_line_raw}\n" if ex_line_raw else ""
-    # Keep TF on its own line; timeframe string already like 15m/1h/4h
-    tf_line = f"{tr(uid, 'sig_tf')}: {s.timeframe}"
+    # TF line: show Entry TF and Trend TF, localized via i18n.
+    # Expect s.timeframe like "15m/1h/4h" (MAIN) or "5m/15m+1h" (MICRO).
+    _tf_raw = str(getattr(s, "timeframe", "") or "").strip()
+    _entry_tf = _tf_raw
+    _trend_tf = ""
+    if "/" in _tf_raw:
+        _entry_tf, _trend_tf = _tf_raw.split("/", 1)
+        _entry_tf = _entry_tf.strip() or _tf_raw
+        _trend_tf = _trend_tf.strip()
+    if _trend_tf:
+        # Use i18n template to avoid hard-coded text.
+        tf_line = trf(uid, "sig_tf_line", entry_tf=_entry_tf, trend_tf=_trend_tf)
+    else:
+        # Fallback to legacy format
+        tf_line = f"{tr(uid, 'sig_tf')}: {_tf_raw}"
+
 
     tp_lines = "\n".join(_tp_lines())
 
