@@ -4805,6 +4805,8 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     }
     ta["ta_block"] = _fmt_ta_block(ta)
     return ta
+
+
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
     return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
 
@@ -4955,6 +4957,7 @@ class Backend:
         self.macro = MacroCalendar()
         # Trades are stored in PostgreSQL (db_store)
         self._last_signal_ts: Dict[str, float] = {}
+        self._last_micro_signal_ts: Dict[str, float] = {}
         self._signal_seq = 1
 
         # Track when price fetching started failing per trade_id (used for forced CLOSE)
@@ -4981,8 +4984,15 @@ class Backend:
         ts = self._last_signal_ts.get(symbol.upper(), 0.0)
         return (time.time() - ts) >= (COOLDOWN_MINUTES * 60)
 
+    def can_emit_micro(self, symbol: str) -> bool:
+        ts = self._last_micro_signal_ts.get(symbol.upper(), 0.0)
+        return (time.time() - ts) >= (MICRO_COOLDOWN_MINUTES * 60)
+
     def mark_emitted(self, symbol: str) -> None:
         self._last_signal_ts[symbol.upper()] = time.time()
+
+    def mark_emitted_micro(self, symbol: str) -> None:
+        self._last_micro_signal_ts[symbol.upper()] = time.time()
 
     async def open_trade(self, user_id: int, signal: Signal, orig_text: str) -> bool:
         """Persist trade in Postgres. Returns False if already opened."""
@@ -5732,10 +5742,15 @@ class Backend:
                         await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
 
                     for sym in symbols:
-                        if not self.can_emit(sym):
+                        can_main = self.can_emit(sym)
+                        can_micro = bool(MICRO_ENABLE and self.can_emit_micro(sym))
+                        if not can_main and not can_micro:
                             continue
                         if mac_act == "PAUSE_ALL":
                             continue
+
+                        # Micro-trend is fully optional and has its own cooldown.
+                        do_micro = bool(can_micro)
 
                         # News action
                         try:
@@ -5752,29 +5767,40 @@ class Backend:
                         async def fetch_exchange(name: str):
                             try:
                                 if name == "BINANCE":
+                                    df5 = await api.klines_binance(sym, MICRO_ENTRY_TF, 300) if do_micro else None
                                     df15 = await api.klines_binance(sym, "15m", 250)
                                     df1h = await api.klines_binance(sym, "1h", 250)
                                     df4h = await api.klines_binance(sym, "4h", 250)
                                 elif name == "BYBIT":
+                                    df5 = await api.klines_bybit(sym, MICRO_ENTRY_TF, 300) if do_micro else None
                                     df15 = await api.klines_bybit(sym, "15m", 200)
                                     df1h = await api.klines_bybit(sym, "1h", 200)
                                     df4h = await api.klines_bybit(sym, "4h", 200)
                                 elif name == "OKX":
+                                    df5 = await api.klines_okx(sym, MICRO_ENTRY_TF, 300) if do_micro else None
                                     df15 = await api.klines_okx(sym, "15m", 200)
                                     df1h = await api.klines_okx(sym, "1h", 200)
                                     df4h = await api.klines_okx(sym, "4h", 200)
                                 elif name == "GATEIO":
+                                    df5 = await api.klines_gateio(sym, MICRO_ENTRY_TF, 300) if do_micro else None
                                     df15 = await api.klines_gateio(sym, "15m", 200)
                                     df1h = await api.klines_gateio(sym, "1h", 200)
                                     df4h = await api.klines_gateio(sym, "4h", 200)
                                 else:  # MEXC
+                                    df5 = await api.klines_mexc(sym, MICRO_ENTRY_TF, 300) if do_micro else None
                                     df15 = await api.klines_mexc(sym, "15m", 200)
                                     df1h = await api.klines_mexc(sym, "1h", 200)
                                     df4h = await api.klines_mexc(sym, "4h", 200)
-                                res = evaluate_on_exchange(df15, df1h, df4h)
-                                return name, res
+                                res_main = evaluate_on_exchange(df15, df1h, df4h)
+                                res_micro = None
+                                if do_micro and df5 is not None:
+                                    try:
+                                        res_micro = evaluate_micro_on_exchange(df5, df15, df1h, df4h)
+                                    except Exception:
+                                        res_micro = None
+                                return name, res_main, res_micro
                             except Exception:
-                                return name, None
+                                return name, None, None
 
                         results = await asyncio.gather(
                             fetch_exchange("BINANCE"),
@@ -5783,13 +5809,71 @@ class Backend:
                             fetch_exchange("GATEIO"),
                             fetch_exchange("MEXC"),
                         )
-                        good = [(name, r) for (name, r) in results if r is not None]
-                        if not good:
+                        good_main = [(name, r1) for (name, r1, _r2) in results if r1 is not None]
+                        good_micro = [(name, r2) for (name, _r1, r2) in results if r2 is not None]
+
+                        # Emit MICRO signal first (optional) without affecting the main strategy.
+                        if do_micro and good_micro:
+                            micro_name, micro_r = max(
+                                good_micro,
+                                key=lambda x: (int((x[1] or {}).get("confidence", 0) or 0), float((x[1] or {}).get("rr", 0.0) or 0.0)),
+                            )
+
+                            micro_dir = micro_r["direction"]
+                            micro_entry = float(micro_r["entry"])
+                            micro_sl = float(micro_r["sl"])
+                            micro_tp1 = float(micro_r["tp1"])
+                            micro_tp2 = float(micro_r["tp2"])
+                            micro_rr = float(micro_r["rr"])
+                            micro_conf = int(micro_r["confidence"])
+
+                            micro_market = choose_market(float(micro_r.get("adx1", 0.0) or 0.0), float(micro_r.get("atr_pct", 0.0) or 0.0))
+                            micro_min_conf = TA_MIN_SCORE_FUTURES if micro_market == "FUTURES" else TA_MIN_SCORE_SPOT
+
+                            if micro_conf >= micro_min_conf and micro_rr >= 2.0:
+                                micro_notes: List[str] = ["🧩 MICRO trend"]
+                                try:
+                                    tb = str(micro_r.get("ta_block", "") or "").strip()
+                                    if tb:
+                                        micro_notes.append(tb)
+                                except Exception:
+                                    pass
+
+                                sid_micro = self.next_signal_id()
+                                sig_micro = Signal(
+                                    signal_id=sid_micro,
+                                    market=micro_market,
+                                    symbol=sym,
+                                    direction=micro_dir,
+                                    # Show explicitly where entry comes from and what defines the micro-trend.
+                                    # Keep main 1h/4h trend display untouched; for MICRO we show Trend=15m+1h (configurable).
+                                    timeframe=f"Entry:{MICRO_ENTRY_TF} | Trend:{MICRO_TREND_TF}+1h",
+                                    entry=micro_entry,
+                                    sl=micro_sl,
+                                    tp1=micro_tp1,
+                                    tp2=micro_tp2,
+                                    rr=micro_rr,
+                                    confidence=micro_conf,
+                                    confirmations=micro_name,
+                                    risk_note="\\n".join(micro_notes).strip(),
+                                    ts=time.time(),
+                                )
+
+                                self.mark_emitted_micro(sym)
+                                logger.info("[micro] emit %s %s %s conf=%s rr=%.2f", sig_micro.symbol, sig_micro.market, sig_micro.direction, sig_micro.confidence, float(sig_micro.rr))
+                                await emit_signal_cb(sig_micro)
+                                await asyncio.sleep(1)
+
+                        # If the main strategy is on cooldown, do not run/emit the main signal.
+                        if not can_main:
+                            continue
+
+                        if not good_main:
                             continue
 
                         # Signal can be produced from a single exchange result.
                         best_name, best_r = max(
-                            good,
+                            good_main,
                             key=lambda x: (int((x[1] or {}).get("confidence", 0) or 0), float((x[1] or {}).get("rr", 0.0) or 0.0)),
                         )
                         best_dir = best_r["direction"]
@@ -5916,7 +6000,8 @@ class Backend:
                             market=market,
                             symbol=sym,
                             direction=best_dir,
-                            timeframe="15m/1h/4h",
+                            # Main strategy: explicitly show Entry TF and Trend TFs.
+                            timeframe="Entry:15m | Trend:1h/4h",
                             entry=entry,
                             sl=sl,
                             tp1=tp1,
