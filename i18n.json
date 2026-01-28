@@ -9,6 +9,7 @@
     "action_allow": "ALLOW",
     "action_pause": "PAUSED",
     "at_api_error_title": "⚠️ Auto-trade ERROR",
+    "at_btn_disconnect": "❌ Disconnect",
     "at_cap_auto_spot": "Auto (Spot balance)",
     "at_cap_decreased": "🧠 Effective Cap decreased (risk protection)\n\n📌 Cap (setting): {ui_cap} USDT\n⬇️ Was: {prev_cap} USDT\n✅ Now: {new_cap} USDT\n📊 Winrate(20): {winrate}%\n\nThe bot will open fewer trades to protect your balance.",
     "at_choose_exchange": "Choose exchange",
@@ -61,6 +62,8 @@
     "at_keys_screen": "🔑 API Keys (select)",
     "at_keys_trade_missing": "❌ Keys not activated\nREAD: ✅ OK\nTRADE: ❌ Trading permission missing",
     "at_label_cap": "📌 Cap",
+    "at_label_cap_setting": "📌 Cap (setting)",
+    "at_label_effective_cap_now": "🧠 Effective Cap (now)",
     "at_label_exchange": "🏦 Exchange",
     "at_label_futures_margin": "💰 Margin per trade",
     "at_label_leverage": "🎚 Leverage",
@@ -205,6 +208,7 @@
     "sig_state_paused": "⏸ PAUSED",
     "sig_status": "Status",
     "sig_tf": "⏱ TF",
+    "sig_tf_line": "⏱️ TF: Entry {entry_tf} | Trend {trend_tf}",
     "sig_too_late_body": "⛔️ Too late\n\n{market_emoji} {market} | {symbol}\n🕒 Signal: {time}\n\n📌 Reason: {reason}\n💱 Current price: {price}\n\nLevels: TP1 {tp1} • TP2 {tp2} • SL {sl}\n\nTip: wait for a new signal in Spot live / Futures live.",
     "sig_too_late_reason_error": "signal is no longer available",
     "sig_too_late_reason_sl": "SL already hit (stop-loss)",
@@ -249,10 +253,7 @@
     "weekly_title": "🗓️ Weekly (last 4w)",
     "welcome": "🤖 CryptoAuto-Scanner Bot\n\n✅ You are subscribed to signals.\nUse the buttons below:",
     "welcome_hint": "Use the buttons below:",
-    "welcome_subscribed": "✅ You are subscribed to signals.",
-    "at_btn_disconnect": "❌ Disconnect",
-    "at_label_cap_setting": "📌 Cap (setting)",
-    "at_label_effective_cap_now": "🧠 Effective Cap (now)"
+    "welcome_subscribed": "✅ You are subscribed to signals."
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -264,6 +265,7 @@
     "action_allow": "Разрешено",
     "action_pause": "Пауза",
     "at_api_error_title": "⚠️ Ошибка Auto-trade",
+    "at_btn_disconnect": "❌ Отключить",
     "at_cap_auto_spot": "Авто (баланс Spot)",
     "at_cap_decreased": "🧠 Effective Cap снижен (защита риска)\n\n📌 Cap (настройка): {ui_cap} USDT\n⬇️ Было: {prev_cap} USDT\n✅ Сейчас: {new_cap} USDT\n📊 Winrate(20): {winrate}%\n\nБот будет открывать меньше сделок, чтобы защитить депозит.",
     "at_choose_exchange": "Выбери биржу",
@@ -316,6 +318,8 @@
     "at_keys_screen": "🔑 API ключи (выбери)",
     "at_keys_trade_missing": "❌ Ключи не активированы\nREAD: ✅ OK\nTRADE: ❌ Нет прав на торговлю",
     "at_label_cap": "📌 Cap",
+    "at_label_cap_setting": "📌 Cap (настройка)",
+    "at_label_effective_cap_now": "🧠 Effective Cap (сейчас)",
     "at_label_exchange": "🏦 Биржа",
     "at_label_futures_margin": "💰 Маржа на сделку",
     "at_label_leverage": "🎚 Плечо",
@@ -460,6 +464,7 @@
     "sig_state_paused": "⏸ ПАУЗА",
     "sig_status": "Статус",
     "sig_tf": "⏱ ТФ",
+    "sig_tf_line": "⏱️ ТФ: Вход {entry_tf} | Тренд {trend_tf}",
     "sig_too_late_body": "⛔️ Слишком поздно\n\n{market_emoji} {market} | {symbol}\n🕒 Сигнал: {time}\n\n📌 Причина: {reason}\n💱 Текущая цена: {price}\n\nУровни: TP1 {tp1} • TP2 {tp2} • SL {sl}\n\nПодсказка: дождись нового сигнала в «Spot live / Futures live».",
     "sig_too_late_reason_error": "сигнал больше не доступен",
     "sig_too_late_reason_sl": "сработал SL (стоп‑лосс)",
@@ -504,9 +509,6 @@
     "weekly_title": "🗓️ По неделям (4н)",
     "welcome": "🤖 CryptoAuto-Scanner Bot\n\n✅ Ты подписан на сигналы.\nНажимай кнопки ниже:",
     "welcome_hint": "Нажимай кнопки ниже:",
-    "welcome_subscribed": "✅ Ты подписан на сигналы.",
-    "at_btn_disconnect": "❌ Отключить",
-    "at_label_cap_setting": "📌 Cap (настройка)",
-    "at_label_effective_cap_now": "🧠 Effective Cap (сейчас)"
+    "welcome_subscribed": "✅ Ты подписан на сигналы."
   }
 }
