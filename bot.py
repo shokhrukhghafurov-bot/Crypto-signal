@@ -4046,8 +4046,13 @@ async def main() -> None:
                     losses = int(b.get('losses') or 0)  # SL hits (LOSS)
                     be = int(b.get('be') or 0)          # BE hits
                     tp1 = int(b.get('tp1_hits') or 0)   # TP1 hits (partial)
-                    closes = int(b.get('closes') or 0)  # manual CLOSE
-                    manual = max(0, closes)
+                    # NOTE:
+                    # UI label "Signals closed" means *all closed outcomes* (WIN/LOSS/BE/CLOSED),
+                    # i.e. the same as `trades` in this bucket.
+                    # Keep a separate counter for manual/forced CLOSE (status='CLOSED') for debugging.
+                    closes = int(b.get('closes') or 0)  # manual/forced CLOSE only
+                    closed_all = max(0, trades)
+                    manual_close = max(0, closes)
                     sum_pnl = float(b.get('sum_pnl_pct') or 0.0)
                     avg_pnl = (sum_pnl / trades) if trades else 0.0
                     out[k] = {
@@ -4056,7 +4061,11 @@ async def main() -> None:
                         "sl": losses,
                         "be": be,
                         "tp1": tp1,
-                        "manual": manual,
+                        # Backward compatible: some dashboards render this as "Signals closed".
+                        "manual": closed_all,
+                        # Explicit, clearer keys for new dashboards.
+                        "closed": closed_all,
+                        "manual_close": manual_close,
                         "sum_pnl_pct": sum_pnl,
                         "avg_pnl_pct": avg_pnl,
                     }
