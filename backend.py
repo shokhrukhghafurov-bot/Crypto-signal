@@ -2670,6 +2670,13 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     BE_DELAY_SEC     = float(os.getenv("SMART_BE_DELAY_SEC", "20") or 20)                 # delay before arming BE after partial TP1
                     PEAK_MIN_GAIN_PCT= float(os.getenv("SMART_PEAK_MIN_GAIN_PCT", "0.40") or 0.40)         # require at least +0.4% from entry to activate reversal exit
                     REV_EXIT_PCT     = float(os.getenv("SMART_REVERSAL_EXIT_PCT", "0.35") or 0.35)         # close if retrace from peak is >= 0.35%
+                    # TA-assisted early exit after TP1 (optional)
+                    SMART_TA_ENABLE     = (os.getenv("SMART_TA_ENABLE", "0").strip().lower() not in ("0","false","no","off"))
+                    SMART_TA_TF         = (os.getenv("SMART_TA_TF", "15m") or "15m").strip()
+                    SMART_TA_CHECK_SEC  = float(os.getenv("SMART_TA_CHECK_SEC", "60") or 60)
+                    SMART_TA_MACD_DELTA = float(os.getenv("SMART_TA_MACD_DELTA", "0.0002") or 0.0002)
+                    SMART_TA_USE_RSI    = (os.getenv("SMART_TA_USE_RSI", "0").strip().lower() not in ("0","false","no","off"))
+                    SMART_TA_WEAK_CONFIRM = int(os.getenv("SMART_TA_WEAK_CONFIRM", "2") or 2)
 
                     # Persistent state in ref
                     state = str(ref.get("sm_state") or "INIT").upper()
@@ -2838,6 +2845,63 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 ref["be_pending"] = False
                                 be_moved = True
                                 dirty = True
+
+                    # --- SMART TA exit after TP1 (optional) ---
+                    if SMART_TA_ENABLE and bool(ref.get("tp1_partial")) and (qty > 0) and (not bool(ref.get("ta_exit_done"))):
+                        # Throttle TA checks
+                        last_ta_ts = float(ref.get("ta_last_check_ts") or 0.0)
+                        if (now_ts - last_ta_ts) >= max(5.0, float(SMART_TA_CHECK_SEC)):
+                            ref["ta_last_check_ts"] = float(now_ts)
+                            try:
+                                # Fetch recent candles for TA timeframe (default 15m)
+                                ohlcv = None
+                                if ex == "binance":
+                                    ohlcv = await self.klines_binance(symbol, interval=SMART_TA_TF, limit=120)
+                                elif ex == "bybit":
+                                    ohlcv = await self.klines_bybit(symbol, interval=SMART_TA_TF, limit=120)
+                                elif ex == "okx":
+                                    ohlcv = await self.klines_okx(symbol, interval=SMART_TA_TF, limit=120)
+                                elif ex == "mexc":
+                                    ohlcv = await self.klines_mexc(symbol, interval=SMART_TA_TF, limit=120)
+                                elif ex == "gateio":
+                                    ohlcv = await self.klines_gateio(symbol, interval=SMART_TA_TF, limit=120)
+                                if ohlcv:
+                                    df_ta = _df_from_ohlcv(ohlcv)
+                                    df_ta = _add_indicators(df_ta)
+                                    hist = df_ta.get("macd_hist")
+                                    rsi = df_ta.get("rsi")
+                                    if hist is not None and len(hist) >= 3:
+                                        h_now = float(hist.iloc[-1])
+                                        h_prev = float(hist.iloc[-2])
+                                        # Deterioration depends on direction
+                                        weak = False
+                                        d = float(SMART_TA_MACD_DELTA)
+                                        if direction == "LONG":
+                                            weak = (h_now < (h_prev - d))
+                                            if SMART_TA_USE_RSI and rsi is not None and len(rsi) >= 2:
+                                                weak = weak and (float(rsi.iloc[-1]) < float(rsi.iloc[-2]))
+                                        else:
+                                            weak = (h_now > (h_prev + d))
+                                            if SMART_TA_USE_RSI and rsi is not None and len(rsi) >= 2:
+                                                weak = weak and (float(rsi.iloc[-1]) > float(rsi.iloc[-2]))
+                                        if weak:
+                                            ref["ta_weak_hits"] = int(ref.get("ta_weak_hits") or 0) + 1
+                                        else:
+                                            # decay weak hits slowly
+                                            ref["ta_weak_hits"] = max(0, int(ref.get("ta_weak_hits") or 0) - 1)
+                                        dirty = True
+                            except Exception:
+                                # TA checks are best-effort; never break manager loop.
+                                pass
+                    
+                        if int(ref.get("ta_weak_hits") or 0) >= int(SMART_TA_WEAK_CONFIRM):
+                            # Market weakness confirmed: close the remaining qty early
+                            try:
+                                await _close_market(qty)
+                                ref["ta_exit_done"] = True
+                                dirty = True
+                            except Exception as e:
+                                _log_rate_limited(f"smart_ta_exit close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
 
                     # --- BE hit: close remaining ---
                     if bool(ref.get("be_moved")) and _hit_be():
