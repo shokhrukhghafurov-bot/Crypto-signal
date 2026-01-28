@@ -3411,6 +3411,10 @@ TA_REQUIRE_1H_TREND = _env_bool("TA_REQUIRE_1H_TREND", True if SIGNAL_MODE == "s
 
 COOLDOWN_MINUTES = max(1, _env_int("COOLDOWN_MINUTES", 180))
 
+MICRO_ENABLE = _env_bool("MICRO_ENABLE", False)
+SMART_BE_TRAIL_ENABLE = _env_bool("SMART_BE_TRAIL_ENABLE", False)
+SMART_BE_TRAIL_STEP_PCT = max(0.0, _env_float("SMART_BE_TRAIL_STEP_PCT", 0.15))  # percent
+SMART_BE_TRAIL_MIN_DELTA_PCT = max(0.0, _env_float("SMART_BE_TRAIL_MIN_DELTA_PCT", 0.02))  # percent
 USE_REAL_PRICE = _env_bool("USE_REAL_PRICE", True)
 # Price source selection per market: BINANCE / BYBIT / MEDIAN
 SPOT_PRICE_SOURCE = (os.getenv("SPOT_PRICE_SOURCE", "MEDIAN").strip().upper() or "MEDIAN")
@@ -5734,6 +5738,34 @@ class Backend:
                         await safe_send(bot, uid, txt, ctx="msg_auto_tp1")
                         await db_store.set_tp1(trade_id, be_price=float(be_px), price=float(s.tp1), pnl_pct=float(calc_profit_pct(s.entry, float(s.tp1), side)))
                         continue
+
+                    # 3a) After TP1: Smart BE trail (optional)
+                    # Pull BE closer as price moves in your favor (helps protect TP1 profit while aiming for TP2).
+                    if tp1_hit and _be_enabled(market) and SMART_BE_TRAIL_ENABLE:
+                        try:
+                            step = float(SMART_BE_TRAIL_STEP_PCT) / 100.0
+                            min_delta = float(SMART_BE_TRAIL_MIN_DELTA_PCT) / 100.0
+                            step = max(0.0, step)
+                            min_delta = max(0.0, min_delta)
+                            if step > 0 and _be_is_armed(side=side, price=price_f, tp1=getattr(s,'tp1',None), tp2=getattr(s,'tp2',None)):
+                                cur_be = float(be_price or _be_exit_price(s.entry, side, market))
+                                entry_f = float(s.entry or 0.0)
+                                if entry_f > 0:
+                                    if side == "LONG":
+                                        new_be = max(cur_be, float(price_f) - (entry_f * step))
+                                        # never below entry for LONG
+                                        new_be = max(new_be, entry_f)
+                                    else:
+                                        new_be = min(cur_be, float(price_f) + (entry_f * step))
+                                        # never above entry for SHORT
+                                        new_be = min(new_be, entry_f)
+                                    # update only if meaningful change
+                                    if abs(new_be - cur_be) / max(1e-12, entry_f) >= min_delta:
+                                        be_price = float(new_be)
+                                        await db_store.set_trade_be_price(trade_id, be_price=float(be_price))
+                        except Exception:
+                            # BE trail must never break tracking loop
+                            pass
 
                     # 3) After TP1: BE close
                     if tp1_hit and _be_enabled(market):
