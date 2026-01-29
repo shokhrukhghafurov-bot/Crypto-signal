@@ -161,6 +161,75 @@ _VIRTUAL_SLTP_ALL = (os.getenv("VIRTUAL_SLTP_ALL", "1").strip().lower() not in (
 # Break-even fee buffer (percent). Example: 0.05 means +0.05% for LONG, -0.05% for SHORT.
 _BE_FEE_BUFFER_PCT = float(os.getenv("BE_FEE_BUFFER_PCT", "0.05") or 0.05)
 
+
+# =======================
+# Smart Trade Manager PRO — ENV (SAFE DEFAULTS)
+# These globals MUST exist because some parts of the code (e.g., track_loop)
+# reference SMART_* names directly. If an env var is missing or malformed,
+# we fall back to safe defaults (no NameError, no crash).
+# =======================
+
+def _smartpro_env_float(name: str, default: float) -> float:
+    try:
+        v = (os.getenv(name) or "").strip()
+        return float(v) if v else float(default)
+    except Exception:
+        return float(default)
+
+def _smartpro_env_int(name: str, default: int) -> int:
+    try:
+        v = (os.getenv(name) or "").strip()
+        return int(float(v)) if v else int(default)
+    except Exception:
+        return int(default)
+
+def _smartpro_env_bool(name: str, default: bool) -> bool:
+    try:
+        v = (os.getenv(name) or "").strip().lower()
+        if not v:
+            return bool(default)
+        return v not in ("0", "false", "no", "off")
+    except Exception:
+        return bool(default)
+
+# --- TP1 / TP2 decision engine ---
+SMART_TP2_PROB_STRONG = _smartpro_env_float("SMART_TP2_PROB_STRONG", 0.72)
+SMART_TP2_PROB_MED = _smartpro_env_float("SMART_TP2_PROB_MED", 0.45)
+SMART_TP1_PARTIAL_PCT = _smartpro_env_float("SMART_TP1_PARTIAL_PCT", 0.50)
+SMART_FORCE_FULL_TP1_IF_NO_TP2 = _smartpro_env_bool("SMART_FORCE_FULL_TP1_IF_NO_TP2", True)
+
+# --- Early-exit / momentum ---
+SMART_MOMENTUM_WINDOW_SEC = _smartpro_env_int("SMART_MOMENTUM_WINDOW_SEC", 30)
+SMART_EARLY_EXIT_MOM_NEG_PCT = _smartpro_env_float("SMART_EARLY_EXIT_MOM_NEG_PCT", 0.16)
+SMART_EARLY_EXIT_CONSEC_NEG = _smartpro_env_int("SMART_EARLY_EXIT_CONSEC_NEG", 2)
+SMART_EARLY_EXIT_MIN_GAIN_PCT = _smartpro_env_float("SMART_EARLY_EXIT_MIN_GAIN_PCT", 0.12)
+
+# --- Dynamic BE ---
+SMART_BE_DELAY_SEC = _smartpro_env_int("SMART_BE_DELAY_SEC", 25)
+SMART_BE_MIN_PCT = _smartpro_env_float("SMART_BE_MIN_PCT", 0.06)
+SMART_BE_MAX_PCT = _smartpro_env_float("SMART_BE_MAX_PCT", 0.45)
+SMART_BE_VOL_MULT = _smartpro_env_float("SMART_BE_VOL_MULT", 0.35)
+SMART_BE_ARM_PCT_TO_TP2 = _smartpro_env_float("SMART_BE_ARM_PCT_TO_TP2", 0.15)
+
+# --- Peak -> reversal exit ---
+SMART_PEAK_MIN_GAIN_PCT = _smartpro_env_float("SMART_PEAK_MIN_GAIN_PCT", 0.42)
+SMART_REVERSAL_EXIT_PCT = _smartpro_env_float("SMART_REVERSAL_EXIT_PCT", 0.32)
+
+# --- Safety controls ---
+SMART_ARM_SL_AFTER_PCT = _smartpro_env_float("SMART_ARM_SL_AFTER_PCT", 0.22)
+SMART_HARD_SL_PCT = _smartpro_env_float("SMART_HARD_SL_PCT", 2.80)
+
+# --- Generic loop tick / debounce (if referenced) ---
+SMART_TICK = _smartpro_env_float("SMART_TICK", 1.0)
+
+# Normalize ranges to avoid accidental misconfig
+if SMART_TP1_PARTIAL_PCT < 0.0:
+    SMART_TP1_PARTIAL_PCT = 0.0
+if SMART_TP1_PARTIAL_PCT > 1.0:
+    SMART_TP1_PARTIAL_PCT = 1.0
+if SMART_BE_MAX_PCT < SMART_BE_MIN_PCT:
+    SMART_BE_MAX_PCT = SMART_BE_MIN_PCT
+
 def _be_with_fee_buffer(entry_price: float, *, direction: str) -> float:
     """Return BE price adjusted by fee buffer."""
     try:
@@ -5134,9 +5203,6 @@ class Backend:
         # Track when price fetching started failing per trade_id (used for forced CLOSE)
         self._price_fail_since: Dict[int, float] = {}
 
-        # Smart Trade Manager PRO per-trade runtime state (peak/reversal, momentum, TP1 timing)
-        self._smart_state: Dict[int, dict] = {}
-
         self.last_signal: Optional[Signal] = None
         self.last_spot_signal: Optional[Signal] = None
         self.last_futures_signal: Optional[Signal] = None
@@ -5764,34 +5830,6 @@ class Backend:
                     status = str(row.get("status") or "ACTIVE").upper()
                     tp1_hit = bool(row.get("tp1_hit"))
                     be_price = float(row.get("be_price") or 0.0) if row.get("be_price") is not None else 0.0
-                    # --- Smart Trade Manager PRO runtime state ---
-                    st = self._smart_state.get(trade_id)
-                    if not isinstance(st, dict):
-                        st = {"peak": price_f, "trough": price_f, "last_px": price_f, "neg": 0, "tp1_ts": 0.0}
-                        self._smart_state[trade_id] = st
-
-                    last_px = float(st.get("last_px") or price_f)
-                    d_pct = 0.0
-                    if last_px > 0:
-                        d_pct = (price_f - last_px) / last_px * 100.0
-
-                    mom_fav_pct = 0.0
-                    mom_neg_pct = 0.0
-                    if side == "LONG":
-                        mom_fav_pct = max(0.0, d_pct)
-                        mom_neg_pct = max(0.0, -d_pct)
-                        st["peak"] = max(float(st.get("peak") or price_f), price_f)
-                    else:
-                        mom_fav_pct = max(0.0, -d_pct)
-                        mom_neg_pct = max(0.0, d_pct)
-                        st["trough"] = min(float(st.get("trough") or price_f), price_f)
-
-                    if mom_neg_pct >= float(SMART_EARLY_EXIT_MOM_NEG_PCT):
-                        st["neg"] = int(st.get("neg") or 0) + 1
-                    else:
-                        st["neg"] = 0
-
-                    st["last_px"] = price_f
 
                     # After TP1 we move protection SL to BE (entry +/- fee buffer).
                     # The debug block should reflect the *active* protective level, not the original signal SL.
@@ -5806,67 +5844,6 @@ class Backend:
                         tp1=(float(s.tp1) if s.tp1 else None),
                         tp2=(float(s.tp2) if s.tp2 else None),
                     )
-                    # --- PRO: peak -> reversal / early-exit ---
-                    try:
-                        entry_p = float(s.entry or 0.0)
-                    except Exception:
-                        entry_p = 0.0
-                    if entry_p > 0:
-                        # peak / trough drawdown
-                        if side == "LONG":
-                            peak = float(st.get("peak") or price_f)
-                            gain_peak = (peak - entry_p) / entry_p * 100.0
-                            dd = (peak - price_f) / max(1e-9, peak) * 100.0
-                            cur_gain = (price_f - entry_p) / entry_p * 100.0
-                        else:
-                            trough = float(st.get("trough") or price_f)
-                            gain_peak = (entry_p - trough) / entry_p * 100.0
-                            dd = (price_f - trough) / max(1e-9, trough) * 100.0
-                            cur_gain = (entry_p - price_f) / entry_p * 100.0
-
-                        # 1) peak -> reversal close
-                        if gain_peak >= float(SMART_PEAK_MIN_GAIN_PCT) and dd >= float(SMART_REVERSAL_EXIT_PCT):
-                            import datetime as _dt
-                            now_utc = _dt.datetime.now(_dt.timezone.utc)
-                            trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
-                            pnl = _calc_effective_pnl_pct(trade_ctx, close_price=price_f, close_reason="REVERSAL")
-                            txt = _trf(uid, "msg_auto_win",
-                                symbol=s.symbol,
-                                market=market,
-                                pnl_total=fmt_pnl_pct(float(pnl)),
-                                opened_time=fmt_dt_msk(row.get("opened_at")),
-                                closed_time=fmt_dt_msk(now_utc),
-                                status="CLOSED",
-                            )
-                            if dbg:
-                                txt += "\n\n" + dbg
-                            await safe_send(bot, uid, txt, ctx="msg_auto_win")
-                            await db_store.close_trade(trade_id, status="CLOSED", price=float(price_f), pnl_total_pct=float(pnl))
-                            self._price_fail_since.pop(trade_id, None)
-                            self._smart_state.pop(trade_id, None)
-                            continue
-
-                        # 2) early-exit on consecutive adverse momentum (structure break)
-                        if cur_gain >= float(SMART_EARLY_EXIT_MIN_GAIN_PCT) and int(st.get("neg") or 0) >= int(SMART_EARLY_EXIT_CONSEC_NEG):
-                            import datetime as _dt
-                            now_utc = _dt.datetime.now(_dt.timezone.utc)
-                            trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
-                            pnl = _calc_effective_pnl_pct(trade_ctx, close_price=price_f, close_reason="EARLY_EXIT")
-                            txt = _trf(uid, "msg_auto_win",
-                                symbol=s.symbol,
-                                market=market,
-                                pnl_total=fmt_pnl_pct(float(pnl)),
-                                opened_time=fmt_dt_msk(row.get("opened_at")),
-                                closed_time=fmt_dt_msk(now_utc),
-                                status="CLOSED",
-                            )
-                            if dbg:
-                                txt += "\n\n" + dbg
-                            await safe_send(bot, uid, txt, ctx="msg_auto_win")
-                            await db_store.close_trade(trade_id, status="CLOSED", price=float(price_f), pnl_total_pct=float(pnl))
-                            self._price_fail_since.pop(trade_id, None)
-                            self._smart_state.pop(trade_id, None)
-                            continue
                     # 1) Before TP1: TP2 (gap) -> WIN
                     if not tp1_hit and s.tp2 and hit_tp(float(s.tp2)):
                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
@@ -5909,76 +5886,13 @@ class Backend:
 
                     # 3) TP1 -> partial close + BE
                     if not tp1_hit and s.tp1 and hit_tp(float(s.tp1)):
-                        # --- PRO: TP1 decision engine (TP2 probability) ---
-                        entry_p = float(s.entry or 0.0)
-                        tp1_p = float(s.tp1 or 0.0)
-                        tp2_p = float(s.tp2 or 0.0) if s.tp2 else 0.0
-
-                        prob_tp2 = 0.0
-                        if tp2_p > 0 and entry_p > 0 and tp2_p != entry_p:
-                            if side == "LONG":
-                                prog = (price_f - entry_p) / (tp2_p - entry_p)
-                                dist = max(0.0, (tp2_p - price_f) / max(1e-9, price_f)) * 100.0
-                            else:
-                                prog = (entry_p - price_f) / (entry_p - tp2_p)
-                                dist = max(0.0, (price_f - tp2_p) / max(1e-9, price_f)) * 100.0
-                            prog = max(0.0, min(1.0, float(prog)))
-                            mom_factor = 0.0
-                            if dist > 0:
-                                mom_factor = max(0.0, min(1.0, mom_fav_pct / max(0.05, dist)))
-                            prob_tp2 = max(0.0, min(1.0, 0.55 * prog + 0.45 * mom_factor))
-
-                        close_pct = 0.0
-                        decision = "HOLD_TO_TP2"
-                        if (tp2_p <= 0) and bool(SMART_FORCE_FULL_TP1_IF_NO_TP2):
-                            decision = "FULL_TP1_NO_TP2"
-                        elif prob_tp2 >= float(SMART_TP2_PROB_STRONG):
-                            decision = "HOLD_TO_TP2"
-                        elif prob_tp2 >= float(SMART_TP2_PROB_MED):
-                            decision = "PARTIAL_TP1"
-                            close_pct = float(SMART_TP1_PARTIAL_PCT) * 100.0
-                        else:
-                            decision = "FULL_TP1"
-                            close_pct = 100.0
-
-                        # Dynamic BE: fee buffer + volatility proxy (entry->tp1 distance)
-                        base_be = _be_with_fee_buffer(entry_p, direction=("LONG" if side == "LONG" else "SHORT"))
-                        move_pct = abs((tp1_p - entry_p) / max(1e-9, entry_p)) * 100.0
-                        dyn_be_buf = float(SMART_BE_MIN_PCT) + float(SMART_BE_VOL_MULT) * move_pct
-                        dyn_be_buf = max(float(SMART_BE_MIN_PCT), min(float(SMART_BE_MAX_PCT), dyn_be_buf))
-                        if side == "LONG":
-                            dyn_be = entry_p * (1.0 + dyn_be_buf / 100.0)
-                            be_px = max(float(base_be), float(dyn_be))
-                        else:
-                            dyn_be = entry_p * (1.0 - dyn_be_buf / 100.0)
-                            be_px = min(float(base_be), float(dyn_be))
-
-                        if decision.startswith("FULL_TP1"):
-                            trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
-                            pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(price_f), close_reason=decision)
-                            import datetime as _dt
-                            now_utc = _dt.datetime.now(_dt.timezone.utc)
-                            txt = _trf(uid, "msg_auto_win",
-                                symbol=s.symbol,
-                                market=market,
-                                pnl_total=fmt_pnl_pct(float(pnl)),
-                                opened_time=fmt_dt_msk(row.get("opened_at")),
-                                closed_time=fmt_dt_msk(now_utc),
-                                status="CLOSED",
-                            )
-                            if dbg:
-                                txt += "\n\n" + dbg
-                            await safe_send(bot, uid, txt, ctx="msg_auto_win")
-                            await db_store.close_trade(trade_id, status="CLOSED", price=float(price_f), pnl_total_pct=float(pnl))
-                            self._price_fail_since.pop(trade_id, None)
-                            self._smart_state.pop(trade_id, None)
-                            continue
+                        be_px = _be_exit_price(s.entry, side, market)
                         import datetime as _dt
                         now_utc = _dt.datetime.now(_dt.timezone.utc)
                         txt = _trf(uid, "msg_auto_tp1",
                             symbol=s.symbol,
                             market=market,
-                            closed_pct=int(close_pct) if close_pct else 0,
+                            closed_pct=int(_partial_close_pct(market)),
                             be_price=f"{float(be_px):.6f}",
                             opened_time=fmt_dt_msk(row.get("opened_at")),
                             event_time=fmt_dt_msk(now_utc),
@@ -5988,7 +5902,6 @@ class Backend:
                             txt += "\n\n" + dbg
                         await safe_send(bot, uid, txt, ctx="msg_auto_tp1")
                         await db_store.set_tp1(trade_id, be_price=float(be_px), price=float(s.tp1), pnl_pct=float(calc_profit_pct(s.entry, float(s.tp1), side)))
-                        st["tp1_ts"] = time.time()
                         continue
 
                     # 3) After TP1: BE close
