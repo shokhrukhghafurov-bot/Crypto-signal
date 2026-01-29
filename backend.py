@@ -34,6 +34,59 @@ from cryptography.fernet import Fernet
 
 logger = logging.getLogger("crypto-signal")
 
+# ------------------ Stablecoin pair blocking (scanner + autotrade) ------------------
+# Blocks stable-vs-stable pairs like USDCUSDT / DAIUSDT / USD1USDT, etc.
+# Configure:
+#   BLOCK_STABLECOIN_PAIRS=1 (default)
+#   STABLECOINS=USDT,USDC,DAI,BUSD,TUSD,FDUSD,USDP,PYUSD,FRAX,EURC,USD1
+#   BLOCKED_SYMBOLS=USDCUSDT,BUSDUSDT,DAIUSDT,USD1USDT  (optional additional hard blocks)
+
+def _env_csv_set(name: str, default_csv: str) -> set[str]:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        raw = default_csv
+    return {p.strip().upper() for p in raw.split(",") if p and p.strip()}
+
+_BLOCK_STABLECOIN_PAIRS = (os.getenv("BLOCK_STABLECOIN_PAIRS", "1").strip().lower() not in ("0","false","no","off"))
+
+_STABLECOINS = _env_csv_set(
+    "STABLECOINS",
+    "USDT,USDC,DAI,BUSD,TUSD,FDUSD,USDP,PYUSD,FRAX,EURC,USD1"
+)
+
+_BLOCKED_SYMBOLS = _env_csv_set(
+    "BLOCKED_SYMBOLS",
+    ""
+)
+
+# Sort by length to match e.g. USD1 before USD
+_STABLECOINS_SORTED = sorted(_STABLECOINS, key=len, reverse=True)
+
+def _normalize_symbol(symbol: str) -> str:
+    s = (symbol or "").upper().strip()
+    s = s.replace("-", "").replace("_", "").replace("/", "")
+    return s
+
+def _split_base_quote(symbol: str) -> tuple[str, str]:
+    """Split a concatenated symbol into (base, quote) when quote matches a known stablecoin."""
+    s = _normalize_symbol(symbol)
+    for q in _STABLECOINS_SORTED:
+        if s.endswith(q) and len(s) > len(q):
+            return (s[:-len(q)], q)
+    return (s, "")
+
+def is_blocked_symbol(symbol: str) -> bool:
+    s = _normalize_symbol(symbol)
+    if s in _BLOCKED_SYMBOLS:
+        return True
+    if not _BLOCK_STABLECOIN_PAIRS:
+        return False
+    base, quote = _split_base_quote(s)
+    if quote and base in _STABLECOINS:
+        return True
+    return False
+
+
 
 # ------------------ Auto-trade exchange API helpers ------------------
 
@@ -1395,6 +1448,12 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     if market not in ("SPOT", "FUTURES"):
         return {"ok": False, "skipped": True, "api_error": None}
 
+    # Hard block: stable-vs-stable pairs (fail-safe)
+    sym = (getattr(sig, "symbol", "") or "").upper().strip()
+    if is_blocked_symbol(sym):
+        logger.warning("[autotrade] blocked stable pair skip: %s", sym)
+        return {"ok": False, "skipped": True, "api_error": None, "reason": "blocked_symbol"}
+
     st = await db_store.get_autotrade_settings(uid)
     mt = "spot" if market == "SPOT" else "futures"
 
@@ -2714,43 +2773,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         last_px_ts = float(now_ts)
                         dirty = True
 
-                    
-                    # --- Early exit: structure/momentum breaks (cuts losers before SL) ---
-                    EARLY_NEG_PCT   = float(os.getenv("SMART_EARLY_EXIT_MOM_NEG_PCT", "0.16") or 0.16)
-                    EARLY_CONSEC    = int(float(os.getenv("SMART_EARLY_EXIT_CONSEC_NEG", "2") or 2))
-                    EARLY_MIN_GAIN  = float(os.getenv("SMART_EARLY_EXIT_MIN_GAIN_PCT", "0.12") or 0.12)
-
-                    # Compute immediate move against position from last anchor
-                    against_pct = 0.0
-                    if last_px > 0:
-                        if direction == "LONG":
-                            against_pct = max(0.0, (1.0 - (px / last_px)) * 100.0)
-                        else:
-                            against_pct = max(0.0, ((px / last_px) - 1.0) * 100.0)
-
-                    neg_streak = int(ref.get("neg_streak") or 0)
-                    if against_pct >= EARLY_NEG_PCT:
-                        neg_streak += 1
-                    else:
-                        neg_streak = 0
-                    ref["neg_streak"] = int(neg_streak)
-
-                    # Only early-exit if we had some profit cushion (prevents exiting instantly right after entry)
-                    cur_gain_pct = 0.0
-                    if entry_p > 0:
-                        if direction == "LONG":
-                            cur_gain_pct = (px / entry_p - 1.0) * 100.0
-                        else:
-                            cur_gain_pct = (1.0 - (px / entry_p)) * 100.0
-
-                    if (neg_streak >= max(1, EARLY_CONSEC)) and (cur_gain_pct >= EARLY_MIN_GAIN):
-                        try:
-                            await _close_market(qty)
-                        except Exception as e:
-                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                        await db_store.close_autotrade_position(user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED")
-                        continue
-# Arm normal SL only after a small move in favor (so we don't "arm into a dump")
+                    # Arm normal SL only after a small move in favor (so we don't "arm into a dump")
                     if (not armed_sl) and entry_p > 0:
                         if direction == "LONG":
                             if px >= entry_p * (1.0 + ARM_SL_AFTER_PCT / 100.0):
@@ -2825,10 +2848,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         continue
 
                     # --- TP1: don't close immediately; check momentum. If weak -> partial close; if strong -> wait TP2.
-
-                    # --- TP1: Smart decision (TP2 probability) ---
                     if (tp1 > 0) and (not tp1_seen) and _hit_tp(tp1):
-                        # Momentum in % over last anchor (positive = in our favor)
+                        # Favorable momentum in % over anchor
                         mom_pct = 0.0
                         if last_px > 0:
                             if direction == "LONG":
@@ -2836,58 +2857,14 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             else:
                                 mom_pct = (1.0 - (px / last_px)) * 100.0
 
-                        # Volatility proxy (abs move from anchor)
-                        vol_pct = 0.0
-                        if last_px > 0:
-                            vol_pct = abs(px / last_px - 1.0) * 100.0
-
-                        # Distance remaining to TP2 (0..inf). If no TP2 -> probability=0
-                        dist_tp2_pct = 999.0
-                        if tp2 > 0 and entry_p > 0:
-                            if direction == "LONG":
-                                dist_tp2_pct = max(0.0, (tp2 / px - 1.0) * 100.0)
-                            else:
-                                dist_tp2_pct = max(0.0, (px / tp2 - 1.0) * 100.0)
-
-                        # Tunables (env) — defaults are safe if env is missing
-                        TP2_PROB_STRONG = float(os.getenv("SMART_TP2_PROB_STRONG", "0.72") or 0.72)
-                        TP2_PROB_MED    = float(os.getenv("SMART_TP2_PROB_MED", "0.45") or 0.45)
-                        TP1_PARTIAL_PCT = float(os.getenv("SMART_TP1_PARTIAL_PCT", "0.50") or 0.50)
-                        FORCE_FULL_TP1  = (os.getenv("SMART_FORCE_FULL_TP1_IF_NO_TP2", "1").strip().lower() not in ("0","false","no","off"))
-
-                        # Simple TP2 probability heuristic (0..1)
-                        # - higher momentum => higher probability
-                        # - higher volatility without progress => lower probability
-                        # - longer remaining distance => lower probability
-                        prob = 0.0
-                        if tp2 > 0:
-                            prob = 0.55
-                            prob += max(-0.25, min(0.35, mom_pct / 1.0))   # +0.35 at +0.35% mom
-                            prob -= max(0.0, min(0.20, (vol_pct - abs(mom_pct)) / 2.0))
-                            prob -= max(0.0, min(0.30, dist_tp2_pct / 2.5))
-                            prob = max(0.0, min(1.0, prob))
+                        strong = (mom_pct >= STRONG_MOM_PCT)
 
                         ref["tp1_seen"] = True
                         tp1_seen = True
-                        ref["tp2_prob"] = float(prob)
                         dirty = True
 
-                        # Decision:
-                        # - prob strong: keep 100% to TP2
-                        # - prob medium: partial close at TP1
-                        # - prob low/no TP2: close 100% at TP1
-                        if (tp2 <= 0) and FORCE_FULL_TP1:
-                            try:
-                                await _close_market(qty)
-                            except Exception as e:
-                                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                            await db_store.close_autotrade_position(user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED")
-                            continue
-
-                        if prob >= TP2_PROB_STRONG:
-                            ref["tp1_mode"] = "HOLD_TO_TP2"
-                            dirty = True
-                        elif prob >= TP2_PROB_MED:
+                        if (not strong) or (tp2 <= 0):
+                            # Weak impulse: partial close now
                             q_close = max(0.0, qty * max(0.05, min(0.95, TP1_PARTIAL_PCT)))
                             q_rem = max(0.0, qty - q_close)
                             if q_close > 0:
@@ -2895,6 +2872,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                     await _close_market(q_close)
                                 except Exception as e:
                                     _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                            # Store remaining qty for future management
                             ref["qty"] = float(q_rem)
                             qty = float(q_rem)
                             ref["tp1_hit"] = True
@@ -2903,50 +2881,17 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             ref["be_pending"] = True
                             dirty = True
                         else:
-                            try:
-                                await _close_market(qty)
-                            except Exception as e:
-                                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                            await db_store.close_autotrade_position(user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED")
-                            continue
+                            # Strong impulse: skip TP1 close, aim for TP2 (close 100%)
+                            ref["tp1_mode"] = "FULL_TO_TP2"
+                            dirty = True
 
                     # --- Arm BE only AFTER partial TP1 and after a short delay + confirmation
-
-                    # --- Arm BE after partial TP1: delay + confirmation + dynamic buffer ---
                     if bool(ref.get("tp1_partial")) and bool(ref.get("be_pending")) and (not be_moved) and entry_p > 0:
-                        BE_MIN_PCT   = float(os.getenv("SMART_BE_MIN_PCT", "0.06") or 0.06)
-                        BE_MAX_PCT   = float(os.getenv("SMART_BE_MAX_PCT", "0.45") or 0.45)
-                        BE_VOL_MULT  = float(os.getenv("SMART_BE_VOL_MULT", "0.35") or 0.35)
-                        BE_DELAY_SEC = float(os.getenv("SMART_BE_DELAY_SEC", "25") or 25)
-                        ARM_TO_TP2   = float(os.getenv("SMART_BE_ARM_PCT_TO_TP2", "0.15") or 0.15)
-
                         if (now_ts - float(ref.get("tp1_ts") or 0.0)) >= max(0.0, BE_DELAY_SEC):
-                            # Confirmation: still not breaking entry in the wrong direction
+                            # Confirm: still not below entry (for long) / not above entry (for short)
                             ok_confirm = (px >= entry_p) if direction == "LONG" else (px <= entry_p)
-
-                            # Optional: wait until we progressed a bit towards TP2 before arming BE (prevents instant BE-out in chop)
-                            ok_progress = True
-                            if tp2 > 0 and ARM_TO_TP2 > 0:
-                                if direction == "LONG" and tp2 > entry_p:
-                                    prog = (px - entry_p) / max(1e-12, (tp2 - entry_p))
-                                    ok_progress = (prog >= ARM_TO_TP2)
-                                elif direction == "SHORT" and tp2 < entry_p:
-                                    prog = (entry_p - px) / max(1e-12, (entry_p - tp2))
-                                    ok_progress = (prog >= ARM_TO_TP2)
-
-                            if ok_confirm and ok_progress:
-                                # Dynamic BE buffer: min + volatility component
-                                vol_pct = 0.0
-                                if last_px > 0:
-                                    vol_pct = abs(px / last_px - 1.0) * 100.0
-                                dyn = max(BE_MIN_PCT, min(BE_MAX_PCT, BE_MIN_PCT + vol_pct * BE_VOL_MULT))
-
-                                base_be = float(_be_with_fee_buffer(entry_p, direction=direction) or 0.0)
-                                if direction == "LONG":
-                                    be_price = base_be * (1.0 + dyn / 100.0)
-                                else:
-                                    be_price = base_be * (1.0 - dyn / 100.0)
-
+                            if ok_confirm:
+                                be_price = float(_be_with_fee_buffer(entry_p, direction=direction) or 0.0)
                                 ref["be_price"] = float(be_price)
                                 ref["be_moved"] = True
                                 ref["be_pending"] = False
@@ -5847,6 +5792,9 @@ class Backend:
 
                     for sym in symbols:
                         if not self.can_emit(sym):
+                            continue
+                        if is_blocked_symbol(sym):
+                            logger.info("[scanner] skip blocked stable pair: %s", sym)
                             continue
                         if mac_act == "PAUSE_ALL":
                             continue
