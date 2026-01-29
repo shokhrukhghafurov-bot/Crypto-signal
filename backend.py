@@ -2721,14 +2721,31 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     now_ts = time.time()
 
                     # Tunables (env)
-                    ARM_SL_AFTER_PCT = float(os.getenv("SMART_ARM_SL_AFTER_PCT", "0.25") or 0.25)          # arm normal SL after +0.25% move in favor
-                    HARD_SL_PCT      = float(os.getenv("SMART_HARD_SL_PCT", "3.00") or 3.00)              # emergency stop while SL is not armed
-                    TP1_PARTIAL_PCT  = float(os.getenv("SMART_TP1_PARTIAL_PCT", "0.50") or 0.50)          # partial close size at TP1 if momentum is weak
-                    STRONG_MOM_PCT   = float(os.getenv("SMART_STRONG_MOMENTUM_PCT", "0.25") or 0.25)      # if momentum >= this, skip TP1 and aim TP2
-                    MOM_WINDOW_SEC   = float(os.getenv("SMART_MOMENTUM_WINDOW_SEC", "30") or 30)          # compare to price N seconds ago
-                    BE_DELAY_SEC     = float(os.getenv("SMART_BE_DELAY_SEC", "20") or 20)                 # delay before arming BE after partial TP1
-                    PEAK_MIN_GAIN_PCT= float(os.getenv("SMART_PEAK_MIN_GAIN_PCT", "0.40") or 0.40)         # require at least +0.4% from entry to activate reversal exit
-                    REV_EXIT_PCT     = float(os.getenv("SMART_REVERSAL_EXIT_PCT", "0.35") or 0.35)         # close if retrace from peak is >= 0.35%
+                    ARM_SL_AFTER_PCT = float(os.getenv("SMART_ARM_SL_AFTER_PCT", "0.22") or 0.22)          # arm normal SL after +X% move in favor
+                    HARD_SL_PCT      = float(os.getenv("SMART_HARD_SL_PCT", "2.80") or 2.80)               # emergency stop while SL is not armed
+
+                    # TP1 -> TP2 probability decision
+                    TP2_PROB_STRONG  = float(os.getenv("SMART_TP2_PROB_STRONG", "0.72") or 0.72)           # hold to TP2 if prob >= strong
+                    TP2_PROB_MED     = float(os.getenv("SMART_TP2_PROB_MED", "0.45") or 0.45)              # partial at TP1 if prob >= med
+                    TP1_PARTIAL_PCT  = float(os.getenv("SMART_TP1_PARTIAL_PCT", "0.50") or 0.50)           # partial close size at TP1 (weak/medium)
+                    FORCE_FULL_TP1_NO_TP2 = (os.getenv("SMART_FORCE_FULL_TP1_IF_NO_TP2", "1").strip().lower() not in ("0","false","no","off"))
+
+                    # Momentum / structure
+                    MOM_WINDOW_SEC   = float(os.getenv("SMART_MOMENTUM_WINDOW_SEC", "30") or 30)           # anchor update window
+                    EARLY_EXIT_NEG_PCT= float(os.getenv("SMART_EARLY_EXIT_MOM_NEG_PCT", "0.16") or 0.16)    # adverse move threshold vs anchor
+                    EARLY_EXIT_CONSEC= int(float(os.getenv("SMART_EARLY_EXIT_CONSEC_NEG", "2") or 2))       # consecutive adverse hits
+                    EARLY_EXIT_MIN_GAIN= float(os.getenv("SMART_EARLY_EXIT_MIN_GAIN_PCT", "0.12") or 0.12)  # only early-exit if already in profit
+
+                    # Dynamic BE
+                    BE_DELAY_SEC     = float(os.getenv("SMART_BE_DELAY_SEC", "25") or 25)                  # delay before arming BE after partial TP1
+                    BE_MIN_PCT       = float(os.getenv("SMART_BE_MIN_PCT", "0.06") or 0.06)
+                    BE_MAX_PCT       = float(os.getenv("SMART_BE_MAX_PCT", "0.45") or 0.45)
+                    BE_VOL_MULT      = float(os.getenv("SMART_BE_VOL_MULT", "0.35") or 0.35)
+                    BE_ARM_PCT_TO_TP2= float(os.getenv("SMART_BE_ARM_PCT_TO_TP2", "0.15") or 0.15)         # arm BE only after this progress to TP2
+
+                    # Peak -> reversal
+                    PEAK_MIN_GAIN_PCT= float(os.getenv("SMART_PEAK_MIN_GAIN_PCT", "0.42") or 0.42)
+                    REV_EXIT_PCT     = float(os.getenv("SMART_REVERSAL_EXIT_PCT", "0.32") or 0.32)
 
                     # Persistent state in ref
                     state = str(ref.get("sm_state") or "INIT").upper()
@@ -2814,6 +2831,42 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 continue
 
                     # Effective SL: before arming -> HARD SL only; after arming -> original SL (fallback to HARD if missing)
+
+                    # --- Early-exit (structure break): consecutive adverse momentum hits while in profit ---
+                    neg_count = int(ref.get("neg_count") or 0)
+                    # adverse move vs anchor
+                    adv_pct = 0.0
+                    if last_px > 0:
+                        if direction == "LONG":
+                            adv_pct = max(0.0, (1.0 - (px / last_px)) * 100.0)
+                        else:
+                            adv_pct = max(0.0, (px / last_px - 1.0) * 100.0)
+
+                    if adv_pct >= max(0.0, EARLY_EXIT_NEG_PCT):
+                        neg_count += 1
+                    else:
+                        neg_count = 0
+
+                    ref["neg_count"] = int(neg_count)
+                    dirty = True
+
+                    # only exit early if already in profit (protect wins)
+                    gain_now_pct = 0.0
+                    if entry_p > 0:
+                        if direction == "LONG":
+                            gain_now_pct = (px / entry_p - 1.0) * 100.0
+                        else:
+                            gain_now_pct = (1.0 - (px / entry_p)) * 100.0
+
+                    if neg_count >= max(1, int(EARLY_EXIT_CONSEC)) and gain_now_pct >= float(EARLY_EXIT_MIN_GAIN):
+                        try:
+                            await _close_market(qty)
+                        except Exception as e:
+                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] early-exit close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                        await db_store.close_autotrade_position(
+                            user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                        )
+                        continue
                     sl_eff = 0.0
                     if armed_sl:
                         sl_eff = float(sl or 0.0) if float(sl or 0.0) > 0 else float(hard_sl or 0.0)
@@ -2847,32 +2900,66 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         )
                         continue
 
-                    # --- TP1: don't close immediately; check momentum. If weak -> partial close; if strong -> wait TP2.
+                    # --- TP1: probability engine (TP2 vs take profit now) ---
                     if (tp1 > 0) and (not tp1_seen) and _hit_tp(tp1):
-                        # Favorable momentum in % over anchor
-                        mom_pct = 0.0
+                        # Momentum vs anchor (%)
+                        mom_fav_pct = 0.0
+                        mom_adv_pct = 0.0
                         if last_px > 0:
                             if direction == "LONG":
-                                mom_pct = (px / last_px - 1.0) * 100.0
+                                mom_fav_pct = max(0.0, (px / last_px - 1.0) * 100.0)
+                                mom_adv_pct = max(0.0, (1.0 - (px / last_px)) * 100.0)
                             else:
-                                mom_pct = (1.0 - (px / last_px)) * 100.0
+                                mom_fav_pct = max(0.0, (1.0 - (px / last_px)) * 100.0)
+                                mom_adv_pct = max(0.0, (px / last_px - 1.0) * 100.0)
 
-                        strong = (mom_pct >= STRONG_MOM_PCT)
+                        # Progress to TP2 (0..1) and distance remaining (%)
+                        prob_tp2 = 0.0
+                        if tp2 > 0 and entry_p > 0 and tp2 != entry_p:
+                            if direction == "LONG":
+                                prog = (px - entry_p) / (tp2 - entry_p)
+                                dist = max(0.0, (tp2 - px) / max(1e-9, px)) * 100.0
+                            else:
+                                prog = (entry_p - px) / (entry_p - tp2)
+                                dist = max(0.0, (px - tp2) / max(1e-9, px)) * 100.0
+                            prog = max(0.0, min(1.0, float(prog)))
+                            # If momentum is strong relative to remaining distance, higher probability.
+                            mom_factor = 0.0
+                            if dist > 0:
+                                mom_factor = max(0.0, min(1.0, mom_fav_pct / max(0.05, dist)))
+                            # Simple, stable blend (no ML, no magic)
+                            prob_tp2 = max(0.0, min(1.0, 0.55 * prog + 0.45 * mom_factor))
 
                         ref["tp1_seen"] = True
                         tp1_seen = True
+                        ref["tp2_prob"] = float(prob_tp2)
                         dirty = True
 
-                        if (not strong) or (tp2 <= 0):
-                            # Weak impulse: partial close now
+                        # Decision
+                        if (tp2 <= 0) and FORCE_FULL_TP1_NO_TP2:
+                            mode = "FULL_TP1_NO_TP2"
+                        elif prob_tp2 >= TP2_PROB_STRONG:
+                            mode = "HOLD_TO_TP2"
+                        elif prob_tp2 >= TP2_PROB_MED:
+                            mode = "PARTIAL_TP1"
+                        else:
+                            mode = "FULL_TP1"
+
+                        ref["tp1_mode"] = mode
+                        dirty = True
+
+                        if mode == "HOLD_TO_TP2":
+                            # Strong conditions: skip TP1 close, aim for TP2 (close 100%)
+                            ref["tp1_hit"] = True
+                            dirty = True
+                        elif mode == "PARTIAL_TP1":
                             q_close = max(0.0, qty * max(0.05, min(0.95, TP1_PARTIAL_PCT)))
                             q_rem = max(0.0, qty - q_close)
                             if q_close > 0:
                                 try:
                                     await _close_market(q_close)
                                 except Exception as e:
-                                    _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                            # Store remaining qty for future management
+                                    _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                             ref["qty"] = float(q_rem)
                             qty = float(q_rem)
                             ref["tp1_hit"] = True
@@ -2881,22 +2968,50 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             ref["be_pending"] = True
                             dirty = True
                         else:
-                            # Strong impulse: skip TP1 close, aim for TP2 (close 100%)
-                            ref["tp1_mode"] = "FULL_TO_TP2"
-                            dirty = True
-
-                    # --- Arm BE only AFTER partial TP1 and after a short delay + confirmation
+                            # FULL_TP1 / FULL_TP1_NO_TP2
+                            try:
+                                await _close_market(qty)
+                            except Exception as e:
+                                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                            await db_store.close_autotrade_position(
+                                user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                            )
+                            continue
+# --- Arm BE only AFTER partial TP1 and after a short delay + confirmation
                     if bool(ref.get("tp1_partial")) and bool(ref.get("be_pending")) and (not be_moved) and entry_p > 0:
                         if (now_ts - float(ref.get("tp1_ts") or 0.0)) >= max(0.0, BE_DELAY_SEC):
                             # Confirm: still not below entry (for long) / not above entry (for short)
                             ok_confirm = (px >= entry_p) if direction == "LONG" else (px <= entry_p)
                             if ok_confirm:
-                                be_price = float(_be_with_fee_buffer(entry_p, direction=direction) or 0.0)
-                                ref["be_price"] = float(be_price)
-                                ref["be_moved"] = True
-                                ref["be_pending"] = False
-                                be_moved = True
-                                dirty = True
+                                # Arm BE only if enough progress to TP2 (optional)
+                                ok_prog = True
+                                if tp2 > 0 and entry_p > 0 and tp2 != entry_p and BE_ARM_PCT_TO_TP2 > 0:
+                                    if direction == "LONG":
+                                        prog2 = (px - entry_p) / (tp2 - entry_p)
+                                    else:
+                                        prog2 = (entry_p - px) / (entry_p - tp2)
+                                    ok_prog = float(prog2) >= float(BE_ARM_PCT_TO_TP2)
+
+                                if ok_prog:
+                                    # Dynamic BE buffer: min + vol_mult*vol, clamped
+                                    vol_pct = 0.0
+                                    if last_px > 0:
+                                        vol_pct = abs(px / last_px - 1.0) * 100.0
+                                    buf_pct = max(float(BE_MIN_PCT), min(float(BE_MAX_PCT), float(BE_MIN_PCT) + float(BE_VOL_MULT) * float(vol_pct)))
+
+                                    be_fee = float(_be_with_fee_buffer(entry_p, direction=direction) or 0.0)
+                                    if direction == "LONG":
+                                        be_dyn = float(entry_p) * (1.0 + (buf_pct / 100.0))
+                                        be_price = max(be_fee, be_dyn)
+                                    else:
+                                        be_dyn = float(entry_p) * (1.0 - (buf_pct / 100.0))
+                                        be_price = min(be_fee if be_fee > 0 else be_dyn, be_dyn)
+
+                                    ref["be_price"] = float(be_price)
+                                    ref["be_moved"] = True
+                                    ref["be_pending"] = False
+                                    be_moved = True
+                                    dirty = True
 
                     # --- BE hit: close remaining ---
                     if bool(ref.get("be_moved")) and _hit_be():
