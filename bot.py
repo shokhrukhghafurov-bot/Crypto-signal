@@ -4033,7 +4033,9 @@ async def main() -> None:
                     be = int(b.get('be') or 0)          # BE hits
                     tp1 = int(b.get('tp1_hits') or 0)   # TP1 hits (partial)
                     closes = int(b.get('closes') or 0)  # manual CLOSE
-                    manual = max(0, closes)
+                    manual_close = max(0, closes)
+                    # 'Signals closed' in dashboard should mean ALL closed outcomes
+                    manual = max(0, trades)
                     sum_pnl = float(b.get('sum_pnl_pct') or 0.0)
                     avg_pnl = (sum_pnl / trades) if trades else 0.0
                     out[k] = {
@@ -4042,7 +4044,9 @@ async def main() -> None:
                         "sl": losses,
                         "be": be,
                         "tp1": tp1,
-                        "manual": manual,
+                        "manual": manual,  # back-compat: used by some dashboards as "Signals closed"
+                        "closed": trades,
+                        "manual_close": manual_close,
                         "sum_pnl_pct": sum_pnl,
                         "avg_pnl_pct": avg_pnl,
                     }
