@@ -158,6 +158,11 @@ _SMARTCAP_HARD_MAX_PCT = min(0.98, max(0.3, _smartcap_env_float("EFF_CAP_HARD_MA
 # It opens an entry MARKET order and then manages TP/SL/BE virtually by watching price and sending MARKET closes.
 _VIRTUAL_SLTP_ALL = (os.getenv("VIRTUAL_SLTP_ALL", "1").strip().lower() not in ("0","false","no","off"))
 
+# When enabled, PRO management is applied even when TP/SL orders were placed on the exchange.
+# The manager will cancel existing TP/SL child orders (when supported) and manage the position like virtual mode.
+_SMART_PRO_CONTROL_REAL = (os.getenv("SMART_PRO_CONTROL_REAL", "1").strip().lower() not in ("0","false","no","off"))
+
+
 # Break-even fee buffer (percent). Example: 0.05 means +0.05% for LONG, -0.05% for SHORT.
 _BE_FEE_BUFFER_PCT = float(os.getenv("BE_FEE_BUFFER_PCT", "0.05") or 0.05)
 
@@ -2675,7 +2680,36 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 
                 # -------- Virtual management (ALL exchanges / SPOT+FUTURES) --------
                 # If ref["virtual"] is True, we manage by watching price and sending MARKET closes.
-                if bool(ref.get("virtual")):
+                if bool(ref.get("virtual")) or _SMART_PRO_CONTROL_REAL:
+
+                    # If this position was opened with exchange TP/SL orders (virtual==False) but PRO-control is enabled,
+                    # cancel child orders once to avoid double-execution and then manage it with the same PRO rules as virtual mode.
+                    if (not bool(ref.get("virtual"))) and _SMART_PRO_CONTROL_REAL and (not bool(ref.get("pro_real_init"))):
+                        try:
+                            if ex == "binance":
+                                for oid in [ref.get("tp1_order_id"), ref.get("tp2_order_id"), ref.get("sl_order_id")]:
+                                    try:
+                                        if oid:
+                                            await _binance_cancel_order(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(oid), futures=(mt=="futures"))
+                                    except Exception:
+                                        pass
+                            elif ex == "bybit":
+                                cat = ("linear" if mt == "futures" else "spot")
+                                for oid in [ref.get("tp1_order_id"), ref.get("tp2_order_id"), ref.get("sl_order_id")]:
+                                    try:
+                                        if oid:
+                                            await _bybit_cancel_order(api_key=api_key, api_secret=api_secret, category=cat, symbol=symbol, order_id=str(oid))
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                        # Clear stored child order ids so legacy branch won't touch them.
+                        ref["tp1_order_id"] = None
+                        ref["tp2_order_id"] = None
+                        ref["sl_order_id"] = None
+                        ref["be_moved"] = False
+                        ref["pro_real_init"] = True
+                        dirty = True
                     try:
                         # --- price ---
                         if ex == "binance":
