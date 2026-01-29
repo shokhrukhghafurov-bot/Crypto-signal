@@ -1849,6 +1849,10 @@ async def status_text(uid: int, *, include_subscribed: bool = False, include_hin
         out_lines.append("")
         out_lines.append(tr(uid, "welcome_subscribed"))
 
+    # Show user id (easy to copy)
+    if uid:
+        out_lines.append(trf(uid, 'status_user_id', id=uid))
+
     out_lines.append("")
     out_lines.append(trf(uid, "status_scanner", state=scanner_state))
 
