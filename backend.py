@@ -2670,13 +2670,6 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     BE_DELAY_SEC     = float(os.getenv("SMART_BE_DELAY_SEC", "20") or 20)                 # delay before arming BE after partial TP1
                     PEAK_MIN_GAIN_PCT= float(os.getenv("SMART_PEAK_MIN_GAIN_PCT", "0.40") or 0.40)         # require at least +0.4% from entry to activate reversal exit
                     REV_EXIT_PCT     = float(os.getenv("SMART_REVERSAL_EXIT_PCT", "0.35") or 0.35)         # close if retrace from peak is >= 0.35%
-                    # TA-assisted early exit after TP1 (optional)
-                    SMART_TA_ENABLE     = (os.getenv("SMART_TA_ENABLE", "0").strip().lower() not in ("0","false","no","off"))
-                    SMART_TA_TF         = (os.getenv("SMART_TA_TF", "15m") or "15m").strip()
-                    SMART_TA_CHECK_SEC  = float(os.getenv("SMART_TA_CHECK_SEC", "60") or 60)
-                    SMART_TA_MACD_DELTA = float(os.getenv("SMART_TA_MACD_DELTA", "0.0002") or 0.0002)
-                    SMART_TA_USE_RSI    = (os.getenv("SMART_TA_USE_RSI", "0").strip().lower() not in ("0","false","no","off"))
-                    SMART_TA_WEAK_CONFIRM = int(os.getenv("SMART_TA_WEAK_CONFIRM", "2") or 2)
 
                     # Persistent state in ref
                     state = str(ref.get("sm_state") or "INIT").upper()
@@ -2845,63 +2838,6 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 ref["be_pending"] = False
                                 be_moved = True
                                 dirty = True
-
-                    # --- SMART TA exit after TP1 (optional) ---
-                    if SMART_TA_ENABLE and bool(ref.get("tp1_partial")) and (qty > 0) and (not bool(ref.get("ta_exit_done"))):
-                        # Throttle TA checks
-                        last_ta_ts = float(ref.get("ta_last_check_ts") or 0.0)
-                        if (now_ts - last_ta_ts) >= max(5.0, float(SMART_TA_CHECK_SEC)):
-                            ref["ta_last_check_ts"] = float(now_ts)
-                            try:
-                                # Fetch recent candles for TA timeframe (default 15m)
-                                ohlcv = None
-                                if ex == "binance":
-                                    ohlcv = await self.klines_binance(symbol, interval=SMART_TA_TF, limit=120)
-                                elif ex == "bybit":
-                                    ohlcv = await self.klines_bybit(symbol, interval=SMART_TA_TF, limit=120)
-                                elif ex == "okx":
-                                    ohlcv = await self.klines_okx(symbol, interval=SMART_TA_TF, limit=120)
-                                elif ex == "mexc":
-                                    ohlcv = await self.klines_mexc(symbol, interval=SMART_TA_TF, limit=120)
-                                elif ex == "gateio":
-                                    ohlcv = await self.klines_gateio(symbol, interval=SMART_TA_TF, limit=120)
-                                if ohlcv:
-                                    df_ta = _df_from_ohlcv(ohlcv)
-                                    df_ta = _add_indicators(df_ta)
-                                    hist = df_ta.get("macd_hist")
-                                    rsi = df_ta.get("rsi")
-                                    if hist is not None and len(hist) >= 3:
-                                        h_now = float(hist.iloc[-1])
-                                        h_prev = float(hist.iloc[-2])
-                                        # Deterioration depends on direction
-                                        weak = False
-                                        d = float(SMART_TA_MACD_DELTA)
-                                        if direction == "LONG":
-                                            weak = (h_now < (h_prev - d))
-                                            if SMART_TA_USE_RSI and rsi is not None and len(rsi) >= 2:
-                                                weak = weak and (float(rsi.iloc[-1]) < float(rsi.iloc[-2]))
-                                        else:
-                                            weak = (h_now > (h_prev + d))
-                                            if SMART_TA_USE_RSI and rsi is not None and len(rsi) >= 2:
-                                                weak = weak and (float(rsi.iloc[-1]) > float(rsi.iloc[-2]))
-                                        if weak:
-                                            ref["ta_weak_hits"] = int(ref.get("ta_weak_hits") or 0) + 1
-                                        else:
-                                            # decay weak hits slowly
-                                            ref["ta_weak_hits"] = max(0, int(ref.get("ta_weak_hits") or 0) - 1)
-                                        dirty = True
-                            except Exception:
-                                # TA checks are best-effort; never break manager loop.
-                                pass
-                    
-                        if int(ref.get("ta_weak_hits") or 0) >= int(SMART_TA_WEAK_CONFIRM):
-                            # Market weakness confirmed: close the remaining qty early
-                            try:
-                                await _close_market(qty)
-                                ref["ta_exit_done"] = True
-                                dirty = True
-                            except Exception as e:
-                                _log_rate_limited(f"smart_ta_exit close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
 
                     # --- BE hit: close remaining ---
                     if bool(ref.get("be_moved")) and _hit_be():
@@ -3411,17 +3347,6 @@ TA_REQUIRE_1H_TREND = _env_bool("TA_REQUIRE_1H_TREND", True if SIGNAL_MODE == "s
 
 COOLDOWN_MINUTES = max(1, _env_int("COOLDOWN_MINUTES", 180))
 
-MICRO_ENABLE = _env_bool("MICRO_ENABLE", False)
-MICRO_COOLDOWN_MINUTES_ENV = _env_int("MICRO_COOLDOWN_MINUTES", 0)
-MICRO_COOLDOWN_SEC = max(10, _env_int("MICRO_COOLDOWN_SEC", 300))
-if MICRO_COOLDOWN_MINUTES_ENV > 0:
-    MICRO_COOLDOWN_SEC = max(10, int(MICRO_COOLDOWN_MINUTES_ENV) * 60)
-# Keep minutes value for UI/logs if needed
-MICRO_COOLDOWN_MINUTES = max(1, int(math.ceil(MICRO_COOLDOWN_SEC / 60)))
-
-SMART_BE_TRAIL_ENABLE = _env_bool("SMART_BE_TRAIL_ENABLE", False)
-SMART_BE_TRAIL_STEP_PCT = max(0.0, _env_float("SMART_BE_TRAIL_STEP_PCT", 0.15))  # percent
-SMART_BE_TRAIL_MIN_DELTA_PCT = max(0.0, _env_float("SMART_BE_TRAIL_MIN_DELTA_PCT", 0.02))  # percent
 USE_REAL_PRICE = _env_bool("USE_REAL_PRICE", True)
 # Price source selection per market: BINANCE / BYBIT / MEDIAN
 SPOT_PRICE_SOURCE = (os.getenv("SPOT_PRICE_SOURCE", "MEDIAN").strip().upper() or "MEDIAN")
@@ -4880,8 +4805,6 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     }
     ta["ta_block"] = _fmt_ta_block(ta)
     return ta
-
-
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
     return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
 
@@ -5032,7 +4955,6 @@ class Backend:
         self.macro = MacroCalendar()
         # Trades are stored in PostgreSQL (db_store)
         self._last_signal_ts: Dict[str, float] = {}
-        self._last_micro_signal_ts: Dict[str, float] = {}
         self._signal_seq = 1
 
         # Track when price fetching started failing per trade_id (used for forced CLOSE)
@@ -5059,15 +4981,8 @@ class Backend:
         ts = self._last_signal_ts.get(symbol.upper(), 0.0)
         return (time.time() - ts) >= (COOLDOWN_MINUTES * 60)
 
-    def can_emit_micro(self, symbol: str) -> bool:
-        ts = self._last_micro_signal_ts.get(symbol.upper(), 0.0)
-        return (time.time() - ts) >= float(MICRO_COOLDOWN_SEC)
-
     def mark_emitted(self, symbol: str) -> None:
         self._last_signal_ts[symbol.upper()] = time.time()
-
-    def mark_emitted_micro(self, symbol: str) -> None:
-        self._last_micro_signal_ts[symbol.upper()] = time.time()
 
     async def open_trade(self, user_id: int, signal: Signal, orig_text: str) -> bool:
         """Persist trade in Postgres. Returns False if already opened."""
@@ -5746,34 +5661,6 @@ class Backend:
                         await db_store.set_tp1(trade_id, be_price=float(be_px), price=float(s.tp1), pnl_pct=float(calc_profit_pct(s.entry, float(s.tp1), side)))
                         continue
 
-                    # 3a) After TP1: Smart BE trail (optional)
-                    # Pull BE closer as price moves in your favor (helps protect TP1 profit while aiming for TP2).
-                    if tp1_hit and _be_enabled(market) and SMART_BE_TRAIL_ENABLE:
-                        try:
-                            step = float(SMART_BE_TRAIL_STEP_PCT) / 100.0
-                            min_delta = float(SMART_BE_TRAIL_MIN_DELTA_PCT) / 100.0
-                            step = max(0.0, step)
-                            min_delta = max(0.0, min_delta)
-                            if step > 0 and _be_is_armed(side=side, price=price_f, tp1=getattr(s,'tp1',None), tp2=getattr(s,'tp2',None)):
-                                cur_be = float(be_price or _be_exit_price(s.entry, side, market))
-                                entry_f = float(s.entry or 0.0)
-                                if entry_f > 0:
-                                    if side == "LONG":
-                                        new_be = max(cur_be, float(price_f) - (entry_f * step))
-                                        # never below entry for LONG
-                                        new_be = max(new_be, entry_f)
-                                    else:
-                                        new_be = min(cur_be, float(price_f) + (entry_f * step))
-                                        # never above entry for SHORT
-                                        new_be = min(new_be, entry_f)
-                                    # update only if meaningful change
-                                    if abs(new_be - cur_be) / max(1e-12, entry_f) >= min_delta:
-                                        be_price = float(new_be)
-                                        await db_store.set_trade_be_price(trade_id, be_price=float(be_price))
-                        except Exception:
-                            # BE trail must never break tracking loop
-                            pass
-
                     # 3) After TP1: BE close
                     if tp1_hit and _be_enabled(market):
                         be_lvl = be_price if be_price else _be_exit_price(s.entry, side, market)
@@ -5845,15 +5732,10 @@ class Backend:
                         await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
 
                     for sym in symbols:
-                        can_main = self.can_emit(sym)
-                        can_micro = bool(MICRO_ENABLE and self.can_emit_micro(sym))
-                        if not can_main and not can_micro:
+                        if not self.can_emit(sym):
                             continue
                         if mac_act == "PAUSE_ALL":
                             continue
-
-                        # Micro-trend is fully optional and has its own cooldown.
-                        do_micro = bool(can_micro)
 
                         # News action
                         try:
@@ -5870,40 +5752,29 @@ class Backend:
                         async def fetch_exchange(name: str):
                             try:
                                 if name == "BINANCE":
-                                    df5 = await api.klines_binance(sym, MICRO_ENTRY_TF, 300) if do_micro else None
                                     df15 = await api.klines_binance(sym, "15m", 250)
                                     df1h = await api.klines_binance(sym, "1h", 250)
                                     df4h = await api.klines_binance(sym, "4h", 250)
                                 elif name == "BYBIT":
-                                    df5 = await api.klines_bybit(sym, MICRO_ENTRY_TF, 300) if do_micro else None
                                     df15 = await api.klines_bybit(sym, "15m", 200)
                                     df1h = await api.klines_bybit(sym, "1h", 200)
                                     df4h = await api.klines_bybit(sym, "4h", 200)
                                 elif name == "OKX":
-                                    df5 = await api.klines_okx(sym, MICRO_ENTRY_TF, 300) if do_micro else None
                                     df15 = await api.klines_okx(sym, "15m", 200)
                                     df1h = await api.klines_okx(sym, "1h", 200)
                                     df4h = await api.klines_okx(sym, "4h", 200)
                                 elif name == "GATEIO":
-                                    df5 = await api.klines_gateio(sym, MICRO_ENTRY_TF, 300) if do_micro else None
                                     df15 = await api.klines_gateio(sym, "15m", 200)
                                     df1h = await api.klines_gateio(sym, "1h", 200)
                                     df4h = await api.klines_gateio(sym, "4h", 200)
                                 else:  # MEXC
-                                    df5 = await api.klines_mexc(sym, MICRO_ENTRY_TF, 300) if do_micro else None
                                     df15 = await api.klines_mexc(sym, "15m", 200)
                                     df1h = await api.klines_mexc(sym, "1h", 200)
                                     df4h = await api.klines_mexc(sym, "4h", 200)
-                                res_main = evaluate_on_exchange(df15, df1h, df4h)
-                                res_micro = None
-                                if do_micro and df5 is not None:
-                                    try:
-                                        res_micro = evaluate_micro_on_exchange(df5, df15, df1h, df4h)
-                                    except Exception:
-                                        res_micro = None
-                                return name, res_main, res_micro
+                                res = evaluate_on_exchange(df15, df1h, df4h)
+                                return name, res
                             except Exception:
-                                return name, None, None
+                                return name, None
 
                         results = await asyncio.gather(
                             fetch_exchange("BINANCE"),
@@ -5912,71 +5783,13 @@ class Backend:
                             fetch_exchange("GATEIO"),
                             fetch_exchange("MEXC"),
                         )
-                        good_main = [(name, r1) for (name, r1, _r2) in results if r1 is not None]
-                        good_micro = [(name, r2) for (name, _r1, r2) in results if r2 is not None]
-
-                        # Emit MICRO signal first (optional) without affecting the main strategy.
-                        if do_micro and good_micro:
-                            micro_name, micro_r = max(
-                                good_micro,
-                                key=lambda x: (int((x[1] or {}).get("confidence", 0) or 0), float((x[1] or {}).get("rr", 0.0) or 0.0)),
-                            )
-
-                            micro_dir = micro_r["direction"]
-                            micro_entry = float(micro_r["entry"])
-                            micro_sl = float(micro_r["sl"])
-                            micro_tp1 = float(micro_r["tp1"])
-                            micro_tp2 = float(micro_r["tp2"])
-                            micro_rr = float(micro_r["rr"])
-                            micro_conf = int(micro_r["confidence"])
-
-                            micro_market = choose_market(float(micro_r.get("adx1", 0.0) or 0.0), float(micro_r.get("atr_pct", 0.0) or 0.0))
-                            micro_min_conf = TA_MIN_SCORE_FUTURES if micro_market == "FUTURES" else TA_MIN_SCORE_SPOT
-
-                            if micro_conf >= micro_min_conf and micro_rr >= 2.0:
-                                micro_notes: List[str] = ["🧩 MICRO trend"]
-                                try:
-                                    tb = str(micro_r.get("ta_block", "") or "").strip()
-                                    if tb:
-                                        micro_notes.append(tb)
-                                except Exception:
-                                    pass
-
-                                sid_micro = self.next_signal_id()
-                                sig_micro = Signal(
-                                    signal_id=sid_micro,
-                                    market=micro_market,
-                                    symbol=sym,
-                                    direction=micro_dir,
-                                    # Show explicitly where entry comes from and what defines the micro-trend.
-                                    # Keep main 1h/4h trend display untouched; for MICRO we show Trend=15m+1h (configurable).
-                                    timeframe=f"Entry:{MICRO_ENTRY_TF} | Trend:{MICRO_TREND_TF}+1h",
-                                    entry=micro_entry,
-                                    sl=micro_sl,
-                                    tp1=micro_tp1,
-                                    tp2=micro_tp2,
-                                    rr=micro_rr,
-                                    confidence=micro_conf,
-                                    confirmations=micro_name,
-                                    risk_note="\\n".join(micro_notes).strip(),
-                                    ts=time.time(),
-                                )
-
-                                self.mark_emitted_micro(sym)
-                                logger.info("[micro] emit %s %s %s conf=%s rr=%.2f", sig_micro.symbol, sig_micro.market, sig_micro.direction, sig_micro.confidence, float(sig_micro.rr))
-                                await emit_signal_cb(sig_micro)
-                                await asyncio.sleep(1)
-
-                        # If the main strategy is on cooldown, do not run/emit the main signal.
-                        if not can_main:
-                            continue
-
-                        if not good_main:
+                        good = [(name, r) for (name, r) in results if r is not None]
+                        if not good:
                             continue
 
                         # Signal can be produced from a single exchange result.
                         best_name, best_r = max(
-                            good_main,
+                            good,
                             key=lambda x: (int((x[1] or {}).get("confidence", 0) or 0), float((x[1] or {}).get("rr", 0.0) or 0.0)),
                         )
                         best_dir = best_r["direction"]
@@ -6103,8 +5916,7 @@ class Backend:
                             market=market,
                             symbol=sym,
                             direction=best_dir,
-                            # Main strategy: explicitly show Entry TF and Trend TFs.
-                            timeframe="Entry:15m | Trend:1h/4h",
+                            timeframe="15m/1h/4h",
                             entry=entry,
                             sl=sl,
                             tp1=tp1,
