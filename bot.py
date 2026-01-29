@@ -1276,22 +1276,8 @@ def _signal_text(uid: int, s: Signal) -> str:
 
     ex_line_raw = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
     exchanges_line = f"{tr(uid, 'sig_exchanges')}: {ex_line_raw}\n" if ex_line_raw else ""
-    # TF line: show Entry TF and Trend TF, localized via i18n.
-    # Expect s.timeframe like "15m/1h/4h" (MAIN) or "5m/15m+1h" (MICRO).
-    _tf_raw = str(getattr(s, "timeframe", "") or "").strip()
-    _entry_tf = _tf_raw
-    _trend_tf = ""
-    if "/" in _tf_raw:
-        _entry_tf, _trend_tf = _tf_raw.split("/", 1)
-        _entry_tf = _entry_tf.strip() or _tf_raw
-        _trend_tf = _trend_tf.strip()
-    if _trend_tf:
-        # Use i18n template to avoid hard-coded text.
-        tf_line = trf(uid, "sig_tf_line", entry_tf=_entry_tf, trend_tf=_trend_tf)
-    else:
-        # Fallback to legacy format
-        tf_line = f"{tr(uid, 'sig_tf')}: {_tf_raw}"
-
+    # Keep TF on its own line; timeframe string already like 15m/1h/4h
+    tf_line = f"{tr(uid, 'sig_tf')}: {s.timeframe}"
 
     tp_lines = "\n".join(_tp_lines())
 
@@ -4046,13 +4032,8 @@ async def main() -> None:
                     losses = int(b.get('losses') or 0)  # SL hits (LOSS)
                     be = int(b.get('be') or 0)          # BE hits
                     tp1 = int(b.get('tp1_hits') or 0)   # TP1 hits (partial)
-                    # NOTE:
-                    # UI label "Signals closed" means *all closed outcomes* (WIN/LOSS/BE/CLOSED),
-                    # i.e. the same as `trades` in this bucket.
-                    # Keep a separate counter for manual/forced CLOSE (status='CLOSED') for debugging.
-                    closes = int(b.get('closes') or 0)  # manual/forced CLOSE only
-                    closed_all = max(0, trades)
-                    manual_close = max(0, closes)
+                    closes = int(b.get('closes') or 0)  # manual CLOSE
+                    manual = max(0, closes)
                     sum_pnl = float(b.get('sum_pnl_pct') or 0.0)
                     avg_pnl = (sum_pnl / trades) if trades else 0.0
                     out[k] = {
@@ -4061,11 +4042,7 @@ async def main() -> None:
                         "sl": losses,
                         "be": be,
                         "tp1": tp1,
-                        # Backward compatible: some dashboards render this as "Signals closed".
-                        "manual": closed_all,
-                        # Explicit, clearer keys for new dashboards.
-                        "closed": closed_all,
-                        "manual_close": manual_close,
+                        "manual": manual,
                         "sum_pnl_pct": sum_pnl,
                         "avg_pnl_pct": avg_pnl,
                     }
