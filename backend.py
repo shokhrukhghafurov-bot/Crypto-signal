@@ -125,8 +125,6 @@ def _should_deactivate_key(err_text: str) -> bool:
         "ip",
         "whitelist",
     )
-    if MID_MIN_ATR_PCT > 0 and not np.isnan(atr_pct) and atr_pct < MID_MIN_ATR_PCT:
-        return None
     return any(n in t for n in needles)
 
 
@@ -3626,64 +3624,6 @@ TA_REQUIRE_1H_TREND = _env_bool("TA_REQUIRE_1H_TREND", True if SIGNAL_MODE == "s
 
 COOLDOWN_MINUTES = max(1, _env_int("COOLDOWN_MINUTES", 180))
 
-# === MID-TREND scanner (5m/30m/1h) ===
-MID_SCANNER_ENABLED = int(os.getenv("MID_SCANNER_ENABLED", "1"))
-MID_TF_TRIGGER = os.getenv("MID_TF_TRIGGER", "5m")
-MID_TF_MID = os.getenv("MID_TF_MID", "30m")
-MID_TF_TREND = os.getenv("MID_TF_TREND", "1h")
-MID_SCAN_INTERVAL_SECONDS = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45"))
-MID_TOP_N = int(os.getenv("MID_TOP_N", str(TOP_N)))  # default: same as main scanner
-MID_COOLDOWN_MINUTES = int(os.getenv("MID_COOLDOWN_MINUTES", "120"))
-
-# MID signal quality mode (separate from main SIGNAL_MODE)
-# - strict: fewer but higher-quality signals, рассчитано под "дальний TP2"
-# - medium: больше сигналов, мягче пороги
-MID_SIGNAL_MODE = os.getenv("MID_SIGNAL_MODE", "strict").strip().lower()
-if os.getenv("MID_STRICT", "").strip() in ("1", "true", "yes", "on"):
-    MID_SIGNAL_MODE = "strict"
-if MID_SIGNAL_MODE not in ("strict", "medium"):
-    MID_SIGNAL_MODE = "strict"
-
-# Defaults tuned for intraday trend (5m/30m/1h)
-if MID_SIGNAL_MODE == "strict":
-    _mid_def_min_rr = 2.0
-    _mid_def_score_spot = 76
-    _mid_def_score_fut = 72
-    _mid_def_tp2_r = 2.8
-else:
-    _mid_def_min_rr = 1.8
-    _mid_def_score_spot = 74
-    _mid_def_score_fut = 70
-    _mid_def_tp2_r = 2.6
-
-MID_MIN_RR = float(os.getenv("MID_MIN_RR", str(_mid_def_min_rr)))
-MID_MIN_SCORE_SPOT = int(os.getenv("MID_MIN_SCORE_SPOT", str(_mid_def_score_spot)))
-MID_MIN_SCORE_FUTURES = int(os.getenv("MID_MIN_SCORE_FUTURES", str(_mid_def_score_fut)))
-
-# Levels
-MID_ATR_MULT_SL = float(os.getenv("MID_ATR_MULT_SL", "1.2"))
-MID_TP1_R = float(os.getenv("MID_TP1_R", "1.2"))
-MID_TP2_R = float(os.getenv("MID_TP2_R", str(_mid_def_tp2_r)))
-
-
-# Extra quality filters for MID (0 disables)
-# Defaults are tuned per MID_SIGNAL_MODE.
-if MID_SIGNAL_MODE == "strict":
-    _mid_def_adx_mid = 20
-    _mid_def_adx_trend = 18
-    _mid_def_atr_pct = 0.7
-else:
-    _mid_def_adx_mid = 16
-    _mid_def_adx_trend = 14
-    _mid_def_atr_pct = 0.5
-
-MID_REQUIRE_30M_TREND = _env_bool("MID_REQUIRE_30M_TREND", True)
-MID_ALLOW_FUTURES = _env_bool("MID_ALLOW_FUTURES", True)
-MID_MIN_ADX_30M = float(os.getenv("MID_MIN_ADX_30M", str(_mid_def_adx_mid)))
-MID_MIN_ADX_1H = float(os.getenv("MID_MIN_ADX_1H", str(_mid_def_adx_trend)))
-MID_MIN_ATR_PCT = float(os.getenv("MID_MIN_ATR_PCT", str(_mid_def_atr_pct)))
-
-
 USE_REAL_PRICE = _env_bool("USE_REAL_PRICE", True)
 # Price source selection per market: BINANCE / BYBIT / MEDIAN
 SPOT_PRICE_SOURCE = (os.getenv("SPOT_PRICE_SOURCE", "MEDIAN").strip().upper() or "MEDIAN")
@@ -5024,67 +4964,6 @@ def _fmt_ta_block(ta: Dict[str, Any]) -> str:
         return ""
 
 
-def _fmt_ta_block_mid(ta: Dict[str, Any]) -> str:
-    """Same as _fmt_ta_block(), but labels match MID-TREND (5m/30m/1h)."""
-    try:
-        if not ta:
-            return ""
-        score = ta.get("score", "—")
-        rsi = ta.get("rsi15", "—")           # value from trigger TF (5m)
-        macd_h = ta.get("macd_hist15", "—")  # value from trigger TF (5m)
-        adx_mid = ta.get("adx1", "—")        # value from mid TF (30m)
-        adx_trend = ta.get("adx4", "—")      # value from trend TF (1h)
-        atrp = ta.get("atr_pct", "—")
-        bb = ta.get("bb_pos", "—")
-        volr = ta.get("vol_rel", "—")
-        vwap = ta.get("vwap_bias", "—")
-        pat = ta.get("pattern", "—")
-        div = ta.get("rsi_div", "—")
-        ch = ta.get("channel", "—")
-        ms = ta.get("mstruct", "—")
-        sup = ta.get("support", None)
-        res = ta.get("resistance", None)
-
-        def fnum(x, fmt="{:.2f}"):
-            try:
-                if x is None or (isinstance(x, float) and np.isnan(x)):
-                    return "—"
-                return fmt.format(float(x))
-            except Exception:
-                return "—"
-
-        def fint(x):
-            try:
-                if x is None or (isinstance(x, float) and np.isnan(x)):
-                    return "—"
-                return str(int(round(float(x))))
-            except Exception:
-                return "—"
-
-        lines = [
-            f"📊 TA score: {fint(score)}/100 | Mode: {SIGNAL_MODE}",
-            f"RSI(5m): {fnum(rsi, '{:.1f}')} | MACD hist(5m): {fnum(macd_h, '{:.4f}')}",
-            f"ADX 30m/1h: {fnum(adx_mid, '{:.1f}')}/{fnum(adx_trend, '{:.1f}')} | ATR%: {fnum(atrp, '{:.2f}')}",
-            f"BB: {bb} | Vol xAvg: {fnum(volr, '{:.2f}')} | VWAP: {vwap}",
-        ]
-
-        ctx = []
-        if div and div != "—":
-            ctx.append(f"Div: {div}")
-        if ch and ch != "—":
-            ctx.append(f"Ch: {ch}")
-        if ms and ms != "—":
-            ctx.append(f"PA: {ms}")
-        if pat and pat != "—":
-            ctx.append(f"Pattern: {pat}")
-        if sup not in (None, "—") or res not in (None, "—"):
-            ctx.append(f"Support: {fnum(sup, '{:.4g}')} | Resistance: {fnum(res, '{:.4g}')}")
-        if ctx:
-            lines.append(" | ".join(ctx[:3]))
-        return "\n".join(lines).strip()
-    except Exception:
-        return ""
-
 def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
     score = 0
     score += 0 if np.isnan(adx4) else int(min(25, max(0, (adx4 - 15) * 1.25)))
@@ -5266,126 +5145,6 @@ def _orderbook_metrics(bids: List[List[Any]], asks: List[List[Any]], *, levels: 
         "mid": float(mid),
     }
 
-def evaluate_on_exchange_mid(df5m: pd.DataFrame, df30m: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """Compute direction + levels + TA snapshot for MID-TREND using 5m/30m/1h OHLCV."""
-    if df5m.empty or df30m.empty or df1h.empty:
-        return None
-
-    df5i = _add_indicators(df5m)
-    df30i = _add_indicators(df30m)
-    df1hi = _add_indicators(df1h)
-
-    dir_trend = _trend_dir(df1hi)   # 1h
-    dir_mid = _trend_dir(df30i)     # 30m
-    if dir_trend is None or dir_mid is None:
-        return None
-    if MID_REQUIRE_30M_TREND and dir_trend != dir_mid:
-        return None
-
-    last5 = df5i.iloc[-1]
-    last30 = df30i.iloc[-1]
-    last1h = df1hi.iloc[-1]
-
-    adx_mid = float(last30.get("adx", np.nan))
-    adx_trend = float(last1h.get("adx", np.nan))
-
-    # Optional quality gates
-    if not np.isnan(adx_mid) and MID_MIN_ADX_30M > 0 and adx_mid < MID_MIN_ADX_30M:
-        return None
-    if not np.isnan(adx_trend) and MID_MIN_ADX_1H > 0 and adx_trend < MID_MIN_ADX_1H:
-        return None
-
-    entry = float(last5["close"])
-    atr = float(last30.get("atr", np.nan))  # ATR from mid TF (30m)
-    if np.isnan(atr) or atr <= 0:
-        return None
-
-    # SL/TP from ATR + R-multiples (2 TP)
-    sl, tp1, tp2, rr, atr_pct, tp2_r = _levels_from_atr(
-        direction=dir_mid,
-        entry=entry,
-        atr=atr,
-        atr_multiplier=MID_ATR_MULT_SL,
-        tp2_r=MID_TP2_R,
-    )
-    # Override TP1 to MID_TP1_R while keeping TP2 as MID_TP2_R
-    r = abs(entry - sl)
-    if r <= 0:
-        return None
-    if dir_mid == "LONG":
-        tp1 = entry + (MID_TP1_R * r)
-    else:
-        tp1 = entry - (MID_TP1_R * r)
-    rr = abs(tp2 - entry) / r if r > 0 else 0.0
-
-    # Trigger (5m) strict trigger like main scanner
-    if not _trigger_15m(df5i, dir_mid):  # reuse same trigger function on 5m data
-        return None
-
-    # Snapshot values from trigger TF (5m)
-    rsi_trig = float(last5.get("rsi", np.nan))
-    macd_hist_trig = float(last5.get("macd_hist", np.nan))
-
-    bb_low = float(last5.get("bb_low", np.nan))
-    bb_mid = float(last5.get("bb_mavg", np.nan))
-    bb_high = float(last5.get("bb_high", np.nan))
-
-    vol = float(last5.get("volume", 0.0) or 0.0)
-    vol_sma = float(last5.get("vol_sma20", np.nan))
-    vol_rel = (vol / vol_sma) if (vol_sma and not np.isnan(vol_sma) and vol_sma > 0) else np.nan
-
-    # Pattern + S/R (pattern from trigger TF, levels from mid TF)
-    pattern, pat_bias = _candle_pattern(df5i)
-    support, resistance = _nearest_levels(df30i, entry)
-
-    bb_pos = _bb_position(bb_low, bb_mid, bb_high, entry)
-    rsi_div = _rsi_divergence(df5i, direction=dir_mid)
-    channel = _channel_bias(df30i)
-    mstruct = _market_structure(df30i)
-
-    score = _ta_score(
-        direction=dir_mid,
-        adx1=adx_mid,
-        adx4=adx_trend,
-        rsi15=rsi_trig,
-        macd_hist15=macd_hist_trig,
-        vol_rel=vol_rel,
-        bb_pos=bb_pos,
-        rsi_div=rsi_div,
-        channel=channel,
-        mstruct=mstruct,
-        pat_bias=pat_bias,
-        atr_pct=atr_pct,
-    )
-    confidence = int(score)
-
-    ta = {
-        "direction": dir_mid,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "rr": rr,
-        "score": score,
-        "confidence": confidence,
-        "atr_pct": atr_pct,
-        "adx1": adx_mid,            # keep keys for compatibility
-        "adx4": adx_trend,
-        "rsi15": rsi_trig,          # keep keys but value is 5m
-        "macd_hist15": macd_hist_trig,
-        "bb_pos": bb_pos,
-        "vol_rel": vol_rel,
-        "vwap_bias": "—",
-        "pattern": pattern,
-        "support": support,
-        "resistance": resistance,
-        "rsi_div": rsi_div,
-        "channel": channel,
-        "mstruct": mstruct,
-        "tp2_r": tp2_r,
-    }
-    return ta
-
 def _orderbook_has_near_wall(side: List[List[Any]], *, mid: float, direction: str, near_pct: float, wall_ratio: float, levels: int) -> bool:
     """Detect an unusually large level close to current price."""
     # side: bids for SHORT-wall, asks for LONG-wall
@@ -5473,9 +5232,10 @@ class Backend:
         self.macro = MacroCalendar()
         # Trades are stored in PostgreSQL (db_store)
         self._last_signal_ts: Dict[str, float] = {}
-        self._last_mid_signal_ts: Dict[str, float] = {}
         self._signal_seq = 1
 
+        self._last_signal_ts_mid: Dict[str, float] = {}
+        self._signal_seq_mid = 1
         # Track when price fetching started failing per trade_id (used for forced CLOSE)
         self._price_fail_since: Dict[int, float] = {}
 
@@ -5488,8 +5248,9 @@ class Backend:
         self.scanner_running: bool = True
         self.last_scan_ts: float = 0.0
         self.trade_stats: dict = {}
-        if hasattr(self, '_load_trade_stats'):
-            self._load_trade_stats()
+        self._load_trade_stats()
+
+
     def next_signal_id(self) -> int:
         sid = self._signal_seq
         self._signal_seq += 1
@@ -5502,13 +5263,14 @@ class Backend:
     def mark_emitted(self, symbol: str) -> None:
         self._last_signal_ts[symbol.upper()] = time.time()
 
+    def can_emit_mid(self, symbol: str) -> bool:
+        """Cooldown for ⚡ MID scanner (5m/30m/1h)."""
+        cooldown_min = int(os.getenv("MID_COOLDOWN_MINUTES", str(COOLDOWN_MINUTES)))
+        ts = self._last_signal_ts_mid.get(symbol.upper(), 0.0)
+        return (time.time() - ts) >= (cooldown_min * 60)
 
-def can_emit_mid(self, symbol: str) -> bool:
-    ts = self._last_mid_signal_ts.get(symbol.upper(), 0.0)
-    return (time.time() - ts) >= (MID_COOLDOWN_MINUTES * 60)
-
-def mark_emitted_mid(self, symbol: str) -> None:
-    self._last_mid_signal_ts[symbol.upper()] = time.time()
+    def mark_emitted_mid(self, symbol: str) -> None:
+        self._last_signal_ts_mid[symbol.upper()] = time.time()
 
     async def open_trade(self, user_id: int, signal: Signal, orig_text: str) -> bool:
         """Persist trade in Postgres. Returns False if already opened."""
@@ -6037,6 +5799,248 @@ def mark_emitted_mid(self, symbol: str) -> None:
                 price = 0.0
             return False, "ERROR", price
 
+
+def next_signal_id_mid(self) -> int:
+    sid = self._signal_seq_mid
+    self._signal_seq_mid += 1
+    return sid
+
+def _fmt_ta_block_mid(self, r: Dict[str, Any], mode: str) -> str:
+    # Relabel timeframes for MID (5m/30m/1h) while using the same computed fields.
+    score = int(r.get("confidence", 0) or 0)
+    rsi = float(r.get("rsi", 0.0) or 0.0)
+    macd_hist = float(r.get("macd_hist", 0.0) or 0.0)
+    adx_30m = float(r.get("adx1", 0.0) or 0.0)   # mapped from 1h slot
+    adx_1h = float(r.get("adx4", 0.0) or 0.0)    # mapped from 4h slot
+    atr_pct = float(r.get("atr_pct", 0.0) or 0.0)
+    bb = r.get("bb_pos", "—")
+    vol_x = float(r.get("rel_vol", 0.0) or 0.0)
+    vwap = r.get("vwap_pos", "—")
+    ch = r.get("channel", "—")
+    pa = r.get("price_action", "—")
+    pattern = r.get("pattern", "—")
+    sup = r.get("support", "—")
+    res = r.get("resistance", "—")
+
+    return "
+".join([
+        f"📊 TA score: {score}/100 | Mode: {mode}",
+        f"RSI: {rsi:.1f} | MACD hist: {macd_hist:.4f}",
+        f"ADX 30m/1h: {adx_30m:.1f}/{adx_1h:.1f} | ATR%: {atr_pct:.2f}",
+        f"BB: {bb} | Vol xAvg: {vol_x:.2f} | VWAP: {vwap}",
+        f"Ch: {ch} | PA: {pa}",
+        f"Pattern: {pattern} | Support: {sup} | Resistance: {res}",
+    ])
+
+async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb=None) -> None:
+    """⚡ MID scanner: 5m / 30m / 1h.
+    Работает как основной сканер, но с меньшим трендом (intraday trend).
+    """
+    if str(os.getenv("MID_SCANNER_ENABLED", "1")).strip().lower() in ("0", "false"):
+        return
+
+    interval = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45"))
+    top_n = int(os.getenv("MID_TOP_N", "50"))
+
+    mode = str(os.getenv("MID_SIGNAL_MODE", "strict")).strip().lower()
+    if str(os.getenv("MID_STRICT", "")).strip().lower() in ("1", "true"):
+        mode = "strict"
+
+    default_spot = 76 if mode == "strict" else 66
+    default_fut = 72 if mode == "strict" else 62
+    min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT", str(default_spot)))
+    min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES", str(default_fut)))
+    min_rr = float(os.getenv("MID_MIN_RR", "2.0" if mode == "strict" else "1.8"))
+
+    require_30m_trend = str(os.getenv("MID_REQUIRE_30M_TREND", "1")).strip().lower() in ("1", "true")
+    allow_futures = str(os.getenv("MID_ALLOW_FUTURES", "1")).strip().lower() in ("1", "true")
+
+    min_adx_30m = float(os.getenv("MID_MIN_ADX_30M", "20" if mode == "strict" else "18"))
+    min_adx_1h = float(os.getenv("MID_MIN_ADX_1H", "18" if mode == "strict" else "16"))
+    min_atr_pct = float(os.getenv("MID_MIN_ATR_PCT", "0.7" if mode == "strict" else "0.5"))
+
+    tp1_r = float(os.getenv("MID_TP1_R", "1.2"))
+    tp2_r = float(os.getenv("MID_TP2_R", "2.8"))
+    atr_mult_sl = float(os.getenv("MID_ATR_MULT_SL", "1.2"))
+
+    log.info("[mid] scanner start TOP_N=%s interval=%ss mode=%s", top_n, interval, mode)
+
+    while True:
+        try:
+            symbols = await api.get_top_usdt_symbols(top_n)
+            for sym in symbols:
+                if is_blocked_symbol(sym):
+                    continue
+                if not self.can_emit_mid(sym):
+                    continue
+
+                # macro/news actions (same semantics)
+                mac_act = await self.macro.action_for_symbol(sym)
+                if mac_act == "PAUSE_ALL":
+                    continue
+                if mac_act and emit_macro_alert_cb:
+                    try:
+                        await emit_macro_alert_cb(mac_act)
+                    except Exception:
+                        pass
+
+                news_act = await self.news.action_for_symbol(sym)
+                if news_act == "PAUSE_ALL":
+                    continue
+
+                async def fetch_exchange(name: str):
+                    try:
+                        if name == "BINANCE":
+                            df5 = await api.klines_binance(sym, "5m", 300)
+                            df30 = await api.klines_binance(sym, "30m", 250)
+                            df1h = await api.klines_binance(sym, "1h", 250)
+                        elif name == "BYBIT":
+                            df5 = await api.klines_bybit(sym, "5m", 250)
+                            df30 = await api.klines_bybit(sym, "30m", 200)
+                            df1h = await api.klines_bybit(sym, "1h", 200)
+                        elif name == "OKX":
+                            df5 = await api.klines_okx(sym, "5m", 250)
+                            df30 = await api.klines_okx(sym, "30m", 200)
+                            df1h = await api.klines_okx(sym, "1h", 200)
+                        elif name == "GATEIO":
+                            df5 = await api.klines_gateio(sym, "5m", 250)
+                            df30 = await api.klines_gateio(sym, "30m", 200)
+                            df1h = await api.klines_gateio(sym, "1h", 200)
+                        elif name == "MEXC":
+                            df5 = await api.klines_mexc(sym, "5m", 250)
+                            df30 = await api.klines_mexc(sym, "30m", 200)
+                            df1h = await api.klines_mexc(sym, "1h", 200)
+                        else:
+                            return name, None
+
+                        # reuse main evaluation by mapping roles:
+                        # df5 -> old df15, df30 -> old df1h, df1h -> old df4h
+                        r = self.evaluate_on_exchange(df5, df30, df1h)
+                        if not r:
+                            return name, None
+
+                        # Replace SL/TP using MID params (ATR from df30 slot already inside r)
+                        entry = float(r.get("entry", 0.0) or 0.0)
+                        sl = float(r.get("sl", 0.0) or 0.0)
+                        direction = r.get("direction", "")
+                        rr = float(r.get("rr", 0.0) or 0.0)
+
+                        # If we can recompute R-based TP (based on entry/sl distance)
+                        risk = abs(entry - sl)
+                        if risk > 0:
+                            if direction == "LONG":
+                                r["tp1"] = entry + tp1_r * risk
+                                r["tp2"] = entry + tp2_r * risk
+                            elif direction == "SHORT":
+                                r["tp1"] = entry - tp1_r * risk
+                                r["tp2"] = entry - tp2_r * risk
+                            # refresh RR against TP2
+                            r["rr"] = (abs(float(r["tp2"]) - entry) / risk) if risk > 0 else rr
+
+                        # widen SL a bit for MID using atr_mult_sl if atr present
+                        atr = float(r.get("atr", 0.0) or 0.0)
+                        if atr > 0 and entry > 0:
+                            if direction == "LONG":
+                                r["sl"] = entry - atr_mult_sl * atr
+                            elif direction == "SHORT":
+                                r["sl"] = entry + atr_mult_sl * atr
+
+                        return name, r
+                    except Exception:
+                        return name, None
+
+                results = await asyncio.gather(
+                    fetch_exchange("BINANCE"),
+                    fetch_exchange("BYBIT"),
+                    fetch_exchange("OKX"),
+                    fetch_exchange("GATEIO"),
+                    fetch_exchange("MEXC"),
+                )
+                good = [(name, r) for (name, r) in results if r is not None]
+                if not good:
+                    continue
+
+                best_name, best_r = max(
+                    good,
+                    key=lambda x: (int((x[1] or {}).get("confidence", 0) or 0), float((x[1] or {}).get("rr", 0.0) or 0.0)),
+                )
+
+                # quality filters
+                adx_30m = float(best_r.get("adx1", 0.0) or 0.0)
+                adx_1h = float(best_r.get("adx4", 0.0) or 0.0)
+                atr_pct = float(best_r.get("atr_pct", 0.0) or 0.0)
+                if adx_30m < min_adx_30m or adx_1h < min_adx_1h or atr_pct < min_atr_pct:
+                    continue
+                if require_30m_trend and best_r.get("dir1") != best_r.get("dir4"):
+                    continue
+
+                entry = float(best_r.get("entry", 0.0) or 0.0)
+                sl = float(best_r.get("sl", 0.0) or 0.0)
+                tp1 = float(best_r.get("tp1", 0.0) or 0.0)
+                tp2 = float(best_r.get("tp2", 0.0) or 0.0)
+                rr = float(best_r.get("rr", 0.0) or 0.0)
+                conf = int(best_r.get("confidence", 0) or 0)
+                direction = best_r.get("direction", "")
+
+                if rr < min_rr:
+                    continue
+
+                # market selection same as main scanner (adx slot=30m)
+                market = choose_market(adx_30m, atr_pct)
+                if not allow_futures:
+                    market = "SPOT"
+
+                # News/Macro downgrade
+                if news_act == "FUTURES_OFF" or mac_act == "FUTURES_OFF":
+                    market = "SPOT"
+
+                if market == "FUTURES":
+                    if conf < min_score_fut:
+                        continue
+                else:
+                    if conf < min_score_spot:
+                        continue
+
+                # orderbook filter (keep existing env behavior)
+                if USE_ORDERBOOK and (not ORDERBOOK_FUTURES_ONLY or market == "FUTURES"):
+                    ok_ob, _act, _price = await orderbook_filter(sym, direction, market)
+                    if not ok_ob:
+                        continue
+
+                supporters = [(best_name, best_r)]
+                confirmations = [best_name]
+
+                sid = self.next_signal_id_mid()
+                risk_note = "⚡ MID TREND
+" + self._fmt_ta_block_mid(best_r, mode)
+
+                sig = Signal(
+                    signal_id=sid,
+                    market=market,
+                    symbol=sym,
+                    direction=direction,
+                    timeframe="5m/30m/1h",
+                    entry=entry,
+                    sl=sl,
+                    tp1=tp1,
+                    tp2=tp2,
+                    rr=rr,
+                    confidence=conf,
+                    confirmations=confirmations,
+                    risk_note=risk_note,
+                    supporters=supporters,
+                )
+
+                self.mark_emitted_mid(sym)
+                await emit_signal_cb(sig)
+
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception("[mid] scanner error: %s", e)
+            await asyncio.sleep(interval)
+
     async def track_loop(self, bot) -> None:
         """Main tracker loop. Reads ACTIVE/TP1 trades from PostgreSQL and updates their status."""
         while True:
@@ -6498,172 +6502,3 @@ async def autotrade_stress_test(*, user_id: int, symbol: str, market_type: str =
     This build keeps production stable: stress-test is disabled here to avoid accidental trading.
     """
     return {"ok": False, "error": "stress_test_disabled_in_production"}
-
-
-
-async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
-    """Additional MID-TREND scanner (5m/30m/1h). Does NOT modify the main scanner."""
-    if not MID_SCANNER_ENABLED:
-        logger.info("[mid-scanner] disabled (MID_SCANNER_ENABLED=0)")
-        return
-
-    tf_str = f"{MID_TF_TRIGGER}/{MID_TF_MID}/{MID_TF_TREND}"
-    logger.info("[mid-scanner] starting tf=%s interval=%ss top_n=%s", tf_str, MID_SCAN_INTERVAL_SECONDS, MID_TOP_N)
-
-    while True:
-        start = time.time()
-        try:
-            api = self.api
-
-            # Macro status once per tick
-            mac_act, mac_ev, mac_win = self.macro.current_action()
-            self.last_macro_action = mac_act
-            if MACRO_FILTER and mac_ev:
-                try:
-                    await emit_macro_alert_cb(mac_act, mac_ev, mac_win)
-                except Exception:
-                    pass
-
-            # Fetch symbols
-            top_n = MID_TOP_N
-            symbols = await api.get_top_usdt_symbols(top_n)
-            self.scanned_symbols_last = len(symbols)
-
-            for sym in symbols:
-                if not self.scanner_running:
-                    break
-
-                sym = sym.upper().strip()
-                if not sym or is_blocked_symbol(sym):
-                    continue
-
-                if MACRO_FILTER and mac_act == "PAUSE_ALL":
-                    continue
-
-                if not self.can_emit_mid(sym):
-                    continue
-
-                # News filter per symbol
-                news_act = "ALLOW"
-                if self.news.enabled():
-                    try:
-                        news_act = await self.news.action_for_symbol(api.session, sym)  # type: ignore[arg-type]
-                    except Exception:
-                        news_act = "ALLOW"
-                self.last_news_action = news_act
-                if NEWS_FILTER and news_act == "PAUSE_ALL":
-                    continue
-
-                # Evaluate across exchanges
-                good: List[Tuple[str, Dict[str, Any]]] = []
-                for name in EXCHANGES:
-                    try:
-                        if name == "BINANCE":
-                            df5 = await api.klines_binance(sym, MID_TF_TRIGGER, 250)
-                            df30 = await api.klines_binance(sym, MID_TF_MID, 250)
-                            df1 = await api.klines_binance(sym, MID_TF_TREND, 250)
-                        elif name == "BYBIT":
-                            df5 = await api.klines_bybit(sym, MID_TF_TRIGGER, 250)
-                            df30 = await api.klines_bybit(sym, MID_TF_MID, 250)
-                            df1 = await api.klines_bybit(sym, MID_TF_TREND, 250)
-                        elif name == "OKX":
-                            df5 = await api.klines_okx(sym, MID_TF_TRIGGER, 250)
-                            df30 = await api.klines_okx(sym, MID_TF_MID, 250)
-                            df1 = await api.klines_okx(sym, MID_TF_TREND, 250)
-                        elif name == "GATEIO":
-                            df5 = await api.klines_gateio(sym, MID_TF_TRIGGER, 250)
-                            df30 = await api.klines_gateio(sym, MID_TF_MID, 250)
-                            df1 = await api.klines_gateio(sym, MID_TF_TREND, 250)
-                        elif name == "MEXC":
-                            df5 = await api.klines_mexc(sym, MID_TF_TRIGGER, 250)
-                            df30 = await api.klines_mexc(sym, MID_TF_MID, 250)
-                            df1 = await api.klines_mexc(sym, MID_TF_TREND, 250)
-                        else:
-                            continue
-
-                        res = evaluate_on_exchange_mid(df5, df30, df1)
-                        if res:
-                            good.append((name, res))
-                    except Exception:
-                        continue
-
-                if not good:
-                    continue
-
-                # Pick best by (confidence, rr)
-                best_name, best_r = max(good, key=lambda x: (int(x[1].get("confidence", 0)), float(x[1].get("rr", 0.0))))
-
-                direction = str(best_r.get("direction"))
-                entry = float(best_r.get("entry"))
-                sl = float(best_r.get("sl"))
-                tp1 = float(best_r.get("tp1"))
-                tp2 = float(best_r.get("tp2"))
-                rr = float(best_r.get("rr", 0.0))
-                conf = int(best_r.get("confidence", 0))
-
-                # Market selection (reuse existing heuristic)
-                market = choose_market(float(best_r.get("adx1", np.nan)), float(best_r.get("atr_pct", np.nan)))
-
-                if market == "FUTURES" and not MID_ALLOW_FUTURES:
-                    market = "SPOT"
-
-                # News/Macro downgrade futures → spot (same behavior as main scanner)
-                if (NEWS_FILTER and news_act == "FUTURES_OFF") or (MACRO_FILTER and mac_act == "FUTURES_OFF"):
-                    market = "SPOT"
-
-                # Thresholds
-                min_conf = MID_MIN_SCORE_FUTURES if market == "FUTURES" else MID_MIN_SCORE_SPOT
-                if rr < MID_MIN_RR or conf < min_conf:
-                    continue
-
-                # Confirmations list (same idea as main scanner)
-                confirmations: List[str] = []
-                for ex in EXCHANGES:
-                    try:
-                        p = await api.get_price(ex, sym)
-                        if p and p > 0:
-                            confirmations.append(ex)
-                    except Exception:
-                        continue
-                if not confirmations:
-                    confirmations = [best_name]
-
-                ta_block = _fmt_ta_block_mid(best_r)
-
-                sig = Signal(
-                    signal_id=self.next_signal_id(),
-                    market=market,
-                    symbol=sym,
-                    direction=direction,
-                    timeframe=tf_str,
-                    entry=entry,
-                    sl=sl,
-                    tp1=tp1,
-                    tp2=tp2,
-                    rr=rr,
-                    confidence=conf,
-                    exchange=best_name,
-                    confirmations=confirmations,
-                    risk_note=ta_block,
-                )
-
-                self.mark_emitted_mid(sym)
-                self.last_signal = sig
-                if sig.market == "SPOT":
-                    self.last_spot_signal = sig
-                else:
-                    self.last_futures_signal = sig
-
-                try:
-                    await emit_signal_cb(sig)
-                except Exception:
-                    pass
-
-            # tick end
-        except Exception as e:
-            logger.exception("[mid-scanner] tick error: %s", e)
-
-        # sleep remainder
-        elapsed = time.time() - start
-        sleep_s = max(1.0, float(MID_SCAN_INTERVAL_SECONDS) - elapsed)
-        await asyncio.sleep(sleep_s)
