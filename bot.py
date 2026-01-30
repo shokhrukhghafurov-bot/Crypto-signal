@@ -4539,6 +4539,12 @@ async def main() -> None:
     asyncio.create_task(backend.track_loop(bot))
     logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+
+    # Additional MID-TREND scanner (5m/30m/1h) - does not affect the main scanner.
+    if getattr(backend, "scanner_loop_mid", None):
+        mid_enabled = os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+        if mid_enabled:
+            asyncio.create_task(backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert))
     logger.info("Starting signal_outcome_loop")
     asyncio.create_task(signal_outcome_loop())
 
