@@ -5438,9 +5438,8 @@ class Backend:
         self.scanner_running: bool = True
         self.last_scan_ts: float = 0.0
         self.trade_stats: dict = {}
-        self._load_trade_stats()
-
-
+        if hasattr(self, '_load_trade_stats'):
+            self._load_trade_stats()
     def next_signal_id(self) -> int:
         sid = self._signal_seq
         self._signal_seq += 1
