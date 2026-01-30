@@ -4544,13 +4544,13 @@ async def main() -> None:
         asyncio.create_task(backend.track_loop(bot))
     else:
         logger.warning("Backend has no track_loop; skipping")
-    logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
+    logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
     # ⚡ MID TREND scanner (5m/30m/1h) - optional, does not affect the main scanner
     mid_enabled = os.getenv('MID_SCANNER_ENABLED', '1').strip().lower() not in ('0','false','no','off')
     if mid_enabled:
         if hasattr(backend, 'scanner_loop_mid'):
-            logger.info("Starting MID scanner_loop interval=%ss top_n=%s", os.getenv('MID_SCAN_INTERVAL_SECONDS',''), os.getenv('MID_TOP_N',''))
+            logger.info("Starting MID scanner_loop (5m/30m/1h) interval=%ss top_n=%s", os.getenv('MID_SCAN_INTERVAL_SECONDS',''), os.getenv('MID_TOP_N',''))
             asyncio.create_task(backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert))
         else:
             logger.warning('MID_SCANNER_ENABLED=1 but Backend has no scanner_loop_mid; skipping')
