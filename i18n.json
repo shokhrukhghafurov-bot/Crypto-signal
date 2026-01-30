@@ -253,7 +253,10 @@
     "at_btn_disconnect": "❌ Disconnect",
     "at_label_cap_setting": "📌 Cap (setting)",
     "at_label_effective_cap_now": "🧠 Effective Cap (now)",
-    "status_user_id": "🆔 ID: {id}"
+    "status_user_id": "🆔 ID: {id}",
+    "sig_mid_tag": "⚡ MID",
+    "sig_mid_trend_tag": "⚡ MID TREND",
+    "sig_intraday_tag": "⚡ INTRADAY"
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -509,6 +512,9 @@
     "at_btn_disconnect": "❌ Отключить",
     "at_label_cap_setting": "📌 Cap (настройка)",
     "at_label_effective_cap_now": "🧠 Effective Cap (сейчас)",
-    "status_user_id": "🆔 ID: {id}"
+    "status_user_id": "🆔 ID: {id}",
+    "sig_mid_tag": "⚡ MID",
+    "sig_mid_trend_tag": "⚡ MID TREND",
+    "sig_intraday_tag": "⚡ INTRADAY"
   }
 }
