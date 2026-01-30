@@ -1206,6 +1206,14 @@ def autotrade_keys_kb(uid: int) -> types.InlineKeyboardMarkup:
 
 def _signal_text(uid: int, s: Signal) -> str:
     header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
+    # ⚡ MID-TREND marker (5m/30m/1h) — keeps old signals untouched
+    if str(getattr(s, "timeframe", "")).strip() == "5m/30m/1h":
+        try:
+            header = f"{tr(uid, 'sig_mid_trend_tag')}
+{header}"
+        except Exception:
+            header = "⚡ MID TREND
+" + header
     market_banner = tr(uid, 'sig_spot_new') if s.market == 'SPOT' else tr(uid, 'sig_fut_new')
 
     # Visual marker near symbol (kept simple to avoid hard-depending on any exchange)
