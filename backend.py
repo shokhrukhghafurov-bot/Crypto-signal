@@ -4292,7 +4292,7 @@ class MultiExchangeData:
         except Exception:
             return None
     async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        interval_map = {"5m":"5", "15m":"15", "30m":"30", "1h":"60", "4h":"240"}
+        interval_map = {"15m":"15", "1h":"60", "4h":"240"}
         itv = interval_map.get(interval, "15")
         url = f"{self.BYBIT}/v5/market/kline"
         params = {"category": "spot", "symbol": symbol, "interval": itv, "limit": str(limit)}
@@ -4308,7 +4308,7 @@ class MultiExchangeData:
         return symbol
 
     async def klines_okx(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        bar_map = {"5m":"5m", "15m":"15m", "30m":"30m", "1h":"1H", "4h":"4H"}
+        bar_map = {"15m":"15m", "1h":"1H", "4h":"4H"}
         bar = bar_map.get(interval, "15m")
         inst = self.okx_inst(symbol)
         url = f"{self.OKX}/api/v5/market/candles"
@@ -6322,15 +6322,20 @@ class Backend:
                 async with MultiExchangeData() as api:
                     await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
                     symbols = await api.get_top_usdt_symbols(top_n)
+                    mac_act, mac_ev, mac_win = self.macro.current_action()
+                    self.last_macro_action = mac_act
+                    if MACRO_FILTER:
+                        logger.info("[mid] macro action=%s next=%s window=%s", mac_act, getattr(mac_ev, "name", None) if mac_ev else None, mac_win)
+                        if mac_act != "ALLOW" and mac_ev and mac_win and self.macro.should_notify(mac_ev):
+                            logger.info("[mid][macro] alert: action=%s event=%s window=%s", mac_act, getattr(mac_ev, "name", None), mac_win)
+                            await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
+
                     for sym in symbols:
                         if not self.can_emit_mid(sym) or is_blocked_symbol(sym):
                             continue
 
-                        mac_act = "OK"
-                        if MACRO_FILTER:
-                            mac_act = await self.macro.action_for_symbol(api.session, sym, emit_macro_alert_cb)  # type: ignore[arg-type]
-                            if mac_act == "PAUSE_ALL":
-                                continue
+                        if MACRO_FILTER and mac_act == "PAUSE_ALL":
+                            continue
                         news_act = "OK"
                         if NEWS_FILTER and CRYPTOPANIC_TOKEN:
                             news_act = await self.news.action_for_symbol(sym)
@@ -6338,7 +6343,7 @@ class Backend:
                                 continue
 
                         supporters = []
-                        for name in SCANNER_EXCHANGES:
+                        for name in EXCHANGES:
                             try:
                                 if name == "BINANCE":
                                     a = await api.klines_binance(sym, tf_trigger, 250)
