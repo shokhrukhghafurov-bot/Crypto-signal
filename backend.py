@@ -125,6 +125,8 @@ def _should_deactivate_key(err_text: str) -> bool:
         "ip",
         "whitelist",
     )
+    if MID_MIN_ATR_PCT > 0 and not np.isnan(atr_pct) and atr_pct < MID_MIN_ATR_PCT:
+        return None
     return any(n in t for n in needles)
 
 
@@ -3632,12 +3634,54 @@ MID_TF_TREND = os.getenv("MID_TF_TREND", "1h")
 MID_SCAN_INTERVAL_SECONDS = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45"))
 MID_TOP_N = int(os.getenv("MID_TOP_N", str(TOP_N)))  # default: same as main scanner
 MID_COOLDOWN_MINUTES = int(os.getenv("MID_COOLDOWN_MINUTES", "120"))
-MID_MIN_RR = float(os.getenv("MID_MIN_RR", "1.8"))
-MID_MIN_SCORE_SPOT = int(os.getenv("MID_MIN_SCORE_SPOT", "74"))
-MID_MIN_SCORE_FUTURES = int(os.getenv("MID_MIN_SCORE_FUTURES", "70"))
+
+# MID signal quality mode (separate from main SIGNAL_MODE)
+# - strict: fewer but higher-quality signals, рассчитано под "дальний TP2"
+# - medium: больше сигналов, мягче пороги
+MID_SIGNAL_MODE = os.getenv("MID_SIGNAL_MODE", "strict").strip().lower()
+if os.getenv("MID_STRICT", "").strip() in ("1", "true", "yes", "on"):
+    MID_SIGNAL_MODE = "strict"
+if MID_SIGNAL_MODE not in ("strict", "medium"):
+    MID_SIGNAL_MODE = "strict"
+
+# Defaults tuned for intraday trend (5m/30m/1h)
+if MID_SIGNAL_MODE == "strict":
+    _mid_def_min_rr = 2.0
+    _mid_def_score_spot = 76
+    _mid_def_score_fut = 72
+    _mid_def_tp2_r = 2.8
+else:
+    _mid_def_min_rr = 1.8
+    _mid_def_score_spot = 74
+    _mid_def_score_fut = 70
+    _mid_def_tp2_r = 2.6
+
+MID_MIN_RR = float(os.getenv("MID_MIN_RR", str(_mid_def_min_rr)))
+MID_MIN_SCORE_SPOT = int(os.getenv("MID_MIN_SCORE_SPOT", str(_mid_def_score_spot)))
+MID_MIN_SCORE_FUTURES = int(os.getenv("MID_MIN_SCORE_FUTURES", str(_mid_def_score_fut)))
+
+# Levels
 MID_ATR_MULT_SL = float(os.getenv("MID_ATR_MULT_SL", "1.2"))
 MID_TP1_R = float(os.getenv("MID_TP1_R", "1.2"))
-MID_TP2_R = float(os.getenv("MID_TP2_R", "2.6"))
+MID_TP2_R = float(os.getenv("MID_TP2_R", str(_mid_def_tp2_r)))
+
+
+# Extra quality filters for MID (0 disables)
+# Defaults are tuned per MID_SIGNAL_MODE.
+if MID_SIGNAL_MODE == "strict":
+    _mid_def_adx_mid = 20
+    _mid_def_adx_trend = 18
+    _mid_def_atr_pct = 0.7
+else:
+    _mid_def_adx_mid = 16
+    _mid_def_adx_trend = 14
+    _mid_def_atr_pct = 0.5
+
+MID_REQUIRE_30M_TREND = _env_bool("MID_REQUIRE_30M_TREND", True)
+MID_ALLOW_FUTURES = _env_bool("MID_ALLOW_FUTURES", True)
+MID_MIN_ADX_30M = float(os.getenv("MID_MIN_ADX_30M", str(_mid_def_adx_mid)))
+MID_MIN_ADX_1H = float(os.getenv("MID_MIN_ADX_1H", str(_mid_def_adx_trend)))
+MID_MIN_ATR_PCT = float(os.getenv("MID_MIN_ATR_PCT", str(_mid_def_atr_pct)))
 
 
 USE_REAL_PRICE = _env_bool("USE_REAL_PRICE", True)
@@ -5235,7 +5279,7 @@ def evaluate_on_exchange_mid(df5m: pd.DataFrame, df30m: pd.DataFrame, df1h: pd.D
     dir_mid = _trend_dir(df30i)     # 30m
     if dir_trend is None or dir_mid is None:
         return None
-    if dir_trend != dir_mid:
+    if MID_REQUIRE_30M_TREND and dir_trend != dir_mid:
         return None
 
     last5 = df5i.iloc[-1]
@@ -5244,6 +5288,12 @@ def evaluate_on_exchange_mid(df5m: pd.DataFrame, df30m: pd.DataFrame, df1h: pd.D
 
     adx_mid = float(last30.get("adx", np.nan))
     adx_trend = float(last1h.get("adx", np.nan))
+
+    # Optional quality gates
+    if not np.isnan(adx_mid) and MID_MIN_ADX_30M > 0 and adx_mid < MID_MIN_ADX_30M:
+        return None
+    if not np.isnan(adx_trend) and MID_MIN_ADX_1H > 0 and adx_trend < MID_MIN_ADX_1H:
+        return None
 
     entry = float(last5["close"])
     atr = float(last30.get("atr", np.nan))  # ATR from mid TF (30m)
@@ -6553,6 +6603,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
 
                 # Market selection (reuse existing heuristic)
                 market = choose_market(float(best_r.get("adx1", np.nan)), float(best_r.get("atr_pct", np.nan)))
+
+                if market == "FUTURES" and not MID_ALLOW_FUTURES:
+                    market = "SPOT"
 
                 # News/Macro downgrade futures → spot (same behavior as main scanner)
                 if (NEWS_FILTER and news_act == "FUTURES_OFF") or (MACRO_FILTER and mac_act == "FUTURES_OFF"):
