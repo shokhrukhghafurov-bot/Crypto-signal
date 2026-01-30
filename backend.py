@@ -4292,7 +4292,7 @@ class MultiExchangeData:
         except Exception:
             return None
     async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        interval_map = {"15m":"15", "1h":"60", "4h":"240"}
+        interval_map = {"5m":"5", "15m":"15", "30m":"30", "1h":"60", "4h":"240"}
         itv = interval_map.get(interval, "15")
         url = f"{self.BYBIT}/v5/market/kline"
         params = {"category": "spot", "symbol": symbol, "interval": itv, "limit": str(limit)}
@@ -4308,7 +4308,7 @@ class MultiExchangeData:
         return symbol
 
     async def klines_okx(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        bar_map = {"15m":"15m", "1h":"1H", "4h":"4H"}
+        bar_map = {"5m":"5m", "15m":"15m", "30m":"30m", "1h":"1H", "4h":"4H"}
         bar = bar_map.get(interval, "15m")
         inst = self.okx_inst(symbol)
         url = f"{self.OKX}/api/v5/market/candles"
