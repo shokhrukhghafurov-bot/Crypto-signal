@@ -6318,6 +6318,12 @@ class Backend:
             tp1_r = float(os.getenv("MID_TP1_R","1.2"))
             tp2_r = float(os.getenv("MID_TP2_R","2.8"))
 
+            # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
+            _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
+            scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
+            if not scan_exchanges:
+                scan_exchanges = ['BINANCE','BYBIT','OKX','GATEIO','MEXC']
+
             try:
                 async with MultiExchangeData() as api:
                     await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
@@ -6338,14 +6344,12 @@ class Backend:
                             continue
                         news_act = "OK"
                         if NEWS_FILTER and CRYPTOPANIC_TOKEN:
-                            news_act = await self.news.action_for_symbol(api.session, sym)  # type: ignore[arg-type]
+                            news_act = await self.news.action_for_symbol(api.session, sym)
                             if news_act == "PAUSE_ALL":
                                 continue
 
-                        self.last_news_action = news_act
-
                         supporters = []
-                        for name in EXCHANGES:
+                        for name in scan_exchanges:
                             try:
                                 if name == "BINANCE":
                                     a = await api.klines_binance(sym, tf_trigger, 250)
