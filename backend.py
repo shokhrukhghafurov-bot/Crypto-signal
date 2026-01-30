@@ -6338,9 +6338,11 @@ class Backend:
                             continue
                         news_act = "OK"
                         if NEWS_FILTER and CRYPTOPANIC_TOKEN:
-                            news_act = await self.news.action_for_symbol(sym)
+                            news_act = await self.news.action_for_symbol(api.session, sym)  # type: ignore[arg-type]
                             if news_act == "PAUSE_ALL":
                                 continue
+
+                        self.last_news_action = news_act
 
                         supporters = []
                         for name in EXCHANGES:
