@@ -1206,12 +1206,6 @@ def autotrade_keys_kb(uid: int) -> types.InlineKeyboardMarkup:
 
 def _signal_text(uid: int, s: Signal) -> str:
     header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
-    # ⚡ MID-TREND marker (5m/30m/1h) — keeps old signals untouched
-    if str(getattr(s, "timeframe", "")).strip() == "5m/30m/1h":
-        try:
-            header = f"{tr(uid, 'sig_mid_trend_tag')}\n{header}"
-        except Exception:
-            header = "⚡ MID TREND\n" + header
     market_banner = tr(uid, 'sig_spot_new') if s.market == 'SPOT' else tr(uid, 'sig_fut_new')
 
     # Visual marker near symbol (kept simple to avoid hard-depending on any exchange)
@@ -4542,14 +4536,14 @@ async def main() -> None:
         await asyncio.Event().wait()
 
     logger.info("Starting track_loop")
-    asyncio.create_task(backend.track_loop(bot))
+    if hasattr(backend, "track_loop"):
+            asyncio.create_task(backend.track_loop(bot))
+        else:
+            log.warning("Backend.track_loop not found; tracking disabled")
     logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
-
-    # Additional MID-TREND scanner (5m/30m/1h) - does not affect the main scanner.
-    if getattr(backend, "scanner_loop_mid", None):
-        mid_enabled = os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
-        if mid_enabled:
+        # ⚡ MID scanner (5m/30m/1h) - optional
+        if hasattr(backend, "scanner_loop_mid") and str(os.getenv("MID_SCANNER_ENABLED","1")).strip().lower() not in ("0","false"):
             asyncio.create_task(backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert))
     logger.info("Starting signal_outcome_loop")
     asyncio.create_task(signal_outcome_loop())
