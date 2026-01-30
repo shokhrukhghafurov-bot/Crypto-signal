@@ -6338,7 +6338,7 @@ class Backend:
                                 continue
 
                         supporters = []
-                        for name in EXCHANGES:
+                        for name in SCANNER_EXCHANGES:
                             try:
                                 if name == "BINANCE":
                                     a = await api.klines_binance(sym, tf_trigger, 250)
