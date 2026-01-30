@@ -1207,6 +1207,10 @@ def autotrade_keys_kb(uid: int) -> types.InlineKeyboardMarkup:
 def _signal_text(uid: int, s: Signal) -> str:
     header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
     market_banner = tr(uid, 'sig_spot_new') if s.market == 'SPOT' else tr(uid, 'sig_fut_new')
+    # ⚡ MID tag (only for MID timeframe; does not affect old signals)
+    if getattr(s, 'timeframe', '') == '5m/30m/1h':
+        header = f"{tr(uid, 'sig_mid_trend_tag')}\n{header}"
+
 
     # Visual marker near symbol (kept simple to avoid hard-depending on any exchange)
     symbol_emoji = "🟢" if s.market == 'SPOT' else "🌕"
@@ -4537,14 +4541,20 @@ async def main() -> None:
 
     logger.info("Starting track_loop")
     if hasattr(backend, "track_loop"):
-            asyncio.create_task(backend.track_loop(bot))
-        else:
-            log.warning("Backend.track_loop not found; tracking disabled")
+        asyncio.create_task(backend.track_loop(bot))
+    else:
+        logger.warning("Backend has no track_loop; skipping")
     logger.info("Starting scanner_loop interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
-        # ⚡ MID scanner (5m/30m/1h) - optional
-        if hasattr(backend, "scanner_loop_mid") and str(os.getenv("MID_SCANNER_ENABLED","1")).strip().lower() not in ("0","false"):
+    # ⚡ MID TREND scanner (5m/30m/1h) - optional, does not affect the main scanner
+    mid_enabled = os.getenv('MID_SCANNER_ENABLED', '1').strip().lower() not in ('0','false','no','off')
+    if mid_enabled:
+        if hasattr(backend, 'scanner_loop_mid'):
+            logger.info("Starting MID scanner_loop interval=%ss top_n=%s", os.getenv('MID_SCAN_INTERVAL_SECONDS',''), os.getenv('MID_TOP_N',''))
             asyncio.create_task(backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert))
+        else:
+            logger.warning('MID_SCANNER_ENABLED=1 but Backend has no scanner_loop_mid; skipping')
+
     logger.info("Starting signal_outcome_loop")
     asyncio.create_task(signal_outcome_loop())
 
