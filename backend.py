@@ -6328,6 +6328,20 @@ class Backend:
                 async with MultiExchangeData() as api:
                     await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
                     symbols = await api.get_top_usdt_symbols(top_n)
+                    # --- MID tick counters / diagnostics ---
+                    _mid_scanned = len(symbols)
+                    _mid_emitted = 0
+                    _mid_skip_blocked = 0
+                    _mid_skip_cooldown = 0
+                    _mid_skip_macro = 0
+                    _mid_skip_news = 0
+                    _mid_f_align = 0
+                    _mid_f_score = 0
+                    _mid_f_rr = 0
+                    _mid_f_adx = 0
+                    _mid_f_atr = 0
+                    _mid_f_futoff = 0
+                    logger.info("[mid] tick start TOP_N=%s interval=%ss scanned=%s", top_n, interval, _mid_scanned)
                     mac_act, mac_ev, mac_win = self.macro.current_action()
                     self.last_macro_action = mac_act
                     if MACRO_FILTER:
@@ -6337,15 +6351,21 @@ class Backend:
                             await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
 
                     for sym in symbols:
-                        if not self.can_emit_mid(sym) or is_blocked_symbol(sym):
+                        if is_blocked_symbol(sym):
+                            _mid_skip_blocked += 1
+                            continue
+                        if not self.can_emit_mid(sym):
+                            _mid_skip_cooldown += 1
                             continue
 
                         if MACRO_FILTER and mac_act == "PAUSE_ALL":
+                            _mid_skip_macro += 1
                             continue
                         news_act = "OK"
                         if NEWS_FILTER and CRYPTOPANIC_TOKEN:
                             news_act = await self.news.action_for_symbol(api.session, sym)
                             if news_act == "PAUSE_ALL":
+                                _mid_skip_news += 1
                                 continue
 
                         supporters = []
@@ -6383,6 +6403,7 @@ class Backend:
 
                         best_name, best_r = max(supporters, key=lambda x: (float(x[1].get("confidence",0)), float(x[1].get("rr",0))))
                         if require_align and str(best_r.get("dir1","")).upper() != str(best_r.get("dir4","")).upper():
+                            _mid_f_align += 1
                             continue
 
                         conf = float(best_r.get("confidence",0) or 0)
@@ -6392,20 +6413,28 @@ class Backend:
                         atrp = float(best_r.get("atr_pct",0) or 0)
 
                         if min_adx_30m and adx30 < min_adx_30m:
+                            _mid_f_adx += 1
                             continue
                         if min_adx_1h and adx1h < min_adx_1h:
+                            _mid_f_adx += 1
                             continue
                         if min_atr_pct and atrp < min_atr_pct:
+                            _mid_f_atr += 1
                             continue
 
                         market = choose_market(adx30, atrp)
                         if not allow_futures:
                             market = "SPOT"
                         if market == "FUTURES" and (news_act == "FUTURES_OFF" or mac_act == "FUTURES_OFF"):
+                            _mid_f_futoff += 1
                             market = "SPOT"
 
                         min_conf = min_score_fut if market == "FUTURES" else min_score_spot
-                        if conf < float(min_conf) or rr < float(min_rr):
+                        if conf < float(min_conf):
+                            _mid_f_score += 1
+                            continue
+                        if rr < float(min_rr):
+                            _mid_f_rr += 1
                             continue
 
                         direction = str(best_r.get("direction","")).upper()
@@ -6446,6 +6475,12 @@ class Backend:
                 logger.exception("[mid] scanner_loop_mid error")
 
             elapsed = time.time() - start
+            try:
+                logger.info("[mid] tick done scanned=%s emitted=%s blocked=%s cooldown=%s macro=%s news=%s align=%s score=%s rr=%s adx=%s atr=%s futoff=%s elapsed=%.1fs",
+                            _mid_scanned, _mid_emitted, _mid_skip_blocked, _mid_skip_cooldown, _mid_skip_macro, _mid_skip_news,
+                            _mid_f_align, _mid_f_score, _mid_f_rr, _mid_f_adx, _mid_f_atr, _mid_f_futoff, float(elapsed))
+            except Exception:
+                pass
             await asyncio.sleep(max(1, interval - int(elapsed)))
 async def autotrade_healthcheck() -> dict:
     """DB-only health snapshot for autotrade. Never places orders."""
