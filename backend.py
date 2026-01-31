@@ -4908,54 +4908,88 @@ def _ta_score(*,
               mstruct: str,
               pat_bias: int,
               atr_pct: float) -> int:
-    """Compute 0..100 TA score (used as 'confidence' too). Keep deterministic and simple."""
+    """Compute 0..100 TA score (used as 'confidence' too).
+
+    This is shared by MAIN and MID. We intentionally avoid saturating to 100 too easily:
+    the raw additive score is passed through a smooth squashing function.
+    """
     score = 50.0
-    # trend strength
+
+    # Trend strength (multi-timeframe)
     if not np.isnan(adx4):
-        score += min(18.0, max(0.0, (adx4 - 15.0) * 1.2))
+        score += min(22.0, max(0.0, (adx4 - 15.0) * 1.1))
     if not np.isnan(adx1):
-        score += min(12.0, max(0.0, (adx1 - 15.0) * 0.9))
-    # volume
-    if not np.isnan(vol_rel):
-        score += min(10.0, max(0.0, (vol_rel - 1.0) * 8.0))
-    # macd impulse
-    if not np.isnan(macd_hist15):
-        if direction == "LONG":
-            score += 6.0 if macd_hist15 >= 0 else 0.0
-        else:
-            score += 6.0 if macd_hist15 <= 0 else 0.0
-    # rsi sanity
+        score += min(18.0, max(0.0, (adx1 - 15.0) * 0.9))
+
+    # RSI sanity (prefer balanced momentum for entries)
     if not np.isnan(rsi15):
-        if direction == "LONG":
-            score += 6.0 if 45 <= rsi15 <= TA_RSI_MAX_LONG else 2.0
+        if 42.0 <= rsi15 <= 58.0:
+            score += 10.0
+        elif 38.0 <= rsi15 <= 62.0:
+            score += 6.0
         else:
-            score += 6.0 if TA_RSI_MIN_SHORT <= rsi15 <= 55 else 2.0
-    # divergence bonus
-    if (direction == "LONG" and rsi_div == "BULL") or (direction == "SHORT" and rsi_div == "BEAR"):
-        score += 8.0
-    # channel bonus
-    if isinstance(channel, str) and channel != "—":
-        if direction == "LONG" and ("asc@lower" in channel or "flat@lower" in channel):
+            score -= 3.0
+
+    # MACD histogram bias (small effect, do not dominate)
+    if not np.isnan(macd_hist15):
+        if direction == "LONG" and macd_hist15 > 0:
             score += 4.0
-        if direction == "SHORT" and ("desc@upper" in channel or "flat@upper" in channel):
+        elif direction == "SHORT" and macd_hist15 < 0:
             score += 4.0
-    # market structure
-    if (direction == "LONG" and mstruct == "HH-HL") or (direction == "SHORT" and mstruct == "LH-LL"):
-        score += 7.0
+        else:
+            score -= 2.0
+
+    # Relative volume (if missing/zero, apply a small penalty)
+    if vol_rel is None or (isinstance(vol_rel, float) and np.isnan(vol_rel)) or vol_rel <= 0:
+        score -= 5.0
+    else:
+        if vol_rel >= 1.6:
+            score += 6.0
+        elif vol_rel >= 1.2:
+            score += 3.0
+
+    # Bollinger position: being at extremes is better for mean-reversion entries,
+    # but for trend-following we just treat it as a mild confirmation.
+    if bb_pos in ("↑high", "↓low"):
+        score += 3.0
+    elif bb_pos in ("mid→high", "low→mid"):
+        score += 1.0
+
+    # Divergence / channel / structure
+    if rsi_div and rsi_div != "—":
+        if (direction == "LONG" and "bull" in str(rsi_div).lower()) or (direction == "SHORT" and "bear" in str(rsi_div).lower()):
+            score += 4.0
+        else:
+            score -= 2.0
+
+    if channel and channel != "—":
+        score += 2.0
+
+    if mstruct == "TREND":
+        score += 4.0
     elif mstruct == "RANGE":
         score -= 4.0
-    # pattern
+
+    # Pattern bias
     if (direction == "LONG" and pat_bias > 0) or (direction == "SHORT" and pat_bias < 0):
-        score += 3.0
-    # atr sanity (too wild reduces score)
+        score += 4.0
+    elif pat_bias == 0:
+        score -= 2.0
+
+    # ATR sanity (too wild reduces score)
     if not np.isnan(atr_pct):
         if atr_pct > 6.0:
-            score -= 6.0
+            score -= 8.0
         elif atr_pct > 4.0:
-            score -= 3.0
+            score -= 4.0
+        elif atr_pct < 0.15:
+            score -= 4.0
+
+    # Smooth squashing so 100/100 is rare.
+    raw = score
+    score = 50.0 + 50.0 * math.tanh((raw - 50.0) / 35.0)
+
     return int(max(0, min(100, round(score))))
-
-
 def _fmt_ta_block(ta: Dict[str, Any]) -> str:
     """
     Format TA snapshot for Telegram/UX. Keep it short but informative.
@@ -5179,8 +5213,8 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
 def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
-    Goal: make MID TA snapshot behave like MAIN TA snapshot, but on 5m/30m/1h.
-    Returns keys used by scanner_loop_mid and _fmt_ta_block_mid.
+    Produces a result dict compatible with scanner_loop_mid and a rich TA block (like MAIN),
+    but tuned for MID timeframes.
     """
     if df5 is None or df30 is None or df1h is None:
         return None
@@ -5194,24 +5228,13 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     except Exception:
         return None
 
-    # --- Direction (trend=1h, mid=30m) with fallback ---
-    def _fallback_dir(df: pd.DataFrame) -> Optional[str]:
-        try:
-            if df is None or df.empty:
-                return None
-            last = df.iloc[-1]
-            ema = last.get("ema50", np.nan)
-            close = last.get("close", np.nan)
-            if np.isnan(ema) or np.isnan(close):
-                return None
-            return "LONG" if float(close) >= float(ema) else "SHORT"
-        except Exception:
-            return None
-
-    dir_trend = _trend_dir(df1hi) or _fallback_dir(df1hi)
-    dir_mid = _trend_dir(df30i) or _fallback_dir(df30i)
-    if dir_trend is None or dir_mid is None:
+    # Directions (trend=1h, mid=30m)
+    dir_trend = _trend_dir(df1hi)
+    dir_mid = _trend_dir(df30i)
+    if dir_trend is None:
         return None
+    if dir_mid is None:
+        dir_mid = dir_trend
 
     last5 = df5i.iloc[-1]
     last30 = df30i.iloc[-1]
@@ -5221,105 +5244,184 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     if np.isnan(entry) or entry <= 0:
         return None
 
-    # ATR from 30m (more stable for MID)
-    atr = float(last30.get("atr", np.nan))
-    if np.isnan(atr) or atr <= 0:
+    # ATR from 30m (prefer indicator, fallback to true-range)
+    atr30 = float(last30.get("atr", np.nan))
+    if np.isnan(atr30) or atr30 <= 0:
+        try:
+            hi = df30i["high"].astype(float)
+            lo = df30i["low"].astype(float)
+            cl = df30i["close"].astype(float)
+            prev = cl.shift(1)
+            tr = np.maximum(hi - lo, np.maximum((hi - prev).abs(), (lo - prev).abs()))
+            atr30 = float(tr.rolling(14).mean().iloc[-1])
+        except Exception:
+            return None
+    if np.isnan(atr30) or atr30 <= 0:
         return None
-    atr_pct = (atr / entry) * 100.0 if entry > 0 else 0.0
 
-    adx30 = float(last30.get("adx", 0.0) or 0.0)
-    adx1h = float(last1h.get("adx", 0.0) or 0.0)
+    # Trend strength
+    adx30 = float(last30.get("adx", np.nan))
+    adx1h = float(last1h.get("adx", np.nan))
+    if np.isnan(adx30):
+        adx30 = float("nan")
+    if np.isnan(adx1h):
+        adx1h = float("nan")
 
-    tp2_r = _adaptive_tp2_r(adx1h)
-    sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr, tp2_r=tp2_r)
+    atr_pct = (atr30 / entry) * 100.0
 
-    # --- Snapshot indicators (like MAIN, but for MID) ---
+    # --- Dynamic TP2/RR for MID ---
+    def _tp2_r_mid(adx_1h: float, adx_30m: float, atrp: float) -> float:
+        """Adaptive TP2_R for MID. Keeps targets realistic in weak trends and allows larger targets in strong trends."""
+        a1 = 0.0 if np.isnan(adx_1h) else float(adx_1h)
+        a30 = 0.0 if np.isnan(adx_30m) else float(adx_30m)
+
+        # Base by trend strength
+        if a1 >= 40:
+            r = 3.0
+        elif a1 >= 30:
+            r = 2.6
+        elif a1 >= 22:
+            r = 2.2
+        elif a1 >= 16:
+            r = 1.8
+        else:
+            r = 1.5
+
+        # Midframe confirmation
+        if a30 >= 28:
+            r += 0.2
+        elif a30 <= 12:
+            r -= 0.1
+
+        # Volatility sanity: too low -> reduce; too high -> reduce
+        try:
+            v = float(atrp)
+        except Exception:
+            v = 0.0
+        if v < 0.2:
+            r -= 0.2
+        elif v > 5.0:
+            r -= 0.3
+        elif v > 3.5:
+            r -= 0.15
+
+        return float(max(1.3, min(3.2, r)))
+
+    tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct)
+    sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
+
+    # --- TA extras (MAIN-like) ---
+    # RSI/MACD on 5m
     rsi5 = float(last5.get("rsi", np.nan))
     macd_hist5 = float(last5.get("macd_hist", np.nan))
-    if np.isnan(rsi5):
-        rsi5 = 50.0
-    if np.isnan(macd_hist5):
-        macd_hist5 = 0.0
 
-    # Bollinger Bands on 5m
-    bb_low = float(last5.get("bb_low", np.nan))
-    bb_mid = float(last5.get("bb_mavg", np.nan))
-    bb_high = float(last5.get("bb_high", np.nan))
-    bb_pos = _bb_position(entry, bb_low, bb_mid, bb_high)
-    if not np.isnan(bb_low) and not np.isnan(bb_mid) and not np.isnan(bb_high):
-        bb_str = f"{bb_low:.6g}/{bb_mid:.6g}/{bb_high:.6g}"
-    else:
-        bb_str = "—"
+    # Bollinger Bands on 5m (20)
+    bb_low = bb_mid = bb_high = float("nan")
+    bb_pos = "—"
+    try:
+        cl = df5i["close"].astype(float)
+        bb_mid = float(cl.rolling(20).mean().iloc[-1])
+        bb_std = float(cl.rolling(20).std(ddof=0).iloc[-1])
+        bb_low = bb_mid - 2.0 * bb_std
+        bb_high = bb_mid + 2.0 * bb_std
+        bb_pos = _bb_position(entry, bb_low, bb_mid, bb_high)
+    except Exception:
+        pass
+    bb_str = bb_pos
 
     # Relative volume on 5m
-    vol = float(last5.get("volume", 0.0) or 0.0)
-    vol_sma = float(last5.get("vol_sma20", np.nan))
-    rel_vol = (vol / vol_sma) if (vol_sma and not np.isnan(vol_sma) and vol_sma > 0) else 0.0
+    vol_rel = float("nan")
+    try:
+        vol = float(df5i.iloc[-1].get("volume", np.nan))
+        vol_sma = float(df5i["volume"].astype(float).rolling(20).mean().iloc[-1])
+        vol_rel = (vol / vol_sma) if (vol_sma and not np.isnan(vol_sma) and vol_sma > 0) else np.nan
+    except Exception:
+        vol_rel = float("nan")
 
-    # VWAP from 30m (more meaningful for MID)
-    vwap30 = float(last30.get("vwap", np.nan))
-    vwap_str = f"{vwap30:.6g}" if not np.isnan(vwap30) and vwap30 > 0 else "—"
+    # VWAP on 30m (typical price * vol)
+    vwap_val = float("nan")
+    vwap_txt = "—"
+    try:
+        d = df30i.tail(80).copy()
+        vol = d["volume"].astype(float)
+        tp = (d["high"].astype(float) + d["low"].astype(float) + d["close"].astype(float)) / 3.0
+        denom = float(vol.sum())
+        if denom > 0:
+            vwap_val = float((tp * vol).sum() / denom)
+            if entry >= vwap_val:
+                vwap_txt = f"{vwap_val:.6g} (above)"
+            else:
+                vwap_txt = f"{vwap_val:.6g} (below)"
+    except Exception:
+        pass
 
-    # Pattern + S/R + divergence + channel + structure (same helpers as MAIN)
-    pattern, _pat_bias = _candle_pattern(df5i)
-    support, resistance = _nearest_levels(df1hi, lookback=180, swing=3)
-    rsi_div = _rsi_divergence(df5i, lookback=140, pivot=3)
-    channel, _ch_pos, _ch_slope = _linreg_channel(df1hi, window=140, k=2.0)
-    structure = _market_structure(df1hi, lookback=200, swing=3)
+    # Pattern on 5m
+    pattern, pat_bias = _candle_pattern(df5i)
 
-    # TA score (reuse MAIN scoring function)
-    score = _ta_score(
+    # RSI divergence on 30m (more stable than 5m)
+    rsi_div = _rsi_divergence(df30i)
+
+    # Channel + structure on 1h
+    channel, _, _ = _linreg_channel(df1hi)
+    mstruct_raw = _market_structure(df1hi)
+    if mstruct_raw in ("HH-HL", "LH-LL"):
+        mstruct = "TREND"
+    elif mstruct_raw == "RANGE":
+        mstruct = "RANGE"
+    else:
+        mstruct = "—"
+
+    support, resistance = _nearest_levels(df1hi)
+
+    # Score / confidence: use unified TA score to avoid constant 100s
+    ta_score = _ta_score(
         direction=dir_trend,
         adx1=adx30,
         adx4=adx1h,
         rsi15=rsi5,
         macd_hist15=macd_hist5,
-        vol_rel=rel_vol,
+        vol_rel=vol_rel,
         bb_pos=bb_pos,
         rsi_div=rsi_div,
         channel=channel,
-        mstruct=structure,
-        support=support,
-        resistance=resistance,
+        mstruct=mstruct,
+        pat_bias=pat_bias,
+        atr_pct=atr_pct,
     )
-    confidence = int(score)
+    confidence = ta_score
 
     ta: Dict[str, Any] = {
         "direction": dir_trend,
-        "entry": float(entry),
-        "sl": float(sl),
-        "tp1": float(tp1),
-        "tp2": float(tp2),
-        "rr": float(rr),
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "rr": rr,
+        "confidence": confidence,
 
-        # what mid loop expects
-        "dir1": dir_mid,            # 30m
-        "dir4": dir_trend,          # 1h
-        "adx1": float(adx30),       # 30m
-        "adx4": float(adx1h),       # 1h
-        "atr_pct": float(atr_pct),
+        # fields used by MID filters/formatter
+        "dir1": dir_mid,
+        "dir4": dir_trend,
+        "adx1": adx30,
+        "adx4": adx1h,
+        "atr_pct": atr_pct,
 
         # MID TA block fields
-        "confidence": int(confidence),
-        "ta_score": int(score),
-        "score": int(score),
-        "rsi": float(rsi5),
-        "macd_hist": float(macd_hist5),
+        "rsi": rsi5,
+        "macd_hist": macd_hist5,
         "bb": bb_str,
-        "rel_vol": float(rel_vol),
-        "vwap": vwap_str,
-        "channel": channel,
-        "structure": structure,
+        "rel_vol": vol_rel if (not np.isnan(vol_rel)) else 0.0,
+        "vwap": vwap_txt,
         "pattern": pattern,
-        "support": support if support is not None else "—",
-        "resistance": resistance if resistance is not None else "—",
+        "support": support,
+        "resistance": resistance,
+        "channel": channel,
+        "mstruct": mstruct,
         "rsi_div": rsi_div,
-        "bb_pos": bb_pos,
+        "ta_score": ta_score,
     }
-    # attach pretty TA block (same style as main)
     ta["ta_block"] = _fmt_ta_block_mid(ta)
     return ta
-
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
     return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
 
