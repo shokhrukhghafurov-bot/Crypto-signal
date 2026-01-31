@@ -5178,15 +5178,15 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
 
 def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
-    Returns the same keys that scanner_loop_mid expects (dir1/dir4, adx1/adx4, atr_pct, rr, confidence, etc.).
-    This function is intentionally more tolerant than the MAIN evaluator so MID can generate candidates.
+
+    Goal: make MID TA snapshot behave like MAIN TA snapshot, but on 5m/30m/1h.
+    Returns keys used by scanner_loop_mid and _fmt_ta_block_mid.
     """
     if df5 is None or df30 is None or df1h is None:
         return None
     if df5.empty or df30.empty or df1h.empty:
         return None
 
-    # Add indicators; tolerate failures by returning None (loop will continue)
     try:
         df5i = _add_indicators(df5)
         df30i = _add_indicators(df30)
@@ -5194,16 +5194,19 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     except Exception:
         return None
 
-    # Determine directions (30m and 1h). If _trend_dir is too strict, fall back to simple close-vs-ema.
+    # --- Direction (trend=1h, mid=30m) with fallback ---
     def _fallback_dir(df: pd.DataFrame) -> Optional[str]:
-        if df is None or df.empty:
+        try:
+            if df is None or df.empty:
+                return None
+            last = df.iloc[-1]
+            ema = last.get("ema50", np.nan)
+            close = last.get("close", np.nan)
+            if np.isnan(ema) or np.isnan(close):
+                return None
+            return "LONG" if float(close) >= float(ema) else "SHORT"
+        except Exception:
             return None
-        last = df.iloc[-1]
-        ema = last.get("ema", np.nan)
-        close = last.get("close", np.nan)
-        if np.isnan(ema) or np.isnan(close):
-            return None
-        return "LONG" if float(close) >= float(ema) else "SHORT"
 
     dir_trend = _trend_dir(df1hi) or _fallback_dir(df1hi)
     dir_mid = _trend_dir(df30i) or _fallback_dir(df30i)
@@ -5218,34 +5221,19 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     if np.isnan(entry) or entry <= 0:
         return None
 
-    atr30 = float(last30.get("atr", np.nan))
-    # Fallback ATR: use average true range approx if atr isn't present
-    if np.isnan(atr30) or atr30 <= 0:
-        try:
-            hi = df30i["high"].astype(float)
-            lo = df30i["low"].astype(float)
-            cl = df30i["close"].astype(float)
-            prev = cl.shift(1)
-            tr = np.maximum(hi - lo, np.maximum((hi - prev).abs(), (lo - prev).abs()))
-            atr30 = float(tr.rolling(14).mean().iloc[-1])
-        except Exception:
-            return None
-    if np.isnan(atr30) or atr30 <= 0:
+    # ATR from 30m (more stable for MID)
+    atr = float(last30.get("atr", np.nan))
+    if np.isnan(atr) or atr <= 0:
         return None
+    atr_pct = (atr / entry) * 100.0 if entry > 0 else 0.0
 
-    adx30 = float(last30.get("adx", np.nan))
-    adx1h = float(last1h.get("adx", np.nan))
-    # If ADX missing, set NaN-safe defaults (won't crash; filters can still use them)
-    if np.isnan(adx30):
-        adx30 = 0.0
-    if np.isnan(adx1h):
-        adx1h = 0.0
-
-    atr_pct = (atr30 / entry) * 100.0 if entry > 0 else 0.0
+    adx30 = float(last30.get("adx", 0.0) or 0.0)
+    adx1h = float(last1h.get("adx", 0.0) or 0.0)
 
     tp2_r = _adaptive_tp2_r(adx1h)
-    sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
+    sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr, tp2_r=tp2_r)
 
+    # --- Snapshot indicators (like MAIN, but for MID) ---
     rsi5 = float(last5.get("rsi", np.nan))
     macd_hist5 = float(last5.get("macd_hist", np.nan))
     if np.isnan(rsi5):
@@ -5253,28 +5241,85 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     if np.isnan(macd_hist5):
         macd_hist5 = 0.0
 
-    conf = _confidence(adx1h, adx30, rsi5, atr_pct)
+    # Bollinger Bands on 5m
+    bb_low = float(last5.get("bb_low", np.nan))
+    bb_mid = float(last5.get("bb_mavg", np.nan))
+    bb_high = float(last5.get("bb_high", np.nan))
+    bb_pos = _bb_position(entry, bb_low, bb_mid, bb_high)
+    if not np.isnan(bb_low) and not np.isnan(bb_mid) and not np.isnan(bb_high):
+        bb_str = f"{bb_low:.6g}/{bb_mid:.6g}/{bb_high:.6g}"
+    else:
+        bb_str = "—"
 
-    return {
+    # Relative volume on 5m
+    vol = float(last5.get("volume", 0.0) or 0.0)
+    vol_sma = float(last5.get("vol_sma20", np.nan))
+    rel_vol = (vol / vol_sma) if (vol_sma and not np.isnan(vol_sma) and vol_sma > 0) else 0.0
+
+    # VWAP from 30m (more meaningful for MID)
+    vwap30 = float(last30.get("vwap", np.nan))
+    vwap_str = f"{vwap30:.6g}" if not np.isnan(vwap30) and vwap30 > 0 else "—"
+
+    # Pattern + S/R + divergence + channel + structure (same helpers as MAIN)
+    pattern, _pat_bias = _candle_pattern(df5i)
+    support, resistance = _nearest_levels(df1hi, lookback=180, swing=3)
+    rsi_div = _rsi_divergence(df5i, lookback=140, pivot=3)
+    channel, _ch_pos, _ch_slope = _linreg_channel(df1hi, window=140, k=2.0)
+    structure = _market_structure(df1hi, lookback=200, swing=3)
+
+    # TA score (reuse MAIN scoring function)
+    score = _ta_score(
+        direction=dir_trend,
+        adx1=adx30,
+        adx4=adx1h,
+        rsi15=rsi5,
+        macd_hist15=macd_hist5,
+        vol_rel=rel_vol,
+        bb_pos=bb_pos,
+        rsi_div=rsi_div,
+        channel=channel,
+        mstruct=structure,
+        support=support,
+        resistance=resistance,
+    )
+    confidence = int(score)
+
+    ta: Dict[str, Any] = {
         "direction": dir_trend,
-        "entry": entry,
-        "sl": sl,
+        "entry": float(entry),
+        "sl": float(sl),
         "tp1": float(tp1),
         "tp2": float(tp2),
         "rr": float(rr),
-        "confidence": int(round(conf)),
-        # mid-loop expects these names
-        "dir1": dir_mid,     # 30m
-        "dir4": dir_trend,   # 1h
-        "adx1": float(adx30),  # 30m
-        "adx4": float(adx1h),  # 1h
+
+        # what mid loop expects
+        "dir1": dir_mid,            # 30m
+        "dir4": dir_trend,          # 1h
+        "adx1": float(adx30),       # 30m
+        "adx4": float(adx1h),       # 1h
         "atr_pct": float(atr_pct),
-        # optional TA snapshot
+
+        # MID TA block fields
+        "confidence": int(confidence),
+        "ta_score": int(score),
+        "score": int(score),
         "rsi": float(rsi5),
         "macd_hist": float(macd_hist5),
+        "bb": bb_str,
+        "rel_vol": float(rel_vol),
+        "vwap": vwap_str,
+        "channel": channel,
+        "structure": structure,
+        "pattern": pattern,
+        "support": support if support is not None else "—",
+        "resistance": resistance if resistance is not None else "—",
+        "rsi_div": rsi_div,
+        "bb_pos": bb_pos,
     }
-    ta["ta_block"] = _fmt_ta_block(ta)
+    # attach pretty TA block (same style as main)
+    ta["ta_block"] = _fmt_ta_block_mid(ta)
     return ta
+
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
     return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
 
