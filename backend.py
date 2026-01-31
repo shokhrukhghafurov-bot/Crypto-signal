@@ -4631,26 +4631,308 @@ def _trigger_15m(direction: str, df15i: pd.DataFrame) -> bool:
     return True
 
 
-def _adaptive_tp2_r(adx1: float | None) -> float:
-    """Return TP2_R multiplier adapted to trend strength (ADX 1H).
-    Enabled via ADAPTIVE_TP2=1.
-    """
-    try:
-        if not ADAPTIVE_TP2:
-            return float(TP2_R)
-        if adx1 is None:
-            return float(ADAPTIVE_TP2_R_WEAK)
-        v = float(adx1)
-        if np.isnan(v):
-            return float(ADAPTIVE_TP2_R_WEAK)
-        if v >= float(ADAPTIVE_TP2_ADX_STRONG):
-            return float(ADAPTIVE_TP2_R_STRONG)
-        if v >= float(ADAPTIVE_TP2_ADX_MED):
-            return float(ADAPTIVE_TP2_R_MED)
-        return float(ADAPTIVE_TP2_R_WEAK)
-    except Exception:
-        return float(TP2_R)
+def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
+    Produces a result dict compatible with scanner_loop_mid and a rich TA block (like MAIN),
+    but tuned for MID timeframes.
+    """
+    if df5 is None or df30 is None or df1h is None:
+        return None
+    if df5.empty or df30.empty or df1h.empty:
+        return None
+
+    try:
+        df5i = _add_indicators(df5)
+        df30i = _add_indicators(df30)
+        df1hi = _add_indicators(df1h)
+    except Exception:
+        return None
+
+    # Directions (trend=1h, mid=30m)
+    dir_trend = _trend_dir(df1hi)
+    dir_mid = _trend_dir(df30i)
+    if dir_trend is None:
+        return None
+    if dir_mid is None:
+        dir_mid = dir_trend
+
+    last5 = df5i.iloc[-1]
+    last30 = df30i.iloc[-1]
+    last1h = df1hi.iloc[-1]
+
+    entry = float(last5.get("close", np.nan))
+    if np.isnan(entry) or entry <= 0:
+        return None
+
+    # ATR from 30m (prefer indicator, fallback to true-range)
+    atr30 = float(last30.get("atr", np.nan))
+    if np.isnan(atr30) or atr30 <= 0:
+        try:
+            hi = df30i["high"].astype(float)
+            lo = df30i["low"].astype(float)
+            cl = df30i["close"].astype(float)
+            prev = cl.shift(1)
+            tr = np.maximum(hi - lo, np.maximum((hi - prev).abs(), (lo - prev).abs()))
+            atr30 = float(tr.rolling(14).mean().iloc[-1])
+        except Exception:
+            return None
+    if np.isnan(atr30) or atr30 <= 0:
+        return None
+
+    # Trend strength
+    adx30 = float(last30.get("adx", np.nan))
+    adx1h = float(last1h.get("adx", np.nan))
+    if np.isnan(adx30):
+        adx30 = float("nan")
+    if np.isnan(adx1h):
+        adx1h = float("nan")
+
+    atr_pct = (atr30 / entry) * 100.0
+
+    # --- Dynamic TP2/RR for MID ---
+
+    def _tp2_r_mid(adx_1h: float, adx_30m: float, atrp: float) -> float:
+        """TP2_R for MID, synchronized with MAIN adaptive TP2_R.
+
+        - Uses MAIN's _adaptive_tp2_r(adx1h) (which already respects ADAPTIVE_TP2 + thresholds).
+        - Applies a small MID discount (MID_RR_DISCOUNT, default 0.92) so MID stays slightly less greedy.
+        - You can disable sync with MID_RR_SYNC_WITH_MAIN=0 (then falls back to MID_TP2_R).
+        """
+        try:
+            sync = (os.getenv("MID_RR_SYNC_WITH_MAIN", "1").strip().lower() not in ("0","false","no","off"))
+            if not sync:
+                # keep legacy fixed RR for MID
+                return float(os.getenv("MID_TP2_R", str(TP2_R)) or TP2_R)
+            base = float(_adaptive_tp2_r(adx_1h))
+            disc = float(os.getenv("MID_RR_DISCOUNT", "0.92") or 0.92)
+            # clamp to sane range
+            if disc < 0.70:
+                disc = 0.70
+            if disc > 1.00:
+                disc = 1.00
+            r = base * disc
+            # keep within practical bounds
+            if r < 1.20:
+                r = 1.20
+            if r > 3.50:
+                r = 3.50
+            return float(r)
+        except Exception:
+            try:
+                return float(_adaptive_tp2_r(adx_1h))
+            except Exception:
+                return float(os.getenv("MID_TP2_R", str(TP2_R)) or TP2_R)
+
+        # Base by trend strength
+        if a1 >= 40:
+            r = 3.0
+        elif a1 >= 30:
+            r = 2.6
+        elif a1 >= 22:
+            r = 2.2
+        elif a1 >= 16:
+            r = 1.8
+        else:
+            r = 1.5
+
+        # Midframe confirmation
+        if a30 >= 28:
+            r += 0.2
+        elif a30 <= 12:
+            r -= 0.1
+
+        # Volatility sanity: too low -> reduce; too high -> reduce
+        try:
+            v = float(atrp)
+        except Exception:
+            v = 0.0
+        if v < 0.2:
+            r -= 0.2
+        elif v > 5.0:
+            r -= 0.3
+        elif v > 3.5:
+            r -= 0.15
+
+        return float(max(1.3, min(3.2, r)))
+
+    tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct)
+    sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
+
+    # --- TA extras (MAIN-like) ---
+    # RSI/MACD on 5m
+    rsi5 = float(last5.get("rsi", np.nan))
+    macd_hist5 = float(last5.get("macd_hist", np.nan))
+
+    # Bollinger Bands on 5m (20)
+    bb_low = bb_mid = bb_high = float("nan")
+    bb_pos = "—"
+    try:
+        cl = df5i["close"].astype(float)
+        bb_mid = float(cl.rolling(20).mean().iloc[-1])
+        bb_std = float(cl.rolling(20).std(ddof=0).iloc[-1])
+        bb_low = bb_mid - 2.0 * bb_std
+        bb_high = bb_mid + 2.0 * bb_std
+        bb_pos = _bb_position(entry, bb_low, bb_mid, bb_high)
+    except Exception:
+        pass
+    bb_str = bb_pos
+
+    # Relative volume on 5m
+    vol_rel = float("nan")
+    try:
+        vol = float(df5i.iloc[-1].get("volume", np.nan))
+        vol_sma = float(df5i["volume"].astype(float).rolling(20).mean().iloc[-1])
+        vol_rel = (vol / vol_sma) if (vol_sma and not np.isnan(vol_sma) and vol_sma > 0) else np.nan
+    except Exception:
+        vol_rel = float("nan")
+
+    # VWAP on 30m (typical price * vol)
+    vwap_val = float("nan")
+    vwap_txt = "—"
+    try:
+        d = df30i.tail(80).copy()
+        vol = d["volume"].astype(float)
+        tp = (d["high"].astype(float) + d["low"].astype(float) + d["close"].astype(float)) / 3.0
+        denom = float(vol.sum())
+        if denom > 0:
+            vwap_val = float((tp * vol).sum() / denom)
+            if entry >= vwap_val:
+                vwap_txt = f"{vwap_val:.6g} (above)"
+            else:
+                vwap_txt = f"{vwap_val:.6g} (below)"
+    except Exception:
+        pass
+
+    # Pattern on 5m
+    pattern, pat_bias = _candle_pattern(df5i)
+
+    # RSI divergence on 30m (more stable than 5m)
+    rsi_div = _rsi_divergence(df30i)
+
+    # Channel + structure on 1h
+    channel, _, _ = _linreg_channel(df1hi)
+    mstruct_raw = _market_structure(df1hi)
+    if mstruct_raw in ("HH-HL", "LH-LL"):
+        mstruct = "TREND"
+    elif mstruct_raw == "RANGE":
+        mstruct = "RANGE"
+    else:
+        mstruct = "—"
+
+    support, resistance = _nearest_levels(df1hi)
+
+    # Score / confidence: use unified TA score to avoid constant 100s
+    ta_score = _ta_score(
+        direction=dir_trend,
+        adx1=adx30,
+        adx4=adx1h,
+        rsi15=rsi5,
+        macd_hist15=macd_hist5,
+        vol_rel=vol_rel,
+        bb_pos=bb_pos,
+        rsi_div=rsi_div,
+        channel=channel,
+        mstruct=mstruct,
+        pat_bias=pat_bias,
+        atr_pct=atr_pct,
+    )
+    confidence = ta_score
+
+    ta: Dict[str, Any] = {
+        "direction": dir_trend,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "rr": rr,
+        "confidence": confidence,
+
+        # fields used by MID filters/formatter
+        "dir1": dir_mid,
+        "dir4": dir_trend,
+        "adx1": adx30,
+        "adx4": adx1h,
+        "atr_pct": atr_pct,
+
+        # MID TA block fields
+        "rsi": rsi5,
+        "macd_hist": macd_hist5,
+        "bb": bb_str,
+        "rel_vol": vol_rel if (not np.isnan(vol_rel)) else 0.0,
+        "vwap": vwap_txt,
+        "pattern": pattern,
+        "support": support,
+        "resistance": resistance,
+        "channel": channel,
+        "mstruct": mstruct,
+        "rsi_div": rsi_div,
+        "ta_score": ta_score,
+    }
+    ta["ta_block"] = _fmt_ta_block_mid(ta)
+    return ta
+def choose_market(adx1_max: float, atr_pct_max: float) -> str:
+    return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
+
+# ------------------ Backend ------------------
+
+    async def orderbook_binance_futures(self, symbol: str, limit: int = 100) -> Dict[str, Any]:
+        """Binance USDT-M futures orderbook."""
+        assert self.session is not None
+        url = f"{self.BINANCE_FUTURES}/fapi/v1/depth"
+        params = {"symbol": symbol, "limit": str(limit)}
+        return await self._get_json(url, params=params)
+
+    async def orderbook_bybit_linear(self, symbol: str, limit: int = 50) -> Dict[str, Any]:
+        """Bybit linear futures orderbook."""
+        assert self.session is not None
+        url = f"{self.BYBIT}/v5/market/orderbook"
+        params = {"category": "linear", "symbol": symbol, "limit": str(limit)}
+        return await self._get_json(url, params=params)
+
+
+# ------------------ Orderbook filter helpers ------------------
+def _orderbook_metrics(bids: List[List[Any]], asks: List[List[Any]], *, levels: int) -> Dict[str, float]:
+    """Return imbalance (bids/asks notional), spread_pct, bid_wall_ratio, ask_wall_ratio, bid_wall_near, ask_wall_near."""
+    def _take(side: List[List[Any]]) -> List[Tuple[float, float]]:
+        out: List[Tuple[float, float]] = []
+        for row in side[:levels]:
+            try:
+                p = float(row[0])
+                q = float(row[1])
+                out.append((p, q))
+            except Exception:
+                continue
+        return out
+
+    b = _take(bids)
+    a = _take(asks)
+    if not b or not a:
+        return {"imbalance": 1.0, "spread_pct": 999.0, "bid_wall_ratio": 0.0, "ask_wall_ratio": 0.0, "mid": 0.0}
+
+    best_bid = b[0][0]
+    best_ask = a[0][0]
+    mid = (best_bid + best_ask) / 2.0 if (best_bid > 0 and best_ask > 0) else max(best_bid, best_ask)
+    spread_pct = ((best_ask - best_bid) / mid * 100.0) if mid > 0 else 999.0
+
+    bid_not = [p * q for p, q in b]
+    ask_not = [p * q for p, q in a]
+    sum_b = float(sum(bid_not))
+    sum_a = float(sum(ask_not))
+    imbalance = (sum_b / sum_a) if sum_a > 0 else 999.0
+
+    bid_avg = (sum_b / len(bid_not)) if bid_not else 0.0
+    ask_avg = (sum_a / len(ask_not)) if ask_not else 0.0
+    bid_wall_ratio = (max(bid_not) / bid_avg) if bid_avg > 0 else 0.0
+    ask_wall_ratio = (max(ask_not) / ask_avg) if ask_avg > 0 else 0.0
+
+    return {
+        "imbalance": float(imbalance),
+        "spread_pct": float(spread_pct),
+        "bid_wall_ratio": float(bid_wall_ratio),
+        "ask_wall_ratio": float(ask_wall_ratio),
+        "mid": float(mid),
+    }
 
 def _be_is_armed(*, side: str, price: float, tp1: float | None, tp2: float | None) -> bool:
     """If BE_ARM_PCT_TO_TP2>0, arm BE only after price moves from TP1 towards TP2 by that fraction."""
