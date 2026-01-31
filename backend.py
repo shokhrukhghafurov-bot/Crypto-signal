@@ -197,6 +197,51 @@ def _smartpro_env_bool(name: str, default: bool) -> bool:
     except Exception:
         return bool(default)
 
+
+def _is_mid_tf(tf: str) -> bool:
+    tf = (tf or "").strip().lower()
+    # MID timeframe usually looks like "5m/30m/1h"
+    return tf.startswith("5m/") or "5m/30m/1h" in tf
+
+def _is_mid_signal(sig: "Signal") -> bool:
+    try:
+        return _is_mid_tf(getattr(sig, "timeframe", "") or "")
+    except Exception:
+        return False
+
+def _env_float_mid(base: str, default: float, is_mid: bool) -> float:
+    """Read env BASE or BASE_MID if is_mid. BASE_MID wins when present."""
+    if is_mid:
+        v = os.getenv(f"{base}_MID")
+        if v is not None and str(v).strip() != "":
+            try:
+                return float(v)
+            except Exception:
+                pass
+    v = os.getenv(base)
+    if v is not None and str(v).strip() != "":
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+    return float(default)
+
+def _env_int_mid(base: str, default: int, is_mid: bool) -> int:
+    if is_mid:
+        v = os.getenv(f"{base}_MID")
+        if v is not None and str(v).strip() != "":
+            try:
+                return int(float(v))
+            except Exception:
+                pass
+    v = os.getenv(base)
+    if v is not None and str(v).strip() != "":
+        try:
+            return int(float(v))
+        except Exception:
+            return int(default)
+    return int(default)
+
 # --- TP1 / TP2 decision engine ---
 SMART_TP2_PROB_STRONG = _smartpro_env_float("SMART_TP2_PROB_STRONG", 0.72)
 SMART_TP2_PROB_MED = _smartpro_env_float("SMART_TP2_PROB_MED", 0.45)
@@ -1636,6 +1681,15 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     fut_lev = int(st.get("futures_leverage") or 1)
 
     need_usdt = spot_amt if mt == "spot" else fut_margin
+    # MID positions are typically noisier; optionally reduce allocation via SMART_MID_ALLOC_MULT
+    try:
+        if _is_mid_signal(sig):
+            mult = float(os.getenv("SMART_MID_ALLOC_MULT", "1.0") or 1.0)
+            if mult > 0:
+                need_usdt *= mult
+    except Exception:
+        pass
+
     # Hard minimums (validated in bot UI and DB, but re-checked here for safety)
     if mt == "spot" and 0 < need_usdt < 15:
         return {"ok": False, "skipped": True, "api_error": None}
@@ -1765,8 +1819,12 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             if _VIRTUAL_SLTP_ALL:
                 entry_p = float(entry or 0.0)
                 ref = {
+                "signal_timeframe": getattr(sig, "timeframe", None),
+                "signal_kind": ("MID" if _is_mid_signal(sig) else "MAIN"),
                     "virtual": True,
                     "exchange": "bybit",
+                    "signal_timeframe": getattr(sig, "timeframe", None),
+                    "signal_kind": ("MID" if _is_mid_signal(sig) else "MAIN"),
                     "market_type": mt,
                     "symbol": symbol,
                     "direction": direction,
@@ -2532,6 +2590,9 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
             for r in rows:
                 try:
                     ref = json.loads(r.get("api_order_ref") or "{}")
+                    tf = str(ref.get("signal_timeframe") or "")
+                    kind = str(ref.get("signal_kind") or "")
+                    is_mid = (kind.upper() == "MID") or _is_mid_tf(tf)
                 except Exception:
                     continue
                 ex = str(ref.get("exchange") or r.get("exchange") or "").lower()
@@ -2835,13 +2896,13 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
 
                     # Momentum / structure
                     MOM_WINDOW_SEC   = float(os.getenv("SMART_MOMENTUM_WINDOW_SEC", "30") or 30)           # anchor update window
-                    EARLY_EXIT_NEG_PCT= float(os.getenv("SMART_EARLY_EXIT_MOM_NEG_PCT", "0.16") or 0.16)    # adverse move threshold vs anchor
-                    EARLY_EXIT_CONSEC= int(float(os.getenv("SMART_EARLY_EXIT_CONSEC_NEG", "2") or 2))       # consecutive adverse hits
-                    EARLY_EXIT_MIN_GAIN= float(os.getenv("SMART_EARLY_EXIT_MIN_GAIN_PCT", "0.12") or 0.12)  # only early-exit if already in profit
+                    EARLY_EXIT_NEG_PCT= _env_float_mid("SMART_EARLY_EXIT_MOM_NEG_PCT", 0.16, is_mid)    # adverse move threshold vs anchor
+                    EARLY_EXIT_CONSEC= _env_int_mid("SMART_EARLY_EXIT_CONSEC_NEG", 2, is_mid)       # consecutive adverse hits
+                    EARLY_EXIT_MIN_GAIN= _env_float_mid("SMART_EARLY_EXIT_MIN_GAIN_PCT", 0.12, is_mid)  # only early-exit if already in profit
 
                     # Dynamic BE
-                    BE_DELAY_SEC     = float(os.getenv("SMART_BE_DELAY_SEC", "25") or 25)                  # delay before arming BE after partial TP1
-                    BE_MIN_PCT       = float(os.getenv("SMART_BE_MIN_PCT", "0.06") or 0.06)
+                    BE_DELAY_SEC     = _env_float_mid("SMART_BE_DELAY_SEC", 25.0, is_mid)                  # delay before arming BE after partial TP1
+                    BE_MIN_PCT       = _env_float_mid("SMART_BE_MIN_PCT", 0.06, is_mid)
                     BE_MAX_PCT       = float(os.getenv("SMART_BE_MAX_PCT", "0.45") or 0.45)
                     BE_VOL_MULT      = float(os.getenv("SMART_BE_VOL_MULT", "0.35") or 0.35)
                     BE_ARM_PCT_TO_TP2= float(os.getenv("SMART_BE_ARM_PCT_TO_TP2", "0.15") or 0.15)         # arm BE only after this progress to TP2
@@ -4292,7 +4353,7 @@ class MultiExchangeData:
         except Exception:
             return None
     async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        interval_map = {"5m":"5", "15m":"15", "30m":"30", "1h":"60", "4h":"240"}
+        interval_map = {"15m":"15", "1h":"60", "4h":"240"}
         itv = interval_map.get(interval, "15")
         url = f"{self.BYBIT}/v5/market/kline"
         params = {"category": "spot", "symbol": symbol, "interval": itv, "limit": str(limit)}
@@ -4308,7 +4369,7 @@ class MultiExchangeData:
         return symbol
 
     async def klines_okx(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        bar_map = {"5m":"5m", "15m":"15m", "30m":"30m", "1h":"1H", "4h":"4H"}
+        bar_map = {"15m":"15m", "1h":"1H", "4h":"4H"}
         bar = bar_map.get(interval, "15m")
         inst = self.okx_inst(symbol)
         url = f"{self.OKX}/api/v5/market/candles"
@@ -5115,137 +5176,6 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     }
     ta["ta_block"] = _fmt_ta_block(ta)
     return ta
-
-
-def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """Compute direction + levels + TA snapshot for MID scanner using 5m/30m/1h OHLCV.
-
-    Returns a dict with the same key names that scanner_loop_mid expects:
-    - direction, entry, sl, tp1, tp2, rr, confidence
-    - dir1/dir4 are used for 30m/1h alignment checks in scanner_loop_mid
-    - adx1/adx4 represent ADX(30m)/ADX(1h)
-    - atr_pct is ATR%(30m)
-    - additional fields are used by _fmt_ta_block_mid (rsi, macd_hist, bb, rel_vol, vwap, channel, structure, pattern, support, resistance)
-    """
-    if df5.empty or df30.empty or df1h.empty:
-        return None
-
-    df5i = _add_indicators(df5)
-    df30i = _add_indicators(df30)
-    df1hi = _add_indicators(df1h)
-
-    dir_trend = _trend_dir(df1hi)   # 1h
-    dir_mid = _trend_dir(df30i)     # 30m
-
-    if dir_trend is None or dir_mid is None:
-        return None
-
-    last5 = df5i.iloc[-1]
-    last30 = df30i.iloc[-1]
-    last1h = df1hi.iloc[-1]
-
-    entry = float(last5.get("close", np.nan))
-    if np.isnan(entry) or entry <= 0:
-        return None
-
-    atr30 = float(last30.get("atr", np.nan))
-    if np.isnan(atr30) or atr30 <= 0:
-        return None
-
-    adx30 = float(last30.get("adx", np.nan))
-    adx1h = float(last1h.get("adx", np.nan))
-
-    atr_pct = (atr30 / entry) * 100.0 if entry > 0 else 0.0
-    tp2_r = _adaptive_tp2_r(adx1h)
-    sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
-
-    # Trigger on the fast timeframe (5m). Reuse existing trigger logic (tuned via ENV).
-    if not _trigger_15m(dir_trend, df5i):
-        return None
-
-    # Snapshot values from 5m
-    rsi5 = float(last5.get("rsi", np.nan))
-    macd_hist5 = float(last5.get("macd_hist", np.nan))
-
-    bb_low = float(last5.get("bb_low", np.nan))
-    bb_mid = float(last5.get("bb_mavg", np.nan))
-    bb_high = float(last5.get("bb_high", np.nan))
-    bb_pos = _bb_position(entry, bb_low, bb_mid, bb_high)
-    bb_txt = "—"
-    try:
-        if not np.isnan(bb_pos):
-            bb_txt = f"{bb_pos:.2f}"
-    except Exception:
-        pass
-
-    # Relative volume on 5m
-    vol = float(last5.get("volume", 0.0) or 0.0)
-    vol_sma = float(last5.get("vol_sma20", np.nan))
-    rel_vol = (vol / vol_sma) if (vol_sma and not np.isnan(vol_sma) and vol_sma > 0) else 0.0
-
-    # VWAP (5m cumulative)
-    vwap = last5.get("vwap", np.nan)
-    try:
-        vwap = f"{float(vwap):.6g}" if (vwap is not None and not (isinstance(vwap, float) and np.isnan(vwap))) else "—"
-    except Exception:
-        vwap = "—"
-
-    # Pattern + S/R using higher TF context
-    pattern, pat_bias = _candle_pattern(df5i)
-    support, resistance = _nearest_levels(df1hi, lookback=220, swing=3)
-
-    # Divergence / channels / structure
-    rsi_div = _rsi_divergence(df5i, lookback=160, pivot=3)
-    channel, ch_pos, ch_slope = _linreg_channel(df30i, window=160, k=2.0)
-    mstruct = _market_structure(df1hi, lookback=240, swing=3)
-
-    score = _ta_score(
-        direction=dir_trend,
-        adx1=adx30,
-        adx4=adx1h,
-        rsi15=rsi5,
-        macd_hist15=macd_hist5,
-        vol_rel=rel_vol,
-        bb_pos=bb_pos,
-        rsi_div=rsi_div,
-        channel=channel,
-        mstruct=mstruct,
-        pat_bias=pat_bias,
-        atr_pct=atr_pct,
-    )
-    confidence = int(score)
-
-    ta: Dict[str, Any] = {
-        "direction": dir_trend,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "rr": rr,
-        "confidence": confidence,
-        "score": score,
-        "atr_pct": atr_pct,
-        # Alignment / diagnostics fields expected by scanner_loop_mid
-        "dir1": dir_mid,      # 30m
-        "dir4": dir_trend,    # 1h
-        "adx1": adx30,        # 30m
-        "adx4": adx1h,        # 1h
-        # Fields used by _fmt_ta_block_mid
-        "rsi": rsi5,
-        "macd_hist": macd_hist5,
-        "bb": bb_txt,
-        "rel_vol": float(rel_vol or 0.0),
-        "vwap": vwap,
-        "channel": channel,
-        "structure": mstruct,
-        "pattern": pattern,
-        "support": support if support is not None else "—",
-        "resistance": resistance if resistance is not None else "—",
-    }
-    ta["ta_block"] = _fmt_ta_block_mid(ta, os.getenv("MID_SIGNAL_MODE","") or os.getenv("SIGNAL_MODE",""))
-    return ta
-
-
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
     return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
 
@@ -6524,7 +6454,7 @@ class Backend:
                                     c = await api.klines_mexc(sym, tf_trend, 250)
                                 else:
                                     continue
-                                r = evaluate_on_exchange_mid(a, b, c)
+                                r = evaluate_on_exchange(a, b, c)
                                 if r:
                                     supporters.append((name, r))
                             except Exception:
