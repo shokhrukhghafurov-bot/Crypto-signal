@@ -4353,7 +4353,7 @@ class MultiExchangeData:
         except Exception:
             return None
     async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        interval_map = {"15m":"15", "1h":"60", "4h":"240"}
+        interval_map = {"5m":"5", "15m":"15", "30m":"30", "1h":"60", "4h":"240"}
         itv = interval_map.get(interval, "15")
         url = f"{self.BYBIT}/v5/market/kline"
         params = {"category": "spot", "symbol": symbol, "interval": itv, "limit": str(limit)}
@@ -4369,7 +4369,7 @@ class MultiExchangeData:
         return symbol
 
     async def klines_okx(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        bar_map = {"15m":"15m", "1h":"1H", "4h":"4H"}
+        bar_map = {"5m":"5m", "15m":"15m", "30m":"30m", "1h":"1H", "4h":"4H"}
         bar = bar_map.get(interval, "15m")
         inst = self.okx_inst(symbol)
         url = f"{self.OKX}/api/v5/market/candles"
@@ -5176,6 +5176,91 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     }
     ta["ta_block"] = _fmt_ta_block(ta)
     return ta
+
+def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """Compute direction + levels + TA snapshot for one exchange using 5m/30m/1h OHLCV (MID scanner)."""
+    if df5.empty or df30.empty or df1h.empty:
+        return None
+
+    df5i = _add_indicators(df5)
+    df30i = _add_indicators(df30)
+    df1hi = _add_indicators(df1h)
+
+    # Trend direction is taken from 1h, mid confirmation from 30m, entry trigger from 5m.
+    dir_trend = _trend_dir(df1hi)
+    dir_mid = _trend_dir(df30i)
+    if not dir_trend or not dir_mid:
+        return None
+
+    last5 = df5i.iloc[-1]
+    last30 = df30i.iloc[-1]
+    last1h = df1hi.iloc[-1]
+
+    try:
+        entry = float(last5.get("close", 0.0))
+    except Exception:
+        entry = 0.0
+    if entry <= 0:
+        return None
+
+    # Use ATR from 30m for MID sizing/levels
+    try:
+        atr = float(last30.get("atr", float("nan")))
+    except Exception:
+        atr = float("nan")
+    if not np.isfinite(atr) or atr <= 0:
+        return None
+
+    try:
+        adx30 = float(last30.get("adx", float("nan")))
+    except Exception:
+        adx30 = float("nan")
+    try:
+        adx1h = float(last1h.get("adx", float("nan")))
+    except Exception:
+        adx1h = float("nan")
+
+    atr_pct = (atr / entry) * 100.0 if entry > 0 else 0.0
+
+    tp2_r = _adaptive_tp2_r(adx1h if np.isfinite(adx1h) else 0.0)
+    sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr, tp2_r=tp2_r)
+
+    # Trigger indicators from 5m
+    try:
+        rsi5 = float(last5.get("rsi", float("nan")))
+    except Exception:
+        rsi5 = float("nan")
+    try:
+        macd_hist5 = float(last5.get("macd_hist", float("nan")))
+    except Exception:
+        macd_hist5 = float("nan")
+
+    conf = _confidence(adx1h if np.isfinite(adx1h) else 0.0,
+                       adx30 if np.isfinite(adx30) else 0.0,
+                       rsi5 if np.isfinite(rsi5) else 50.0,
+                       atr_pct)
+
+    out: Dict[str, Any] = {
+        "direction": dir_trend,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "rr": rr,
+        "confidence": conf,
+
+        # Fields expected by scanner_loop_mid filters/formatter:
+        "dir1": dir_mid,      # 30m direction
+        "dir4": dir_trend,    # 1h direction
+        "adx1": adx30,        # 30m ADX
+        "adx4": adx1h,        # 1h ADX
+        "atr_pct": atr_pct,
+
+        "rsi": rsi5,
+        "macd_hist": macd_hist5,
+    }
+    return out
+
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
     return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
 
@@ -6454,7 +6539,7 @@ class Backend:
                                     c = await api.klines_mexc(sym, tf_trend, 250)
                                 else:
                                     continue
-                                r = evaluate_on_exchange(a, b, c)
+                                r = evaluate_on_exchange_mid(a, b, c)
                                 if r:
                                     supporters.append((name, r))
                             except Exception:
