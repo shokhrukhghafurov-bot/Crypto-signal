@@ -5273,7 +5273,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "rsi": float(rsi5),
         "macd_hist": float(macd_hist5),
     }
-["ta_block"] = _fmt_ta_block(ta)
+    ta["ta_block"] = _fmt_ta_block(ta)
     return ta
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
     return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
