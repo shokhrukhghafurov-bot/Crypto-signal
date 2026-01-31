@@ -4292,7 +4292,7 @@ class MultiExchangeData:
         except Exception:
             return None
     async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        interval_map = {"15m":"15", "1h":"60", "4h":"240"}
+        interval_map = {"5m":"5", "15m":"15", "30m":"30", "1h":"60", "4h":"240"}
         itv = interval_map.get(interval, "15")
         url = f"{self.BYBIT}/v5/market/kline"
         params = {"category": "spot", "symbol": symbol, "interval": itv, "limit": str(limit)}
@@ -4308,7 +4308,7 @@ class MultiExchangeData:
         return symbol
 
     async def klines_okx(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        bar_map = {"15m":"15m", "1h":"1H", "4h":"4H"}
+        bar_map = {"5m":"5m", "15m":"15m", "30m":"30m", "1h":"1H", "4h":"4H"}
         bar = bar_map.get(interval, "15m")
         inst = self.okx_inst(symbol)
         url = f"{self.OKX}/api/v5/market/candles"
@@ -5115,6 +5115,137 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     }
     ta["ta_block"] = _fmt_ta_block(ta)
     return ta
+
+
+def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """Compute direction + levels + TA snapshot for MID scanner using 5m/30m/1h OHLCV.
+
+    Returns a dict with the same key names that scanner_loop_mid expects:
+    - direction, entry, sl, tp1, tp2, rr, confidence
+    - dir1/dir4 are used for 30m/1h alignment checks in scanner_loop_mid
+    - adx1/adx4 represent ADX(30m)/ADX(1h)
+    - atr_pct is ATR%(30m)
+    - additional fields are used by _fmt_ta_block_mid (rsi, macd_hist, bb, rel_vol, vwap, channel, structure, pattern, support, resistance)
+    """
+    if df5.empty or df30.empty or df1h.empty:
+        return None
+
+    df5i = _add_indicators(df5)
+    df30i = _add_indicators(df30)
+    df1hi = _add_indicators(df1h)
+
+    dir_trend = _trend_dir(df1hi)   # 1h
+    dir_mid = _trend_dir(df30i)     # 30m
+
+    if dir_trend is None or dir_mid is None:
+        return None
+
+    last5 = df5i.iloc[-1]
+    last30 = df30i.iloc[-1]
+    last1h = df1hi.iloc[-1]
+
+    entry = float(last5.get("close", np.nan))
+    if np.isnan(entry) or entry <= 0:
+        return None
+
+    atr30 = float(last30.get("atr", np.nan))
+    if np.isnan(atr30) or atr30 <= 0:
+        return None
+
+    adx30 = float(last30.get("adx", np.nan))
+    adx1h = float(last1h.get("adx", np.nan))
+
+    atr_pct = (atr30 / entry) * 100.0 if entry > 0 else 0.0
+    tp2_r = _adaptive_tp2_r(adx1h)
+    sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
+
+    # Trigger on the fast timeframe (5m). Reuse existing trigger logic (tuned via ENV).
+    if not _trigger_15m(dir_trend, df5i):
+        return None
+
+    # Snapshot values from 5m
+    rsi5 = float(last5.get("rsi", np.nan))
+    macd_hist5 = float(last5.get("macd_hist", np.nan))
+
+    bb_low = float(last5.get("bb_low", np.nan))
+    bb_mid = float(last5.get("bb_mavg", np.nan))
+    bb_high = float(last5.get("bb_high", np.nan))
+    bb_pos = _bb_position(entry, bb_low, bb_mid, bb_high)
+    bb_txt = "—"
+    try:
+        if not np.isnan(bb_pos):
+            bb_txt = f"{bb_pos:.2f}"
+    except Exception:
+        pass
+
+    # Relative volume on 5m
+    vol = float(last5.get("volume", 0.0) or 0.0)
+    vol_sma = float(last5.get("vol_sma20", np.nan))
+    rel_vol = (vol / vol_sma) if (vol_sma and not np.isnan(vol_sma) and vol_sma > 0) else 0.0
+
+    # VWAP (5m cumulative)
+    vwap = last5.get("vwap", np.nan)
+    try:
+        vwap = f"{float(vwap):.6g}" if (vwap is not None and not (isinstance(vwap, float) and np.isnan(vwap))) else "—"
+    except Exception:
+        vwap = "—"
+
+    # Pattern + S/R using higher TF context
+    pattern, pat_bias = _candle_pattern(df5i)
+    support, resistance = _nearest_levels(df1hi, lookback=220, swing=3)
+
+    # Divergence / channels / structure
+    rsi_div = _rsi_divergence(df5i, lookback=160, pivot=3)
+    channel, ch_pos, ch_slope = _linreg_channel(df30i, window=160, k=2.0)
+    mstruct = _market_structure(df1hi, lookback=240, swing=3)
+
+    score = _ta_score(
+        direction=dir_trend,
+        adx1=adx30,
+        adx4=adx1h,
+        rsi15=rsi5,
+        macd_hist15=macd_hist5,
+        vol_rel=rel_vol,
+        bb_pos=bb_pos,
+        rsi_div=rsi_div,
+        channel=channel,
+        mstruct=mstruct,
+        pat_bias=pat_bias,
+        atr_pct=atr_pct,
+    )
+    confidence = int(score)
+
+    ta: Dict[str, Any] = {
+        "direction": dir_trend,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "rr": rr,
+        "confidence": confidence,
+        "score": score,
+        "atr_pct": atr_pct,
+        # Alignment / diagnostics fields expected by scanner_loop_mid
+        "dir1": dir_mid,      # 30m
+        "dir4": dir_trend,    # 1h
+        "adx1": adx30,        # 30m
+        "adx4": adx1h,        # 1h
+        # Fields used by _fmt_ta_block_mid
+        "rsi": rsi5,
+        "macd_hist": macd_hist5,
+        "bb": bb_txt,
+        "rel_vol": float(rel_vol or 0.0),
+        "vwap": vwap,
+        "channel": channel,
+        "structure": mstruct,
+        "pattern": pattern,
+        "support": support if support is not None else "—",
+        "resistance": resistance if resistance is not None else "—",
+    }
+    ta["ta_block"] = _fmt_ta_block_mid(ta, os.getenv("MID_SIGNAL_MODE","") or os.getenv("SIGNAL_MODE",""))
+    return ta
+
+
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
     return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
 
@@ -6393,7 +6524,7 @@ class Backend:
                                     c = await api.klines_mexc(sym, tf_trend, 250)
                                 else:
                                     continue
-                                r = evaluate_on_exchange(a, b, c)
+                                r = evaluate_on_exchange_mid(a, b, c)
                                 if r:
                                     supporters.append((name, r))
                             except Exception:
