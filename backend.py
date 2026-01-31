@@ -4353,7 +4353,7 @@ class MultiExchangeData:
         except Exception:
             return None
     async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        interval_map = {"15m":"15", "1h":"60", "4h":"240"}
+        interval_map = {"5m":"5", "15m":"15", "30m":"30", "1h":"60", "4h":"240"}
         itv = interval_map.get(interval, "15")
         url = f"{self.BYBIT}/v5/market/kline"
         params = {"category": "spot", "symbol": symbol, "interval": itv, "limit": str(limit)}
@@ -4369,7 +4369,7 @@ class MultiExchangeData:
         return symbol
 
     async def klines_okx(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        bar_map = {"15m":"15m", "1h":"1H", "4h":"4H"}
+        bar_map = {"5m":"5m", "15m":"15m", "30m":"30m", "1h":"1H", "4h":"4H"}
         bar = bar_map.get(interval, "15m")
         inst = self.okx_inst(symbol)
         url = f"{self.OKX}/api/v5/market/candles"
@@ -5174,7 +5174,106 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
         "support": support,
         "resistance": resistance,
     }
-    ta["ta_block"] = _fmt_ta_block(ta)
+    ta
+
+def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
+    Returns the same keys that scanner_loop_mid expects (dir1/dir4, adx1/adx4, atr_pct, rr, confidence, etc.).
+    This function is intentionally more tolerant than the MAIN evaluator so MID can generate candidates.
+    """
+    if df5 is None or df30 is None or df1h is None:
+        return None
+    if df5.empty or df30.empty or df1h.empty:
+        return None
+
+    # Add indicators; tolerate failures by returning None (loop will continue)
+    try:
+        df5i = _add_indicators(df5)
+        df30i = _add_indicators(df30)
+        df1hi = _add_indicators(df1h)
+    except Exception:
+        return None
+
+    # Determine directions (30m and 1h). If _trend_dir is too strict, fall back to simple close-vs-ema.
+    def _fallback_dir(df: pd.DataFrame) -> Optional[str]:
+        if df is None or df.empty:
+            return None
+        last = df.iloc[-1]
+        ema = last.get("ema", np.nan)
+        close = last.get("close", np.nan)
+        if np.isnan(ema) or np.isnan(close):
+            return None
+        return "LONG" if float(close) >= float(ema) else "SHORT"
+
+    dir_trend = _trend_dir(df1hi) or _fallback_dir(df1hi)
+    dir_mid = _trend_dir(df30i) or _fallback_dir(df30i)
+    if dir_trend is None or dir_mid is None:
+        return None
+
+    last5 = df5i.iloc[-1]
+    last30 = df30i.iloc[-1]
+    last1h = df1hi.iloc[-1]
+
+    entry = float(last5.get("close", np.nan))
+    if np.isnan(entry) or entry <= 0:
+        return None
+
+    atr30 = float(last30.get("atr", np.nan))
+    # Fallback ATR: use average true range approx if atr isn't present
+    if np.isnan(atr30) or atr30 <= 0:
+        try:
+            hi = df30i["high"].astype(float)
+            lo = df30i["low"].astype(float)
+            cl = df30i["close"].astype(float)
+            prev = cl.shift(1)
+            tr = np.maximum(hi - lo, np.maximum((hi - prev).abs(), (lo - prev).abs()))
+            atr30 = float(tr.rolling(14).mean().iloc[-1])
+        except Exception:
+            return None
+    if np.isnan(atr30) or atr30 <= 0:
+        return None
+
+    adx30 = float(last30.get("adx", np.nan))
+    adx1h = float(last1h.get("adx", np.nan))
+    # If ADX missing, set NaN-safe defaults (won't crash; filters can still use them)
+    if np.isnan(adx30):
+        adx30 = 0.0
+    if np.isnan(adx1h):
+        adx1h = 0.0
+
+    atr_pct = (atr30 / entry) * 100.0 if entry > 0 else 0.0
+
+    tp2_r = _adaptive_tp2_r(adx1h)
+    sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
+
+    rsi5 = float(last5.get("rsi", np.nan))
+    macd_hist5 = float(last5.get("macd_hist", np.nan))
+    if np.isnan(rsi5):
+        rsi5 = 50.0
+    if np.isnan(macd_hist5):
+        macd_hist5 = 0.0
+
+    conf = _confidence(adx1h, adx30, rsi5, atr_pct)
+
+    return {
+        "direction": dir_trend,
+        "entry": entry,
+        "sl": sl,
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "rr": float(rr),
+        "confidence": int(round(conf)),
+        # mid-loop expects these names
+        "dir1": dir_mid,     # 30m
+        "dir4": dir_trend,   # 1h
+        "adx1": float(adx30),  # 30m
+        "adx4": float(adx1h),  # 1h
+        "atr_pct": float(atr_pct),
+        # optional TA snapshot
+        "rsi": float(rsi5),
+        "macd_hist": float(macd_hist5),
+    }
+["ta_block"] = _fmt_ta_block(ta)
     return ta
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
     return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
@@ -6454,7 +6553,10 @@ class Backend:
                                     c = await api.klines_mexc(sym, tf_trend, 250)
                                 else:
                                     continue
-                                r = evaluate_on_exchange(a, b, c)
+                                if a is None or b is None or c is None or a.empty or b.empty or c.empty:
+                                    no_data += 1
+                                    continue
+                                r = evaluate_on_exchange_mid(a, b, c)
                                 if r:
                                     supporters.append((name, r))
                             except Exception:
