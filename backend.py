@@ -4967,7 +4967,69 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     except Exception:
         pass
 
-    # --- TA extras (MAIN-like) ---
+    
+    # --- Dynamic SL (reduce wick stopouts, MID only) ---
+    try:
+        dyn_sl_enabled = (os.getenv("MID_DYN_SL_ENABLED", "1").strip().lower() not in ("0","false","no","off"))
+        if dyn_sl_enabled and atr30 and (not np.isnan(atr30)) and float(atr30) > 0:
+            lb = int(float(os.getenv("MID_DYN_SL_LOOKBACK_5M", "12") or 12))
+            lb = max(5, min(60, lb))
+            buf_atr = float(os.getenv("MID_DYN_SL_BUFFER_ATR", "0.15") or 0.15)
+            max_risk_atr = float(os.getenv("MID_DYN_SL_MAX_RISK_ATR", "1.25") or 1.25)
+
+            d5 = df5i.tail(lb).copy()
+            hi = float(d5["high"].astype(float).max())
+            lo = float(d5["low"].astype(float).min())
+            buf = float(abs(atr30)) * float(max(0.0, buf_atr))
+
+            if dir_trend == "SHORT":
+                sl_dyn = float(hi + buf)
+                sl = float(max(sl, sl_dyn))
+                # Cap risk (do not allow extremely wide SL)
+                cap = float(entry + float(abs(atr30)) * float(max_risk_atr))
+                if cap > 0:
+                    sl = float(min(sl, cap))
+            else:
+                sl_dyn = float(lo - buf)
+                sl = float(min(sl, sl_dyn))
+                cap = float(entry - float(abs(atr30)) * float(max_risk_atr))
+                if cap > 0:
+                    sl = float(max(sl, cap))
+
+            # Recompute RR if needed (TPs unchanged here)
+            try:
+                if tp2 and sl and abs(entry - sl) > 0:
+                    rr = abs(float(tp2) - float(entry)) / max(1
+    # VWAP retest detector (no-entry-before-VWAP-retest)
+    vwap_retest = False
+    try:
+        lb = int(float(os.getenv("MID_VWAP_RETEST_LOOKBACK_30M", "6") or 6))
+        lb = max(2, min(30, lb))
+        tol_atr = float(os.getenv("MID_VWAP_RETEST_TOL_ATR", "0.25") or 0.25)
+        move_atr = float(os.getenv("MID_VWAP_RETEST_MOVE_ATR", "0.20") or 0.20)
+        if vwap_val and (not np.isnan(vwap_val)) and float(vwap_val) > 0 and atr30 and float(atr30) > 0:
+            tol = float(abs(atr30)) * max(0.0, float(tol_atr))
+            move = float(abs(atr30)) * max(0.0, float(move_atr))
+            d30 = df30i.tail(lb).copy()
+            if not d30.empty:
+                if dir_trend == "SHORT":
+                    touched = float(d30["high"].astype(float).max()) >= (float(vwap_val) - tol)
+                    rejected = float(entry) <= (float(vwap_val) - tol)
+                    moved = (float(vwap_val) - float(entry)) >= move
+                    vwap_retest = bool(touched and rejected and moved)
+                else:
+                    touched = float(d30["low"].astype(float).min()) <= (float(vwap_val) + tol)
+                    rejected = float(entry) >= (float(vwap_val) + tol)
+                    moved = (float(entry) - float(vwap_val)) >= move
+                    vwap_retest = bool(touched and rejected and moved)
+    except Exception:
+        vwap_retest = False
+e-12, abs(float(entry) - float(sl)))
+            except Exception:
+                pass
+    except Exception:
+        pass
+# --- TA extras (MAIN-like) ---
     # RSI/MACD on 5m
     rsi5 = float(last5.get("rsi", np.nan))
     macd_hist5 = float(last5.get("macd_hist", np.nan))
@@ -5070,6 +5132,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "rel_vol": vol_rel if (not np.isnan(vol_rel)) else 0.0,
         "vwap": vwap_txt,
         "vwap_val": vwap_val if (not np.isnan(vwap_val)) else 0.0,
+        "vwap_retest": bool(vwap_retest),
         "pattern": pattern,
         "support": support,
         "resistance": resistance,
@@ -7126,6 +7189,7 @@ class Backend:
             mid_require_vwap_bias = os.getenv("MID_REQUIRE_VWAP_BIAS", "1").strip().lower() not in ("0","false","no","off")
             mid_min_vwap_dist_atr = float(os.getenv("MID_MIN_VWAP_DIST_ATR", "0") or "0")
 
+            mid_require_vwap_retest = os.getenv("MID_REQUIRE_VWAP_RETEST", "1").strip().lower() not in ("0","false","no")
             require_align = os.getenv("MID_REQUIRE_30M_TREND","1").strip().lower() not in ("0","false","no")
             allow_futures = os.getenv("MID_ALLOW_FUTURES","1").strip().lower() not in ("0","false","no")
 
@@ -7280,6 +7344,13 @@ class Backend:
                                 if abs(entry - vwap_val_num) < (atr30 * mid_min_vwap_dist_atr):
                                     _mid_f_atr += 1
                                     continue
+
+
+                        # 3) No-entry-before-VWAP-retest: require a recent VWAP touch + rejection before signaling
+                        if mid_require_vwap_retest:
+                            if not bool(best_r.get("vwap_retest", False)):
+                                _mid_f_align += 1
+                                continue
 
                         if tp_policy == "R":
                             risk = abs(entry-sl)
