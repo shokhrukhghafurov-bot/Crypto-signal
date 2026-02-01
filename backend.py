@@ -5069,6 +5069,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "bb": bb_str,
         "rel_vol": vol_rel if (not np.isnan(vol_rel)) else 0.0,
         "vwap": vwap_txt,
+        "vwap_val": vwap_val if (not np.isnan(vwap_val)) else 0.0,
         "pattern": pattern,
         "support": support,
         "resistance": resistance,
@@ -7120,6 +7121,11 @@ class Backend:
             min_adx_30m = float(os.getenv("MID_MIN_ADX_30M","0") or "0")
             min_adx_1h = float(os.getenv("MID_MIN_ADX_1H","0") or "0")
             min_atr_pct = float(os.getenv("MID_MIN_ATR_PCT","0") or "0")
+            # HARD MID TP2-first extra filters
+            mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or "0")
+            mid_require_vwap_bias = os.getenv("MID_REQUIRE_VWAP_BIAS", "1").strip().lower() not in ("0","false","no","off")
+            mid_min_vwap_dist_atr = float(os.getenv("MID_MIN_VWAP_DIST_ATR", "0") or "0")
+
             require_align = os.getenv("MID_REQUIRE_30M_TREND","1").strip().lower() not in ("0","false","no")
             allow_futures = os.getenv("MID_ALLOW_FUTURES","1").strip().lower() not in ("0","false","no")
 
@@ -7252,6 +7258,29 @@ class Backend:
                         direction = str(best_r.get("direction","")).upper()
                         entry = float(best_r["entry"]); sl = float(best_r["sl"])
                         tp1 = float(best_r["tp1"]); tp2 = float(best_r["tp2"])
+                        # --- HARD MID filters (TP2-first) ---
+                        # 1) Volume must be real, иначе TP2 часто не добивает
+                        volx = float(best_r.get("rel_vol", 0.0) or 0.0)
+                        if mid_min_vol_x and volx < mid_min_vol_x:
+                            _mid_f_score += 1
+                            continue
+
+                        # 2) Must be on the correct side of VWAP + far enough from VWAP (avoid chop)
+                        vwap_val_num = float(best_r.get("vwap_val", 0.0) or 0.0)
+                        atr30 = abs(entry) * (abs(atrp) / 100.0) if entry > 0 else 0.0
+                        if vwap_val_num > 0 and atr30 > 0:
+                            if mid_require_vwap_bias:
+                                if direction == "SHORT" and not (entry < vwap_val_num):
+                                    _mid_f_align += 1
+                                    continue
+                                if direction == "LONG" and not (entry > vwap_val_num):
+                                    _mid_f_align += 1
+                                    continue
+                            if mid_min_vwap_dist_atr > 0:
+                                if abs(entry - vwap_val_num) < (atr30 * mid_min_vwap_dist_atr):
+                                    _mid_f_atr += 1
+                                    continue
+
                         if tp_policy == "R":
                             risk = abs(entry-sl)
                             if risk <= 0:
