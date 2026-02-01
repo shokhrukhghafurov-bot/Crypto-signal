@@ -3992,22 +3992,18 @@ async def main() -> None:
             if not _check_basic(request):
                 return _unauthorized()
 
-            now_tz = dt.datetime.now(TZ)
+            now_utc = dt.datetime.now(dt.timezone.utc)
 
-            def _to_utc(d: dt.datetime) -> dt.datetime:
-                if d.tzinfo is None:
-                    d = d.replace(tzinfo=TZ)
-                return d.astimezone(dt.timezone.utc)
-
-            # Period boundaries in bot TZ (MSK by default)
-            day_start = now_tz.replace(hour=0, minute=0, second=0, microsecond=0)
-            week_start = (now_tz - dt.timedelta(days=now_tz.isoweekday() - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
-            month_start = now_tz.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
+            # Rolling windows (ideal for dashboard):
+            #   - day   = last 24h
+            #   - week  = last 7 days
+            #   - month = last 30 days
+            #
+            # This avoids edge-cases at week/month boundaries (e.g., 1st day of month showing 0).
             ranges = {
-                "day": (_to_utc(day_start), _to_utc(now_tz)),
-                "week": (_to_utc(week_start), _to_utc(now_tz)),
-                "month": (_to_utc(month_start), _to_utc(now_tz)),
+                "day": (now_utc - dt.timedelta(hours=24), now_utc),
+                "week": (now_utc - dt.timedelta(days=7), now_utc),
+                "month": (now_utc - dt.timedelta(days=30), now_utc),
             }
             # Signals sent counters are stored in Postgres (signal_sent_events).
             # Backward compatible fields: day/week/month totals + split day_spot/day_futures/...
