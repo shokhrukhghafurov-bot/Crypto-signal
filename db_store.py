@@ -1206,20 +1206,45 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
     market = str(market or "").upper()
     if market not in ("SPOT", "FUTURES"):
         market = "SPOT"
-    pool = get_pool()
+    # In some startup/error scenarios the pool might not be initialized yet.
+    # The dashboard endpoint should not crash in that case; return empty stats.
+    try:
+        pool = get_pool()
+    except Exception:
+        return {
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "be": 0,
+            "closes": 0,
+            "tp1_hits": 0,
+            "sum_pnl_pct": 0.0,
+        }
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT
+              -- IMPORTANT: use the actual close timestamp.
+              -- Using updated_at can skew stats (e.g., background updates after close).
               COUNT(*) FILTER (WHERE status IN ('WIN','LOSS','BE','CLOSED')
-                               AND COALESCE(closed_at, updated_at) >= $2 AND COALESCE(closed_at, updated_at) < $3)::int AS trades,
-              COUNT(*) FILTER (WHERE status='WIN'  AND COALESCE(closed_at, updated_at) >= $2 AND COALESCE(closed_at, updated_at) < $3)::int AS wins,
-              COUNT(*) FILTER (WHERE status='LOSS' AND COALESCE(closed_at, updated_at) >= $2 AND COALESCE(closed_at, updated_at) < $3)::int AS losses,
-              COUNT(*) FILTER (WHERE status='BE'   AND COALESCE(closed_at, updated_at) >= $2 AND COALESCE(closed_at, updated_at) < $3)::int AS be,
-              COUNT(*) FILTER (WHERE status='CLOSED' AND COALESCE(closed_at, updated_at) >= $2 AND COALESCE(closed_at, updated_at) < $3)::int AS closes,
+                               AND closed_at IS NOT NULL
+                               AND closed_at >= $2 AND closed_at < $3)::int AS trades,
+              COUNT(*) FILTER (WHERE status='WIN'
+                               AND closed_at IS NOT NULL
+                               AND closed_at >= $2 AND closed_at < $3)::int AS wins,
+              COUNT(*) FILTER (WHERE status='LOSS'
+                               AND closed_at IS NOT NULL
+                               AND closed_at >= $2 AND closed_at < $3)::int AS losses,
+              COUNT(*) FILTER (WHERE status='BE'
+                               AND closed_at IS NOT NULL
+                               AND closed_at >= $2 AND closed_at < $3)::int AS be,
+              COUNT(*) FILTER (WHERE status='CLOSED'
+                               AND closed_at IS NOT NULL
+                               AND closed_at >= $2 AND closed_at < $3)::int AS closes,
               COUNT(*) FILTER (WHERE tp1_hit=TRUE  AND tp1_hit_at >= $2 AND tp1_hit_at < $3)::int AS tp1_hits,
               COALESCE(SUM(CASE WHEN status IN ('WIN','LOSS','BE','CLOSED')
-                                AND COALESCE(closed_at, updated_at) >= $2 AND COALESCE(closed_at, updated_at) < $3
+                                AND closed_at IS NOT NULL
+                                AND closed_at >= $2 AND closed_at < $3
                                 THEN COALESCE(pnl_total_pct,0) ELSE 0 END),0)::float AS sum_pnl_pct
             FROM signal_tracks
             WHERE market=$1;
