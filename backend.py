@@ -1819,26 +1819,25 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             if _VIRTUAL_SLTP_ALL:
                 entry_p = float(entry or 0.0)
                 ref = {
-                "signal_timeframe": getattr(sig, "timeframe", None),
-                "signal_kind": ("MID" if _is_mid_signal(sig) else "MAIN"),
-                    "virtual": True,
-                    "exchange": "bybit",
-                    "signal_timeframe": getattr(sig, "timeframe", None),
-                    "signal_kind": ("MID" if _is_mid_signal(sig) else "MAIN"),
-                    "market_type": mt,
-                    "symbol": symbol,
-                    "direction": direction,
-                    "side": side,
-                    "close_side": ("SELL" if str(side).upper() == "BUY" else "BUY"),
-                    "entry_price": entry_p,
-                    "qty": float(qty),
-                    "tp1": float(tp1 or 0.0),
-                    "tp2": float(tp2 or 0.0),
-                    "sl": float(sl or 0.0),
-                    "tp1_hit": False,
-                    "be_moved": False,
-                    "be_price": 0.0,
-                }
+    "virtual": True,
+    "exchange": "bybit",
+    "signal_timeframe": getattr(sig, "timeframe", None),
+    "signal_kind": ("MID" if _is_mid_signal(sig) else "MAIN"),
+    "market_type": mt,
+    "symbol": symbol,
+    "direction": direction,
+    "side": side,
+    "close_side": ("SELL" if str(side).upper() == "BUY" else "BUY"),
+    "entry_price": entry_p,
+    "qty": float(qty),
+    "tp1": float(tp1 or 0.0),
+    "tp2": float(tp2 or 0.0),
+    "sl": float(sl or 0.0),
+    "tp1_hit": False,
+    "be_moved": False,
+    "be_price": 0.0,
+}
+
                 sig_id = _extract_signal_id(sig)
                 if sig_id <= 0:
                     raise ExchangeAPIError("missing signal_id")
@@ -4723,177 +4722,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 return float(_adaptive_tp2_r(adx_1h))
             except Exception:
                 return float(os.getenv("MID_TP2_R", str(TP2_R)) or TP2_R)
-
-        # Base by trend strength
-        if a1 >= 40:
-            r = 3.0
-        elif a1 >= 30:
-            r = 2.6
-        elif a1 >= 22:
-            r = 2.2
-        elif a1 >= 16:
-            r = 1.8
-        else:
-            r = 1.5
-
-        # Midframe confirmation
-        if a30 >= 28:
-            r += 0.2
-        elif a30 <= 12:
-            r -= 0.1
-
-        # Volatility sanity: too low -> reduce; too high -> reduce
-        try:
-            v = float(atrp)
-        except Exception:
-            v = 0.0
-        if v < 0.2:
-            r -= 0.2
-        elif v > 5.0:
-            r -= 0.3
-        elif v > 3.5:
-            r -= 0.15
-
-        return float(max(1.3, min(3.2, r)))
-
-    tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct)
-    sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
-
-    # --- TA extras (MAIN-like) ---
-    # RSI/MACD on 5m
-    rsi5 = float(last5.get("rsi", np.nan))
-    macd_hist5 = float(last5.get("macd_hist", np.nan))
-
-    # Bollinger Bands on 5m (20)
-    bb_low = bb_mid = bb_high = float("nan")
-    bb_pos = "—"
-    try:
-        cl = df5i["close"].astype(float)
-        bb_mid = float(cl.rolling(20).mean().iloc[-1])
-        bb_std = float(cl.rolling(20).std(ddof=0).iloc[-1])
-        bb_low = bb_mid - 2.0 * bb_std
-        bb_high = bb_mid + 2.0 * bb_std
-        bb_pos = _bb_position(entry, bb_low, bb_mid, bb_high)
-    except Exception:
-        pass
-    bb_str = bb_pos
-
-    # Relative volume on 5m
-    vol_rel = float("nan")
-    try:
-        vol = float(df5i.iloc[-1].get("volume", np.nan))
-        vol_sma = float(df5i["volume"].astype(float).rolling(20).mean().iloc[-1])
-        vol_rel = (vol / vol_sma) if (vol_sma and not np.isnan(vol_sma) and vol_sma > 0) else np.nan
-    except Exception:
-        vol_rel = float("nan")
-
-    # VWAP on 30m (typical price * vol)
-    vwap_val = float("nan")
-    vwap_txt = "—"
-    try:
-        d = df30i.tail(80).copy()
-        vol = d["volume"].astype(float)
-        tp = (d["high"].astype(float) + d["low"].astype(float) + d["close"].astype(float)) / 3.0
-        denom = float(vol.sum())
-        if denom > 0:
-            vwap_val = float((tp * vol).sum() / denom)
-            if entry >= vwap_val:
-                vwap_txt = f"{vwap_val:.6g} (above)"
-            else:
-                vwap_txt = f"{vwap_val:.6g} (below)"
-    except Exception:
-        pass
-
-    # Pattern on 5m
-    pattern, pat_bias = _candle_pattern(df5i)
-
-    # RSI divergence on 30m (more stable than 5m)
-    rsi_div = _rsi_divergence(df30i)
-
-    # Channel + structure on 1h
-    channel, _, _ = _linreg_channel(df1hi)
-    mstruct_raw = _market_structure(df1hi)
-    if mstruct_raw in ("HH-HL", "LH-LL"):
-        mstruct = "TREND"
-    elif mstruct_raw == "RANGE":
-        mstruct = "RANGE"
-    else:
-        mstruct = "—"
-
-    support, resistance = _nearest_levels(df1hi)
-
-    # Score / confidence: use unified TA score to avoid constant 100s
-    ta_score = _ta_score(
-        direction=dir_trend,
-        adx1=adx30,
-        adx4=adx1h,
-        rsi15=rsi5,
-        macd_hist15=macd_hist5,
-        vol_rel=vol_rel,
-        bb_pos=bb_pos,
-        rsi_div=rsi_div,
-        channel=channel,
-        mstruct=mstruct,
-        pat_bias=pat_bias,
-        atr_pct=atr_pct,
-    )
-    confidence = ta_score
-
-    ta: Dict[str, Any] = {
-        "direction": dir_trend,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "rr": rr,
-        "confidence": confidence,
-
-        # fields used by MID filters/formatter
-        "dir1": dir_mid,
-        "dir4": dir_trend,
-        "adx1": adx30,
-        "adx4": adx1h,
-        "atr_pct": atr_pct,
-
-        # MID TA block fields
-        "rsi": rsi5,
-        "macd_hist": macd_hist5,
-        "bb": bb_str,
-        "rel_vol": vol_rel if (not np.isnan(vol_rel)) else 0.0,
-        "vwap": vwap_txt,
-        "pattern": pattern,
-        "support": support,
-        "resistance": resistance,
-        "channel": channel,
-        "mstruct": mstruct,
-        "rsi_div": rsi_div,
-        "ta_score": ta_score,
-    }
-    ta["ta_block"] = _fmt_ta_block_mid(ta)
-    return ta
-def choose_market(adx1_max: float, atr_pct_max: float) -> str:
-    return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
-
-# ------------------ Backend ------------------
-
-    async def orderbook_binance_futures(self, symbol: str, limit: int = 100) -> Dict[str, Any]:
-        """Binance USDT-M futures orderbook."""
-        assert self.session is not None
-        url = f"{self.BINANCE_FUTURES}/fapi/v1/depth"
-        params = {"symbol": symbol, "limit": str(limit)}
-        return await self._get_json(url, params=params)
-
-    async def orderbook_bybit_linear(self, symbol: str, limit: int = 50) -> Dict[str, Any]:
-        """Bybit linear futures orderbook."""
-        assert self.session is not None
-        url = f"{self.BYBIT}/v5/market/orderbook"
-        params = {"category": "linear", "symbol": symbol, "limit": str(limit)}
-        return await self._get_json(url, params=params)
-
-
-# ------------------ Orderbook filter helpers ------------------
-def _orderbook_metrics(bids: List[List[Any]], asks: List[List[Any]], *, levels: int) -> Dict[str, float]:
-    """Return imbalance (bids/asks notional), spread_pct, bid_wall_ratio, ask_wall_ratio, bid_wall_near, ask_wall_near."""
     def _take(side: List[List[Any]]) -> List[Tuple[float, float]]:
         out: List[Tuple[float, float]] = []
         for row in side[:levels]:
