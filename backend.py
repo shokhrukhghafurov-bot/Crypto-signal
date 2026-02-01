@@ -12,6 +12,145 @@ import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List, Any
 
+### MID AUTO-TUNE (TP2 hit-rate control)
+_MID_AUTOTUNE_ENABLED = os.getenv("MID_AUTOTUNE_ENABLED", "0").strip().lower() not in ("0","false","no","off")
+_MID_AUTOTUNE_TARGET = float(os.getenv("MID_AUTOTUNE_TARGET", "0.70") or 0.70)
+_MID_AUTOTUNE_TOL = float(os.getenv("MID_AUTOTUNE_TOL", "0.03") or 0.03)
+_MID_AUTOTUNE_ALPHA = float(os.getenv("MID_AUTOTUNE_ALPHA", "0.10") or 0.10)  # EMA speed (~20 trades memory)
+_MID_AUTOTUNE_MIN_TRADES = int(os.getenv("MID_AUTOTUNE_MIN_TRADES", "20") or 20)
+_MID_AUTOTUNE_EVERY_N = int(os.getenv("MID_AUTOTUNE_EVERY_N", "5") or 5)
+_MID_AUTOTUNE_K_ATR = float(os.getenv("MID_AUTOTUNE_K_ATR", "0.25") or 0.25)
+_MID_AUTOTUNE_K_RR = float(os.getenv("MID_AUTOTUNE_K_RR", "0.06") or 0.06)
+
+_MID_AUTOTUNE_ATR_MIN_SPOT = float(os.getenv("MID_AUTOTUNE_ATR_MIN_SPOT", "1.8") or 1.8)
+_MID_AUTOTUNE_ATR_MAX_SPOT = float(os.getenv("MID_AUTOTUNE_ATR_MAX_SPOT", "3.0") or 3.0)
+_MID_AUTOTUNE_ATR_MIN_FUT = float(os.getenv("MID_AUTOTUNE_ATR_MIN_FUT", "1.6") or 1.6)
+_MID_AUTOTUNE_ATR_MAX_FUT = float(os.getenv("MID_AUTOTUNE_ATR_MAX_FUT", "2.6") or 2.6)
+
+_MID_AUTOTUNE_DISC_MIN = float(os.getenv("MID_AUTOTUNE_DISC_MIN", "0.78") or 0.78)
+_MID_AUTOTUNE_DISC_MAX = float(os.getenv("MID_AUTOTUNE_DISC_MAX", "0.94") or 0.94)
+
+_MID_AUTOTUNE_PATH = Path(os.getenv("MID_AUTOTUNE_PATH", str(Path(__file__).with_name("mid_autotune.json"))))
+
+def _clamp(v: float, lo: float, hi: float) -> float:
+    try:
+        return float(max(lo, min(hi, float(v))))
+    except Exception:
+        return float(lo)
+
+def _mid_autotune_load() -> dict:
+    try:
+        if _MID_AUTOTUNE_PATH.exists():
+            return json.loads(_MID_AUTOTUNE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {"p_ema": None, "n": 0, "since": 0, "params": {}}
+
+def _mid_autotune_save(state: dict) -> None:
+    try:
+        _MID_AUTOTUNE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _MID_AUTOTUNE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def _mid_autotune_get_param(name: str, default: float) -> float:
+    # tuned value overrides env if enabled
+    if not _MID_AUTOTUNE_ENABLED:
+        return float(os.getenv(name, str(default)) or default)
+    st = _mid_autotune_load()
+    try:
+        pv = st.get("params", {}).get(name, None)
+        if pv is not None:
+            return float(pv)
+    except Exception:
+        pass
+    return float(os.getenv(name, str(default)) or default)
+
+def _mid_autotune_is_mid_trade(orig_text: str, timeframe: str) -> bool:
+    try:
+        if timeframe in ("5m","30m","1h"):
+            return True
+        t = (orig_text or "").upper()
+        return (" MID" in t) or ("[MID]" in t) or ("TF:5M" in t) or ("TF: 5M" in t)
+    except Exception:
+        return False
+
+def _mid_autotune_update_on_close(*, market: str, orig_text: str, timeframe: str, tp2_present: bool, hit_tp2: bool) -> None:
+    if not _MID_AUTOTUNE_ENABLED:
+        return
+    if not tp2_present:
+        return
+    if not _mid_autotune_is_mid_trade(orig_text, timeframe):
+        return
+
+    st = _mid_autotune_load()
+    n = int(st.get("n") or 0)
+    since = int(st.get("since") or 0)
+
+    # EMA update
+    p_prev = st.get("p_ema", None)
+    x = 1.0 if hit_tp2 else 0.0
+    if p_prev is None:
+        p = x
+    else:
+        p = (1.0 - _MID_AUTOTUNE_ALPHA) * float(p_prev) + _MID_AUTOTUNE_ALPHA * x
+
+    n += 1
+    since += 1
+    st["p_ema"] = float(p)
+    st["n"] = n
+    st["since"] = since
+
+    # tune periodically
+    if n < _MID_AUTOTUNE_MIN_TRADES or since < _MID_AUTOTUNE_EVERY_N:
+        _mid_autotune_save(st)
+        return
+
+    target = _MID_AUTOTUNE_TARGET
+    e = target - float(p)
+    if abs(e) < _MID_AUTOTUNE_TOL:
+        st["since"] = 0
+        _mid_autotune_save(st)
+        return
+
+    params = dict(st.get("params") or {})
+
+    # Defaults if not set yet
+    disc = float(params.get("MID_RR_DISCOUNT", os.getenv("MID_RR_DISCOUNT", "0.86") or 0.86))
+    max_tp2_atr = float(params.get("MID_MAX_TP2_ATR", os.getenv("MID_MAX_TP2_ATR", "2.2") or 2.2))
+
+    mkt = (market or "FUTURES").upper()
+    if mkt == "SPOT":
+        atr_min, atr_max = _MID_AUTOTUNE_ATR_MIN_SPOT, _MID_AUTOTUNE_ATR_MAX_SPOT
+    else:
+        atr_min, atr_max = _MID_AUTOTUNE_ATR_MIN_FUT, _MID_AUTOTUNE_ATR_MAX_FUT
+
+    # Main lever: TP2 ATR cap (multiplicative)
+    max_tp2_atr = _clamp(max_tp2_atr * math.exp(_MID_AUTOTUNE_K_ATR * e), atr_min, atr_max)
+    # Secondary lever: RR discount (additive)
+    disc = _clamp(disc + _MID_AUTOTUNE_K_RR * e, _MID_AUTOTUNE_DISC_MIN, _MID_AUTOTUNE_DISC_MAX)
+
+    params["MID_MAX_TP2_ATR"] = float(max_tp2_atr)
+    params["MID_RR_DISCOUNT"] = float(disc)
+
+    # Optional: tighten ADX thresholds if still missing target and already at minimum greediness
+    try:
+        min_adx_1h = float(params.get("MID_MIN_ADX_1H", os.getenv("MID_MIN_ADX_1H", "22") or 22))
+        min_adx_30m = float(params.get("MID_MIN_ADX_30M", os.getenv("MID_MIN_ADX_30M", "20") or 20))
+    except Exception:
+        min_adx_1h, min_adx_30m = 22.0, 20.0
+
+    if float(p) < (target - 0.05) and max_tp2_atr <= (atr_min + 0.05) and disc <= (_MID_AUTOTUNE_DISC_MIN + 0.01):
+        min_adx_1h = _clamp(min_adx_1h + 1.0, 0.0, 60.0)
+        min_adx_30m = _clamp(min_adx_30m + 1.0, 0.0, 60.0)
+        params["MID_MIN_ADX_1H"] = float(min_adx_1h)
+        params["MID_MIN_ADX_30M"] = float(min_adx_30m)
+
+    st["params"] = params
+    st["since"] = 0
+    _mid_autotune_save(st)
+
+
 import aiohttp
 import hmac
 import hashlib
@@ -4690,106 +4829,97 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
     atr_pct = (atr30 / entry) * 100.0
 
-
-    # --- Quality gate (aiming for high TP2 hit-rate) ---
-    # For ~70% TP2 hit-rate you must trade fewer, stronger setups.
+    # Quality gate: avoid choppy markets (helps TP2 hit-rate)
     try:
-        min_adx_1h = float(os.getenv("MID_MIN_ADX_1H", "22") or 22)
-        min_adx_30m = float(os.getenv("MID_MIN_ADX_30M", "20") or 20)
+        allow_range = os.getenv("MID_ALLOW_RANGE", "0").strip().lower() not in ("0","false","no","off")
+        min_adx_30m = float(_mid_autotune_get_param("MID_MIN_ADX_30M", float(os.getenv("MID_MIN_ADX_30M", "0") or 0)))
+        min_adx_1h = float(_mid_autotune_get_param("MID_MIN_ADX_1H", float(os.getenv("MID_MIN_ADX_1H", "0") or 0)))
+        if not allow_range and min_adx_30m > 0 and min_adx_1h > 0:
+            if (not np.isnan(adx30)) and (not np.isnan(adx1h)) and (adx30 < min_adx_30m) and (adx1h < min_adx_1h):
+                return None
     except Exception:
-        min_adx_1h, min_adx_30m = 22.0, 20.0
+        pass
 
-    # If either timeframe is weak/trendless -> skip (avoid chop that kills TP2)
-    if (not np.isnan(adx1h) and adx1h < min_adx_1h) or (not np.isnan(adx30) and adx30 < min_adx_30m):
-        allow_range = (os.getenv("MID_ALLOW_RANGE", "0").strip().lower() in ("1","true","yes","on"))
-        if not allow_range:
-            return None
+    # --- Dynamic TP2/RR for MID ---
 
-    # --- Dynamic TP2/RR for MID (high TP2 hit-rate mode) ---
+    def _tp2_r_mid(adx_1h: float, adx_30m: float, atrp: float) -> float:
+        """TP2_R for MID, synchronized with MAIN adaptive TP2_R.
 
-    def _tp2_r_mid(adx_1h: float, adx_30m: float, atrp: float, atr_mult_sl: float) -> float:
-        """Dynamic TP2_R for MID.
-
-        Defaults are tuned for high TP2 hit-rate (target ~70%) at the cost of fewer signals and smaller RR.
-
-        Env tunables:
-          - MID_RR_SYNC_WITH_MAIN (default 1)
-          - MID_RR_DISCOUNT (default 0.90)
-          - MID_TP2_R_MIN (default 1.15)
-          - MID_TP2_R_MAX (default 1.90)
-          - MID_MAX_TP2_ATR (default 2.0)  # TP2 distance cap in ATR units
-          - MID_ATRP_HARD (default 3.0)    # ATR% threshold for extra reduction
+        - Uses MAIN's _adaptive_tp2_r(adx1h) (which already respects ADAPTIVE_TP2 + thresholds).
+        - Applies a small MID discount (MID_RR_DISCOUNT, default 0.92) so MID stays slightly less greedy.
+        - You can disable sync with MID_RR_SYNC_WITH_MAIN=0 (then falls back to MID_TP2_R).
         """
-        # Base RR
         try:
-            sync = (os.getenv("MID_RR_SYNC_WITH_MAIN", "1").strip().lower() not in ("0", "false", "no", "off"))
+            sync = (os.getenv("MID_RR_SYNC_WITH_MAIN", "1").strip().lower() not in ("0","false","no","off"))
+            if not sync:
+                # keep legacy fixed RR for MID
+                return float(os.getenv("MID_TP2_R", str(TP2_R)) or TP2_R)
+            base = float(_adaptive_tp2_r(adx_1h))
+            disc = float(_mid_autotune_get_param("MID_RR_DISCOUNT", 0.92))
+            # clamp to sane range
+            if disc < 0.70:
+                disc = 0.70
+            if disc > 1.00:
+                disc = 1.00
+            r = base * disc
+            # keep within practical bounds
+            if r < 1.20:
+                r = 1.20
+            if r > 3.50:
+                r = 3.50
+            return float(r)
         except Exception:
-            sync = True
-
-        if sync:
             try:
-                base = float(_adaptive_tp2_r(adx_1h))
+                return float(_adaptive_tp2_r(adx_1h))
             except Exception:
-                base = float(os.getenv("MID_TP2_R", str(TP2_R)) or TP2_R)
+                return float(os.getenv("MID_TP2_R", str(TP2_R)) or TP2_R)
+
+        # Base by trend strength
+        if a1 >= 40:
+            r = 3.0
+        elif a1 >= 30:
+            r = 2.6
+        elif a1 >= 22:
+            r = 2.2
+        elif a1 >= 16:
+            r = 1.8
         else:
-            base = float(os.getenv("MID_TP2_R", str(TP2_R)) or TP2_R)
+            r = 1.5
 
+        # Midframe confirmation
+        if a30 >= 28:
+            r += 0.2
+        elif a30 <= 12:
+            r -= 0.1
+
+        # Volatility sanity: too low -> reduce; too high -> reduce
         try:
-            disc = float(os.getenv("MID_RR_DISCOUNT", "0.90") or 0.90)
+            v = float(atrp)
         except Exception:
-            disc = 0.90
-        disc = max(0.70, min(1.00, disc))
-        r = base * disc
-
-        # Trend correction (gentle)
-        a1 = float(adx_1h) if not np.isnan(adx_1h) else 0.0
-        a30 = float(adx_30m) if not np.isnan(adx_30m) else 0.0
-        a = 0.6 * a1 + 0.4 * a30
-
-        if a >= 35:
-            r += 0.20
-        elif a >= 28:
-            r += 0.10
-        elif a >= 22:
-            r += 0.00
-        elif a >= 18:
-            r -= 0.10
-        else:
-            r -= 0.20
-
-        # Volatility protection by ATR%
-        try:
-            atrp_hard = float(os.getenv("MID_ATRP_HARD", "3.0") or 3.0)
-        except Exception:
-            atrp_hard = 3.0
-        if (not np.isnan(atrp)) and atrp > atrp_hard:
+            v = 0.0
+        if v < 0.2:
+            r -= 0.2
+        elif v > 5.0:
+            r -= 0.3
+        elif v > 3.5:
             r -= 0.15
 
-        # Hard clamp by RR bounds
-        try:
-            r_min = float(os.getenv("MID_TP2_R_MIN", "1.15") or 1.15)
-            r_max = float(os.getenv("MID_TP2_R_MAX", "1.90") or 1.90)
-        except Exception:
-            r_min, r_max = 1.15, 1.90
-        r_min = max(1.05, r_min)
-        if r_max < r_min:
-            r_max = r_min
-        r = max(r_min, min(r_max, r))
+        return float(max(1.3, min(3.2, r)))
 
-        # Cap TP2 distance in ATR units:
-        # TP2 distance ≈ r * ATR_MULT_SL * ATR, so in ATRs it's r * ATR_MULT_SL
-        try:
-            max_tp2_atr = float(os.getenv("MID_MAX_TP2_ATR", "2.0") or 2.0)
-        except Exception:
-            max_tp2_atr = 2.0
-        if max_tp2_atr > 0 and atr_mult_sl > 0:
-            r_cap = max_tp2_atr / float(atr_mult_sl)
-            r = min(r, max(r_min, r_cap))
-
-        return float(max(r_min, min(r_max, r)))
-
-    tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct, ATR_MULT_SL)
+    tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct)
     sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
+    # Hard cap: keep TP2 within MID_MAX_TP2_ATR * ATR to improve hit-rate
+    try:
+        max_tp2_atr = float(_mid_autotune_get_param("MID_MAX_TP2_ATR", float(os.getenv("MID_MAX_TP2_ATR", "2.2") or 2.2)))
+        if max_tp2_atr > 0 and atr30 and tp2:
+            max_dist = abs(float(atr30)) * float(max_tp2_atr)
+            cur_dist = abs(float(tp2) - float(entry))
+            if max_dist > 0 and cur_dist > max_dist:
+                tp2 = float(entry) + (max_dist if dir_trend == "LONG" else -max_dist)
+                # recompute rr with adjusted tp2
+                rr = abs(float(tp2) - float(entry)) / max(1e-12, abs(float(entry) - float(sl)))
+    except Exception:
+        pass
 
     # --- TA extras (MAIN-like) ---
     # RSI/MACD on 5m
@@ -6550,6 +6680,10 @@ class Backend:
                             txt += "\n\n" + dbg
                         await safe_send(bot, uid, txt, ctx="msg_auto_win")
                         await db_store.close_trade(trade_id, status="WIN", price=float(s.tp2), pnl_total_pct=float(pnl))
+                        try:
+                            _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=True)
+                        except Exception:
+                            pass
                         continue
 
                     # 2) Before TP1: SL -> LOSS
@@ -6570,6 +6704,10 @@ class Backend:
                             txt += "\n\n" + dbg
                         await safe_send(bot, uid, txt, ctx="msg_auto_loss")
                         await db_store.close_trade(trade_id, status="LOSS", price=float(s.sl), pnl_total_pct=float(pnl))
+                        try:
+                            _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=False)
+                        except Exception:
+                            pass
                         continue
 
                     # 3) TP1 -> partial close + BE
@@ -6612,6 +6750,10 @@ class Backend:
                             trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
                             pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(be_lvl), close_reason="BE")
                             await db_store.close_trade(trade_id, status="BE", price=float(be_lvl), pnl_total_pct=float(pnl))
+                        try:
+                            _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=False)
+                        except Exception:
+                            pass
                             continue
 
                     # 4) TP2 -> WIN
