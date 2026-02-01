@@ -1,4 +1,8 @@
+
 from __future__ import annotations
+
+def utcnow():
+    return datetime.now(timezone.utc)
 
 import asyncpg
 import datetime as dt
