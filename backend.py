@@ -4999,7 +4999,13 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             # Recompute RR if needed (TPs unchanged here)
             try:
                 if tp2 and sl and abs(entry - sl) > 0:
-                    rr = abs(float(tp2) - float(entry)) / max(1
+                    rr = abs(float(tp2) - float(entry)) / max(1e-12, abs(float(entry) - float(sl)))
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+
     # VWAP retest detector (no-entry-before-VWAP-retest)
     vwap_retest = False
     try:
@@ -5024,12 +5030,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                     vwap_retest = bool(touched and rejected and moved)
     except Exception:
         vwap_retest = False
-e-12, abs(float(entry) - float(sl)))
-            except Exception:
-                pass
-    except Exception:
-        pass
-# --- TA extras (MAIN-like) ---
+    # --- TA extras (MAIN-like) ---
     # RSI/MACD on 5m
     rsi5 = float(last5.get("rsi", np.nan))
     macd_hist5 = float(last5.get("macd_hist", np.nan))
