@@ -39,12 +39,38 @@ def _clamp(v: float, lo: float, hi: float) -> float:
         return float(lo)
 
 def _mid_autotune_load() -> dict:
+    """Load autotune state.
+
+    Since v2, state is per-market:
+      { "spot": {...}, "futures": {...} }
+    For backward compatibility, a legacy flat dict is migrated into both buckets.
+    """
     try:
         if _MID_AUTOTUNE_PATH.exists():
-            return json.loads(_MID_AUTOTUNE_PATH.read_text(encoding="utf-8"))
+            st = json.loads(_MID_AUTOTUNE_PATH.read_text(encoding="utf-8"))
+            if isinstance(st, dict):
+                # v2 format
+                if "spot" in st or "futures" in st:
+                    if "spot" not in st:
+                        st["spot"] = {"p_ema": None, "n": 0, "since": 0, "params": {}}
+                    if "futures" not in st:
+                        st["futures"] = {"p_ema": None, "n": 0, "since": 0, "params": {}}
+                    return st
+                # legacy flat format
+                if any(k in st for k in ("p_ema","n","since","params")):
+                    legacy = {
+                        "p_ema": st.get("p_ema", None),
+                        "n": int(st.get("n") or 0),
+                        "since": int(st.get("since") or 0),
+                        "params": dict(st.get("params") or {}),
+                    }
+                    return {"spot": dict(legacy), "futures": dict(legacy)}
     except Exception:
         pass
-    return {"p_ema": None, "n": 0, "since": 0, "params": {}}
+    return {
+        "spot": {"p_ema": None, "n": 0, "since": 0, "params": {}},
+        "futures": {"p_ema": None, "n": 0, "since": 0, "params": {}},
+    }
 
 def _mid_autotune_save(state: dict) -> None:
     try:
@@ -53,13 +79,32 @@ def _mid_autotune_save(state: dict) -> None:
     except Exception:
         pass
 
-def _mid_autotune_get_param(name: str, default: float) -> float:
+def _mid_autotune_bucket(st: dict, market: str) -> dict:
+    m = (market or "").strip().lower()
+    if m.startswith("fut"):
+        key = "futures"
+    else:
+        key = "spot"
+    b = st.get(key)
+    if not isinstance(b, dict):
+        b = {"p_ema": None, "n": 0, "since": 0, "params": {}}
+        st[key] = b
+    # normalize fields
+    b.setdefault("p_ema", None)
+    b.setdefault("n", 0)
+    b.setdefault("since", 0)
+    if "params" not in b or not isinstance(b.get("params"), dict):
+        b["params"] = {}
+    return b
+
+def _mid_autotune_get_param(name: str, default: float, market: str = "spot") -> float:
     # tuned value overrides env if enabled
     if not _MID_AUTOTUNE_ENABLED:
         return float(os.getenv(name, str(default)) or default)
     st = _mid_autotune_load()
+    b = _mid_autotune_bucket(st, market)
     try:
-        pv = st.get("params", {}).get(name, None)
+        pv = b.get("params", {}).get(name, None)
         if pv is not None:
             return float(pv)
     except Exception:
@@ -84,11 +129,12 @@ def _mid_autotune_update_on_close(*, market: str, orig_text: str, timeframe: str
         return
 
     st = _mid_autotune_load()
-    n = int(st.get("n") or 0)
-    since = int(st.get("since") or 0)
+    b = _mid_autotune_bucket(st, market)
+    n = int(b.get("n") or 0)
+    since = int(b.get("since") or 0)
 
     # EMA update
-    p_prev = st.get("p_ema", None)
+    p_prev = b.get("p_ema", None)
     x = 1.0 if hit_tp2 else 0.0
     if p_prev is None:
         p = x
@@ -98,8 +144,8 @@ def _mid_autotune_update_on_close(*, market: str, orig_text: str, timeframe: str
     n += 1
     since += 1
     st["p_ema"] = float(p)
-    st["n"] = n
-    st["since"] = since
+    b["n"] = n
+    b["since"] = since
 
     # tune periodically
     if n < _MID_AUTOTUNE_MIN_TRADES or since < _MID_AUTOTUNE_EVERY_N:
@@ -109,11 +155,11 @@ def _mid_autotune_update_on_close(*, market: str, orig_text: str, timeframe: str
     target = _MID_AUTOTUNE_TARGET
     e = target - float(p)
     if abs(e) < _MID_AUTOTUNE_TOL:
-        st["since"] = 0
+        b["since"] = 0
         _mid_autotune_save(st)
         return
 
-    params = dict(st.get("params") or {})
+    params = dict(b.get("params") or {})
 
     # Defaults if not set yet
     disc = float(params.get("MID_RR_DISCOUNT", os.getenv("MID_RR_DISCOUNT", "0.86") or 0.86))
@@ -146,8 +192,8 @@ def _mid_autotune_update_on_close(*, market: str, orig_text: str, timeframe: str
         params["MID_MIN_ADX_1H"] = float(min_adx_1h)
         params["MID_MIN_ADX_30M"] = float(min_adx_30m)
 
-    st["params"] = params
-    st["since"] = 0
+    b["params"] = params
+    b["since"] = 0
     _mid_autotune_save(st)
 
 
@@ -4832,8 +4878,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     # Quality gate: avoid choppy markets (helps TP2 hit-rate)
     try:
         allow_range = os.getenv("MID_ALLOW_RANGE", "0").strip().lower() not in ("0","false","no","off")
-        min_adx_30m = float(_mid_autotune_get_param("MID_MIN_ADX_30M", float(os.getenv("MID_MIN_ADX_30M", "0") or 0)))
-        min_adx_1h = float(_mid_autotune_get_param("MID_MIN_ADX_1H", float(os.getenv("MID_MIN_ADX_1H", "0") or 0)))
+        min_adx_30m = float(_mid_autotune_get_param("MID_MIN_ADX_30M", float(os.getenv("MID_MIN_ADX_30M", "0") or 0), market))
+        min_adx_1h = float(_mid_autotune_get_param("MID_MIN_ADX_1H", float(os.getenv("MID_MIN_ADX_1H", "0") or 0), market))
         if not allow_range and min_adx_30m > 0 and min_adx_1h > 0:
             if (not np.isnan(adx30)) and (not np.isnan(adx1h)) and (adx30 < min_adx_30m) and (adx1h < min_adx_1h):
                 return None
@@ -4855,7 +4901,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 # keep legacy fixed RR for MID
                 return float(os.getenv("MID_TP2_R", str(TP2_R)) or TP2_R)
             base = float(_adaptive_tp2_r(adx_1h))
-            disc = float(_mid_autotune_get_param("MID_RR_DISCOUNT", 0.92))
+            disc = float(_mid_autotune_get_param("MID_RR_DISCOUNT", 0.92, market))
             # clamp to sane range
             if disc < 0.70:
                 disc = 0.70
@@ -4910,7 +4956,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
     # Hard cap: keep TP2 within MID_MAX_TP2_ATR * ATR to improve hit-rate
     try:
-        max_tp2_atr = float(_mid_autotune_get_param("MID_MAX_TP2_ATR", float(os.getenv("MID_MAX_TP2_ATR", "2.2") or 2.2)))
+        max_tp2_atr = float(_mid_autotune_get_param("MID_MAX_TP2_ATR", float(os.getenv("MID_MAX_TP2_ATR", "2.2") or 2.2), market))
         if max_tp2_atr > 0 and atr30 and tp2:
             max_dist = abs(float(atr30)) * float(max_tp2_atr)
             cur_dist = abs(float(tp2) - float(entry))
