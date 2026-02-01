@@ -4692,78 +4692,100 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
     # --- Dynamic TP2/RR for MID ---
 
+    # --- Quality gate (reduce chop / improve TP2 hit-rate) ---
+    try:
+        allow_range = (os.getenv("MID_ALLOW_RANGE", "0").strip().lower() not in ("0","false","no","off"))
+        min_adx_1h = float(os.getenv("MID_MIN_ADX_1H", "18") or 18.0)
+        min_adx_30m = float(os.getenv("MID_MIN_ADX_30M", "16") or 16.0)
+        a1 = float(adx1h) if (adx1h == adx1h) else 0.0
+        a30 = float(adx30) if (adx30 == adx30) else 0.0
+        if (not allow_range) and (a1 < min_adx_1h) and (a30 < min_adx_30m):
+            # Market is likely ranging/choppy on both 1h and 30m -> skip MID signal entirely
+            return None
+    except Exception:
+        pass
+
+    # --- Dynamic TP2/RR for MID (trend + volatility aware) ---
+
     def _tp2_r_mid(adx_1h: float, adx_30m: float, atrp: float) -> float:
-        """Dynamic TP2_R for MID signals.
+        """TP2_R for MID, synchronized with MAIN but adjusted for MID quality.
 
         Goals:
-        - Keep MID RR dynamic (trend strength + volatility), not a fixed constant.
-        - Reuse MAIN adaptive RR as a baseline for consistent behaviour.
-        - Slightly de-risk MID with a small discount and ATR/ADX-based adjustments.
-
-        Env tunables:
-          MID_RR_SYNC_WITH_MAIN=1|0
-          MID_RR_DISCOUNT=0.92
-          MID_TP2_R (fallback if sync off)
-          MID_TP2_R_MIN=1.30
-          MID_TP2_R_MAX=3.20
+        - Keep TP2 reachable (cap by ATR multiples).
+        - Increase RR only when trend is confirmed (ADX 1h + 30m).
+        - Reduce RR in high volatility (ATR%).
         """
-        def _f(env_name: str, default: float) -> float:
+        # base RR
+        sync = (os.getenv("MID_RR_SYNC_WITH_MAIN", "1").strip().lower() not in ("0","false","no","off"))
+        if sync:
             try:
-                return float(os.getenv(env_name, str(default)) or default)
+                base = float(_adaptive_tp2_r(adx_1h))
             except Exception:
-                return float(default)
+                base = float(os.getenv("MID_TP2_R", str(TP2_R)) or TP2_R)
+        else:
+            base = float(os.getenv("MID_TP2_R", str(TP2_R)) or TP2_R)
 
-        def _clamp(x: float, lo: float, hi: float) -> float:
-            if x < lo:
-                return lo
-            if x > hi:
-                return hi
-            return x
-
+        # MID discount to stay slightly less greedy than MAIN
         try:
-            sync = (os.getenv("MID_RR_SYNC_WITH_MAIN", "1").strip().lower() not in ("0", "false", "no", "off"))
-            if not sync:
-                return _f("MID_TP2_R", float(TP2_R))
-
-            base = float(_adaptive_tp2_r(adx_1h))
-            disc = _clamp(_f("MID_RR_DISCOUNT", 0.92), 0.70, 1.00)
-            r = base * disc
-
-            # ADX confluence (30m + 1h)
-            if not (np.isnan(adx_30m) or np.isnan(adx_1h)):
-                # bonus/penalty in [-0.20 .. +0.20], centered around ADX~20
-                b30 = _clamp((adx_30m - 20.0) / 25.0, -0.20, 0.20)
-                b1h = _clamp((adx_1h - 20.0) / 30.0, -0.15, 0.15)
-                r += (b30 * 0.70) + (b1h * 0.30)
-
-            # Volatility guard (ATR%)
-            try:
-                v = float(atrp)
-            except Exception:
-                v = float("nan")
-            if not np.isnan(v):
-                if v > 6.0:
-                    r -= 0.35
-                elif v > 4.5:
-                    r -= 0.25
-                elif v > 3.5:
-                    r -= 0.15
-                elif v < 0.25:
-                    r -= 0.10
-
-            rmin = _f("MID_TP2_R_MIN", 1.30)
-            rmax = _f("MID_TP2_R_MAX", 3.20)
-            if rmin < 1.10:
-                rmin = 1.10
-            if rmax < rmin:
-                rmax = rmin + 0.10
-            return float(_clamp(r, rmin, rmax))
-
+            disc = float(os.getenv("MID_RR_DISCOUNT", "0.92") or 0.92)
         except Exception:
-            try:
-                return float(_adaptive_tp2_r(adx_1h))
-            except Exception:
-                return _f("MID_TP2_R", float(TP2_R))
+            disc = 0.92
+        disc = max(0.70, min(disc, 1.00))
+        r = base * disc
+
+        # Trend confirmation (ADX)
+        a1 = float(adx_1h) if (adx_1h == adx_1h) else 0.0
+        a30 = float(adx_30m) if (adx_30m == adx_30m) else 0.0
+        adx_avg = 0.60 * a1 + 0.40 * a30
+
+        if adx_avg >= 32:
+            r += 0.25
+        elif adx_avg >= 28:
+            r += 0.18
+        elif adx_avg >= 24:
+            r += 0.10
+        elif adx_avg <= 14:
+            r -= 0.18
+        elif adx_avg <= 17:
+            r -= 0.08
+
+        # Volatility adjustment via ATR%
+        try:
+            v = float(atrp) if (atrp == atrp) else 0.0
+        except Exception:
+            v = 0.0
+
+        if v >= 4.0:
+            r *= 0.72
+        elif v >= 3.0:
+            r *= 0.80
+        elif v >= 2.0:
+            r *= 0.88
+        elif v > 0 and v < 0.35 and adx_avg >= 22:
+            # calm + trending -> allow slightly larger RR
+            r *= 1.05
+
+        # Clamp to sane bounds
+        try:
+            rmin = float(os.getenv("MID_TP2_R_MIN", "1.25") or 1.25)
+            rmax = float(os.getenv("MID_TP2_R_MAX", "3.00") or 3.00)
+        except Exception:
+            rmin, rmax = 1.25, 3.00
+        r = max(rmin, min(r, rmax))
+
+        # Hard cap by TP2 distance in ATR multiples (keeps TP2 reachable)
+        try:
+            max_tp2_atr = float(os.getenv("MID_MAX_TP2_ATR", "2.80") or 2.80)
+        except Exception:
+            max_tp2_atr = 2.80
+        cap_rr = max_tp2_atr / max(1e-9, float(ATR_MULT_SL))
+        if r > cap_rr:
+            r = cap_rr
+
+        # Final sanity
+        if r < 1.05:
+            r = 1.05
+        return float(r)
 
     tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct)
     sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
