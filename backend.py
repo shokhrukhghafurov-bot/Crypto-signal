@@ -4690,33 +4690,42 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
     atr_pct = (atr30 / entry) * 100.0
 
-    # --- Dynamic TP2/RR for MID ---
 
-    # --- Quality gate (reduce chop / improve TP2 hit-rate) ---
+    # --- Quality gate (aiming for high TP2 hit-rate) ---
+    # For ~70% TP2 hit-rate you must trade fewer, stronger setups.
     try:
-        allow_range = (os.getenv("MID_ALLOW_RANGE", "0").strip().lower() not in ("0","false","no","off"))
-        min_adx_1h = float(os.getenv("MID_MIN_ADX_1H", "18") or 18.0)
-        min_adx_30m = float(os.getenv("MID_MIN_ADX_30M", "16") or 16.0)
-        a1 = float(adx1h) if (adx1h == adx1h) else 0.0
-        a30 = float(adx30) if (adx30 == adx30) else 0.0
-        if (not allow_range) and (a1 < min_adx_1h) and (a30 < min_adx_30m):
-            # Market is likely ranging/choppy on both 1h and 30m -> skip MID signal entirely
-            return None
+        min_adx_1h = float(os.getenv("MID_MIN_ADX_1H", "22") or 22)
+        min_adx_30m = float(os.getenv("MID_MIN_ADX_30M", "20") or 20)
     except Exception:
-        pass
+        min_adx_1h, min_adx_30m = 22.0, 20.0
 
-    # --- Dynamic TP2/RR for MID (trend + volatility aware) ---
+    # If either timeframe is weak/trendless -> skip (avoid chop that kills TP2)
+    if (not np.isnan(adx1h) and adx1h < min_adx_1h) or (not np.isnan(adx30) and adx30 < min_adx_30m):
+        allow_range = (os.getenv("MID_ALLOW_RANGE", "0").strip().lower() in ("1","true","yes","on"))
+        if not allow_range:
+            return None
 
-    def _tp2_r_mid(adx_1h: float, adx_30m: float, atrp: float) -> float:
-        """TP2_R for MID, synchronized with MAIN but adjusted for MID quality.
+    # --- Dynamic TP2/RR for MID (high TP2 hit-rate mode) ---
 
-        Goals:
-        - Keep TP2 reachable (cap by ATR multiples).
-        - Increase RR only when trend is confirmed (ADX 1h + 30m).
-        - Reduce RR in high volatility (ATR%).
+    def _tp2_r_mid(adx_1h: float, adx_30m: float, atrp: float, atr_mult_sl: float) -> float:
+        """Dynamic TP2_R for MID.
+
+        Defaults are tuned for high TP2 hit-rate (target ~70%) at the cost of fewer signals and smaller RR.
+
+        Env tunables:
+          - MID_RR_SYNC_WITH_MAIN (default 1)
+          - MID_RR_DISCOUNT (default 0.90)
+          - MID_TP2_R_MIN (default 1.15)
+          - MID_TP2_R_MAX (default 1.90)
+          - MID_MAX_TP2_ATR (default 2.0)  # TP2 distance cap in ATR units
+          - MID_ATRP_HARD (default 3.0)    # ATR% threshold for extra reduction
         """
-        # base RR
-        sync = (os.getenv("MID_RR_SYNC_WITH_MAIN", "1").strip().lower() not in ("0","false","no","off"))
+        # Base RR
+        try:
+            sync = (os.getenv("MID_RR_SYNC_WITH_MAIN", "1").strip().lower() not in ("0", "false", "no", "off"))
+        except Exception:
+            sync = True
+
         if sync:
             try:
                 base = float(_adaptive_tp2_r(adx_1h))
@@ -4725,69 +4734,61 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         else:
             base = float(os.getenv("MID_TP2_R", str(TP2_R)) or TP2_R)
 
-        # MID discount to stay slightly less greedy than MAIN
         try:
-            disc = float(os.getenv("MID_RR_DISCOUNT", "0.92") or 0.92)
+            disc = float(os.getenv("MID_RR_DISCOUNT", "0.90") or 0.90)
         except Exception:
-            disc = 0.92
-        disc = max(0.70, min(disc, 1.00))
+            disc = 0.90
+        disc = max(0.70, min(1.00, disc))
         r = base * disc
 
-        # Trend confirmation (ADX)
-        a1 = float(adx_1h) if (adx_1h == adx_1h) else 0.0
-        a30 = float(adx_30m) if (adx_30m == adx_30m) else 0.0
-        adx_avg = 0.60 * a1 + 0.40 * a30
+        # Trend correction (gentle)
+        a1 = float(adx_1h) if not np.isnan(adx_1h) else 0.0
+        a30 = float(adx_30m) if not np.isnan(adx_30m) else 0.0
+        a = 0.6 * a1 + 0.4 * a30
 
-        if adx_avg >= 32:
-            r += 0.25
-        elif adx_avg >= 28:
-            r += 0.18
-        elif adx_avg >= 24:
+        if a >= 35:
+            r += 0.20
+        elif a >= 28:
             r += 0.10
-        elif adx_avg <= 14:
-            r -= 0.18
-        elif adx_avg <= 17:
-            r -= 0.08
+        elif a >= 22:
+            r += 0.00
+        elif a >= 18:
+            r -= 0.10
+        else:
+            r -= 0.20
 
-        # Volatility adjustment via ATR%
+        # Volatility protection by ATR%
         try:
-            v = float(atrp) if (atrp == atrp) else 0.0
+            atrp_hard = float(os.getenv("MID_ATRP_HARD", "3.0") or 3.0)
         except Exception:
-            v = 0.0
+            atrp_hard = 3.0
+        if (not np.isnan(atrp)) and atrp > atrp_hard:
+            r -= 0.15
 
-        if v >= 4.0:
-            r *= 0.72
-        elif v >= 3.0:
-            r *= 0.80
-        elif v >= 2.0:
-            r *= 0.88
-        elif v > 0 and v < 0.35 and adx_avg >= 22:
-            # calm + trending -> allow slightly larger RR
-            r *= 1.05
-
-        # Clamp to sane bounds
+        # Hard clamp by RR bounds
         try:
-            rmin = float(os.getenv("MID_TP2_R_MIN", "1.25") or 1.25)
-            rmax = float(os.getenv("MID_TP2_R_MAX", "3.00") or 3.00)
+            r_min = float(os.getenv("MID_TP2_R_MIN", "1.15") or 1.15)
+            r_max = float(os.getenv("MID_TP2_R_MAX", "1.90") or 1.90)
         except Exception:
-            rmin, rmax = 1.25, 3.00
-        r = max(rmin, min(r, rmax))
+            r_min, r_max = 1.15, 1.90
+        r_min = max(1.05, r_min)
+        if r_max < r_min:
+            r_max = r_min
+        r = max(r_min, min(r_max, r))
 
-        # Hard cap by TP2 distance in ATR multiples (keeps TP2 reachable)
+        # Cap TP2 distance in ATR units:
+        # TP2 distance ≈ r * ATR_MULT_SL * ATR, so in ATRs it's r * ATR_MULT_SL
         try:
-            max_tp2_atr = float(os.getenv("MID_MAX_TP2_ATR", "2.80") or 2.80)
+            max_tp2_atr = float(os.getenv("MID_MAX_TP2_ATR", "2.0") or 2.0)
         except Exception:
-            max_tp2_atr = 2.80
-        cap_rr = max_tp2_atr / max(1e-9, float(ATR_MULT_SL))
-        if r > cap_rr:
-            r = cap_rr
+            max_tp2_atr = 2.0
+        if max_tp2_atr > 0 and atr_mult_sl > 0:
+            r_cap = max_tp2_atr / float(atr_mult_sl)
+            r = min(r, max(r_min, r_cap))
 
-        # Final sanity
-        if r < 1.05:
-            r = 1.05
-        return float(r)
+        return float(max(r_min, min(r_max, r)))
 
-    tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct)
+    tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct, ATR_MULT_SL)
     sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
 
     # --- TA extras (MAIN-like) ---
