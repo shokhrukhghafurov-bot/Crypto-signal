@@ -152,7 +152,7 @@
     "msg_auto_loss": "🔴 SL | {symbol} | {market}\n\nPrice hit SL\n• SL: {sl}\n\n🕒 Opened: {opened_time} (MSK)\n🕒 Closed: {closed_time} (MSK)\n\nStatus: LOSS",
     "msg_auto_tp1": "🎯 TP1 HIT | {symbol} | {market}\n\nPartial close:\n• Closed: {closed_pct}%\n• Profit locked at TP1\n\n🛡 Protection enabled:\nSL → BE ({be_price})\n\n🕒 Opened: {opened_time} (MSK)\n🕒 TP1: {event_time} (MSK)\n\nStatus: TP1\n❗ Loss after TP1 is impossible",
     "msg_auto_win": "🏆 TP2 | WIN | {symbol} | {market}\n\nTP2 reached 🎯\n• TP1: ✅\n• TP2: ✅\n• Total PnL: {pnl_total}\n\n🕒 Opened: {opened_time} (MSK)\n🕒 Closed: {closed_time} (MSK)\n\nStatus: WIN",
-    "msg_open_card": "{market_banner}\n🚨 NEW SIGNAL\n\n{header}\n\n🪙 {symbol}\n{direction_line}{tf_line}\n{exchanges_line}\n\nEntry: {entry}\nSL: {sl}\n{tp_lines}\n\n{rr_line}\n{conf_line}\n{confirm_line}{risk_block}\n\n{open_prompt}",
+    "msg_open_card": "{market_banner}\n🚨 NEW SIGNAL\n\n{header}\n\n🪙 {symbol}\n{direction_line}{tf_line}\n{exchanges_line}{autotrade_line}\n\nEntry: {entry}\nSL: {sl}\n{tp_lines}\n\n{rr_line}\n{conf_line}\n{confirm_line}{risk_block}\n\n{open_prompt}",
     "msg_price_unavailable_close": "⚠️ Price unavailable\nFailed to fetch price from Binance / Bybit / OKX for {minutes} minutes.\n\nThe trade was force-closed by the bot to avoid uncontrolled risk.\n\n{symbol} | {market}",
     "my_trades_empty": "You have no opened trades yet. Open a signal first ✅",
     "my_trades_title": "📂 My trades (showing {a}-{b} of {n})\nTap a trade to open details.",
@@ -188,7 +188,8 @@
     "sig_btn_refresh": "🔄 Refresh",
     "sig_buttons": "Buttons:",
     "sig_confidence": "Confidence",
-    "sig_confirm": "Confirm",
+    "sig_confirm": "Source",
+    "sig_autotrade": "Auto-trade",
     "sig_entry": "Entry",
     "sig_exchanges": "Exchanges",
     "sig_expired_note": "⛔️ Too late — the signal has already played out.\nReason: {reason}\nCurrent price: {price}\nButton disabled.",
@@ -411,7 +412,7 @@
     "msg_auto_loss": "🔴 SL | {symbol} | {market}\n\nЦена дошла до SL\n• SL: {sl}\n\n🕒 Открыта: {opened_time} (MSK)\n🕒 Закрыта: {closed_time} (MSK)\n\nСтатус: LOSS",
     "msg_auto_tp1": "🎯 TP1 ДОСТИГНУТ | {symbol} | {market}\n\nЧастичное закрытие:\n• Закрыто: {closed_pct}%\n• Прибыль зафиксирована по TP1\n\n🛡 Защита включена:\nSL → BE ({be_price})\n\n🕒 Открыта: {opened_time} (MSK)\n🕒 TP1: {event_time} (MSK)\n\nСтатус: TP1\n❗ Минус после TP1 невозможен",
     "msg_auto_win": "🏆 TP2 | WIN | {symbol} | {market}\n\nTP2 достигнут 🎯\n• TP1: ✅\n• TP2: ✅\n• Total PnL: {pnl_total}\n\n🕒 Открыта: {opened_time} (MSK)\n🕒 Закрыта: {closed_time} (MSK)\n\nСтатус: WIN",
-    "msg_open_card": "{market_banner}\n🚨 НОВЫЙ СИГНАЛ\n\n{header}\n\n🪙 {symbol}\n{direction_line}{tf_line}\n{exchanges_line}\n\nВход (Entry): {entry}\nСтоп-лосс (SL): {sl}\n{tp_lines}\n\n{rr_line}\n{conf_line}\n{confirm_line}{risk_block}\n\n{open_prompt}",
+    "msg_open_card": "{market_banner}\n🚨 НОВЫЙ СИГНАЛ\n\n{header}\n\n🪙 {symbol}\n{direction_line}{tf_line}\n{exchanges_line}{autotrade_line}\n\nВход (Entry): {entry}\nСтоп-лосс (SL): {sl}\n{tp_lines}\n\n{rr_line}\n{conf_line}\n{confirm_line}{risk_block}\n\n{open_prompt}",
     "msg_price_unavailable_close": "⚠️ Цена недоступна\nНе удалось получить цену с Binance / Bybit / OKX в течение {minutes} мин.\n\nСделка принудительно закрыта ботом, чтобы избежать неконтролируемого риска.\n\n{symbol} | {market}",
     "my_trades_empty": "У тебя пока нет открытых сделок. Сначала открой сигнал ✅",
     "my_trades_title": "📂 Мои сделки (показано {a}-{b} из {n})\nНажми на сделку, чтобы открыть детали.",
@@ -447,7 +448,8 @@
     "sig_btn_refresh": "🔄 Обновить",
     "sig_buttons": "Кнопки:",
     "sig_confidence": "Уверенность",
-    "sig_confirm": "Подтверждение",
+    "sig_confirm": "Источник",
+    "sig_autotrade": "Автотрейд",
     "sig_entry": "Вход",
     "sig_exchanges": "Биржи",
     "sig_expired_note": "⛔️ Уже поздно — сигнал отработал.\nПричина: {reason}\nТекущая цена: {price}\nКнопка отключена.",
@@ -518,3 +520,4 @@
     "welcome_subscribed": "✅ Ты подписан на сигналы."
   }
 }
+
