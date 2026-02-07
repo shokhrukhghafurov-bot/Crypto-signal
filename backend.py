@@ -3975,6 +3975,16 @@ class Signal:
     risk_note: str
     ts: float
 
+    # NEW (optional)
+    source_exchange: str = ""
+    available_exchanges: str = ""
+
+    # Backward-compatible extras used by the bot message renderer.
+    # source_exchange: primary venue that produced the signal (can differ from executable venues).
+    # available_exchanges: venues where the pair exists for the given market (SPOT/FUTURES).
+    source_exchange: str = ""
+    available_exchanges: str = ""
+
 @dataclass
 class UserTrade:
     user_id: int
@@ -7028,7 +7038,11 @@ class Backend:
                         _ex_order = ["BINANCE", "OKX", "BYBIT"] if market == "FUTURES" else ["GATEIO", "BINANCE", "OKX", "BYBIT", "MEXC"]
                         _oks = await asyncio.gather(*[_pair_exists(x) for x in _ex_order])
                         _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
-                        if not _pair_exchanges:
+                        # If a FUTURES signal has no executable venues -> don't emit (non-tradable & cannot be monitored).
+                        if market == "FUTURES" and not _pair_exchanges:
+                            continue
+                        # SPOT: keep old behavior (fallback to best venue) so users still see an exchange label.
+                        if market != "FUTURES" and not _pair_exchanges:
                             _pair_exchanges = [best_name]
                         conf_names = "+".join(_pair_exchanges)
 
@@ -7047,6 +7061,8 @@ class Backend:
                             rr=rr,
                             confidence=conf,
                             confirmations=conf_names,
+                            source_exchange=best_name,
+                            available_exchanges=conf_names,
                             risk_note="\\n".join(risk_notes).strip(),
                             ts=time.time(),
                         )
@@ -7290,6 +7306,61 @@ class Backend:
                             else:
                                 tp1 = entry - risk*tp1_r; tp2 = entry - risk*tp2_r
 
+                        # List exchanges where the symbol exists for THIS market.
+                        # For FUTURES we only count executable futures venues (BINANCE/OKX/BYBIT).
+                        async def _pair_exists_mid(ex: str, mkt: str) -> bool:
+                            try:
+                                exu = (ex or "").upper().strip()
+                                mkt_u = (mkt or "FUTURES").upper().strip()
+                                if mkt_u == "FUTURES":
+                                    if exu == "BINANCE":
+                                        p = await self._fetch_rest_price("FUTURES", sym)
+                                    elif exu == "BYBIT":
+                                        p = await self._fetch_bybit_price("FUTURES", sym)
+                                    elif exu == "OKX":
+                                        p = await self._fetch_okx_price("FUTURES", sym)
+                                    else:
+                                        return False
+                                    return bool(p and float(p) > 0)
+
+                                # SPOT
+                                if exu == "BINANCE":
+                                    p = await self._fetch_rest_price("SPOT", sym)
+                                elif exu == "BYBIT":
+                                    p = await self._fetch_bybit_price("SPOT", sym)
+                                elif exu == "OKX":
+                                    p = await self._fetch_okx_price("SPOT", sym)
+                                elif exu == "MEXC":
+                                    p = await _mexc_public_price(sym)
+                                else:  # GATEIO
+                                    p = await _gateio_public_price(sym)
+                                return bool(p and float(p) > 0)
+                            except Exception:
+                                return False
+
+                        # Try to keep MID signals executable/monitorable.
+                        _ex_order_f = ["BINANCE", "OKX", "BYBIT"]
+                        _ex_order_s = ["GATEIO", "BINANCE", "OKX", "BYBIT", "MEXC"]
+                        _pair_exchanges_mid: List[str] = []
+
+                        if market == "FUTURES":
+                            _oks = await asyncio.gather(*[_pair_exists_mid(x, "FUTURES") for x in _ex_order_f])
+                            _pair_exchanges_mid = [x for x, ok in zip(_ex_order_f, _oks) if ok]
+                            # If futures venues are missing -> downgrade to SPOT (only if executable).
+                            if not _pair_exchanges_mid:
+                                market = "SPOT"
+
+                        if market == "SPOT":
+                            # Avoid sending non-executable SPOT SHORT.
+                            if direction == "SHORT":
+                                continue
+                            _oks = await asyncio.gather(*[_pair_exists_mid(x, "SPOT") for x in _ex_order_s])
+                            _pair_exchanges_mid = [x for x, ok in zip(_ex_order_s, _oks) if ok]
+                            if not _pair_exchanges_mid:
+                                _pair_exchanges_mid = [best_name]
+
+                        conf_names_mid = "+".join(_pair_exchanges_mid)
+
                         sig = Signal(
                             signal_id=self.next_signal_id(),
                             market=market,
@@ -7299,7 +7370,9 @@ class Backend:
                             entry=entry, sl=sl, tp1=float(tp1), tp2=float(tp2),
                             rr=float(tp2_r if tp_policy=="R" else rr),
                             confidence=int(round(conf)),
-                            confirmations=best_name,
+                            confirmations=conf_names_mid,
+                            source_exchange=best_name,
+                            available_exchanges=conf_names_mid,
                             risk_note=_fmt_ta_block_mid(best_r, mode),
                             ts=time.time(),
                         )
