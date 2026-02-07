@@ -7304,7 +7304,7 @@ class Backend:
                             else:
                                 risk_note = "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
 
-sig = Signal(
+                            sig = Signal(
                             signal_id=self.next_signal_id(),
                             market=market,
                             symbol=sym,
