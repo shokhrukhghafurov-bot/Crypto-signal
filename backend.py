@@ -4059,6 +4059,7 @@ class Signal:
     rr: float
     confidence: int
     confirmations: str
+    source_exchange: str = ""
     risk_note: str
     ts: float
 
@@ -7134,7 +7135,8 @@ class Backend:
                             rr=rr,
                             confidence=conf,
                             confirmations=conf_names,
-                            risk_note="\\n".join(risk_notes).strip(),
+                            source_exchange=best_name,
+                            risk_note="\n".join(risk_notes).strip(),
                             ts=time.time(),
                         )
 
@@ -7391,18 +7393,60 @@ class Backend:
                             else:
                                 risk_note = "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
 
+                        
+                        # Determine exchanges where the pair exists (for display & Auto-trade routing)
+                        async def _pair_exists(exu: str, sym0: str) -> bool:
+                            try:
+                                # FUTURES confirmations (Binance/Bybit/OKX)
+                                if market == "FUTURES":
+                                    if exu == "BINANCE":
+                                        p = await self._fetch_rest_price("FUTURES", sym0)
+                                    elif exu == "BYBIT":
+                                        p = await self._fetch_bybit_price("FUTURES", sym0)
+                                    elif exu == "OKX":
+                                        p = await self._fetch_okx_price("FUTURES", sym0)
+                                    else:
+                                        return False
+                                    return bool(p and float(p) > 0)
+
+                                # SPOT confirmations (supports all 5 exchanges)
+                                if exu == "BINANCE":
+                                    p = await self._fetch_rest_price("SPOT", sym0)
+                                elif exu == "BYBIT":
+                                    p = await self._fetch_bybit_price("SPOT", sym0)
+                                elif exu == "OKX":
+                                    p = await self._fetch_okx_price("SPOT", sym0)
+                                elif exu == "MEXC":
+                                    p = await _mexc_public_price(sym0)
+                                else:  # GATEIO
+                                    p = await _gateio_public_price(sym0)
+                                return bool(p and float(p) > 0)
+                            except Exception:
+                                return False
+
+                        _ex_order = ["BINANCE", "OKX", "BYBIT"] if market == "FUTURES" else ["GATEIO", "BINANCE", "OKX", "BYBIT", "MEXC"]
+                        _oks = await asyncio.gather(*[_pair_exists(x, sym) for x in _ex_order])
+                        _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
+                        if not _pair_exchanges:
+                            _pair_exchanges = [best_name]
+                        conf_names = "+".join(_pair_exchanges)
+
                         sig = Signal(
-                        signal_id=self.next_signal_id(),
-                        market=market,
-                        symbol=sym,
-                        direction=direction,
-                        timeframe=f"{tf_trigger}/{tf_mid}/{tf_trend}",
-                        entry=entry, sl=sl, tp1=float(tp1), tp2=float(tp2),
-                        rr=float(tp2_r if tp_policy=="R" else rr),
-                        confidence=int(round(conf)),
-                        confirmations=best_name,
-                        risk_note=risk_note,
-                        ts=time.time(),
+                            signal_id=self.next_signal_id(),
+                            market=market,
+                            symbol=sym,
+                            direction=direction,
+                            timeframe=f"{tf_trigger}/{tf_mid}/{tf_trend}",
+                            entry=entry,
+                            sl=sl,
+                            tp1=float(tp1),
+                            tp2=float(tp2),
+                            rr=float(tp2_r if tp_policy == "R" else rr),
+                            confidence=int(round(conf)),
+                            confirmations=conf_names,
+                            source_exchange=best_name,
+                            risk_note=risk_note,
+                            ts=time.time(),
                         )
                         self.mark_emitted_mid(sym)
                         self.last_signal = sig
