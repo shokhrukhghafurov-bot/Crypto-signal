@@ -742,7 +742,13 @@ async def _refresh_autotrade_bot_global_once() -> None:
         AUTOTRADE_BOT_GLOBAL["maintenance_mode"] = bool(st.get("maintenance_mode"))
         AUTOTRADE_BOT_GLOBAL["updated_at"] = st.get("updated_at")
     except Exception:
-        # keep previous values
+        # FAIL-CLOSED: if we can't read DB settings, block new auto-trade opens.
+        # This prevents a situation where admin enabled pause/maintenance but DB read failed,
+        # leading to unintended new trades.
+        logger.exception("Auto-trade global settings load failed; fail-closed (pause+maintenance)")
+        AUTOTRADE_BOT_GLOBAL["pause_autotrade"] = True
+        AUTOTRADE_BOT_GLOBAL["maintenance_mode"] = True
+        AUTOTRADE_BOT_GLOBAL["updated_at"] = None
         return
 
 async def _autotrade_bot_global_loop() -> None:
@@ -1606,7 +1612,9 @@ async def broadcast_signal(sig: Signal) -> None:
                             logger.info("Auto-trade skipped by global setting (pause/maintenance) uid=%s", _uid)
                             return
                     except Exception:
-                        pass
+                        # FAIL-CLOSED: if DB read failed, do NOT open new trades.
+                        logger.exception("Auto-trade skipped: failed to read global pause/maintenance (fail-closed) uid=%s", _uid)
+                        return
 
                     res = await autotrade_execute(_uid, _sig)
                     err = res.get("api_error") if isinstance(res, dict) else None
