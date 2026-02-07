@@ -454,10 +454,6 @@ SMART_REVERSAL_EXIT_PCT = _smartpro_env_float("SMART_REVERSAL_EXIT_PCT", 0.32)
 SMART_ARM_SL_AFTER_PCT = _smartpro_env_float("SMART_ARM_SL_AFTER_PCT", 0.22)
 SMART_HARD_SL_PCT = _smartpro_env_float("SMART_HARD_SL_PCT", 2.80)
 
-# --- SL candle confirmation (anti-spike) ---
-SMART_SL_CONFIRM_CANDLE = _smartpro_env_bool("SMART_SL_CONFIRM_CANDLE", True)
-SMART_SL_DEEP_BREAK_PCT = _smartpro_env_float("SMART_SL_DEEP_BREAK_PCT", 0.35)
-
 # --- Generic loop tick / debounce (if referenced) ---
 SMART_TICK = _smartpro_env_float("SMART_TICK", 1.0)
 
@@ -468,78 +464,6 @@ if SMART_TP1_PARTIAL_PCT > 1.0:
     SMART_TP1_PARTIAL_PCT = 1.0
 if SMART_BE_MAX_PCT < SMART_BE_MIN_PCT:
     SMART_BE_MAX_PCT = SMART_BE_MIN_PCT
-
-def _sl_tf_to_binance_interval(tf: str) -> str:
-    """Map signal timeframe to Binance interval string. Falls back to 1m."""
-    t = (tf or "").strip().lower().replace(" ", "")
-    if not t:
-        return "1m"
-    t = t.replace("min", "m").replace("minutes", "m").replace("minute", "m")
-    t = t.replace("hour", "h").replace("hours", "h")
-    t = t.replace("day", "d").replace("days", "d")
-
-    m = re.match(r"^(\d+)([mhdw])$", t)
-    if m:
-        n = int(m.group(1))
-        u = m.group(2)
-        if u == "m" and n in (1, 3, 5, 15, 30):
-            return f"{n}m"
-        if u == "h" and n in (1, 2, 4, 6, 8, 12):
-            return f"{n}h"
-        if u == "d" and n in (1, 3):
-            return f"{n}d"
-        if u == "w" and n == 1:
-            return "1w"
-
-    m = re.match(r"^([mhdw])(\d+)$", t)
-    if m:
-        u = m.group(1)
-        n = int(m.group(2))
-        return _sl_tf_to_binance_interval(f"{n}{u}")
-
-    if t in ("1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d","3d","1w"):
-        return t
-
-    return "1m"
-
-
-async def _sl_last_closed_candle_binance(*, market: str, symbol: str, interval: str) -> dict | None:
-    """Fetch last *closed* candle close price from Binance (spot/futures).
-
-    Returns {"close": float, "open_time": int_ms, "interval": str} or None.
-    Uses limit=2 and returns the second last candle to ensure it's closed.
-    Called only on SL-touch, so overhead is minimal.
-    """
-    mkt = (market or "FUTURES").upper().strip()
-    sym = (symbol or "").upper().replace("/", "")
-    if not sym:
-        return None
-
-    itv = _sl_tf_to_binance_interval(interval)
-
-    base = "https://api.binance.com" if mkt == "SPOT" else "https://fapi.binance.com"
-    path = "/api/v3/klines" if mkt == "SPOT" else "/fapi/v1/klines"
-    url = base + path
-    params = {"symbol": sym, "interval": itv, "limit": "2"}
-
-    try:
-        timeout = aiohttp.ClientTimeout(total=6)
-        async with aiohttp.ClientSession(timeout=timeout) as ses:
-            async with ses.get(url, params=params) as r:
-                if r.status != 200:
-                    return None
-                data = await r.json(content_type=None)
-
-        if not isinstance(data, list) or not data:
-            return None
-
-        row = data[-2] if len(data) >= 2 else data[-1]
-        close = float(row[4])
-        ot = int(row[0])
-        return {"close": close, "open_time": ot, "interval": itv}
-    except Exception:
-        return None
-
 
 def _be_with_fee_buffer(entry_price: float, *, direction: str) -> float:
     """Return BE price adjusted by fee buffer."""
@@ -4138,6 +4062,7 @@ class Signal:
     rr: float = 0.0
     confidence: int = 0
     confirmations: str = ""
+    # Exchange metadata (used for display/routing)
     source_exchange: str = ""
     available_exchanges: str = ""
     risk_note: str = ""
@@ -6904,26 +6829,6 @@ class Backend:
 
                     # 2) Before TP1: SL -> LOSS
                     if not tp1_hit and s.sl and hit_sl(float(s.sl)):
-                        # Optional: confirm SL on candle close to ignore wick spikes (anti-stop-hunt)
-                        try:
-                            if SMART_SL_CONFIRM_CANDLE:
-                                sl_val = float(s.sl)
-                                deep = abs((sl_val - price_f) / sl_val) * 100.0 if sl_val else 999.0
-                                if deep < float(SMART_SL_DEEP_BREAK_PCT or 0.0):
-                                    tf = str(getattr(s, 'timeframe', '') or '')
-                                    c = await _sl_last_closed_candle_binance(market=market, symbol=s.symbol, interval=tf)
-                                    if not c:
-                                        continue
-                                    close_px = float(c.get('close') or 0.0)
-                                    # For LONG: require candle close <= SL to confirm breakdown.
-                                    if side == 'LONG' and close_px > sl_val:
-                                        continue
-                                    # For SHORT: require candle close >= SL to confirm breakdown.
-                                    if side != 'LONG' and close_px < sl_val:
-                                        continue
-                        except Exception:
-                            # fail-safe: keep legacy behavior on unexpected errors
-                            pass
                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
                         pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.sl), close_reason="LOSS")
                         import datetime as _dt
