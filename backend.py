@@ -4062,8 +4062,8 @@ class Signal:
     rr: float = 0.0
     confidence: int = 0
     confirmations: str = ""
-    source_exchange: str = \"\"
-    available_exchanges: str = \"\"
+    source_exchange: str = ""
+    available_exchanges: str = ""
     risk_note: str = ""
     ts: float = 0.0
 
