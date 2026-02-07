@@ -2735,6 +2735,42 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
         val = _as_float(o.get("cumExecValue"), 0.0)
         return (val / qty) if qty > 0 else 0.0
 
+
+    def _tf_to_sec(tf: str | None) -> int:
+        """Best-effort timeframe to seconds. Supports '1m','5m','15m','1h','4h','1d' and combos like '15m/4h'."""
+        try:
+            s = (tf or "").strip()
+            if not s:
+                return 900  # default 15m
+            # take first leg if combined
+            if "/" in s:
+                s = s.split("/", 1)[0].strip()
+            s = s.lower().replace(" ", "")
+            m = re.match(r"^(\d+)([mhd])$", s)
+            if not m:
+                # sometimes timeframe comes like '15' meaning minutes
+                if re.match(r"^\d+$", s):
+                    return int(s) * 60
+                return 900
+            n = int(m.group(1))
+            unit = m.group(2)
+            if unit == "m":
+                return max(60, n * 60)
+            if unit == "h":
+                return max(60, n * 3600)
+            if unit == "d":
+                return max(60, n * 86400)
+            return 900
+        except Exception:
+            return 900
+
+    def _next_candle_close_ts(now_ts: float, tf_sec: int) -> float:
+        try:
+            p = max(60, int(tf_sec or 900))
+            return (math.floor(float(now_ts) / p) + 1) * p
+        except Exception:
+            return float(now_ts) + 900.0
+
     def _calc_autotrade_pnl_from_orders(*, ref: dict, entry_order: dict, exit_order: dict, exchange: str, market_type: str, allocated_usdt: float) -> tuple[float | None, float | None]:
         """Compute net PnL using entry/exit average fills + modeled fees.
 
@@ -3263,16 +3299,101 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             return False
                         return (px <= sl_eff) if direction == "LONG" else (px >= sl_eff)
 
-                    # --- SL (emergency or armed) ---
-                    if _hit_sl_eff():
-                        try:
-                            await _close_market(qty)
-                        except Exception as e:
-                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                        await db_store.close_autotrade_position(
-                            user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
-                        )
-                        continue
+# --- SL (emergency or armed) ---
+# New: optional candle-close confirmation to avoid wick/stop-hunt closes.
+# Default ON. Existing logic remains for deep breaks.
+SL_CONFIRM_ON = (os.getenv("SMART_SL_CONFIRM_CANDLE", "1").strip().lower() not in ("0","false","no","off"))
+SL_CONFIRM_DEEP_PCT = float(os.getenv("SMART_SL_CONFIRM_DEEP_PCT", "0.35") or 0.35)  # close immediately if break >= this %
+sl_pending = bool(ref.get("sl_confirm_pending"))
+sl_until = float(ref.get("sl_confirm_until") or 0.0)
+
+def _sl_break_pct() -> float:
+    try:
+        if sl_eff <= 0:
+            return 0.0
+        if direction == "LONG":
+            return max(0.0, (sl_eff - px) / sl_eff * 100.0)
+        else:
+            return max(0.0, (px - sl_eff) / sl_eff * 100.0)
+    except Exception:
+        return 0.0
+
+if SL_CONFIRM_ON:
+    # If pending but price recovered before candle close -> cancel pending.
+    if sl_pending and (sl_until > 0) and (now_ts < sl_until) and (not _hit_sl_eff()):
+        ref.pop("sl_confirm_pending", None)
+        ref.pop("sl_confirm_until", None)
+        ref.pop("sl_confirm_since", None)
+        dirty = True
+        sl_pending = False
+        sl_until = 0.0
+
+    # If SL is hit now:
+    if _hit_sl_eff():
+        deep = _sl_break_pct()
+        # Deep break -> immediate close (keeps emergency behavior).
+        if deep >= max(0.0, SL_CONFIRM_DEEP_PCT):
+            try:
+                await _close_market(qty)
+            except Exception as e:
+                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+            await db_store.close_autotrade_position(
+                user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+            )
+            continue
+
+        # Not deep -> start / continue waiting until candle close.
+        if (not sl_pending) or (sl_until <= 0):
+            tf_sec = _tf_to_sec(str(ref.get("signal_timeframe") or ref.get("timeframe") or "15m"))
+            sl_until = float(_next_candle_close_ts(now_ts, tf_sec))
+            ref["sl_confirm_pending"] = True
+            ref["sl_confirm_until"] = float(sl_until)
+            ref["sl_confirm_since"] = float(now_ts)
+            dirty = True
+        else:
+            # If candle is already closed (time passed) -> decide now.
+            if now_ts >= sl_until:
+                if _hit_sl_eff():
+                    try:
+                        await _close_market(qty)
+                    except Exception as e:
+                        _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                    await db_store.close_autotrade_position(
+                        user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                    )
+                    continue
+                # recovered at close -> cancel pending
+                ref.pop("sl_confirm_pending", None)
+                ref.pop("sl_confirm_until", None)
+                ref.pop("sl_confirm_since", None)
+                dirty = True
+    else:
+        # If candle-close time passed and we are pending, resolve using current price.
+        if sl_pending and (sl_until > 0) and (now_ts >= sl_until):
+            if _hit_sl_eff():
+                try:
+                    await _close_market(qty)
+                except Exception as e:
+                    _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                await db_store.close_autotrade_position(
+                    user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                )
+                continue
+            ref.pop("sl_confirm_pending", None)
+            ref.pop("sl_confirm_until", None)
+            ref.pop("sl_confirm_since", None)
+            dirty = True
+else:
+    # Legacy immediate SL behavior
+    if _hit_sl_eff():
+        try:
+            await _close_market(qty)
+        except Exception as e:
+            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+        await db_store.close_autotrade_position(
+            user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+        )
+        continue
 
                     # --- TP2: if reached, close 100% ---
                     if tp2 > 0 and _hit_tp(tp2):
@@ -4062,8 +4183,8 @@ class Signal:
     rr: float = 0.0
     confidence: int = 0
     confirmations: str = ""
-    source_exchange: str = ""
-    available_exchanges: str = ""
+    source_exchange: str = \"\"
+    available_exchanges: str = \"\"
     risk_note: str = ""
     ts: float = 0.0
 
