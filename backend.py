@@ -315,8 +315,8 @@ def _should_deactivate_key(err_text: str) -> bool:
 
 # ------------------ Smart FUTURES Cap (effective cap) ------------------
 # In-memory cache: last effective cap per user (resets on restart).
-_LAST_EFFECTIVE_FUT_CAP: dict[int, float] = {}  # legacy (DB is used now)
-_LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT: dict[int, float] = {}  # legacy
+_LAST_EFFECTIVE_FUT_CAP: dict[int, float] = {}
+_LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT: dict[int, float] = {}
 
 def _smartcap_env_float(name: str, default: float) -> float:
     try:
@@ -1935,27 +1935,18 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                     winrate = None
 
                 eff_cap = _calc_effective_futures_cap(balance_usdt=float(free), ui_cap_usdt=float(fut_cap), winrate=winrate)
-                # Persist effective futures cap in Postgres (survives restarts).
-                state = await db_store.update_effective_futures_cap_state(uid, float(eff_cap))
-                prev_eff = state.get("prev_cap")
-                prev_notify_at = state.get("prev_notify_at")
 
+                prev_eff = _LAST_EFFECTIVE_FUT_CAP.get(uid)
+                _LAST_EFFECTIVE_FUT_CAP[uid] = float(eff_cap)
                 if prev_eff is not None:
                     prev_eff_val = float(prev_eff)
                     if float(eff_cap) + 1e-9 < float(prev_eff):
                         dec = float(prev_eff) - float(eff_cap)
                         now_ts = time.time()
-                        try:
-                            last_ts = float(prev_notify_at.timestamp()) if prev_notify_at else 0.0
-                        except Exception:
-                            last_ts = 0.0
+                        last_ts = float(_LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT.get(uid) or 0.0)
                         if dec >= _SMARTCAP_DECREASE_MIN_USDT and (now_ts - last_ts) >= _SMARTCAP_COOLDOWN_SEC:
                             cap_decreased = True
-                            # Mark notification time for cooldown control.
-                            try:
-                                await db_store.set_effective_futures_cap_notify_now(uid)
-                            except Exception:
-                                pass
+                            _LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT[uid] = now_ts
 
                 if eff_cap > 0 and used + need_usdt > eff_cap:
                     return {
@@ -4071,6 +4062,8 @@ class Signal:
     rr: float = 0.0
     confidence: int = 0
     confirmations: str = ""
+    source_exchange: str = \"\"
+    available_exchanges: str = \"\"
     risk_note: str = ""
     ts: float = 0.0
 
@@ -7404,6 +7397,41 @@ class Backend:
                             else:
                                 risk_note = "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
 
+                        # Exchanges where the symbol exists (used for display and SPOT autotrade routing).
+                        async def _pair_exists(ex: str) -> bool:
+                            try:
+                                exu = (ex or '').upper().strip()
+                                if market == 'FUTURES':
+                                    if exu == 'BINANCE':
+                                        p = await self._fetch_rest_price('FUTURES', sym)
+                                    elif exu == 'BYBIT':
+                                        p = await self._fetch_bybit_price('FUTURES', sym)
+                                    elif exu == 'OKX':
+                                        p = await self._fetch_okx_price('FUTURES', sym)
+                                    else:
+                                        return False
+                                    return bool(p and float(p) > 0)
+                                # SPOT
+                                if exu == 'BINANCE':
+                                    p = await self._fetch_rest_price('SPOT', sym)
+                                elif exu == 'BYBIT':
+                                    p = await self._fetch_bybit_price('SPOT', sym)
+                                elif exu == 'OKX':
+                                    p = await self._fetch_okx_price('SPOT', sym)
+                                elif exu == 'MEXC':
+                                    p = await _mexc_public_price(sym)
+                                else:  # GATEIO
+                                    p = await _gateio_public_price(sym)
+                                return bool(p and float(p) > 0)
+                            except Exception:
+                                return False
+
+                        _ex_order = ['BINANCE', 'OKX', 'BYBIT'] if market == 'FUTURES' else ['GATEIO', 'BINANCE', 'OKX', 'BYBIT', 'MEXC']
+                        _oks = await asyncio.gather(*[_pair_exists(x) for x in _ex_order])
+                        _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
+                        if not _pair_exchanges:
+                            _pair_exchanges = [best_name]
+                        conf_names = '+'.join(_pair_exchanges)
                         sig = Signal(
                         signal_id=self.next_signal_id(),
                         market=market,
@@ -7413,7 +7441,9 @@ class Backend:
                         entry=entry, sl=sl, tp1=float(tp1), tp2=float(tp2),
                         rr=float(tp2_r if tp_policy=="R" else rr),
                         confidence=int(round(conf)),
-                        confirmations=best_name,
+                        confirmations=conf_names,
+                        source_exchange=best_name,
+                        available_exchanges=conf_names,
                         risk_note=risk_note,
                         ts=time.time(),
                         )
