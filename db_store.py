@@ -586,8 +586,22 @@ async def ensure_user_signal_trial(user_id: int) -> None:
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO users (telegram_id, notify_signals, signal_enabled, signal_expires_at)
-            VALUES ($1, TRUE, TRUE, (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours')
+            INSERT INTO users (
+                telegram_id,
+                notify_signals,
+                signal_enabled,
+                signal_expires_at,
+                autotrade_enabled,
+                autotrade_expires_at
+            )
+            VALUES (
+                $1,
+                TRUE,
+                TRUE,
+                (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours',
+                TRUE,
+                (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'
+            )
             ON CONFLICT (telegram_id) DO NOTHING;
             """,
             int(user_id),
