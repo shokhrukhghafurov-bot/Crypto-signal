@@ -1246,6 +1246,7 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
                                AND closed_at IS NOT NULL
                                AND closed_at >= $2 AND closed_at < $3)::int AS trades,
               COUNT(*) FILTER (WHERE status='WIN'
+                 AND tp2 IS NOT NULL
                                AND closed_at IS NOT NULL
                                AND closed_at >= $2 AND closed_at < $3)::int AS wins,
               COUNT(*) FILTER (WHERE status='LOSS'
