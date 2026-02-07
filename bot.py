@@ -4093,9 +4093,25 @@ async def main() -> None:
                 "futures": await _mk('FUTURES'),
             }
 
+            # Closed positions totals (derived from perf buckets: trades == closed outcomes)
+            closed: dict = {}
+            try:
+                for k in ("day","week","month"):
+                    spot_closed = int(((perf.get("spot") or {}).get(k) or {}).get("trades") or 0)
+                    fut_closed = int(((perf.get("futures") or {}).get(k) or {}).get("trades") or 0)
+                    total_closed = spot_closed + fut_closed
+                    closed[k] = total_closed  # legacy
+                    closed[f"{k}_total"] = total_closed
+                    closed[f"{k}_spot"] = spot_closed
+                    closed[f"{k}_futures"] = fut_closed
+            except Exception:
+                pass
+
+
             return web.json_response({
                 "ok": True,
                 "signals": signals,
+                "closed": closed,
                 "perf": perf,
             })
 
