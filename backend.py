@@ -2736,35 +2736,71 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
         return (val / qty) if qty > 0 else 0.0
 
     def _calc_autotrade_pnl_from_orders(*, ref: dict, entry_order: dict, exit_order: dict, exchange: str, market_type: str, allocated_usdt: float) -> tuple[float | None, float | None]:
-        """Compute approximate pnl using entry/exit average fill prices.
+        """Compute net PnL using entry/exit average fills + modeled fees.
 
-        Note: This is an approximation. For partial closes, it accounts only the final closing order.
+        Improvements vs legacy:
+        - uses executed qty from the *exit* order when available
+        - subtracts modeled fees (FEE_RATE_SPOT/FEE_RATE_FUTURES) for entry+exit notionals
+        - adds any previously accumulated realized pnl from partial closes (e.g., TP1) stored in ref
+
+        Still an approximation (we do not fetch per-fill commissions/funding to keep API usage light).
         """
         try:
             side = str(ref.get("side") or "BUY").upper()
-            qty = _as_float(ref.get("qty"), 0.0)
-            if qty <= 0:
+            qty_ref = _as_float(ref.get("qty"), 0.0)
+            if qty_ref <= 0:
                 return None, None
+
+            # Extract executed qty from the exit order if possible (more accurate for partial closes)
+            def _binance_exec_qty(order: dict) -> float:
+                if not isinstance(order, dict):
+                    return 0.0
+                return _as_float(order.get("executedQty"), 0.0)
+
+            def _bybit_exec_qty(resp: dict) -> float:
+                try:
+                    lst = ((resp.get("result") or {}).get("list") or [])
+                    o = lst[0] if (lst and isinstance(lst[0], dict)) else {}
+                except Exception:
+                    o = {}
+                return _as_float(o.get("cumExecQty"), 0.0)
 
             if exchange == "binance":
                 entry_p = _binance_avg_price(entry_order)
                 exit_p = _binance_avg_price(exit_order)
+                qty_exit = _binance_exec_qty(exit_order)
             else:
                 entry_p = _bybit_avg_price(entry_order)
                 exit_p = _bybit_avg_price(exit_order)
+                qty_exit = _bybit_exec_qty(exit_order)
 
             if entry_p <= 0 or exit_p <= 0:
                 return None, None
 
+            qty_used = qty_exit if qty_exit > 0 else qty_ref
+            qty_used = max(0.0, min(float(qty_used), float(qty_ref) if qty_ref > 0 else float(qty_used)))
+            if qty_used <= 0:
+                return None, None
+
             # BUY = long, SELL = short (for futures); for spot we assume BUY then SELL
             if side == "BUY":
-                pnl = (exit_p - entry_p) * qty
+                pnl_gross = (exit_p - entry_p) * qty_used
             else:
-                pnl = (entry_p - exit_p) * qty
+                pnl_gross = (entry_p - exit_p) * qty_used
+
+            # Modeled fees (keep light: no per-fill fees API calls)
+            fr = float(FEE_RATE_SPOT if str(market_type).lower() == "spot" else FEE_RATE_FUTURES)
+            fees_est = fr * ((entry_p * qty_used) + (exit_p * qty_used))
+
+            # Add previously realized pnl/fees from earlier partial closes (e.g. TP1)
+            realized_pnl = _as_float(ref.get("realized_pnl_usdt"), 0.0)
+            realized_fee = _as_float(ref.get("realized_fee_usdt"), 0.0)
+
+            pnl_net = float(pnl_gross) - float(fees_est) + float(realized_pnl) - float(realized_fee)
 
             alloc = float(allocated_usdt or 0.0)
-            roi = (pnl / alloc * 100.0) if alloc > 0 else None
-            return float(pnl), (float(roi) if roi is not None else None)
+            roi = (pnl_net / alloc * 100.0) if alloc > 0 else None
+            return float(pnl_net), (float(roi) if roi is not None else None)
         except Exception:
             return None, None
 
@@ -3415,6 +3451,57 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                     category = str(ref.get("category") or ("spot" if mt == "spot" else "linear"))
                                     await _bybit_cancel_order(api_key=api_key, api_secret=api_secret, category=category, symbol=symbol, order_id=str(sl_id))
                         except Exception:
+                            pass
+
+                        # Accumulate realized PnL on partial close (TP1) to improve final PnL accuracy.
+                        # Keep this light: reuse TP1 status response ("o") and optionally fetch entry order once.
+                        try:
+                            if not bool(ref.get("tp1_realized_done")):
+                                # Determine executed qty and avg price for TP1
+                                if ex == "binance":
+                                    tp1_qty_exec = _as_float(o.get("executedQty"), 0.0)
+                                    tp1_avg = _binance_avg_price(o)
+                                else:
+                                    try:
+                                        lst0 = ((o.get("result") or {}).get("list") or [])
+                                        od0 = lst0[0] if (lst0 and isinstance(lst0[0], dict)) else {}
+                                    except Exception:
+                                        od0 = {}
+                                    tp1_qty_exec = _as_float(od0.get("cumExecQty"), 0.0)
+                                    tp1_avg = _bybit_avg_price(o)
+
+                                # Get entry avg price (best-effort)
+                                entry_avg = _as_float(ref.get("entry_avg_price"), 0.0)
+                                if entry_avg <= 0:
+                                    entry_id = ref.get("entry_order_id")
+                                    if entry_id:
+                                        if ex == "binance":
+                                            eo = await _binance_order_status(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(entry_id), futures=futures)
+                                            entry_avg = _binance_avg_price(eo)
+                                        else:
+                                            category = str(ref.get("category") or ("spot" if mt == "spot" else "linear"))
+                                            eo = await _bybit_order_status(api_key=api_key, api_secret=api_secret, category=category, symbol=symbol, order_id=str(entry_id))
+                                            entry_avg = _bybit_avg_price(eo)
+                                if entry_avg <= 0:
+                                    entry_avg = _as_float(ref.get("entry_price"), 0.0)
+
+                                if tp1_qty_exec > 0 and tp1_avg > 0 and entry_avg > 0:
+                                    side_local = str(ref.get("side") or "BUY").upper()
+                                    if side_local == "BUY":
+                                        pnl_gross = (tp1_avg - entry_avg) * tp1_qty_exec
+                                    else:
+                                        pnl_gross = (entry_avg - tp1_avg) * tp1_qty_exec
+
+                                    fr_local = float(FEE_RATE_SPOT if str(mt).lower() == "spot" else FEE_RATE_FUTURES)
+                                    fees_est = fr_local * ((entry_avg * tp1_qty_exec) + (tp1_avg * tp1_qty_exec))
+
+                                    ref["realized_pnl_usdt"] = float(_as_float(ref.get("realized_pnl_usdt"), 0.0) + pnl_gross)
+                                    ref["realized_fee_usdt"] = float(_as_float(ref.get("realized_fee_usdt"), 0.0) + fees_est)
+                                    ref["realized_qty"] = float(_as_float(ref.get("realized_qty"), 0.0) + tp1_qty_exec)
+                                    ref["entry_avg_price"] = float(entry_avg)
+                                    ref["tp1_realized_done"] = True
+                        except Exception:
+                            # Best-effort only; do not block management.
                             pass
 
                         # Place new SL at BE
