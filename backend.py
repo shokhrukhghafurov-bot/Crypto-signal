@@ -315,8 +315,8 @@ def _should_deactivate_key(err_text: str) -> bool:
 
 # ------------------ Smart FUTURES Cap (effective cap) ------------------
 # In-memory cache: last effective cap per user (resets on restart).
-_LAST_EFFECTIVE_FUT_CAP: dict[int, float] = {}
-_LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT: dict[int, float] = {}
+_LAST_EFFECTIVE_FUT_CAP: dict[int, float] = {}  # legacy (DB is used now)
+_LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT: dict[int, float] = {}  # legacy
 
 def _smartcap_env_float(name: str, default: float) -> float:
     try:
@@ -1935,18 +1935,27 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                     winrate = None
 
                 eff_cap = _calc_effective_futures_cap(balance_usdt=float(free), ui_cap_usdt=float(fut_cap), winrate=winrate)
+                # Persist effective futures cap in Postgres (survives restarts).
+                state = await db_store.update_effective_futures_cap_state(uid, float(eff_cap))
+                prev_eff = state.get("prev_cap")
+                prev_notify_at = state.get("prev_notify_at")
 
-                prev_eff = _LAST_EFFECTIVE_FUT_CAP.get(uid)
-                _LAST_EFFECTIVE_FUT_CAP[uid] = float(eff_cap)
                 if prev_eff is not None:
                     prev_eff_val = float(prev_eff)
                     if float(eff_cap) + 1e-9 < float(prev_eff):
                         dec = float(prev_eff) - float(eff_cap)
                         now_ts = time.time()
-                        last_ts = float(_LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT.get(uid) or 0.0)
+                        try:
+                            last_ts = float(prev_notify_at.timestamp()) if prev_notify_at else 0.0
+                        except Exception:
+                            last_ts = 0.0
                         if dec >= _SMARTCAP_DECREASE_MIN_USDT and (now_ts - last_ts) >= _SMARTCAP_COOLDOWN_SEC:
                             cap_decreased = True
-                            _LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT[uid] = now_ts
+                            # Mark notification time for cooldown control.
+                            try:
+                                await db_store.set_effective_futures_cap_notify_now(uid)
+                            except Exception:
+                                pass
 
                 if eff_cap > 0 and used + need_usdt > eff_cap:
                     return {
