@@ -235,6 +235,18 @@ ON CONFLICT (id) DO NOTHING;
         except Exception:
             pass
 
+        # Persisted Smart Risk Manager state (effective futures cap) — survives restarts.
+        # These columns are optional and added for existing installations.
+        try:
+            await conn.execute("""
+            ALTER TABLE autotrade_settings
+              ADD COLUMN IF NOT EXISTS effective_futures_cap NUMERIC(18,8),
+              ADD COLUMN IF NOT EXISTS effective_futures_cap_updated_at TIMESTAMPTZ,
+              ADD COLUMN IF NOT EXISTS effective_futures_cap_notify_at TIMESTAMPTZ;
+            """)
+        except Exception:
+            pass
+
         # Add constraints for existing installations (CREATE TABLE IF NOT EXISTS won't update old schema).
         await conn.execute("""DO $$
         BEGIN
@@ -1370,7 +1382,8 @@ async def get_autotrade_settings(user_id: int) -> Dict[str, Any]:
                    spot_exchange_priority,
                    spot_exchange, futures_exchange,
                    spot_amount_per_trade, futures_margin_per_trade,
-                   futures_leverage, futures_cap
+                   futures_leverage, futures_cap,
+                   effective_futures_cap, effective_futures_cap_notify_at
             FROM autotrade_settings
             WHERE user_id=$1
             """,
@@ -1396,6 +1409,8 @@ async def get_autotrade_settings(user_id: int) -> Dict[str, Any]:
                 "futures_margin_per_trade": 0.0,
                 "futures_leverage": 1,
                 "futures_cap": 0.0,
+                "effective_futures_cap": None,
+                "effective_futures_cap_notify_at": None,
             }
         return {
             "user_id": uid,
@@ -1408,8 +1423,80 @@ async def get_autotrade_settings(user_id: int) -> Dict[str, Any]:
             "futures_margin_per_trade": float(row.get("futures_margin_per_trade") or 0.0),
             "futures_leverage": int(row.get("futures_leverage") or 1),
             "futures_cap": float(row.get("futures_cap") or 0.0),
+            "effective_futures_cap": (float(row.get("effective_futures_cap")) if row.get("effective_futures_cap") is not None else None),
+            "effective_futures_cap_notify_at": row.get("effective_futures_cap_notify_at"),
         }
 
+
+
+async def update_effective_futures_cap_state(user_id: int, new_effective_cap: float) -> Dict[str, Any]:
+    """Persist Smart Risk Manager effective futures cap and return previous state.
+
+    Returns:
+      { "prev_cap": float|None, "prev_notify_at": datetime|None }
+    """
+    pool = get_pool()
+    uid = int(user_id)
+    cap = float(new_effective_cap or 0.0)
+    async with pool.acquire() as conn:
+        # Ensure the row exists
+        await conn.execute(
+            """
+            INSERT INTO autotrade_settings(user_id) VALUES ($1)
+            ON CONFLICT (user_id) DO NOTHING;
+            """,
+            uid,
+        )
+        row = await conn.fetchrow(
+            """
+            WITH prev AS (
+              SELECT effective_futures_cap, effective_futures_cap_notify_at
+              FROM autotrade_settings
+              WHERE user_id=$1
+            ),
+            upd AS (
+              UPDATE autotrade_settings
+              SET effective_futures_cap=$2,
+                  effective_futures_cap_updated_at=NOW(),
+                  updated_at=NOW()
+              WHERE user_id=$1
+              RETURNING 1
+            )
+            SELECT prev.effective_futures_cap AS prev_cap,
+                   prev.effective_futures_cap_notify_at AS prev_notify_at
+            FROM prev;
+            """,
+            uid,
+            cap,
+        )
+        return {
+            "prev_cap": (float(row.get("prev_cap")) if row and row.get("prev_cap") is not None else None),
+            "prev_notify_at": (row.get("prev_notify_at") if row else None),
+        }
+
+
+async def set_effective_futures_cap_notify_now(user_id: int) -> None:
+    """Mark that we have notified the user about effective cap decrease (cooldown marker)."""
+    pool = get_pool()
+    uid = int(user_id)
+    async with pool.acquire() as conn:
+        # Ensure the row exists
+        await conn.execute(
+            """
+            INSERT INTO autotrade_settings(user_id) VALUES ($1)
+            ON CONFLICT (user_id) DO NOTHING;
+            """,
+            uid,
+        )
+        await conn.execute(
+            """
+            UPDATE autotrade_settings
+            SET effective_futures_cap_notify_at=NOW(),
+                updated_at=NOW()
+            WHERE user_id=$1;
+            """,
+            uid,
+        )
 
 async def set_autotrade_toggle(user_id: int, market_type: str, enabled: bool) -> None:
     pool = get_pool()
