@@ -1205,7 +1205,7 @@ def autotrade_keys_kb(uid: int) -> types.InlineKeyboardMarkup:
 
 
 
-def _signal_text(uid: int, s: Signal) -> str:
+def _signal_text(uid: int, s: Signal, *, autotrade_hint: str = "") -> str:
     header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
     market_banner = tr(uid, 'sig_spot_new') if s.market == 'SPOT' else tr(uid, 'sig_fut_new')
     # ⚡ MID tag (only for MID timeframe; does not affect old signals)
@@ -1279,7 +1279,9 @@ def _signal_text(uid: int, s: Signal) -> str:
             logger.exception("Failed to send message to uid=%s", uid)
         return lines
 
-    ex_line_raw = _fmt_exchanges(getattr(s, 'confirmations', '') or '')
+    # Exchanges line: where the pair exists for the given market (executable venues).
+    raw_avail = (getattr(s, 'available_exchanges', '') or '').strip() or (getattr(s, 'confirmations', '') or '')
+    ex_line_raw = _fmt_exchanges(raw_avail)
     exchanges_line = f"{tr(uid, 'sig_exchanges')}: {ex_line_raw}\n" if ex_line_raw else ""
     # Keep TF on its own line; timeframe string already like 15m/1h/4h
     tf_line = f"{tr(uid, 'sig_tf')}: {s.timeframe}"
@@ -1288,7 +1290,11 @@ def _signal_text(uid: int, s: Signal) -> str:
 
     rr_line = f"{tr(uid, 'sig_rr')}: 1:{s.rr:.2f}"
     conf_line = f"{tr(uid, 'sig_confidence')}: {s.confidence}/100"
-    confirm_line = f"{tr(uid, 'sig_confirm')}: {s.confirmations}"
+    # Confirm line: primary venue that produced the signal.
+    src_ex = (getattr(s, 'source_exchange', '') or '').strip() or (getattr(s, 'confirmations', '') or '').strip()
+    confirm_line = f"{tr(uid, 'sig_confirm')}: {src_ex}"
+
+    autotrade_line = f"{tr(uid, 'sig_autotrade')}: {autotrade_hint}\n" if autotrade_hint else ""
 
     risk_note = (s.risk_note or '').strip()
     risk_block = f"\n\n{risk_note}" if risk_note else ""
@@ -1308,6 +1314,7 @@ def _signal_text(uid: int, s: Signal) -> str:
         rr_line=rr_line,
         conf_line=conf_line,
         confirm_line=confirm_line,
+        autotrade_line=autotrade_line,
         risk_block=risk_block,
         open_prompt=tr(uid, 'sig_open_prompt')
     )
@@ -1372,7 +1379,8 @@ def _calc_profit_pct(sig: Signal) -> float:
 def _open_card_text(uid: int, sig: Signal) -> str:
     sym_disp = _fmt_symbol(sig.symbol)
     base = sym_disp.split("/")[0].strip().replace(" ", "") if sym_disp else "SYMBOL"
-    exchanges = (getattr(sig, "confirmations", "") or "").replace("+", " • ")
+    raw_avail = (getattr(sig, "available_exchanges", "") or "").strip() or (getattr(sig, "confirmations", "") or "")
+    exchanges = str(raw_avail).replace("+", " • ")
     if not exchanges:
         exchanges = tr(uid, "status_next_macro_none")
 
@@ -1568,10 +1576,25 @@ async def broadcast_signal(sig: Signal) -> None:
     uids = await get_broadcast_user_ids()
     for uid in uids:
         try:
-            ORIGINAL_SIGNAL_TEXT[(uid, sig.signal_id)] = _signal_text(uid, sig)
+            # Per-user Auto-trade hint: show whether Auto-trade is enabled and which exchange is selected.
+            at_hint = ""
+            try:
+                st = await db_store.get_autotrade_settings(uid)
+                mkt = str(sig.market or "FUTURES").upper().strip()
+                if mkt == "SPOT":
+                    en = bool(st.get("spot_enabled"))
+                    ex = str(st.get("spot_exchange") or "").upper().strip()
+                else:
+                    en = bool(st.get("futures_enabled"))
+                    ex = str(st.get("futures_exchange") or "").upper().strip()
+                at_hint = ("🟢 " + ex) if (en and ex) else "🔴 OFF"
+            except Exception:
+                at_hint = ""
+
+            ORIGINAL_SIGNAL_TEXT[(uid, sig.signal_id)] = _signal_text(uid, sig, autotrade_hint=at_hint)
             kb_u = InlineKeyboardBuilder()
             kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
-            await safe_send(uid, _signal_text(uid, sig), reply_markup=kb_u.as_markup())
+            await safe_send(uid, _signal_text(uid, sig, autotrade_hint=at_hint), reply_markup=kb_u.as_markup())
 
             # Auto-trade: execute real orders asynchronously, without affecting broadcast.
             async def _run_autotrade(_uid: int, _sig: Signal):
@@ -2326,7 +2349,7 @@ async def notify_handler(call: types.CallbackQuery) -> None:
             return
         kb = InlineKeyboardBuilder()
         kb.button(text=tr(0, "btn_opened"), callback_data=f"open:{sig.signal_id}")
-        await safe_send(call.from_user.id, _signal_text(sig), reply_markup=kb.as_markup())
+        await safe_send(call.from_user.id, _signal_text(uid, sig), reply_markup=kb.as_markup())
         return
 
 
