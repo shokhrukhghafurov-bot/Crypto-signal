@@ -454,6 +454,10 @@ SMART_REVERSAL_EXIT_PCT = _smartpro_env_float("SMART_REVERSAL_EXIT_PCT", 0.32)
 SMART_ARM_SL_AFTER_PCT = _smartpro_env_float("SMART_ARM_SL_AFTER_PCT", 0.22)
 SMART_HARD_SL_PCT = _smartpro_env_float("SMART_HARD_SL_PCT", 2.80)
 
+# --- SL candle confirmation (anti-spike) ---
+SMART_SL_CONFIRM_CANDLE = _smartpro_env_bool("SMART_SL_CONFIRM_CANDLE", True)
+SMART_SL_DEEP_BREAK_PCT = _smartpro_env_float("SMART_SL_DEEP_BREAK_PCT", 0.35)
+
 # --- Generic loop tick / debounce (if referenced) ---
 SMART_TICK = _smartpro_env_float("SMART_TICK", 1.0)
 
@@ -464,6 +468,78 @@ if SMART_TP1_PARTIAL_PCT > 1.0:
     SMART_TP1_PARTIAL_PCT = 1.0
 if SMART_BE_MAX_PCT < SMART_BE_MIN_PCT:
     SMART_BE_MAX_PCT = SMART_BE_MIN_PCT
+
+def _sl_tf_to_binance_interval(tf: str) -> str:
+    """Map signal timeframe to Binance interval string. Falls back to 1m."""
+    t = (tf or "").strip().lower().replace(" ", "")
+    if not t:
+        return "1m"
+    t = t.replace("min", "m").replace("minutes", "m").replace("minute", "m")
+    t = t.replace("hour", "h").replace("hours", "h")
+    t = t.replace("day", "d").replace("days", "d")
+
+    m = re.match(r"^(\d+)([mhdw])$", t)
+    if m:
+        n = int(m.group(1))
+        u = m.group(2)
+        if u == "m" and n in (1, 3, 5, 15, 30):
+            return f"{n}m"
+        if u == "h" and n in (1, 2, 4, 6, 8, 12):
+            return f"{n}h"
+        if u == "d" and n in (1, 3):
+            return f"{n}d"
+        if u == "w" and n == 1:
+            return "1w"
+
+    m = re.match(r"^([mhdw])(\d+)$", t)
+    if m:
+        u = m.group(1)
+        n = int(m.group(2))
+        return _sl_tf_to_binance_interval(f"{n}{u}")
+
+    if t in ("1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d","3d","1w"):
+        return t
+
+    return "1m"
+
+
+async def _sl_last_closed_candle_binance(*, market: str, symbol: str, interval: str) -> dict | None:
+    """Fetch last *closed* candle close price from Binance (spot/futures).
+
+    Returns {"close": float, "open_time": int_ms, "interval": str} or None.
+    Uses limit=2 and returns the second last candle to ensure it's closed.
+    Called only on SL-touch, so overhead is minimal.
+    """
+    mkt = (market or "FUTURES").upper().strip()
+    sym = (symbol or "").upper().replace("/", "")
+    if not sym:
+        return None
+
+    itv = _sl_tf_to_binance_interval(interval)
+
+    base = "https://api.binance.com" if mkt == "SPOT" else "https://fapi.binance.com"
+    path = "/api/v3/klines" if mkt == "SPOT" else "/fapi/v1/klines"
+    url = base + path
+    params = {"symbol": sym, "interval": itv, "limit": "2"}
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as ses:
+            async with ses.get(url, params=params) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json(content_type=None)
+
+        if not isinstance(data, list) or not data:
+            return None
+
+        row = data[-2] if len(data) >= 2 else data[-1]
+        close = float(row[4])
+        ot = int(row[0])
+        return {"close": close, "open_time": ot, "interval": itv}
+    except Exception:
+        return None
+
 
 def _be_with_fee_buffer(entry_price: float, *, direction: str) -> float:
     """Return BE price adjusted by fee buffer."""
@@ -2735,42 +2811,6 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
         val = _as_float(o.get("cumExecValue"), 0.0)
         return (val / qty) if qty > 0 else 0.0
 
-
-    def _tf_to_sec(tf: str | None) -> int:
-        """Best-effort timeframe to seconds. Supports '1m','5m','15m','1h','4h','1d' and combos like '15m/4h'."""
-        try:
-            s = (tf or "").strip()
-            if not s:
-                return 900  # default 15m
-            # take first leg if combined
-            if "/" in s:
-                s = s.split("/", 1)[0].strip()
-            s = s.lower().replace(" ", "")
-            m = re.match(r"^(\d+)([mhd])$", s)
-            if not m:
-                # sometimes timeframe comes like '15' meaning minutes
-                if re.match(r"^\d+$", s):
-                    return int(s) * 60
-                return 900
-            n = int(m.group(1))
-            unit = m.group(2)
-            if unit == "m":
-                return max(60, n * 60)
-            if unit == "h":
-                return max(60, n * 3600)
-            if unit == "d":
-                return max(60, n * 86400)
-            return 900
-        except Exception:
-            return 900
-
-    def _next_candle_close_ts(now_ts: float, tf_sec: int) -> float:
-        try:
-            p = max(60, int(tf_sec or 900))
-            return (math.floor(float(now_ts) / p) + 1) * p
-        except Exception:
-            return float(now_ts) + 900.0
-
     def _calc_autotrade_pnl_from_orders(*, ref: dict, entry_order: dict, exit_order: dict, exchange: str, market_type: str, allocated_usdt: float) -> tuple[float | None, float | None]:
         """Compute net PnL using entry/exit average fills + modeled fees.
 
@@ -3299,101 +3339,16 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             return False
                         return (px <= sl_eff) if direction == "LONG" else (px >= sl_eff)
 
-# --- SL (emergency or armed) ---
-# New: optional candle-close confirmation to avoid wick/stop-hunt closes.
-# Default ON. Existing logic remains for deep breaks.
-SL_CONFIRM_ON = (os.getenv("SMART_SL_CONFIRM_CANDLE", "1").strip().lower() not in ("0","false","no","off"))
-SL_CONFIRM_DEEP_PCT = float(os.getenv("SMART_SL_CONFIRM_DEEP_PCT", "0.35") or 0.35)  # close immediately if break >= this %
-sl_pending = bool(ref.get("sl_confirm_pending"))
-sl_until = float(ref.get("sl_confirm_until") or 0.0)
-
-def _sl_break_pct() -> float:
-    try:
-        if sl_eff <= 0:
-            return 0.0
-        if direction == "LONG":
-            return max(0.0, (sl_eff - px) / sl_eff * 100.0)
-        else:
-            return max(0.0, (px - sl_eff) / sl_eff * 100.0)
-    except Exception:
-        return 0.0
-
-if SL_CONFIRM_ON:
-    # If pending but price recovered before candle close -> cancel pending.
-    if sl_pending and (sl_until > 0) and (now_ts < sl_until) and (not _hit_sl_eff()):
-        ref.pop("sl_confirm_pending", None)
-        ref.pop("sl_confirm_until", None)
-        ref.pop("sl_confirm_since", None)
-        dirty = True
-        sl_pending = False
-        sl_until = 0.0
-
-    # If SL is hit now:
-    if _hit_sl_eff():
-        deep = _sl_break_pct()
-        # Deep break -> immediate close (keeps emergency behavior).
-        if deep >= max(0.0, SL_CONFIRM_DEEP_PCT):
-            try:
-                await _close_market(qty)
-            except Exception as e:
-                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-            await db_store.close_autotrade_position(
-                user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
-            )
-            continue
-
-        # Not deep -> start / continue waiting until candle close.
-        if (not sl_pending) or (sl_until <= 0):
-            tf_sec = _tf_to_sec(str(ref.get("signal_timeframe") or ref.get("timeframe") or "15m"))
-            sl_until = float(_next_candle_close_ts(now_ts, tf_sec))
-            ref["sl_confirm_pending"] = True
-            ref["sl_confirm_until"] = float(sl_until)
-            ref["sl_confirm_since"] = float(now_ts)
-            dirty = True
-        else:
-            # If candle is already closed (time passed) -> decide now.
-            if now_ts >= sl_until:
-                if _hit_sl_eff():
-                    try:
-                        await _close_market(qty)
-                    except Exception as e:
-                        _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                    await db_store.close_autotrade_position(
-                        user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
-                    )
-                    continue
-                # recovered at close -> cancel pending
-                ref.pop("sl_confirm_pending", None)
-                ref.pop("sl_confirm_until", None)
-                ref.pop("sl_confirm_since", None)
-                dirty = True
-    else:
-        # If candle-close time passed and we are pending, resolve using current price.
-        if sl_pending and (sl_until > 0) and (now_ts >= sl_until):
-            if _hit_sl_eff():
-                try:
-                    await _close_market(qty)
-                except Exception as e:
-                    _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                await db_store.close_autotrade_position(
-                    user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
-                )
-                continue
-            ref.pop("sl_confirm_pending", None)
-            ref.pop("sl_confirm_until", None)
-            ref.pop("sl_confirm_since", None)
-            dirty = True
-else:
-    # Legacy immediate SL behavior
-    if _hit_sl_eff():
-        try:
-            await _close_market(qty)
-        except Exception as e:
-            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-        await db_store.close_autotrade_position(
-            user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
-        )
-        continue
+                    # --- SL (emergency or armed) ---
+                    if _hit_sl_eff():
+                        try:
+                            await _close_market(qty)
+                        except Exception as e:
+                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                        await db_store.close_autotrade_position(
+                            user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                        )
+                        continue
 
                     # --- TP2: if reached, close 100% ---
                     if tp2 > 0 and _hit_tp(tp2):
@@ -4183,8 +4138,8 @@ class Signal:
     rr: float = 0.0
     confidence: int = 0
     confirmations: str = ""
-    source_exchange: str = \"\"
-    available_exchanges: str = \"\"
+    source_exchange: str = ""
+    available_exchanges: str = ""
     risk_note: str = ""
     ts: float = 0.0
 
@@ -6949,6 +6904,26 @@ class Backend:
 
                     # 2) Before TP1: SL -> LOSS
                     if not tp1_hit and s.sl and hit_sl(float(s.sl)):
+                        # Optional: confirm SL on candle close to ignore wick spikes (anti-stop-hunt)
+                        try:
+                            if SMART_SL_CONFIRM_CANDLE:
+                                sl_val = float(s.sl)
+                                deep = abs((sl_val - price_f) / sl_val) * 100.0 if sl_val else 999.0
+                                if deep < float(SMART_SL_DEEP_BREAK_PCT or 0.0):
+                                    tf = str(getattr(s, 'timeframe', '') or '')
+                                    c = await _sl_last_closed_candle_binance(market=market, symbol=s.symbol, interval=tf)
+                                    if not c:
+                                        continue
+                                    close_px = float(c.get('close') or 0.0)
+                                    # For LONG: require candle close <= SL to confirm breakdown.
+                                    if side == 'LONG' and close_px > sl_val:
+                                        continue
+                                    # For SHORT: require candle close >= SL to confirm breakdown.
+                                    if side != 'LONG' and close_px < sl_val:
+                                        continue
+                        except Exception:
+                            # fail-safe: keep legacy behavior on unexpected errors
+                            pass
                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
                         pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.sl), close_reason="LOSS")
                         import datetime as _dt
