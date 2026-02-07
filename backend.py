@@ -7304,18 +7304,18 @@ class Backend:
                             else:
                                 risk_note = "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
 
-                            sig = Signal(
-                            signal_id=self.next_signal_id(),
-                            market=market,
-                            symbol=sym,
-                            direction=direction,
-                            timeframe=f"{tf_trigger}/{tf_mid}/{tf_trend}",
-                            entry=entry, sl=sl, tp1=float(tp1), tp2=float(tp2),
-                            rr=float(tp2_r if tp_policy=="R" else rr),
-                            confidence=int(round(conf)),
-                            confirmations=best_name,
-                            risk_note=risk_note,
-                            ts=time.time(),
+                        sig = Signal(
+                        signal_id=self.next_signal_id(),
+                        market=market,
+                        symbol=sym,
+                        direction=direction,
+                        timeframe=f"{tf_trigger}/{tf_mid}/{tf_trend}",
+                        entry=entry, sl=sl, tp1=float(tp1), tp2=float(tp2),
+                        rr=float(tp2_r if tp_policy=="R" else rr),
+                        confidence=int(round(conf)),
+                        confirmations=best_name,
+                        risk_note=risk_note,
+                        ts=time.time(),
                         )
                         self.mark_emitted_mid(sym)
                         self.last_signal = sig
