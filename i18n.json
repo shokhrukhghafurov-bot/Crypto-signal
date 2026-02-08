@@ -257,7 +257,8 @@
     "weekly_title": "🗓️ Weekly (last 4w)",
     "welcome": "🤖 CryptoAuto-Scanner Bot\n\n✅ You are subscribed to signals.\nUse the buttons below:",
     "welcome_hint": "Use the buttons below:",
-    "welcome_subscribed": "✅ You are subscribed to signals."
+    "welcome_subscribed": "✅ You are subscribed to signals.",
+    "sig_main_trend_tag": "🔥 MAIN TREND"
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -517,10 +518,7 @@
     "weekly_title": "🗓️ По неделям (4н)",
     "welcome": "🤖 CryptoAuto-Scanner Bot\n\n✅ Ты подписан на сигналы.\nНажимай кнопки ниже:",
     "welcome_hint": "Нажимай кнопки ниже:",
-    "welcome_subscribed": "✅ Ты подписан на сигналы."
+    "welcome_subscribed": "✅ Ты подписан на сигналы.",
+    "sig_main_trend_tag": "🔥 MAIN TREND"
   }
 }
-
-
-
-
