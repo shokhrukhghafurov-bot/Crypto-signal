@@ -5131,6 +5131,37 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
     support, resistance = _nearest_levels(df1hi)
 
+    # Range position filter (only when market structure is RANGE)
+    range_pos = None
+    range_pos_txt = "—"
+    try:
+        sup = float(support) if support is not None else float("nan")
+        res = float(resistance) if resistance is not None else float("nan")
+        if (not np.isnan(sup)) and (not np.isnan(res)) and res > sup:
+            range_pos = (float(entry) - sup) / (res - sup)
+            # keep in [0..1] for safety
+            if range_pos < 0:
+                range_pos = 0.0
+            if range_pos > 1:
+                range_pos = 1.0
+            range_pos_txt = f"{range_pos:.2f}"
+    except Exception:
+        range_pos = None
+        range_pos_txt = "—"
+
+    try:
+        range_pos_filter = os.getenv("MID_RANGE_POS_FILTER", "0").strip().lower() not in ("0","false","no","off")
+        long_max = float(os.getenv("MID_RANGE_POS_LONG_MAX", "0.75") or 0.75)
+        short_min = float(os.getenv("MID_RANGE_POS_SHORT_MIN", "0.25") or 0.25)
+        if range_pos_filter and (mstruct == "RANGE") and (range_pos is not None):
+            if (dir_trend == "LONG") and (range_pos > long_max):
+                return None
+            if (dir_trend == "SHORT") and (range_pos < short_min):
+                return None
+    except Exception:
+        pass
+
+
     # Score / confidence: use unified TA score to avoid constant 100s
     ta_score = _ta_score(
         direction=dir_trend,
@@ -5176,6 +5207,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "resistance": resistance,
         "channel": channel,
         "mstruct": mstruct,
+        "range_pos": range_pos_txt,
+        "range_pos_val": (range_pos if range_pos is not None else 0.0),
         "rsi_div": rsi_div,
         "ta_score": ta_score,
     }
