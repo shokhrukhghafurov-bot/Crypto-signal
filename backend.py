@@ -4979,220 +4979,6 @@ def _trigger_15m(direction: str, df15i: pd.DataFrame) -> bool:
     return True
 
 
-
-# ------------------ MID anti top/bottom-trap filters (1H structure) ------------------
-# Goal: reduce SL frequency by blocking MID entries that occur too close to local extremes
-# or right after liquidity sweeps / exhaustion impulses.
-#
-# Applies to BOTH LONG and SHORT, and to BOTH FUTURES and SPOT MID signals.
-#
-# Env toggles (all optional):
-#   MID_TRAP_FILTERS=1            enable/disable all filters
-#   MID_TRAP_ATR_MULT=1.2         distance-to-extreme threshold in ATR(1h)
-#   MID_TRAP_LOOKBACK=48          candles for local high/low on 1h
-#   MID_TRAP_WICK_RATIO=0.60      wick/body ratio threshold
-#   MID_TRAP_WICK_LAST=3          how many last 1h candles to inspect
-#   MID_TRAP_WICK_HITS=2          require >= hits among last candles
-#   MID_TRAP_IMPULSE_N=6          consecutive candles threshold
-#   MID_TRAP_WEAK_LAST=3          last candles to detect "pierce & fail"
-#   MID_TRAP_WEAK_BASE=24         base window for previous extreme (excluding last candles)
-#   MID_TRAP_PIERCE_PCT=0.0       minimal pierce percent (0.1 = 0.1%)
-def _mid_trap_env_bool(name: str, default: bool) -> bool:
-    try:
-        v = (os.getenv(name) or "").strip().lower()
-        if not v:
-            return bool(default)
-        return v not in ("0","false","no","off")
-    except Exception:
-        return bool(default)
-
-def _mid_trap_env_int(name: str, default: int) -> int:
-    try:
-        v = (os.getenv(name) or "").strip()
-        return int(float(v)) if v else int(default)
-    except Exception:
-        return int(default)
-
-def _mid_trap_env_float(name: str, default: float) -> float:
-    try:
-        v = (os.getenv(name) or "").strip()
-        return float(v) if v else float(default)
-    except Exception:
-        return float(default)
-
-def _mid_atr_1h(df1hi: pd.DataFrame) -> float:
-    try:
-        last1h = df1hi.iloc[-1]
-        atr = float(last1h.get("atr", np.nan))
-        if not np.isnan(atr) and atr > 0:
-            return float(atr)
-    except Exception:
-        pass
-    # Fallback compute ATR-ish from true range
-    try:
-        hi = df1hi["high"].astype(float)
-        lo = df1hi["low"].astype(float)
-        cl = df1hi["close"].astype(float)
-        prev = cl.shift(1)
-        tr = np.maximum(hi - lo, np.maximum((hi - prev).abs(), (lo - prev).abs()))
-        atr = float(tr.rolling(14, min_periods=8).mean().iloc[-1])
-        if not np.isnan(atr) and atr > 0:
-            return float(atr)
-    except Exception:
-        pass
-    return 0.0
-
-def _mid_wick_ratio(candle: pd.Series, *, direction: str) -> float:
-    try:
-        o = float(candle.get("open", np.nan))
-        c = float(candle.get("close", np.nan))
-        h = float(candle.get("high", np.nan))
-        l = float(candle.get("low", np.nan))
-        if any(np.isnan(x) for x in (o,c,h,l)):
-            return 0.0
-        body = abs(c - o)
-        eps = max(1e-12, body)
-        d = (direction or "").upper().strip()
-        if d == "SHORT":
-            wick = min(o, c) - l  # lower wick
-        else:
-            wick = h - max(o, c)  # upper wick
-        if wick <= 0:
-            return 0.0
-        return float(wick / eps)
-    except Exception:
-        return 0.0
-
-def _mid_consecutive_candles(df1hi: pd.DataFrame, *, direction: str, n: int) -> bool:
-    try:
-        if n <= 1:
-            return False
-        tail = df1hi.tail(n)
-        if len(tail) < n:
-            return False
-        d = (direction or "").upper().strip()
-        if d == "SHORT":
-            return bool((tail["close"].astype(float) < tail["open"].astype(float)).all())
-        return bool((tail["close"].astype(float) > tail["open"].astype(float)).all())
-    except Exception:
-        return False
-
-def _mid_weak_extreme(df1hi: pd.DataFrame, *, direction: str, last_n: int, base_n: int, pierce_pct: float) -> bool:
-    """Weak High/Low: price pierces previous extreme but fails to hold on closes."""
-    try:
-        if df1hi is None or df1hi.empty:
-            return False
-        last_n = max(1, int(last_n))
-        base_n = max(last_n + 3, int(base_n))
-        if len(df1hi) < (base_n + last_n):
-            # best-effort: use what we have, but keep meaning
-            base = df1hi.iloc[:-last_n] if len(df1hi) > last_n else df1hi
-            tail = df1hi.tail(last_n)
-        else:
-            base = df1hi.iloc[-(base_n + last_n):-last_n]
-            tail = df1hi.tail(last_n)
-        d = (direction or "").upper().strip()
-        pp = max(0.0, float(pierce_pct)) / 100.0
-        if d == "SHORT":
-            prev_low = float(base["low"].astype(float).min())
-            if np.isnan(prev_low) or prev_low <= 0:
-                return False
-            # pierce below prev_low but close back above
-            for _, r in tail.iterrows():
-                lo = float(r.get("low", np.nan))
-                cl = float(r.get("close", np.nan))
-                if np.isnan(lo) or np.isnan(cl):
-                    continue
-                if lo < prev_low * (1.0 - pp) and cl > prev_low:
-                    return True
-            return False
-        else:
-            prev_high = float(base["high"].astype(float).max())
-            if np.isnan(prev_high) or prev_high <= 0:
-                return False
-            for _, r in tail.iterrows():
-                hi = float(r.get("high", np.nan))
-                cl = float(r.get("close", np.nan))
-                if np.isnan(hi) or np.isnan(cl):
-                    continue
-                if hi > prev_high * (1.0 + pp) and cl < prev_high:
-                    return True
-            return False
-    except Exception:
-        return False
-
-def _mid_structure_trap_ok(*, direction: str, entry: float, df1hi: pd.DataFrame) -> tuple[bool, str]:
-    enabled = _mid_trap_env_bool("MID_TRAP_FILTERS", True)
-    if not enabled:
-        return (True, "")
-
-    d = (direction or "").upper().strip()
-    if d not in ("LONG","SHORT"):
-        return (True, "")
-
-    atr_mult = max(0.1, _mid_trap_env_float("MID_TRAP_ATR_MULT", 1.2))
-    lookback = max(12, _mid_trap_env_int("MID_TRAP_LOOKBACK", 48))
-    wick_ratio_th = max(0.1, _mid_trap_env_float("MID_TRAP_WICK_RATIO", 0.60))
-    wick_last = max(1, _mid_trap_env_int("MID_TRAP_WICK_LAST", 3))
-    wick_hits_req = max(1, _mid_trap_env_int("MID_TRAP_WICK_HITS", 2))
-    impulse_n = max(3, _mid_trap_env_int("MID_TRAP_IMPULSE_N", 6))
-    weak_last = max(1, _mid_trap_env_int("MID_TRAP_WEAK_LAST", 3))
-    weak_base = max(12, _mid_trap_env_int("MID_TRAP_WEAK_BASE", 24))
-    pierce_pct = max(0.0, _mid_trap_env_float("MID_TRAP_PIERCE_PCT", 0.0))
-
-    try:
-        ep = float(entry)
-        if np.isnan(ep) or ep <= 0:
-            return (True, "")
-    except Exception:
-        return (True, "")
-
-    if df1hi is None or df1hi.empty or len(df1hi) < 20:
-        return (True, "")
-
-    atr1h = _mid_atr_1h(df1hi)
-    if atr1h <= 0:
-        return (True, "")
-
-    # Filter 1: distance to local 1H extreme
-    try:
-        w = df1hi.tail(lookback)
-        if d == "LONG":
-            loc_high = float(w["high"].astype(float).max())
-            dist = float(loc_high - ep)
-            if dist <= atr_mult * atr1h:
-                return (False, f"near_1h_high dist={dist:.6g} atr={atr1h:.6g}")
-        else:
-            loc_low = float(w["low"].astype(float).min())
-            dist = float(ep - loc_low)
-            if dist <= atr_mult * atr1h:
-                return (False, f"near_1h_low dist={dist:.6g} atr={atr1h:.6g}")
-    except Exception:
-        pass
-
-    # Filter 2: wick liquidity (upper for LONG / lower for SHORT)
-    try:
-        tail = df1hi.tail(wick_last)
-        hits = 0
-        for _, r in tail.iterrows():
-            if _mid_wick_ratio(r, direction=d) > wick_ratio_th:
-                hits += 1
-        if hits >= wick_hits_req:
-            return (False, f"wick_liquidity hits={hits}/{wick_last}")
-    except Exception:
-        pass
-
-    # Filter 3: post-impulse exhaustion (N same-color candles)
-    if _mid_consecutive_candles(df1hi, direction=d, n=impulse_n):
-        return (False, f"post_impulse_{impulse_n}")
-
-    # Filter 4: weak high/low (pierce & fail)
-    if _mid_weak_extreme(df1hi, direction=d, last_n=weak_last, base_n=weak_base, pierce_pct=pierce_pct):
-        return (False, "weak_extreme_pierce_fail")
-
-    return (True, "")
-
-
 def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
@@ -5251,17 +5037,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         adx1h = float("nan")
 
     atr_pct = (atr30 / entry) * 100.0
-
-
-    # MID structural trap filters (apply to LONG/SHORT, SPOT/FUTURES)
-    ok_trap, trap_reason = _mid_structure_trap_ok(direction=dir_trend, entry=entry, df1hi=df1hi)
-    if not ok_trap:
-        try:
-            logger.info("MID blocked by trap filter: dir=%s reason=%s entry=%.6g", dir_trend, trap_reason, float(entry))
-        except Exception:
-            pass
-        return None
-
 
     # Quality gate: avoid choppy markets (helps TP2 hit-rate)
     try:
@@ -5466,6 +5241,17 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     )
     confidence = ta_score
 
+    # --- Trap filters (1H structure) ---
+
+    trap_ok, trap_reason = _trap_check_1h(df1hi, entry=entry, direction=dir_trend)
+
+    if not trap_ok:
+
+        # Return a blocked marker so scanner can log and skip safely.
+
+        return {"_blocked": True, "trap_reason": trap_reason}
+
+
     ta: Dict[str, Any] = {
         "direction": dir_trend,
         "entry": entry,
@@ -5498,6 +5284,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "range_pos_val": (range_pos if range_pos is not None else 0.0),
         "rsi_div": rsi_div,
         "ta_score": ta_score,
+        "trap_ok": True,
+        "trap_reason": "OK",
     }
     ta["ta_block"] = _fmt_ta_block_mid(ta)
     return ta
@@ -5924,6 +5712,7 @@ def _fmt_ta_block(ta: Dict[str, Any]) -> str:
         ms = ta.get("mstruct", "—")
         sup = ta.get("support", None)
         res = ta.get("resistance", None)
+        trap_txt = "OK" if bool(ta.get("trap_ok", True)) else f"BLOCKED ({ta.get('trap_reason','')})"
 
         def fnum(x, fmt="{:.2f}"):
             try:
@@ -5943,14 +5732,11 @@ def _fmt_ta_block(ta: Dict[str, Any]) -> str:
 
         lines = [
             f"📊 TA score: {fint(score)}/100 | Mode: {SIGNAL_MODE}",
+            f"🧱 Trap: {trap_txt}",
             f"RSI: {fnum(rsi, '{:.1f}')} | MACD hist: {fnum(macd_h, '{:.4f}')}",
             f"ADX 1h/4h: {fnum(adx1, '{:.1f}')}/{fnum(adx4, '{:.1f}')} | ATR%: {fnum(atrp, '{:.2f}')}",
             f"BB: {bb} | Vol xAvg: {fnum(volr, '{:.2f}')} | VWAP: {vwap}",
         ]
-        trap_ok = bool(ta.get("trap_ok", True))
-        trap_reason = str(ta.get("trap_reason", "") or "")
-        trap_line = "🧱 Trap: OK" if trap_ok else ("🧱 Trap: BLOCKED (" + trap_reason + ")" if trap_reason else "🧱 Trap: BLOCKED")
-        lines.append(trap_line)
         # extra context (keep concise)
         ctx = []
         if div and div != "—":
@@ -5995,6 +5781,7 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
         pattern = ta.get("pattern", "—")
         sup = ta.get("support", "—")
         res = ta.get("resistance", "—")
+        trap_txt = "OK" if bool(ta.get("trap_ok", True)) else f"BLOCKED ({ta.get('trap_reason','')})"
         lines = [
             f"📊 TA score: {int(round(float(score))):d}/100 | Mode: {mode_txt}",
             f"RSI(5m): {rsi:.1f} | MACD hist(5m): {macd_hist:.4f}",
@@ -6003,18 +5790,201 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
             f"Ch: {ch} | PA: {pa}",
             f"Pattern: {pattern} | Support: {sup} | Resistance: {res}",
         ]
-        trap_ok = bool(ta.get("trap_ok", True))
-        trap_reason = str(ta.get("trap_reason", "") or "")
-        trap_line = "🧱 Trap: OK" if trap_ok else ("🧱 Trap: BLOCKED (" + trap_reason + ")" if trap_reason else "🧱 Trap: BLOCKED")
-        # Put right after VWAP line
-        try:
-            lines.insert(4, trap_line)
-        except Exception:
-            lines.append(trap_line)
         return "\n".join(lines)
     except Exception:
         return ""
 
+
+
+# ------------------ Trap / Anti-top filters (1H structure) ------------------
+# These filters are used to avoid entering after a spike / near extremes (common SL traps).
+# Applied symmetrically to LONG/SHORT and used by both MID and MAIN evaluations.
+def _trap_env_float(name: str, default: float) -> float:
+    try:
+        v = (os.getenv(name) or "").strip()
+        return float(v) if v else float(default)
+    except Exception:
+        return float(default)
+
+def _trap_env_int(name: str, default: int) -> int:
+    try:
+        v = (os.getenv(name) or "").strip()
+        return int(float(v)) if v else int(default)
+    except Exception:
+        return int(default)
+
+_TRAP_ENABLED = os.getenv("TRAP_FILTER_ENABLED", "1").strip().lower() not in ("0","false","no","off")
+_TRAP_NEAR_EXTREME_ATR = _trap_env_float("TRAP_NEAR_EXTREME_ATR", 1.2)
+_TRAP_WICK_RATIO = _trap_env_float("TRAP_WICK_RATIO", 0.60)
+_TRAP_WICK_N = _trap_env_int("TRAP_WICK_N", 3)
+_TRAP_WICK_MIN_HITS = _trap_env_int("TRAP_WICK_MIN_HITS", 2)
+_TRAP_IMPULSE_STREAK = _trap_env_int("TRAP_IMPULSE_STREAK", 6)
+_TRAP_WEAK_EXTREME_LOOKBACK = _trap_env_int("TRAP_WEAK_EXTREME_LOOKBACK", 12)
+_TRAP_WEAK_PIERCE_EPS = _trap_env_float("TRAP_WEAK_PIERCE_EPS", 0.0010)  # 0.10%
+_TRAP_WEAK_HOLD_EPS = _trap_env_float("TRAP_WEAK_HOLD_EPS", 0.0003)      # 0.03%
+
+# Spike → Range (distribution) trap
+_TRAP_SPIKE_ATR_MULT = _trap_env_float("TRAP_SPIKE_ATR_MULT", 2.5)
+_TRAP_POST_RANGE_FRAC = _trap_env_float("TRAP_POST_RANGE_FRAC", 0.60)
+_TRAP_POST_RANGE_MIN = _trap_env_int("TRAP_POST_RANGE_MIN", 3)
+_TRAP_POST_RANGE_MAX = _trap_env_int("TRAP_POST_RANGE_MAX", 5)
+_TRAP_SPIKE_LOOKBACK = _trap_env_int("TRAP_SPIKE_LOOKBACK", 10)
+
+def _trap_atr_1h(df1h: pd.DataFrame) -> float:
+    try:
+        v = float(df1h.iloc[-1].get("atr", np.nan))
+        if not np.isnan(v) and v > 0:
+            return v
+    except Exception:
+        pass
+    try:
+        hi = df1h["high"].astype(float)
+        lo = df1h["low"].astype(float)
+        cl = df1h["close"].astype(float)
+        prev = cl.shift(1)
+        tr = np.maximum(hi - lo, np.maximum((hi - prev).abs(), (lo - prev).abs()))
+        v = float(tr.rolling(14).mean().iloc[-1])
+        return v if (not np.isnan(v) and v > 0) else float("nan")
+    except Exception:
+        return float("nan")
+
+def _trap_wick_hits(df1h: pd.DataFrame, *, direction: str) -> int:
+    n = max(1, int(_TRAP_WICK_N))
+    d = (direction or "").upper().strip()
+    hits = 0
+    tail = df1h.tail(n)
+    for _, r in tail.iterrows():
+        try:
+            o = float(r["open"]); c = float(r["close"]); h = float(r["high"]); l = float(r["low"])
+            body = abs(c - o)
+            body = body if body > 1e-12 else 1e-12
+            upper = h - max(o, c)
+            lower = min(o, c) - l
+            if d == "LONG":
+                if (upper / body) > _TRAP_WICK_RATIO:
+                    hits += 1
+            else:
+                if (lower / body) > _TRAP_WICK_RATIO:
+                    hits += 1
+        except Exception:
+            continue
+    return int(hits)
+
+def _trap_impulse_streak(df1h: pd.DataFrame, *, direction: str) -> bool:
+    n = max(2, int(_TRAP_IMPULSE_STREAK))
+    d = (direction or "").upper().strip()
+    tail = df1h.tail(n)
+    try:
+        if d == "LONG":
+            return bool(((tail["close"].astype(float) > tail["open"].astype(float))).all())
+        return bool(((tail["close"].astype(float) < tail["open"].astype(float))).all())
+    except Exception:
+        return False
+
+def _trap_weak_extreme(df1h: pd.DataFrame, *, direction: str) -> bool:
+    # Weak High / Weak Low: pierce previous extreme but fails to hold closes beyond it.
+    d = (direction or "").upper().strip()
+    lb = max(6, int(_TRAP_WEAK_EXTREME_LOOKBACK))
+    if len(df1h) < lb + 3:
+        return False
+    try:
+        prev = df1h.iloc[-(lb+3):-3]
+        last3 = df1h.iloc[-3:]
+        if d == "LONG":
+            prev_high = float(prev["high"].astype(float).max())
+            pierce = (last3["high"].astype(float) > (prev_high * (1.0 + _TRAP_WEAK_PIERCE_EPS))).any()
+            hold = float(last3["close"].astype(float).max()) > (prev_high * (1.0 + _TRAP_WEAK_HOLD_EPS))
+            return bool(pierce and (not hold))
+        else:
+            prev_low = float(prev["low"].astype(float).min())
+            pierce = (last3["low"].astype(float) < (prev_low * (1.0 - _TRAP_WEAK_PIERCE_EPS))).any()
+            hold = float(last3["close"].astype(float).min()) < (prev_low * (1.0 - _TRAP_WEAK_HOLD_EPS))
+            return bool(pierce and (not hold))
+    except Exception:
+        return False
+
+def _trap_near_extreme(df1h: pd.DataFrame, *, entry: float, direction: str, atr1h: float) -> bool:
+    if atr1h <= 0 or np.isnan(atr1h):
+        return False
+    tail = df1h.tail(24)  # last day
+    try:
+        d = (direction or "").upper().strip()
+        if d == "LONG":
+            recent_high = float(tail["high"].astype(float).max())
+            return (recent_high - float(entry)) <= (_TRAP_NEAR_EXTREME_ATR * atr1h)
+        recent_low = float(tail["low"].astype(float).min())
+        return (float(entry) - recent_low) <= (_TRAP_NEAR_EXTREME_ATR * atr1h)
+    except Exception:
+        return False
+
+def _trap_spike_range(df1h: pd.DataFrame, *, entry: float, direction: str, atr1h: float) -> bool:
+    # Detect a large spike candle (range > mult*ATR) followed by tight range (distribution),
+    # which often returns to base (bad for chasing).
+    if atr1h <= 0 or np.isnan(atr1h):
+        return False
+    d = (direction or "").upper().strip()
+    lb = max(6, int(_TRAP_SPIKE_LOOKBACK))
+    if len(df1h) < lb + _TRAP_POST_RANGE_MIN + 1:
+        return False
+    look = df1h.tail(lb + _TRAP_POST_RANGE_MAX + 1).reset_index(drop=True)
+    # consider spike positions that allow post-range candles
+    for i in range(0, max(1, len(look) - (_TRAP_POST_RANGE_MIN + 1))):
+        try:
+            row = look.iloc[i]
+            o = float(row["open"]); c = float(row["close"]); h = float(row["high"]); l = float(row["low"])
+            rng = float(h - l)
+            if rng <= (_TRAP_SPIKE_ATR_MULT * atr1h):
+                continue
+            body = abs(c - o)
+            # require directional spike with close near extreme
+            if d == "LONG":
+                if not (c > o and (h - c) <= rng * 0.35):
+                    continue
+            else:
+                if not (c < o and (c - l) <= rng * 0.35):
+                    continue
+            # post candles
+            for k in range(_TRAP_POST_RANGE_MIN, _TRAP_POST_RANGE_MAX + 1):
+                if i + 1 + k > len(look):
+                    continue
+                post = look.iloc[i+1:i+1+k]
+                prng = (post["high"].astype(float) - post["low"].astype(float)).astype(float)
+                if prng.empty:
+                    continue
+                if float(prng.max()) >= (rng * _TRAP_POST_RANGE_FRAC):
+                    continue
+                # ensure entry is "chasing": on the same side as spike continuation area
+                if d == "LONG":
+                    if float(entry) >= (o + rng * 0.55):
+                        return True
+                else:
+                    if float(entry) <= (o - rng * 0.55):
+                        return True
+        except Exception:
+            continue
+    return False
+
+def _trap_check_1h(df1h: pd.DataFrame, *, entry: float, direction: str) -> tuple[bool, str]:
+    if not _TRAP_ENABLED:
+        return (True, "disabled")
+    d = (direction or "").upper().strip()
+    if d not in ("LONG", "SHORT"):
+        return (True, "no_dir")
+    atr1h = _trap_atr_1h(df1h)
+    reasons: list[str] = []
+    if _trap_near_extreme(df1h, entry=float(entry), direction=d, atr1h=float(atr1h)):
+        reasons.append("near_1h_extreme")
+    if _trap_wick_hits(df1h, direction=d) >= _TRAP_WICK_MIN_HITS:
+        reasons.append("wick_liquidity")
+    if _trap_impulse_streak(df1h, direction=d):
+        reasons.append("post_impulse")
+    if _trap_weak_extreme(df1h, direction=d):
+        reasons.append("weak_extreme")
+    if _trap_spike_range(df1h, entry=float(entry), direction=d, atr1h=float(atr1h)):
+        reasons.append("spike_range")
+    if reasons:
+        return (False, "+".join(reasons))
+    return (True, "OK")
 
 def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
     score = 0
@@ -6054,8 +6024,6 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     adx1 = float(last1h.get("adx", np.nan))
 
     entry = float(last15["close"])
-    # --- Anti-trap structure filters (avoid tops/bottoms) ---
-    trap_ok, trap_reason = _mid_structure_trap_ok(direction=str(dir4).upper(), entry=entry, df1hi=df1hi)
     atr = float(last1h.get("atr", np.nan))
     if np.isnan(atr) or atr <= 0:
         return None
@@ -6117,9 +6085,6 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
         "rr": rr,
         "score": score,
         "confidence": confidence,
-        "trap_ok": bool(trap_ok),
-        "trap_reason": str(trap_reason or ""),
-        "blocked": (not bool(trap_ok)),
         "atr_pct": atr_pct,
         "adx1": adx1,
         "adx4": adx4,
@@ -6136,6 +6101,8 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
         "mstruct": mstruct,
         "support": support,
         "resistance": resistance,
+        "trap_ok": True,
+        "trap_reason": "OK",
     }
     return ta
 
@@ -6238,8 +6205,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
     tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct)
     sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
-    # --- Anti-trap structure filters (apply to MID and MAIN candidates) ---
-    trap_ok, trap_reason = _mid_structure_trap_ok(direction=str(dir_trend).upper(), entry=entry, df1hi=df1hi)
 
     # --- TA extras (MAIN-like) ---
     # RSI/MACD on 5m
@@ -6321,6 +6286,15 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     )
     confidence = ta_score
 
+    # --- Trap filters (1H structure) ---
+
+    trap_ok, trap_reason = _trap_check_1h(df1hi, entry=entry, direction=dir1)
+
+    if not trap_ok:
+
+        return {"_blocked": True, "trap_reason": trap_reason}
+
+
     ta: Dict[str, Any] = {
         "direction": dir_trend,
         "entry": entry,
@@ -6343,7 +6317,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "bb": bb_str,
         "rel_vol": vol_rel if (not np.isnan(vol_rel)) else 0.0,
         "vwap": vwap_txt,
-        "vwap_val": (float(vwap_val) if (not np.isnan(vwap_val)) else 0.0),
         "pattern": pattern,
         "support": support,
         "resistance": resistance,
@@ -7667,7 +7640,6 @@ class Backend:
                     _mid_skip_cooldown = 0
                     _mid_skip_macro = 0
                     _mid_skip_news = 0
-                    _mid_skip_trap = 0
                     _mid_f_align = 0
                     _mid_f_score = 0
                     _mid_f_rr = 0
@@ -7730,6 +7702,9 @@ class Backend:
                                     no_data += 1
                                     continue
                                 r = evaluate_on_exchange_mid(a, b, c)
+                                if r and r.get('_blocked'):
+                                    logger.info("[mid][trap] %s %s blocked on %s reason=%s", sym, str(r.get('direction') or ''), name, r.get('trap_reason'))
+                                    continue
                                 if r:
                                     supporters.append((name, r))
                             except Exception:
@@ -7740,11 +7715,6 @@ class Backend:
                         best_name, best_r = max(supporters, key=lambda x: (float(x[1].get("confidence",0)), float(x[1].get("rr",0))))
                         binance_r = next((r for n, r in supporters if n == "BINANCE"), None)
                         base_r = binance_r or best_r
-                        # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
-                        if base_r.get("trap_ok") is False or base_r.get("blocked") is True:
-                            _mid_skip_trap += 1
-                            logger.info("[mid][trap] %s %s blocked=%s reason=%s src_best=%s", sym, str(base_r.get("direction","")).upper(), base_r.get("blocked"), base_r.get("trap_reason",""), best_name)
-                            continue
                         if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
                             _mid_f_align += 1
                             continue
