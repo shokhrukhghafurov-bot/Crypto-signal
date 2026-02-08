@@ -4979,6 +4979,142 @@ def _trigger_15m(direction: str, df15i: pd.DataFrame) -> bool:
     return True
 
 
+
+# ------------------ MID structure anti-top filters (1h) ------------------
+# Goal: reduce "buying the top" on MID (5m/30m/1h) longs.
+# These filters are applied ONLY for dir_trend == LONG.
+#
+# Filters:
+# 1) Distance to local 1H high: if price is too close to recent high (< 1.2 * ATR) -> block LONG
+# 2) Upper-wick liquidity: if 2+ of last 3 1H candles have upper wick > 60% of body -> block LONG
+# 3) Post-impulse: if last 6 1H candles are green -> block LONG
+# 4) Weak high: if there was a pierce above prior high but closes failed to hold above -> block LONG
+#
+# Env overrides (optional):
+#   MID_TOP_FILTERS=1/0 (default 1)
+#   MID_TOP_DIST_ATR=1.2
+#   MID_TOP_WICK_BODY=0.60
+#   MID_TOP_WICK_LAST_N=3
+#   MID_TOP_WICK_MIN_HITS=2
+#   MID_TOP_GREEN_STREAK=6
+#   MID_TOP_LOCAL_HIGH_LOOKBACK=72
+#   MID_TOP_WEAK_HIGH_LOOKBACK=60
+#   MID_TOP_WEAK_HIGH_EXCLUDE_LAST=3
+#   MID_TOP_WEAK_HIGH_TOL=0.001  (0.1%)
+def _mid_top_filters_enabled() -> bool:
+    try:
+        return (os.getenv("MID_TOP_FILTERS", "1").strip().lower() not in ("0","false","no","off"))
+    except Exception:
+        return True
+
+def _mid_block_long_near_high(*, df1hi: pd.DataFrame, entry: float, atr1h: float) -> bool:
+    try:
+        if df1hi is None or df1hi.empty:
+            return False
+        mult = float(os.getenv("MID_TOP_DIST_ATR", "1.2") or 1.2)
+        lookback = int(float(os.getenv("MID_TOP_LOCAL_HIGH_LOOKBACK", "72") or 72))
+        if lookback <= 5:
+            lookback = 72
+        recent_high = float(df1hi.tail(lookback)["high"].astype(float).max())
+        if recent_high <= 0 or atr1h <= 0:
+            return False
+        dist = recent_high - float(entry)
+        return dist >= 0 and dist <= (mult * float(atr1h))
+    except Exception:
+        return False
+
+def _mid_block_long_upper_wicks(*, df1hi: pd.DataFrame) -> bool:
+    try:
+        if df1hi is None or df1hi.empty:
+            return False
+        last_n = int(float(os.getenv("MID_TOP_WICK_LAST_N", "3") or 3))
+        min_hits = int(float(os.getenv("MID_TOP_WICK_MIN_HITS", "2") or 2))
+        thr = float(os.getenv("MID_TOP_WICK_BODY", "0.60") or 0.60)
+        d = df1hi.tail(max(3, last_n)).copy()
+        hits = 0
+        eps = 1e-12
+        for _, row in d.iterrows():
+            o = float(row.get("open"))
+            c = float(row.get("close"))
+            h = float(row.get("high"))
+            upper = h - max(o, c)
+            body = abs(c - o)
+            if upper > thr * max(body, eps):
+                hits += 1
+        return hits >= min_hits
+    except Exception:
+        return False
+
+def _mid_block_long_post_impulse(*, df1hi: pd.DataFrame) -> bool:
+    try:
+        if df1hi is None or df1hi.empty:
+            return False
+        streak = int(float(os.getenv("MID_TOP_GREEN_STREAK", "6") or 6))
+        if streak < 3:
+            streak = 6
+        d = df1hi.tail(streak).copy()
+        if len(d) < streak:
+            return False
+        greens = 0
+        for _, row in d.iterrows():
+            if float(row.get("close")) > float(row.get("open")):
+                greens += 1
+        return greens >= streak
+    except Exception:
+        return False
+
+def _mid_block_long_weak_high(*, df1hi: pd.DataFrame) -> bool:
+    try:
+        if df1hi is None or df1hi.empty:
+            return False
+        lookback = int(float(os.getenv("MID_TOP_WEAK_HIGH_LOOKBACK", "60") or 60))
+        excl = int(float(os.getenv("MID_TOP_WEAK_HIGH_EXCLUDE_LAST", "3") or 3))
+        tol = float(os.getenv("MID_TOP_WEAK_HIGH_TOL", "0.001") or 0.001)
+        d = df1hi.tail(max(lookback, excl + 5)).copy()
+        if len(d) < (excl + 10):
+            return False
+        hist = d.iloc[:-excl].copy()
+        recent = d.iloc[-excl:].copy()
+        prev_high = float(hist["high"].astype(float).max())
+        if prev_high <= 0:
+            return False
+        # "pierce": high breaks above prev_high by tol, but close fails to hold above prev_high
+        pierce = False
+        for _, row in recent.iterrows():
+            h = float(row.get("high"))
+            c = float(row.get("close"))
+            if h > prev_high * (1.0 + tol) and c < prev_high:
+                pierce = True
+                break
+        if not pierce:
+            return False
+        # and we still didn't break/hold above
+        last_close = float(d.iloc[-1].get("close"))
+        return last_close < prev_high
+    except Exception:
+        return False
+
+def _mid_should_block_long_top(*, df1hi: pd.DataFrame, entry: float) -> bool:
+    try:
+        if not _mid_top_filters_enabled():
+            return False
+        last = df1hi.iloc[-1]
+        atr1h = float(last.get("atr", 0.0) or 0.0)
+        if atr1h <= 0:
+            # if ATR missing, be permissive (do not block)
+            return False
+        if _mid_block_long_near_high(df1hi=df1hi, entry=float(entry), atr1h=atr1h):
+            return True
+        if _mid_block_long_upper_wicks(df1hi=df1hi):
+            return True
+        if _mid_block_long_post_impulse(df1hi=df1hi):
+            return True
+        if _mid_block_long_weak_high(df1hi=df1hi):
+            return True
+        return False
+    except Exception:
+        return False
+
 def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
@@ -5012,6 +5148,16 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     entry = float(last5.get("close", np.nan))
     if np.isnan(entry) or entry <= 0:
         return None
+    # --- MID anti-top filters (1h structure) ---
+    # Prevent entering LONG too close to local highs / after liquidity wicks / after a vertical impulse.
+    if dir_trend == "LONG":
+        try:
+            if _mid_should_block_long_top(df1hi=df1hi, entry=float(entry)):
+                return None
+        except Exception:
+            # never break scanner
+            pass
+
 
     # ATR from 30m (prefer indicator, fallback to true-range)
     atr30 = float(last30.get("atr", np.nan))
