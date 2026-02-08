@@ -3343,7 +3343,15 @@ def _be_is_armed_sig(side: str, price: float, tp1: float | None, tp2: float | No
 
 async def _fetch_binance_price(symbol: str, *, futures: bool) -> float:
     """Best-effort public price from Binance (spot or futures)."""
+    # Binance endpoints require the plain concatenated symbol (e.g., BTCUSDT).
+    # We normalize common variants that scanners or UI can emit: "BTC/USDT", "BTC-USDT",
+    # "BTC_USDT", etc. Keep only A-Z0-9 to avoid silent 0.0 prices -> never-closing outcomes.
     symbol = str(symbol or "").upper().strip()
+    try:
+        symbol = re.sub(r"[^A-Z0-9]", "", symbol)
+    except Exception:
+        # Fallback normalization (no regex)
+        symbol = symbol.replace("/", "").replace("-", "").replace("_", "").replace(":", "")
     if not symbol:
         return 0.0
     url = ("https://fapi.binance.com/fapi/v1/ticker/price" if futures else "https://api.binance.com/api/v3/ticker/price")
