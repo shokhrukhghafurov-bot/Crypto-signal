@@ -5115,6 +5115,21 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     # Channel + structure on 1h
     channel, _, _ = _linreg_channel(df1hi)
     mstruct_raw = _market_structure(df1hi)
+
+    # MID structure veto on 1h (prevents counter-structure signals and RANGE chop)
+    try:
+        _allow_range_struct = os.getenv("MID_ALLOW_RANGE", "0").strip().lower() not in ("0","false","no","off")
+    except Exception:
+        _allow_range_struct = False
+
+    if (not _allow_range_struct) and mstruct_raw == "RANGE":
+        return None
+
+    # If 1h structure is directional, require alignment with trend direction
+    if mstruct_raw == "HH-HL" and dir_trend < 0:
+        return None
+    if mstruct_raw == "LH-LL" and dir_trend > 0:
+        return None
     if mstruct_raw in ("HH-HL", "LH-LL"):
         mstruct = "TREND"
     elif mstruct_raw == "RANGE":
