@@ -5947,6 +5947,10 @@ def _fmt_ta_block(ta: Dict[str, Any]) -> str:
             f"ADX 1h/4h: {fnum(adx1, '{:.1f}')}/{fnum(adx4, '{:.1f}')} | ATR%: {fnum(atrp, '{:.2f}')}",
             f"BB: {bb} | Vol xAvg: {fnum(volr, '{:.2f}')} | VWAP: {vwap}",
         ]
+        trap_ok = bool(ta.get("trap_ok", True))
+        trap_reason = str(ta.get("trap_reason", "") or "")
+        trap_line = "🧱 Trap: OK" if trap_ok else ("🧱 Trap: BLOCKED (" + trap_reason + ")" if trap_reason else "🧱 Trap: BLOCKED")
+        lines.append(trap_line)
         # extra context (keep concise)
         ctx = []
         if div and div != "—":
@@ -5999,6 +6003,14 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
             f"Ch: {ch} | PA: {pa}",
             f"Pattern: {pattern} | Support: {sup} | Resistance: {res}",
         ]
+        trap_ok = bool(ta.get("trap_ok", True))
+        trap_reason = str(ta.get("trap_reason", "") or "")
+        trap_line = "🧱 Trap: OK" if trap_ok else ("🧱 Trap: BLOCKED (" + trap_reason + ")" if trap_reason else "🧱 Trap: BLOCKED")
+        # Put right after VWAP line
+        try:
+            lines.insert(4, trap_line)
+        except Exception:
+            lines.append(trap_line)
         return "\n".join(lines)
     except Exception:
         return ""
@@ -6042,6 +6054,8 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     adx1 = float(last1h.get("adx", np.nan))
 
     entry = float(last15["close"])
+    # --- Anti-trap structure filters (avoid tops/bottoms) ---
+    trap_ok, trap_reason = _mid_structure_trap_ok(direction=str(dir4).upper(), entry=entry, df1hi=df1hi)
     atr = float(last1h.get("atr", np.nan))
     if np.isnan(atr) or atr <= 0:
         return None
@@ -6103,6 +6117,9 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
         "rr": rr,
         "score": score,
         "confidence": confidence,
+        "trap_ok": bool(trap_ok),
+        "trap_reason": str(trap_reason or ""),
+        "blocked": (not bool(trap_ok)),
         "atr_pct": atr_pct,
         "adx1": adx1,
         "adx4": adx4,
@@ -6221,6 +6238,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
     tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct)
     sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
+    # --- Anti-trap structure filters (apply to MID and MAIN candidates) ---
+    trap_ok, trap_reason = _mid_structure_trap_ok(direction=str(dir_trend).upper(), entry=entry, df1hi=df1hi)
 
     # --- TA extras (MAIN-like) ---
     # RSI/MACD on 5m
@@ -6324,6 +6343,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "bb": bb_str,
         "rel_vol": vol_rel if (not np.isnan(vol_rel)) else 0.0,
         "vwap": vwap_txt,
+        "vwap_val": (float(vwap_val) if (not np.isnan(vwap_val)) else 0.0),
         "pattern": pattern,
         "support": support,
         "resistance": resistance,
@@ -7647,6 +7667,7 @@ class Backend:
                     _mid_skip_cooldown = 0
                     _mid_skip_macro = 0
                     _mid_skip_news = 0
+                    _mid_skip_trap = 0
                     _mid_f_align = 0
                     _mid_f_score = 0
                     _mid_f_rr = 0
@@ -7719,6 +7740,11 @@ class Backend:
                         best_name, best_r = max(supporters, key=lambda x: (float(x[1].get("confidence",0)), float(x[1].get("rr",0))))
                         binance_r = next((r for n, r in supporters if n == "BINANCE"), None)
                         base_r = binance_r or best_r
+                        # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
+                        if base_r.get("trap_ok") is False or base_r.get("blocked") is True:
+                            _mid_skip_trap += 1
+                            logger.info("[mid][trap] %s %s blocked=%s reason=%s src_best=%s", sym, str(base_r.get("direction","")).upper(), base_r.get("blocked"), base_r.get("trap_reason",""), best_name)
+                            continue
                         if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
                             _mid_f_align += 1
                             continue
