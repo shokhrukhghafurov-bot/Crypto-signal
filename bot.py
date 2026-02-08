@@ -337,26 +337,6 @@ def _normalize_side_for_stats(direction: str) -> str:
         return "LONG"
     # Fallback to keep DB insert valid
     return "LONG"
-
-
-def _normalize_side_ls(v: str) -> str:
-    """Normalize any side/direction representation to LONG/SHORT.
-
-    Canonical outcome logic expects LONG/SHORT.
-    Older DB rows or other parts of the system may have BUY/SELL.
-    """
-    s = str(v or "").strip().upper()
-    if not s:
-        return "LONG"
-    if s in ("BUY", "B"):
-        return "LONG"
-    if s in ("SELL", "S"):
-        return "SHORT"
-    if "LONG" in s or "ЛОНГ" in s:
-        return "LONG"
-    if "SHORT" in s or "ШОРТ" in s:
-        return "SHORT"
-    return "LONG"
 # No local JSON files are used.
 
 
@@ -3054,8 +3034,7 @@ async def trades_page(call: types.CallbackQuery) -> None:
 def _trade_card_text(uid: int, t: dict) -> str:
     symbol = str(t.get("symbol") or "")
     market = str(t.get("market") or "FUTURES").upper()
-	                    # signal_tracks.side is LONG/SHORT, but older installs could have BUY/SELL.
-	                    side = _normalize_side_ls(t.get("side") or "LONG")
+    side = str(t.get("side") or "LONG").upper()
     status = str(t.get("status") or "ACTIVE").upper()
 
     entry = float(t.get("entry") or 0.0)
@@ -3634,8 +3613,7 @@ async def signal_outcome_loop() -> None:
                     sid = int(t.get("signal_id") or 0)
                     market = str(t.get("market") or "SPOT").upper()
                     symbol = str(t.get("symbol") or "").upper()
-                    # signal_tracks.side is LONG/SHORT, but older installs could have BUY/SELL.
-                    side = _normalize_side_ls(t.get("side") or "LONG")
+                    side = str(t.get("side") or "LONG").upper()
                     status = str(t.get("status") or "ACTIVE").upper()
 
                     entry = float(t.get("entry") or 0.0)
