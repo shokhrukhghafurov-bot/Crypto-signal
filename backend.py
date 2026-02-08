@@ -351,6 +351,13 @@ _SMART_PRO_CONTROL_REAL = (os.getenv("SMART_PRO_CONTROL_REAL", "1").strip().lowe
 # Break-even fee buffer (percent). Example: 0.05 means +0.05% for LONG, -0.05% for SHORT.
 _BE_FEE_BUFFER_PCT = float(os.getenv("BE_FEE_BUFFER_PCT", "0.05") or 0.05)
 
+# Stop-loss confirmation (seconds) and buffer (percent).
+# SL_CONFIRM_SEC: require price to remain beyond SL for N seconds before closing.
+# SL_BUFFER_PCT: extra buffer around SL in percent (0.03 means 0.03%).
+_SL_CONFIRM_SEC = int(float(os.getenv("SL_CONFIRM_SEC", "0") or 0))
+_SL_BUFFER_PCT = float(os.getenv("SL_BUFFER_PCT", "0") or 0.0)
+
+
 
 # =======================
 # Smart Trade Manager PRO — ENV (SAFE DEFAULTS)
@@ -5115,21 +5122,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     # Channel + structure on 1h
     channel, _, _ = _linreg_channel(df1hi)
     mstruct_raw = _market_structure(df1hi)
-
-    # MID structure veto on 1h (prevents counter-structure signals and RANGE chop)
-    try:
-        _allow_range_struct = os.getenv("MID_ALLOW_RANGE", "0").strip().lower() not in ("0","false","no","off")
-    except Exception:
-        _allow_range_struct = False
-
-    if (not _allow_range_struct) and mstruct_raw == "RANGE":
-        return None
-
-    # If 1h structure is directional, require alignment with trend direction
-    if mstruct_raw == "HH-HL" and dir_trend < 0:
-        return None
-    if mstruct_raw == "LH-LL" and dir_trend > 0:
-        return None
     if mstruct_raw in ("HH-HL", "LH-LL"):
         mstruct = "TREND"
     elif mstruct_raw == "RANGE":
@@ -6177,6 +6169,10 @@ class Backend:
         # Track when price fetching started failing per trade_id (used for forced CLOSE)
         self._price_fail_since: Dict[int, float] = {}
 
+        # Track first moment when price breached SL per trade_id (for SL confirmation).
+        self._sl_breach_since: Dict[int, float] = {}
+
+
         self.last_signal: Optional[Signal] = None
         self.last_spot_signal: Optional[Signal] = None
         self.last_futures_signal: Optional[Signal] = None
@@ -6227,9 +6223,11 @@ class Backend:
         close_price = float(row.get("entry") or 0.0)
         try:
             await db_store.close_trade(trade_id, status="CLOSED", price=close_price, pnl_total_pct=float(row.get("pnl_total_pct") or 0.0))
+            self._sl_breach_since.pop(trade_id, None)
         except Exception:
             # best effort
             await db_store.close_trade(trade_id, status="CLOSED")
+            self._sl_breach_since.pop(trade_id, None)
         return True
 
 
@@ -6792,6 +6790,7 @@ class Backend:
                         # Use entry as best-effort close price
                         close_px = float(s.entry or 0.0)
                         await db_store.close_trade(trade_id, status="CLOSED", price=close_px, pnl_total_pct=float(row.get("pnl_total_pct") or 0.0) if row.get("pnl_total_pct") is not None else 0.0)
+                        self._sl_breach_since.pop(trade_id, None)
                         self._price_fail_since.pop(trade_id, None)
                         continue
 
@@ -6836,6 +6835,7 @@ class Backend:
                             txt += "\n\n" + dbg
                         await safe_send(bot, uid, txt, ctx="msg_auto_win")
                         await db_store.close_trade(trade_id, status="WIN", price=float(s.tp2), pnl_total_pct=float(pnl))
+                        self._sl_breach_since.pop(trade_id, None)
                         try:
                             _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=True)
                         except Exception:
@@ -6843,7 +6843,23 @@ class Backend:
                         continue
 
                     # 2) Before TP1: SL -> LOSS
-                    if not tp1_hit and s.sl and hit_sl(float(s.sl)):
+                    if not tp1_hit and s.sl:
+                        sl_lvl = float(s.sl)
+                        buf = (_SL_BUFFER_PCT / 100.0)
+                        breached = (price_f <= sl_lvl * (1 - buf)) if side == "LONG" else (price_f >= sl_lvl * (1 + buf))
+                        if breached and _SL_CONFIRM_SEC > 0:
+                            t0 = self._sl_breach_since.get(trade_id)
+                            if t0 is None:
+                                self._sl_breach_since[trade_id] = time.time()
+                                continue
+                            if (time.time() - t0) < _SL_CONFIRM_SEC:
+                                continue
+                        else:
+                            self._sl_breach_since.pop(trade_id, None)
+                    else:
+                        breached = False
+
+                    if not tp1_hit and s.sl and breached:
                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
                         pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.sl), close_reason="LOSS")
                         import datetime as _dt
@@ -6860,6 +6876,7 @@ class Backend:
                             txt += "\n\n" + dbg
                         await safe_send(bot, uid, txt, ctx="msg_auto_loss")
                         await db_store.close_trade(trade_id, status="LOSS", price=float(s.sl), pnl_total_pct=float(pnl))
+                        self._sl_breach_since.pop(trade_id, None)
                         try:
                             _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=False)
                         except Exception:
@@ -6906,6 +6923,7 @@ class Backend:
                             trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
                             pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(be_lvl), close_reason="BE")
                             await db_store.close_trade(trade_id, status="BE", price=float(be_lvl), pnl_total_pct=float(pnl))
+                            self._sl_breach_since.pop(trade_id, None)
                         try:
                             _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=False)
                         except Exception:
@@ -6930,6 +6948,7 @@ class Backend:
                             txt += "\n\n" + dbg
                         await safe_send(bot, uid, txt, ctx="msg_auto_win")
                         await db_store.close_trade(trade_id, status="WIN", price=float(s.tp2), pnl_total_pct=float(pnl))
+                        self._sl_breach_since.pop(trade_id, None)
                         continue
 
                 except Exception:
