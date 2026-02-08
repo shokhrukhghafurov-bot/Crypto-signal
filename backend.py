@@ -7123,6 +7123,20 @@ class Backend:
                                 return name, None
 
                         # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
+                        _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
+                        scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
+                        if not scan_exchanges:
+                            scan_exchanges = ['BINANCE','BYBIT','OKX','GATEIO','MEXC']
+
+                        results = await asyncio.gather(*[fetch_exchange(ex) for ex in scan_exchanges])
+                        good = [(name, r) for (name, r) in results if r is not None]
+                        if not good:
+                            continue
+
+                        # Signal can be produced from a single exchange result.
+                        best_name, best_r = max(
+                            good,
+                            key=lambda x: (int((x[1] or {}).get("confidence", 0) or 0), float((x[1] or {}).get("rr", 0.0) or 0.0)),
                         )
                         best_dir = best_r["direction"]
                         supporters = [(best_name, best_r)]
@@ -7348,6 +7362,18 @@ class Backend:
             tp2_r = float(os.getenv("MID_TP2_R","2.8"))
 
             # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
+            _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
+            scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
+            if not scan_exchanges:
+                scan_exchanges = ['BINANCE','BYBIT','OKX','GATEIO','MEXC']
+
+            try:
+                async with MultiExchangeData() as api:
+                    await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
+                    symbols = await api.get_top_usdt_symbols(top_n)
+                    # --- MID tick counters / diagnostics ---
+                    _mid_scanned = len(symbols)
+                    _mid_emitted = 0
                     _mid_skip_blocked = 0
                     _mid_skip_cooldown = 0
                     _mid_skip_macro = 0
@@ -7386,6 +7412,15 @@ class Backend:
                                 continue
 
                         supporters = []
+                        for name in scan_exchanges:
+                            try:
+                                if name == "BINANCE":
+                                    a = await api.klines_binance(sym, tf_trigger, 250)
+                                    b = await api.klines_binance(sym, tf_mid, 250)
+                                    c = await api.klines_binance(sym, tf_trend, 250)
+                                elif name == "BYBIT":
+                                    a = await api.klines_bybit(sym, tf_trigger, 250)
+                                    b = await api.klines_bybit(sym, tf_mid, 250)
                                     c = await api.klines_bybit(sym, tf_trend, 250)
                                 elif name == "OKX":
                                     a = await api.klines_okx(sym, tf_trigger, 250)
