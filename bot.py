@@ -315,6 +315,28 @@ _SENT_SIG_TTL_SEC = int(os.getenv("SENT_SIG_TTL_SEC", "600"))  # default 10 minu
 
 # ---------------- bot statistics ----------------
 # NOTE: Statistics are stored ONLY in Postgres (signal_sent_events + signal_tracks).
+
+def _normalize_side_for_stats(direction: str) -> str:
+    """Normalize direction to LONG/SHORT for signal_tracks DB constraints.
+
+    Broadcast text may be localized (e.g. "ШОРТ"/"ЛОНГ").
+    signal_tracks.side is constrained to ('LONG','SHORT'), so we map common variants.
+    """
+    d = str(direction or "").strip().upper()
+    if not d:
+        return "LONG"
+    # RU
+    if "ШОРТ" in d:
+        return "SHORT"
+    if "ЛОНГ" in d:
+        return "LONG"
+    # EN
+    if "SHORT" in d or d in ("SELL", "S"):
+        return "SHORT"
+    if "LONG" in d or d in ("BUY", "B"):
+        return "LONG"
+    # Fallback to keep DB insert valid
+    return "LONG"
 # No local JSON files are used.
 
 
@@ -1562,12 +1584,13 @@ async def broadcast_signal(sig: Signal) -> None:
 
     # Persist bot-level signal tracker (independent from users) for outcomes (TP/SL/BE) statistics.
     try:
+        side_stats = _normalize_side_for_stats(getattr(sig, 'direction', ''))
         await db_store.upsert_signal_track(
             signal_id=int(sig.signal_id or 0),
             sig_key=sig_key,
             market=str(sig.market).upper(),
             symbol=str(sig.symbol),
-            side=str(sig.direction).upper(),
+            side=side_stats,
             entry=float(sig.entry or 0.0),
             tp1=(float(sig.tp1) if sig.tp1 is not None else None),
             tp2=(float(sig.tp2) if sig.tp2 is not None else None),
