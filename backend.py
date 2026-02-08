@@ -6701,16 +6701,52 @@ class Backend:
                 return float(p), "OKX_REST"
             return None, "OKX"
 
+        async def get_mexc() -> tuple[float | None, str]:
+            # MEXC/Gate are SPOT-only fallbacks for price.
+            if market != "SPOT":
+                return None, "MEXC"
+            try:
+                p = await _mexc_public_price(signal.symbol)
+            except Exception:
+                p = None
+            if _is_reasonable(p):
+                return float(p), "MEXC_PUBLIC"
+            return None, "MEXC"
+
+        async def get_gateio() -> tuple[float | None, str]:
+            if market != "SPOT":
+                return None, "GATEIO"
+            try:
+                p = await _gateio_public_price(signal.symbol)
+            except Exception:
+                p = None
+            if _is_reasonable(p):
+                return float(p), "GATEIO_PUBLIC"
+            return None, "GATEIO"
+
         if mode == "BINANCE":
             b, bsrc = await get_binance()
             if b is not None:
                 return float(b), bsrc
+            m1, msrc = await get_mexc()
+            if m1 is not None:
+                return float(m1), msrc
+            g1, gsrc = await get_gateio()
+            if g1 is not None:
+                return float(g1), gsrc
             y, ysrc = await get_bybit()
             if y is not None:
                 return float(y), ysrc
             o, osrc = await get_okx()
             if o is not None:
                 return float(o), osrc
+            m1, msrc = await get_mexc()
+            if m1 is not None:
+                return float(m1), msrc
+            g1, gsrc = await get_gateio()
+            if g1 is not None:
+                return float(g1), gsrc
+
         elif mode == "BYBIT":
             y, ysrc = await get_bybit()
             if y is not None:
@@ -6763,6 +6799,14 @@ class Backend:
             o, osrc = await get_okx()
             if _is_reasonable(o):
                 return float(o), "OKX_ONLY"
+
+            m1, msrc = await get_mexc()
+            if _is_reasonable(m1):
+                return float(m1), "MEXC_ONLY"
+            g1, gsrc = await get_gateio()
+            if _is_reasonable(g1):
+                return float(g1), "GATEIO_ONLY"
+
 
         # All sources failed -> let caller decide (skip tick / forced CLOSE)
         raise PriceUnavailableError(f"price unavailable market={market} symbol={signal.symbol} mode={mode}")
