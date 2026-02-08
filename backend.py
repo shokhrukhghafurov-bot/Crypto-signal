@@ -7208,6 +7208,10 @@ class Backend:
                             rr=rr,
                             confidence=conf,
                             confirmations=conf_names,
+                            # Source = where the scanner found the signal (TA is calculated on this exchange).
+                            source_exchange=best_name,
+                            # Executable venues where the symbol exists (used for SPOT routing / display).
+                            available_exchanges=conf_names,
                             risk_note="\\n".join(risk_notes).strip(),
                             ts=time.time(),
                         )
