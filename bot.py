@@ -977,13 +977,14 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
     def _conf_set(sig_obj: Any) -> set[str]:
         if not sig_obj:
             return set()
-        conf = str(getattr(sig_obj, "confirmations", "") or "").strip()
+        # Prefer explicit per-market venue list if present
+        conf = str((getattr(sig_obj, "available_exchanges", "") or getattr(sig_obj, "confirmations", "") or "")).strip()
         if not conf:
             return set()
         return {p.strip().lower() for p in conf.split("+") if p.strip()}
 
     allowed_spot = ["binance", "bybit", "okx", "mexc", "gateio"]
-    allowed_fut = ["binance", "bybit"]
+    allowed_fut = ["binance", "bybit", "okx"]
 
     last_spot_sig = getattr(backend, "last_spot_signal", None) or LAST_SIGNAL_BY_MARKET.get("SPOT")
     last_fut_sig = getattr(backend, "last_futures_signal", None) or LAST_SIGNAL_BY_MARKET.get("FUTURES")
@@ -1015,8 +1016,12 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
         if not fut_conf:
             return None
         ex = fut_ex.lower().strip()
-        if ex in fut_conf and _eligible(ex, "futures"):
+        # Try user's selected exchange first, then any other eligible futures venue
+        if ex in allowed_fut and ex in fut_conf and _eligible(ex, "futures"):
             return ex
+        for alt in allowed_fut:
+            if alt in fut_conf and _eligible(alt, "futures"):
+                return alt
         return None
 
     # Render block
