@@ -3994,10 +3994,6 @@ TOP_N = _env_int("TOP_N", 50)
 SCAN_INTERVAL_SECONDS = max(30, _env_int("SCAN_INTERVAL_SECONDS", 150))
 CONFIDENCE_MIN = max(0, min(100, _env_int("CONFIDENCE_MIN", 80)))
 # --- TA Quality mode (strict/medium) ---
-# NOTE:
-#   * These TA_* thresholds are kept as-is for MID (scanner_loop_mid can optionally reuse them).
-#   * MAIN scanner has its own independent knobs via MAIN_SIGNAL_MODE / MAIN_TA_* so MAIN can be tuned
-#     without changing MID behaviour.
 SIGNAL_MODE = (os.getenv("SIGNAL_MODE", "").strip().lower() or "strict")
 if SIGNAL_MODE not in ("strict", "medium"):
     SIGNAL_MODE = "strict"
@@ -4027,54 +4023,6 @@ TA_RSI_MIN_SHORT = max(0.0, _env_float("TA_RSI_MIN_SHORT", 32.0 if SIGNAL_MODE =
 # Multi-timeframe confirmation: if 1, require 4h and 1h trend alignment (recommended).
 # If 0, allow 4h trend only (more signals).
 TA_REQUIRE_1H_TREND = _env_bool("TA_REQUIRE_1H_TREND", True if SIGNAL_MODE == "strict" else False)
-
-# --- MAIN-only TA knobs (do NOT affect MID) ---
-# If MAIN_SIGNAL_MODE is not specified, we default MAIN to 'medium' so MAIN does not become completely silent
-# on fresh deployments where SIGNAL_MODE is left at default 'strict'.
-MAIN_SIGNAL_MODE = (os.getenv("MAIN_SIGNAL_MODE", "").strip().lower() or "medium")
-if MAIN_SIGNAL_MODE not in ("strict", "medium"):
-    MAIN_SIGNAL_MODE = "medium"
-
-_main_def_spot = 78 if MAIN_SIGNAL_MODE == "strict" else 65
-_main_def_fut = 74 if MAIN_SIGNAL_MODE == "strict" else 62
-MAIN_TA_MIN_SCORE_SPOT = max(0, min(100, _env_int("MAIN_TA_MIN_SCORE_SPOT", _main_def_spot)))
-MAIN_TA_MIN_SCORE_FUTURES = max(0, min(100, _env_int("MAIN_TA_MIN_SCORE_FUTURES", _main_def_fut)))
-
-MAIN_TA_MIN_ADX = max(0.0, _env_float("MAIN_TA_MIN_ADX", 22.0 if MAIN_SIGNAL_MODE == "strict" else 17.0))
-MAIN_TA_MIN_VOL_X = max(0.5, _env_float("MAIN_TA_MIN_VOL_X", 1.25 if MAIN_SIGNAL_MODE == "strict" else 1.05))
-
-# Optional per-market overrides for MAIN (do NOT affect MID):
-# If not provided, they fall back to MAIN_TA_MIN_ADX / MAIN_TA_MIN_VOL_X.
-MAIN_TA_MIN_ADX_SPOT = max(0.0, _env_float("MAIN_TA_MIN_ADX_SPOT", MAIN_TA_MIN_ADX))
-MAIN_TA_MIN_ADX_FUTURES = max(0.0, _env_float("MAIN_TA_MIN_ADX_FUTURES", MAIN_TA_MIN_ADX))
-MAIN_TA_MIN_VOL_X_SPOT = max(0.5, _env_float("MAIN_TA_MIN_VOL_X_SPOT", MAIN_TA_MIN_VOL_X))
-MAIN_TA_MIN_VOL_X_FUTURES = max(0.5, _env_float("MAIN_TA_MIN_VOL_X_FUTURES", MAIN_TA_MIN_VOL_X))
-MAIN_TA_MIN_MACD_H = max(0.0, _env_float("MAIN_TA_MIN_MACD_H", 0.0 if MAIN_SIGNAL_MODE == "strict" else 0.0))
-MAIN_TA_BB_REQUIRE_BREAKOUT = _env_bool("MAIN_TA_BB_REQUIRE_BREAKOUT", True if MAIN_SIGNAL_MODE == "strict" else False)
-MAIN_TA_RSI_MAX_LONG = max(1.0, _env_float("MAIN_TA_RSI_MAX_LONG", 68.0 if MAIN_SIGNAL_MODE == "strict" else 72.0))
-MAIN_TA_RSI_MIN_SHORT = max(0.0, _env_float("MAIN_TA_RSI_MIN_SHORT", 32.0 if MAIN_SIGNAL_MODE == "strict" else 28.0))
-MAIN_TA_REQUIRE_1H_TREND = _env_bool("MAIN_TA_REQUIRE_1H_TREND", True if MAIN_SIGNAL_MODE == "strict" else False)
-
-# Convenience pack for MAIN trigger thresholds
-MAIN_TRIGGER_THRESHOLDS_SPOT = {
-    "min_adx": MAIN_TA_MIN_ADX_SPOT,
-    "min_vol_x": MAIN_TA_MIN_VOL_X_SPOT,
-    "min_macd_h": MAIN_TA_MIN_MACD_H,
-    "bb_require_breakout": MAIN_TA_BB_REQUIRE_BREAKOUT,
-    "rsi_max_long": MAIN_TA_RSI_MAX_LONG,
-    "rsi_min_short": MAIN_TA_RSI_MIN_SHORT,
-}
-MAIN_TRIGGER_THRESHOLDS_FUTURES = {
-    "min_adx": MAIN_TA_MIN_ADX_FUTURES,
-    "min_vol_x": MAIN_TA_MIN_VOL_X_FUTURES,
-    "min_macd_h": MAIN_TA_MIN_MACD_H,
-    "bb_require_breakout": MAIN_TA_BB_REQUIRE_BREAKOUT,
-    "rsi_max_long": MAIN_TA_RSI_MAX_LONG,
-    "rsi_min_short": MAIN_TA_RSI_MIN_SHORT,
-}
-
-# Backward-compatible alias (defaults to SPOT thresholds)
-MAIN_TRIGGER_THRESHOLDS = MAIN_TRIGGER_THRESHOLDS_SPOT
 
 COOLDOWN_MINUTES = max(1, _env_int("COOLDOWN_MINUTES", 180))
 
@@ -4954,22 +4902,10 @@ def _trend_dir(df: pd.DataFrame) -> Optional[str]:
         return None
     return "LONG" if row["ema50"] > row["ema200"] else ("SHORT" if row["ema50"] < row["ema200"] else None)
 
-def _trigger_15m(direction: str, df15i: pd.DataFrame, *, th: Optional[Dict[str, Any]] = None) -> bool:
+def _trigger_15m(direction: str, df15i: pd.DataFrame) -> bool:
     """
-    Entry trigger on 15m timeframe.
-
-    By default uses global TA_* thresholds (legacy). For MAIN scanner we pass MAIN_TRIGGER_THRESHOLDS
-    so MAIN can be tuned independently from MID.
+    Entry trigger on 15m timeframe with configurable strict/medium thresholds via ENV.
     """
-    th = th or {}
-
-    min_adx = float(th.get("min_adx", TA_MIN_ADX) or 0.0)
-    min_vol_x = float(th.get("min_vol_x", TA_MIN_VOL_X) or 0.0)
-    min_macd_h = float(th.get("min_macd_h", TA_MIN_MACD_H) or 0.0)
-    bb_require_breakout = bool(th.get("bb_require_breakout", TA_BB_REQUIRE_BREAKOUT))
-    rsi_max_long = float(th.get("rsi_max_long", TA_RSI_MAX_LONG) or TA_RSI_MAX_LONG)
-    rsi_min_short = float(th.get("rsi_min_short", TA_RSI_MIN_SHORT) or TA_RSI_MIN_SHORT)
-
     if len(df15i) < 25:
         return False
     last = df15i.iloc[-1]
@@ -4985,28 +4921,28 @@ def _trigger_15m(direction: str, df15i: pd.DataFrame, *, th: Optional[Dict[str, 
 
     # ADX on 15m should show at least some structure (helps reduce chop)
     adx15 = float(last.get("adx", np.nan))
-    if not np.isnan(adx15) and adx15 < max(10.0, min_adx - 6.0):
+    if not np.isnan(adx15) and adx15 < max(10.0, TA_MIN_ADX - 6.0):
         return False
 
     # MACD momentum confirmation + optional histogram magnitude
     macd_hist = float(last["macd_hist"])
     prev_hist = float(prev["macd_hist"])
     if direction == "LONG":
-        macd_ok = (last["macd"] > last["macd_signal"]) and (macd_hist > prev_hist) and (macd_hist >= min_macd_h)
+        macd_ok = (last["macd"] > last["macd_signal"]) and (macd_hist > prev_hist) and (macd_hist >= TA_MIN_MACD_H)
     else:
-        macd_ok = (last["macd"] < last["macd_signal"]) and (macd_hist < prev_hist) and (macd_hist <= -min_macd_h)
+        macd_ok = (last["macd"] < last["macd_signal"]) and (macd_hist < prev_hist) and (macd_hist <= -TA_MIN_MACD_H)
     if not macd_ok:
         return False
 
-    # RSI cross 50 with guard rails
+    # RSI cross 50 with guard rails (configurable)
     rsi_last = float(last["rsi"])
     rsi_prev = float(prev["rsi"])
     if direction == "LONG":
-        rsi_ok = (rsi_prev < 50) and (rsi_last >= 50) and (rsi_last <= rsi_max_long)
+        rsi_ok = (rsi_prev < 50) and (rsi_last >= 50) and (rsi_last <= TA_RSI_MAX_LONG)
         if float(last["mfi"]) >= 80:
             return False
     else:
-        rsi_ok = (rsi_prev > 50) and (rsi_last <= 50) and (rsi_last >= rsi_min_short)
+        rsi_ok = (rsi_prev > 50) and (rsi_last <= 50) and (rsi_last >= TA_RSI_MIN_SHORT)
         if float(last["mfi"]) <= 20:
             return False
     if not rsi_ok:
@@ -5019,7 +4955,7 @@ def _trigger_15m(direction: str, df15i: pd.DataFrame, *, th: Optional[Dict[str, 
 
     if direction == "LONG":
         # avoid extremes: stay below upper band unless breakout is required
-        if bb_require_breakout:
+        if TA_BB_REQUIRE_BREAKOUT:
             # require cross above midline on the last candle
             if not (prev_close <= bb_mid and close > bb_mid):
                 return False
@@ -5027,7 +4963,7 @@ def _trigger_15m(direction: str, df15i: pd.DataFrame, *, th: Optional[Dict[str, 
             if not (close > bb_mid and close < bb_high):
                 return False
     else:
-        if bb_require_breakout:
+        if TA_BB_REQUIRE_BREAKOUT:
             if not (prev_close >= bb_mid and close < bb_mid):
                 return False
         else:
@@ -5037,10 +4973,11 @@ def _trigger_15m(direction: str, df15i: pd.DataFrame, *, th: Optional[Dict[str, 
     # Volume activity: require above-average volume
     vol = float(last.get("volume", 0.0) or 0.0)
     vol_sma = float(last["vol_sma20"])
-    if vol_sma > 0 and vol < vol_sma * min_vol_x:
+    if vol_sma > 0 and vol < vol_sma * TA_MIN_VOL_X:
         return False
 
     return True
+
 
 def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
@@ -5852,7 +5789,7 @@ def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
     score += 10
     return int(max(0, min(100, score)))
 
-def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, *, require_1h_trend: Optional[bool] = None, trigger_th: Optional[Dict[str, Any]] = None, apply_trigger: bool = True) -> Optional[Dict[str, Any]]:
+def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """Compute direction + levels + TA snapshot for one exchange using 15m/1h/4h OHLCV."""
     if df15.empty or df1h.empty or df4h.empty:
         return None
@@ -5867,7 +5804,7 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     # Multi-timeframe confirmation (configurable)
     if dir4 is None:
         return None
-    if (MAIN_TA_REQUIRE_1H_TREND if require_1h_trend is None else bool(require_1h_trend)):
+    if TA_REQUIRE_1H_TREND:
         if dir1 is None or dir4 != dir1:
             return None
     else:
@@ -5912,9 +5849,8 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     bb_pos = _bb_position(entry, bb_low, bb_mid, bb_high)
 
     # Strict-ish trigger on 15m (uses ENV thresholds)
-    if apply_trigger:
-        if not _trigger_15m(dir1, df15i, th=(trigger_th or MAIN_TRIGGER_THRESHOLDS)):
-            return None
+    if not _trigger_15m(dir1, df15i):
+        return None
 
     score = _ta_score(
         direction=dir1,
@@ -5959,7 +5895,7 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
         "support": support,
         "resistance": resistance,
     }
-    ta
+    return ta
 
 def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
@@ -7181,10 +7117,10 @@ class Backend:
                                     df15 = await api.klines_mexc(sym, "15m", 200)
                                     df1h = await api.klines_mexc(sym, "1h", 200)
                                     df4h = await api.klines_mexc(sym, "4h", 200)
-                                res = evaluate_on_exchange(df15, df1h, df4h, apply_trigger=False)
-                                return name, res, df15
+                                res = evaluate_on_exchange(df15, df1h, df4h)
+                                return name, res
                             except Exception:
-                                return name, None, None
+                                return name, None
 
                         results = await asyncio.gather(
                             fetch_exchange("BINANCE"),
@@ -7193,20 +7129,7 @@ class Backend:
                             fetch_exchange("GATEIO"),
                             fetch_exchange("MEXC"),
                         )
-                        good: List[Tuple[str, Dict[str, Any]]] = []
-                        for (name, r, _df15) in results:
-                            if r is None or _df15 is None:
-                                continue
-                            try:
-                                _mkt = choose_market(float(r.get("adx1", 0.0) or 0.0), float(r.get("atr_pct", 0.0) or 0.0))
-                                _th = MAIN_TRIGGER_THRESHOLDS_FUTURES if _mkt == "FUTURES" else MAIN_TRIGGER_THRESHOLDS_SPOT
-                                _df15i = _add_indicators(_df15)
-                                if not _trigger_15m(str(r.get("direction") or ""), _df15i, th=_th):
-                                    continue
-                                good.append((name, r))
-                            except Exception:
-                                continue
-
+                        good = [(name, r) for (name, r) in results if r is not None]
                         if not good:
                             continue
 
@@ -7228,7 +7151,7 @@ class Backend:
                         market = choose_market(float(best_r.get("adx1", 0.0) or 0.0),
                                               float(best_r.get("atr_pct", 0.0) or 0.0))
                         
-                        min_conf = MAIN_TA_MIN_SCORE_FUTURES if market == "FUTURES" else MAIN_TA_MIN_SCORE_SPOT
+                        min_conf = TA_MIN_SCORE_FUTURES if market == "FUTURES" else TA_MIN_SCORE_SPOT
 
 # Orderbook confirmation (FUTURES only, enabled via ENV)
                         if USE_ORDERBOOK and (not ORDERBOOK_FUTURES_ONLY or market == "FUTURES"):
