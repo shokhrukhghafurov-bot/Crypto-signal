@@ -4042,6 +4042,13 @@ MAIN_TA_MIN_SCORE_FUTURES = max(0, min(100, _env_int("MAIN_TA_MIN_SCORE_FUTURES"
 
 MAIN_TA_MIN_ADX = max(0.0, _env_float("MAIN_TA_MIN_ADX", 22.0 if MAIN_SIGNAL_MODE == "strict" else 17.0))
 MAIN_TA_MIN_VOL_X = max(0.5, _env_float("MAIN_TA_MIN_VOL_X", 1.25 if MAIN_SIGNAL_MODE == "strict" else 1.05))
+
+# Optional per-market overrides for MAIN (do NOT affect MID):
+# If not provided, they fall back to MAIN_TA_MIN_ADX / MAIN_TA_MIN_VOL_X.
+MAIN_TA_MIN_ADX_SPOT = max(0.0, _env_float("MAIN_TA_MIN_ADX_SPOT", MAIN_TA_MIN_ADX))
+MAIN_TA_MIN_ADX_FUTURES = max(0.0, _env_float("MAIN_TA_MIN_ADX_FUTURES", MAIN_TA_MIN_ADX))
+MAIN_TA_MIN_VOL_X_SPOT = max(0.5, _env_float("MAIN_TA_MIN_VOL_X_SPOT", MAIN_TA_MIN_VOL_X))
+MAIN_TA_MIN_VOL_X_FUTURES = max(0.5, _env_float("MAIN_TA_MIN_VOL_X_FUTURES", MAIN_TA_MIN_VOL_X))
 MAIN_TA_MIN_MACD_H = max(0.0, _env_float("MAIN_TA_MIN_MACD_H", 0.0 if MAIN_SIGNAL_MODE == "strict" else 0.0))
 MAIN_TA_BB_REQUIRE_BREAKOUT = _env_bool("MAIN_TA_BB_REQUIRE_BREAKOUT", True if MAIN_SIGNAL_MODE == "strict" else False)
 MAIN_TA_RSI_MAX_LONG = max(1.0, _env_float("MAIN_TA_RSI_MAX_LONG", 68.0 if MAIN_SIGNAL_MODE == "strict" else 72.0))
@@ -4049,14 +4056,25 @@ MAIN_TA_RSI_MIN_SHORT = max(0.0, _env_float("MAIN_TA_RSI_MIN_SHORT", 32.0 if MAI
 MAIN_TA_REQUIRE_1H_TREND = _env_bool("MAIN_TA_REQUIRE_1H_TREND", True if MAIN_SIGNAL_MODE == "strict" else False)
 
 # Convenience pack for MAIN trigger thresholds
-MAIN_TRIGGER_THRESHOLDS = {
-    "min_adx": MAIN_TA_MIN_ADX,
-    "min_vol_x": MAIN_TA_MIN_VOL_X,
+MAIN_TRIGGER_THRESHOLDS_SPOT = {
+    "min_adx": MAIN_TA_MIN_ADX_SPOT,
+    "min_vol_x": MAIN_TA_MIN_VOL_X_SPOT,
     "min_macd_h": MAIN_TA_MIN_MACD_H,
     "bb_require_breakout": MAIN_TA_BB_REQUIRE_BREAKOUT,
     "rsi_max_long": MAIN_TA_RSI_MAX_LONG,
     "rsi_min_short": MAIN_TA_RSI_MIN_SHORT,
 }
+MAIN_TRIGGER_THRESHOLDS_FUTURES = {
+    "min_adx": MAIN_TA_MIN_ADX_FUTURES,
+    "min_vol_x": MAIN_TA_MIN_VOL_X_FUTURES,
+    "min_macd_h": MAIN_TA_MIN_MACD_H,
+    "bb_require_breakout": MAIN_TA_BB_REQUIRE_BREAKOUT,
+    "rsi_max_long": MAIN_TA_RSI_MAX_LONG,
+    "rsi_min_short": MAIN_TA_RSI_MIN_SHORT,
+}
+
+# Backward-compatible alias (defaults to SPOT thresholds)
+MAIN_TRIGGER_THRESHOLDS = MAIN_TRIGGER_THRESHOLDS_SPOT
 
 COOLDOWN_MINUTES = max(1, _env_int("COOLDOWN_MINUTES", 180))
 
@@ -5834,7 +5852,7 @@ def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
     score += 10
     return int(max(0, min(100, score)))
 
-def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, *, require_1h_trend: Optional[bool] = None, trigger_th: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFrame, *, require_1h_trend: Optional[bool] = None, trigger_th: Optional[Dict[str, Any]] = None, apply_trigger: bool = True) -> Optional[Dict[str, Any]]:
     """Compute direction + levels + TA snapshot for one exchange using 15m/1h/4h OHLCV."""
     if df15.empty or df1h.empty or df4h.empty:
         return None
@@ -5894,8 +5912,9 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     bb_pos = _bb_position(entry, bb_low, bb_mid, bb_high)
 
     # Strict-ish trigger on 15m (uses ENV thresholds)
-    if not _trigger_15m(dir1, df15i, th=(trigger_th or MAIN_TRIGGER_THRESHOLDS)):
-        return None
+    if apply_trigger:
+        if not _trigger_15m(dir1, df15i, th=(trigger_th or MAIN_TRIGGER_THRESHOLDS)):
+            return None
 
     score = _ta_score(
         direction=dir1,
@@ -7162,10 +7181,10 @@ class Backend:
                                     df15 = await api.klines_mexc(sym, "15m", 200)
                                     df1h = await api.klines_mexc(sym, "1h", 200)
                                     df4h = await api.klines_mexc(sym, "4h", 200)
-                                res = evaluate_on_exchange(df15, df1h, df4h)
-                                return name, res
+                                res = evaluate_on_exchange(df15, df1h, df4h, apply_trigger=False)
+                                return name, res, df15
                             except Exception:
-                                return name, None
+                                return name, None, None
 
                         results = await asyncio.gather(
                             fetch_exchange("BINANCE"),
@@ -7174,7 +7193,20 @@ class Backend:
                             fetch_exchange("GATEIO"),
                             fetch_exchange("MEXC"),
                         )
-                        good = [(name, r) for (name, r) in results if r is not None]
+                        good: List[Tuple[str, Dict[str, Any]]] = []
+                        for (name, r, _df15) in results:
+                            if r is None or _df15 is None:
+                                continue
+                            try:
+                                _mkt = choose_market(float(r.get("adx1", 0.0) or 0.0), float(r.get("atr_pct", 0.0) or 0.0))
+                                _th = MAIN_TRIGGER_THRESHOLDS_FUTURES if _mkt == "FUTURES" else MAIN_TRIGGER_THRESHOLDS_SPOT
+                                _df15i = _add_indicators(_df15)
+                                if not _trigger_15m(str(r.get("direction") or ""), _df15i, th=_th):
+                                    continue
+                                good.append((name, r))
+                            except Exception:
+                                continue
+
                         if not good:
                             continue
 
