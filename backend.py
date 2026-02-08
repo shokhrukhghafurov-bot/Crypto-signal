@@ -1805,7 +1805,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     # Fallback order is user-defined (1->2->3...), and we ONLY trade on exchanges that confirmed the signal.
     if mt == "spot":
         # Parse confirmations like "BYBIT+OKX" to {"bybit","okx"}
-        conf_raw = str(getattr(sig, "confirmations", "") or "")
+        conf_raw = str((getattr(sig, "available_exchanges", "") or getattr(sig, "confirmations", "") or "")).strip()
         conf_set: set[str] = set()
         for part in re.split(r"[+ ,;/|]+", conf_raw.strip()):
             p = part.strip().lower()
@@ -1861,10 +1861,72 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             return {"ok": True, "skipped": True, "api_error": None}
         exchange = chosen
 
-    # FUTURES: only Binance/Bybit supported
+    # FUTURES: choose exchange based on where the futures contract actually exists
+    # (BINANCE/BYBIT/OKX). If the signal provides a list of executable futures venues
+    # in available_exchanges/confirmations, we enforce it. Otherwise we allow the
+    # user-selected exchange as a best-effort fallback.
     if mt == "futures":
-        if exchange not in ("binance", "bybit"):
+        fut_allowed = ["binance", "bybit", "okx"]
+
+        # Parse venues like "BINANCE+OKX" -> {"binance","okx"}
+        conf_raw = str((getattr(sig, "available_exchanges", "") or getattr(sig, "confirmations", "") or "")).strip()
+        conf_set: set[str] = set()
+        for part in re.split(r"[+ ,;/|]+", conf_raw.strip()):
+            p = part.strip().lower()
+            if not p:
+                continue
+            if p in ("binance", "bnb"):
+                conf_set.add("binance")
+            elif p in ("bybit", "byb"):
+                conf_set.add("bybit")
+            elif p in ("okx",):
+                conf_set.add("okx")
+
+        # Helper: does user have active futures keys for exchange?
+        async def _has_fut_keys(ex: str) -> bool:
+            try:
+                row = await db_store.get_autotrade_keys_row(user_id=uid, exchange=ex, market_type="futures")
+                if not row or not bool(row.get("is_active")):
+                    return False
+                if not (row.get("api_key_enc") and row.get("api_secret_enc")):
+                    return False
+                if ex == "okx" and not row.get("passphrase_enc"):
+                    return False
+                return True
+            except Exception:
+                return False
+
+        # Normalize invalid selection
+        if exchange not in fut_allowed:
             exchange = "binance"
+
+        # If we have a confirmed list, enforce it
+        if conf_set:
+            # Try user's selected exchange first
+            if (exchange in conf_set) and (await _has_fut_keys(exchange)):
+                pass
+            else:
+                chosen = None
+                for ex in fut_allowed:
+                    if ex not in conf_set:
+                        continue
+                    if await _has_fut_keys(ex):
+                        chosen = ex
+                        break
+                if not chosen:
+                    return {"ok": True, "skipped": True, "api_error": None}
+                exchange = chosen
+        else:
+            # No confirmations in signal (old signals / compatibility): just require keys on selected exchange.
+            if not (await _has_fut_keys(exchange)):
+                chosen = None
+                for ex in fut_allowed:
+                    if await _has_fut_keys(ex):
+                        chosen = ex
+                        break
+                if not chosen:
+                    return {"ok": True, "skipped": True, "api_error": None}
+                exchange = chosen
 
     # amounts
     spot_amt = float(st.get("spot_amount_per_trade") or 0.0)
@@ -7186,7 +7248,10 @@ class Backend:
                             except Exception:
                                 return False
 
-                        _ex_order = ["BINANCE", "OKX", "BYBIT"] if market == "FUTURES" else ["GATEIO", "BINANCE", "OKX", "BYBIT", "MEXC"]
+                        # Exchanges where the instrument exists for the given market.
+                        # FUTURES: only executable futures venues (Binance/Bybit/OKX)
+                        # SPOT: full supported set (Binance/Bybit/OKX/GateIO/MEXC)
+                        _ex_order = ["BINANCE", "BYBIT", "OKX"] if market == "FUTURES" else ["BINANCE", "BYBIT", "OKX", "GATEIO", "MEXC"]
                         _oks = await asyncio.gather(*[_pair_exists(x) for x in _ex_order])
                         _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
                         if not _pair_exchanges:
@@ -7208,9 +7273,7 @@ class Backend:
                             rr=rr,
                             confidence=conf,
                             confirmations=conf_names,
-                            # Source = where the scanner found the signal (TA is calculated on this exchange).
                             source_exchange=best_name,
-                            # Executable venues where the symbol exists (used for SPOT routing / display).
                             available_exchanges=conf_names,
                             risk_note="\\n".join(risk_notes).strip(),
                             ts=time.time(),
@@ -7385,15 +7448,17 @@ class Backend:
                             continue
 
                         best_name, best_r = max(supporters, key=lambda x: (float(x[1].get("confidence",0)), float(x[1].get("rr",0))))
-                        if require_align and str(best_r.get("dir1","")).upper() != str(best_r.get("dir4","")).upper():
+                        binance_r = next((r for n, r in supporters if n == "BINANCE"), None)
+                        base_r = binance_r or best_r
+                        if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
                             _mid_f_align += 1
                             continue
 
-                        conf = float(best_r.get("confidence",0) or 0)
-                        rr = float(best_r.get("rr",0) or 0)
-                        adx30 = float(best_r.get("adx1",0) or 0)
-                        adx1h = float(best_r.get("adx4",0) or 0)
-                        atrp = float(best_r.get("atr_pct",0) or 0)
+                        conf = float(base_r.get("confidence",0) or 0)
+                        rr = float(base_r.get("rr",0) or 0)
+                        adx30 = float(base_r.get("adx1",0) or 0)
+                        adx1h = float(base_r.get("adx4",0) or 0)
+                        atrp = float(base_r.get("atr_pct",0) or 0)
 
                         if min_adx_30m and adx30 < min_adx_30m:
                             _mid_f_adx += 1
@@ -7420,18 +7485,18 @@ class Backend:
                             _mid_f_rr += 1
                             continue
 
-                        direction = str(best_r.get("direction","")).upper()
-                        entry = float(best_r["entry"]); sl = float(best_r["sl"])
-                        tp1 = float(best_r["tp1"]); tp2 = float(best_r["tp2"])
+                        direction = str(base_r.get("direction","")).upper()
+                        entry = float(base_r["entry"]); sl = float(base_r["sl"])
+                        tp1 = float(base_r["tp1"]); tp2 = float(base_r["tp2"])
                         # --- HARD MID filters (TP2-first) ---
                         # 1) Volume must be real, иначе TP2 часто не добивает
-                        volx = float(best_r.get("rel_vol", 0.0) or 0.0)
+                        volx = float(base_r.get("rel_vol", 0.0) or 0.0)
                         if mid_min_vol_x and volx < mid_min_vol_x:
                             _mid_f_score += 1
                             continue
 
                         # 2) Must be on the correct side of VWAP + far enough from VWAP (avoid chop)
-                        vwap_val_num = float(best_r.get("vwap_val", 0.0) or 0.0)
+                        vwap_val_num = float(base_r.get("vwap_val", 0.0) or 0.0)
                         atr30 = abs(entry) * (abs(atrp) / 100.0) if entry > 0 else 0.0
                         if vwap_val_num > 0 and atr30 > 0:
                             if mid_require_vwap_bias:
@@ -7457,7 +7522,7 @@ class Backend:
 
                         
                         # Policy: SPOT + SHORT is confusing (spot has no short). Auto-convert to FUTURES.
-                        risk_note = _fmt_ta_block_mid(best_r, mode)
+                        risk_note = _fmt_ta_block_mid(base_r, mode)
                         if market == "SPOT" and str(direction).upper() == "SHORT":
                             fut_forced_off = (not allow_futures) or (news_act == "FUTURES_OFF") or (mac_act == "FUTURES_OFF")
                             if fut_forced_off:
@@ -7498,7 +7563,8 @@ class Backend:
                             except Exception:
                                 return False
 
-                        _ex_order = ['BINANCE', 'OKX', 'BYBIT'] if market == 'FUTURES' else ['GATEIO', 'BINANCE', 'OKX', 'BYBIT', 'MEXC']
+                        # Exchanges where the instrument exists for the given market.
+                        _ex_order = ['BINANCE', 'BYBIT', 'OKX'] if market == 'FUTURES' else ['BINANCE', 'BYBIT', 'OKX', 'GATEIO', 'MEXC']
                         _oks = await asyncio.gather(*[_pair_exists(x) for x in _ex_order])
                         _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
                         if not _pair_exchanges:
