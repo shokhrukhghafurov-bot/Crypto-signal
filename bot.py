@@ -1239,12 +1239,11 @@ def autotrade_keys_kb(uid: int) -> types.InlineKeyboardMarkup:
 
 
 def _signal_text(uid: int, s: Signal, *, autotrade_hint: str = "") -> str:
-    # Market banner stays the same (SPOT/FUTURES). Header distinguishes MAIN vs MID.
+    header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
     market_banner = tr(uid, 'sig_spot_new') if s.market == 'SPOT' else tr(uid, 'sig_fut_new')
+    # ⚡ MID tag (only for MID timeframe; does not affect old signals)
     if getattr(s, 'timeframe', '') == '5m/30m/1h':
-        header = tr(uid, 'sig_mid_trend_tag')
-    else:
-        header = tr(uid, 'sig_main_trend_tag')
+        header = f"{tr(uid, 'sig_mid_trend_tag')}\n{header}"
 
 
     # Visual marker near symbol (kept simple to avoid hard-depending on any exchange)
