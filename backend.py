@@ -7123,12 +7123,12 @@ class Backend:
                                 return name, None
 
                         # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
-                        _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
-                        scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
-                        if not scan_exchanges:
-                            scan_exchanges = ['BINANCE','BYBIT','OKX','GATEIO','MEXC']
-                        
-                        results = await asyncio.gather(*[fetch_exchange(ex) for ex in scan_exchanges])
+_scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
+scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
+if not scan_exchanges:
+    scan_exchanges = ['BINANCE','BYBIT','OKX','GATEIO','MEXC']
+
+results = await asyncio.gather(*[fetch_exchange(ex) for ex in scan_exchanges])
                         good = [(name, r) for (name, r) in results if r is not None]
                         if not good:
                             continue
