@@ -4625,12 +4625,7 @@ async def main() -> None:
     else:
         logger.warning("Backend has no track_loop; skipping")
     logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
-    # MAIN scanner can be disabled independently (useful when you want MID-only mode).
-    main_enabled = os.getenv('MAIN_SCANNER_ENABLED', '1').strip().lower() not in ('0','false','no','off')
-    if main_enabled:
-        asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
-    else:
-        logger.warning("MAIN_SCANNER_ENABLED=0 -> main scanner_loop disabled (MID-only mode)")
+    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
     # ⚡ MID TREND scanner (5m/30m/1h) - optional, does not affect the main scanner
     mid_enabled = os.getenv('MID_SCANNER_ENABLED', '1').strip().lower() not in ('0','false','no','off')
     if mid_enabled:
