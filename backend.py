@@ -219,6 +219,100 @@ from cryptography.fernet import Fernet
 
 logger = logging.getLogger("crypto-signal")
 
+
+# ===================== TRAP FILTERS (v5 relaxed) =====================
+# Anti-trap structural filters to reduce entries into common reversal zones:
+# Works for LONG/SHORT and SPOT/FUTURES (logic is direction-mirrored).
+
+TRAP_NEAR_EXTREME_ATR = float(os.getenv("TRAP_NEAR_EXTREME_ATR", "0.9"))
+TRAP_WICK_RATIO = float(os.getenv("TRAP_WICK_RATIO", "0.80"))
+TRAP_WICK_MIN_HITS = int(os.getenv("TRAP_WICK_MIN_HITS", "3"))
+TRAP_IMPULSE_STREAK = int(os.getenv("TRAP_IMPULSE_STREAK", "7"))
+TRAP_SPIKE_ATR_MULT = float(os.getenv("TRAP_SPIKE_ATR_MULT", "3.0"))
+TRAP_POST_RANGE_FRAC = float(os.getenv("TRAP_POST_RANGE_FRAC", "0.45"))
+
+def _trap_check_1h(df_1h: pd.DataFrame, entry: float, atr_1h: float, direction: str) -> tuple[bool, str]:
+    """Return (blocked, reason) based on 1H structure."""
+    try:
+        if df_1h is None or df_1h.empty:
+            return False, "no_df"
+        highs = df_1h["high"].astype(float).values
+        lows = df_1h["low"].astype(float).values
+        opens = df_1h["open"].astype(float).values
+        closes = df_1h["close"].astype(float).values
+
+        if len(highs) < 25:
+            return False, "short_hist"
+
+        atr = float(atr_1h or 0.0)
+        if atr <= 0:
+            return False, "no_atr"
+
+        d = (direction or "").upper().strip()
+        if d not in ("LONG", "SHORT"):
+            return False, "bad_dir"
+
+        # 1) Near local extreme (last ~20 bars)
+        recent_high = float(max(highs[-20:]))
+        recent_low = float(min(lows[-20:]))
+        if d == "LONG":
+            if (recent_high - float(entry)) <= (TRAP_NEAR_EXTREME_ATR * atr):
+                return True, "near_1h_high"
+        else:
+            if (float(entry) - recent_low) <= (TRAP_NEAR_EXTREME_ATR * atr):
+                return True, "near_1h_low"
+
+        # 2) Wick liquidity (last 3 bars; count hits)
+        wick_hits = 0
+        for i in range(-3, 0):
+            body = abs(float(closes[i]) - float(opens[i])) + 1e-9
+            upper_wick = float(highs[i]) - max(float(opens[i]), float(closes[i]))
+            lower_wick = min(float(opens[i]), float(closes[i])) - float(lows[i])
+            if d == "LONG":
+                if (upper_wick / body) > TRAP_WICK_RATIO:
+                    wick_hits += 1
+            else:
+                if (lower_wick / body) > TRAP_WICK_RATIO:
+                    wick_hits += 1
+        if wick_hits >= TRAP_WICK_MIN_HITS:
+            return True, "wick_liquidity"
+
+        # 3) Post-impulse streak (last N bars same color)
+        streak = 0
+        for i in range(-TRAP_IMPULSE_STREAK, 0):
+            if d == "LONG" and float(closes[i]) > float(opens[i]):
+                streak += 1
+            elif d == "SHORT" and float(closes[i]) < float(opens[i]):
+                streak += 1
+        if streak >= TRAP_IMPULSE_STREAK:
+            return True, "post_impulse"
+
+        # 4) Weak high/low (pierce then fail to hold on close)
+        prev_high = float(highs[-6])
+        prev_low = float(lows[-6])
+        if d == "LONG":
+            if float(highs[-3]) > prev_high and float(closes[-3]) < prev_high:
+                return True, "weak_high"
+        else:
+            if float(lows[-3]) < prev_low and float(closes[-3]) > prev_low:
+                return True, "weak_low"
+
+        # 5) Spike -> range (distribution after abnormal impulse)
+        spike_range = float(highs[-5]) - float(lows[-5])
+        if spike_range > (TRAP_SPIKE_ATR_MULT * atr):
+            small = 0
+            for i in range(-4, -1):
+                r = float(highs[i]) - float(lows[i])
+                if r < (TRAP_POST_RANGE_FRAC * spike_range):
+                    small += 1
+            if small >= 2:
+                return True, "spike_range"
+
+        return False, "ok"
+    except Exception:
+        return False, "error"
+
+
 # ------------------ Stablecoin pair blocking (scanner + autotrade) ------------------
 # Blocks stable-vs-stable pairs like USDCUSDT / DAIUSDT / USD1USDT, etc.
 # Configure:
@@ -5038,6 +5132,16 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
     atr_pct = (atr30 / entry) * 100.0
 
+    # --- TRAP filters (1H structure) ---
+    atr1h = float(last1h.get("atr", np.nan))
+    if np.isnan(atr1h) or atr1h <= 0:
+        atr1h = float(atr30) if (atr30 and not np.isnan(atr30)) else 0.0
+    blocked, reason = _trap_check_1h(df1hi, entry, atr1h, dir_trend)
+    if blocked:
+        _log_rate_limited(f"trap_mid:{dir_trend}", f"[TRAP][MID] blocked {dir_trend} reason={reason}", every_s=30, level="debug")
+        return None
+
+
     # Quality gate: avoid choppy markets (helps TP2 hit-rate)
     try:
         allow_range = os.getenv("MID_ALLOW_RANGE", "0").strip().lower() not in ("0","false","no","off")
@@ -6027,6 +6131,13 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     atr = float(last1h.get("atr", np.nan))
     if np.isnan(atr) or atr <= 0:
         return None
+
+    # --- TRAP filters (1H structure) ---
+    blocked, reason = _trap_check_1h(df1hi, entry, atr, dir1)
+    if blocked:
+        _log_rate_limited(f"trap_main:{dir1}", f"[TRAP][MAIN] blocked {dir1} reason={reason}", every_s=30, level="debug")
+        return None
+
 
     atr_pct = (atr / entry) * 100.0 if entry > 0 else 0.0
     tp2_r = _adaptive_tp2_r(adx1)
