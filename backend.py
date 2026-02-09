@@ -2915,6 +2915,58 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
         except Exception:
             return None, None
 
+   
+
+    # One-time fast self-heal (at startup): populate meta.ref from api_order_ref for all OPEN positions.
+    async def _meta_selfheal_once() -> None:
+        try:
+            rows0 = await db_store.list_open_autotrade_positions(limit=500)
+        except Exception:
+            return
+        for rr in rows0 or []:
+            try:
+                ref0 = json.loads(rr.get("api_order_ref") or "{}")
+            except Exception:
+                continue
+
+            meta0 = {}
+            try:
+                mr = rr.get("meta")
+                if isinstance(mr, str):
+                    meta0 = json.loads(mr or "{}") or {}
+                elif isinstance(mr, dict):
+                    meta0 = dict(mr)
+            except Exception:
+                meta0 = {}
+
+            try:
+                if meta0.get("ref"):
+                    continue
+                src_ref = ""
+                for k in (
+                    "ref",
+                    "order_ref",
+                    "client_order_ref",
+                    "clientOrderId",
+                    "client_order_id",
+                    "orderLinkId",
+                    "order_link_id",
+                ):
+                    v = ref0.get(k)
+                    if v is not None and str(v).strip():
+                        src_ref = str(v).strip()
+                        break
+                if src_ref:
+                    # merge-patch only (keep any existing meta fields)
+                    await db_store.update_autotrade_position_meta(row_id=int(rr.get("id") or 0), meta={"ref": src_ref}, replace=False)
+            except Exception:
+                pass
+
+    try:
+        await _meta_selfheal_once()
+    except Exception:
+        pass
+
     # Best-effort; never crash.
     while True:
         try:
