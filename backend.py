@@ -2927,6 +2927,41 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     is_mid = (kind.upper() == "MID") or _is_mid_tf(tf)
                 except Exception:
                     continue
+
+                # --- Meta (persistent per-position extra state) ---
+                meta = {}
+                try:
+                    meta_raw = r.get("meta")
+                    if isinstance(meta_raw, str):
+                        meta = json.loads(meta_raw or "{}") or {}
+                    elif isinstance(meta_raw, dict):
+                        meta = dict(meta_raw)
+                    else:
+                        meta = {}
+                except Exception:
+                    meta = {}
+
+                # --- Self-heal: if meta.ref is empty, copy from api_order_ref (slow migration without manual scripts) ---
+                try:
+                    if not (meta.get("ref") or ""):
+                        src_ref = ""
+                        for k in ("ref", "order_ref", "client_order_ref", "clientOrderId", "client_order_id", "orderLinkId", "order_link_id"):
+                            v = ref.get(k)
+                            if v is not None and str(v).strip():
+                                src_ref = str(v).strip()
+                                break
+                        if src_ref:
+                            meta["ref"] = src_ref
+                            try:
+                                await db_store.update_autotrade_position_meta(row_id=int(r.get("id") or 0), meta=json.dumps(meta))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                # Keep in-memory copy (used later in this loop)
+                r["meta"] = meta
+
                 ex = str(ref.get("exchange") or r.get("exchange") or "").lower()
                 if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
                     continue
