@@ -1769,6 +1769,26 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     st = await db_store.get_autotrade_settings(uid)
     mt = "spot" if market == "SPOT" else "futures"
 
+
+    # Extract TA extras (ATR 5m) from confirmations JSON for smarter manager (trailing, near-TP2).
+    def _sig_ta_float(name: str) -> float:
+        try:
+            raw = getattr(sig, "confirmations", "") or ""
+            if not raw:
+                return 0.0
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(data, dict):
+                # Some deployments store {"ta": {...}}; others store TA dict directly.
+                ta = data.get("ta") if isinstance(data.get("ta"), dict) else data
+                v = ta.get(name, 0.0) if isinstance(ta, dict) else 0.0
+                return float(v or 0.0)
+        except Exception:
+            return 0.0
+        return 0.0
+
+    atr5_sig = _sig_ta_float("atr5")
+    atr5_pct_sig = _sig_ta_float("atr5_pct")
+    atr_pct_sig = _sig_ta_float("atr_pct")
     # --- Admin gate (like SIGNAL): global per-user Auto-trade allow/deny + expiry ---
     # This is independent from per-market toggles in autotrade_settings.
     # If disabled/expired/blocked -> skip silently.
@@ -2082,6 +2102,9 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                     "signal_kind": ("MID" if _is_mid_signal(sig) else "MAIN"),
                     "market_type": mt,
                     "symbol": symbol,
+                "atr_pct": float(atr_pct_sig) if mt == "futures" else 0.0,
+                "atr5": float(atr5_sig) if mt == "futures" else 0.0,
+                "atr5_pct": float(atr5_pct_sig) if mt == "futures" else 0.0,
                     "direction": direction,
                     "side": side,
                     "close_side": ("SELL" if str(side).upper() == "BUY" else "BUY"),
@@ -2200,6 +2223,9 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 "market_type": mt,
                 "category": category,
                 "symbol": symbol,
+                "atr_pct": float(atr_pct_sig) if mt == "futures" else 0.0,
+                "atr5": float(atr5_sig) if mt == "futures" else 0.0,
+                "atr5_pct": float(atr5_pct_sig) if mt == "futures" else 0.0,
                 "side": side,
                 "close_side": close_side,
                 "entry_order_id": str(order_id) if order_id else None,
@@ -2276,6 +2302,9 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 "exchange": exchange,
                 "market_type": "spot",
                 "symbol": symbol,
+                "atr_pct": float(atr_pct_sig) if mt == "futures" else 0.0,
+                "atr5": float(atr5_sig) if mt == "futures" else 0.0,
+                "atr5_pct": float(atr5_pct_sig) if mt == "futures" else 0.0,
                 "side": "BUY",
                 "close_side": "SELL",
                 "virtual": True,
@@ -2362,6 +2391,9 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                     "exchange": "binance",
                     "market_type": "spot",
                     "symbol": symbol,
+                "atr_pct": float(atr_pct_sig) if mt == "futures" else 0.0,
+                "atr5": float(atr5_sig) if mt == "futures" else 0.0,
+                "atr5_pct": float(atr5_pct_sig) if mt == "futures" else 0.0,
                     "direction": direction,
                     "side": "BUY",
                     "close_side": "SELL",
@@ -2428,6 +2460,9 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 "exchange": "binance",
                 "market_type": "spot",
                 "symbol": symbol,
+                "atr_pct": float(atr_pct_sig) if mt == "futures" else 0.0,
+                "atr5": float(atr5_sig) if mt == "futures" else 0.0,
+                "atr5_pct": float(atr5_pct_sig) if mt == "futures" else 0.0,
                 "side": "BUY",
                 "entry_order_id": entry_res.get("orderId"),
                 "sl_order_id": sl_res.get("orderId"),
@@ -2491,6 +2526,9 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 "exchange": "binance",
                 "market_type": "futures",
                 "symbol": symbol,
+                "atr_pct": float(atr_pct_sig) if mt == "futures" else 0.0,
+                "atr5": float(atr5_sig) if mt == "futures" else 0.0,
+                "atr5_pct": float(atr5_pct_sig) if mt == "futures" else 0.0,
                 "direction": direction,
                 "side": side.upper(),
                 "close_side": ("SELL" if side.upper() == "BUY" else "BUY"),
@@ -2577,6 +2615,9 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             "exchange": "binance",
             "market_type": "futures",
             "symbol": symbol,
+                "atr_pct": float(atr_pct_sig) if mt == "futures" else 0.0,
+                "atr5": float(atr5_sig) if mt == "futures" else 0.0,
+                "atr5_pct": float(atr5_pct_sig) if mt == "futures" else 0.0,
             "side": side,
             "close_side": close_side,
             "entry_order_id": entry_res.get("orderId"),
@@ -3296,6 +3337,47 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             ref["best_px"] = float(best_px)
                             dirty = True
 
+                    # --- OPTIONAL trailing stop after TP1 (uses ATR(5m) if available) ---
+                    TRAIL_AFTER_TP1 = (os.getenv("SMART_TRAIL_AFTER_TP1", "0").strip().lower() not in ("0","false","no","off"))
+                    TRAIL_ATR_MULT  = float(os.getenv("SMART_TRAIL_ATR_MULT", "1.30") or 1.30)
+                    TRAIL_CONFIRM_SEC = float(os.getenv("SMART_TRAIL_CONFIRM_SEC", "2") or 2)
+                    # Prefer ATR(5m) from signal; fallback to ATR% (30m) stored on ref (if present)
+                    atr5_ref = float(ref.get("atr5") or 0.0)
+                    if atr5_ref <= 0 and entry_p > 0:
+                        try:
+                            atrp = float(ref.get("atr_pct") or 0.0)
+                            atr5_ref = (atrp / 100.0) * entry_p if atrp > 0 else 0.0
+                        except Exception:
+                            atr5_ref = 0.0
+
+                    if TRAIL_AFTER_TP1 and atr5_ref > 0 and bool(ref.get("tp1_seen")):
+                        # activate only after TP1 decision (partial or hold); protect profits on pullback
+                        if direction == "LONG":
+                            trail_px = float(best_px) - (max(0.5, TRAIL_ATR_MULT) * float(atr5_ref))
+                        else:
+                            trail_px = float(best_px) + (max(0.5, TRAIL_ATR_MULT) * float(atr5_ref))
+                        if trail_px > 0:
+                            ref["trail_px"] = float(trail_px)
+                            # track how long price stayed beyond trail
+                            t_first = float(ref.get("trail_first_ts") or 0.0)
+                            hit_trail = (px <= trail_px) if direction == "LONG" else (px >= trail_px)
+                            if hit_trail:
+                                if t_first <= 0:
+                                    ref["trail_first_ts"] = float(now_ts)
+                                    dirty = True
+                                elif (now_ts - t_first) >= TRAIL_CONFIRM_SEC:
+                                    # close remaining qty (market reduce-only)
+                                    try:
+                                        await _close_market(qty)
+                                    except Exception as e:
+                                        _log_rate_limited(f"smart_trail_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] trail close failed {ex}/{mt} {symbol}: {e}", every_s=30, level="warning")
+                                    ref["sm_state"] = "TRAIL_EXIT"
+                                    dirty = True
+                            else:
+                                if t_first != 0.0:
+                                    ref["trail_first_ts"] = 0.0
+                                    dirty = True
+
                     # Update momentum anchor price every MOM_WINDOW_SEC
                     if (now_ts - last_px_ts) >= max(5.0, MOM_WINDOW_SEC):
                         ref["last_px"] = float(px)
@@ -3312,8 +3394,6 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         ref["armed_sl"] = True
                         ref["sm_state"] = "PROTECT"
                         dirty = True
-                            dirty = True
-
                     # Reversal exit (close near the top/bottom when retrace starts)
                     if entry_p > 0 and best_px > 0:
                         if direction == "LONG":
@@ -5440,6 +5520,23 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     atr_pct = (atr30 / entry) * 100.0
 
 
+
+    # ATR on 5m (for smart trailing / near-TP2 logic in autotrade manager)
+    atr5 = float(last5.get("atr", np.nan))
+    if np.isnan(atr5) or atr5 <= 0:
+        try:
+            hi = df5i["high"].astype(float)
+            lo = df5i["low"].astype(float)
+            cl = df5i["close"].astype(float)
+            prev = cl.shift(1)
+            tr = np.maximum(hi - lo, np.maximum((hi - prev).abs(), (lo - prev).abs()))
+            atr5 = float(tr.rolling(14).mean().iloc[-1])
+        except Exception:
+            atr5 = 0.0
+    if np.isnan(atr5) or atr5 <= 0:
+        atr5 = 0.0
+    atr5_pct = (atr5 / entry) * 100.0 if entry > 0 else 0.0
+
     # MID structural trap filters (apply to LONG/SHORT, SPOT/FUTURES)
     ok_trap, trap_reason = _mid_structure_trap_ok(direction=dir_trend, entry=entry, df1hi=df1hi)
     if not ok_trap:
@@ -5650,7 +5747,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         mstruct=mstruct,
         pat_bias=pat_bias,
         atr_pct=atr_pct,
-    )
+)
     confidence = ta_score
 
     ta: Dict[str, Any] = {
@@ -5669,6 +5766,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "adx4": adx1h,
         "atr_pct": atr_pct,
 
+        "atr5": atr5,
+        "atr5_pct": atr5_pct,
         # MID TA block fields
         "rsi": rsi5,
         "macd_hist": macd_hist5,
