@@ -3322,11 +3322,17 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     # Goals:
                     # 1) If structure SL is broken -> close (decisive)
                     # 2) Avoid one-tick / one-wick false SL (confirmation)
-                    # 3) Keep HARD SL as emergency fallback
+                    # 3) If price quickly reclaims above SL (noise sweep) -> do NOT close
+                    # 4) Keep HARD SL as emergency fallback
                     SL_CONFIRM_LAST = int(os.getenv("SMART_SL_CONFIRM_LAST", "3") or 3)
                     SL_CONFIRM_HITS = int(os.getenv("SMART_SL_CONFIRM_HITS", "2") or 2)
                     SL_CONFIRM_SEC  = float(os.getenv("SMART_SL_CONFIRM_SEC", "3") or 3)
                     SL_DEEP_PCT     = float(os.getenv("SMART_SL_DEEP_PCT", "0.15") or 0.15)
+
+                    # Noise-sweep protection: allow quick reclaim above SL within grace window
+                    SL_GRACE_SEC    = float(os.getenv("SMART_SL_GRACE_SEC", "6") or 6)
+                    SL_RECLAIM_PCT  = float(os.getenv("SMART_SL_RECLAIM_PCT", "0.04") or 0.04)  # reclaim buffer around SL
+                    SL_BOUNCE_PCT   = float(os.getenv("SMART_SL_BOUNCE_PCT", "0.10") or 0.10)    # bounce from breach extreme
 
                     sl_struct = float(sl or 0.0)
                     sl_hard   = float(hard_sl or 0.0)
@@ -3343,10 +3349,18 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             return False
                         return (px <= sl_struct) if direction == "LONG" else (px >= sl_struct)
 
+                    def _reclaimed() -> bool:
+                        if sl_struct <= 0:
+                            return False
+                        # Price back inside with a tiny buffer to avoid flicker around SL
+                        if direction == "LONG":
+                            return px >= sl_struct * (1.0 + SL_RECLAIM_PCT / 100.0)
+                        else:
+                            return px <= sl_struct * (1.0 - SL_RECLAIM_PCT / 100.0)
+
                     def _deep_breach() -> bool:
                         if sl_struct <= 0 or entry_p <= 0:
                             return False
-                        # Deep breach measured as distance beyond SL vs entry (percent)
                         if direction == "LONG":
                             d = (sl_struct - px)
                         else:
@@ -3355,36 +3369,72 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             return False
                         return (d / entry_p) * 100.0 >= SL_DEEP_PCT
 
-                    # Update confirmation state
+                    # Update breach tracking state
                     sl_hits = int(ref.get("sl_hits") or 0)
                     sl_first_ts = float(ref.get("sl_first_ts") or 0.0)
+                    sl_extreme = float(ref.get("sl_extreme") or 0.0)  # lowest px for LONG breach, highest for SHORT breach
 
                     crossed = _hit_struct()
+
                     if crossed:
                         if sl_first_ts <= 0:
                             sl_first_ts = now_ts
+                            # init extreme
+                            sl_extreme = px
+                        # update extreme
+                        if direction == "LONG":
+                            sl_extreme = min(sl_extreme, px) if sl_extreme else px
+                        else:
+                            sl_extreme = max(sl_extreme, px) if sl_extreme else px
                         sl_hits += 1
                         ref["sl_hits"] = int(sl_hits)
                         ref["sl_first_ts"] = float(sl_first_ts)
+                        ref["sl_extreme"] = float(sl_extreme)
                         dirty = True
                     else:
-                        if sl_hits != 0 or sl_first_ts != 0.0:
+                        # If we reclaimed quickly after a sweep, reset immediately
+                        if sl_hits != 0 or sl_first_ts != 0.0 or sl_extreme != 0.0:
                             ref["sl_hits"] = 0
                             ref["sl_first_ts"] = 0.0
+                            ref["sl_extreme"] = 0.0
                             dirty = True
 
-                    # Decide close: hard SL OR deep breach OR confirmed structural breach
+                    # Decide close:
+                    # - HARD SL: immediate (failsafe)
+                    # - Deep breach: immediate
+                    # - Otherwise: require confirmation AND no quick reclaim/bounce within grace window
                     sl_close = False
                     if _hit_hard():
                         sl_close = True
                     elif crossed and _deep_breach():
                         sl_close = True
                     elif crossed:
-                        # Confirm by hits or time-under
-                        if sl_hits >= SL_CONFIRM_HITS:
-                            sl_close = True
-                        elif sl_first_ts > 0 and (now_ts - sl_first_ts) >= SL_CONFIRM_SEC:
-                            sl_close = True
+                        # Grace: if price reclaims above SL quickly -> do not close
+                        age = (now_ts - sl_first_ts) if sl_first_ts > 0 else 0.0
+
+                        # bounce check: if price bounced enough from extreme AND reclaimed -> reset (noise sweep)
+                        bounced = False
+                        if sl_extreme and entry_p > 0:
+                            if direction == "LONG":
+                                # bounce up from lowest point
+                                bounced = ((px - sl_extreme) / entry_p) * 100.0 >= SL_BOUNCE_PCT
+                            else:
+                                bounced = ((sl_extreme - px) / entry_p) * 100.0 >= SL_BOUNCE_PCT
+
+                        if age <= SL_GRACE_SEC and (_reclaimed() or bounced):
+                            ref["sl_hits"] = 0
+                            ref["sl_first_ts"] = 0.0
+                            ref["sl_extreme"] = 0.0
+                            dirty = True
+                            sl_close = False
+                        else:
+                            # Confirm by hits or time-under (after grace window starts to matter)
+                            if sl_hits >= SL_CONFIRM_HITS:
+                                # require that we are past the minimal confirm sec OR past grace sec
+                                if age >= min(SL_CONFIRM_SEC, SL_GRACE_SEC):
+                                    sl_close = True
+                            elif sl_first_ts > 0 and age >= SL_CONFIRM_SEC and age >= SL_GRACE_SEC:
+                                sl_close = True
 
                     # --- SL (smart structural) ---
                     if sl_close:
