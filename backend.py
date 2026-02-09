@@ -2996,8 +2996,11 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
             roi = (pnl_net / alloc * 100.0) if alloc > 0 else None
             return float(pnl_net), (float(roi) if roi is not None else None)
         except Exception:
-        MID_LAST_FAIL_REASON.set('ind_fail')
-        return None, None
+            try:
+                MID_LAST_FAIL_REASON.set('ind_fail')
+            except Exception:
+                pass
+            return None, None
 
     # Best-effort; never crash.
     while True:
@@ -4832,8 +4835,11 @@ class MultiExchangeData:
             data = await self._get_json(url, params=params)
             return data if isinstance(data, dict) else None
         except Exception:
-        MID_LAST_FAIL_REASON.set('ind_fail')
-        return None
+            try:
+                MID_LAST_FAIL_REASON.set('ind_fail')
+            except Exception:
+                pass
+            return None
     async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
         _key = ('BYBIT', str(symbol).upper(), str(interval), int(limit))
         _cached = _candle_cache_get(_key)
@@ -5187,8 +5193,11 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             tr = np.maximum(hi - lo, np.maximum((hi - prev).abs(), (lo - prev).abs()))
             atr30 = float(tr.rolling(14).mean().iloc[-1])
         except Exception:
-        MID_LAST_FAIL_REASON.set('ind_fail')
-        return None
+            try:
+                MID_LAST_FAIL_REASON.set('ind_fail')
+            except Exception:
+                pass
+            return None
     if np.isnan(atr30) or atr30 <= 0:
         return None
 
@@ -6337,8 +6346,11 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             tr = np.maximum(hi - lo, np.maximum((hi - prev).abs(), (lo - prev).abs()))
             atr30 = float(tr.rolling(14).mean().iloc[-1])
         except Exception:
-        MID_LAST_FAIL_REASON.set('ind_fail')
-        return None
+            try:
+                MID_LAST_FAIL_REASON.set('ind_fail')
+            except Exception:
+                pass
+            return None
     if np.isnan(atr30) or atr30 <= 0:
         return None
 
@@ -6943,8 +6955,11 @@ class Backend:
             p = data.get("price") if isinstance(data, dict) else None
             return float(p) if p is not None else None
         except Exception:
-        MID_LAST_FAIL_REASON.set('ind_fail')
-        return None
+            try:
+                MID_LAST_FAIL_REASON.set('ind_fail')
+            except Exception:
+                pass
+            return None
 
     async def _fetch_bybit_price(self, market: str, symbol: str) -> float | None:
         """Bybit REST price (spot/futures). Uses V5 tickers.
@@ -6979,8 +6994,11 @@ class Backend:
             p = item.get("lastPrice") or item.get("indexPrice") or item.get("markPrice")
             return float(p) if p is not None else None
         except Exception:
-        MID_LAST_FAIL_REASON.set('ind_fail')
-        return None
+            try:
+                MID_LAST_FAIL_REASON.set('ind_fail')
+            except Exception:
+                pass
+            return None
 
 
     async def _fetch_okx_price(self, market: str, symbol: str) -> float | None:
@@ -7017,8 +7035,11 @@ class Backend:
             p = item.get("last") or item.get("lastPrice")
             return float(p) if p is not None else None
         except Exception:
-        MID_LAST_FAIL_REASON.set('ind_fail')
-        return None
+            try:
+                MID_LAST_FAIL_REASON.set('ind_fail')
+            except Exception:
+                pass
+            return None
 
 
     async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
