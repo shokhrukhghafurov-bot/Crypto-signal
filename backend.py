@@ -7720,6 +7720,7 @@ class Backend:
                         logger.info("SIGNAL %s %s %s conf=%s rr=%.2f notes=%s", sig.market, sig.symbol, sig.direction, sig.confidence, sig.rr, (sig.risk_note or "-"))
                         logger.info("SIGNAL found %s %s %s conf=%s rr=%.2f exch=%s", sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr), sig.confirmations)
                         await emit_signal_cb(sig)
+                        _mid_emitted += 1
                         await asyncio.sleep(2)
 
             except Exception:
@@ -7814,6 +7815,7 @@ class Backend:
                     _mid_f_adx = 0
                     _mid_f_atr = 0
                     _mid_f_futoff = 0
+                    _mid_nodata = 0
                     logger.info("[mid] tick start TOP_N=%s interval=%ss scanned=%s", top_n, interval, _mid_scanned)
                     mac_act, mac_ev, mac_win = self.macro.current_action()
                     self.last_macro_action = mac_act
@@ -7867,7 +7869,7 @@ class Backend:
                                 else:
                                     continue
                                 if a is None or b is None or c is None or a.empty or b.empty or c.empty:
-                                    no_data += 1
+                                    _mid_nodata += 1
                                     continue
                                 r = evaluate_on_exchange_mid(a, b, c)
                                 if r and r.get('_blocked'):
@@ -8025,15 +8027,16 @@ class Backend:
                         else:
                             self.last_futures_signal = sig
                         await emit_signal_cb(sig)
+                        _mid_emitted += 1
                         await asyncio.sleep(2)
             except Exception:
                 logger.exception("[mid] scanner_loop_mid error")
 
             elapsed = time.time() - start
             try:
-                logger.info("[mid] tick done scanned=%s emitted=%s blocked=%s cooldown=%s macro=%s news=%s align=%s score=%s rr=%s adx=%s atr=%s futoff=%s elapsed=%.1fs",
+                logger.info("[mid] tick done scanned=%s emitted=%s blocked=%s cooldown=%s macro=%s news=%s align=%s score=%s rr=%s adx=%s atr=%s futoff=%s nodata=%s elapsed=%.1fs",
                             _mid_scanned, _mid_emitted, _mid_skip_blocked, _mid_skip_cooldown, _mid_skip_macro, _mid_skip_news,
-                            _mid_f_align, _mid_f_score, _mid_f_rr, _mid_f_adx, _mid_f_atr, _mid_f_futoff, float(elapsed))
+                            _mid_f_align, _mid_f_score, _mid_f_rr, _mid_f_adx, _mid_f_atr, _mid_f_futoff, _mid_nodata, float(elapsed))
             except Exception:
                 pass
             await asyncio.sleep(max(1, interval - int(elapsed)))
