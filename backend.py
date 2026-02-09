@@ -5814,18 +5814,18 @@ def _trap_env_int(name: str, default: int) -> int:
         return int(default)
 
 _TRAP_ENABLED = os.getenv("TRAP_FILTER_ENABLED", "1").strip().lower() not in ("0","false","no","off")
-_TRAP_NEAR_EXTREME_ATR = _trap_env_float("TRAP_NEAR_EXTREME_ATR", 1.2)
-_TRAP_WICK_RATIO = _trap_env_float("TRAP_WICK_RATIO", 0.60)
+_TRAP_NEAR_EXTREME_ATR = _trap_env_float("TRAP_NEAR_EXTREME_ATR", 0.9)
+_TRAP_WICK_RATIO = _trap_env_float("TRAP_WICK_RATIO", 0.80)
 _TRAP_WICK_N = _trap_env_int("TRAP_WICK_N", 3)
-_TRAP_WICK_MIN_HITS = _trap_env_int("TRAP_WICK_MIN_HITS", 2)
-_TRAP_IMPULSE_STREAK = _trap_env_int("TRAP_IMPULSE_STREAK", 6)
+_TRAP_WICK_MIN_HITS = _trap_env_int("TRAP_WICK_MIN_HITS", 3)
+_TRAP_IMPULSE_STREAK = _trap_env_int("TRAP_IMPULSE_STREAK", 7)
 _TRAP_WEAK_EXTREME_LOOKBACK = _trap_env_int("TRAP_WEAK_EXTREME_LOOKBACK", 12)
-_TRAP_WEAK_PIERCE_EPS = _trap_env_float("TRAP_WEAK_PIERCE_EPS", 0.0010)  # 0.10%
-_TRAP_WEAK_HOLD_EPS = _trap_env_float("TRAP_WEAK_HOLD_EPS", 0.0003)      # 0.03%
+_TRAP_WEAK_PIERCE_EPS = _trap_env_float("TRAP_WEAK_PIERCE_EPS", 0.0015)  # 0.15%
+_TRAP_WEAK_HOLD_EPS = _trap_env_float("TRAP_WEAK_HOLD_EPS", 0.0001)      # 0.01%
 
 # Spike → Range (distribution) trap
-_TRAP_SPIKE_ATR_MULT = _trap_env_float("TRAP_SPIKE_ATR_MULT", 2.5)
-_TRAP_POST_RANGE_FRAC = _trap_env_float("TRAP_POST_RANGE_FRAC", 0.60)
+_TRAP_SPIKE_ATR_MULT = _trap_env_float("TRAP_SPIKE_ATR_MULT", 3.0)
+_TRAP_POST_RANGE_FRAC = _trap_env_float("TRAP_POST_RANGE_FRAC", 0.45)
 _TRAP_POST_RANGE_MIN = _trap_env_int("TRAP_POST_RANGE_MIN", 3)
 _TRAP_POST_RANGE_MAX = _trap_env_int("TRAP_POST_RANGE_MAX", 5)
 _TRAP_SPIKE_LOOKBACK = _trap_env_int("TRAP_SPIKE_LOOKBACK", 10)
