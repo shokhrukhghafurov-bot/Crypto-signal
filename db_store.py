@@ -304,6 +304,12 @@ ON CONFLICT (id) DO NOTHING;
         except Exception:
             pass
 
+
+        try:
+            await conn.execute("ALTER TABLE autotrade_positions ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb;")
+        except Exception:
+            pass
+
         try:
             await conn.execute("ALTER TABLE autotrade_settings DROP CONSTRAINT IF EXISTS autotrade_settings_spot_exchange_check;")
         except Exception:
@@ -334,16 +340,6 @@ ON CONFLICT (id) DO NOTHING;
           UNIQUE (user_id, signal_id, exchange, market_type)
         );
         """)
-
-        # Backfill/upgrade: add meta JSONB for smart-manager state persistence.
-        try:
-            await conn.execute("ALTER TABLE autotrade_positions ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT \'{}\'::jsonb;")
-        except Exception:
-            pass
-        try:
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_autotrade_positions_meta_gin ON autotrade_positions USING GIN (meta);")
-        except Exception:
-            pass
 
         # Backward-compatible migrations for existing DBs
         try:
@@ -2039,7 +2035,7 @@ async def list_open_autotrade_positions(*, limit: int = 200) -> List[Dict[str, A
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, user_id, signal_id, exchange, market_type, symbol, side, allocated_usdt, api_order_ref, opened_at
+            SELECT id, user_id, signal_id, exchange, market_type, symbol, side, allocated_usdt, api_order_ref, meta, opened_at
             FROM autotrade_positions
             WHERE status='OPEN'
             ORDER BY opened_at ASC
@@ -2063,54 +2059,25 @@ async def update_autotrade_order_ref(*, row_id: int, api_order_ref: str) -> None
             rid,
             api_order_ref,
         )
+async def update_autotrade_position_meta(*, row_id: int, meta: str) -> None:
+    """Persist JSON meta for autotrade position.
 
-
-
-async def update_autotrade_position_meta(*, row_id: int, meta_patch: Dict[str, Any], replace: bool = False) -> None:
-    """Merge (or replace) meta JSONB for an autotrade position.
-
-    - replace=False: meta = meta || meta_patch
-    - replace=True:  meta = meta_patch
+    meta: JSON string (stored in Postgres JSONB).
     """
     pool = get_pool()
-    rid = int(row_id or 0)
-    if rid <= 0:
-        return
-    patch = meta_patch or {}
+    rid = int(row_id)
     async with pool.acquire() as conn:
-        if replace:
-            await conn.execute(
-                """
-                UPDATE autotrade_positions
-                SET meta=$2::jsonb
-                WHERE id=$1;
-                """,
-                rid,
-                json.dumps(patch),
-            )
-        else:
-            await conn.execute(
-                """
-                UPDATE autotrade_positions
-                SET meta=COALESCE(meta, '{}'::jsonb) || $2::jsonb
-                WHERE id=$1;
-                """,
-                rid,
-                json.dumps(patch),
-            )
+        await conn.execute(
+            """
+            UPDATE autotrade_positions
+            SET meta=$2::jsonb
+            WHERE id=$1;
+            """,
+            rid,
+            meta,
+        )
 
 
-async def get_autotrade_position_meta(*, row_id: int) -> Dict[str, Any]:
-    pool = get_pool()
-    rid = int(row_id or 0)
-    if rid <= 0:
-        return {}
-    async with pool.acquire() as conn:
-        v = await conn.fetchval("SELECT meta FROM autotrade_positions WHERE id=$1", rid)
-    try:
-        return dict(v or {})
-    except Exception:
-        return {}
 
 async def upsert_autotrade_keys(
     *,
