@@ -310,6 +310,12 @@ ON CONFLICT (id) DO NOTHING;
         except Exception:
             pass
 
+        # Optional: speed up meta queries (best-effort)
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_autotrade_positions_meta_gin ON autotrade_positions USING GIN (meta);")
+        except Exception:
+            pass
+
         try:
             await conn.execute("ALTER TABLE autotrade_settings DROP CONSTRAINT IF EXISTS autotrade_settings_spot_exchange_check;")
         except Exception:
@@ -2059,23 +2065,51 @@ async def update_autotrade_order_ref(*, row_id: int, api_order_ref: str) -> None
             rid,
             api_order_ref,
         )
-async def update_autotrade_position_meta(*, row_id: int, meta: str) -> None:
-    """Persist JSON meta for autotrade position.
+async def update_autotrade_position_meta(*, row_id: int, meta: Any, replace: bool = False) -> None:
+    """Update autotrade_positions.meta (JSONB).
 
-    meta: JSON string (stored in Postgres JSONB).
+    - If replace=True: meta is fully replaced.
+    - If replace=False (default): meta is merged (meta = meta || patch).
+
+    meta can be:
+      - dict (will be json-dumped)
+      - JSON string
     """
     pool = get_pool()
     rid = int(row_id)
+
+    patch_json = meta
+    try:
+        if isinstance(meta, dict):
+            patch_json = json.dumps(meta, ensure_ascii=False)
+        elif meta is None:
+            patch_json = "{}"
+        else:
+            patch_json = str(meta)
+    except Exception:
+        patch_json = "{}"
+
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE autotrade_positions
-            SET meta=$2::jsonb
-            WHERE id=$1;
-            """,
-            rid,
-            meta,
-        )
+        if replace:
+            await conn.execute(
+                """
+                UPDATE autotrade_positions
+                SET meta=$2::jsonb
+                WHERE id=$1;
+                """,
+                rid,
+                patch_json,
+            )
+        else:
+            await conn.execute(
+                """
+                UPDATE autotrade_positions
+                SET meta = COALESCE(meta, '{}'::jsonb) || ($2::jsonb)
+                WHERE id=$1;
+                """,
+                rid,
+                patch_json,
+            )
 
 
 
