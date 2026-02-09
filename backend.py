@@ -208,17 +208,32 @@ import urllib.parse
 import numpy as np
 import pandas as pd
 
-# ------------------ Candle cache (DISABLED) ------------------
-# The candle cache caused stale/mismatched OHLCV reuse across exchanges/symbols and led to MID/MAIN producing no signals.
-# Cache is fully disabled: every call fetches fresh candles from the exchange.
+# ------------------ Candle cache (30-60s) ------------------
+# Avoid refetching the same candles multiple times per tick (e.g., TA + TRAP using 1h).
+# Keyed by (exchange, symbol, interval, limit). Stores a shallow copy of the DataFrame.
+_CANDLE_CACHE: dict[tuple, tuple[float, pd.DataFrame]] = {}
+_CANDLE_CACHE_TTL = float(os.getenv("CANDLES_CACHE_TTL", os.getenv("CANDLE_CACHE_TTL", "45")) or 45)
 
-_CANDLE_CACHE_TTL = 0.0
-
-def _candle_cache_get(key: tuple):
+def _candle_cache_get(key: tuple) -> pd.DataFrame | None:
+    try:
+        ts, df = _CANDLE_CACHE.get(key, (0.0, None))  # type: ignore[misc]
+        if df is None:
+            return None
+        if (time.time() - float(ts)) <= float(_CANDLE_CACHE_TTL):
+            return df.copy()
+    except Exception:
+        MID_LAST_FAIL_REASON.set('ind_fail')
+        return None
     return None
 
-def _candle_cache_put(key: tuple, df):
-    return
+def _candle_cache_put(key: tuple, df: pd.DataFrame) -> None:
+    try:
+        if df is None or df.empty:
+            return
+        _CANDLE_CACHE[key] = (time.time(), df.copy())
+    except Exception:
+        pass
+
 
 import websockets
 from ta.trend import EMAIndicator, MACD, ADXIndicator
@@ -7879,66 +7894,43 @@ class Backend:
                                 _mid_skip_news += 1
                                 continue
 
-                        supporters = []
-                        for name in scan_exchanges:
-                            try:
-                                if name == "BINANCE":
-                                    a = await api.klines_binance(sym, tf_trigger, 250)
-                                    b = await api.klines_binance(sym, tf_mid, 250)
-                                    c = await api.klines_binance(sym, tf_trend, 250)
-                                elif name == "BYBIT":
-                                    a = await api.klines_bybit(sym, tf_trigger, 250)
-                                    b = await api.klines_bybit(sym, tf_mid, 250)
-                                    c = await api.klines_bybit(sym, tf_trend, 250)
-                                elif name == "OKX":
-                                    a = await api.klines_okx(sym, tf_trigger, 250)
-                                    b = await api.klines_okx(sym, tf_mid, 250)
-                                    c = await api.klines_okx(sym, tf_trend, 250)
-                                elif name == "GATEIO":
-                                    a = await api.klines_gateio(sym, tf_trigger, 250)
-                                    b = await api.klines_gateio(sym, tf_mid, 250)
-                                    c = await api.klines_gateio(sym, tf_trend, 250)
-                                elif name == "MEXC":
-                                    a = await api.klines_mexc(sym, tf_trigger, 250)
-                                    b = await api.klines_mexc(sym, tf_mid, 250)
-                                    c = await api.klines_mexc(sym, tf_trend, 250)
-                                else:
-                                    continue
-                                if a is None or b is None or c is None or a.empty or b.empty or c.empty:
-                                    _mid_nodata += 1
-                                    continue
-                                r = evaluate_on_exchange_mid(a, b, c)
-                                if r is None:
-                                    _mid_nocand += 1
-                                    _reason = MID_LAST_FAIL_REASON.get()
-                                    if _reason == 'ind_fail':
-                                        _mid_indfail += 1
-                                    elif _reason == 'no_trend':
-                                        _mid_notrend += 1
-                                    elif _reason == 'bad_entry':
-                                        _mid_badentry += 1
-                                    elif _reason == 'atr_fail':
-                                        _mid_atrfail += 1
-                                    elif _reason == 'nodata':
-                                        _mid_nodata += 1
-                                    else:
-                                        _mid_otherfail += 1
-                                    continue
-                                if r and r.get('_blocked'):
-                                    _mid_trap += 1
-                                    logger.info("[mid][trap] %s %s blocked on %s reason=%s", sym, str(r.get('direction') or ''), name, r.get('trap_reason'))
-                                    continue
-                                if r:
-                                    supporters.append((name, r))
-                            except Exception:
-                                continue
-                        if not supporters:
-                            _mid_nosupp += 1
+                        # Fetch candles ONCE from BINANCE for TA/TRAP (source of truth), to avoid multi-exchange candle load/rate limits.
+                        a = b = c = None
+                        try:
+                            a = await api.klines_binance(sym, tf_trigger, 250)
+                            b = await api.klines_binance(sym, tf_mid, 250)
+                            c = await api.klines_binance(sym, tf_trend, 250)
+                        except Exception:
+                            a = b = c = None
+                        if a is None or b is None or c is None or a.empty or b.empty or c.empty:
+                            _mid_nodata += 1
                             continue
 
-                        best_name, best_r = max(supporters, key=lambda x: (float(x[1].get("confidence",0)), float(x[1].get("rr",0))))
-                        binance_r = next((r for n, r in supporters if n == "BINANCE"), None)
-                        base_r = binance_r or best_r
+                        r = evaluate_on_exchange_mid(a, b, c)
+                        if r is None:
+                            _mid_nocand += 1
+                            _reason = MID_LAST_FAIL_REASON.get()
+                            if _reason == 'ind_fail':
+                                _mid_indfail += 1
+                            elif _reason == 'no_trend':
+                                _mid_notrend += 1
+                            elif _reason == 'bad_entry':
+                                _mid_badentry += 1
+                            elif _reason == 'atr_fail':
+                                _mid_atrfail += 1
+                            elif _reason == 'nodata':
+                                _mid_nodata += 1
+                            else:
+                                _mid_otherfail += 1
+                            continue
+
+                        if r.get('_blocked'):
+                            _mid_trap += 1
+                            logger.info("[mid][trap] %s %s blocked on %s reason=%s", sym, str(r.get('direction') or ''), "BINANCE", r.get('trap_reason'))
+                            continue
+
+                        best_name = "BINANCE"
+                        base_r = r
                         if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
                             _mid_f_align += 1
                             continue
