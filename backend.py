@@ -4104,7 +4104,7 @@ def fmt_dt_msk(d):
     if not d:
         return "—"
     import datetime as dt
-import contextvars
+
     if isinstance(d, dt.datetime):
         if d.tzinfo is None:
             d = d.replace(tzinfo=dt.timezone.utc)
@@ -7941,7 +7941,7 @@ class Backend:
                                     continue
                                 if r and r.get('_blocked'):
                                     _mid_trap += 1
-                                logger.info("[mid][trap] %s %s blocked on %s reason=%s", sym, str(r.get('direction') or ''), name, r.get('trap_reason'))
+                                    logger.info("[mid][trap] %s %s blocked on %s reason=%s", sym, str(r.get('direction') or ''), name, r.get('trap_reason'))
                                     continue
                                 if r:
                                     supporters.append((name, r))
