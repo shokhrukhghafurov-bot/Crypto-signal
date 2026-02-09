@@ -6,6 +6,7 @@ import os
 import logging
 import re
 import math
+import statistics
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
 from dataclasses import replace
@@ -3477,6 +3478,22 @@ async def _fetch_signal_price(symbol: str, *, market: str) -> tuple[float, str]:
             return 0.0
 
     if m == "FUTURES":
+        # Robust decision price: median of available sources (Binance+Bybit+OKX) to reduce single-source noise.
+        # Enable/disable via SIG_PRICE_FUTURES_MEDIAN (default on).
+        use_med = (os.getenv("SIG_PRICE_FUTURES_MEDIAN", "1").strip().lower() not in ("0","false","no","off"))
+        if use_med:
+            b = await _safe(_fetch_binance_price(sym, futures=True))
+            y = await _safe(_fetch_bybit_price(sym, futures=True))
+            o = await _safe(_fetch_okx_price(sym, futures=True))
+            srcs = [(b, "binance"), (y, "bybit"), (o, "okx")]
+            vals = [v for v,_ in srcs if v > 0]
+            if len(vals) >= 2:
+                return float(statistics.median(vals)), "MEDIAN(" + "+".join([s.upper() for v,s in srcs if v > 0]) + ")"
+            elif len(vals) == 1:
+                only = [s for v,s in srcs if v > 0][0]
+                return float(vals[0]), only
+
+        # Fallback order-based
         order = _parse_price_order("SIG_PRICE_ORDER_FUTURES", "binance,bybit,okx")
         for src in order:
             if src == "binance":
