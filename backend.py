@@ -143,7 +143,7 @@ def _mid_autotune_update_on_close(*, market: str, orig_text: str, timeframe: str
 
     n += 1
     since += 1
-    b["p_ema"] = float(p)
+    st["p_ema"] = float(p)
     b["n"] = n
     b["since"] = since
 
@@ -204,6 +204,33 @@ import base64
 import urllib.parse
 import numpy as np
 import pandas as pd
+
+# ------------------ Candle cache (30-60s) ------------------
+# Avoid refetching the same candles multiple times per tick (e.g., TA + TRAP using 1h).
+# Keyed by (exchange, symbol, interval, limit). Stores a shallow copy of the DataFrame.
+_CANDLE_CACHE: dict[tuple, tuple[float, pd.DataFrame]] = {}
+_CANDLE_CACHE_TTL = float(os.getenv("CANDLES_CACHE_TTL", os.getenv("CANDLE_CACHE_TTL", "45")) or 45)
+
+def _candle_cache_get(key: tuple) -> pd.DataFrame | None:
+    try:
+        ts, df = _CANDLE_CACHE.get(key, (0.0, None))  # type: ignore[misc]
+        if df is None:
+            return None
+        if (time.time() - float(ts)) <= float(_CANDLE_CACHE_TTL):
+            return df.copy()
+    except Exception:
+        return None
+    return None
+
+def _candle_cache_put(key: tuple, df: pd.DataFrame) -> None:
+    try:
+        if df is None or df.empty:
+            return
+        _CANDLE_CACHE[key] = (time.time(), df.copy())
+    except Exception:
+        pass
+
+
 import websockets
 from ta.trend import EMAIndicator, MACD, ADXIndicator
 from ta.momentum import RSIIndicator
@@ -4777,6 +4804,12 @@ class MultiExchangeData:
         return df
 
     async def klines_binance(self, symbol: str, interval: str, limit: int = 250) -> pd.DataFrame:
+        _key = ('BINANCE', str(symbol).upper(), str(interval), int(limit))
+        _cached = _candle_cache_get(_key)
+        if _cached is not None and not _cached.empty:
+            _df = _cached
+            _candle_cache_put(_key, _df)
+            return _df
         url = f"{self.BINANCE_SPOT}/api/v3/klines"
         params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
         raw = await self._get_json(url, params=params)
@@ -4795,6 +4828,12 @@ class MultiExchangeData:
         except Exception:
             return None
     async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+        _key = ('BYBIT', str(symbol).upper(), str(interval), int(limit))
+        _cached = _candle_cache_get(_key)
+        if _cached is not None and not _cached.empty:
+            _df = _cached
+            _candle_cache_put(_key, _df)
+            return _df
         interval_map = {"5m":"5", "15m":"15", "30m":"30", "1h":"60", "4h":"240"}
         itv = interval_map.get(interval, "15")
         url = f"{self.BYBIT}/v5/market/kline"
@@ -4811,6 +4850,12 @@ class MultiExchangeData:
         return symbol
 
     async def klines_okx(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+        _key = ('OKX', str(symbol).upper(), str(interval), int(limit))
+        _cached = _candle_cache_get(_key)
+        if _cached is not None and not _cached.empty:
+            _df = _cached
+            _candle_cache_put(_key, _df)
+            return _df
         bar_map = {"5m":"5m", "15m":"15m", "30m":"30m", "1h":"1H", "4h":"4H"}
         bar = bar_map.get(interval, "15m")
         inst = self.okx_inst(symbol)
@@ -4823,6 +4868,12 @@ class MultiExchangeData:
 
 
     async def klines_mexc(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+        _key = ('MEXC', str(symbol).upper(), str(interval), int(limit))
+        _cached = _candle_cache_get(_key)
+        if _cached is not None and not _cached.empty:
+            _df = _cached
+            _candle_cache_put(_key, _df)
+            return _df
         """Fetch klines from MEXC Spot (Binance-compatible /api/v3/klines).
 
         MEXC returns rows with 8 fields: [openTime, open, high, low, close, volume, closeTime, quoteVolume].
@@ -4850,6 +4901,12 @@ class MultiExchangeData:
 
 
     async def klines_gateio(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+        _key = ('GATEIO', str(symbol).upper(), str(interval), int(limit))
+        _cached = _candle_cache_get(_key)
+        if _cached is not None and not _cached.empty:
+            _df = _cached
+            _candle_cache_put(_key, _df)
+            return _df
         """Fetch klines from Gate.io Spot API v4 /spot/candlesticks.
 
         Gate returns a list of arrays (most commonly 6 fields):
@@ -7757,8 +7814,6 @@ class Backend:
                     _mid_f_adx = 0
                     _mid_f_atr = 0
                     _mid_f_futoff = 0
-                    _mid_no_supporters = 0
-                    no_data = 0
                     logger.info("[mid] tick start TOP_N=%s interval=%ss scanned=%s", top_n, interval, _mid_scanned)
                     mac_act, mac_ev, mac_win = self.macro.current_action()
                     self.last_macro_action = mac_act
@@ -7823,7 +7878,6 @@ class Backend:
                             except Exception:
                                 continue
                         if not supporters:
-                            _mid_no_supporters += 1
                             continue
 
                         best_name, best_r = max(supporters, key=lambda x: (float(x[1].get("confidence",0)), float(x[1].get("rr",0))))
@@ -7977,9 +8031,9 @@ class Backend:
 
             elapsed = time.time() - start
             try:
-                logger.info("[mid] tick done scanned=%s emitted=%s blocked=%s cooldown=%s macro=%s news=%s align=%s score=%s rr=%s adx=%s atr=%s futoff=%s nodata=%s nosupp=%s elapsed=%.1fs",
+                logger.info("[mid] tick done scanned=%s emitted=%s blocked=%s cooldown=%s macro=%s news=%s align=%s score=%s rr=%s adx=%s atr=%s futoff=%s elapsed=%.1fs",
                             _mid_scanned, _mid_emitted, _mid_skip_blocked, _mid_skip_cooldown, _mid_skip_macro, _mid_skip_news,
-                            _mid_f_align, _mid_f_score, _mid_f_rr, _mid_f_adx, _mid_f_atr, _mid_f_futoff, no_data, _mid_no_supporters, float(elapsed))
+                            _mid_f_align, _mid_f_score, _mid_f_rr, _mid_f_adx, _mid_f_atr, _mid_f_futoff, float(elapsed))
             except Exception:
                 pass
             await asyncio.sleep(max(1, interval - int(elapsed)))
