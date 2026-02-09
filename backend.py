@@ -3245,16 +3245,13 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         dirty = True
 
                     # Arm normal SL only after a small move in favor (so we don't "arm into a dump")
-                    if (not armed_sl) and entry_p > 0:
-                        if direction == "LONG":
-                            if px >= entry_p * (1.0 + ARM_SL_AFTER_PCT / 100.0):
-                                armed_sl = True
-                        else:
-                            if px <= entry_p * (1.0 - ARM_SL_AFTER_PCT / 100.0):
-                                armed_sl = True
-                        if armed_sl:
-                            ref["armed_sl"] = True
-                            ref["sm_state"] = "PROTECT"
+                    # For FUTURES we treat SL as structure: arm immediately if SL is provided.
+                    # (Noise handling is done via confirmation in SMART STRUCTURAL SL below.)
+                    if (not armed_sl) and float(sl or 0.0) > 0:
+                        armed_sl = True
+                        ref["armed_sl"] = True
+                        ref["sm_state"] = "PROTECT"
+                        dirty = True
                             dirty = True
 
                     # Reversal exit (close near the top/bottom when retrace starts)
@@ -3321,19 +3318,77 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
                         )
                         continue
-                    sl_eff = 0.0
-                    if armed_sl:
-                        sl_eff = float(sl or 0.0) if float(sl or 0.0) > 0 else float(hard_sl or 0.0)
-                    else:
-                        sl_eff = float(hard_sl or 0.0)
+                    # --- SMART STRUCTURAL SL ---
+                    # Goals:
+                    # 1) If structure SL is broken -> close (decisive)
+                    # 2) Avoid one-tick / one-wick false SL (confirmation)
+                    # 3) Keep HARD SL as emergency fallback
+                    SL_CONFIRM_LAST = int(os.getenv("SMART_SL_CONFIRM_LAST", "3") or 3)
+                    SL_CONFIRM_HITS = int(os.getenv("SMART_SL_CONFIRM_HITS", "2") or 2)
+                    SL_CONFIRM_SEC  = float(os.getenv("SMART_SL_CONFIRM_SEC", "3") or 3)
+                    SL_DEEP_PCT     = float(os.getenv("SMART_SL_DEEP_PCT", "0.15") or 0.15)
 
-                    def _hit_sl_eff() -> bool:
-                        if sl_eff <= 0:
+                    sl_struct = float(sl or 0.0)
+                    sl_hard   = float(hard_sl or 0.0)
+
+                    # Emergency HARD SL always active
+                    def _hit_hard() -> bool:
+                        if sl_hard <= 0:
                             return False
-                        return (px <= sl_eff) if direction == "LONG" else (px >= sl_eff)
+                        return (px <= sl_hard) if direction == "LONG" else (px >= sl_hard)
 
-                    # --- SL (emergency or armed) ---
-                    if _hit_sl_eff():
+                    # Structural SL hit (raw)
+                    def _hit_struct() -> bool:
+                        if sl_struct <= 0:
+                            return False
+                        return (px <= sl_struct) if direction == "LONG" else (px >= sl_struct)
+
+                    def _deep_breach() -> bool:
+                        if sl_struct <= 0 or entry_p <= 0:
+                            return False
+                        # Deep breach measured as distance beyond SL vs entry (percent)
+                        if direction == "LONG":
+                            d = (sl_struct - px)
+                        else:
+                            d = (px - sl_struct)
+                        if d <= 0:
+                            return False
+                        return (d / entry_p) * 100.0 >= SL_DEEP_PCT
+
+                    # Update confirmation state
+                    sl_hits = int(ref.get("sl_hits") or 0)
+                    sl_first_ts = float(ref.get("sl_first_ts") or 0.0)
+
+                    crossed = _hit_struct()
+                    if crossed:
+                        if sl_first_ts <= 0:
+                            sl_first_ts = now_ts
+                        sl_hits += 1
+                        ref["sl_hits"] = int(sl_hits)
+                        ref["sl_first_ts"] = float(sl_first_ts)
+                        dirty = True
+                    else:
+                        if sl_hits != 0 or sl_first_ts != 0.0:
+                            ref["sl_hits"] = 0
+                            ref["sl_first_ts"] = 0.0
+                            dirty = True
+
+                    # Decide close: hard SL OR deep breach OR confirmed structural breach
+                    sl_close = False
+                    if _hit_hard():
+                        sl_close = True
+                    elif crossed and _deep_breach():
+                        sl_close = True
+                    elif crossed:
+                        # Confirm by hits or time-under
+                        if sl_hits >= SL_CONFIRM_HITS:
+                            sl_close = True
+                        elif sl_first_ts > 0 and (now_ts - sl_first_ts) >= SL_CONFIRM_SEC:
+                            sl_close = True
+
+                    # --- SL (smart structural) ---
+                    if sl_close:
+
                         try:
                             await _close_market(qty)
                         except Exception as e:
