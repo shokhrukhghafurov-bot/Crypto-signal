@@ -8,9 +8,12 @@ import random
 import re
 import time
 import datetime as dt
+import contextvars
 import math
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List, Any
+
+MID_LAST_FAIL_REASON = contextvars.ContextVar('MID_LAST_FAIL_REASON', default='ok')
 
 ### MID AUTO-TUNE (TP2 hit-rate control)
 _MID_AUTOTUNE_ENABLED = os.getenv("MID_AUTOTUNE_ENABLED", "0").strip().lower() not in ("0","false","no","off")
@@ -219,6 +222,7 @@ def _candle_cache_get(key: tuple) -> pd.DataFrame | None:
         if (time.time() - float(ts)) <= float(_CANDLE_CACHE_TTL):
             return df.copy()
     except Exception:
+        MID_LAST_FAIL_REASON.set('ind_fail')
         return None
     return None
 
@@ -2992,7 +2996,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
             roi = (pnl_net / alloc * 100.0) if alloc > 0 else None
             return float(pnl_net), (float(roi) if roi is not None else None)
         except Exception:
-            return None, None
+        MID_LAST_FAIL_REASON.set('ind_fail')
+        return None, None
 
     # Best-effort; never crash.
     while True:
@@ -4096,6 +4101,7 @@ def fmt_dt_msk(d):
     if not d:
         return "—"
     import datetime as dt
+import contextvars
     if isinstance(d, dt.datetime):
         if d.tzinfo is None:
             d = d.replace(tzinfo=dt.timezone.utc)
@@ -4826,7 +4832,8 @@ class MultiExchangeData:
             data = await self._get_json(url, params=params)
             return data if isinstance(data, dict) else None
         except Exception:
-            return None
+        MID_LAST_FAIL_REASON.set('ind_fail')
+        return None
     async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
         _key = ('BYBIT', str(symbol).upper(), str(interval), int(limit))
         _cached = _candle_cache_get(_key)
@@ -5137,8 +5144,10 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     but tuned for MID timeframes.
     """
     if df5 is None or df30 is None or df1h is None:
+        MID_LAST_FAIL_REASON.set('nodata')
         return None
     if df5.empty or df30.empty or df1h.empty:
+        MID_LAST_FAIL_REASON.set('nodata')
         return None
 
     try:
@@ -5146,12 +5155,14 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         df30i = _add_indicators(df30)
         df1hi = _add_indicators(df1h)
     except Exception:
+        MID_LAST_FAIL_REASON.set('ind_fail')
         return None
 
     # Directions (trend=1h, mid=30m)
     dir_trend = _trend_dir(df1hi)
     dir_mid = _trend_dir(df30i)
     if dir_trend is None:
+        MID_LAST_FAIL_REASON.set('no_trend')
         return None
     if dir_mid is None:
         dir_mid = dir_trend
@@ -5162,6 +5173,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
     entry = float(last5.get("close", np.nan))
     if np.isnan(entry) or entry <= 0:
+        MID_LAST_FAIL_REASON.set('bad_entry')
         return None
 
     # ATR from 30m (prefer indicator, fallback to true-range)
@@ -5175,7 +5187,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             tr = np.maximum(hi - lo, np.maximum((hi - prev).abs(), (lo - prev).abs()))
             atr30 = float(tr.rolling(14).mean().iloc[-1])
         except Exception:
-            return None
+        MID_LAST_FAIL_REASON.set('ind_fail')
+        return None
     if np.isnan(atr30) or atr30 <= 0:
         return None
 
@@ -6281,8 +6294,10 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     but tuned for MID timeframes.
     """
     if df5 is None or df30 is None or df1h is None:
+        MID_LAST_FAIL_REASON.set('nodata')
         return None
     if df5.empty or df30.empty or df1h.empty:
+        MID_LAST_FAIL_REASON.set('nodata')
         return None
 
     try:
@@ -6290,12 +6305,14 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         df30i = _add_indicators(df30)
         df1hi = _add_indicators(df1h)
     except Exception:
+        MID_LAST_FAIL_REASON.set('ind_fail')
         return None
 
     # Directions (trend=1h, mid=30m)
     dir_trend = _trend_dir(df1hi)
     dir_mid = _trend_dir(df30i)
     if dir_trend is None:
+        MID_LAST_FAIL_REASON.set('no_trend')
         return None
     if dir_mid is None:
         dir_mid = dir_trend
@@ -6306,6 +6323,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
     entry = float(last5.get("close", np.nan))
     if np.isnan(entry) or entry <= 0:
+        MID_LAST_FAIL_REASON.set('bad_entry')
         return None
 
     # ATR from 30m (prefer indicator, fallback to true-range)
@@ -6319,7 +6337,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             tr = np.maximum(hi - lo, np.maximum((hi - prev).abs(), (lo - prev).abs()))
             atr30 = float(tr.rolling(14).mean().iloc[-1])
         except Exception:
-            return None
+        MID_LAST_FAIL_REASON.set('ind_fail')
+        return None
     if np.isnan(atr30) or atr30 <= 0:
         return None
 
@@ -6924,7 +6943,8 @@ class Backend:
             p = data.get("price") if isinstance(data, dict) else None
             return float(p) if p is not None else None
         except Exception:
-            return None
+        MID_LAST_FAIL_REASON.set('ind_fail')
+        return None
 
     async def _fetch_bybit_price(self, market: str, symbol: str) -> float | None:
         """Bybit REST price (spot/futures). Uses V5 tickers.
@@ -6959,7 +6979,8 @@ class Backend:
             p = item.get("lastPrice") or item.get("indexPrice") or item.get("markPrice")
             return float(p) if p is not None else None
         except Exception:
-            return None
+        MID_LAST_FAIL_REASON.set('ind_fail')
+        return None
 
 
     async def _fetch_okx_price(self, market: str, symbol: str) -> float | None:
@@ -6996,7 +7017,8 @@ class Backend:
             p = item.get("last") or item.get("lastPrice")
             return float(p) if p is not None else None
         except Exception:
-            return None
+        MID_LAST_FAIL_REASON.set('ind_fail')
+        return None
 
 
     async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
@@ -7816,6 +7838,14 @@ class Backend:
                     _mid_f_atr = 0
                     _mid_f_futoff = 0
                     _mid_nodata = 0
+                    _mid_nocand = 0
+                    _mid_indfail = 0
+                    _mid_notrend = 0
+                    _mid_trap = 0
+                    _mid_nosupp = 0
+                    _mid_badentry = 0
+                    _mid_atrfail = 0
+                    _mid_otherfail = 0
                     logger.info("[mid] tick start TOP_N=%s interval=%ss scanned=%s", top_n, interval, _mid_scanned)
                     mac_act, mac_ev, mac_win = self.macro.current_action()
                     self.last_macro_action = mac_act
@@ -7872,14 +7902,32 @@ class Backend:
                                     _mid_nodata += 1
                                     continue
                                 r = evaluate_on_exchange_mid(a, b, c)
+                                if r is None:
+                                    _mid_nocand += 1
+                                    _reason = MID_LAST_FAIL_REASON.get()
+                                    if _reason == 'ind_fail':
+                                        _mid_indfail += 1
+                                    elif _reason == 'no_trend':
+                                        _mid_notrend += 1
+                                    elif _reason == 'bad_entry':
+                                        _mid_badentry += 1
+                                    elif _reason == 'atr_fail':
+                                        _mid_atrfail += 1
+                                    elif _reason == 'nodata':
+                                        _mid_nodata += 1
+                                    else:
+                                        _mid_otherfail += 1
+                                    continue
                                 if r and r.get('_blocked'):
-                                    logger.info("[mid][trap] %s %s blocked on %s reason=%s", sym, str(r.get('direction') or ''), name, r.get('trap_reason'))
+                                    _mid_trap += 1
+                                logger.info("[mid][trap] %s %s blocked on %s reason=%s", sym, str(r.get('direction') or ''), name, r.get('trap_reason'))
                                     continue
                                 if r:
                                     supporters.append((name, r))
                             except Exception:
                                 continue
                         if not supporters:
+                            _mid_nosupp += 1
                             continue
 
                         best_name, best_r = max(supporters, key=lambda x: (float(x[1].get("confidence",0)), float(x[1].get("rr",0))))
@@ -8034,9 +8082,10 @@ class Backend:
 
             elapsed = time.time() - start
             try:
-                logger.info("[mid] tick done scanned=%s emitted=%s blocked=%s cooldown=%s macro=%s news=%s align=%s score=%s rr=%s adx=%s atr=%s futoff=%s nodata=%s elapsed=%.1fs",
+                logger.info("[mid] tick done scanned=%s emitted=%s blocked=%s cooldown=%s macro=%s news=%s align=%s score=%s rr=%s adx=%s atr=%s futoff=%s nodata=%s nocand=%s indfail=%s notrend=%s trap=%s nosupp=%s badentry=%s atrfail=%s otherfail=%s elapsed=%.1fs",
                             _mid_scanned, _mid_emitted, _mid_skip_blocked, _mid_skip_cooldown, _mid_skip_macro, _mid_skip_news,
-                            _mid_f_align, _mid_f_score, _mid_f_rr, _mid_f_adx, _mid_f_atr, _mid_f_futoff, _mid_nodata, float(elapsed))
+                            _mid_f_align, _mid_f_score, _mid_f_rr, _mid_f_adx, _mid_f_atr, _mid_f_futoff,
+                            _mid_nodata, _mid_nocand, _mid_indfail, _mid_notrend, _mid_trap, _mid_nosupp, _mid_badentry, _mid_atrfail, _mid_otherfail, float(elapsed))
             except Exception:
                 pass
             await asyncio.sleep(max(1, interval - int(elapsed)))
