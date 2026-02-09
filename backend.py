@@ -9,6 +9,7 @@ import re
 import time
 import datetime as dt
 import math
+import statistics
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List, Any
 
@@ -3062,22 +3063,66 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         ref["pro_real_init"] = True
                         dirty = True
                     try:
-                        # --- price ---
-                        if ex == "binance":
-                            if mt == "futures":
-                                data = await _http_json("GET", "https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
-                                px = float(data.get("price") or 0.0)
+                        # --- price (decision) ---
+                        # For futures, prefer a robust decision price to reduce noise:
+                        # median of available sources (Binance Futures + Bybit Linear + optional public OKX),
+                        # falling back to the trade exchange source if only one is available.
+                        if mt == "futures":
+                            srcs = []
+                            try:
+                                data_b = await _http_json("GET", "https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
+                                px_b = float((data_b or {}).get("price") or 0.0)
+                                if px_b > 0:
+                                    srcs.append(px_b)
+                            except Exception:
+                                pass
+                            try:
+                                px_y = await _bybit_price(symbol, category="linear")
+                                if float(px_y or 0.0) > 0:
+                                    srcs.append(float(px_y))
+                            except Exception:
+                                pass
+                            try:
+                                # OKX public last (best-effort)
+                                px_o = await _okx_public_price(symbol)
+                                if float(px_o or 0.0) > 0:
+                                    srcs.append(float(px_o))
+                            except Exception:
+                                pass
+                            if len(srcs) >= 2:
+                                px = float(statistics.median(srcs))
+                                ref["px_decision_src"] = "MEDIAN"
+                                dirty = True
+                            elif len(srcs) == 1:
+                                px = float(srcs[0])
+                                ref["px_decision_src"] = "SINGLE"
+                                dirty = True
                             else:
-                                data = await _http_json("GET", "https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
-                                px = float(data.get("price") or 0.0)
-                        elif ex == "bybit":
-                            px = await _bybit_price(symbol, category=("linear" if mt == "futures" else "spot"))
-                        elif ex == "okx":
-                            px = await _okx_public_price(symbol)
-                        elif ex == "mexc":
-                            px = await _mexc_public_price(symbol)
+                                # fall back to per-exchange source
+                                if ex == "binance":
+                                    data = await _http_json("GET", "https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
+                                    px = float((data or {}).get("price") or 0.0)
+                                elif ex == "bybit":
+                                    px = await _bybit_price(symbol, category="linear")
+                                elif ex == "okx":
+                                    px = await _okx_public_price(symbol)
+                                elif ex == "mexc":
+                                    px = await _mexc_public_price(symbol)
+                                else:
+                                    px = await _gateio_public_price(symbol)
                         else:
-                            px = await _gateio_public_price(symbol)
+                            # spot: keep per-exchange source
+                            if ex == "binance":
+                                data = await _http_json("GET", "https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
+                                px = float((data or {}).get("price") or 0.0)
+                            elif ex == "bybit":
+                                px = await _bybit_price(symbol, category="spot")
+                            elif ex == "okx":
+                                px = await _okx_public_price(symbol)
+                            elif ex == "mexc":
+                                px = await _mexc_public_price(symbol)
+                            else:
+                                px = await _gateio_public_price(symbol)
                     except Exception:
                         px = 0.0
 
@@ -3114,6 +3159,21 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 every_s=120,
                                 level="debug",
                             )
+                            # Emergency fallback: try close-all stop-market for Binance Futures (closePosition=true)
+                            # using a trigger slightly beyond current px so it fires immediately.
+                            try:
+                                if mt == "futures" and ex == "binance":
+                                    sp = float(px) * (0.999 if direction == "LONG" else 1.001)
+                                    await _binance_futures_stop_market_close_all(
+                                        api_key=api_key,
+                                        api_secret=api_secret,
+                                        symbol=symbol,
+                                        side=("SELL" if direction == "LONG" else "BUY"),
+                                        stop_price=sp,
+                                        reduce_only=True,
+                                    )
+                            except Exception:
+                                pass
                             return
                         # Spot short is not supported in this bot; virtual logic assumes LONG for spot.
                         if mt == "spot":
@@ -3252,6 +3312,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         ref["armed_sl"] = True
                         ref["sm_state"] = "PROTECT"
                         dirty = True
+                            dirty = True
+
                     # Reversal exit (close near the top/bottom when retrace starts)
                     if entry_p > 0 and best_px > 0:
                         if direction == "LONG":
@@ -3329,6 +3391,18 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
 
                     # Noise-sweep protection: allow quick reclaim above SL within grace window
                     SL_GRACE_SEC    = float(os.getenv("SMART_SL_GRACE_SEC", "6") or 6)
+                    SL_GRACE_BASE   = float(os.getenv("SMART_SL_GRACE_BASE", "0") or 0)
+                    SL_GRACE_ATR_K  = float(os.getenv("SMART_SL_GRACE_ATR_K", "0") or 0)
+                    SL_USE_5M_CLOSE = (os.getenv("SMART_SL_USE_5M_CLOSE", "0").strip().lower() not in ("0","false","no","off"))
+                    # Adaptive grace: grace = max(SMART_SL_GRACE_SEC, SMART_SL_GRACE_BASE + SMART_SL_GRACE_ATR_K * ATR%)
+                    try:
+                        atrp = float(ref.get("atr_pct") or ref.get("atr_pct_30m") or 0.0)
+                    except Exception:
+                        atrp = 0.0
+                    try:
+                        SL_GRACE_SEC = max(float(SL_GRACE_SEC), float(SL_GRACE_BASE) + float(SL_GRACE_ATR_K) * max(0.0, float(atrp)))
+                    except Exception:
+                        pass
                     SL_RECLAIM_PCT  = float(os.getenv("SMART_SL_RECLAIM_PCT", "0.04") or 0.04)  # reclaim buffer around SL
                     SL_BOUNCE_PCT   = float(os.getenv("SMART_SL_BOUNCE_PCT", "0.10") or 0.10)    # bounce from breach extreme
 
@@ -3410,6 +3484,16 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         # Grace: if price reclaims above SL quickly -> do not close
                         age = (now_ts - sl_first_ts) if sl_first_ts > 0 else 0.0
 
+                        def _allow_struct_close() -> bool:
+                            if not SL_USE_5M_CLOSE or sl_first_ts <= 0:
+                                return True
+                            try:
+                                next5m = (math.floor(float(sl_first_ts) / 300.0) + 1.0) * 300.0
+                            except Exception:
+                                return True
+                            # wait for the next 5m boundary (proxy for a candle close confirmation)
+                            return float(now_ts) >= float(next5m)
+
                         # bounce check: if price bounced enough from extreme AND reclaimed -> reset (noise sweep)
                         bounced = False
                         if sl_extreme and entry_p > 0:
@@ -3430,9 +3514,9 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             if sl_hits >= SL_CONFIRM_HITS:
                                 # require that we are past the minimal confirm sec OR past grace sec
                                 if age >= min(SL_CONFIRM_SEC, SL_GRACE_SEC):
-                                    sl_close = True
+                                    sl_close = _allow_struct_close()
                             elif sl_first_ts > 0 and age >= SL_CONFIRM_SEC and age >= SL_GRACE_SEC:
-                                sl_close = True
+                                sl_close = _allow_struct_close()
 
                     # --- SL (smart structural) ---
                     if sl_close:
