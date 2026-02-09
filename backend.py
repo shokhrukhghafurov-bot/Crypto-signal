@@ -208,32 +208,17 @@ import urllib.parse
 import numpy as np
 import pandas as pd
 
-# ------------------ Candle cache (30-60s) ------------------
-# Avoid refetching the same candles multiple times per tick (e.g., TA + TRAP using 1h).
-# Keyed by (exchange, symbol, interval, limit). Stores a shallow copy of the DataFrame.
-_CANDLE_CACHE: dict[tuple, tuple[float, pd.DataFrame]] = {}
-_CANDLE_CACHE_TTL = float(os.getenv("CANDLES_CACHE_TTL", os.getenv("CANDLE_CACHE_TTL", "45")) or 45)
+# ------------------ Candle cache (DISABLED) ------------------
+# The candle cache caused stale/mismatched OHLCV reuse across exchanges/symbols and led to MID/MAIN producing no signals.
+# Cache is fully disabled: every call fetches fresh candles from the exchange.
 
-def _candle_cache_get(key: tuple) -> pd.DataFrame | None:
-    try:
-        ts, df = _CANDLE_CACHE.get(key, (0.0, None))  # type: ignore[misc]
-        if df is None:
-            return None
-        if (time.time() - float(ts)) <= float(_CANDLE_CACHE_TTL):
-            return df.copy()
-    except Exception:
-        MID_LAST_FAIL_REASON.set('ind_fail')
-        return None
+_CANDLE_CACHE_TTL = 0.0
+
+def _candle_cache_get(key: tuple):
     return None
 
-def _candle_cache_put(key: tuple, df: pd.DataFrame) -> None:
-    try:
-        if df is None or df.empty:
-            return
-        _CANDLE_CACHE[key] = (time.time(), df.copy())
-    except Exception:
-        pass
-
+def _candle_cache_put(key: tuple, df):
+    return
 
 import websockets
 from ta.trend import EMAIndicator, MACD, ADXIndicator
