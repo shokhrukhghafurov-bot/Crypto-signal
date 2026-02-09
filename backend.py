@@ -143,7 +143,7 @@ def _mid_autotune_update_on_close(*, market: str, orig_text: str, timeframe: str
 
     n += 1
     since += 1
-    st["p_ema"] = float(p)
+    b["p_ema"] = float(p)
     b["n"] = n
     b["since"] = since
 
@@ -7757,6 +7757,8 @@ class Backend:
                     _mid_f_adx = 0
                     _mid_f_atr = 0
                     _mid_f_futoff = 0
+                    _mid_no_supporters = 0
+                    no_data = 0
                     logger.info("[mid] tick start TOP_N=%s interval=%ss scanned=%s", top_n, interval, _mid_scanned)
                     mac_act, mac_ev, mac_win = self.macro.current_action()
                     self.last_macro_action = mac_act
@@ -7821,6 +7823,7 @@ class Backend:
                             except Exception:
                                 continue
                         if not supporters:
+                            _mid_no_supporters += 1
                             continue
 
                         best_name, best_r = max(supporters, key=lambda x: (float(x[1].get("confidence",0)), float(x[1].get("rr",0))))
@@ -7974,9 +7977,9 @@ class Backend:
 
             elapsed = time.time() - start
             try:
-                logger.info("[mid] tick done scanned=%s emitted=%s blocked=%s cooldown=%s macro=%s news=%s align=%s score=%s rr=%s adx=%s atr=%s futoff=%s elapsed=%.1fs",
+                logger.info("[mid] tick done scanned=%s emitted=%s blocked=%s cooldown=%s macro=%s news=%s align=%s score=%s rr=%s adx=%s atr=%s futoff=%s nodata=%s nosupp=%s elapsed=%.1fs",
                             _mid_scanned, _mid_emitted, _mid_skip_blocked, _mid_skip_cooldown, _mid_skip_macro, _mid_skip_news,
-                            _mid_f_align, _mid_f_score, _mid_f_rr, _mid_f_adx, _mid_f_atr, _mid_f_futoff, float(elapsed))
+                            _mid_f_align, _mid_f_score, _mid_f_rr, _mid_f_adx, _mid_f_atr, _mid_f_futoff, no_data, _mid_no_supporters, float(elapsed))
             except Exception:
                 pass
             await asyncio.sleep(max(1, interval - int(elapsed)))
