@@ -3252,8 +3252,6 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         ref["armed_sl"] = True
                         ref["sm_state"] = "PROTECT"
                         dirty = True
-                            dirty = True
-
                     # Reversal exit (close near the top/bottom when retrace starts)
                     if entry_p > 0 and best_px > 0:
                         if direction == "LONG":
