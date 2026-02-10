@@ -5839,7 +5839,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     if not ok_trap:
         try:
             logger.info("MID blocked (trap): dir=%s reason=%s entry=%.6g", dir_trend, trap_reason, float(entry))
-            _emit_mid_trap_event({"symbol": str(symbol), "dir": str(dir_trend), "reason": str(trap_reason), "reason_key": _mid_trap_reason_key(str(trap_reason)), "entry": float(entry)})
+            _emit_mid_trap_event({"dir": str(dir_trend), "reason": str(trap_reason), "reason_key": _mid_trap_reason_key(str(trap_reason)), "entry": float(entry)})
         except Exception:
             pass
         return None
@@ -6887,7 +6887,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         try:
             logger.info('MID blocked (trap): dir=%s reason=%s entry=%.6g', str(dir_trend).upper(), str(trap_reason), float(entry))
             _emit_mid_trap_event({
-                'symbol': str(symbol),
                 'dir': str(dir_trend).upper(),
                 'reason': str(trap_reason),
                 'reason_key': _mid_trap_reason_key(str(trap_reason)),
@@ -8301,17 +8300,27 @@ class Backend:
         key = r.split()[0].strip()
         return key or "unknown"
 
-    def _mid_digest_add(self, stats: dict, direction: str, reason: str) -> None:
+    def _mid_digest_add(self, stats: dict, symbol: str, direction: str, entry, reason: str) -> None:
         key = self._mid_reason_key(reason)
         ent = stats.setdefault(key, {"count": 0, "LONG": 0, "SHORT": 0, "examples": []})
         ent["count"] += 1
         d = (direction or "").upper()
         if d in ("LONG", "SHORT"):
             ent[d] += 1
-        # keep a few examples
-        ex = (reason or "").strip()
-        if ex and len(ent["examples"]) < int(os.getenv("MID_TRAP_DIGEST_EXAMPLES", "2") or 2):
-            ent["examples"].append(ex)
+
+        # keep a few compact examples: "FILUSDT SHORT entry=0.02341 late_entry atr>2.2"
+        max_ex = int(os.getenv("MID_TRAP_DIGEST_EXAMPLES", "2") or 2)
+        if max_ex <= 0 or len(ent["examples"]) >= max_ex:
+            return
+
+        sym = (symbol or "").strip() or "—"
+        try:
+            en_txt = f"{float(entry):.6g}" if entry is not None else "—"
+        except Exception:
+            en_txt = "—"
+        r = (reason or "").strip()
+        ent["examples"].append(f"{sym} {d} entry={en_txt} {r}".strip())
+
 
     async def _mid_digest_maybe_send(self, stats: dict, last_sent_at: float) -> float:
         period = int(os.getenv("MID_TRAP_DIGEST_SEC", "600") or 600)
@@ -8320,25 +8329,34 @@ class Backend:
         now = time.time()
         if (now - last_sent_at) < period:
             return last_sent_at
+
         total = sum(int(v.get("count", 0) or 0) for v in stats.values())
         if total <= 0:
             return now  # reset window even if empty
+
         top_n = int(os.getenv("MID_TRAP_DIGEST_TOP", "5") or 5)
         # sort by count desc
         items = sorted(stats.items(), key=lambda kv: int(kv[1].get("count", 0) or 0), reverse=True)[:max(1, top_n)]
-        lines = [f"🧱 MID trap digest — {period}s (total {total})", "", "Top reasons:"]
-        for i, (k, v) in enumerate(items, 1):
+
+        # pretty header like "10m"
+        if period % 60 == 0:
+            mins = period // 60
+            win = f"{mins}m"
+        else:
+            win = f"{period}s"
+
+        lines = [f"🧪 MID trap digest ({win}) — blocks: {total}", ""]
+        for k, v in items:
             cnt = int(v.get("count", 0) or 0)
-            lcnt = int(v.get("LONG", 0) or 0)
-            scnt = int(v.get("SHORT", 0) or 0)
-            lines.append(f"{i}) {k} — {cnt} | SHORT {scnt} / LONG {lcnt}")
+            lines.append(f"• {k}: {cnt}")
             exs = v.get("examples") or []
-            if exs:
-                lines.append("   examples:")
-                for ex in exs:
-                    # keep it compact
-                    lines.append(f"   - reason={ex}")
+            for ex in exs:
+                lines.append(f"  - {ex}")
             lines.append("")
+
+        if len(stats) > len(items):
+            lines.append(f"… +{len(stats)-len(items)} other reasons")
+
         text = "\n".join(lines).strip()
         try:
             emit = getattr(self, "emit_mid_digest", None)
@@ -8348,6 +8366,7 @@ class Backend:
             pass
         stats.clear()
         return now
+
 
 
     async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
@@ -8445,19 +8464,35 @@ class Backend:
                     for sym in symbols:
                         if is_blocked_symbol(sym):
                             _mid_skip_blocked += 1
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "blocked_symbol")
+                            except Exception:
+                                pass
                             continue
                         if not self.can_emit_mid(sym):
                             _mid_skip_cooldown += 1
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "cooldown")
+                            except Exception:
+                                pass
                             continue
 
                         if MACRO_FILTER and mac_act == "PAUSE_ALL":
                             _mid_skip_macro += 1
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "macro_pause_all")
+                            except Exception:
+                                pass
                             continue
                         news_act = "OK"
                         if NEWS_FILTER and CRYPTOPANIC_TOKEN:
                             news_act = await self.news.action_for_symbol(api.session, sym)
                             if news_act == "PAUSE_ALL":
                                 _mid_skip_news += 1
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "news_pause_all")
+                                except Exception:
+                                    pass
                                 continue
 
                         supporters = []
@@ -8506,13 +8541,17 @@ class Backend:
                             # collect digest stats (DO NOT forward to error-bot)
                             _r = (base_r.get("trap_reason") or base_r.get("block_reason") or "")
                             try:
-                                self._mid_digest_add(self._mid_trap_digest_stats, str(base_r.get("direction","")), str(_r))
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), str(_r))
                             except Exception:
                                 pass
                             logger.info("[mid][trap] %s %s blocked=%s reason=%s src_best=%s", sym, str(base_r.get("direction","")).upper(), base_r.get("blocked"), base_r.get("trap_reason",""), best_name)
                             continue
                         if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
                             _mid_f_align += 1
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), "align_mismatch")
+                            except Exception:
+                                pass
                             continue
 
                         conf = float(base_r.get("confidence",0) or 0)
@@ -8523,12 +8562,24 @@ class Backend:
 
                         if min_adx_30m and adx30 < min_adx_30m:
                             _mid_f_adx += 1
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx30<{min_adx_30m:g} adx={adx30:g}")
+                            except Exception:
+                                pass
                             continue
                         if min_adx_1h and adx1h < min_adx_1h:
                             _mid_f_adx += 1
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx1h<{min_adx_1h:g} adx={adx1h:g}")
+                            except Exception:
+                                pass
                             continue
                         if min_atr_pct and atrp < min_atr_pct:
                             _mid_f_atr += 1
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"atr_pct<{min_atr_pct:g} atr%={atrp:g}")
+                            except Exception:
+                                pass
                             continue
 
                         market = choose_market(adx30, atrp)
@@ -8541,9 +8592,17 @@ class Backend:
                         min_conf = min_score_fut if market == "FUTURES" else min_score_spot
                         if conf < float(min_conf):
                             _mid_f_score += 1
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"score<{float(min_conf):g} score={conf:g}")
+                            except Exception:
+                                pass
                             continue
                         if rr < float(min_rr):
                             _mid_f_rr += 1
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"rr<{float(min_rr):g} rr={rr:g}")
+                            except Exception:
+                                pass
                             continue
 
                         direction = str(base_r.get("direction","")).upper()
@@ -8554,6 +8613,10 @@ class Backend:
                         volx = float(base_r.get("rel_vol", 0.0) or 0.0)
                         if mid_min_vol_x and volx < mid_min_vol_x:
                             _mid_f_score += 1
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"vol_x<{mid_min_vol_x:g} vol_x={volx:g}")
+                            except Exception:
+                                pass
                             continue
 
                         # 2) Must be on the correct side of VWAP + far enough from VWAP (avoid chop)
@@ -8563,13 +8626,26 @@ class Backend:
                             if mid_require_vwap_bias:
                                 if direction == "SHORT" and not (entry < vwap_val_num):
                                     _mid_f_align += 1
+                                    try:
+                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_short entry>=vwap vwap={vwap_val_num:g}")
+                                    except Exception:
+                                        pass
                                     continue
                                 if direction == "LONG" and not (entry > vwap_val_num):
                                     _mid_f_align += 1
+                                    try:
+                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_long entry<=vwap vwap={vwap_val_num:g}")
+                                    except Exception:
+                                        pass
                                     continue
                             if mid_min_vwap_dist_atr > 0:
                                 if abs(entry - vwap_val_num) < (atr30 * mid_min_vwap_dist_atr):
                                     _mid_f_atr += 1
+                                    try:
+                                        dist = abs(entry - vwap_val_num) / atr30 if atr30 else 0.0
+                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_far {dist:.2g}atr")
+                                    except Exception:
+                                        pass
                                     continue
 
                         if tp_policy == "R":
