@@ -165,9 +165,18 @@ ERROR_BOT_SEND_LEVEL = (os.getenv("ERROR_BOT_SEND_LEVEL", "ERROR") or "ERROR").u
 _ERROR_BOT_IGNORE_SUBSTRINGS = tuple(s.strip().lower() for s in (os.getenv("ERROR_BOT_IGNORE_SUBSTRINGS") or "").split(",") if s.strip())
 # built-in ignores
 _ERROR_BOT_IGNORE_DEFAULT = (
-    "invalid api-key", "invalid api key", "api-key invalid", "signature", "whitelist", "ip not allowed",
-    "permission", "not authorized", "rate limit", "too many requests", "time mismatch", "timestamp",,
-    "telegramconflicterror", "terminated by other getupdates request", "conflict: terminated by other getupdates request", "failed to fetch updates - telegramconflicterror"
+    "invalid api-key",
+    "invalid api key",
+    "api-key invalid",
+    "signature",
+    "whitelist",
+    "ip not allowed",
+    "permission",
+    "not authorized",
+    "rate limit",
+    "too many requests",
+    "time mismatch",
+    "timestamp",
 )
 _ERROR_BOT_IGNORE_SCAN_BLOCK = ("scan_block", "blocked_stable_pair", "blocked_symbol_list")  # stablecoin & hardblock noise
 
