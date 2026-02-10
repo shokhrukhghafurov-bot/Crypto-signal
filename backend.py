@@ -5591,12 +5591,12 @@ def _mid_structure_trap_ok(*, direction: str, entry: float, df1hi: pd.DataFrame)
             loc_high = float(w["high"].astype(float).max())
             dist = float(loc_high - ep)
             if dist <= atr_mult * atr1h:
-                return (False, f"near_1h_high dist={dist:.6g} atr={atr1h:.6g}")
+                return (False, f"near_1h_high dist={dist:.6g} atr={atr1h:.6g} entry={entry:.6g}")
         else:
             loc_low = float(w["low"].astype(float).min())
             dist = float(ep - loc_low)
             if dist <= atr_mult * atr1h:
-                return (False, f"near_1h_low dist={dist:.6g} atr={atr1h:.6g}")
+                return (False, f"near_1h_low dist={dist:.6g} atr={atr1h:.6g} entry={entry:.6g}")
     except Exception:
         pass
 
@@ -5608,17 +5608,17 @@ def _mid_structure_trap_ok(*, direction: str, entry: float, df1hi: pd.DataFrame)
             if _mid_wick_ratio(r, direction=d) > wick_ratio_th:
                 hits += 1
         if hits >= wick_hits_req:
-            return (False, f"wick_liquidity hits={hits}/{wick_last}")
+            return (False, f"wick_liquidity hits={hits}/{wick_last} entry={entry:.6g}")
     except Exception:
         pass
 
     # Filter 3: post-impulse exhaustion (N same-color candles)
     if _mid_consecutive_candles(df1hi, direction=d, n=impulse_n):
-        return (False, f"post_impulse_{impulse_n}")
+        return (False, f"post_impulse_{impulse_n} entry={entry:.6g}")
 
     # Filter 4: weak high/low (pierce & fail)
     if _mid_weak_extreme(df1hi, direction=d, last_n=weak_last, base_n=weak_base, pierce_pct=pierce_pct):
-        return (False, "weak_extreme_pierce_fail")
+        return (False, f"weak_extreme_pierce_fail entry={entry:.6g}")
 
     return (True, "")
 
@@ -5977,11 +5977,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "tp2": tp2,
         "rr": rr,
         "confidence": confidence,
-        "trap_ok": bool(trap_ok),
-        "trap_reason": (str(trap_reason) if trap_reason else ""),
-        "blocked": (not bool(trap_ok)) or (mid_block_reason is not None),
-        "block_reason": (str(mid_block_reason) if mid_block_reason else ""),
-
 
         # fields used by MID filters/formatter
         "dir1": dir_mid,
@@ -6755,67 +6750,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     # RSI/MACD on 5m
     rsi5 = float(last5.get("rsi", np.nan))
     macd_hist5 = float(last5.get("macd_hist", np.nan))
-
-    # --- Extra MID entry filters (late entry / RSI / VWAP distance / climax) ---
-    mid_block_reason = None
-    try:
-        _lb = int(os.getenv("MID_LATE_ENTRY_LOOKBACK_30M", "48"))
-        _lb = max(10, min(200, _lb))
-        recent_low = float(df30i["low"].astype(float).tail(_lb).min())
-        recent_high = float(df30i["high"].astype(float).tail(_lb).max())
-
-        vwap_30m = float(last30.get("vwap", np.nan))
-        if np.isnan(vwap_30m):
-            vwap_30m = None
-
-        last_vol_30m = float(last30.get("volume", 0.0) or 0.0)
-        avg_vol_30m = float(last30.get("vol_sma20", 0.0) or 0.0)
-
-        o30 = float(last30.get("open", np.nan))
-        if np.isnan(o30):
-            o30 = None
-
-        # detect a recent "climax" bar (volume spike + big body); blocks for MID_CLIMAX_COOLDOWN_BARS bars
-        climax_recent = 0
-        try:
-            n_cd = int(MID_CLIMAX_COOLDOWN_BARS)
-            if n_cd > 0 and "volume" in df30i.columns:
-                tail = df30i.tail(max(1, n_cd))
-                for _, row in tail.iterrows():
-                    atr_r = float(row.get("atr", atr30) or atr30)
-                    if not atr_r or atr_r <= 0:
-                        continue
-                    op_r = float(row.get("open", np.nan))
-                    cl_r = float(row.get("close", np.nan))
-                    if np.isnan(op_r) or np.isnan(cl_r):
-                        continue
-                    vol_r = float(row.get("volume", 0.0) or 0.0)
-                    avgv_r = float(row.get("vol_sma20", avg_vol_30m) or avg_vol_30m)
-                    body_atr_r = abs(cl_r - op_r) / atr_r
-                    vol_x_r = (vol_r / avgv_r) if (avgv_r and avgv_r > 0) else 0.0
-                    if vol_x_r > MID_CLIMAX_VOL_X and body_atr_r > MID_CLIMAX_BODY_ATR:
-                        climax_recent = 1
-                        break
-        except Exception:
-            climax_recent = 0
-
-        mid_block_reason = _mid_block_reason(
-            symbol="",
-            side=str(dir_trend).upper(),
-            close=float(entry),
-            o=(float(o30) if o30 is not None else float(entry)),
-            recent_low=recent_low,
-            recent_high=recent_high,
-            atr_30m=float(atr30),
-            rsi_5m=(float(rsi5) if not np.isnan(rsi5) else None),
-            vwap=vwap_30m,
-            last_vol=float(last_vol_30m),
-            avg_vol=float(avg_vol_30m),
-            last_body=float(abs(float(entry) - (float(o30) if o30 is not None else float(entry)))),
-            climax_recent_bars=int(climax_recent),
-        )
-    except Exception:
-        mid_block_reason = None
 
     # Bollinger Bands on 5m (20)
     bb_low = bb_mid = bb_high = float("nan")
@@ -8188,6 +8122,65 @@ class Backend:
             m = self._last_emit_mid
         m[symbol] = time.time()
 
+
+# ---------------- MID trap/blocked digest (anti-spam analytics) ----------------
+def _mid_reason_key(self, reason: str) -> str:
+    r = (reason or "").strip()
+    if not r:
+        return "unknown"
+    # take token before first space; also strip trailing punctuation
+    key = r.split()[0].strip()
+    return key or "unknown"
+
+def _mid_digest_add(self, stats: dict, direction: str, reason: str) -> None:
+    key = self._mid_reason_key(reason)
+    ent = stats.setdefault(key, {"count": 0, "LONG": 0, "SHORT": 0, "examples": []})
+    ent["count"] += 1
+    d = (direction or "").upper()
+    if d in ("LONG", "SHORT"):
+        ent[d] += 1
+    # keep a few examples
+    ex = (reason or "").strip()
+    if ex and len(ent["examples"]) < int(os.getenv("MID_TRAP_DIGEST_EXAMPLES", "2") or 2):
+        ent["examples"].append(ex)
+
+async def _mid_digest_maybe_send(self, stats: dict, last_sent_at: float) -> float:
+    period = int(os.getenv("MID_TRAP_DIGEST_SEC", "600") or 600)
+    if period <= 0:
+        return last_sent_at
+    now = time.time()
+    if (now - last_sent_at) < period:
+        return last_sent_at
+    total = sum(int(v.get("count", 0) or 0) for v in stats.values())
+    if total <= 0:
+        return now  # reset window even if empty
+    top_n = int(os.getenv("MID_TRAP_DIGEST_TOP", "5") or 5)
+    # sort by count desc
+    items = sorted(stats.items(), key=lambda kv: int(kv[1].get("count", 0) or 0), reverse=True)[:max(1, top_n)]
+    lines = [f"🧱 MID trap digest — {period}s (total {total})", "", "Top reasons:"]
+    for i, (k, v) in enumerate(items, 1):
+        cnt = int(v.get("count", 0) or 0)
+        lcnt = int(v.get("LONG", 0) or 0)
+        scnt = int(v.get("SHORT", 0) or 0)
+        lines.append(f"{i}) {k} — {cnt} | SHORT {scnt} / LONG {lcnt}")
+        exs = v.get("examples") or []
+        if exs:
+            lines.append("   examples:")
+            for ex in exs:
+                # keep it compact
+                lines.append(f"   - reason={ex}")
+        lines.append("")
+    text = "\n".join(lines).strip()
+    try:
+        emit = getattr(self, "emit_mid_digest", None)
+        if callable(emit):
+            await emit(text)
+    except Exception:
+        pass
+    stats.clear()
+    return now
+
+
     async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         tf_trigger, tf_mid, tf_trend = "5m", "30m", "1h"
         while True:
@@ -8198,6 +8191,12 @@ class Backend:
 
             interval = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45"))
             top_n = int(os.getenv("MID_TOP_N", "50"))
+
+# --- MID trap digest state (persists across ticks) ---
+if not hasattr(self, "_mid_trap_digest_stats"):
+    self._mid_trap_digest_stats = {}
+if not hasattr(self, "_mid_trap_digest_last_sent"):
+    self._mid_trap_digest_last_sent = time.time()
 
             mode = (os.getenv("MID_SIGNAL_MODE","").strip().lower()
                     or os.getenv("SIGNAL_MODE","").strip().lower()
@@ -8323,6 +8322,13 @@ class Backend:
                         # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
                         if base_r.get("trap_ok") is False or base_r.get("blocked") is True:
                             _mid_skip_trap += 1
+
+# collect digest stats (DO NOT forward to error-bot)
+_r = (base_r.get("trap_reason") or base_r.get("block_reason") or "")
+try:
+    self._mid_digest_add(self._mid_trap_digest_stats, str(base_r.get("direction","")), str(_r))
+except Exception:
+    pass
                             logger.info("[mid][trap] %s %s blocked=%s reason=%s src_best=%s", sym, str(base_r.get("direction","")).upper(), base_r.get("blocked"), base_r.get("trap_reason",""), best_name)
                             continue
                         if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
@@ -8470,6 +8476,15 @@ class Backend:
                         await asyncio.sleep(2)
             except Exception:
                 logger.exception("[mid] scanner_loop_mid error")
+
+
+# --- send digest every MID_TRAP_DIGEST_SEC ---
+try:
+    self._mid_trap_digest_last_sent = await self._mid_digest_maybe_send(
+        self._mid_trap_digest_stats, float(getattr(self, "_mid_trap_digest_last_sent", time.time()))
+    )
+except Exception:
+    pass
 
             elapsed = time.time() - start
             try:
