@@ -5705,7 +5705,14 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     if not ok_trap:
         try:
             logger.info("MID blocked (trap): dir=%s reason=%s entry=%.6g", dir_trend, trap_reason, float(entry))
-            _emit_mid_trap_event({"dir": str(dir_trend), "reason": str(trap_reason), "reason_key": _mid_trap_reason_key(str(trap_reason)), "entry": float(entry)})
+            # Include symbol to make digest examples actionable.
+            _emit_mid_trap_event({
+                "symbol": str(symbol),
+                "dir": str(dir_trend),
+                "reason": str(trap_reason),
+                "reason_key": _mid_trap_reason_key(str(trap_reason)),
+                "entry": float(entry),
+            })
         except Exception:
             pass
         return None
