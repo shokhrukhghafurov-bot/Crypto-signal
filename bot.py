@@ -76,66 +76,20 @@ def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
-
-# --- outbound send rate limit (avoid Telegram flood control) ---
-_SEND_LOCKS: dict[int, asyncio.Lock] = {}
-_LAST_SEND_AT: dict[int, float] = {}
-_MIN_SEND_INTERVAL_SEC = float(os.getenv("SEND_MIN_INTERVAL_SEC", "0.8") or 0.8)
-
 async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
-    """Send a message with anti-flood protection.
-
-    Telegram may return TelegramRetryAfter (Too Many Requests) for a chat if we send too fast.
-    We:
-      - serialize sends per chat_id
-      - enforce a minimal interval between sends
-      - retry on TelegramRetryAfter using the provided delay
-    """
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
-
-    lock = _SEND_LOCKS.get(chat_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _SEND_LOCKS[chat_id] = lock
-
-    async with lock:
-        # Enforce minimal interval between sends to this chat
-        try:
-            now = time.time()
-            last = float(_LAST_SEND_AT.get(chat_id, 0.0) or 0.0)
-            wait = (_MIN_SEND_INTERVAL_SEC - (now - last))
-            if wait > 0:
-                await asyncio.sleep(wait)
-        except Exception:
-            pass
-
-        # Never recurse. Send via bot API.
-        tries = 0
-        while True:
-            tries += 1
-            try:
-                res = await bot.send_message(chat_id, text, **kwargs)
-                _LAST_SEND_AT[chat_id] = time.time()
-                return res
-            except TelegramRetryAfter as e:
-                # Flood control exceeded. Respect retry_after.
-                delay = float(getattr(e, "retry_after", 1) or 1)
-                # Cap the delay to avoid stalling forever (still safe)
-                delay = min(max(1.0, delay), 90.0)
-                logger.warning("safe_send: flood control for chat_id=%s retry_after=%.1fs (try=%s)", chat_id, delay, tries)
-                await asyncio.sleep(delay + 0.2)
-                if tries < 4:
-                    continue
-                raise
-            except TelegramForbiddenError:
-                # User blocked the bot or cannot be contacted
-                await set_user_blocked(chat_id, blocked=True)
-                raise
-            except TelegramBadRequest as e:
-                if "chat not found" in str(e).lower():
-                    # Chat does not exist / user never started the bot
-                    await set_user_blocked(chat_id, blocked=True)
-                raise
+    # Never recurse. Send via bot API.
+    try:
+        return await bot.send_message(chat_id, text, **kwargs)
+    except TelegramForbiddenError:
+        # User blocked the bot or cannot be contacted
+        await set_user_blocked(chat_id, blocked=True)
+        raise
+    except TelegramBadRequest as e:
+        if "chat not found" in str(e).lower():
+            # Chat does not exist / user never started the bot
+            await set_user_blocked(chat_id, blocked=True)
+        raise
 
 async def safe_edit_text(chat_id: int, message_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
@@ -195,6 +149,106 @@ except (ZoneInfoNotFoundError, FileNotFoundError):
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 backend = Backend()
+# ---------------- Admin/Error bot alerts (separate bot) ----------------
+# Send important errors / blocks to a dedicated Telegram bot to avoid polluting the main bot chat.
+ERROR_BOT_TOKEN = (os.getenv("ERROR_BOT_TOKEN") or "").strip()
+ADMIN_ALERT_CHAT_ID = int(os.getenv("ADMIN_ALERT_CHAT_ID", "5090106525") or 5090106525)
+
+# What to forward (defaults are SAFE: only critical + scanner errors + MID blocks; ignore stablecoin SCAN_BLOCK spam)
+ERROR_BOT_ENABLED = (os.getenv("ERROR_BOT_ENABLED", "1").strip().lower() not in ("0","false","no","off"))
+ERROR_BOT_SEND_SCAN_BLOCK = (os.getenv("ERROR_BOT_SEND_SCAN_BLOCK", "0").strip().lower() not in ("0","false","no","off"))
+ERROR_BOT_SEND_MID_BLOCK = (os.getenv("ERROR_BOT_SEND_MID_BLOCK", "1").strip().lower() not in ("0","false","no","off"))
+ERROR_BOT_SEND_SCANNER_ERRORS = (os.getenv("ERROR_BOT_SEND_SCANNER_ERRORS", "1").strip().lower() not in ("0","false","no","off"))
+ERROR_BOT_SEND_LEVEL = (os.getenv("ERROR_BOT_SEND_LEVEL", "ERROR") or "ERROR").upper().strip()  # ERROR/WARNING/INFO
+
+# Patterns we NEVER forward (noisy, user/API-key problems, stablecoin scan blocks)
+_ERROR_BOT_IGNORE_SUBSTRINGS = tuple(s.strip().lower() for s in (os.getenv("ERROR_BOT_IGNORE_SUBSTRINGS") or "").split(",") if s.strip())
+# built-in ignores
+_ERROR_BOT_IGNORE_DEFAULT = (
+    "invalid api-key", "invalid api key", "api-key invalid", "signature", "whitelist", "ip not allowed",
+    "permission", "not authorized", "rate limit", "too many requests", "time mismatch", "timestamp",
+)
+_ERROR_BOT_IGNORE_SCAN_BLOCK = ("scan_block", "blocked_stable_pair", "blocked_symbol_list")  # stablecoin & hardblock noise
+
+_error_bot: Bot | None = None
+if ERROR_BOT_TOKEN and ERROR_BOT_ENABLED:
+    try:
+        _error_bot = Bot(ERROR_BOT_TOKEN)
+    except Exception:
+        _error_bot = None
+
+# Simple per-chat rate limiter for error bot sends (prevents Telegram flood control)
+_ERROR_SEND_LOCKS: dict[int, asyncio.Lock] = {}
+_ERROR_LAST_SENT_AT: dict[int, float] = {}
+_ERROR_MIN_INTERVAL_SEC = float(os.getenv("ERROR_BOT_MIN_INTERVAL_SEC", "0.8") or 0.8)
+
+async def _error_bot_send(text: str) -> None:
+    if not _error_bot or not ERROR_BOT_ENABLED:
+        return
+    chat_id = ADMIN_ALERT_CHAT_ID
+    lock = _ERROR_SEND_LOCKS.setdefault(chat_id, asyncio.Lock())
+    async with lock:
+        # spacing
+        now = time.time()
+        last = _ERROR_LAST_SENT_AT.get(chat_id, 0.0)
+        wait = _ERROR_MIN_INTERVAL_SEC - (now - last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        # send with retry-after handling
+        for _ in range(3):
+            try:
+                await _error_bot.send_message(chat_id, text[:3900])
+                _ERROR_LAST_SENT_AT[chat_id] = time.time()
+                return
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(float(getattr(e, "retry_after", 1.0)))
+            except Exception:
+                return
+
+def _should_forward_to_error_bot(levelno: int, msg: str) -> bool:
+    m = (msg or "").lower()
+    # ignore stablecoin scan blocks unless explicitly enabled
+    if "scan_block" in m and any(x in m for x in _ERROR_BOT_IGNORE_SCAN_BLOCK):
+        return False
+    # ignore common credential/noise issues
+    if any(x in m for x in _ERROR_BOT_IGNORE_DEFAULT):
+        return False
+    if _ERROR_BOT_IGNORE_SUBSTRINGS and any(x in m for x in _ERROR_BOT_IGNORE_SUBSTRINGS):
+        return False
+
+    # Always forward ERROR+
+    min_level = getattr(logging, ERROR_BOT_SEND_LEVEL, logging.ERROR)
+    if levelno >= min_level and min_level >= logging.WARNING:
+        return True
+
+    # Allow selected INFO/WARNING markers
+    if ERROR_BOT_SEND_SCANNER_ERRORS and ("error scanner" in m or "scanner error" in m):
+        return True
+    if ERROR_BOT_SEND_MID_BLOCK and ("mid blocked" in m or "mid_block" in m):
+        return True
+    if ERROR_BOT_SEND_SCAN_BLOCK and ("scan_block" in m):
+        # but still avoid stable pair spam above
+        return True
+
+    return False
+
+class ErrorBotLogHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+            if not _should_forward_to_error_bot(record.levelno, msg):
+                return
+            text = f"❗ {logging.getLevelName(record.levelno)}\n{record.name}\n{msg}"
+            asyncio.create_task(_error_bot_send(text))
+        except Exception:
+            pass
+
+# Attach handler (once)
+if _error_bot and ERROR_BOT_ENABLED:
+    _h = ErrorBotLogHandler()
+    _h.setLevel(logging.INFO)
+    logging.getLogger().addHandler(_h)
+# ----------------------------------------------------------------------
 
 # Keep last broadcast signals for 'Spot live' / 'Futures live' buttons
 LAST_SIGNAL_BY_MARKET = {"SPOT": None, "FUTURES": None}
