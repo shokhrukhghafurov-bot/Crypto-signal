@@ -1680,6 +1680,24 @@ def _too_late_text(uid: int, sig: Signal, reason: str, price: float) -> str:
     )
 
 
+
+def _price_unavailable_notice(uid: int, sig: 'Signal') -> str:
+    """Human-friendly transient warning shown when we can't fetch current price.
+    IMPORTANT: this is NOT the same as 'signal expired' (TP/SL/time).
+    """
+    mkt = (getattr(sig, "market", None) or "FUTURES").upper()
+    if mkt == "SPOT":
+        ex = "Binance/Bybit/OKX/Gate.io/MEXC"
+    else:
+        ex = "Binance/Bybit/OKX"
+    # Prefer i18n if keys exist, otherwise fall back to RU text requested by user.
+    try:
+        if "sig_price_unavailable" in I18N.get(get_lang(uid), {}):
+            return trf(uid, "sig_price_unavailable", exchanges=ex)
+    except Exception:
+        pass
+    return f"⚠️ Не удалось получить цену ({ex}). Попробуй ещё раз."
+
 def _fmt_countdown(seconds: float) -> str:
     if seconds < 0:
         seconds = 0
@@ -2337,7 +2355,17 @@ async def menu_handler(call: types.CallbackQuery) -> None:
 
         allowed, reason, price = await backend.check_signal_openable(sig)
         if not allowed:
-            # Drop stale signal from Live caches
+            # If we couldn't fetch current price (temporary exchange/API issue),
+            # do NOT treat the signal as expired. Show it with a warning and keep the OPEN button.
+            if (reason or "").upper() == "ERROR":
+                kb = InlineKeyboardBuilder()
+                kb.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+                kb.adjust(1)
+                warn = _price_unavailable_notice(uid, sig)
+                await safe_edit(call.message, warn + "\n\n" + _signal_text(uid, sig), kb.as_markup())
+                return
+
+            # Otherwise it's truly not live anymore (TP/SL/time) -> drop from cache.
             if LAST_SIGNAL_BY_MARKET.get(market) and LAST_SIGNAL_BY_MARKET[market].signal_id == sig.signal_id:
                 LAST_SIGNAL_BY_MARKET[market] = None
             await safe_edit(call.message, tr(uid, "no_live_signals"), menu_kb(uid))
@@ -3389,7 +3417,21 @@ async def opened(call: types.CallbackQuery) -> None:
 
     allowed, reason, price = await backend.check_signal_openable(sig)
     if not allowed:
-        # remove stale from Live cache
+        # If we couldn't fetch current price (temporary exchange/API issue),
+        # do NOT expire the signal. Just warn and let the user retry.
+        if (reason or "").upper() == "ERROR":
+            await call.answer(_price_unavailable_notice(call.from_user.id, sig), show_alert=True)
+            # Send a small helper message with the OPEN button (so user can tap again).
+            kb = InlineKeyboardBuilder()
+            kb.button(text=tr(call.from_user.id, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+            kb.adjust(1)
+            try:
+                await safe_send(call.from_user.id, _price_unavailable_notice(call.from_user.id, sig), reply_markup=kb.as_markup())
+            except Exception:
+                pass
+            return
+
+        # Otherwise it's truly too late (TP/SL/time) -> remove stale from Live cache + expire message.
         mkt = (sig.market or "FUTURES").upper()
         if LAST_SIGNAL_BY_MARKET.get(mkt) and LAST_SIGNAL_BY_MARKET[mkt].signal_id == sig.signal_id:
             LAST_SIGNAL_BY_MARKET[mkt] = None
