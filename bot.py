@@ -321,7 +321,6 @@ _MID_TRAP_DIGEST_WINDOW_SEC = float(os.getenv("MID_TRAP_DIGEST_WINDOW_SEC", "600
 _MID_TRAP_DIGEST_MAX_REASONS = int(float(os.getenv("MID_TRAP_DIGEST_MAX_REASONS", "5") or 5))
 _MID_TRAP_DIGEST_EXAMPLES_PER_REASON = int(float(os.getenv("MID_TRAP_DIGEST_EXAMPLES_PER_REASON", "2") or 2))
 _MID_TRAP_DIGEST_MAX_EVENTS = int(float(os.getenv("MID_TRAP_DIGEST_MAX_EVENTS", "500") or 500))
-_MID_TRAP_DIGEST_SEND_EMPTY = (os.getenv("MID_TRAP_DIGEST_SEND_EMPTY", "0").strip().lower() not in ("0","false","no","off"))
 
 _mid_trap_events: list[dict] = []
 _mid_trap_lock = asyncio.Lock()
@@ -363,9 +362,7 @@ def _build_mid_trap_digest(events: list[dict]) -> str:
                 en_txt = f"{float(en):.6g}" if en is not None else "—"
             except Exception:
                 en_txt = "—"
-            sym = str(s.get('symbol') or '').strip()
-            sym_txt = (sym + ' ') if sym else ''
-            lines.append(f"  - {sym_txt}{d} entry={en_txt} {reason}")
+            lines.append(f"  - {d} entry={en_txt} {reason}")
     if len(by) > len(items):
         lines.append(f"… +{len(by)-len(items)} other reasons")
     return "\n".join(lines)
@@ -384,15 +381,11 @@ async def _mid_trap_digest_loop() -> None:
             continue
         async with _mid_trap_lock:
             if not _mid_trap_events:
-                events = []
                 _mid_trap_last_flush_ts = now
-            else:
-                events = list(_mid_trap_events)
-                _mid_trap_events.clear()
-                _mid_trap_last_flush_ts = now
-        if (not events) and (not _MID_TRAP_DIGEST_SEND_EMPTY):
-            continue
-
+                continue
+            events = list(_mid_trap_events)
+            _mid_trap_events.clear()
+            _mid_trap_last_flush_ts = now
         try:
             await _error_bot_send(_build_mid_trap_digest(events))
         except Exception:
