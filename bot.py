@@ -4115,7 +4115,9 @@ async def main() -> None:
             async def _mk(market: str) -> dict:
                 out: dict[str, dict] = {}
                 for k, (since, until) in ranges.items():
-                    b = await db_store.signal_perf_bucket_global(market, since=since, until=until)
+                    # Admin dashboard expects *executed* outcomes (AUTO-TRADE), not theoretical signal tracks.
+                    # Use trade_events/trades aggregation.
+                    b = await db_store.trade_perf_bucket_global(market, since=since, until=until)
                     trades = int(b.get('trades') or 0)
                     wins = int(b.get('wins') or 0)      # TP2 hits (WIN)
                     losses = int(b.get('losses') or 0)  # SL hits (LOSS)
