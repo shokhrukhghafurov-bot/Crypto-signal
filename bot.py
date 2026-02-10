@@ -1572,8 +1572,21 @@ async def broadcast_signal(sig: Signal) -> None:
         sid = await db_store.next_signal_id()
         sig = replace(sig, signal_id=sid)
     except Exception as e:
-        # Fallback to existing id if DB is unavailable; still log for visibility.
+        # Fallback: derive a stable non-zero signal_id from sig_key so:
+        # - tracking rows (signal_tracks) still exist
+        # - open/close callbacks still work across restarts
+        # This keeps "Signals closed (outcomes)" dashboard functional even if DB sequence is unavailable.
         logger.error("Failed to allocate signal_id from DB sequence: %s", e)
+        try:
+            if not getattr(sig, "signal_id", 0):
+                # Take first 8 bytes of SHA1(sig_raw) -> uint64 -> fit into BIGINT safely.
+                _h = bytes.fromhex(sig_key)[:8]
+                sid2 = int.from_bytes(_h, "big", signed=False)
+                if sid2 == 0:
+                    sid2 = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+                sig = replace(sig, signal_id=sid2)
+        except Exception:
+            pass
     # Save as last live signal for menu buttons
     try:
         LAST_SIGNAL_BY_MARKET["SPOT" if sig.market == "SPOT" else "FUTURES"] = sig
@@ -4115,9 +4128,7 @@ async def main() -> None:
             async def _mk(market: str) -> dict:
                 out: dict[str, dict] = {}
                 for k, (since, until) in ranges.items():
-                    # Admin dashboard expects *executed* outcomes (AUTO-TRADE), not theoretical signal tracks.
-                    # Use trade_events/trades aggregation.
-                    b = await db_store.trade_perf_bucket_global(market, since=since, until=until)
+                    b = await db_store.signal_perf_bucket_global(market, since=since, until=until)
                     trades = int(b.get('trades') or 0)
                     wins = int(b.get('wins') or 0)      # TP2 hits (WIN)
                     losses = int(b.get('losses') or 0)  # SL hits (LOSS)
