@@ -5056,29 +5056,160 @@ class MultiExchangeData:
         if self.session:
             await self.session.close()
 
-    async def get_top_usdt_symbols(self, n: int) -> List[str]:
+    def _norm_top_symbol(self, s: str) -> str:
+        s = (s or "").upper().strip()
+        s = s.replace("-", "").replace("_", "").replace("/", "")
+        return s
+
+    def _is_ok_top_symbol(self, sym: str) -> bool:
+        if not sym.endswith("USDT"):
+            return False
+        if any(x in sym for x in ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
+            return False
+        return True
+
+    async def _top_from_binance(self) -> list[tuple[float, str]]:
         assert self.session is not None
         url = f"{self.BINANCE_SPOT}/api/v3/ticker/24hr"
-        async with self.session.get(url) as r:
-            r.raise_for_status()
-            data = await r.json()
-
-        items = []
-        for t in data:
-            sym = t.get("symbol", "")
-            if not sym.endswith("USDT"):
-                continue
-            if any(x in sym for x in ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
+        data = await self._get_json(url)
+        out: list[tuple[float, str]] = []
+        for t in data or []:
+            sym = self._norm_top_symbol(t.get("symbol", ""))
+            if not self._is_ok_top_symbol(sym):
                 continue
             try:
                 qv = float(t.get("quoteVolume", "0") or 0)
             except Exception:
                 qv = 0.0
-            items.append((qv, sym))
-        items.sort(reverse=True, key=lambda x: x[0])
+            out.append((qv, sym))
+        return out
+
+    async def _top_from_mexc(self) -> list[tuple[float, str]]:
+        assert self.session is not None
+        url = f"{self.MEXC}/api/v3/ticker/24hr"
+        data = await self._get_json(url)
+        out: list[tuple[float, str]] = []
+        for t in data or []:
+            sym = self._norm_top_symbol(t.get("symbol", ""))
+            if not self._is_ok_top_symbol(sym):
+                continue
+            try:
+                # MEXC uses quoteVolume too
+                qv = float(t.get("quoteVolume", "0") or 0)
+            except Exception:
+                qv = 0.0
+            out.append((qv, sym))
+        return out
+
+    async def _top_from_bybit(self) -> list[tuple[float, str]]:
+        # Bybit v5 spot tickers
+        url = f"{self.BYBIT}/v5/market/tickers"
+        data = await self._get_json(url, params={"category": "spot"})
+        lst = (((data or {}).get("result") or {}).get("list") or []) if isinstance(data, dict) else []
+        out: list[tuple[float, str]] = []
+        for t in lst:
+            sym = self._norm_top_symbol(t.get("symbol", ""))
+            if not self._is_ok_top_symbol(sym):
+                continue
+            # turnover24h is quote turnover (in USDT for USDT pairs)
+            qv = 0.0
+            for k in ("turnover24h", "quoteVolume", "volume24h"):
+                try:
+                    if t.get(k) is not None:
+                        qv = float(t.get(k) or 0.0)
+                        break
+                except Exception:
+                    continue
+            out.append((qv, sym))
+        return out
+
+    async def _top_from_okx(self) -> list[tuple[float, str]]:
+        url = f"{self.OKX}/api/v5/market/tickers"
+        data = await self._get_json(url, params={"instType": "SPOT"})
+        lst = (data.get("data") or []) if isinstance(data, dict) else []
+        out: list[tuple[float, str]] = []
+        for t in lst:
+            sym = self._norm_top_symbol(t.get("instId", ""))
+            if not self._is_ok_top_symbol(sym):
+                continue
+            qv = 0.0
+            # volCcy24h is quote volume
+            for k in ("volCcy24h", "volCcy", "vol24h"):
+                try:
+                    if t.get(k) is not None:
+                        qv = float(t.get(k) or 0.0)
+                        break
+                except Exception:
+                    continue
+            out.append((qv, sym))
+        return out
+
+    async def _top_from_gateio(self) -> list[tuple[float, str]]:
+        url = f"{self.GATEIO}/spot/tickers"
+        data = await self._get_json(url)
+        out: list[tuple[float, str]] = []
+        for t in data or []:
+            sym = self._norm_top_symbol(t.get("currency_pair", ""))
+            if not self._is_ok_top_symbol(sym):
+                continue
+            qv = 0.0
+            # quote_volume is quote volume; some accounts use "quote_volume" / "quote_volume_24h"
+            for k in ("quote_volume", "quote_volume_24h", "base_volume", "base_volume_24h"):
+                try:
+                    if t.get(k) is not None:
+                        qv = float(t.get(k) or 0.0)
+                        break
+                except Exception:
+                    continue
+            out.append((qv, sym))
+        return out
+
+    async def get_top_usdt_symbols(self, n: int) -> List[str]:
+        """Return Binance-style symbols (e.g. BTCUSDT) sorted by quote turnover.
+
+        IMPORTANT: Binance may be unreachable (DNS/ban/region). We fall back to other exchanges.
+        """
+        assert self.session is not None
+
+        providers = [
+            ("BINANCE", self._top_from_binance),
+            ("BYBIT", self._top_from_bybit),
+            ("OKX", self._top_from_okx),
+            ("MEXC", self._top_from_mexc),
+            ("GATEIO", self._top_from_gateio),
+        ]
+
+        last_err: Exception | None = None
+        items: list[tuple[float, str]] = []
+        for name, fn in providers:
+            try:
+                items = await fn()
+                if items:
+                    break
+            except Exception as e:
+                last_err = e
+                logger.warning("get_top_usdt_symbols: %s failed: %s", name, e)
+                continue
+
+        if not items:
+            if last_err is not None:
+                raise last_err
+            return []
+
+        items.sort(reverse=True, key=lambda x: float(x[0] or 0.0))
+        syms = [sym for _, sym in items if sym]
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        dedup: list[str] = []
+        for s in syms:
+            if s in seen:
+                continue
+            seen.add(s)
+            dedup.append(s)
+
         if n <= 0:
-            return [sym for _, sym in items]
-        return [sym for _, sym in items[:n]]
+            return dedup
+        return dedup[:n]
 
     async def _get_json(self, url: str, params: Optional[Dict[str, str]] = None) -> Any:
         assert self.session is not None
@@ -5578,6 +5709,9 @@ def _mid_structure_trap_ok(*, direction: str, entry: float, df1hi: pd.DataFrame)
         return (True, "")
 
     if df1hi is None or df1hi.empty or len(df1hi) < 20:
+        require_1h = _mid_trap_env_bool("MID_TRAP_REQUIRE_1H_DATA", True)
+        if require_1h:
+            return (False, "no_1h_data")
         return (True, "")
 
     atr1h = _mid_atr_1h(df1hi)
@@ -5977,10 +6111,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "tp2": tp2,
         "rr": rr,
         "confidence": confidence,
-        "trap_ok": bool(trap_ok),
-        "trap_reason": str(trap_reason or ""),
-        "blocked": (not bool(trap_ok)),
-
 
         # fields used by MID filters/formatter
         "dir1": dir_mid,
@@ -7030,6 +7160,9 @@ class Backend:
         self.last_macro_action: str = "ALLOW"
         self.scanner_running: bool = True
         self.last_scan_ts: float = 0.0
+        # Cache last successful TOP symbols so scanner can continue when one exchange is temporarily down.
+        self._symbols_cache: list[str] = []
+        self._symbols_cache_ts: float = 0.0
         self.trade_stats: dict = {}
         self._load_trade_stats()
 
@@ -7868,7 +8001,18 @@ class Backend:
                 async with MultiExchangeData() as api:
                     await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
 
-                    symbols = await api.get_top_usdt_symbols(TOP_N)
+                    try:
+                        symbols = await api.get_top_usdt_symbols(TOP_N)
+                        if symbols:
+                            self._symbols_cache = list(symbols)
+                            self._symbols_cache_ts = time.time()
+                    except Exception as e:
+                        # If Binance (or other primary) is unreachable (DNS/ban), fall back to cached list.
+                        if self._symbols_cache:
+                            logger.warning("[scanner] get_top_usdt_symbols failed (%s); using cached symbols (%s)", e, len(self._symbols_cache))
+                            symbols = list(self._symbols_cache)
+                        else:
+                            raise
                     self.scanned_symbols_last = len(symbols)
                     logger.info("[scanner] symbols loaded: %s", self.scanned_symbols_last)
 
@@ -8242,7 +8386,18 @@ class Backend:
             try:
                 async with MultiExchangeData() as api:
                     await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
-                    symbols = await api.get_top_usdt_symbols(top_n)
+                    # Same best-effort symbols loading as MAIN scanner.
+                    try:
+                        symbols = await api.get_top_usdt_symbols(top_n)
+                        if symbols:
+                            self._symbols_cache = list(symbols)
+                            self._symbols_cache_ts = time.time()
+                    except Exception as e:
+                        if self._symbols_cache:
+                            logger.warning("[mid] get_top_usdt_symbols failed (%s); using cached symbols (%s)", e, len(self._symbols_cache))
+                            symbols = list(self._symbols_cache)
+                        else:
+                            raise
                     # --- MID tick counters / diagnostics ---
                     _mid_scanned = len(symbols)
                     _mid_emitted = 0
