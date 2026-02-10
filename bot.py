@@ -1,3 +1,10 @@
+
+_ERROR_BOT_IGNORE_DEFAULT = [
+    "telegramconflicterror",
+    "terminated by other getupdates request"
+]
+
+
 from __future__ import annotations
 
 import asyncio
@@ -26,14 +33,6 @@ import db_store
 
 from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test
 import time
-
-
-_ERROR_BOT_IGNORE_DEFAULT = [
-    "telegramconflicterror",
-    "terminated by other getupdates request"
-]
-
-
 
 load_dotenv()
 
@@ -305,116 +304,153 @@ def _error_agg_note(levelno: int, logger_name: str, msg: str) -> None:
 
 
 
-# --- MID trap digest (group "MID blocked (trap)" INFO spam into one message every N seconds) ---
+# --- MID trap digest (group by reason) ---
+# Instead of spamming error-bot with many INFO lines like:
+#   "MID blocked (trap): dir=... reason=... ..."
+# we aggregate them into a digest sent every N seconds.
 _MID_TRAP_DIGEST_ENABLED = (os.getenv("MID_TRAP_DIGEST_ENABLED", "1").strip().lower() not in ("0","false","no","off"))
-_MID_TRAP_DIGEST_WINDOW_SEC = float(os.getenv("MID_TRAP_DIGEST_WINDOW_SEC", "600") or 600)  # default 10 minutes
-_MID_TRAP_DIGEST_MAX_LINES = int(float(os.getenv("MID_TRAP_DIGEST_MAX_LINES", "25") or 25))  # cap lines in digest
+_MID_TRAP_DIGEST_WINDOW_SEC = int(float(os.getenv("MID_TRAP_DIGEST_WINDOW_SEC", "600") or 600))
+_MID_TRAP_DIGEST_TOP_N = int(float(os.getenv("MID_TRAP_DIGEST_TOP_N", "6") or 6))
+_MID_TRAP_DIGEST_EXAMPLES_PER_REASON = int(float(os.getenv("MID_TRAP_DIGEST_EXAMPLES_PER_REASON", "2") or 2))
+_MID_TRAP_DIGEST_MAX_TOTAL_LINES = int(float(os.getenv("MID_TRAP_DIGEST_MAX_TOTAL_LINES", "45") or 45))
 
-# msg -> count
-_MID_TRAP_BUCKET: dict[str, int] = {}
-_MID_TRAP_FIRST_TS: float | None = None
-_MID_TRAP_LAST_TS: float | None = None
-_MID_TRAP_FLUSH_TASK: asyncio.Task | None = None
+_MID_TRAP_DIGEST_LOCK: asyncio.Lock = asyncio.Lock()
+_MID_TRAP_DIGEST: dict[str, dict] = {}  # reason -> {"count":int,"dirs":{dir:int},"examples":[str]}
+_MID_TRAP_DIGEST_LAST_FLUSH_AT: float = 0.0
+_MID_TRAP_DIGEST_TASK: asyncio.Task | None = None
 
-def _is_mid_trap_msg(msg: str) -> bool:
+_RX_TRAP_REASON = re.compile(r"\breason=([a-zA-Z0-9_\-]+)")
+_RX_TRAP_DIR = re.compile(r"\bdir=([A-Z]+)")
+
+def _mid_trap_compact_example(msg: str) -> str:
+    # Keep a compact, useful tail. Remove the leading "MID blocked (trap):" and "dir=...".
+    m = (msg or "").strip()
+    m = m.replace("MID blocked (trap):", "").strip()
+    # drop dir=... prefix if present
+    m = re.sub(r"\bdir=[A-Z]+\s*", "", m).strip()
+    # keep it short
+    if len(m) > 180:
+        m = m[:177] + "..."
+    return m
+
+async def _mid_trap_digest_note(msg: str) -> None:
+    global _MID_TRAP_DIGEST_TASK
+    if not _MID_TRAP_DIGEST_ENABLED or _MID_TRAP_DIGEST_WINDOW_SEC <= 0:
+        return
+
+    reason = "unknown"
+    direction = "NA"
     try:
-        m = (msg or "").lower()
-        return "mid blocked" in m and "(trap" in m
+        mr = _RX_TRAP_REASON.search(msg or "")
+        if mr:
+            reason = (mr.group(1) or "unknown").strip()
+        md = _RX_TRAP_DIR.search(msg or "")
+        if md:
+            direction = (md.group(1) or "NA").strip().upper()
     except Exception:
-        return False
+        reason = "unknown"
+        direction = "NA"
 
-def _mid_trap_normalize(msg: str) -> str:
-    # Keep it compact but informative; strip excessive whitespace.
-    try:
-        s = str(msg or "").strip()
-        s = re.sub(r"\s+", " ", s)
-        return s
-    except Exception:
-        return str(msg or "").strip()
+    ex = _mid_trap_compact_example(msg)
 
-async def _mid_trap_flush() -> None:
-    global _MID_TRAP_BUCKET, _MID_TRAP_FIRST_TS, _MID_TRAP_LAST_TS, _MID_TRAP_FLUSH_TASK
-    try:
-        await asyncio.sleep(max(1.0, float(_MID_TRAP_DIGEST_WINDOW_SEC)))
-        if not _MID_TRAP_DIGEST_ENABLED:
-            _MID_TRAP_BUCKET.clear()
-            _MID_TRAP_FIRST_TS = None
-            _MID_TRAP_LAST_TS = None
-            _MID_TRAP_FLUSH_TASK = None
-            return
+    async with _MID_TRAP_DIGEST_LOCK:
+        ent = _MID_TRAP_DIGEST.get(reason)
+        if not ent:
+            ent = {"count": 0, "dirs": {}, "examples": []}
+            _MID_TRAP_DIGEST[reason] = ent
+        ent["count"] = int(ent.get("count") or 0) + 1
+        dct = ent.get("dirs") or {}
+        dct[direction] = int(dct.get(direction) or 0) + 1
+        ent["dirs"] = dct
+        # keep a few examples
+        exs = ent.get("examples") or []
+        if ex and (len(exs) < max(0, _MID_TRAP_DIGEST_EXAMPLES_PER_REASON)) and (ex not in exs):
+            exs.append(ex)
+        ent["examples"] = exs[:max(0, _MID_TRAP_DIGEST_EXAMPLES_PER_REASON)]
 
-        if not _MID_TRAP_BUCKET:
-            _MID_TRAP_FIRST_TS = None
-            _MID_TRAP_LAST_TS = None
-            _MID_TRAP_FLUSH_TASK = None
-            return
+        # start loop once
+        if _MID_TRAP_DIGEST_TASK is None or _MID_TRAP_DIGEST_TASK.done():
+            _MID_TRAP_DIGEST_TASK = asyncio.create_task(_mid_trap_digest_loop())
 
-        total = sum(int(v or 0) for v in _MID_TRAP_BUCKET.values())
-        first_ts = float(_MID_TRAP_FIRST_TS or time.time())
-        last_ts = float(_MID_TRAP_LAST_TS or first_ts)
-
-        # Sort by count desc
-        items = sorted(_MID_TRAP_BUCKET.items(), key=lambda kv: (-int(kv[1] or 0), kv[0]))
-        lines: list[str] = []
-        for msg, cnt in items[:max(1, int(_MID_TRAP_DIGEST_MAX_LINES))]:
-            if cnt > 1:
-                lines.append(f"• x{cnt} {msg}")
-            else:
-                lines.append(f"• {msg}")
-
-        header = (
-            f"🧪 MID blocked (trap) — digest ({int(_MID_TRAP_DIGEST_WINDOW_SEC)}s)\n"
-            f"total: {total}\n"
-            f"first: {_fmt_ts(first_ts)}\n"
-            f"last:  {_fmt_ts(last_ts)}"
-        )
-        body = "\n".join(lines)
-
-        # Ensure within Telegram limit
-        text = header + "\n" + body
-        if len(text) > 3800:
-            # truncate body
-            cut = 3800 - len(header) - 2
-            body = (body[:cut] + "\n…(truncated)") if cut > 0 else ""
-            text = header + "\n" + body
-
-        await _error_bot_send(text)
-
-    except Exception:
-        pass
-    finally:
-        _MID_TRAP_BUCKET.clear()
-        _MID_TRAP_FIRST_TS = None
-        _MID_TRAP_LAST_TS = None
-        _MID_TRAP_FLUSH_TASK = None
-
-def _mid_trap_note(msg: str) -> None:
-    global _MID_TRAP_BUCKET, _MID_TRAP_FIRST_TS, _MID_TRAP_LAST_TS, _MID_TRAP_FLUSH_TASK
+async def _mid_trap_digest_flush() -> None:
+    global _MID_TRAP_DIGEST_LAST_FLUSH_AT
     if not _MID_TRAP_DIGEST_ENABLED:
         return
-    try:
-        now = time.time()
-        if _MID_TRAP_FIRST_TS is None:
-            _MID_TRAP_FIRST_TS = now
-        _MID_TRAP_LAST_TS = now
+    async with _MID_TRAP_DIGEST_LOCK:
+        if not _MID_TRAP_DIGEST:
+            _MID_TRAP_DIGEST_LAST_FLUSH_AT = time.time()
+            return
+        snap = _MID_TRAP_DIGEST
+        _MID_TRAP_DIGEST = {}
+        _MID_TRAP_DIGEST_LAST_FLUSH_AT = time.time()
 
-        norm = _mid_trap_normalize(msg)
-        _MID_TRAP_BUCKET[norm] = int(_MID_TRAP_BUCKET.get(norm, 0) or 0) + 1
+    # Build digest text (outside lock)
+    total = sum(int(v.get("count") or 0) for v in snap.values())
+    if total <= 0:
+        return
 
-        if _MID_TRAP_FLUSH_TASK is None:
-            _MID_TRAP_FLUSH_TASK = asyncio.create_task(_mid_trap_flush())
-    except Exception:
-        pass
+    # sort reasons by count desc
+    items = sorted(snap.items(), key=lambda kv: int((kv[1] or {}).get("count") or 0), reverse=True)
+    top_n = max(1, _MID_TRAP_DIGEST_TOP_N)
+    items = items[:top_n]
 
+    lines: list[str] = []
+    lines.append(f"🧱 MID trap blocked — {int(_MID_TRAP_DIGEST_WINDOW_SEC)}s digest ({total} total)")
+    lines.append("")
+    lines.append("Top reasons:")
+
+    line_budget = max(10, _MID_TRAP_DIGEST_MAX_TOTAL_LINES)
+    used_lines = len(lines)
+
+    for i, (reason, ent) in enumerate(items, start=1):
+        cnt = int((ent or {}).get("count") or 0)
+        dirs = (ent or {}).get("dirs") or {}
+        # show top dirs
+        dir_parts = []
+        for d, dc in sorted(dirs.items(), key=lambda kv: int(kv[1] or 0), reverse=True):
+            if d and d != "NA":
+                dir_parts.append(f"{d} {int(dc)}")
+        dir_txt = (" | " + " / ".join(dir_parts)) if dir_parts else ""
+        lines.append(f"{i}) {reason} — {cnt}{dir_txt}")
+        used_lines += 1
+        exs = (ent or {}).get("examples") or []
+        if exs:
+            lines.append("   examples:")
+            used_lines += 1
+            for ex in exs[:max(0, _MID_TRAP_DIGEST_EXAMPLES_PER_REASON)]:
+                if used_lines >= line_budget:
+                    break
+                lines.append(f"   - {ex}")
+                used_lines += 1
+        if used_lines >= line_budget:
+            break
+
+    text = "\n".join(lines).strip()
+    await _error_bot_send(text)
+
+async def _mid_trap_digest_loop() -> None:
+    # Periodic flush
+    while _MID_TRAP_DIGEST_ENABLED and _MID_TRAP_DIGEST_WINDOW_SEC > 0:
+        await asyncio.sleep(max(5, _MID_TRAP_DIGEST_WINDOW_SEC))
+        try:
+            await _mid_trap_digest_flush()
+        except Exception:
+            # best-effort
+            pass
 class ErrorBotLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = record.getMessage()
 
-            # Special handling: group noisy "MID blocked (trap)" INFO into a periodic digest
-            if ERROR_BOT_SEND_MID_BLOCK and record.name == "crypto-signal" and _is_mid_trap_msg(msg):
-                _mid_trap_note(f"{record.name} | {msg}")
-                return
+            # Special case: MID trap blocks are INFO-noise; send as grouped digest every N seconds.
+            if _MID_TRAP_DIGEST_ENABLED and record.levelno <= logging.INFO:
+                mlow = (msg or "").lower()
+                if ("mid blocked (trap)" in mlow) or ("mid blocked (trap):" in mlow):
+                    try:
+                        asyncio.create_task(_mid_trap_digest_note(msg))
+                    except Exception:
+                        pass
+                    return
 
             if not _should_forward_to_error_bot(record.levelno, msg):
                 return
