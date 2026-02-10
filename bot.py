@@ -25,7 +25,7 @@ from aiohttp import web
 
 import db_store
 
-from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test, set_mid_trap_sink
+from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test
 import time
 
 load_dotenv()
@@ -321,6 +321,7 @@ _MID_TRAP_DIGEST_WINDOW_SEC = float(os.getenv("MID_TRAP_DIGEST_WINDOW_SEC", "600
 _MID_TRAP_DIGEST_MAX_REASONS = int(float(os.getenv("MID_TRAP_DIGEST_MAX_REASONS", "5") or 5))
 _MID_TRAP_DIGEST_EXAMPLES_PER_REASON = int(float(os.getenv("MID_TRAP_DIGEST_EXAMPLES_PER_REASON", "2") or 2))
 _MID_TRAP_DIGEST_MAX_EVENTS = int(float(os.getenv("MID_TRAP_DIGEST_MAX_EVENTS", "500") or 500))
+_MID_TRAP_DIGEST_SEND_EMPTY = (os.getenv("MID_TRAP_DIGEST_SEND_EMPTY", "0").strip().lower() not in ("0","false","no","off"))
 
 _mid_trap_events: list[dict] = []
 _mid_trap_lock = asyncio.Lock()
@@ -355,7 +356,6 @@ def _build_mid_trap_digest(events: list[dict]) -> str:
         lines.append(f"• {rk}: {len(lst)}")
         ex = lst[:max(1, _MID_TRAP_DIGEST_EXAMPLES_PER_REASON)]
         for s in ex:
-            sym = str(s.get('symbol') or '').upper().strip()
             d = str(s.get('dir') or '').upper()
             en = s.get('entry', None)
             reason = str(s.get('reason') or '').strip()
@@ -363,10 +363,9 @@ def _build_mid_trap_digest(events: list[dict]) -> str:
                 en_txt = f"{float(en):.6g}" if en is not None else "—"
             except Exception:
                 en_txt = "—"
-            if sym:
-                lines.append(f"  - {sym} {d} entry={en_txt} {reason}")
-            else:
-                lines.append(f"  - {d} entry={en_txt} {reason}")
+            sym = str(s.get('symbol') or '').strip()
+            sym_txt = (sym + ' ') if sym else ''
+            lines.append(f"  - {sym_txt}{d} entry={en_txt} {reason}")
     if len(by) > len(items):
         lines.append(f"… +{len(by)-len(items)} other reasons")
     return "\n".join(lines)
@@ -385,11 +384,15 @@ async def _mid_trap_digest_loop() -> None:
             continue
         async with _mid_trap_lock:
             if not _mid_trap_events:
+                events = []
                 _mid_trap_last_flush_ts = now
-                continue
-            events = list(_mid_trap_events)
-            _mid_trap_events.clear()
-            _mid_trap_last_flush_ts = now
+            else:
+                events = list(_mid_trap_events)
+                _mid_trap_events.clear()
+                _mid_trap_last_flush_ts = now
+        if (not events) and (not _MID_TRAP_DIGEST_SEND_EMPTY):
+            continue
+
         try:
             await _error_bot_send(_build_mid_trap_digest(events))
         except Exception:
@@ -4983,8 +4986,7 @@ async def main() -> None:
 
     # --- MID trap digest ---
     try:
-        # backend exposes a module-level sink registrar (not a Backend() method)
-        set_mid_trap_sink(_mid_trap_note)
+        backend.set_mid_trap_sink(_mid_trap_note)
         if (_error_bot and ERROR_BOT_ENABLED) and _MID_TRAP_DIGEST_ENABLED and _MID_TRAP_DIGEST_WINDOW_SEC > 0:
             asyncio.create_task(_mid_trap_digest_loop())
     except Exception:
