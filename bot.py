@@ -355,6 +355,7 @@ def _build_mid_trap_digest(events: list[dict]) -> str:
         lines.append(f"• {rk}: {len(lst)}")
         ex = lst[:max(1, _MID_TRAP_DIGEST_EXAMPLES_PER_REASON)]
         for s in ex:
+            sym = str(s.get('symbol') or '').upper().strip() or '—'
             d = str(s.get('dir') or '').upper()
             en = s.get('entry', None)
             reason = str(s.get('reason') or '').strip()
@@ -362,7 +363,7 @@ def _build_mid_trap_digest(events: list[dict]) -> str:
                 en_txt = f"{float(en):.6g}" if en is not None else "—"
             except Exception:
                 en_txt = "—"
-            lines.append(f"  - {d} entry={en_txt} {reason}")
+            lines.append(f"  - {sym} {d} entry={en_txt} {reason}")
     if len(by) > len(items):
         lines.append(f"… +{len(by)-len(items)} other reasons")
     return "\n".join(lines)
