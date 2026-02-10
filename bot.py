@@ -1,10 +1,3 @@
-
-_ERROR_BOT_IGNORE_DEFAULT = [
-    "telegramconflicterror",
-    "terminated by other getupdates request"
-]
-
-
 from __future__ import annotations
 
 import asyncio
@@ -33,6 +26,14 @@ import db_store
 
 from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test
 import time
+
+
+_ERROR_BOT_IGNORE_DEFAULT = [
+    "telegramconflicterror",
+    "terminated by other getupdates request"
+]
+
+
 
 load_dotenv()
 
