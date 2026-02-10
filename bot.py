@@ -303,10 +303,119 @@ def _error_agg_note(levelno: int, logger_name: str, msg: str) -> None:
     ent["last_ts"] = now
 
 
+
+
+# --- MID trap digest (group "MID blocked (trap)" INFO spam into one message every N seconds) ---
+_MID_TRAP_DIGEST_ENABLED = (os.getenv("MID_TRAP_DIGEST_ENABLED", "1").strip().lower() not in ("0","false","no","off"))
+_MID_TRAP_DIGEST_WINDOW_SEC = float(os.getenv("MID_TRAP_DIGEST_WINDOW_SEC", "600") or 600)  # default 10 minutes
+_MID_TRAP_DIGEST_MAX_LINES = int(float(os.getenv("MID_TRAP_DIGEST_MAX_LINES", "25") or 25))  # cap lines in digest
+
+# msg -> count
+_MID_TRAP_BUCKET: dict[str, int] = {}
+_MID_TRAP_FIRST_TS: float | None = None
+_MID_TRAP_LAST_TS: float | None = None
+_MID_TRAP_FLUSH_TASK: asyncio.Task | None = None
+
+def _is_mid_trap_msg(msg: str) -> bool:
+    try:
+        m = (msg or "").lower()
+        return "mid blocked" in m and "(trap" in m
+    except Exception:
+        return False
+
+def _mid_trap_normalize(msg: str) -> str:
+    # Keep it compact but informative; strip excessive whitespace.
+    try:
+        s = str(msg or "").strip()
+        s = re.sub(r"\s+", " ", s)
+        return s
+    except Exception:
+        return str(msg or "").strip()
+
+async def _mid_trap_flush() -> None:
+    global _MID_TRAP_BUCKET, _MID_TRAP_FIRST_TS, _MID_TRAP_LAST_TS, _MID_TRAP_FLUSH_TASK
+    try:
+        await asyncio.sleep(max(1.0, float(_MID_TRAP_DIGEST_WINDOW_SEC)))
+        if not _MID_TRAP_DIGEST_ENABLED:
+            _MID_TRAP_BUCKET.clear()
+            _MID_TRAP_FIRST_TS = None
+            _MID_TRAP_LAST_TS = None
+            _MID_TRAP_FLUSH_TASK = None
+            return
+
+        if not _MID_TRAP_BUCKET:
+            _MID_TRAP_FIRST_TS = None
+            _MID_TRAP_LAST_TS = None
+            _MID_TRAP_FLUSH_TASK = None
+            return
+
+        total = sum(int(v or 0) for v in _MID_TRAP_BUCKET.values())
+        first_ts = float(_MID_TRAP_FIRST_TS or time.time())
+        last_ts = float(_MID_TRAP_LAST_TS or first_ts)
+
+        # Sort by count desc
+        items = sorted(_MID_TRAP_BUCKET.items(), key=lambda kv: (-int(kv[1] or 0), kv[0]))
+        lines: list[str] = []
+        for msg, cnt in items[:max(1, int(_MID_TRAP_DIGEST_MAX_LINES))]:
+            if cnt > 1:
+                lines.append(f"• x{cnt} {msg}")
+            else:
+                lines.append(f"• {msg}")
+
+        header = (
+            f"🧪 MID blocked (trap) — digest ({int(_MID_TRAP_DIGEST_WINDOW_SEC)}s)\n"
+            f"total: {total}\n"
+            f"first: {_fmt_ts(first_ts)}\n"
+            f"last:  {_fmt_ts(last_ts)}"
+        )
+        body = "\n".join(lines)
+
+        # Ensure within Telegram limit
+        text = header + "\n" + body
+        if len(text) > 3800:
+            # truncate body
+            cut = 3800 - len(header) - 2
+            body = (body[:cut] + "\n…(truncated)") if cut > 0 else ""
+            text = header + "\n" + body
+
+        await _error_bot_send(text)
+
+    except Exception:
+        pass
+    finally:
+        _MID_TRAP_BUCKET.clear()
+        _MID_TRAP_FIRST_TS = None
+        _MID_TRAP_LAST_TS = None
+        _MID_TRAP_FLUSH_TASK = None
+
+def _mid_trap_note(msg: str) -> None:
+    global _MID_TRAP_BUCKET, _MID_TRAP_FIRST_TS, _MID_TRAP_LAST_TS, _MID_TRAP_FLUSH_TASK
+    if not _MID_TRAP_DIGEST_ENABLED:
+        return
+    try:
+        now = time.time()
+        if _MID_TRAP_FIRST_TS is None:
+            _MID_TRAP_FIRST_TS = now
+        _MID_TRAP_LAST_TS = now
+
+        norm = _mid_trap_normalize(msg)
+        _MID_TRAP_BUCKET[norm] = int(_MID_TRAP_BUCKET.get(norm, 0) or 0) + 1
+
+        if _MID_TRAP_FLUSH_TASK is None:
+            _MID_TRAP_FLUSH_TASK = asyncio.create_task(_mid_trap_flush())
+    except Exception:
+        pass
+
 class ErrorBotLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = record.getMessage()
+
+            # Special handling: group noisy "MID blocked (trap)" INFO into a periodic digest
+            if ERROR_BOT_SEND_MID_BLOCK and record.name == "crypto-signal" and _is_mid_trap_msg(msg):
+                _mid_trap_note(f"{record.name} | {msg}")
+                return
+
             if not _should_forward_to_error_bot(record.levelno, msg):
                 return
             _error_agg_note(record.levelno, record.name, msg)
