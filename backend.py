@@ -7031,12 +7031,12 @@ class Backend:
 
 
 
-def set_mid_trap_sink(self, cb) -> None:
-    """Register sink for MID trap events (used by bot to build 10m digest)."""
-    try:
-        set_mid_trap_sink(cb)
-    except Exception:
-        pass
+    def set_mid_trap_sink(self, cb) -> None:
+        """Register sink for MID trap events (used by bot to build 10m digest)."""
+        try:
+            set_mid_trap_sink(cb)
+        except Exception:
+            pass
 
 
     def next_signal_id(self) -> int:
