@@ -24,7 +24,7 @@ from aiohttp import web
 
 import db_store
 
-from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test
+from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test, set_admin_notifier
 import time
 
 load_dotenv()
@@ -147,8 +147,25 @@ except (ZoneInfoNotFoundError, FileNotFoundError):
         TZ = ZoneInfo("UTC")
 
 bot = Bot(BOT_TOKEN)
+
+# --- Admin alerts (private) ---
+_ADMIN_ALERT_CHAT_ID = int(os.getenv("ADMIN_ALERT_CHAT_ID", "5090106525") or 5090106525)
+_ADMIN_ALERT_ENABLED = os.getenv("ADMIN_ALERT_ENABLED", "1").strip().lower() not in ("0","false","no","off")
+
+async def _admin_notify(msg: str) -> None:
+    if not _ADMIN_ALERT_ENABLED:
+        return
+    try:
+        text = str(msg or "")
+        if len(text) > 3900:
+            text = text[:3900] + "…"
+        await bot.send_message(_ADMIN_ALERT_CHAT_ID, text)
+    except Exception:
+        pass
+
 dp = Dispatcher()
 backend = Backend()
+set_admin_notifier(_admin_notify)
 
 # Keep last broadcast signals for 'Spot live' / 'Futures live' buttons
 LAST_SIGNAL_BY_MARKET = {"SPOT": None, "FUTURES": None}
