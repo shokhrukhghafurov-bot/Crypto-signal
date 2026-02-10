@@ -24,7 +24,7 @@ from aiohttp import web
 
 import db_store
 
-from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test, set_admin_notifier
+from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test
 import time
 
 load_dotenv()
@@ -148,89 +148,99 @@ except (ZoneInfoNotFoundError, FileNotFoundError):
 
 bot = Bot(BOT_TOKEN)
 
-# --- Admin alerts (private) ---
-_ADMIN_ALERT_CHAT_ID = int(os.getenv("ADMIN_ALERT_CHAT_ID", "5090106525") or 5090106525)
-_ADMIN_ALERT_ENABLED = os.getenv("ADMIN_ALERT_ENABLED", "1").strip().lower() not in ("0","false","no","off")
+# --- Admin alert channel (separate bot) ---
+ADMIN_ALERT_CHAT_ID = int(os.getenv("ADMIN_ALERT_CHAT_ID", "5090106525") or 5090106525)
+ERROR_BOT_TOKEN = (os.getenv("ERROR_BOT_TOKEN") or "").strip()
 
-async def _admin_notify(msg: str) -> None:
-    if not _ADMIN_ALERT_ENABLED:
-        return
+# If ERROR_BOT_TOKEN is provided, alerts are sent via that bot (e.g. @errorrrrrrg_bot).
+# Otherwise, fall back to the main bot.
+error_bot = Bot(ERROR_BOT_TOKEN) if ERROR_BOT_TOKEN else bot
+
+# Anti-spam cooldown per (kind,symbol,reason)
+_ADMIN_ALERT_COOLDOWN_SEC = int(float(os.getenv("ADMIN_ALERT_COOLDOWN_SEC", "60") or 60))
+_admin_alert_last: dict[str, float] = {}
+
+def _should_skip_admin_alert(text: str) -> bool:
+    """Skip expected key/permission/IP/rate-limit errors."""
+    t = (text or "").lower()
+    needles = (
+        "invalid api-key",
+        "api key invalid",
+        "invalid api key",
+        "-2015",
+        "signature mismatch",
+        "invalid signature",
+        "no permission",
+        "not authorized",
+        "permission denied",
+        "ip whitelist",
+        "whitelist",
+        "rate limit",
+        "too many requests",
+        "timestamp",
+        "time mismatch",
+    )
+    return any(n in t for n in needles)
+
+async def admin_alert(text: str, *, key: str | None = None) -> None:
+    """Send admin alert to ADMIN_ALERT_CHAT_ID via error_bot."""
     try:
-        text = str(msg or "")
-        if len(text) > 3900:
-            text = text[:3900] + "…"
-        await bot.send_message(_ADMIN_ALERT_CHAT_ID, text)
+        if not text:
+            return
+        if _should_skip_admin_alert(text):
+            return
+        k = key or text[:120]
+        now = time.time()
+        last = _admin_alert_last.get(k, 0.0)
+        if now - last < _ADMIN_ALERT_COOLDOWN_SEC:
+            return
+        _admin_alert_last[k] = now
+        await error_bot.send_message(ADMIN_ALERT_CHAT_ID, text[:3500])
     except Exception:
         pass
 
-dp = Dispatcher()
-backend = Backend()
-set_admin_notifier(_admin_notify)
-
-# --- Forward selected ERROR logs to admin (filtered) ---
-# We forward real system bugs / outages, but suppress common/expected credential errors.
-_ADMIN_LOG_FORWARD_ENABLED = os.getenv("ADMIN_LOG_FORWARD_ENABLED", "1").strip().lower() not in ("0","false","no","off")
-# Comma-separated substrings (case-insensitive) to IGNORE when forwarding errors.
-# Defaults include common exchange auth/permission issues (you said these are not needed).
-_ADMIN_LOG_IGNORE = [s.strip().lower() for s in (os.getenv(
-    "ADMIN_LOG_IGNORE",
-    "invalid api-key,invalid api key,api-key invalid,invalid key,invalid signature,signature mismatch,permission,no permission,not authorized,ip,whitelist,rate limit,too many requests,time mismatch,timestamp,-2015,code -2015"
-) or "").split(",") if s.strip()]
-
-# Anti-spam: same (logger+msg) forwarded at most once per N seconds
-_ADMIN_LOG_COOLDOWN_SEC = int(float(os.getenv("ADMIN_LOG_COOLDOWN_SEC", "30") or 30))
-_ADMIN_LOG_LAST: dict[str, float] = {}
-
-class _AdminLogForwardHandler(logging.Handler):
+class _AdminAlertLogHandler(logging.Handler):
+    """Forward selected log records to admin_alert() via error bot."""
     def emit(self, record: logging.LogRecord) -> None:
-        if not _ADMIN_ALERT_ENABLED or not _ADMIN_LOG_FORWARD_ENABLED:
-            return
         try:
-            if record.levelno < logging.ERROR:
+            msg = record.getMessage()
+            if not msg:
                 return
 
-            msg = record.getMessage() if record else ""
-            full = msg
-            # Include exception text if available
-            if record.exc_info:
-                try:
-                    full = full + "\n" + "".join(logging.Formatter().formatException(record.exc_info))
-                except Exception:
-                    pass
+            # Always forward ERROR+
+            forward = record.levelno >= logging.ERROR
 
-            low = (full or "").lower()
+            # Also forward important scanner blocks/info markers if they appear in logs
+            # (backend logs: 'SCAN_BLOCK ...', 'MID BLOCKED ...')
+            if not forward:
+                u = msg.upper()
+                if u.startswith("SCAN_BLOCK") or u.startswith("MID BLOCKED") or u.startswith("MID_BLOCK") or u.startswith("ERROR SCANNER") or "BLOCKED_STABLE_PAIR" in u:
+                    forward = True
 
-            # Ignore common/expected exchange credential errors
-            if any(s and s in low for s in _ADMIN_LOG_IGNORE):
+            if not forward:
                 return
 
-            # Additional ignore: autotrade key errors are not actionable here
-            # (example: Binance code -2015 Invalid API-key)
-            if "autotrade" in low and ("invalid" in low or "-2015" in low or "permission" in low):
-                return
+            text = f"❗ {record.levelname}\n{record.name}\n{msg}"
 
-            key = f"{record.name}|{msg}"[:500]
-            now = time.time()
-            last = _ADMIN_LOG_LAST.get(key, 0.0)
-            if now - last < _ADMIN_LOG_COOLDOWN_SEC:
+            # Needs a running loop; if none, ignore (won't crash app)
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
                 return
-            _ADMIN_LOG_LAST[key] = now
-
-            txt = f"❗ LOG ERROR\n{record.name}\n{(full or '').strip()}"
-            if len(txt) > 3900:
-                txt = txt[:3900] + "…"
-            asyncio.create_task(_admin_notify(txt))
+            loop.create_task(admin_alert(text, key=f"{record.name}:{record.levelname}:{msg[:160]}"))
         except Exception:
             pass
 
-# Attach handler once
+# Install handler once
 try:
-    _h = _AdminLogForwardHandler()
-    _h.setLevel(logging.ERROR)
+    _h = _AdminAlertLogHandler()
+    _h.setLevel(logging.INFO)
     logging.getLogger().addHandler(_h)
 except Exception:
     pass
 
+dp = Dispatcher()
+backend = Backend()
 
 # Keep last broadcast signals for 'Spot live' / 'Futures live' buttons
 LAST_SIGNAL_BY_MARKET = {"SPOT": None, "FUTURES": None}
