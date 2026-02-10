@@ -230,6 +230,32 @@ from cryptography.fernet import Fernet
 
 logger = logging.getLogger("crypto-signal")
 
+
+# --- MID trap digest sink (aggregates "MID blocked (trap)" into a periodic digest) ---
+# Bot can register a sink callback that receives structured trap events.
+_MID_TRAP_SINK = None  # type: ignore
+def set_mid_trap_sink(cb):
+    """Register a callable that receives trap events: cb(event: dict)."""
+    global _MID_TRAP_SINK
+    _MID_TRAP_SINK = cb
+
+def _emit_mid_trap_event(event: dict) -> None:
+    try:
+        cb = _MID_TRAP_SINK
+        if cb:
+            cb(event)
+    except Exception:
+        pass
+
+def _mid_trap_reason_key(reason: str) -> str:
+    try:
+        r = (reason or "").strip()
+        if not r:
+            return "unknown"
+        return r.split()[0].strip()
+    except Exception:
+        return "unknown"
+
 # ------------------ Stablecoin pair blocking (scanner + autotrade) ------------------
 # Blocks stable-vs-stable pairs like USDCUSDT / DAIUSDT / USD1USDT, etc.
 # Configure:
@@ -5678,7 +5704,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     ok_trap, trap_reason = _mid_structure_trap_ok(direction=dir_trend, entry=entry, df1hi=df1hi)
     if not ok_trap:
         try:
-            logger.info("MID blocked by trap filter: dir=%s reason=%s entry=%.6g", dir_trend, trap_reason, float(entry))
+            logger.info("MID blocked (trap): dir=%s reason=%s entry=%.6g", dir_trend, trap_reason, float(entry))
+            _emit_mid_trap_event({"dir": str(dir_trend), "reason": str(trap_reason), "reason_key": _mid_trap_reason_key(str(trap_reason)), "entry": float(entry)})
         except Exception:
             pass
         return None
@@ -7001,6 +7028,15 @@ class Backend:
         self.last_scan_ts: float = 0.0
         self.trade_stats: dict = {}
         self._load_trade_stats()
+
+
+
+def set_mid_trap_sink(self, cb) -> None:
+    """Register sink for MID trap events (used by bot to build 10m digest)."""
+    try:
+        set_mid_trap_sink(cb)
+    except Exception:
+        pass
 
 
     def next_signal_id(self) -> int:
