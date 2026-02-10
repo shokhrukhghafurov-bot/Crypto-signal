@@ -4964,16 +4964,15 @@ async def main() -> None:
         logger.warning("Another bot instance holds the polling lock; running HTTP server only (no polling/loops)")
         await asyncio.Event().wait()
 
-    
-# --- MID trap digest ---
-try:
-    backend.set_mid_trap_sink(_mid_trap_note)
-    if (_error_bot and ERROR_BOT_ENABLED) and _MID_TRAP_DIGEST_ENABLED and _MID_TRAP_DIGEST_WINDOW_SEC > 0:
-        asyncio.create_task(_mid_trap_digest_loop())
-except Exception:
-    pass
+    # --- MID trap digest ---
+    try:
+        backend.set_mid_trap_sink(_mid_trap_note)
+        if (_error_bot and ERROR_BOT_ENABLED) and _MID_TRAP_DIGEST_ENABLED and _MID_TRAP_DIGEST_WINDOW_SEC > 0:
+            asyncio.create_task(_mid_trap_digest_loop())
+    except Exception:
+        pass
 
-logger.info("Starting track_loop")
+    logger.info("Starting track_loop")
     if hasattr(backend, "track_loop"):
         asyncio.create_task(backend.track_loop(bot))
     else:
