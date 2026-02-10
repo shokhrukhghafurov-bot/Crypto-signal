@@ -263,33 +263,12 @@ def _split_base_quote(symbol: str) -> tuple[str, str]:
 
 def is_blocked_symbol(symbol: str) -> bool:
     s = _normalize_symbol(symbol)
-
-    # local anti-spam cache (per process)
-    if not hasattr(is_blocked_symbol, "_last"):
-        is_blocked_symbol._last = {}  # type: ignore[attr-defined]
-
-    def _log_once(reason: str):
-        try:
-            import logging, time as _t, os as _os
-            cd = int(float(_os.getenv("ADMIN_BLOCK_COOLDOWN_SEC", "600") or 600))
-            key = f"{s}:{reason}"
-            now = _t.time()
-            last = is_blocked_symbol._last.get(key, 0.0)  # type: ignore[attr-defined]
-            if now - last < cd:
-                return
-            is_blocked_symbol._last[key] = now  # type: ignore[attr-defined]
-            logging.getLogger("crypto-signal").info("SCAN_BLOCK %s %s", s, reason)
-        except Exception:
-            pass
-
     if s in _BLOCKED_SYMBOLS:
-        _log_once("blocked_symbol_list")
         return True
     if not _BLOCK_STABLECOIN_PAIRS:
         return False
     base, quote = _split_base_quote(s)
     if quote and base in _STABLECOINS:
-        _log_once("blocked_stable_pair")
         return True
     return False
 
@@ -4431,6 +4410,31 @@ ADAPTIVE_TP2_ADX_MED = _env_float("ADAPTIVE_TP2_ADX_MED", 25.0)
 ADAPTIVE_TP2_R_STRONG = _env_float("ADAPTIVE_TP2_R_STRONG", 2.8)
 ADAPTIVE_TP2_R_MED = _env_float("ADAPTIVE_TP2_R_MED", 2.45)
 ADAPTIVE_TP2_R_WEAK = _env_float("ADAPTIVE_TP2_R_WEAK", 2.2)
+def _adaptive_tp2_r(adx_1h: float | None) -> float:
+    """Return TP2_R depending on ADX strength when ADAPTIVE_TP2=1.
+
+    Safe: never raises, always returns float.
+    """
+    try:
+        base = float(TP2_R)
+    except Exception:
+        base = 3.0
+    if not bool(ADAPTIVE_TP2):
+        return base
+    try:
+        a = float(adx_1h) if adx_1h is not None else float("nan")
+    except Exception:
+        a = float("nan")
+    if not (a == a):  # NaN
+        return base
+    try:
+        if a >= float(ADAPTIVE_TP2_ADX_STRONG):
+            return float(ADAPTIVE_TP2_R_STRONG)
+        if a >= float(ADAPTIVE_TP2_ADX_MED):
+            return float(ADAPTIVE_TP2_R_MED)
+        return float(ADAPTIVE_TP2_R_WEAK)
+    except Exception:
+        return base
 
 # When >0, BE (SL->BE) becomes "armed" only after price moves from TP1 towards TP2 by this fraction.
 # Helps TP2 by reducing BE whipsaws after TP1. 0 = immediate BE (legacy behavior).
@@ -5110,7 +5114,14 @@ class MultiExchangeData:
         We normalize into the same OHLCV DataFrame shape used by Binance.
         """
         url = f"{self.MEXC}/api/v3/klines"
-        params = {"symbol": symbol.upper(), "interval": interval, "limit": str(limit)}
+        # MEXC can be picky about interval format; normalize hours to minutes when needed.
+        interval_m = (interval or '').strip()
+        try:
+            if interval_m.endswith('h') and interval_m[:-1].isdigit():
+                interval_m = f"{int(interval_m[:-1]) * 60}m"
+        except Exception:
+            interval_m = (interval or '').strip()
+        params = {"symbol": symbol.upper(), "interval": interval_m, "limit": str(limit)}
         raw = await self._get_json(url, params=params)
         rows = raw if isinstance(raw, list) else []
         norm: list[list] = []
