@@ -1310,6 +1310,86 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
         "sum_pnl_pct": float(row.get("sum_pnl_pct") or 0.0),
     }
 
+
+async def trade_perf_bucket_global(market: str, *, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
+    """Aggregate AUTO-TRADE outcomes in [since, until) across ALL users.
+
+    This is what the admin dashboard "Signals closed (outcomes)" expects: it reflects
+    actual executed trades (trade_events + trades), not theoretical signal tracks.
+
+    We take the *last* terminal outcome per trade (WIN/LOSS/BE/CLOSE) within the window.
+    TP1 is counted separately as DISTINCT trades that had a TP1 event in the window.
+    """
+    market = str(market or "").upper()
+    if market not in ("SPOT", "FUTURES"):
+        market = "SPOT"
+
+    # If DB not ready, be safe for dashboard.
+    try:
+        pool = get_pool()
+    except Exception:
+        return {
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "be": 0,
+            "closes": 0,
+            "tp1_hits": 0,
+            "sum_pnl_pct": 0.0,
+        }
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            WITH last_outcome AS (
+              SELECT DISTINCT ON (e.trade_id)
+                     e.trade_id,
+                     e.event_type,
+                     e.pnl_pct,
+                     e.created_at
+                FROM trade_events e
+                JOIN trades t ON t.id = e.trade_id
+               WHERE t.market = $1
+                 AND e.event_type IN ('WIN','LOSS','BE','CLOSE')
+                 AND e.created_at >= $2 AND e.created_at < $3
+               ORDER BY e.trade_id, e.created_at DESC
+            ),
+            tp1 AS (
+              SELECT COUNT(DISTINCT e.trade_id)::int AS tp1_hits
+                FROM trade_events e
+                JOIN trades t ON t.id = e.trade_id
+               WHERE t.market = $1
+                 AND e.event_type = 'TP1'
+                 AND e.created_at >= $2 AND e.created_at < $3
+            )
+            SELECT
+              COUNT(*)::int AS trades,
+              SUM(CASE WHEN event_type='WIN'  THEN 1 ELSE 0 END)::int AS wins,
+              SUM(CASE WHEN event_type='LOSS' THEN 1 ELSE 0 END)::int AS losses,
+              SUM(CASE WHEN event_type='BE'   THEN 1 ELSE 0 END)::int AS be,
+              SUM(CASE WHEN event_type='CLOSE' THEN 1 ELSE 0 END)::int AS closes,
+              (SELECT tp1_hits FROM tp1)::int AS tp1_hits,
+              COALESCE(SUM(COALESCE(pnl_pct, 0)), 0)::float AS sum_pnl_pct
+            FROM last_outcome;
+            """,
+            market,
+            since,
+            until,
+        )
+
+    if not row:
+        return {"trades": 0, "wins": 0, "losses": 0, "be": 0, "closes": 0, "tp1_hits": 0, "sum_pnl_pct": 0.0}
+
+    return {
+        "trades": int(row.get("trades") or 0),
+        "wins": int(row.get("wins") or 0),
+        "losses": int(row.get("losses") or 0),
+        "be": int(row.get("be") or 0),
+        "closes": int(row.get("closes") or 0),
+        "tp1_hits": int(row.get("tp1_hits") or 0),
+        "sum_pnl_pct": float(row.get("sum_pnl_pct") or 0.0),
+    }
+
 # ---------------- Signal bot settings (global) ----------------
 
 async def get_signal_bot_settings() -> Dict[str, Any]:
