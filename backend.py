@@ -6695,6 +6695,9 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     entry = float(last15["close"])
     # --- Anti-trap structure filters (avoid tops/bottoms) ---
     trap_ok, trap_reason = _mid_structure_trap_ok(direction=str(dir4).upper(), entry=entry, df1hi=df1hi)
+    if not bool(trap_ok):
+        return None
+
     atr = float(last1h.get("atr", np.nan))
     if np.isnan(atr) or atr <= 0:
         return None
@@ -6879,6 +6882,20 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
     # --- Anti-trap structure filters (apply to MID and MAIN candidates) ---
     trap_ok, trap_reason = _mid_structure_trap_ok(direction=str(dir_trend).upper(), entry=entry, df1hi=df1hi)
+    if not bool(trap_ok):
+        # Block obvious top/bottom traps. Also emit a structured event so bot can build a digest.
+        try:
+            logger.info('MID blocked (trap): dir=%s reason=%s entry=%.6g', str(dir_trend).upper(), str(trap_reason), float(entry))
+            _emit_mid_trap_event({
+                'dir': str(dir_trend).upper(),
+                'reason': str(trap_reason),
+                'reason_key': _mid_trap_reason_key(str(trap_reason)),
+                'entry': float(entry),
+            })
+        except Exception:
+            pass
+        return None
+
 
     # --- TA extras (MAIN-like) ---
     # RSI/MACD on 5m
@@ -6968,6 +6985,9 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "tp2": tp2,
         "rr": rr,
         "confidence": confidence,
+        "trap_ok": bool(trap_ok),
+        "trap_reason": str(trap_reason or ""),
+        "blocked": (not bool(trap_ok)),
 
         # fields used by MID filters/formatter
         "dir1": dir_mid,
