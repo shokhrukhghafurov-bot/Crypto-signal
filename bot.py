@@ -155,6 +155,20 @@ backend = Backend()
 ERROR_BOT_TOKEN = (os.getenv("ERROR_BOT_TOKEN") or "").strip()
 ADMIN_ALERT_CHAT_ID = int(os.getenv("ADMIN_ALERT_CHAT_ID", "5090106525") or 5090106525)
 
+# ---------------- MID digest sender (USES ERROR BOT via ERROR_BOT_TOKEN) ----------------
+# Digest is diagnostics; it should go to @errorrrrrrg_bot (ERROR_BOT_TOKEN), not the main bot.
+
+async def _mid_digest_send(text: str) -> None:
+    # _error_bot_send is defined below (after error-bot setup). Name is resolved at runtime.
+    try:
+        await _error_bot_send(text)
+    except Exception:
+        return
+
+# expose to backend (scanner_loop_mid checks for this)
+backend.emit_mid_digest = _mid_digest_send
+
+
 # What to forward (defaults are SAFE: only critical + scanner errors + MID blocks; ignore stablecoin SCAN_BLOCK spam)
 ERROR_BOT_ENABLED = (os.getenv("ERROR_BOT_ENABLED", "1").strip().lower() not in ("0","false","no","off"))
 ERROR_BOT_SEND_SCAN_BLOCK = (os.getenv("ERROR_BOT_SEND_SCAN_BLOCK", "0").strip().lower() not in ("0","false","no","off"))
