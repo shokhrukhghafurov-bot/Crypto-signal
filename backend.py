@@ -219,64 +219,6 @@ import db_store
 from cryptography.fernet import Fernet
 
 logger = logging.getLogger("crypto-signal")
-# ------------------ Admin alerts (Telegram) ------------------
-# Set by bot.py at runtime via set_admin_notifier(async_fn).
-# Used to push scanner blocks/errors to a private admin chat.
-from typing import Callable, Awaitable
-
-_ADMIN_NOTIFY_FN: Callable[[str], Awaitable[None]] | None = None
-_ADMIN_ALERT_LAST: dict[str, float] = {}
-_ADMIN_ALERT_COOLDOWN_SEC = int(float(os.getenv("ADMIN_ALERT_COOLDOWN_SEC", "30") or 30))
-_ADMIN_ALERT_ENABLED = os.getenv("ADMIN_ALERT_ENABLED", "1").strip().lower() not in ("0","false","no","off")
-
-def set_admin_notifier(fn: Callable[[str], Awaitable[None]] | None) -> None:
-    global _ADMIN_NOTIFY_FN
-    _ADMIN_NOTIFY_FN = fn
-
-def _admin_should_send(key: str) -> bool:
-    if not _ADMIN_ALERT_ENABLED:
-        return False
-    try:
-        now = time.time()
-    except Exception:
-        return True
-    k = str(key or "default")
-    last = _ADMIN_ALERT_LAST.get(k, 0.0)
-    if (now - last) < float(_ADMIN_ALERT_COOLDOWN_SEC):
-        return False
-    _ADMIN_ALERT_LAST[k] = now
-    return True
-
-def admin_alert(text: str, *, key: str = "default") -> None:
-    """Fire-and-forget admin alert (never raises)."""
-    if not _ADMIN_NOTIFY_FN:
-        return
-    if not _admin_should_send(key):
-        return
-    try:
-        msg = str(text or "")
-        # Telegram limit ~4096
-        if len(msg) > 3900:
-            msg = msg[:3900] + "…"
-        asyncio.create_task(_ADMIN_NOTIFY_FN(msg))
-    except Exception:
-        pass
-
-def admin_block(kind: str, symbol: str, reason: str, **vals: float | int | str) -> None:
-    sym = (symbol or "").strip().upper()
-    lines = [f"🚫 {kind}", sym, reason]
-    for k, v in vals.items():
-        try:
-            lines.append(f"• {k}: {v}")
-        except Exception:
-            pass
-    admin_alert("\n".join([x for x in lines if x]), key=f"{kind}:{sym}:{reason.split()[0] if reason else ''}")
-
-def admin_error(where: str, symbol: str, err: Exception) -> None:
-    sym = (symbol or "").strip().upper()
-    ecls = err.__class__.__name__
-    emsg = str(err)
-    admin_alert(f"❗ ERROR {where}\n{sym}\n{ecls}: {emsg}", key=f"ERR:{where}:{sym}:{ecls}")
 
 # ------------------ Stablecoin pair blocking (scanner + autotrade) ------------------
 # Blocks stable-vs-stable pairs like USDCUSDT / DAIUSDT / USD1USDT, etc.
@@ -321,12 +263,33 @@ def _split_base_quote(symbol: str) -> tuple[str, str]:
 
 def is_blocked_symbol(symbol: str) -> bool:
     s = _normalize_symbol(symbol)
+
+    # local anti-spam cache (per process)
+    if not hasattr(is_blocked_symbol, "_last"):
+        is_blocked_symbol._last = {}  # type: ignore[attr-defined]
+
+    def _log_once(reason: str):
+        try:
+            import logging, time as _t, os as _os
+            cd = int(float(_os.getenv("ADMIN_BLOCK_COOLDOWN_SEC", "600") or 600))
+            key = f"{s}:{reason}"
+            now = _t.time()
+            last = is_blocked_symbol._last.get(key, 0.0)  # type: ignore[attr-defined]
+            if now - last < cd:
+                return
+            is_blocked_symbol._last[key] = now  # type: ignore[attr-defined]
+            logging.getLogger("crypto-signal").info("SCAN_BLOCK %s %s", s, reason)
+        except Exception:
+            pass
+
     if s in _BLOCKED_SYMBOLS:
+        _log_once("blocked_symbol_list")
         return True
     if not _BLOCK_STABLECOIN_PAIRS:
         return False
     base, quote = _split_base_quote(s)
     if quote and base in _STABLECOINS:
+        _log_once("blocked_stable_pair")
         return True
     return False
 
@@ -5605,7 +5568,7 @@ def _mid_structure_trap_ok(*, direction: str, entry: float, df1hi: pd.DataFrame)
     return (True, "")
 
 
-def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame, symbol: str = "") -> Optional[Dict[str, Any]]:
+def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
     Produces a result dict compatible with scanner_loop_mid and a rich TA block (like MAIN),
@@ -5838,15 +5801,11 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             w = df5i.tail(late_lookback)
             if dir_trend == "LONG":
                 recent_low = float(w["low"].astype(float).min())
-                val = (entry - recent_low) / atr30
-                if val > late_max_atr:
-                    admin_block("MID_BLOCK", symbol, "late_entry (LONG)", move_atr=f"{val:.2f}", max_atr=f"{late_max_atr:.2f}")
+                if (entry - recent_low) / atr30 > late_max_atr:
                     return None
             elif dir_trend == "SHORT":
                 recent_high = float(w["high"].astype(float).max())
-                val = (recent_high - entry) / atr30
-                if val > late_max_atr:
-                    admin_block("MID_BLOCK", symbol, "late_entry (SHORT)", move_atr=f"{val:.2f}", max_atr=f"{late_max_atr:.2f}")
+                if (recent_high - entry) / atr30 > late_max_atr:
                     return None
     except Exception:
         pass
@@ -5858,10 +5817,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         rsi_min_short = float(os.getenv("MID_RSI_MIN_SHORT", "34") or 34)
         if not np.isnan(rsi5_val):
             if dir_trend == "LONG" and rsi_max_long > 0 and rsi5_val >= rsi_max_long:
-                admin_block("MID_BLOCK", symbol, "rsi_overheat (LONG)", rsi=f"{rsi5_val:.1f}", max=f"{rsi_max_long:.1f}")
                 return None
             if dir_trend == "SHORT" and rsi_min_short > 0 and rsi5_val <= rsi_min_short:
-                admin_block("MID_BLOCK", symbol, "rsi_overheat (SHORT)", rsi=f"{rsi5_val:.1f}", min=f"{rsi_min_short:.1f}")
                 return None
     except Exception:
         pass
@@ -5870,9 +5827,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         # VWAP distance (30m), in ATRs
         min_vwap_dist_atr = float(os.getenv("MID_VWAP_MIN_DIST_ATR", "0.35") or 0.35)
         if min_vwap_dist_atr > 0 and (not np.isnan(vwap_val)) and float(vwap_val) > 0 and atr30 > 0:
-            dist_atr = abs(entry - float(vwap_val)) / atr30
             if abs(entry - float(vwap_val)) < (atr30 * min_vwap_dist_atr):
-                admin_block("MID_BLOCK", symbol, "vwap_chop (too close)", dist_atr=f"{dist_atr:.2f}", min_atr=f"{min_vwap_dist_atr:.2f}")
                 return None
     except Exception:
         pass
@@ -5887,9 +5842,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             if (not np.isnan(o)) and (not np.isnan(c)):
                 body = abs(c - o)
                 vr = float(vol_rel) if (not np.isnan(vol_rel)) else float("nan")
-                body_atr = body / atr30
                 if (not np.isnan(vr)) and vr >= culm_vol_x and body >= (atr30 * culm_body_atr):
-                    admin_block("MID_BLOCK", symbol, "climax_candle", body_atr=f"{body_atr:.2f}", vol_x=f"{vr:.2f}", min_body_atr=f"{culm_body_atr:.2f}")
                     return None
     except Exception:
         pass
@@ -7864,7 +7817,6 @@ class Backend:
                             continue
                         if is_blocked_symbol(sym):
                             logger.info("[scanner] skip blocked stable pair: %s", sym)
-                            admin_block("SCAN_BLOCK", sym, "blocked_stable_pair")
                             continue
                         if mac_act == "PAUSE_ALL":
                             continue
@@ -7905,9 +7857,7 @@ class Backend:
                                     df4h = await api.klines_mexc(sym, "4h", 200)
                                 res = evaluate_on_exchange(df15, df1h, df4h)
                                 return name, res
-                            except Exception as e:
-                                logger.exception("[scanner] evaluate error on %s @ %s", sym, name)
-                                admin_error(f"scanner:{name}", sym, e)
+                            except Exception:
                                 return name, None
 
                         # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
@@ -8185,7 +8135,6 @@ class Backend:
                     for sym in symbols:
                         if is_blocked_symbol(sym):
                             _mid_skip_blocked += 1
-                            admin_block("SCAN_BLOCK", sym, "blocked_stable_pair")
                             continue
                         if not self.can_emit_mid(sym):
                             _mid_skip_cooldown += 1
