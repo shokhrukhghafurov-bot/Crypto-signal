@@ -299,6 +299,84 @@ def _error_agg_note(levelno: int, logger_name: str, msg: str) -> None:
     ent["last_ts"] = now
 
 
+
+
+# --- MID trap digest (group by reason_key, send once per window) ---
+_MID_TRAP_DIGEST_ENABLED = (os.getenv("MID_TRAP_DIGEST_ENABLED", "1").strip().lower() not in ("0","false","no","off"))
+_MID_TRAP_DIGEST_WINDOW_SEC = float(os.getenv("MID_TRAP_DIGEST_WINDOW_SEC", "600") or 600)  # 10 minutes
+_MID_TRAP_DIGEST_MAX_REASONS = int(float(os.getenv("MID_TRAP_DIGEST_MAX_REASONS", "5") or 5))
+_MID_TRAP_DIGEST_EXAMPLES_PER_REASON = int(float(os.getenv("MID_TRAP_DIGEST_EXAMPLES_PER_REASON", "2") or 2))
+_MID_TRAP_DIGEST_MAX_EVENTS = int(float(os.getenv("MID_TRAP_DIGEST_MAX_EVENTS", "500") or 500))
+
+_mid_trap_events: list[dict] = []
+_mid_trap_lock = asyncio.Lock()
+_mid_trap_last_flush_ts = 0.0
+
+def _mid_trap_note(event: dict) -> None:
+    """Called from backend trap sink (sync)."""
+    try:
+        if not _MID_TRAP_DIGEST_ENABLED:
+            return
+        # schedule async append safely
+        async def _append():
+            async with _mid_trap_lock:
+                if len(_mid_trap_events) >= _MID_TRAP_DIGEST_MAX_EVENTS:
+                    _mid_trap_events.pop(0)
+                _mid_trap_events.append(dict(event))
+        asyncio.get_event_loop().create_task(_append())
+    except Exception:
+        pass
+
+def _build_mid_trap_digest(events: list[dict]) -> str:
+    # group by reason_key
+    by: dict[str, list[dict]] = {}
+    for e in events:
+        rk = str(e.get("reason_key") or e.get("reason") or "unknown").strip() or "unknown"
+        by.setdefault(rk, []).append(e)
+    items = sorted(by.items(), key=lambda kv: len(kv[1]), reverse=True)
+    items = items[:max(1, _MID_TRAP_DIGEST_MAX_REASONS)]
+    total = len(events)
+    lines = [f"🧪 MID trap digest (10m) — blocks: {total}"]
+    for rk, lst in items:
+        lines.append(f"• {rk}: {len(lst)}")
+        ex = lst[:max(1, _MID_TRAP_DIGEST_EXAMPLES_PER_REASON)]
+        for s in ex:
+            d = str(s.get('dir') or '').upper()
+            en = s.get('entry', None)
+            reason = str(s.get('reason') or '').strip()
+            try:
+                en_txt = f"{float(en):.6g}" if en is not None else "—"
+            except Exception:
+                en_txt = "—"
+            lines.append(f"  - {d} entry={en_txt} {reason}")
+    if len(by) > len(items):
+        lines.append(f"… +{len(by)-len(items)} other reasons")
+    return "\n".join(lines)
+
+async def _mid_trap_digest_loop() -> None:
+    global _mid_trap_last_flush_ts
+    _mid_trap_last_flush_ts = time.time()
+    while True:
+        await asyncio.sleep(5)
+        if not _MID_TRAP_DIGEST_ENABLED:
+            continue
+        if not (_error_bot and ERROR_BOT_ENABLED):
+            continue
+        now = time.time()
+        if (now - _mid_trap_last_flush_ts) < _MID_TRAP_DIGEST_WINDOW_SEC:
+            continue
+        async with _mid_trap_lock:
+            if not _mid_trap_events:
+                _mid_trap_last_flush_ts = now
+                continue
+            events = list(_mid_trap_events)
+            _mid_trap_events.clear()
+            _mid_trap_last_flush_ts = now
+        try:
+            await _error_bot_send(_build_mid_trap_digest(events))
+        except Exception:
+            pass
+
 class ErrorBotLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -4886,7 +4964,16 @@ async def main() -> None:
         logger.warning("Another bot instance holds the polling lock; running HTTP server only (no polling/loops)")
         await asyncio.Event().wait()
 
-    logger.info("Starting track_loop")
+    
+# --- MID trap digest ---
+try:
+    backend.set_mid_trap_sink(_mid_trap_note)
+    if (_error_bot and ERROR_BOT_ENABLED) and _MID_TRAP_DIGEST_ENABLED and _MID_TRAP_DIGEST_WINDOW_SEC > 0:
+        asyncio.create_task(_mid_trap_digest_loop())
+except Exception:
+    pass
+
+logger.info("Starting track_loop")
     if hasattr(backend, "track_loop"):
         asyncio.create_task(backend.track_loop(bot))
     else:
