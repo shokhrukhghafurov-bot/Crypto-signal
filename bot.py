@@ -167,6 +167,71 @@ dp = Dispatcher()
 backend = Backend()
 set_admin_notifier(_admin_notify)
 
+# --- Forward selected ERROR logs to admin (filtered) ---
+# We forward real system bugs / outages, but suppress common/expected credential errors.
+_ADMIN_LOG_FORWARD_ENABLED = os.getenv("ADMIN_LOG_FORWARD_ENABLED", "1").strip().lower() not in ("0","false","no","off")
+# Comma-separated substrings (case-insensitive) to IGNORE when forwarding errors.
+# Defaults include common exchange auth/permission issues (you said these are not needed).
+_ADMIN_LOG_IGNORE = [s.strip().lower() for s in (os.getenv(
+    "ADMIN_LOG_IGNORE",
+    "invalid api-key,invalid api key,api-key invalid,invalid key,invalid signature,signature mismatch,permission,no permission,not authorized,ip,whitelist,rate limit,too many requests,time mismatch,timestamp,-2015,code -2015"
+) or "").split(",") if s.strip()]
+
+# Anti-spam: same (logger+msg) forwarded at most once per N seconds
+_ADMIN_LOG_COOLDOWN_SEC = int(float(os.getenv("ADMIN_LOG_COOLDOWN_SEC", "30") or 30))
+_ADMIN_LOG_LAST: dict[str, float] = {}
+
+class _AdminLogForwardHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        if not _ADMIN_ALERT_ENABLED or not _ADMIN_LOG_FORWARD_ENABLED:
+            return
+        try:
+            if record.levelno < logging.ERROR:
+                return
+
+            msg = record.getMessage() if record else ""
+            full = msg
+            # Include exception text if available
+            if record.exc_info:
+                try:
+                    full = full + "\n" + "".join(logging.Formatter().formatException(record.exc_info))
+                except Exception:
+                    pass
+
+            low = (full or "").lower()
+
+            # Ignore common/expected exchange credential errors
+            if any(s and s in low for s in _ADMIN_LOG_IGNORE):
+                return
+
+            # Additional ignore: autotrade key errors are not actionable here
+            # (example: Binance code -2015 Invalid API-key)
+            if "autotrade" in low and ("invalid" in low or "-2015" in low or "permission" in low):
+                return
+
+            key = f"{record.name}|{msg}"[:500]
+            now = time.time()
+            last = _ADMIN_LOG_LAST.get(key, 0.0)
+            if now - last < _ADMIN_LOG_COOLDOWN_SEC:
+                return
+            _ADMIN_LOG_LAST[key] = now
+
+            txt = f"❗ LOG ERROR\n{record.name}\n{(full or '').strip()}"
+            if len(txt) > 3900:
+                txt = txt[:3900] + "…"
+            asyncio.create_task(_admin_notify(txt))
+        except Exception:
+            pass
+
+# Attach handler once
+try:
+    _h = _AdminLogForwardHandler()
+    _h.setLevel(logging.ERROR)
+    logging.getLogger().addHandler(_h)
+except Exception:
+    pass
+
+
 # Keep last broadcast signals for 'Spot live' / 'Futures live' buttons
 LAST_SIGNAL_BY_MARKET = {"SPOT": None, "FUTURES": None}
 
