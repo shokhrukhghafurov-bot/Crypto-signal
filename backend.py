@@ -5597,7 +5597,7 @@ def _mid_structure_trap_ok(*, direction: str, entry: float, df1hi: pd.DataFrame)
     return (True, "")
 
 
-def _evaluate_on_exchange_mid_old(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
+def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
     Produces a result dict compatible with scanner_loop_mid and a rich TA block (like MAIN),
@@ -5874,75 +5874,6 @@ def _evaluate_on_exchange_mid_old(df5: pd.DataFrame, df30: pd.DataFrame, df1h: p
                 if (not np.isnan(vr)) and vr >= culm_vol_x and body >= (atr30 * culm_body_atr):
                     return None
     except Exception:
-        pass
-
-    # --- HARD MID entry filters (anti-late-entry / RSI / VWAP distance / climax) ---
-    try:
-        side = "SHORT" if str(dir_trend).upper() == "SHORT" else "LONG"
-        close = float(entry)
-        o = float(last5.get("open", close))
-        # recent extremes from 30m window
-        try:
-            w = df30i.tail(60)
-            recent_low = float(w["low"].astype(float).min())
-            recent_high = float(w["high"].astype(float).max())
-        except Exception:
-            recent_low = float(close)
-            recent_high = float(close)
-
-        rsi_5m = float(rsi5) if (not np.isnan(rsi5)) else None
-        vwap_num = float(vwap_val) if (not np.isnan(vwap_val)) else None
-
-        last_vol = float(df5i.iloc[-1].get("volume", 0.0) or 0.0)
-        try:
-            avg_vol = float(df5i["volume"].astype(float).rolling(20).mean().iloc[-1])
-        except Exception:
-            avg_vol = 0.0
-
-        # climax cooldown: if any of previous N bars were a climax, block current bar
-        climax_recent_bars = 0
-        try:
-            n = int(MID_CLIMAX_COOLDOWN_BARS or 0)
-            if n > 0 and len(df5i) > n:
-                prev = df5i.iloc[-(n+1):-1]
-                for _, row in prev.iterrows():
-                    try:
-                        pv = float(row.get("volume", 0.0) or 0.0)
-                        po = float(row.get("open", float(row.get("close", close))))
-                        pc = float(row.get("close", close))
-                        body_atr = (abs(pc - po) / float(atr30)) if atr30 > 0 else 0.0
-                        vol_x = (pv / avg_vol) if avg_vol and avg_vol > 0 else 0.0
-                        if (vol_x > MID_CLIMAX_VOL_X) and (body_atr > MID_CLIMAX_BODY_ATR):
-                            climax_recent_bars = 1
-                            break
-                    except Exception:
-                        continue
-        except Exception:
-            climax_recent_bars = 0
-
-        reason = _mid_block_reason(
-            symbol="",
-            side=side,
-            close=close,
-            o=o,
-            recent_low=recent_low,
-            recent_high=recent_high,
-            atr_30m=float(atr30),
-            rsi_5m=rsi_5m,
-            vwap=vwap_num,
-            last_vol=last_vol,
-            avg_vol=avg_vol,
-            last_body=abs(close - o),
-            climax_recent_bars=climax_recent_bars,
-        )
-        if reason:
-            try:
-                logger.info("MID blocked: %s", reason)
-            except Exception:
-                pass
-            return None
-    except Exception:
-        # if filter computation fails, do not block (best-effort)
         pass
 
     # Pattern on 5m
@@ -6787,13 +6718,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
     # --- Anti-trap structure filters (apply to MID and MAIN candidates) ---
     trap_ok, trap_reason = _mid_structure_trap_ok(direction=str(dir_trend).upper(), entry=entry, df1hi=df1hi)
-
-    if not trap_ok:
-        try:
-            logger.info("MID blocked (trap): dir=%s reason=%s entry=%.6g", str(dir_trend).upper(), trap_reason, float(entry))
-        except Exception:
-            pass
-        return None
 
     # --- TA extras (MAIN-like) ---
     # RSI/MACD on 5m
