@@ -25,7 +25,7 @@ from aiohttp import web
 
 import db_store
 
-from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test
+from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test, set_mid_trap_sink
 import time
 
 load_dotenv()
@@ -355,6 +355,7 @@ def _build_mid_trap_digest(events: list[dict]) -> str:
         lines.append(f"• {rk}: {len(lst)}")
         ex = lst[:max(1, _MID_TRAP_DIGEST_EXAMPLES_PER_REASON)]
         for s in ex:
+            sym = str(s.get('symbol') or '').upper().strip()
             d = str(s.get('dir') or '').upper()
             en = s.get('entry', None)
             reason = str(s.get('reason') or '').strip()
@@ -362,7 +363,10 @@ def _build_mid_trap_digest(events: list[dict]) -> str:
                 en_txt = f"{float(en):.6g}" if en is not None else "—"
             except Exception:
                 en_txt = "—"
-            lines.append(f"  - {d} entry={en_txt} {reason}")
+            if sym:
+                lines.append(f"  - {sym} {d} entry={en_txt} {reason}")
+            else:
+                lines.append(f"  - {d} entry={en_txt} {reason}")
     if len(by) > len(items):
         lines.append(f"… +{len(by)-len(items)} other reasons")
     return "\n".join(lines)
@@ -4979,7 +4983,8 @@ async def main() -> None:
 
     # --- MID trap digest ---
     try:
-        backend.set_mid_trap_sink(_mid_trap_note)
+        # backend exposes a module-level sink registrar (not a Backend() method)
+        set_mid_trap_sink(_mid_trap_note)
         if (_error_bot and ERROR_BOT_ENABLED) and _MID_TRAP_DIGEST_ENABLED and _MID_TRAP_DIGEST_WINDOW_SEC > 0:
             asyncio.create_task(_mid_trap_digest_loop())
     except Exception:
