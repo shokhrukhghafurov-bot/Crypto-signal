@@ -3326,6 +3326,12 @@ async def opened(call: types.CallbackQuery) -> None:
 _SIG_WATCH_INTERVAL_SEC = max(5, int(os.getenv("SIG_WATCH_INTERVAL_SEC", "15")))
 _BE_BUFFER_PCT = float(os.getenv("BE_BUFFER_PCT", "0.001") or 0.001)  # 0.1% default
 _BE_CONFIRM_SEC = max(0, int(os.getenv("BE_CONFIRM_SEC", "60") or 60))  # require staying past BE trigger for N seconds
+# SL anti-wick confirmation for SIGNAL outcomes (admin stats)
+# Price must cross SL +/- buffer and stay beyond it for SIG_SL_CONFIRM_SEC seconds.
+_SIG_SL_BUFFER_PCT = float(os.getenv("SIG_SL_BUFFER_PCT", "0.0005") or 0.0005)  # 0.05% default
+_SIG_SL_CONFIRM_SEC = max(0, int(os.getenv("SIG_SL_CONFIRM_SEC", "10") or 10))
+_SIG_SL_BREACH_SINCE: dict[int, float] = {}  # signal_id -> unix ts when SL was first breached
+
 _SIG_TP1_PARTIAL_PCT = float(os.getenv("SIG_TP1_PARTIAL_CLOSE_PCT", "50") or 50)  # model partial close at TP1
 _SIG_BE_ARM_PCT_TO_TP2 = max(0.0, min(1.0, float(os.getenv('BE_ARM_PCT_TO_TP2', '0') or 0.0)))
 
@@ -3640,6 +3646,7 @@ async def signal_outcome_loop() -> None:
         AND stays beyond it for BE_CONFIRM_SEC seconds (anti-wick confirmation).
     """
     import datetime as _dt
+    import time as _time
     logger.info("Starting signal_outcome_loop interval=%ss buffer_pct=%s confirm_sec=%s", _SIG_WATCH_INTERVAL_SEC, _BE_BUFFER_PCT, _BE_CONFIRM_SEC)
     while True:
         try:
@@ -3681,20 +3688,39 @@ async def signal_outcome_loop() -> None:
                         if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
                             pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if (eff_tp1 > 0 and eff_tp2 > 0) else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            _SIG_SL_BREACH_SINCE.pop(sid, None)
                             continue
                         if eff_tp2 <= 0 and eff_tp1 > 0 and _hit_tp(side, px, eff_tp1):
                             # single-target win at TP1
                             pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp1, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            _SIG_SL_BREACH_SINCE.pop(sid, None)
                             continue
                         # LOSS by SL (only before TP1 in strict mode)
-                        if sl > 0 and _hit_sl(side, px, sl):
-                            pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
-                            await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
-                            continue
+                        if sl > 0:
+                            # Anti-wick SL confirmation:
+                            # - apply a small buffer beyond SL
+                            # - require staying beyond trigger for SIG_SL_CONFIRM_SEC seconds
+                            trigger = sl * (1.0 - _SIG_SL_BUFFER_PCT) if side == "LONG" else sl * (1.0 + _SIG_SL_BUFFER_PCT)
+                            crossed = bool(px <= trigger) if side == "LONG" else bool(px >= trigger)
+
+                            since = _SIG_SL_BREACH_SINCE.get(sid)
+                            if crossed and since is None:
+                                _SIG_SL_BREACH_SINCE[sid] = _time.time()
+                                continue
+                            if not crossed and since is not None:
+                                _SIG_SL_BREACH_SINCE.pop(sid, None)
+                                # keep tracking
+                            if crossed:
+                                if _SIG_SL_CONFIRM_SEC == 0 or (since is not None and (_time.time() - since) >= _SIG_SL_CONFIRM_SEC):
+                                    pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
+                                    await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
+                                    _SIG_SL_BREACH_SINCE.pop(sid, None)
+                                    continue
                         # TP1 hit -> arm BE
                         if eff_tp1 > 0 and _hit_tp(side, px, eff_tp1):
                             await db_store.mark_signal_tp1(signal_id=sid, be_price=float(entry))
+                            _SIG_SL_BREACH_SINCE.pop(sid, None)
                             continue
 
                     # TP1 stage (BE armed)
@@ -3703,6 +3729,7 @@ async def signal_outcome_loop() -> None:
                         if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
                             pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            _SIG_SL_BREACH_SINCE.pop(sid, None)
                             continue
 
                         if not _be_is_armed_sig(side, px, eff_tp1, eff_tp2):
@@ -3728,10 +3755,12 @@ async def signal_outcome_loop() -> None:
                             if (now - crossed_at_dt).total_seconds() >= _BE_CONFIRM_SEC:
                                 pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
                                 await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
+                                _SIG_SL_BREACH_SINCE.pop(sid, None)
                                 continue
                         if crossed and crossed_at_dt is not None and _BE_CONFIRM_SEC == 0:
                             pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
+                            _SIG_SL_BREACH_SINCE.pop(sid, None)
                             continue
 
                 except Exception:
