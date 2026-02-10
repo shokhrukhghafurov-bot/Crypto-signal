@@ -5771,6 +5771,61 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     except Exception:
         pass
 
+    # ------------------ MID hard filters (reduce SL hits) ------------------
+    try:
+        # Late entry: moved too far from recent swing (in ATRs)
+        late_lookback = int(float(os.getenv("MID_LATE_ENTRY_LOOKBACK", "48") or 48))
+        late_max_atr = float(os.getenv("MID_LATE_ENTRY_MAX_ATR", "2.2") or 2.2)
+        if late_lookback >= 10 and late_max_atr > 0 and atr30 > 0 and len(df5i) >= late_lookback:
+            w = df5i.tail(late_lookback)
+            if dir_trend == "LONG":
+                recent_low = float(w["low"].astype(float).min())
+                if (entry - recent_low) / atr30 > late_max_atr:
+                    return None
+            elif dir_trend == "SHORT":
+                recent_high = float(w["high"].astype(float).max())
+                if (recent_high - entry) / atr30 > late_max_atr:
+                    return None
+    except Exception:
+        pass
+
+    try:
+        # RSI extremes (5m)
+        rsi5_val = float(last5.get("rsi", np.nan))
+        rsi_max_long = float(os.getenv("MID_RSI_MAX_LONG", "66") or 66)
+        rsi_min_short = float(os.getenv("MID_RSI_MIN_SHORT", "34") or 34)
+        if not np.isnan(rsi5_val):
+            if dir_trend == "LONG" and rsi_max_long > 0 and rsi5_val >= rsi_max_long:
+                return None
+            if dir_trend == "SHORT" and rsi_min_short > 0 and rsi5_val <= rsi_min_short:
+                return None
+    except Exception:
+        pass
+
+    try:
+        # VWAP distance (30m), in ATRs
+        min_vwap_dist_atr = float(os.getenv("MID_VWAP_MIN_DIST_ATR", "0.35") or 0.35)
+        if min_vwap_dist_atr > 0 and (not np.isnan(vwap_val)) and float(vwap_val) > 0 and atr30 > 0:
+            if abs(entry - float(vwap_val)) < (atr30 * min_vwap_dist_atr):
+                return None
+    except Exception:
+        pass
+
+    try:
+        # Huge 5m body + high rel volume -> often reverses
+        culm_vol_x = float(os.getenv("MID_CULM_VOL_X", "2.5") or 2.5)
+        culm_body_atr = float(os.getenv("MID_CULM_BODY_ATR", "0.9") or 0.9)
+        if culm_vol_x > 0 and culm_body_atr > 0 and atr30 > 0:
+            o = float(last5.get("open", np.nan))
+            c = float(last5.get("close", np.nan))
+            if (not np.isnan(o)) and (not np.isnan(c)):
+                body = abs(c - o)
+                vr = float(vol_rel) if (not np.isnan(vol_rel)) else float("nan")
+                if (not np.isnan(vr)) and vr >= culm_vol_x and body >= (atr30 * culm_body_atr):
+                    return None
+    except Exception:
+        pass
+
     # Pattern on 5m
     pattern, pat_bias = _candle_pattern(df5i)
 
