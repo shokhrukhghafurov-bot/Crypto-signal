@@ -232,14 +232,76 @@ def _should_forward_to_error_bot(levelno: int, msg: str) -> bool:
 
     return False
 
+# --- Error-bot aggregation (anti-spam) ---
+_ERROR_AGG_ENABLED = (os.getenv("ERROR_BOT_AGG_ENABLED", "1").strip().lower() not in ("0","false","no","off"))
+_ERROR_AGG_WINDOW_SEC = float(os.getenv("ERROR_BOT_AGG_WINDOW_SEC", "120") or 120)  # group repeats within this window
+_ERROR_AGG_MAX_KEYS = int(float(os.getenv("ERROR_BOT_AGG_MAX_KEYS", "200") or 200))
+
+_ERROR_AGG: dict[tuple[int,str,str], dict] = {}
+
+def _fmt_ts(ts: float) -> str:
+    try:
+        return dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return str(ts)
+
+async def _error_agg_flush(key: tuple[int,str,str]) -> None:
+    try:
+        await asyncio.sleep(max(0.0, _ERROR_AGG_WINDOW_SEC))
+        ent = _ERROR_AGG.get(key)
+        if not ent:
+            return
+        cnt = int(ent.get("count") or 0)
+        if cnt <= 1:
+            # first message already sent; nothing else to do
+            _ERROR_AGG.pop(key, None)
+            return
+        levelno, logger_name, msg = key
+        first_ts = float(ent.get("first_ts") or 0.0)
+        last_ts = float(ent.get("last_ts") or first_ts)
+        text = (
+            f"❗ {logging.getLevelName(levelno)} x{cnt} (aggregated {int(_ERROR_AGG_WINDOW_SEC)}s)\n"
+            f"{logger_name}\n"
+            f"{msg}\n"
+            f"first: {_fmt_ts(first_ts)}\n"
+            f"last:  {_fmt_ts(last_ts)}"
+        )
+        await _error_bot_send(text)
+        _ERROR_AGG.pop(key, None)
+    except Exception:
+        _ERROR_AGG.pop(key, None)
+
+def _error_agg_note(levelno: int, logger_name: str, msg: str) -> None:
+    if not _ERROR_AGG_ENABLED or _ERROR_AGG_WINDOW_SEC <= 0:
+        asyncio.create_task(_error_bot_send(f"❗ {logging.getLevelName(levelno)}\n{logger_name}\n{msg}"))
+        return
+
+    # memory guard
+    if len(_ERROR_AGG) >= _ERROR_AGG_MAX_KEYS:
+        _ERROR_AGG.clear()
+
+    key = (int(levelno), str(logger_name), str(msg))
+    now = time.time()
+    ent = _ERROR_AGG.get(key)
+    if not ent:
+        _ERROR_AGG[key] = {"count": 1, "first_ts": now, "last_ts": now}
+        # Send first occurrence immediately
+        asyncio.create_task(_error_bot_send(f"❗ {logging.getLevelName(levelno)}\n{logger_name}\n{msg}"))
+        # Flush summary later if repeated
+        asyncio.create_task(_error_agg_flush(key))
+        return
+
+    ent["count"] = int(ent.get("count") or 0) + 1
+    ent["last_ts"] = now
+
+
 class ErrorBotLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = record.getMessage()
             if not _should_forward_to_error_bot(record.levelno, msg):
                 return
-            text = f"❗ {logging.getLevelName(record.levelno)}\n{record.name}\n{msg}"
-            asyncio.create_task(_error_bot_send(text))
+            _error_agg_note(record.levelno, record.name, msg)
         except Exception:
             pass
 
