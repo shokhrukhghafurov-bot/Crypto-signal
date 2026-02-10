@@ -14,7 +14,7 @@ from dataclasses import replace
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import datetime as dt
@@ -76,20 +76,66 @@ def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
+
+# --- outbound send rate limit (avoid Telegram flood control) ---
+_SEND_LOCKS: dict[int, asyncio.Lock] = {}
+_LAST_SEND_AT: dict[int, float] = {}
+_MIN_SEND_INTERVAL_SEC = float(os.getenv("SEND_MIN_INTERVAL_SEC", "0.8") or 0.8)
+
 async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
+    """Send a message with anti-flood protection.
+
+    Telegram may return TelegramRetryAfter (Too Many Requests) for a chat if we send too fast.
+    We:
+      - serialize sends per chat_id
+      - enforce a minimal interval between sends
+      - retry on TelegramRetryAfter using the provided delay
+    """
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
-    # Never recurse. Send via bot API.
-    try:
-        return await bot.send_message(chat_id, text, **kwargs)
-    except TelegramForbiddenError:
-        # User blocked the bot or cannot be contacted
-        await set_user_blocked(chat_id, blocked=True)
-        raise
-    except TelegramBadRequest as e:
-        if "chat not found" in str(e).lower():
-            # Chat does not exist / user never started the bot
-            await set_user_blocked(chat_id, blocked=True)
-        raise
+
+    lock = _SEND_LOCKS.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SEND_LOCKS[chat_id] = lock
+
+    async with lock:
+        # Enforce minimal interval between sends to this chat
+        try:
+            now = time.time()
+            last = float(_LAST_SEND_AT.get(chat_id, 0.0) or 0.0)
+            wait = (_MIN_SEND_INTERVAL_SEC - (now - last))
+            if wait > 0:
+                await asyncio.sleep(wait)
+        except Exception:
+            pass
+
+        # Never recurse. Send via bot API.
+        tries = 0
+        while True:
+            tries += 1
+            try:
+                res = await bot.send_message(chat_id, text, **kwargs)
+                _LAST_SEND_AT[chat_id] = time.time()
+                return res
+            except TelegramRetryAfter as e:
+                # Flood control exceeded. Respect retry_after.
+                delay = float(getattr(e, "retry_after", 1) or 1)
+                # Cap the delay to avoid stalling forever (still safe)
+                delay = min(max(1.0, delay), 90.0)
+                logger.warning("safe_send: flood control for chat_id=%s retry_after=%.1fs (try=%s)", chat_id, delay, tries)
+                await asyncio.sleep(delay + 0.2)
+                if tries < 4:
+                    continue
+                raise
+            except TelegramForbiddenError:
+                # User blocked the bot or cannot be contacted
+                await set_user_blocked(chat_id, blocked=True)
+                raise
+            except TelegramBadRequest as e:
+                if "chat not found" in str(e).lower():
+                    # Chat does not exist / user never started the bot
+                    await set_user_blocked(chat_id, blocked=True)
+                raise
 
 async def safe_edit_text(chat_id: int, message_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
@@ -147,98 +193,6 @@ except (ZoneInfoNotFoundError, FileNotFoundError):
         TZ = ZoneInfo("UTC")
 
 bot = Bot(BOT_TOKEN)
-
-# --- Admin alert channel (separate bot) ---
-ADMIN_ALERT_CHAT_ID = int(os.getenv("ADMIN_ALERT_CHAT_ID", "5090106525") or 5090106525)
-ERROR_BOT_TOKEN = (os.getenv("ERROR_BOT_TOKEN") or "").strip()
-
-# If ERROR_BOT_TOKEN is provided, alerts are sent via that bot (e.g. @errorrrrrrg_bot).
-# Otherwise, fall back to the main bot.
-error_bot = Bot(ERROR_BOT_TOKEN) if ERROR_BOT_TOKEN else bot
-
-# Anti-spam cooldown per (kind,symbol,reason)
-_ADMIN_ALERT_COOLDOWN_SEC = int(float(os.getenv("ADMIN_ALERT_COOLDOWN_SEC", "60") or 60))
-_admin_alert_last: dict[str, float] = {}
-
-def _should_skip_admin_alert(text: str) -> bool:
-    """Skip expected key/permission/IP/rate-limit errors."""
-    t = (text or "").lower()
-    needles = (
-        "invalid api-key",
-        "api key invalid",
-        "invalid api key",
-        "-2015",
-        "signature mismatch",
-        "invalid signature",
-        "no permission",
-        "not authorized",
-        "permission denied",
-        "ip whitelist",
-        "whitelist",
-        "rate limit",
-        "too many requests",
-        "timestamp",
-        "time mismatch",
-    )
-    return any(n in t for n in needles)
-
-async def admin_alert(text: str, *, key: str | None = None) -> None:
-    """Send admin alert to ADMIN_ALERT_CHAT_ID via error_bot."""
-    try:
-        if not text:
-            return
-        if _should_skip_admin_alert(text):
-            return
-        k = key or text[:120]
-        now = time.time()
-        last = _admin_alert_last.get(k, 0.0)
-        if now - last < _ADMIN_ALERT_COOLDOWN_SEC:
-            return
-        _admin_alert_last[k] = now
-        await error_bot.send_message(ADMIN_ALERT_CHAT_ID, text[:3500])
-    except Exception:
-        pass
-
-class _AdminAlertLogHandler(logging.Handler):
-    """Forward selected log records to admin_alert() via error bot."""
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            msg = record.getMessage()
-            if not msg:
-                return
-
-            # Always forward ERROR+
-            forward = record.levelno >= logging.ERROR
-
-            # Also forward important scanner blocks/info markers if they appear in logs
-            # (backend logs: 'SCAN_BLOCK ...', 'MID BLOCKED ...')
-            if not forward:
-                u = msg.upper()
-                if u.startswith("SCAN_BLOCK") or u.startswith("MID BLOCKED") or u.startswith("MID_BLOCK") or u.startswith("ERROR SCANNER") or "BLOCKED_STABLE_PAIR" in u:
-                    forward = True
-
-            if not forward:
-                return
-
-            text = f"❗ {record.levelname}\n{record.name}\n{msg}"
-
-            # Needs a running loop; if none, ignore (won't crash app)
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                return
-            loop.create_task(admin_alert(text, key=f"{record.name}:{record.levelname}:{msg[:160]}"))
-        except Exception:
-            pass
-
-# Install handler once
-try:
-    _h = _AdminAlertLogHandler()
-    _h.setLevel(logging.INFO)
-    logging.getLogger().addHandler(_h)
-except Exception:
-    pass
-
 dp = Dispatcher()
 backend = Backend()
 
