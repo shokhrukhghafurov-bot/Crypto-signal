@@ -4411,10 +4411,10 @@ async def main() -> None:
 
             Returns counts for:
               - signals sent: day/week/month
-              - trade outcomes & real pnl%: day/week/month per market (SPOT/FUTURES)
+              - signal outcomes & pnl%: day/week/month per market (SPOT/FUTURES)
 
-            Trade stats are computed from Postgres trade_events (WIN/LOSS/BE/CLOSE + TP1).
-            This gives correct PnL% that matches how positions were closed.
+            Outcome stats are computed from bot-level signal tracking (signal_tracks).
+            This reflects how sent signals performed (WIN/LOSS/BE/CLOSED + TP1).
             """
             if not _check_basic(request):
                 return _unauthorized()
@@ -4458,26 +4458,25 @@ async def main() -> None:
                 out: dict[str, dict] = {}
                 for k, (since, until) in ranges.items():
                     b = await db_store.signal_perf_bucket_global(market, since=since, until=until)
+                    # Bot-level SIGNAL outcomes (not auto-trade):
+                    # trades = total closed signals (WIN/LOSS/BE/CLOSED) in window
                     trades = int(b.get('trades') or 0)
-                    wins = int(b.get('wins') or 0)      # TP2 hits (WIN)
-                    losses = int(b.get('losses') or 0)  # SL hits (LOSS)
-                    be = int(b.get('be') or 0)          # BE hits
-                    tp1 = int(b.get('tp1_hits') or 0)   # TP1 hits (partial)
-                    closes = int(b.get('closes') or 0)  # manual CLOSE
-                    manual_close = max(0, closes)
-                    # 'Signals closed' in dashboard should mean ALL closed outcomes
-                    manual = max(0, trades)
+                    tp2 = int(b.get('wins') or 0)       # WIN (final target reached)
+                    sl = int(b.get('losses') or 0)      # LOSS (SL)
+                    be = int(b.get('be') or 0)          # BE
+                    tp1 = int(b.get('tp1_hits') or 0)   # TP1 hit (partial)
+                    closes = int(b.get('closes') or 0)  # CLOSED (manual/expired/forced)
                     sum_pnl = float(b.get('sum_pnl_pct') or 0.0)
                     avg_pnl = (sum_pnl / trades) if trades else 0.0
                     out[k] = {
                         "trades": trades,
-                        "tp2": wins,
-                        "sl": losses,
+                        "tp2": tp2,
+                        "sl": sl,
                         "be": be,
                         "tp1": tp1,
-                        "manual": manual,  # back-compat: used by some dashboards as "Signals closed"
-                        "closed": trades,
-                        "manual_close": manual_close,
+                        "manual": trades,      # back-compat: some dashboards use this as "closed"
+                        "closed": trades,      # total closed outcomes
+                        "manual_close": closes,
                         "sum_pnl_pct": sum_pnl,
                         "avg_pnl_pct": avg_pnl,
                     }
