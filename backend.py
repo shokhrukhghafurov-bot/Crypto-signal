@@ -4,6 +4,16 @@ import asyncio
 import json
 from pathlib import Path
 import os
+
+# --- MID extra entry filters (anti-late-entry / RSI / VWAP distance / climax) ---
+MID_LATE_ENTRY_ATR_MAX = float(os.getenv("MID_LATE_ENTRY_ATR_MAX", "2.2"))   # (close - recent_low)/ATR_30m
+MID_RSI_LONG_MAX = float(os.getenv("MID_RSI_LONG_MAX", "66"))               # RSI(5m) for LONG must be <
+MID_RSI_SHORT_MIN = float(os.getenv("MID_RSI_SHORT_MIN", "34"))             # RSI(5m) for SHORT must be >
+MID_VWAP_DIST_ATR_MAX = float(os.getenv("MID_VWAP_DIST_ATR_MAX", "1.8"))     # abs(close - vwap)/ATR_30m
+MID_CLIMAX_VOL_X = float(os.getenv("MID_CLIMAX_VOL_X", "2.5"))              # last_vol / avg_vol
+MID_CLIMAX_BODY_ATR = float(os.getenv("MID_CLIMAX_BODY_ATR", "1.2"))         # abs(close-open)/ATR_30m
+MID_CLIMAX_COOLDOWN_BARS = int(os.getenv("MID_CLIMAX_COOLDOWN_BARS", "1"))   # block next N bars after climax
+
 import random
 import re
 import time
@@ -4468,6 +4478,46 @@ FOMC_DECISION_HOUR_ET = max(0, min(23, _env_int("FOMC_DECISION_HOUR_ET", 14)))
 FOMC_DECISION_MINUTE_ET = max(0, min(59, _env_int("FOMC_DECISION_MINUTE_ET", 0)))
 
 # ------------------ Models ------------------
+def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low: float, recent_high: float,
+                      atr_30m: float, rsi_5m: float, vwap: float, last_vol: float, avg_vol: float,
+                      last_body: float, climax_recent_bars: int) -> str | None:
+    """Return human-readable MID BLOCKED reason (for logging + error-bot), or None if allowed."""
+    try:
+        if atr_30m and atr_30m > 0:
+            if side.upper() == "LONG":
+                move_from_low = (close - recent_low) / atr_30m
+                if move_from_low > MID_LATE_ENTRY_ATR_MAX:
+                    return f"late_entry_atr={move_from_low:.2f} > {MID_LATE_ENTRY_ATR_MAX:g}"
+            else:  # SHORT
+                move_from_high = (recent_high - close) / atr_30m
+                if move_from_high > MID_LATE_ENTRY_ATR_MAX:
+                    return f"late_entry_atr={move_from_high:.2f} > {MID_LATE_ENTRY_ATR_MAX:g}"
+
+            dist = abs(close - vwap) / atr_30m if vwap is not None else 0.0
+            if dist > MID_VWAP_DIST_ATR_MAX:
+                return f"vwap_dist_atr={dist:.2f} > {MID_VWAP_DIST_ATR_MAX:g}"
+
+            body_atr = (abs(close - o) / atr_30m) if o is not None else 0.0
+            if avg_vol and avg_vol > 0:
+                vol_x = last_vol / avg_vol
+            else:
+                vol_x = 0.0
+            # "climax": big vol + big body; block next N bars
+            if climax_recent_bars > 0 or (vol_x > MID_CLIMAX_VOL_X and body_atr > MID_CLIMAX_BODY_ATR):
+                return f"climax vol_x={vol_x:.2f} > {MID_CLIMAX_VOL_X:g} and body_atr={body_atr:.2f} > {MID_CLIMAX_BODY_ATR:g}"
+
+        # RSI filter (works even if ATR missing)
+        if rsi_5m is not None:
+            if side.upper() == "LONG" and rsi_5m >= MID_RSI_LONG_MAX:
+                return f"rsi_long={rsi_5m:.1f} >= {MID_RSI_LONG_MAX:g}"
+            if side.upper() == "SHORT" and rsi_5m <= MID_RSI_SHORT_MIN:
+                return f"rsi_short={rsi_5m:.1f} <= {MID_RSI_SHORT_MIN:g}"
+    except Exception:
+        # if filter computation fails, don't block signal; let normal error handling deal with it
+        return None
+    return None
+
+
 @dataclass(frozen=True)
 class Signal:
     # NOTE: All fields have defaults to avoid dataclass ordering issues
