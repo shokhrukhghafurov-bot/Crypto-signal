@@ -5977,6 +5977,11 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "tp2": tp2,
         "rr": rr,
         "confidence": confidence,
+        "trap_ok": bool(trap_ok),
+        "trap_reason": (str(trap_reason) if trap_reason else ""),
+        "blocked": (not bool(trap_ok)) or (mid_block_reason is not None),
+        "block_reason": (str(mid_block_reason) if mid_block_reason else ""),
+
 
         # fields used by MID filters/formatter
         "dir1": dir_mid,
@@ -6750,6 +6755,67 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     # RSI/MACD on 5m
     rsi5 = float(last5.get("rsi", np.nan))
     macd_hist5 = float(last5.get("macd_hist", np.nan))
+
+    # --- Extra MID entry filters (late entry / RSI / VWAP distance / climax) ---
+    mid_block_reason = None
+    try:
+        _lb = int(os.getenv("MID_LATE_ENTRY_LOOKBACK_30M", "48"))
+        _lb = max(10, min(200, _lb))
+        recent_low = float(df30i["low"].astype(float).tail(_lb).min())
+        recent_high = float(df30i["high"].astype(float).tail(_lb).max())
+
+        vwap_30m = float(last30.get("vwap", np.nan))
+        if np.isnan(vwap_30m):
+            vwap_30m = None
+
+        last_vol_30m = float(last30.get("volume", 0.0) or 0.0)
+        avg_vol_30m = float(last30.get("vol_sma20", 0.0) or 0.0)
+
+        o30 = float(last30.get("open", np.nan))
+        if np.isnan(o30):
+            o30 = None
+
+        # detect a recent "climax" bar (volume spike + big body); blocks for MID_CLIMAX_COOLDOWN_BARS bars
+        climax_recent = 0
+        try:
+            n_cd = int(MID_CLIMAX_COOLDOWN_BARS)
+            if n_cd > 0 and "volume" in df30i.columns:
+                tail = df30i.tail(max(1, n_cd))
+                for _, row in tail.iterrows():
+                    atr_r = float(row.get("atr", atr30) or atr30)
+                    if not atr_r or atr_r <= 0:
+                        continue
+                    op_r = float(row.get("open", np.nan))
+                    cl_r = float(row.get("close", np.nan))
+                    if np.isnan(op_r) or np.isnan(cl_r):
+                        continue
+                    vol_r = float(row.get("volume", 0.0) or 0.0)
+                    avgv_r = float(row.get("vol_sma20", avg_vol_30m) or avg_vol_30m)
+                    body_atr_r = abs(cl_r - op_r) / atr_r
+                    vol_x_r = (vol_r / avgv_r) if (avgv_r and avgv_r > 0) else 0.0
+                    if vol_x_r > MID_CLIMAX_VOL_X and body_atr_r > MID_CLIMAX_BODY_ATR:
+                        climax_recent = 1
+                        break
+        except Exception:
+            climax_recent = 0
+
+        mid_block_reason = _mid_block_reason(
+            symbol="",
+            side=str(dir_trend).upper(),
+            close=float(entry),
+            o=(float(o30) if o30 is not None else float(entry)),
+            recent_low=recent_low,
+            recent_high=recent_high,
+            atr_30m=float(atr30),
+            rsi_5m=(float(rsi5) if not np.isnan(rsi5) else None),
+            vwap=vwap_30m,
+            last_vol=float(last_vol_30m),
+            avg_vol=float(avg_vol_30m),
+            last_body=float(abs(float(entry) - (float(o30) if o30 is not None else float(entry)))),
+            climax_recent_bars=int(climax_recent),
+        )
+    except Exception:
+        mid_block_reason = None
 
     # Bollinger Bands on 5m (20)
     bb_low = bb_mid = bb_high = float("nan")
