@@ -3113,7 +3113,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         if src_ref:
                             meta["ref"] = src_ref
                             try:
-                                await db_store.update_autotrade_position_meta(row_id=int(r.get("id") or 0), meta=json.dumps(meta))
+                                await db_store.update_autotrade_position_meta(row_id=int(r.get("id") or 0), meta=meta, replace=False)
                             except Exception:
                                 pass
                 except Exception:
