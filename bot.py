@@ -4459,7 +4459,11 @@ async def main() -> None:
                 fut_n = 0
                 if pool is not None:
                     try:
-                        counts = await db_store.count_signal_sent_by_market(since=since, until=until)
+                        # Prefer signal_tracks for "sent" counters so that Sent and Outcomes come from the same source.
+                        try:
+                            counts = await db_store.count_signal_tracks_opened_by_market(since=since, until=until)
+                        except Exception:
+                            counts = await db_store.count_signal_sent_by_market(since=since, until=until)
                         spot_n = int(counts.get('SPOT') or 0)
                         fut_n = int(counts.get('FUTURES') or 0)
                     except Exception:
