@@ -368,7 +368,12 @@ ON CONFLICT (id) DO NOTHING;
         ON autotrade_positions (user_id, market_type, status);
         """)
 
-        # Prevent duplicate OPEN positions per symbol (race-condition safe)
+        
+        await conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_autotrade_positions_mgr_lock
+        ON autotrade_positions (status, mgr_lock_until);
+        """)
+# Prevent duplicate OPEN positions per symbol (race-condition safe)
         # NOTE: partial unique index; Postgres supports this.
         try:
             await conn.execute("""
@@ -2061,6 +2066,9 @@ async def close_autotrade_position(
             UPDATE autotrade_positions
             SET status=$5,
                 closed_at=NOW(),
+                mgr_owner=NULL,
+                mgr_lock_until=NULL,
+                mgr_lock_acquired_at=NULL,
                 pnl_usdt=COALESCE($6, pnl_usdt),
                 roi_percent=COALESCE($7, roi_percent)
             WHERE user_id=$1 AND signal_id=$2 AND exchange=$3 AND market_type=$4;
@@ -2175,6 +2183,106 @@ async def list_open_autotrade_positions(*, limit: int = 200) -> List[Dict[str, A
             lim,
         )
         return [dict(r) for r in rows]
+
+async def claim_open_autotrade_positions(*, owner: str, limit: int = 200, lease_sec: int = 90) -> List[Dict[str, Any]]:
+    """Claim a batch of OPEN autotrade_positions for this manager worker.
+
+    Uses a DB-level row lock (FOR UPDATE SKIP LOCKED) + lease fields (mgr_owner/mgr_lock_until)
+    so multiple replicas can safely run autotrade_manager_loop without double-processing.
+
+    Lease expires automatically if a worker dies.
+    """
+    pool = get_pool()
+    lim = int(limit or 200)
+    if lim < 1:
+        lim = 1
+    if lim > 2000:
+        lim = 2000
+    lease = int(lease_sec or 90)
+    if lease < 5:
+        lease = 5
+    if lease > 3600:
+        lease = 3600
+    own = str(owner or "").strip()
+    if not own:
+        own = "worker"
+
+    async with pool.acquire() as conn:
+        # One statement, protected by row locks.
+        rows = await conn.fetch(
+            """
+            WITH picked AS (
+                SELECT id
+                FROM autotrade_positions
+                WHERE status='OPEN'
+                  AND (mgr_lock_until IS NULL OR mgr_lock_until < NOW() OR mgr_owner=$1)
+                ORDER BY opened_at ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE autotrade_positions p
+            SET mgr_owner=$1,
+                mgr_lock_until=NOW() + ($3::int * INTERVAL '1 second'),
+                mgr_lock_acquired_at=COALESCE(p.mgr_lock_acquired_at, NOW())
+            FROM picked
+            WHERE p.id=picked.id
+            RETURNING p.id, p.user_id, p.signal_id, p.exchange, p.market_type, p.symbol, p.side,
+                      p.allocated_usdt, p.api_order_ref, p.meta, p.opened_at;
+            """,
+            own,
+            lim,
+            lease,
+        )
+        return [dict(r) for r in rows]
+
+
+async def release_autotrade_position_lock(*, row_id: int, owner: str) -> None:
+    """Release manager lease early (optional)."""
+    pool = get_pool()
+    rid = int(row_id)
+    own = str(owner or "").strip()
+    if not own:
+        own = "worker"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE autotrade_positions
+            SET mgr_lock_until=NULL,
+                mgr_owner=NULL,
+                mgr_lock_acquired_at=NULL
+            WHERE id=$1 AND (mgr_owner=$2 OR mgr_owner IS NULL);
+            """,
+            rid,
+            own,
+        )
+
+
+async def touch_autotrade_position_lock(*, row_id: int, owner: str, lease_sec: int = 90) -> None:
+    """Extend lease for a row already owned by this worker."""
+    pool = get_pool()
+    rid = int(row_id)
+    lease = int(lease_sec or 90)
+    if lease < 5:
+        lease = 5
+    if lease > 3600:
+        lease = 3600
+    own = str(owner or "").strip()
+    if not own:
+        own = "worker"
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE autotrade_positions
+            SET mgr_lock_until=NOW() + ($3::int * INTERVAL '1 second'),
+                mgr_owner=$2,
+                mgr_lock_acquired_at=COALESCE(mgr_lock_acquired_at, NOW())
+            WHERE id=$1 AND status='OPEN' AND (mgr_owner=$2 OR mgr_owner IS NULL OR mgr_lock_until < NOW());
+            """,
+            rid,
+            own,
+            lease,
+        )
+
 
 
 async def update_autotrade_order_ref(*, row_id: int, api_order_ref: str) -> None:
