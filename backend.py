@@ -6096,8 +6096,10 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 # Reuse MID trap sink/digest to show why MID hard-filters blocked entries
                 _emit_mid_trap_event({
                     "dir": str(dir_trend),
-                    "reason": f"mid_block {reason}",
-                    "reason_key": "mid_block",
+                    # Keep the raw reason so the digest can bucket by the *actual* filter
+                    # (anti_bounce_short / rsi_short / bb_bounce_zone / etc.)
+                    "reason": str(reason),
+                    "reason_key": _mid_trap_reason_key(str(reason)),
                     "entry": float(entry),
                 })
             except Exception:
