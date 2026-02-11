@@ -4537,10 +4537,19 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                     if dist_high_atr > MID_ANTI_BOUNCE_ATR_MAX:
                         return f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {MID_ANTI_BOUNCE_ATR_MAX:g}"
 
-            # --- BB bounce guard: avoid SHORTs in mid→high bounce zone (common SL pattern) ---
+            # --- BB bounce guard (mirror): avoid entries away from BB extremes ---
+            # For quality entries (less SL), we prefer:
+            #   LONG  only near/below lower band (bb_pos == '↓low')
+            #   SHORT only near/above upper band (bb_pos == '↑high')
+            # Everything inside the bands is treated as "bounce zone" and blocked.
             if MID_BLOCK_BB_BOUNCE and bb_pos:
-                if side.upper() == "SHORT" and str(bb_pos) in ("mid→high", "low→mid"):
-                    return f"bb_bounce_zone={bb_pos}"
+                b = str(bb_pos)
+                if side.upper() == "SHORT":
+                    if b in ("mid→high", "low→mid", "↓low"):
+                        return f"bb_bounce_zone={bb_pos}"
+                else:  # LONG
+                    if b in ("mid→high", "low→mid", "↑high"):
+                        return f"bb_bounce_zone={bb_pos}"
 
             dist = abs(close - vwap) / atr_30m if vwap is not None else 0.0
             if dist > MID_VWAP_DIST_ATR_MAX:
