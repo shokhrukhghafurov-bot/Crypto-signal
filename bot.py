@@ -4432,18 +4432,24 @@ async def main() -> None:
             if not _check_basic(request):
                 return _unauthorized()
 
-            now_utc = dt.datetime.now(dt.timezone.utc)
-
-            # Rolling windows (ideal for dashboard):
-            #   - day   = last 24h
-            #   - week  = last 7 days
-            #   - month = last 30 days
+            # IMPORTANT:
+            # Dashboard numbers must match Moscow time (TZ_NAME/TZ).
+            # Use *calendar* ranges in TZ (Europe/Moscow by default):
+            #   - day   = today 00:00..now (MSK)
+            #   - week  = Monday 00:00..now (MSK)
+            #   - month = 1st day 00:00..now (MSK)
             #
-            # This avoids edge-cases at week/month boundaries (e.g., 1st day of month showing 0).
+            # Convert ranges to UTC before querying Postgres.
+            now_utc = dt.datetime.now(dt.timezone.utc)
+            now_tz = now_utc.astimezone(TZ)
+            day_start_tz = now_tz.replace(hour=0, minute=0, second=0, microsecond=0)
+            week_start_tz = day_start_tz - dt.timedelta(days=day_start_tz.weekday())  # Monday
+            month_start_tz = day_start_tz.replace(day=1)
+
             ranges = {
-                "day": (now_utc - dt.timedelta(hours=24), now_utc),
-                "week": (now_utc - dt.timedelta(days=7), now_utc),
-                "month": (now_utc - dt.timedelta(days=30), now_utc),
+                "day": (day_start_tz.astimezone(dt.timezone.utc), now_utc),
+                "week": (week_start_tz.astimezone(dt.timezone.utc), now_utc),
+                "month": (month_start_tz.astimezone(dt.timezone.utc), now_utc),
             }
             # Signals sent counters are stored in Postgres (signal_sent_events).
             # Backward compatible fields: day/week/month totals + split day_spot/day_futures/...
