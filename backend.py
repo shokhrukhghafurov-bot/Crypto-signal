@@ -289,288 +289,6 @@ from cryptography.fernet import Fernet
 logger = logging.getLogger("crypto-signal")
 
 
-# --- Shared HTTP session + per-exchange rate limiting + short-lived price cache ---
-# Goal: when many users have many positions, we must NOT open a new HTTP session and hit the exchange
-# for every position. We:
-#   1) reuse one aiohttp session (keep-alive),
-#   2) throttle per exchange (binance/bybit/okx/etc) independently,
-#   3) cache last price per (exchange, market, symbol) for ~1-2 seconds and share it between positions.
-
-_HTTP_SESSION: aiohttp.ClientSession | None = None
-_HTTP_SESSION_LOCK = asyncio.Lock()
-
-async def _get_http_session() -> aiohttp.ClientSession:
-    global _HTTP_SESSION
-    if _HTTP_SESSION is not None and not _HTTP_SESSION.closed:
-        return _HTTP_SESSION
-    async with _HTTP_SESSION_LOCK:
-        if _HTTP_SESSION is not None and not _HTTP_SESSION.closed:
-            return _HTTP_SESSION
-        timeout = aiohttp.ClientTimeout(total=float(os.getenv("HTTP_TIMEOUT_SEC", "6") or 6))
-        _HTTP_SESSION = aiohttp.ClientSession(timeout=timeout)
-        return _HTTP_SESSION
-
-class _PerExchangeLimiter:
-    """Very small async rate limiter with per-exchange spacing.
-
-    It doesn't try to be perfect token-bucket; it guarantees *min interval* between requests
-    per exchange, which is what we need to avoid bursts when many positions are tracked.
-    """
-
-    def __init__(self, *, min_interval_sec: float) -> None:
-        self.min_interval = max(0.0, float(min_interval_sec))
-        self._lock = asyncio.Lock()
-        self._next_ts = 0.0
-
-    async def wait(self) -> None:
-        if self.min_interval <= 0:
-            return
-        async with self._lock:
-            now = time.time()
-            if now < self._next_ts:
-                await asyncio.sleep(self._next_ts - now)
-            self._next_ts = time.time() + self.min_interval
-
-_RATE_LIMITERS: dict[str, _PerExchangeLimiter] = {}
-
-def _limiter_for(exchange: str) -> _PerExchangeLimiter:
-    ex = (exchange or "").upper().strip()
-    if not ex:
-        ex = "GENERIC"
-    lim = _RATE_LIMITERS.get(ex)
-    if lim is not None:
-        return lim
-    # Requests per second per exchange (safe defaults).
-    # You can tune these in env without changing code.
-    env_key = f"{ex}_RPS"
-    try:
-        rps = float(os.getenv(env_key, "8") or 8)
-    except Exception:
-        rps = 8.0
-    if rps <= 0:
-        min_interval = 0.0
-    else:
-        min_interval = 1.0 / rps
-    lim = _PerExchangeLimiter(min_interval_sec=min_interval)
-    _RATE_LIMITERS[ex] = lim
-    return lim
-
-# Price cache: (exchange, market, symbol) -> (ts, price)
-_PRICE_CACHE: dict[tuple[str, str, str], tuple[float, float]] = {}
-_PRICE_INFLIGHT: dict[tuple[str, str, str], asyncio.Lock] = {}
-
-async def _get_cached_price(key: tuple[str, str, str], *, ttl_sec: float, fetch_fn) -> float | None:
-    """Return cached price or fetch once and cache.
-
-    fetch_fn must be an async callable returning float|None.
-    """
-    try:
-        ttl = float(ttl_sec)
-    except Exception:
-        ttl = 1.2
-    if ttl <= 0:
-        try:
-            return await fetch_fn()
-        except Exception:
-            return None
-
-    now = time.time()
-    hit = _PRICE_CACHE.get(key)
-    if hit is not None:
-        ts, p = hit
-        if (now - ts) <= ttl:
-            return float(p)
-
-    lock = _PRICE_INFLIGHT.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _PRICE_INFLIGHT[key] = lock
-
-    async with lock:
-        # re-check after waiting
-        now2 = time.time()
-        hit2 = _PRICE_CACHE.get(key)
-        if hit2 is not None:
-            ts2, p2 = hit2
-            if (now2 - ts2) <= ttl:
-                return float(p2)
-        try:
-            p = await fetch_fn()
-        except Exception:
-            p = None
-        if p is not None:
-            try:
-                _PRICE_CACHE[key] = (time.time(), float(p))
-            except Exception:
-                pass
-        return float(p) if p is not None else None
-
-
-def _norm_ex_name(ex: str) -> str:
-    """Normalize exchange names across the codebase."""
-    e = (ex or "").strip().lower()
-    if e in ("gate", "gateio", "gate.io"):
-        return "gateio"
-    if e in ("mexc", "mexcglobal"):
-        return "mexc"
-    if e in ("binance", "bnb"):
-        return "binance"
-    if e in ("bybit",):
-        return "bybit"
-    if e in ("okx", "okex"):
-        return "okx"
-    return e or "binance"
-
-
-async def _public_price_cached(*, exchange: str, market: str, symbol: str) -> float | None:
-    """Get last price from a specific exchange+market with limiter + short cache.
-
-    - exchange: binance/bybit/okx/mexc/gateio
-    - market: SPOT/FUTURES
-
-    Note: MEXC and Gate.io are treated as SPOT-only for public price.
-    """
-    ex = _norm_ex_name(exchange)
-    mkt = (market or "FUTURES").upper().strip()
-    sym = (symbol or "").upper().replace("/", "").replace("-", "").replace("_", "")
-    if not sym:
-        return None
-
-    # SPOT-only exchanges
-    if ex in ("mexc", "gateio") and mkt != "SPOT":
-        return None
-
-    ttl = float(os.getenv("PRICE_CACHE_TTL_SEC", "1.2") or 1.2)
-    key = (ex.upper(), mkt, sym)
-
-    async def _do() -> float | None:
-        try:
-            session = await _get_http_session()
-            await _limiter_for(ex.upper()).wait()
-
-            if ex == "binance":
-                url = "https://api.binance.com/api/v3/ticker/price" if mkt == "SPOT" else "https://fapi.binance.com/fapi/v1/ticker/price"
-                async with session.get(url, params={"symbol": sym}) as r:
-                    if r.status != 200:
-                        return None
-                    data = await r.json(content_type=None)
-                p = (data or {}).get("price") if isinstance(data, dict) else None
-                return float(p) if p is not None else None
-
-            if ex == "bybit":
-                category = "spot" if mkt == "SPOT" else "linear"
-                url = "https://api.bybit.com/v5/market/tickers"
-                async with session.get(url, params={"category": category, "symbol": sym}) as r:
-                    if r.status != 200:
-                        return None
-                    data = await r.json(content_type=None)
-                if not isinstance(data, dict) or int(data.get("retCode", 0) or 0) != 0:
-                    return None
-                res = data.get("result") or {}
-                lst = (res.get("list") or []) if isinstance(res, dict) else []
-                if not lst:
-                    return None
-                item = lst[0] if isinstance(lst[0], dict) else None
-                if not isinstance(item, dict):
-                    return None
-                p = item.get("lastPrice") or item.get("indexPrice") or item.get("markPrice")
-                return float(p) if p is not None else None
-
-            if ex == "okx":
-                # symbol assumed like BTCUSDT -> BTC-USDT (or BTC-USDT-SWAP)
-                base = sym[:-4] if sym.endswith("USDT") and len(sym) > 4 else sym
-                inst = f"{base}-USDT" if mkt == "SPOT" else f"{base}-USDT-SWAP"
-                url = "https://www.okx.com/api/v5/market/ticker"
-                async with session.get(url, params={"instId": inst}) as r:
-                    if r.status != 200:
-                        return None
-                    data = await r.json(content_type=None)
-                if not isinstance(data, dict):
-                    return None
-                arr = data.get("data") or []
-                if not arr or not isinstance(arr, list):
-                    return None
-                item = arr[0] if isinstance(arr[0], dict) else None
-                if not isinstance(item, dict):
-                    return None
-                p = item.get("last") or item.get("lastPrice")
-                return float(p) if p is not None else None
-
-            if ex == "mexc":
-                url = "https://api.mexc.com/api/v3/ticker/price"
-                async with session.get(url, params={"symbol": sym}) as r:
-                    if r.status != 200:
-                        return None
-                    data = await r.json(content_type=None)
-                if not isinstance(data, dict):
-                    return None
-                p = data.get("price")
-                return float(p) if p is not None else None
-
-            if ex == "gateio":
-                pair = _gate_pair(sym)
-                url = "https://api.gateio.ws/api/v4/spot/tickers"
-                async with session.get(url, params={"currency_pair": pair}) as r:
-                    if r.status != 200:
-                        return None
-                    data = await r.json(content_type=None)
-                if isinstance(data, list) and data and isinstance(data[0], dict):
-                    p = data[0].get("last")
-                    return float(p) if p is not None else None
-                return None
-
-            return None
-        except Exception:
-            return None
-
-    return await _get_cached_price(key, ttl_sec=ttl, fetch_fn=_do)
-
-
-async def _price_for_position(*, exchange: str, market_type: str, symbol: str) -> tuple[float | None, str]:
-    """Price for a specific position.
-
-    Rule:
-      1) try the position's own exchange first
-      2) if it fails, fall back to other exchanges (market-aware)
-      3) for FUTURES, if multiple fallbacks are available, use median to reduce noise
-    """
-    ex = _norm_ex_name(exchange)
-    mt = (market_type or "futures").lower().strip()
-    mkt = "SPOT" if mt == "spot" else "FUTURES"
-
-    # 1) primary
-    p0 = await _public_price_cached(exchange=ex, market=mkt, symbol=symbol)
-    if p0 is not None and float(p0) > 0:
-        return float(p0), ex.upper()
-
-    # 2) fallbacks
-    if mkt == "FUTURES":
-        candidates = ["binance", "bybit", "okx"]
-    else:
-        candidates = ["binance", "bybit", "okx", "mexc", "gateio"]
-
-    others = [c for c in candidates if c != ex]
-    vals: list[float] = []
-    srcs: list[str] = []
-    for c in others:
-        pc = await _public_price_cached(exchange=c, market=mkt, symbol=symbol)
-        if pc is not None and float(pc) > 0:
-            vals.append(float(pc))
-            srcs.append(c.upper())
-            # For SPOT, first good one is enough.
-            if mkt == "SPOT":
-                return float(pc), c.upper()
-
-    if mkt == "FUTURES" and vals:
-        # prefer median if we have >=2 sources
-        if len(vals) >= 2:
-            return float(statistics.median(vals)), "FALLBACK_MEDIAN(" + "+".join(srcs) + ")"
-        return float(vals[0]), "FALLBACK_" + srcs[0]
-
-    return None, "NO_PRICE"
-
-
-
 # --- MID trap digest sink (aggregates "MID blocked (trap)" into a periodic digest) ---
 # Bot can register a sink callback that receives structured trap events.
 _MID_TRAP_SINK = None  # type: ignore
@@ -1042,6 +760,20 @@ def _okx_inst(symbol: str) -> str:
     s = symbol.upper()
     if s.endswith("USDT"):
         return f"{s[:-4]}-USDT"
+    return s
+
+def _okx_swap_inst(symbol: str) -> str:
+    """OKX perpetual swap instrument id (best-effort).
+
+    For USDT-margined perps OKX commonly uses: BASE-USDT-SWAP
+    Example: BTCUSDT -> BTC-USDT-SWAP
+    """
+    s = symbol.upper().strip()
+    if s.endswith("USDT"):
+        base = s[:-4]
+        if base:
+            return f"{base}-USDT-SWAP"
+    # Fallback: try raw (won't work for most, but safe)
     return s
 
 def _gate_pair(symbol: str) -> str:
@@ -3509,8 +3241,16 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             allocated_usdt = _as_float(r.get("allocated_usdt"), 0.0)
                             px = 0.0
                             try:
-                                pxx, _psrc = await _price_for_position(exchange=ex, market_type=mt, symbol=symbol)
-                                px = float(pxx or 0.0)
+                                if ex == "binance":
+                                    px = await _binance_price(symbol, futures=(mt == "futures"))
+                                elif ex == "bybit":
+                                    px = await _bybit_price(symbol, category=("linear" if mt == "futures" else "spot"))
+                                elif ex == "okx":
+                                    px = await _okx_public_price(symbol)
+                                elif ex == "mexc":
+                                    px = await _mexc_public_price(symbol)
+                                else:
+                                    px = await _gateio_public_price(symbol)
                             except Exception:
                                 px = 0.0
                             pnl_usdt = None
@@ -3601,14 +3341,65 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         dirty = True
                     try:
                         # --- price (decision) ---
-                        # Use the position's own exchange first.
-                        # If it fails, fall back to other exchanges (market-aware) using cached + rate-limited fetches.
-                        px, psrc = await _price_for_position(exchange=ex, market_type=mt, symbol=symbol)
-                        if px is not None and float(px) > 0:
-                            ref["px_decision_src"] = str(psrc)
-                            dirty = True
+                        # For futures, prefer a robust decision price to reduce noise:
+                        # median of available sources (Binance Futures + Bybit Linear + optional public OKX),
+                        # falling back to the trade exchange source if only one is available.
+                        if mt == "futures":
+                            srcs = []
+                            try:
+                                data_b = await _http_json("GET", "https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
+                                px_b = float((data_b or {}).get("price") or 0.0)
+                                if px_b > 0:
+                                    srcs.append(px_b)
+                            except Exception:
+                                pass
+                            try:
+                                px_y = await _bybit_price(symbol, category="linear")
+                                if float(px_y or 0.0) > 0:
+                                    srcs.append(float(px_y))
+                            except Exception:
+                                pass
+                            try:
+                                # OKX public last (best-effort)
+                                px_o = await _okx_public_price(symbol)
+                                if float(px_o or 0.0) > 0:
+                                    srcs.append(float(px_o))
+                            except Exception:
+                                pass
+                            if len(srcs) >= 2:
+                                px = float(statistics.median(srcs))
+                                ref["px_decision_src"] = "MEDIAN"
+                                dirty = True
+                            elif len(srcs) == 1:
+                                px = float(srcs[0])
+                                ref["px_decision_src"] = "SINGLE"
+                                dirty = True
+                            else:
+                                # fall back to per-exchange source
+                                if ex == "binance":
+                                    data = await _http_json("GET", "https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
+                                    px = float((data or {}).get("price") or 0.0)
+                                elif ex == "bybit":
+                                    px = await _bybit_price(symbol, category="linear")
+                                elif ex == "okx":
+                                    px = await _okx_public_price(symbol)
+                                elif ex == "mexc":
+                                    px = await _mexc_public_price(symbol)
+                                else:
+                                    px = await _gateio_public_price(symbol)
                         else:
-                            px = 0.0
+                            # spot: keep per-exchange source
+                            if ex == "binance":
+                                data = await _http_json("GET", "https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
+                                px = float((data or {}).get("price") or 0.0)
+                            elif ex == "bybit":
+                                px = await _bybit_price(symbol, category="spot")
+                            elif ex == "okx":
+                                px = await _okx_public_price(symbol)
+                            elif ex == "mexc":
+                                px = await _mexc_public_price(symbol)
+                            else:
+                                px = await _gateio_public_price(symbol)
                     except Exception:
                         px = 0.0
 
@@ -5340,42 +5131,175 @@ class MacroCalendar:
 # ------------------ Price feed (WS, Binance) ------------------
 class PriceFeed:
     def __init__(self) -> None:
+        # Backward-compatible (BINANCE-only) cache used by older call sites.
         self._prices: Dict[Tuple[str, str], float] = {}
         self._sources: Dict[Tuple[str, str], str] = {}
+        self._ts: Dict[Tuple[str, str], float] = {}
         self._tasks: Dict[Tuple[str, str], asyncio.Task] = {}
+
+        # Multi-exchange cache: (EXCHANGE, MARKET, SYMBOL) -> price/source/ts.
+        self._prices_ex: Dict[Tuple[str, str, str], float] = {}
+        self._sources_ex: Dict[Tuple[str, str, str], str] = {}
+        self._ts_ex: Dict[Tuple[str, str, str], float] = {}
+        self._tasks_ex: Dict[Tuple[str, str, str], asyncio.Task] = {}
 
     def get_latest(self, market: str, symbol: str) -> Optional[float]:
         return self._prices.get((market.upper(), symbol.upper()))
 
+    def get_latest_ex(self, exchange: str, market: str, symbol: str) -> Optional[float]:
+        return self._prices_ex.get((exchange.upper(), market.upper(), symbol.upper()))
+
     def get_latest_source(self, market: str, symbol: str) -> Optional[str]:
         return self._sources.get((market.upper(), symbol.upper()))
 
+    def get_latest_source_ex(self, exchange: str, market: str, symbol: str) -> Optional[str]:
+        return self._sources_ex.get((exchange.upper(), market.upper(), symbol.upper()))
+
+    def get_latest_ts_ex(self, exchange: str, market: str, symbol: str) -> Optional[float]:
+        return self._ts_ex.get((exchange.upper(), market.upper(), symbol.upper()))
+
     def _set_latest(self, market: str, symbol: str, price: float, source: str = "WS") -> None:
+        # BINANCE legacy cache.
         key = (market.upper(), symbol.upper())
         self._prices[key] = float(price)
         self._sources[key] = str(source or "WS")
+        self._ts[key] = time.time()
 
-    async def ensure_stream(self, market: str, symbol: str) -> None:
-        key = (market.upper(), symbol.upper())
-        t = self._tasks.get(key)
+    def _set_latest_ex(self, exchange: str, market: str, symbol: str, price: float, source: str = "WS") -> None:
+        key = (exchange.upper(), market.upper(), symbol.upper())
+        self._prices_ex[key] = float(price)
+        self._sources_ex[key] = str(source or "WS")
+        self._ts_ex[key] = time.time()
+
+        # Keep BINANCE updated for older code paths.
+        if exchange.upper() == "BINANCE":
+            try:
+                self._set_latest(market, symbol, float(price), source=source)
+            except Exception:
+                pass
+
+    async def ensure_stream(self, market: str, symbol: str, exchange: str = "BINANCE") -> None:
+        """Ensure WS stream for (exchange, market, symbol) is running.
+
+        Backward compatibility: older code calls ensure_stream(market, symbol) which
+        defaults to BINANCE.
+        """
+        ex = (exchange or "BINANCE").upper().strip()
+        if ex == "BINANCE":
+            key = (market.upper(), symbol.upper())
+            t = self._tasks.get(key)
+            if t and not t.done():
+                return
+            self._tasks[key] = asyncio.create_task(self._run_stream(market, symbol, exchange=ex))
+            return
+
+        key_ex = (ex, market.upper(), symbol.upper())
+        t = self._tasks_ex.get(key_ex)
         if t and not t.done():
             return
-        self._tasks[key] = asyncio.create_task(self._run_stream(market, symbol))
+        self._tasks_ex[key_ex] = asyncio.create_task(self._run_stream(market, symbol, exchange=ex))
 
-    async def _run_stream(self, market: str, symbol: str) -> None:
+    async def _run_stream(self, market: str, symbol: str, exchange: str = "BINANCE") -> None:
         m = market.upper()
-        sym = symbol.lower()
-        url = f"wss://stream.binance.com:9443/ws/{sym}@trade" if m == "SPOT" else f"wss://fstream.binance.com/ws/{sym}@trade"
+        ex = (exchange or "BINANCE").upper().strip()
+        sym_u = symbol.upper().strip()
+        sym_l = symbol.lower().strip()
+
+        # BINANCE (trade stream)
+        if ex == "BINANCE":
+            url = f"wss://stream.binance.com:9443/ws/{sym_l}@trade" if m == "SPOT" else f"wss://fstream.binance.com/ws/{sym_l}@trade"
+        # BYBIT v5 public WS (tickers)
+        elif ex == "BYBIT":
+            url = "wss://stream.bybit.com/v5/public/spot" if m == "SPOT" else "wss://stream.bybit.com/v5/public/linear"
+        # OKX public WS (tickers)
+        elif ex == "OKX":
+            url = "wss://ws.okx.com:8443/ws/v5/public"
+        # Gate.io WS v4 (spot tickers)
+        elif ex in {"GATE", "GATEIO", "GATE.IO"}:
+            url = "wss://api.gateio.ws/ws/v4/"
+        # MEXC spot WS (best-effort)
+        elif ex == "MEXC":
+            url = "wss://wbs.mexc.com/ws"
+        else:
+            # Unknown exchange -> no WS.
+            return
+
         backoff = 1
         while True:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                     backoff = 1
+
+                    # Subscribe (non-BINANCE streams need subscription message)
+                    try:
+                        if ex == "BYBIT":
+                            await ws.send(json.dumps({"op": "subscribe", "args": [f"tickers.{sym_u}"]}))
+                        elif ex == "OKX":
+                            inst = _okx_inst(sym_u) if m == "SPOT" else _okx_swap_inst(sym_u)
+                            await ws.send(json.dumps({"op": "subscribe", "args": [{"channel": "tickers", "instId": inst}]}))
+                        elif ex in {"GATE", "GATEIO", "GATE.IO"}:
+                            if m != "SPOT":
+                                # We only use Gate WS as SPOT price fallback.
+                                return
+                            pair = _gate_pair(sym_u)
+                            await ws.send(json.dumps({"time": int(time.time()), "channel": "spot.tickers", "event": "subscribe", "payload": [pair]}))
+                        elif ex == "MEXC":
+                            if m != "SPOT":
+                                return
+                            # Best-effort deals stream; yields last trade price.
+                            await ws.send(json.dumps({"method": "SUBSCRIPTION", "params": [f"spot@public.deals.v3.api@{sym_u}"], "id": 1}))
+                    except Exception:
+                        pass
+
                     async for msg in ws:
                         data = json.loads(msg)
-                        p = data.get("p")
-                        if p is not None:
-                            self._set_latest(m, symbol, float(p), source="WS")
+
+                        # BINANCE trade event: {"p": "..."}
+                        if ex == "BINANCE":
+                            p = data.get("p")
+                            if p is not None:
+                                self._set_latest_ex("BINANCE", m, sym_u, float(p), source="WS")
+                            continue
+
+                        # BYBIT tickers: {"topic":"tickers.SYMBOL", "data": {"lastPrice":"..."}}
+                        if ex == "BYBIT":
+                            dd = data.get("data") if isinstance(data, dict) else None
+                            if isinstance(dd, dict):
+                                p = dd.get("lastPrice") or dd.get("last_price")
+                                if p is not None:
+                                    self._set_latest_ex("BYBIT", m, sym_u, float(p), source="WS")
+                            continue
+
+                        # OKX tickers: {"arg":..., "data":[{"last":"..."}]}
+                        if ex == "OKX":
+                            lst = data.get("data") if isinstance(data, dict) else None
+                            if isinstance(lst, list) and lst:
+                                it = lst[0] if isinstance(lst[0], dict) else {}
+                                p = it.get("last")
+                                if p is not None:
+                                    self._set_latest_ex("OKX", m, sym_u, float(p), source="WS")
+                            continue
+
+                        # Gate spot.tickers: {"result":{"last":"..."}}
+                        if ex in {"GATE", "GATEIO", "GATE.IO"}:
+                            res = data.get("result") if isinstance(data, dict) else None
+                            if isinstance(res, dict):
+                                p = res.get("last")
+                                if p is not None:
+                                    self._set_latest_ex("GATEIO", m, sym_u, float(p), source="WS")
+                            continue
+
+                        # MEXC deals: {"d":{"deals":[{"p":"..."}]}}
+                        if ex == "MEXC":
+                            d = data.get("d") if isinstance(data, dict) else None
+                            deals = None
+                            if isinstance(d, dict):
+                                deals = d.get("deals")
+                            if isinstance(deals, list) and deals:
+                                it = deals[0] if isinstance(deals[0], dict) else {}
+                                p = it.get("p") or it.get("price")
+                                if p is not None:
+                                    self._set_latest_ex("MEXC", m, sym_u, float(p), source="WS")
             except Exception:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
@@ -7824,35 +7748,27 @@ class Backend:
             reason = coin
             until_ts = until
         return {"action": act, "reason": reason, "until_ts": until_ts}
-
     async def _fetch_rest_price(self, market: str, symbol: str) -> float | None:
-        """Binance REST fallback price (spot/futures), with per-exchange limiter + 1-2s cache."""
+        """Binance REST fallback price (spot/futures)."""
         m = (market or "FUTURES").upper()
         sym = (symbol or "").upper()
         if not sym:
             return None
-
         url = "https://api.binance.com/api/v3/ticker/price" if m == "SPOT" else "https://fapi.binance.com/fapi/v1/ticker/price"
-        key = ("BINANCE", m, sym)
-        ttl = float(os.getenv("PRICE_CACHE_TTL_SEC", "1.2") or 1.2)
-
-        async def _do() -> float | None:
-            try:
-                session = await _get_http_session()
-                await _limiter_for("BINANCE").wait()
-                async with session.get(url, params={"symbol": sym}) as r:
+        try:
+            timeout = aiohttp.ClientTimeout(total=6)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(url, params={"symbol": sym}) as r:
                     if r.status != 200:
                         return None
-                    data = await r.json(content_type=None)
-                p = data.get("price") if isinstance(data, dict) else None
-                return float(p) if p is not None else None
-            except Exception:
-                return None
-
-        return await _get_cached_price(key, ttl_sec=ttl, fetch_fn=_do)
+                    data = await r.json()
+            p = data.get("price") if isinstance(data, dict) else None
+            return float(p) if p is not None else None
+        except Exception:
+            return None
 
     async def _fetch_bybit_price(self, market: str, symbol: str) -> float | None:
-        """Bybit REST price (spot/futures). Uses V5 tickers, with limiter + short cache.
+        """Bybit REST price (spot/futures). Uses V5 tickers.
 
         market: SPOT -> category=spot
                 FUTURES -> category=linear (USDT perpetual)
@@ -7861,40 +7777,34 @@ class Backend:
         sym = (symbol or "").upper().replace("/", "")
         if not sym:
             return None
-
         category = "spot" if mkt == "SPOT" else "linear"
         url = "https://api.bybit.com/v5/market/tickers"
-        key = ("BYBIT", mkt, sym)
-        ttl = float(os.getenv("PRICE_CACHE_TTL_SEC", "1.2") or 1.2)
-
-        async def _do() -> float | None:
-            try:
-                session = await _get_http_session()
-                await _limiter_for("BYBIT").wait()
-                async with session.get(url, params={"category": category, "symbol": sym}) as r:
+        try:
+            timeout = aiohttp.ClientTimeout(total=6)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(url, params={"category": category, "symbol": sym}) as r:
                     if r.status != 200:
                         return None
-                    data = await r.json(content_type=None)
-                if not isinstance(data, dict):
-                    return None
-                if int(data.get("retCode", 0) or 0) != 0:
-                    return None
-                res = data.get("result") or {}
-                lst = (res.get("list") or []) if isinstance(res, dict) else []
-                if not lst:
-                    return None
-                item = lst[0] if isinstance(lst, list) else None
-                if not isinstance(item, dict):
-                    return None
-                p = item.get("lastPrice") or item.get("indexPrice") or item.get("markPrice")
-                return float(p) if p is not None else None
-            except Exception:
+                    data = await r.json()
+            if not isinstance(data, dict):
                 return None
+            if int(data.get("retCode", 0) or 0) != 0:
+                return None
+            res = data.get("result") or {}
+            lst = (res.get("list") or []) if isinstance(res, dict) else []
+            if not lst:
+                return None
+            item = lst[0] if isinstance(lst, list) else None
+            if not isinstance(item, dict):
+                return None
+            p = item.get("lastPrice") or item.get("indexPrice") or item.get("markPrice")
+            return float(p) if p is not None else None
+        except Exception:
+            return None
 
-        return await _get_cached_price(key, ttl_sec=ttl, fetch_fn=_do)
 
     async def _fetch_okx_price(self, market: str, symbol: str) -> float | None:
-        """OKX REST price (spot/futures), with limiter + short cache.
+        """OKX REST price (spot/futures).
 
         market: SPOT -> instId=BASE-USDT
                 FUTURES -> instId=BASE-USDT-SWAP (USDT perpetual)
@@ -7903,38 +7813,32 @@ class Backend:
         sym = (symbol or "").upper().replace("/", "")
         if not sym:
             return None
-
-        key = ("OKX", mkt, sym)
-        ttl = float(os.getenv("PRICE_CACHE_TTL_SEC", "1.2") or 1.2)
-
-        async def _do() -> float | None:
-            try:
-                if sym.endswith("USDT"):
-                    base = sym[:-4]
-                else:
-                    base = sym
-                inst = f"{base}-USDT" if mkt == "SPOT" else f"{base}-USDT-SWAP"
-                url = "https://www.okx.com/api/v5/market/ticker"
-                session = await _get_http_session()
-                await _limiter_for("OKX").wait()
-                async with session.get(url, params={"instId": inst}) as r:
+        try:
+            if sym.endswith("USDT"):
+                base = sym[:-4]
+            else:
+                base = sym
+            inst = f"{base}-USDT" if mkt == "SPOT" else f"{base}-USDT-SWAP"
+            url = "https://www.okx.com/api/v5/market/ticker"
+            timeout = aiohttp.ClientTimeout(total=6)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(url, params={"instId": inst}) as r:
                     if r.status != 200:
                         return None
-                    data = await r.json(content_type=None)
-                if not isinstance(data, dict):
-                    return None
-                arr = data.get("data") or []
-                if not arr or not isinstance(arr, list):
-                    return None
-                item = arr[0] if arr else None
-                if not isinstance(item, dict):
-                    return None
-                p = item.get("last") or item.get("lastPrice")
-                return float(p) if p is not None else None
-            except Exception:
+                    data = await r.json()
+            if not isinstance(data, dict):
                 return None
+            arr = data.get("data") or []
+            if not arr or not isinstance(arr, list):
+                return None
+            item = arr[0] if arr else None
+            if not isinstance(item, dict):
+                return None
+            p = item.get("last") or item.get("lastPrice")
+            return float(p) if p is not None else None
+        except Exception:
+            return None
 
-        return await _get_cached_price(key, ttl_sec=ttl, fetch_fn=_do)
 
     async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
         """Return (price, source) for tracking.
@@ -8013,14 +7917,44 @@ class Backend:
             return None, "BINANCE"
 
         async def get_bybit() -> tuple[float | None, str]:
+            # websocket first, REST fallback
+            try:
+                await self.feed.ensure_stream(market, signal.symbol, exchange="BYBIT")
+                latest = self.feed.get_latest_ex("BYBIT", market, signal.symbol)
+                ts = self.feed.get_latest_ts_ex("BYBIT", market, signal.symbol)
+                max_age = float(os.getenv("PRICE_WS_MAX_AGE_SEC", "3") or 3)
+                if latest is not None and ts is not None and (time.time() - float(ts)) <= max_age and _is_reasonable(float(latest)):
+                    src = self.feed.get_latest_source_ex("BYBIT", market, signal.symbol) or "WS"
+                    return float(latest), ("BYBIT_WS" if src == "WS" else f"BYBIT_{src}")
+            except Exception:
+                pass
             p = await self._fetch_bybit_price(market, signal.symbol)
             if _is_reasonable(p):
+                try:
+                    self.feed._set_latest_ex("BYBIT", market, signal.symbol, float(p), source="REST")
+                except Exception:
+                    pass
                 return float(p), "BYBIT_REST"
             return None, "BYBIT"
 
         async def get_okx() -> tuple[float | None, str]:
+            # websocket first, REST fallback
+            try:
+                await self.feed.ensure_stream(market, signal.symbol, exchange="OKX")
+                latest = self.feed.get_latest_ex("OKX", market, signal.symbol)
+                ts = self.feed.get_latest_ts_ex("OKX", market, signal.symbol)
+                max_age = float(os.getenv("PRICE_WS_MAX_AGE_SEC", "3") or 3)
+                if latest is not None and ts is not None and (time.time() - float(ts)) <= max_age and _is_reasonable(float(latest)):
+                    src = self.feed.get_latest_source_ex("OKX", market, signal.symbol) or "WS"
+                    return float(latest), ("OKX_WS" if src == "WS" else f"OKX_{src}")
+            except Exception:
+                pass
             p = await self._fetch_okx_price(market, signal.symbol)
             if _is_reasonable(p):
+                try:
+                    self.feed._set_latest_ex("OKX", market, signal.symbol, float(p), source="REST")
+                except Exception:
+                    pass
                 return float(p), "OKX_REST"
             return None, "OKX"
 
@@ -8028,22 +7962,50 @@ class Backend:
             # MEXC/Gate are SPOT-only fallbacks for price.
             if market != "SPOT":
                 return None, "MEXC"
+            # websocket first, REST fallback
+            try:
+                await self.feed.ensure_stream(market, signal.symbol, exchange="MEXC")
+                latest = self.feed.get_latest_ex("MEXC", market, signal.symbol)
+                ts = self.feed.get_latest_ts_ex("MEXC", market, signal.symbol)
+                max_age = float(os.getenv("PRICE_WS_MAX_AGE_SEC", "3") or 3)
+                if latest is not None and ts is not None and (time.time() - float(ts)) <= max_age and _is_reasonable(float(latest)):
+                    return float(latest), "MEXC_WS"
+            except Exception:
+                pass
             try:
                 p = await _mexc_public_price(signal.symbol)
             except Exception:
                 p = None
             if _is_reasonable(p):
+                try:
+                    self.feed._set_latest_ex("MEXC", market, signal.symbol, float(p), source="REST")
+                except Exception:
+                    pass
                 return float(p), "MEXC_PUBLIC"
             return None, "MEXC"
 
         async def get_gateio() -> tuple[float | None, str]:
             if market != "SPOT":
                 return None, "GATEIO"
+            # websocket first, REST fallback
+            try:
+                await self.feed.ensure_stream(market, signal.symbol, exchange="GATEIO")
+                latest = self.feed.get_latest_ex("GATEIO", market, signal.symbol)
+                ts = self.feed.get_latest_ts_ex("GATEIO", market, signal.symbol)
+                max_age = float(os.getenv("PRICE_WS_MAX_AGE_SEC", "3") or 3)
+                if latest is not None and ts is not None and (time.time() - float(ts)) <= max_age and _is_reasonable(float(latest)):
+                    return float(latest), "GATEIO_WS"
+            except Exception:
+                pass
             try:
                 p = await _gateio_public_price(signal.symbol)
             except Exception:
                 p = None
             if _is_reasonable(p):
+                try:
+                    self.feed._set_latest_ex("GATEIO", market, signal.symbol, float(p), source="REST")
+                except Exception:
+                    pass
                 return float(p), "GATEIO_PUBLIC"
             return None, "GATEIO"
 
