@@ -5033,37 +5033,40 @@ async def main() -> None:
     # --- Single-instance guard (prevents Telegram getUpdates conflict) ---
     # If multiple containers start simultaneously, only one should run polling & loops.
     async def _try_acquire_singleton_lock() -> bool:
+        """Cluster-wide singleton lock (Postgres advisory lock).
+
+        Used to ensure only ONE replica runs heavy background loops (scanner/track/outcomes),
+        while ALL replicas may still serve HTTP (admin + Telegram webhook).
+        """
         try:
             async with pool.acquire() as conn:
                 v = await conn.fetchval("SELECT pg_try_advisory_lock(8313103750)")
                 return bool(v)
         except Exception:
-            # If lock query fails, do not block startup.
-            return True
+            # If DB is temporarily unavailable:
+            # - In POLLING mode: allow startup (otherwise bot becomes unreachable).
+            # - In WEBHOOK mode: be conservative and act as WORKER (avoid duplicate scanners).
+            logger.exception("Failed to acquire singleton advisory lock")
+            return False if WEBHOOK_MODE else True
 
     is_primary = await _try_acquire_singleton_lock()
 
-    # In webhook mode, many replicas may accept updates. However, we still keep
-    # background loops (scanner/track/outcomes) single-instance to reduce load.
-    # Only the primary instance sets the webhook to avoid races with delete/reset.
-    if WEBHOOK_MODE and is_primary and WEBHOOK_BASE_URL and (SimpleRequestHandler and setup_application):
-        try:
-            url = _webhook_url()
-            if url:
-                await bot.set_webhook(url, secret_token=WEBHOOK_SECRET_TOKEN, drop_pending_updates=True)
-                logger.info("Webhook set to %s", url)
-        except Exception:
-            logger.exception("Failed to set Telegram webhook")
-
-    if not is_primary:
-        logger.warning(
-            "Another instance holds the Telegram polling lock; this replica will run ONLY autotrade manager + HTTP (no polling/scanner)."
-        )
-        try:
-            asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
-        except Exception:
-            pass
-        await asyncio.Event().wait()
+    # In webhook mode, all replicas can accept updates, but only the primary replica
+    # should set the webhook and run background loops to avoid duplicate signals.
+    # In polling mode, only the primary replica can poll Telegram (getUpdates).
+    if WEBHOOK_MODE:
+        if not is_primary:
+            logger.warning("Webhook WORKER replica: will serve HTTP/webhook + autotrade manager only (no scanner/track/outcomes).")
+    else:
+        if not is_primary:
+            logger.warning(
+                "Another instance holds the Telegram polling lock; this replica will run ONLY autotrade manager + HTTP (no polling/scanner)."
+            )
+            try:
+                asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
+            except Exception:
+                pass
+            await asyncio.Event().wait()
 
     # --- MID trap digest ---
     try:
@@ -5073,24 +5076,28 @@ async def main() -> None:
     except Exception:
         pass
 
-    logger.info("Starting track_loop")
-    if hasattr(backend, "track_loop"):
-        asyncio.create_task(backend.track_loop(bot))
+        # Background loops (track/scanners/outcomes) are heavy and MUST be single-instance in a cluster.
+    if (WEBHOOK_MODE and not is_primary):
+        logger.info("Skipping background loops on webhook WORKER replica.")
     else:
-        logger.warning("Backend has no track_loop; skipping")
-    logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
-    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
-    # ⚡ MID TREND scanner (5m/30m/1h) - optional, does not affect the main scanner
-    mid_enabled = os.getenv('MID_SCANNER_ENABLED', '1').strip().lower() not in ('0','false','no','off')
-    if mid_enabled:
-        if hasattr(backend, 'scanner_loop_mid'):
-            logger.info("Starting MID scanner_loop (5m/30m/1h) interval=%ss top_n=%s", os.getenv('MID_SCAN_INTERVAL_SECONDS',''), os.getenv('MID_TOP_N',''))
-            asyncio.create_task(backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert))
+    logger.info("Starting track_loop")
+        if hasattr(backend, "track_loop"):
+            asyncio.create_task(backend.track_loop(bot))
         else:
-            logger.warning('MID_SCANNER_ENABLED=1 but Backend has no scanner_loop_mid; skipping')
+            logger.warning("Backend has no track_loop; skipping")
+        logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
+        asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+        # ⚡ MID TREND scanner (5m/30m/1h) - optional, does not affect the main scanner
+        mid_enabled = os.getenv('MID_SCANNER_ENABLED', '1').strip().lower() not in ('0','false','no','off')
+        if mid_enabled:
+            if hasattr(backend, 'scanner_loop_mid'):
+                logger.info("Starting MID scanner_loop (5m/30m/1h) interval=%ss top_n=%s", os.getenv('MID_SCAN_INTERVAL_SECONDS',''), os.getenv('MID_TOP_N',''))
+                asyncio.create_task(backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert))
+            else:
+                logger.warning('MID_SCANNER_ENABLED=1 but Backend has no scanner_loop_mid; skipping')
 
-    logger.info("Starting signal_outcome_loop")
-    asyncio.create_task(signal_outcome_loop())
+        logger.info("Starting signal_outcome_loop")
+        asyncio.create_task(signal_outcome_loop())
 
     # Auto-trade manager (SL/TP/BE) - runs in background.
     asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
