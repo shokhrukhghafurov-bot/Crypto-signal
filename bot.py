@@ -4424,10 +4424,13 @@ async def main() -> None:
 
             Returns counts for:
               - signals sent: day/week/month
-              - signal outcomes & pnl%: day/week/month per market (SPOT/FUTURES)
+              - outcomes & pnl%: day/week/month per market (SPOT/FUTURES)
 
-            Outcome stats are computed from bot-level signal tracking (signal_tracks).
-            This reflects how sent signals performed (WIN/LOSS/BE/CLOSED + TP1).
+            IMPORTANT:
+            The admin panel widget **"Signals closed (outcomes)"** reflects **bot-level signal outcomes**,
+            i.e. how many broadcasted signals eventually closed as TP2/WIN, SL/LOSS, BE, TP1-hit, etc.
+
+            Source of truth for outcomes is `signal_tracks` (bot-level tracking), not user trades.
             """
             if not _check_basic(request):
                 return _unauthorized()
@@ -4480,15 +4483,15 @@ async def main() -> None:
             async def _mk(market: str) -> dict:
                 out: dict[str, dict] = {}
                 for k, (since, until) in ranges.items():
+                    # Bot-level outcomes are tracked in signal_tracks.
                     b = await db_store.signal_perf_bucket_global(market, since=since, until=until)
-                    # Bot-level SIGNAL outcomes (not auto-trade):
                     # trades = total closed signals (WIN/LOSS/BE/CLOSED) in window
                     trades = int(b.get('trades') or 0)
                     tp2 = int(b.get('wins') or 0)       # WIN (final target reached)
                     sl = int(b.get('losses') or 0)      # LOSS (SL)
                     be = int(b.get('be') or 0)          # BE
                     tp1 = int(b.get('tp1_hits') or 0)   # TP1 hit (partial)
-                    closes = int(b.get('closes') or 0)  # CLOSED (manual/expired/forced)
+                    closes = int(b.get('closes') or 0)  # CLOSE (manual/expired/forced)
                     sum_pnl = float(b.get('sum_pnl_pct') or 0.0)
                     avg_pnl = (sum_pnl / trades) if trades else 0.0
                     out[k] = {
