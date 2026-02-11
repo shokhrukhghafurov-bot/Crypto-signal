@@ -3179,6 +3179,47 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 is_closed = True
 
                         if is_closed:
+                            # Best-effort: cancel any known child orders to avoid stray fills after manual close.
+                            # (Some exchanges allow reduce-only orders to remain; spot leftovers are especially risky.)
+                            try:
+                                if ex in ("binance", "bybit"):
+                                    cat2 = str(ref.get("category") or ("linear" if mt == "futures" else "spot"))
+                                    for oid in [ref.get("tp1_order_id"), ref.get("tp2_order_id"), ref.get("sl_order_id")]:
+                                        if not oid:
+                                            continue
+                                        try:
+                                            if ex == "binance":
+                                                await _binance_cancel_order(
+                                                    api_key=api_key,
+                                                    api_secret=api_secret,
+                                                    symbol=symbol,
+                                                    order_id=int(oid),
+                                                    futures=(mt == "futures"),
+                                                )
+                                            else:
+                                                await _bybit_cancel_order(
+                                                    api_key=api_key,
+                                                    api_secret=api_secret,
+                                                    category=cat2,
+                                                    symbol=symbol,
+                                                    order_id=str(oid),
+                                                )
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+
+                            # Persist a reason so UI/debug can distinguish manual closes from TP/SL.
+                            try:
+                                if pos_id:
+                                    await db_store.update_autotrade_position_meta(
+                                        row_id=int(pos_id),
+                                        meta={"closed_reason": "MANUAL_CLOSE", "closed_by_user": True},
+                                        replace=False,
+                                    )
+                            except Exception:
+                                pass
+
                             # Best-effort PnL: use current price at detection time.
                             entry = _as_float(ref.get("entry"), _as_float(r.get("entry"), 0.0))
                             qty = _as_float(ref.get("qty"), 0.0)
