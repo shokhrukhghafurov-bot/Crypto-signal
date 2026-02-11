@@ -16,14 +16,6 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-
-# Webhook integration for aiogram v3 + aiohttp.
-# If aiogram webhook helpers are unavailable (older version), we keep polling mode.
-try:
-    from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-except Exception:
-    SimpleRequestHandler = None  # type: ignore
-    setup_application = None  # type: ignore
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import datetime as dt
@@ -158,19 +150,6 @@ except (ZoneInfoNotFoundError, FileNotFoundError):
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 backend = Backend()
-
-# --- Webhook mode (optional) ---
-WEBHOOK_MODE = (os.getenv("WEBHOOK_MODE", "0").strip().lower() not in ("0", "false", "no", "off"))
-WEBHOOK_PATH = (os.getenv("WEBHOOK_PATH", "/webhook") or "/webhook").strip() or "/webhook"
-WEBHOOK_BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or "").strip().rstrip("/")
-WEBHOOK_SECRET_TOKEN = (os.getenv("WEBHOOK_SECRET_TOKEN") or "").strip() or None
-
-def _webhook_url() -> str:
-    if not WEBHOOK_BASE_URL:
-        return ""
-    if not WEBHOOK_PATH.startswith("/"):
-        return f"{WEBHOOK_BASE_URL}/{WEBHOOK_PATH}"
-    return f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
 # ---------------- Admin/Error bot alerts (separate bot) ----------------
 # Send important errors / blocks to a dedicated Telegram bot to avoid polluting the main bot chat.
 ERROR_BOT_TOKEN = (os.getenv("ERROR_BOT_TOKEN") or "").strip()
@@ -4125,27 +4104,6 @@ async def main() -> None:
     async def _admin_http_app() -> web.Application:
         app = web.Application()
 
-        # ---- Telegram Webhook endpoint (optional) ----
-        # Works together with the existing Admin HTTP server on the same PORT.
-        # In WEBHOOK_MODE we do NOT run polling; Telegram pushes updates to this path.
-        if WEBHOOK_MODE:
-            if not (SimpleRequestHandler and setup_application):
-                logger.warning("WEBHOOK_MODE=1 but aiogram webhook helpers are not available; falling back to polling mode.")
-            elif not WEBHOOK_BASE_URL:
-                logger.warning("WEBHOOK_MODE=1 but WEBHOOK_BASE_URL is empty; webhook will not be set.")
-            else:
-                try:
-                    # Register webhook handler on the same aiohttp app.
-                    SimpleRequestHandler(
-                        dispatcher=dp,
-                        bot=bot,
-                        secret_token=WEBHOOK_SECRET_TOKEN,
-                    ).register(app, path=WEBHOOK_PATH)
-                    setup_application(app, dp, bot=bot)
-                    logger.info("Telegram webhook route enabled at %s", WEBHOOK_PATH)
-                except Exception:
-                    logger.exception("Failed to register Telegram webhook route")
-
         # ---- Basic Auth ----
         ADMIN_USER = os.getenv("SIGNAL_ADMIN_USER") or os.getenv("ADMIN_USER") or "admin"
         ADMIN_PASS = os.getenv("SIGNAL_ADMIN_PASS") or os.getenv("ADMIN_PASS") or "password"
@@ -5012,6 +4970,38 @@ async def main() -> None:
         app.router.add_route("PATCH", "/api/infra/admin/signal/users/{telegram_id}", patch_user)
         app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/block", block_user)
         app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/unblock", unblock_user)
+        # ---- Telegram Webhook (optional) ----
+        WEBHOOK_MODE = os.getenv("WEBHOOK_MODE", "0").strip().lower() in ("1","true","yes","on")
+        WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip() or "/webhook"
+        WEBHOOK_SECRET_TOKEN = (os.getenv("WEBHOOK_SECRET_TOKEN") or "").strip()
+
+        async def telegram_webhook(request: web.Request) -> web.Response:
+            if not WEBHOOK_MODE:
+                return web.Response(status=404, text="webhook disabled")
+            if WEBHOOK_SECRET_TOKEN:
+                got = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+                if got != WEBHOOK_SECRET_TOKEN:
+                    return web.Response(status=403, text="forbidden")
+            try:
+                data = await request.json()
+            except Exception:
+                return web.Response(status=400, text="bad json")
+            try:
+                # aiogram v3 Update model
+                if hasattr(types.Update, "model_validate"):
+                    update = types.Update.model_validate(data)
+                else:
+                    update = types.Update(**data)
+                await dp.feed_update(bot, update)
+            except Exception:
+                logger.exception("Webhook update handling failed")
+                return web.Response(status=500, text="error")
+            return web.Response(status=200, text="ok")
+
+        if WEBHOOK_MODE:
+            app.router.add_route("POST", WEBHOOK_PATH, telegram_webhook)
+            logger.info("Telegram webhook route enabled at %s", WEBHOOK_PATH)
+
         # Allow preflight
         app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204))
         return app
@@ -5030,45 +5020,90 @@ async def main() -> None:
 
     asyncio.create_task(_start_http_server())
 
-    # --- Single-instance guard (prevents Telegram getUpdates conflict) ---
-    # If multiple containers start simultaneously, only one should run polling & loops.
-    async def _try_acquire_singleton_lock() -> bool:
-        """Cluster-wide singleton lock (Postgres advisory lock).
+    # --- Replica roles (Webhook-safe):
+    # - HTTP server (Admin API + /webhook) runs on ALL replicas
+    # - Background loops (scanner/track/outcomes) run ONLY on one "primary" replica
+    # - Autotrade manager may run on all replicas (it has DB lease/locks)
+    WEBHOOK_MODE = os.getenv("WEBHOOK_MODE", "0").strip().lower() in ("1","true","yes","on")
+    WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip() or "/webhook"
+    WEBHOOK_BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or "").strip()
+    WEBHOOK_SECRET_TOKEN = (os.getenv("WEBHOOK_SECRET_TOKEN") or "").strip()
 
-        Used to ensure only ONE replica runs heavy background loops (scanner/track/outcomes),
-        while ALL replicas may still serve HTTP (admin + Telegram webhook).
-        """
+    async def _try_acquire_primary_lock() -> bool:
+        """Primary lock for background loops + setWebhook (one replica)."""
         try:
             async with pool.acquire() as conn:
                 v = await conn.fetchval("SELECT pg_try_advisory_lock(8313103750)")
                 return bool(v)
         except Exception:
-            # If DB is temporarily unavailable:
-            # - In POLLING mode: allow startup (otherwise bot becomes unreachable).
-            # - In WEBHOOK mode: be conservative and act as WORKER (avoid duplicate scanners).
-            logger.exception("Failed to acquire singleton advisory lock")
-            return False if WEBHOOK_MODE else True
+            # If lock query fails, do not block startup.
+            return True
 
-    is_primary = await _try_acquire_singleton_lock()
+    is_primary = await _try_acquire_primary_lock()
 
-    # In webhook mode, all replicas can accept updates, but only the primary replica
-    # should set the webhook and run background loops to avoid duplicate signals.
-    # In polling mode, only the primary replica can poll Telegram (getUpdates).
+    # Always run autotrade manager in background (cluster-safe)
+    try:
+        asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
+    except Exception:
+        pass
+
     if WEBHOOK_MODE:
-        if not is_primary:
-            logger.warning("Webhook WORKER replica: will serve HTTP/webhook + autotrade manager only (no scanner/track/outcomes).")
-    else:
-        if not is_primary:
-            logger.warning(
-                "Another instance holds the Telegram polling lock; this replica will run ONLY autotrade manager + HTTP (no polling/scanner)."
-            )
+        # Only primary should set webhook to avoid "racing" setWebhook between replicas.
+        if is_primary:
+            if not WEBHOOK_BASE_URL:
+                logger.error("WEBHOOK_MODE=1 but WEBHOOK_BASE_URL is empty; cannot set webhook.")
+            else:
+                webhook_url = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+                try:
+                    await bot.set_webhook(
+                        webhook_url,
+                        secret_token=WEBHOOK_SECRET_TOKEN or None,
+                        drop_pending_updates=True,
+                    )
+                    logger.info("Webhook set to %s", webhook_url)
+                except Exception:
+                    logger.exception("Failed to set webhook")
+
+            # --- MID trap digest (primary only) ---
             try:
-                asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
+                backend.set_mid_trap_sink(_mid_trap_note)
+                if (_error_bot and ERROR_BOT_ENABLED) and _MID_TRAP_DIGEST_ENABLED and _MID_TRAP_DIGEST_WINDOW_SEC > 0:
+                    asyncio.create_task(_mid_trap_digest_loop())
             except Exception:
                 pass
-            await asyncio.Event().wait()
 
-    # --- MID trap digest ---
+            # Background loops (primary only)
+            logger.info("Starting track_loop")
+            if hasattr(backend, "track_loop"):
+                asyncio.create_task(backend.track_loop(bot))
+            else:
+                logger.warning("Backend has no track_loop; skipping")
+
+            logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv("SCAN_INTERVAL_SECONDS",""), os.getenv("TOP_N",""))
+            asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+
+            mid_enabled = os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() not in ("0","false","no","off")
+            if mid_enabled:
+                if hasattr(backend, "scanner_loop_mid"):
+                    logger.info("Starting MID scanner_loop (5m/30m/1h) interval=%ss top_n=%s", os.getenv("MID_SCAN_INTERVAL_SECONDS",""), os.getenv("MID_TOP_N",""))
+                    asyncio.create_task(backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert))
+                else:
+                    logger.warning("MID_SCANNER_ENABLED=1 but Backend has no scanner_loop_mid; skipping")
+
+            logger.info("Starting signal_outcome_loop")
+            asyncio.create_task(signal_outcome_loop())
+        else:
+            logger.warning("Webhook WORKER replica: skipping background loops (scanner/track/outcomes).")
+
+        logger.info("Webhook mode active; waiting for HTTP requests")
+        await asyncio.Event().wait()
+
+    # --- Polling mode (legacy) ---
+    if not is_primary:
+        logger.warning("Another instance holds the Telegram polling lock; this replica will run ONLY autotrade manager + HTTP (no polling/scanner).")
+        await asyncio.Event().wait()
+
+    # --- MID trap digest (polling primary) ---
     try:
         backend.set_mid_trap_sink(_mid_trap_note)
         if (_error_bot and ERROR_BOT_ENABLED) and _MID_TRAP_DIGEST_ENABLED and _MID_TRAP_DIGEST_WINDOW_SEC > 0:
@@ -5076,38 +5111,26 @@ async def main() -> None:
     except Exception:
         pass
 
-        # Background loops (track/scanners/outcomes) are heavy and MUST be single-instance in a cluster.
-    if (WEBHOOK_MODE and not is_primary):
-        logger.info("Skipping background loops on webhook WORKER replica.")
-    else:
     logger.info("Starting track_loop")
-        if hasattr(backend, "track_loop"):
-            asyncio.create_task(backend.track_loop(bot))
-        else:
-            logger.warning("Backend has no track_loop; skipping")
-        logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
-        asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
-        # ⚡ MID TREND scanner (5m/30m/1h) - optional, does not affect the main scanner
-        mid_enabled = os.getenv('MID_SCANNER_ENABLED', '1').strip().lower() not in ('0','false','no','off')
-        if mid_enabled:
-            if hasattr(backend, 'scanner_loop_mid'):
-                logger.info("Starting MID scanner_loop (5m/30m/1h) interval=%ss top_n=%s", os.getenv('MID_SCAN_INTERVAL_SECONDS',''), os.getenv('MID_TOP_N',''))
-                asyncio.create_task(backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert))
-            else:
-                logger.warning('MID_SCANNER_ENABLED=1 but Backend has no scanner_loop_mid; skipping')
-
-        logger.info("Starting signal_outcome_loop")
-        asyncio.create_task(signal_outcome_loop())
-
-    # Auto-trade manager (SL/TP/BE) - runs in background.
-    asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
-
-    if WEBHOOK_MODE and WEBHOOK_BASE_URL and (SimpleRequestHandler and setup_application):
-        # HTTP server receives Telegram updates; nothing else to run here.
-        logger.info("Webhook mode active; waiting for HTTP requests")
-        await asyncio.Event().wait()
+    if hasattr(backend, "track_loop"):
+        asyncio.create_task(backend.track_loop(bot))
     else:
-        await dp.start_polling(bot)
+        logger.warning("Backend has no track_loop; skipping")
 
+    logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv("SCAN_INTERVAL_SECONDS",""), os.getenv("TOP_N",""))
+    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+
+    mid_enabled = os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() not in ("0","false","no","off")
+    if mid_enabled:
+        if hasattr(backend, "scanner_loop_mid"):
+            logger.info("Starting MID scanner_loop (5m/30m/1h) interval=%ss top_n=%s", os.getenv("MID_SCAN_INTERVAL_SECONDS",""), os.getenv("MID_TOP_N",""))
+            asyncio.create_task(backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert))
+        else:
+            logger.warning("MID_SCANNER_ENABLED=1 but Backend has no scanner_loop_mid; skipping")
+
+    logger.info("Starting signal_outcome_loop")
+    asyncio.create_task(signal_outcome_loop())
+
+    await dp.start_polling(bot)
 if __name__ == "__main__":
     asyncio.run(main())
