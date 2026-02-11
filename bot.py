@@ -8,6 +8,8 @@ import logging
 import re
 import math
 import statistics
+import socket
+import uuid
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
 from dataclasses import replace
@@ -4991,20 +4993,121 @@ async def main() -> None:
     # IMPORTANT: advisory lock is held on a dedicated DB connection for the lifetime of the process.
     # If you acquire it inside a context manager and release the connection, the lock is released too,
     # which would let multiple replicas run background loops at the same time.
+    
+    # We use a **two-layer** leader election to be robust across different Postgres setups:
+    #   1) Prefer session-level advisory lock (fast, no extra table) when it works.
+    #   2) Fallback to a heartbeat-based lease row (works even behind PgBouncer transaction pooling).
+    #
+    # Why this matters: some managed Postgres deployments route connections through PgBouncer in
+    # transaction pooling mode, which can make session-level advisory locks unreliable. The lease
+    # fallback ensures we always get exactly one PRIMARY replica.
+    PRIMARY_LOCK_KEY = int(os.getenv("PRIMARY_LOCK_KEY", "8313103750"))
+    PRIMARY_LEASE_NAME = os.getenv("PRIMARY_LEASE_NAME", "crypto_signal_primary").strip() or "crypto_signal_primary"
+    PRIMARY_LEASE_TTL_SEC = int(os.getenv("PRIMARY_LEASE_TTL_SEC", "45"))
+    PRIMARY_HEARTBEAT_SEC = int(os.getenv("PRIMARY_HEARTBEAT_SEC", "15"))
+
+    _leader_heartbeat_task: asyncio.Task | None = None
+
     async def _acquire_primary_lock() -> tuple[bool, object | None]:
+        # 1) Try advisory lock on a dedicated connection kept for process lifetime.
         try:
             conn = await pool.acquire()
-            got = await conn.fetchval("SELECT pg_try_advisory_lock(8313103750)")
+            got = await conn.fetchval(f"SELECT pg_try_advisory_lock({PRIMARY_LOCK_KEY})")
             if got:
+                logger.info("Primary election: acquired advisory lock key=%s", PRIMARY_LOCK_KEY)
                 return True, conn  # keep conn open (do NOT release)
             try:
                 await pool.release(conn)
             except Exception:
                 pass
+            logger.warning("Primary election: advisory lock key=%s NOT acquired (maybe held elsewhere). Falling back to lease.", PRIMARY_LOCK_KEY)
+        except Exception as e:
+            logger.warning("Primary election: advisory lock failed (%s). Falling back to lease.", e)
+
+        # 2) Fallback: heartbeat lease row (single-writer) with TTL.
+        holder = (
+            os.getenv("RAILWAY_REPLICA_ID")
+            or os.getenv("REPLICA_ID")
+            or os.getenv("HOSTNAME")
+            or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        )
+        try:
+            conn2 = await pool.acquire()
+            # Ensure lease table exists (lightweight, once per boot).
+            await conn2.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS infra_primary_leases (
+                    name TEXT PRIMARY KEY,
+                    holder TEXT NOT NULL,
+                    heartbeat TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                '''
+            )
+
+            # Try to become leader:
+            # - Insert if empty
+            # - Or steal if heartbeat is older than TTL
+            # - Or refresh if we already are the holder
+            row = await conn2.fetchrow(
+                '''
+                INSERT INTO infra_primary_leases(name, holder, heartbeat)
+                VALUES($1, $2, NOW())
+                ON CONFLICT (name) DO UPDATE
+                  SET holder = EXCLUDED.holder,
+                      heartbeat = NOW()
+                WHERE infra_primary_leases.holder = EXCLUDED.holder
+                   OR infra_primary_leases.heartbeat < (NOW() - ($3::int * INTERVAL '1 second'))
+                RETURNING holder;
+                ''',
+                PRIMARY_LEASE_NAME,
+                holder,
+                PRIMARY_LEASE_TTL_SEC,
+            )
+
+            is_leader = bool(row) and (row["holder"] == holder)
+            if not is_leader:
+                try:
+                    await pool.release(conn2)
+                except Exception:
+                    pass
+                logger.warning("Primary election: lease NOT acquired (name=%s ttl=%ss). This replica is WORKER. holder=%s", PRIMARY_LEASE_NAME, PRIMARY_LEASE_TTL_SEC, holder)
+                return False, None
+
+            logger.info("Primary election: lease acquired (name=%s ttl=%ss heartbeat=%ss) holder=%s", PRIMARY_LEASE_NAME, PRIMARY_LEASE_TTL_SEC, PRIMARY_HEARTBEAT_SEC, holder)
+
+            async def _heartbeat_loop() -> None:
+                nonlocal conn2
+                while True:
+                    try:
+                        # Keep the lease alive. If we fail to update, we should drop out of PRIMARY.
+                        res = await conn2.execute(
+                            '''
+                            UPDATE infra_primary_leases
+                               SET heartbeat = NOW()
+                             WHERE name = $1 AND holder = $2
+                            ''',
+                            PRIMARY_LEASE_NAME,
+                            holder,
+                        )
+                        # asyncpg returns "UPDATE <n>"
+                        if not res.endswith(" 1"):
+                            logger.error("Primary election: LOST lease (name=%s). Stopping process to allow re-election.", PRIMARY_LEASE_NAME)
+                            os._exit(0)
+                    except Exception as e:
+                        logger.error("Primary election: heartbeat error (%s). Stopping process to allow re-election.", e)
+                        os._exit(0)
+                    await asyncio.sleep(PRIMARY_HEARTBEAT_SEC)
+
+            # Start heartbeat task and keep the lease connection open too.
+            nonlocal _leader_heartbeat_task
+            _leader_heartbeat_task = asyncio.create_task(_heartbeat_loop(), name="primary_lease_heartbeat")
+            return True, conn2  # keep conn open (do NOT release)
+
+        except Exception as e:
+            # Lease election failure: fail OPEN (become primary) would be dangerous.
+            # Better to become WORKER and keep webhook alive.
+            logger.error("Primary election: lease mechanism failed (%s). Running as WORKER.", e)
             return False, None
-        except Exception:
-            # If lock query fails, do not block startup (best-effort).
-            return True, None
 
     is_primary, _primary_lock_conn = await _acquire_primary_lock()
 
