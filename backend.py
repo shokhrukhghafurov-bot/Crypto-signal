@@ -5133,18 +5133,34 @@ class PriceFeed:
     def __init__(self) -> None:
         self._prices: Dict[Tuple[str, str], float] = {}
         self._sources: Dict[Tuple[str, str], str] = {}
+        self._ts: Dict[Tuple[str, str], float] = {}
         self._tasks: Dict[Tuple[str, str], asyncio.Task] = {}
 
-    def get_latest(self, market: str, symbol: str) -> Optional[float]:
-        return self._prices.get((market.upper(), symbol.upper()))
+    def get_latest(self, market: str, symbol: str, *, max_age_sec: float | None = None) -> Optional[float]:
+        key = (market.upper(), symbol.upper())
+        p = self._prices.get(key)
+        if p is None:
+            return None
+        if max_age_sec is not None:
+            try:
+                ts = float(self._ts.get(key, 0.0) or 0.0)
+            except Exception:
+                ts = 0.0
+            if ts <= 0 or (time.time() - ts) > float(max_age_sec):
+                return None
+        return p
 
     def get_latest_source(self, market: str, symbol: str) -> Optional[str]:
         return self._sources.get((market.upper(), symbol.upper()))
+
+    def get_latest_ts(self, market: str, symbol: str) -> Optional[float]:
+        return self._ts.get((market.upper(), symbol.upper()))
 
     def _set_latest(self, market: str, symbol: str, price: float, source: str = "WS") -> None:
         key = (market.upper(), symbol.upper())
         self._prices[key] = float(price)
         self._sources[key] = str(source or "WS")
+        self._ts[key] = time.time()
 
     async def ensure_stream(self, market: str, symbol: str) -> None:
         key = (market.upper(), symbol.upper())
@@ -5179,6 +5195,113 @@ class PriceFeed:
         self._prices[key] = price
         self._sources[key] = "MOCK"
         return price
+
+
+# ------------------ Price caching + REST limiting ------------------
+class _RestLimiter:
+    """Very lightweight per-exchange limiter to avoid REST storms/429.
+
+    It enforces:
+      - max concurrent in-flight REST requests per exchange
+      - a minimum delay between request starts per exchange
+    """
+
+    def __init__(self) -> None:
+        self._sem: dict[str, asyncio.Semaphore] = {}
+        self._lock: dict[str, asyncio.Lock] = {}
+        self._next_ts: dict[str, float] = {}
+
+    def _cfg(self, ex: str) -> tuple[int, float]:
+        exu = (ex or "").upper()
+        mc = int(os.getenv(f"REST_MAX_CONCURRENT_{exu}", os.getenv("REST_MAX_CONCURRENT", "3")) or 3)
+        if mc < 1:
+            mc = 1
+        if mc > 50:
+            mc = 50
+        mi_ms = float(os.getenv(f"REST_MIN_INTERVAL_MS_{exu}", os.getenv("REST_MIN_INTERVAL_MS", "150")) or 150.0)
+        if mi_ms < 0:
+            mi_ms = 0.0
+        if mi_ms > 5000:
+            mi_ms = 5000.0
+        return mc, mi_ms / 1000.0
+
+    async def run(self, ex: str, fn):
+        exn = (ex or "").lower().strip() or "generic"
+        mc, min_interval = self._cfg(exn)
+        sem = self._sem.get(exn)
+        if sem is None or sem._value + len(getattr(sem, "_waiters", []) or []) != mc:
+            sem = asyncio.Semaphore(mc)
+            self._sem[exn] = sem
+        lk = self._lock.setdefault(exn, asyncio.Lock())
+        async with sem:
+            if min_interval > 0:
+                async with lk:
+                    now = time.time()
+                    nxt = float(self._next_ts.get(exn, 0.0) or 0.0)
+                    if nxt > now:
+                        await asyncio.sleep(nxt - now)
+                    self._next_ts[exn] = time.time() + min_interval
+            return await fn()
+
+
+class _AsyncPriceCache:
+    """Cache for (exchange, market, symbol) -> (price, source, ts) with anti-storm in-flight dedupe."""
+
+    def __init__(self, ttl_sec: float = 2.0) -> None:
+        self.ttl_sec = float(ttl_sec)
+        self._data: dict[tuple[str, str, str], tuple[float, str, float]] = {}
+        self._inflight: dict[tuple[str, str, str], asyncio.Future] = {}
+        self._mu = asyncio.Lock()
+
+    def get(self, ex: str, market: str, symbol: str) -> tuple[float, str] | None:
+        key = (ex.lower(), market.upper(), symbol.upper())
+        v = self._data.get(key)
+        if not v:
+            return None
+        p, src, ts = v
+        if (time.time() - float(ts)) <= self.ttl_sec:
+            return float(p), str(src)
+        return None
+
+    async def get_or_fetch(self, ex: str, market: str, symbol: str, fetch_coro):
+        key = (ex.lower(), market.upper(), symbol.upper())
+        # Fast path: cache hit
+        v = self.get(ex, market, symbol)
+        if v is not None:
+            return v
+
+        async with self._mu:
+            # Re-check under lock
+            v = self.get(ex, market, symbol)
+            if v is not None:
+                return v
+            fut = self._inflight.get(key)
+            if fut is None or fut.done():
+                fut = asyncio.get_running_loop().create_future()
+                self._inflight[key] = fut
+                owner = True
+            else:
+                owner = False
+
+        if not owner:
+            return await fut
+
+        try:
+            p, src = await fetch_coro()
+            if p is None:
+                raise PriceUnavailableError("cache fetch returned None")
+            async with self._mu:
+                self._data[key] = (float(p), str(src), time.time())
+                if not fut.done():
+                    fut.set_result((float(p), str(src)))
+                self._inflight.pop(key, None)
+            return float(p), str(src)
+        except Exception as e:
+            async with self._mu:
+                if not fut.done():
+                    fut.set_exception(e)
+                self._inflight.pop(key, None)
+            raise
 
 # ------------------ Exchange data (candles) ------------------
 class MultiExchangeData:
@@ -7339,6 +7462,10 @@ class Backend:
         self.feed = PriceFeed()
         self.news = NewsFilter()
         self.macro = MacroCalendar()
+
+        self._rest_limiter = _RestLimiter()
+        self._price_cache = _AsyncPriceCache(ttl_sec=float(os.getenv("PRICE_CACHE_TTL_SEC", "2") or 2))
+        self._ws_max_age_sec = float(os.getenv("PRICE_WS_MAX_AGE_SEC", "2") or 2)
         # Trades are stored in PostgreSQL (db_store)
         self._last_signal_ts: Dict[str, float] = {}
         self._signal_seq = 1
@@ -7615,6 +7742,27 @@ class Backend:
             reason = coin
             until_ts = until
         return {"action": act, "reason": reason, "until_ts": until_ts}
+
+    async def _price_cached(self, ex: str, market: str, symbol: str, fetch_fn, *, src_label: str) -> tuple[float | None, str]:
+        """(cache -> fetch) helper for a single exchange."""
+        try:
+            c = self._price_cache.get(ex, market, symbol)
+            if c is not None:
+                p, src = c
+                return float(p), str(src)
+        except Exception:
+            pass
+
+        async def _do():
+            p = await fetch_fn()
+            return (p, src_label)
+
+        try:
+            p, src = await self._price_cache.get_or_fetch(ex, market, symbol, _do)
+            return float(p), str(src)
+        except Exception:
+            return None, ex.upper()
+
     async def _fetch_rest_price(self, market: str, symbol: str) -> float | None:
         """Binance REST fallback price (spot/futures)."""
         m = (market or "FUTURES").upper()
@@ -7622,17 +7770,25 @@ class Backend:
         if not sym:
             return None
         url = "https://api.binance.com/api/v3/ticker/price" if m == "SPOT" else "https://fapi.binance.com/fapi/v1/ticker/price"
+
+        async def _do_req():
+            try:
+                timeout = aiohttp.ClientTimeout(total=6)
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get(url, params={"symbol": sym}) as r:
+                        if r.status != 200:
+                            return None
+                        data = await r.json()
+                p = data.get("price") if isinstance(data, dict) else None
+                return float(p) if p is not None else None
+            except Exception:
+                return None
+
         try:
-            timeout = aiohttp.ClientTimeout(total=6)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(url, params={"symbol": sym}) as r:
-                    if r.status != 200:
-                        return None
-                    data = await r.json()
-            p = data.get("price") if isinstance(data, dict) else None
-            return float(p) if p is not None else None
+            return await self._rest_limiter.run("binance", _do_req)
         except Exception:
             return None
+
 
     async def _fetch_bybit_price(self, market: str, symbol: str) -> float | None:
         """Bybit REST price (spot/futures). Uses V5 tickers.
@@ -7646,26 +7802,33 @@ class Backend:
             return None
         category = "spot" if mkt == "SPOT" else "linear"
         url = "https://api.bybit.com/v5/market/tickers"
+
+        async def _do_req():
+            try:
+                timeout = aiohttp.ClientTimeout(total=6)
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get(url, params={"category": category, "symbol": sym}) as r:
+                        if r.status != 200:
+                            return None
+                        data = await r.json()
+                if not isinstance(data, dict):
+                    return None
+                if int(data.get("retCode", 0) or 0) != 0:
+                    return None
+                res = data.get("result") or {}
+                lst = (res.get("list") or []) if isinstance(res, dict) else []
+                if not lst:
+                    return None
+                item = lst[0] if isinstance(lst, list) else None
+                if not isinstance(item, dict):
+                    return None
+                p = item.get("lastPrice") or item.get("indexPrice") or item.get("markPrice")
+                return float(p) if p is not None else None
+            except Exception:
+                return None
+
         try:
-            timeout = aiohttp.ClientTimeout(total=6)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(url, params={"category": category, "symbol": sym}) as r:
-                    if r.status != 200:
-                        return None
-                    data = await r.json()
-            if not isinstance(data, dict):
-                return None
-            if int(data.get("retCode", 0) or 0) != 0:
-                return None
-            res = data.get("result") or {}
-            lst = (res.get("list") or []) if isinstance(res, dict) else []
-            if not lst:
-                return None
-            item = lst[0] if isinstance(lst, list) else None
-            if not isinstance(item, dict):
-                return None
-            p = item.get("lastPrice") or item.get("indexPrice") or item.get("markPrice")
-            return float(p) if p is not None else None
+            return await self._rest_limiter.run("bybit", _do_req)
         except Exception:
             return None
 
@@ -7681,30 +7844,39 @@ class Backend:
         if not sym:
             return None
         try:
-            if sym.endswith("USDT"):
-                base = sym[:-4]
-            else:
-                base = sym
+            base = sym[:-4] if sym.endswith("USDT") else sym
             inst = f"{base}-USDT" if mkt == "SPOT" else f"{base}-USDT-SWAP"
-            url = "https://www.okx.com/api/v5/market/ticker"
-            timeout = aiohttp.ClientTimeout(total=6)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(url, params={"instId": inst}) as r:
-                    if r.status != 200:
-                        return None
-                    data = await r.json()
-            if not isinstance(data, dict):
-                return None
-            arr = data.get("data") or []
-            if not arr or not isinstance(arr, list):
-                return None
-            item = arr[0] if arr else None
-            if not isinstance(item, dict):
-                return None
-            p = item.get("last") or item.get("lastPrice")
-            return float(p) if p is not None else None
         except Exception:
             return None
+
+        url = "https://www.okx.com/api/v5/market/ticker"
+
+        async def _do_req():
+            try:
+                timeout = aiohttp.ClientTimeout(total=6)
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get(url, params={"instId": inst}) as r:
+                        if r.status != 200:
+                            return None
+                        data = await r.json()
+                if not isinstance(data, dict):
+                    return None
+                arr = data.get("data") or []
+                if not arr or not isinstance(arr, list):
+                    return None
+                item = arr[0] if arr else None
+                if not isinstance(item, dict):
+                    return None
+                p = item.get("last") or item.get("lastPrice")
+                return float(p) if p is not None else None
+            except Exception:
+                return None
+
+        try:
+            return await self._rest_limiter.run("okx", _do_req)
+        except Exception:
+            return None
+
 
 
     async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
@@ -7758,62 +7930,87 @@ class Backend:
             return True
 
         async def get_binance() -> tuple[float | None, str]:
-            # websocket first, REST fallback
+            # websocket first, then cache, then REST fallback
             try:
                 await self.feed.ensure_stream(market, signal.symbol)
-                latest = self.feed.get_latest(market, signal.symbol)
+                latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec)
                 if latest is not None and float(latest) > 0:
                     src = self.feed.get_latest_source(market, signal.symbol) or "BINANCE_WS"
                     if src == "WS":
                         src = "BINANCE_WS"
                     elif src == "REST":
                         src = "BINANCE_REST"
-                    # Guard against rare cases where a stale/invalid cached tick
-                    # (e.g., 0.0) could slip through.
                     if _is_reasonable(float(latest)):
                         return float(latest), str(src)
             except Exception:
                 pass
+
+            # cache (may have BINANCE_REST from a recent fetch)
+            try:
+                c = self._price_cache.get("binance", market, signal.symbol)
+                if c is not None and _is_reasonable(c[0]):
+                    return float(c[0]), str(c[1])
+            except Exception:
+                pass
+
+            # REST
             rest = await self._fetch_rest_price(market, signal.symbol)
             if _is_reasonable(rest):
+                try:
+                    async with self._price_cache._mu:
+                        self._price_cache._data[("binance", market.upper(), signal.symbol.upper())] = (float(rest), "BINANCE_REST", time.time())
+                except Exception:
+                    pass
                 try:
                     self.feed._set_latest(market, signal.symbol, float(rest), source="REST")
                 except Exception:
                     pass
                 return float(rest), "BINANCE_REST"
             return None, "BINANCE"
-
         async def get_bybit() -> tuple[float | None, str]:
-            p = await self._fetch_bybit_price(market, signal.symbol)
+            async def _fetch():
+                return await self._fetch_bybit_price(market, signal.symbol)
+            p, _src = await self._price_cached("bybit", market, signal.symbol, _fetch, src_label="BYBIT_REST")
             if _is_reasonable(p):
                 return float(p), "BYBIT_REST"
             return None, "BYBIT"
-
         async def get_okx() -> tuple[float | None, str]:
-            p = await self._fetch_okx_price(market, signal.symbol)
+            async def _fetch():
+                return await self._fetch_okx_price(market, signal.symbol)
+            p, _src = await self._price_cached("okx", market, signal.symbol, _fetch, src_label="OKX_REST")
             if _is_reasonable(p):
                 return float(p), "OKX_REST"
             return None, "OKX"
-
         async def get_mexc() -> tuple[float | None, str]:
             # MEXC/Gate are SPOT-only fallbacks for price.
             if market != "SPOT":
                 return None, "MEXC"
-            try:
-                p = await _mexc_public_price(signal.symbol)
-            except Exception:
-                p = None
+
+            async def _fetch():
+                async def _do():
+                    try:
+                        return await _mexc_public_price(signal.symbol)
+                    except Exception:
+                        return None
+                return await self._rest_limiter.run("mexc", _do)
+
+            p, _src = await self._price_cached("mexc", market, signal.symbol, _fetch, src_label="MEXC_PUBLIC")
             if _is_reasonable(p):
                 return float(p), "MEXC_PUBLIC"
             return None, "MEXC"
-
         async def get_gateio() -> tuple[float | None, str]:
             if market != "SPOT":
                 return None, "GATEIO"
-            try:
-                p = await _gateio_public_price(signal.symbol)
-            except Exception:
-                p = None
+
+            async def _fetch():
+                async def _do():
+                    try:
+                        return await _gateio_public_price(signal.symbol)
+                    except Exception:
+                        return None
+                return await self._rest_limiter.run("gateio", _do)
+
+            p, _src = await self._price_cached("gateio", market, signal.symbol, _fetch, src_label="GATEIO_PUBLIC")
             if _is_reasonable(p):
                 return float(p), "GATEIO_PUBLIC"
             return None, "GATEIO"
