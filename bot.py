@@ -4999,8 +4999,16 @@ async def main() -> None:
             # If lock query fails, do not block startup.
             return True
 
-    if not await _try_acquire_singleton_lock():
-        logger.warning("Another bot instance holds the polling lock; running HTTP server only (no polling/loops)")
+    is_primary = await _try_acquire_singleton_lock()
+
+    if not is_primary:
+        logger.warning(
+            "Another instance holds the Telegram polling lock; this replica will run ONLY autotrade manager + HTTP (no polling/scanner)."
+        )
+        try:
+            asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
+        except Exception:
+            pass
         await asyncio.Event().wait()
 
     # --- MID trap digest ---
