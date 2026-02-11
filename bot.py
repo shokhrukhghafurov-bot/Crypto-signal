@@ -317,7 +317,7 @@ def _error_agg_note(levelno: int, logger_name: str, msg: str) -> None:
 
 # --- MID trap digest (group by reason_key, send once per window) ---
 _MID_TRAP_DIGEST_ENABLED = (os.getenv("MID_TRAP_DIGEST_ENABLED", "1").strip().lower() not in ("0","false","no","off"))
-_MID_TRAP_DIGEST_WINDOW_SEC = float(os.getenv("MID_TRAP_DIGEST_WINDOW_SEC", "600") or 600)  # 10 minutes
+_MID_TRAP_DIGEST_WINDOW_SEC = float(os.getenv("MID_TRAP_DIGEST_WINDOW_SEC", "21600") or 21600)  # 6 hours
 _MID_TRAP_DIGEST_MAX_REASONS = int(float(os.getenv("MID_TRAP_DIGEST_MAX_REASONS", "5") or 5))
 _MID_TRAP_DIGEST_EXAMPLES_PER_REASON = int(float(os.getenv("MID_TRAP_DIGEST_EXAMPLES_PER_REASON", "2") or 2))
 _MID_TRAP_DIGEST_MAX_EVENTS = int(float(os.getenv("MID_TRAP_DIGEST_MAX_EVENTS", "500") or 500))
