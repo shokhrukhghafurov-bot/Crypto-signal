@@ -50,6 +50,10 @@ _MID_AUTOTUNE_DISC_MAX = float(os.getenv("MID_AUTOTUNE_DISC_MAX", "0.94") or 0.9
 
 _MID_AUTOTUNE_PATH = Path(os.getenv("MID_AUTOTUNE_PATH", str(Path(__file__).with_name("mid_autotune.json"))))
 
+# In-memory cache for MID autotune state.
+# Kept sync-friendly because scanner code uses it from non-async contexts.
+_MID_AUTOTUNE_CACHE: dict = {}
+
 def _clamp(v: float, lo: float, hi: float) -> float:
     try:
         return float(max(lo, min(hi, float(v))))
@@ -63,32 +67,44 @@ def _mid_autotune_load() -> dict:
       { "spot": {...}, "futures": {...} }
     For backward compatibility, a legacy flat dict is migrated into both buckets.
     """
+    global _MID_AUTOTUNE_CACHE
+    # Fast path: already loaded into memory.
+    if isinstance(_MID_AUTOTUNE_CACHE, dict) and (_MID_AUTOTUNE_CACHE.get("spot") or _MID_AUTOTUNE_CACHE.get("futures")):
+        return _MID_AUTOTUNE_CACHE
+
+    st: Optional[dict] = None
     try:
         if _MID_AUTOTUNE_PATH.exists():
             st = json.loads(_MID_AUTOTUNE_PATH.read_text(encoding="utf-8"))
-            if isinstance(st, dict):
-                # v2 format
-                if "spot" in st or "futures" in st:
-                    if "spot" not in st:
-                        st["spot"] = {"p_ema": None, "n": 0, "since": 0, "params": {}}
-                    if "futures" not in st:
-                        st["futures"] = {"p_ema": None, "n": 0, "since": 0, "params": {}}
-                    return st
-                # legacy flat format
-                if any(k in st for k in ("p_ema","n","since","params")):
-                    legacy = {
-                        "p_ema": st.get("p_ema", None),
-                        "n": int(st.get("n") or 0),
-                        "since": int(st.get("since") or 0),
-                        "params": dict(st.get("params") or {}),
-                    }
-                    return {"spot": dict(legacy), "futures": dict(legacy)}
     except Exception:
-        pass
-    return {
+        st = None
+
+    if isinstance(st, dict):
+        # v2 format
+        if "spot" in st or "futures" in st:
+            if "spot" not in st:
+                st["spot"] = {"p_ema": None, "n": 0, "since": 0, "params": {}}
+            if "futures" not in st:
+                st["futures"] = {"p_ema": None, "n": 0, "since": 0, "params": {}}
+            _MID_AUTOTUNE_CACHE = st
+            return _MID_AUTOTUNE_CACHE
+
+        # legacy flat format
+        if any(k in st for k in ("p_ema", "n", "since", "params")):
+            legacy = {
+                "p_ema": st.get("p_ema", None),
+                "n": int(st.get("n") or 0),
+                "since": int(st.get("since") or 0),
+                "params": dict(st.get("params") or {}),
+            }
+            _MID_AUTOTUNE_CACHE = {"spot": dict(legacy), "futures": dict(legacy)}
+            return _MID_AUTOTUNE_CACHE
+
+    _MID_AUTOTUNE_CACHE = {
         "spot": {"p_ema": None, "n": 0, "since": 0, "params": {}},
         "futures": {"p_ema": None, "n": 0, "since": 0, "params": {}},
     }
+    return _MID_AUTOTUNE_CACHE
 
 def _mid_autotune_save(state: dict) -> None:
     try:
@@ -138,7 +154,8 @@ def _mid_autotune_is_mid_trade(orig_text: str, timeframe: str) -> bool:
     except Exception:
         return False
 
-def _mid_autotune_update_on_close(*, market: str, orig_text: str, timeframe: str, tp2_present: bool, hit_tp2: bool) -> None:
+async def _mid_autotune_update_on_close(*, market: str, orig_text: str, timeframe: str, tp2_present: bool, hit_tp2: bool) -> None:
+    global _MID_AUTOTUNE_CACHE
     if not _MID_AUTOTUNE_ENABLED:
         return
     if not tp2_present:
@@ -146,7 +163,18 @@ def _mid_autotune_update_on_close(*, market: str, orig_text: str, timeframe: str
     if not _mid_autotune_is_mid_trade(orig_text, timeframe):
         return
 
+    # Prefer Postgres KV state if available, but keep an in-memory cache for sync scanner calls.
     st = _mid_autotune_load()
+    try:
+        import db_store as _db_store
+        if _db_store.get_pool() is not None:
+            kv = await _db_store.kv_get_json("mid_autotune")
+            if isinstance(kv, dict):
+                st = kv
+                # refresh cache
+                _MID_AUTOTUNE_CACHE = st
+    except Exception:
+        pass
     b = _mid_autotune_bucket(st, market)
     n = int(b.get("n") or 0)
     since = int(b.get("since") or 0)
@@ -161,13 +189,23 @@ def _mid_autotune_update_on_close(*, market: str, orig_text: str, timeframe: str
 
     n += 1
     since += 1
-    st["p_ema"] = float(p)
+    # BUGFIX: p_ema is per-market bucket, not at the root.
+    b["p_ema"] = float(p)
     b["n"] = n
     b["since"] = since
+
+    # Refresh cache for sync readers.
+    _MID_AUTOTUNE_CACHE = st
 
     # tune periodically
     if n < _MID_AUTOTUNE_MIN_TRADES or since < _MID_AUTOTUNE_EVERY_N:
         _mid_autotune_save(st)
+        try:
+            import db_store as _db_store
+            if _db_store.get_pool() is not None:
+                await _db_store.kv_set_json("mid_autotune", st)
+        except Exception:
+            pass
         return
 
     target = _MID_AUTOTUNE_TARGET
@@ -175,6 +213,12 @@ def _mid_autotune_update_on_close(*, market: str, orig_text: str, timeframe: str
     if abs(e) < _MID_AUTOTUNE_TOL:
         b["since"] = 0
         _mid_autotune_save(st)
+        try:
+            import db_store as _db_store
+            if _db_store.get_pool() is not None:
+                await _db_store.kv_set_json("mid_autotune", st)
+        except Exception:
+            pass
         return
 
     params = dict(b.get("params") or {})
@@ -212,7 +256,14 @@ def _mid_autotune_update_on_close(*, market: str, orig_text: str, timeframe: str
 
     b["params"] = params
     b["since"] = 0
+    _MID_AUTOTUNE_CACHE = st
     _mid_autotune_save(st)
+    try:
+        import db_store as _db_store
+        if _db_store.get_pool() is not None:
+            await _db_store.kv_set_json("mid_autotune", st)
+    except Exception:
+        pass
 
 
 import aiohttp
@@ -7964,7 +8015,7 @@ class Backend:
                         await db_store.close_trade(trade_id, status="WIN", price=float(s.tp2), pnl_total_pct=float(pnl))
                         self._sl_breach_since.pop(trade_id, None)
                         try:
-                            _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=True)
+                            await _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=True)
                         except Exception:
                             pass
                         continue
@@ -8005,7 +8056,7 @@ class Backend:
                         await db_store.close_trade(trade_id, status="LOSS", price=float(s.sl), pnl_total_pct=float(pnl))
                         self._sl_breach_since.pop(trade_id, None)
                         try:
-                            _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=False)
+                            await _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=False)
                         except Exception:
                             pass
                         continue
@@ -8052,7 +8103,7 @@ class Backend:
                             await db_store.close_trade(trade_id, status="BE", price=float(be_lvl), pnl_total_pct=float(pnl))
                             self._sl_breach_since.pop(trade_id, None)
                         try:
-                            _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=False)
+                            await _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=False)
                         except Exception:
                             pass
                             continue
