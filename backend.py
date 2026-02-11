@@ -8342,7 +8342,8 @@ class Backend:
 
 
     async def _mid_digest_maybe_send(self, stats: dict, last_sent_at: float) -> float:
-        period = int(os.getenv("MID_TRAP_DIGEST_SEC", "600") or 600)
+        period = int(os.getenv("MID_TRAP_DIGEST_SEC", "21600") or 21600)
+        period = max(int(period), 21600)  # force >= 6 hours
         if period <= 0:
             return last_sent_at
         now = time.time()
