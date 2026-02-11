@@ -1102,6 +1102,43 @@ async def count_signal_sent_by_market(*, since: dt.datetime, until: dt.datetime)
 
 
 
+async def count_signal_tracks_opened_by_market(*, since: dt.datetime, until: dt.datetime) -> Dict[str, int]:
+    """Count bot-level signal tracks opened in [since, until) grouped by market.
+
+    This is the most consistent definition of "signals sent" for the dashboard,
+    because outcomes are computed from the same signal_tracks table.
+    """
+    # In some startup/error scenarios the pool might not be initialized yet.
+    try:
+        pool = get_pool()
+    except Exception:
+        return {'SPOT': 0, 'FUTURES': 0}
+
+    out: Dict[str, int] = {'SPOT': 0, 'FUTURES': 0}
+    async with pool.acquire() as conn:
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT market, COUNT(*)::BIGINT AS n
+                FROM signal_tracks
+                WHERE opened_at IS NOT NULL
+                  AND opened_at >= $1 AND opened_at < $2
+                GROUP BY market;
+                """,
+                since, until,
+            )
+            for r in rows or []:
+                mk = str(r.get('market') or '').upper()
+                if mk in out:
+                    out[mk] = int(r.get('n') or 0)
+        except Exception:
+            # If the table doesn't exist yet or DB is unavailable, fail gracefully.
+            logger.exception('count_signal_tracks_opened_by_market failed')
+    return out
+
+
+
+
 # ---------------- bot-level signal outcome tracking ----------------
 
 async def upsert_signal_track(
