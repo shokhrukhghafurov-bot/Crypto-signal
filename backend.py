@@ -7353,7 +7353,7 @@ class Backend:
 
 
     def set_mid_trap_sink(self, cb) -> None:
-        """Register sink for MID trap events (used by bot to build 10m digest)."""
+        """Register sink for MID trap events (used by bot to build periodic digest (>=6h))."""
         try:
             set_mid_trap_sink(cb)
         except Exception:
@@ -8487,7 +8487,8 @@ class Backend:
 
 
     async def _mid_digest_maybe_send(self, stats: dict, last_sent_at: float) -> float:
-        period = int(os.getenv("MID_TRAP_DIGEST_SEC", "600") or 600)
+        period = int(os.getenv("MID_TRAP_DIGEST_SEC", "21600") or 21600)
+        period = max(period, 21600)  # force >= 6 hours
         if period <= 0:
             return last_sent_at
         now = time.time()
@@ -8502,7 +8503,7 @@ class Backend:
         # sort by count desc
         items = sorted(stats.items(), key=lambda kv: int(kv[1].get("count", 0) or 0), reverse=True)[:max(1, top_n)]
 
-        # pretty header like "10m"
+        # pretty header like "6h" (or more)
         if period % 60 == 0:
             mins = period // 60
             win = f"{mins}m"
