@@ -114,6 +114,15 @@ async def ensure_schema() -> None:
         ADD COLUMN IF NOT EXISTS support_username TEXT;
         """)
 
+        # --- Generic KV store for small persistent JSON state (e.g., MID autotune) ---
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS kv_store (
+          key TEXT PRIMARY KEY,
+          value JSONB NOT NULL DEFAULT '{}'::jsonb,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+
         
 
 
@@ -2512,3 +2521,43 @@ async def count_closed_autotrade_positions(*, user_id: int, market_type: str = "
             return int(len(rows))
         except Exception:
             return 0
+
+
+# ----------------------
+# Generic KV store (JSONB)
+# ----------------------
+
+async def kv_get_json(key: str) -> Optional[dict]:
+    """Return JSON object for a key from Postgres KV store.
+
+    Returns None if key not found.
+    """
+    pool = get_pool()
+    k = str(key or "").strip()
+    if not k:
+        return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM kv_store WHERE key=$1", k)
+        if not row:
+            return None
+        v = row.get("value")
+        return v if isinstance(v, dict) else None
+
+
+async def kv_set_json(key: str, value: dict) -> None:
+    """Upsert JSON value for a key into Postgres KV store."""
+    pool = get_pool()
+    k = str(key or "").strip()
+    if not k:
+        return
+    # asyncpg will encode dict -> jsonb automatically
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO kv_store(key, value, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (key)
+            DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+            """,
+            k, value
+        )
