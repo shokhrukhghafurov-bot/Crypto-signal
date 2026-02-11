@@ -317,7 +317,7 @@ def _error_agg_note(levelno: int, logger_name: str, msg: str) -> None:
 
 # --- MID trap digest (group by reason_key, send once per window) ---
 _MID_TRAP_DIGEST_ENABLED = (os.getenv("MID_TRAP_DIGEST_ENABLED", "1").strip().lower() not in ("0","false","no","off"))
-_MID_TRAP_DIGEST_WINDOW_SEC = float(os.getenv("MID_TRAP_DIGEST_WINDOW_SEC", "21600") or 21600)  # 6 hours
+_MID_TRAP_DIGEST_WINDOW_SEC = float(os.getenv("MID_TRAP_DIGEST_WINDOW_SEC", "600") or 600)  # 10 minutes
 _MID_TRAP_DIGEST_MAX_REASONS = int(float(os.getenv("MID_TRAP_DIGEST_MAX_REASONS", "5") or 5))
 _MID_TRAP_DIGEST_EXAMPLES_PER_REASON = int(float(os.getenv("MID_TRAP_DIGEST_EXAMPLES_PER_REASON", "2") or 2))
 _MID_TRAP_DIGEST_MAX_EVENTS = int(float(os.getenv("MID_TRAP_DIGEST_MAX_EVENTS", "500") or 500))
@@ -347,18 +347,22 @@ def _build_mid_trap_digest(events: list[dict]) -> str:
     for e in events:
         rk = str(e.get("reason_key") or e.get("reason") or "unknown").strip() or "unknown"
         by.setdefault(rk, []).append(e)
+
     items = sorted(by.items(), key=lambda kv: len(kv[1]), reverse=True)
     items = items[:max(1, _MID_TRAP_DIGEST_MAX_REASONS)]
     total = len(events)
-    # pretty window like "10m" / "6h"
-win_s = float(_MID_TRAP_DIGEST_WINDOW_SEC or 0.0)
-if win_s >= 3600 and (win_s % 3600 == 0):
-    win = f"{int(win_s//3600)}h"
-elif win_s >= 60 and (win_s % 60 == 0):
-    win = f"{int(win_s//60)}m"
-else:
-    win = f"{int(win_s)}s" if win_s > 0 else "—"
-lines = [f"🧪 MID trap digest ({win}) — blocks: {total}"]
+
+    # dynamic window label
+    w = int(_MID_TRAP_DIGEST_WINDOW_SEC)
+    if w % 3600 == 0:
+        wlabel = f"{w//3600}h"
+    elif w % 60 == 0:
+        wlabel = f"{w//60}m"
+    else:
+        wlabel = f"{w}s"
+
+    lines = [f"🧪 MID trap digest ({wlabel}) — blocks: {total}"]
+
     for rk, lst in items:
         lines.append(f"• {rk}: {len(lst)}")
         ex = lst[:max(1, _MID_TRAP_DIGEST_EXAMPLES_PER_REASON)]
@@ -371,10 +375,11 @@ lines = [f"🧪 MID trap digest ({win}) — blocks: {total}"]
             except Exception:
                 en_txt = "—"
             lines.append(f"  - {d} entry={en_txt} {reason}")
+
     if len(by) > len(items):
         lines.append(f"… +{len(by)-len(items)} other reasons")
-    return "\n".join(lines)
 
+    return "\n".join(lines)
 async def _mid_trap_digest_loop() -> None:
     global _mid_trap_last_flush_ts
     _mid_trap_last_flush_ts = time.time()
