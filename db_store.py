@@ -325,6 +325,21 @@ ON CONFLICT (id) DO NOTHING;
         except Exception:
             pass
 
+        # --- cluster manager lease/lock columns (for multi-replica autotrade manager) ---
+        try:
+            await conn.execute("ALTER TABLE autotrade_positions ADD COLUMN IF NOT EXISTS mgr_owner TEXT;")
+        except Exception:
+            pass
+        try:
+            await conn.execute("ALTER TABLE autotrade_positions ADD COLUMN IF NOT EXISTS mgr_lock_until TIMESTAMPTZ;")
+        except Exception:
+            pass
+        try:
+            await conn.execute("ALTER TABLE autotrade_positions ADD COLUMN IF NOT EXISTS mgr_lock_acquired_at TIMESTAMPTZ;")
+        except Exception:
+            pass
+
+
         try:
             await conn.execute("ALTER TABLE autotrade_settings DROP CONSTRAINT IF EXISTS autotrade_settings_spot_exchange_check;")
         except Exception:
@@ -350,6 +365,9 @@ ON CONFLICT (id) DO NOTHING;
           status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','CLOSED','ERROR')),
           api_order_ref TEXT,
           meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+          mgr_owner TEXT,
+          mgr_lock_until TIMESTAMPTZ,
+          mgr_lock_acquired_at TIMESTAMPTZ,
           opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           closed_at TIMESTAMPTZ,
           UNIQUE (user_id, signal_id, exchange, market_type)
