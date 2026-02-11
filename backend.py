@@ -406,6 +406,170 @@ async def _get_cached_price(key: tuple[str, str, str], *, ttl_sec: float, fetch_
         return float(p) if p is not None else None
 
 
+def _norm_ex_name(ex: str) -> str:
+    """Normalize exchange names across the codebase."""
+    e = (ex or "").strip().lower()
+    if e in ("gate", "gateio", "gate.io"):
+        return "gateio"
+    if e in ("mexc", "mexcglobal"):
+        return "mexc"
+    if e in ("binance", "bnb"):
+        return "binance"
+    if e in ("bybit",):
+        return "bybit"
+    if e in ("okx", "okex"):
+        return "okx"
+    return e or "binance"
+
+
+async def _public_price_cached(*, exchange: str, market: str, symbol: str) -> float | None:
+    """Get last price from a specific exchange+market with limiter + short cache.
+
+    - exchange: binance/bybit/okx/mexc/gateio
+    - market: SPOT/FUTURES
+
+    Note: MEXC and Gate.io are treated as SPOT-only for public price.
+    """
+    ex = _norm_ex_name(exchange)
+    mkt = (market or "FUTURES").upper().strip()
+    sym = (symbol or "").upper().replace("/", "").replace("-", "").replace("_", "")
+    if not sym:
+        return None
+
+    # SPOT-only exchanges
+    if ex in ("mexc", "gateio") and mkt != "SPOT":
+        return None
+
+    ttl = float(os.getenv("PRICE_CACHE_TTL_SEC", "1.2") or 1.2)
+    key = (ex.upper(), mkt, sym)
+
+    async def _do() -> float | None:
+        try:
+            session = await _get_http_session()
+            await _limiter_for(ex.upper()).wait()
+
+            if ex == "binance":
+                url = "https://api.binance.com/api/v3/ticker/price" if mkt == "SPOT" else "https://fapi.binance.com/fapi/v1/ticker/price"
+                async with session.get(url, params={"symbol": sym}) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json(content_type=None)
+                p = (data or {}).get("price") if isinstance(data, dict) else None
+                return float(p) if p is not None else None
+
+            if ex == "bybit":
+                category = "spot" if mkt == "SPOT" else "linear"
+                url = "https://api.bybit.com/v5/market/tickers"
+                async with session.get(url, params={"category": category, "symbol": sym}) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json(content_type=None)
+                if not isinstance(data, dict) or int(data.get("retCode", 0) or 0) != 0:
+                    return None
+                res = data.get("result") or {}
+                lst = (res.get("list") or []) if isinstance(res, dict) else []
+                if not lst:
+                    return None
+                item = lst[0] if isinstance(lst[0], dict) else None
+                if not isinstance(item, dict):
+                    return None
+                p = item.get("lastPrice") or item.get("indexPrice") or item.get("markPrice")
+                return float(p) if p is not None else None
+
+            if ex == "okx":
+                # symbol assumed like BTCUSDT -> BTC-USDT (or BTC-USDT-SWAP)
+                base = sym[:-4] if sym.endswith("USDT") and len(sym) > 4 else sym
+                inst = f"{base}-USDT" if mkt == "SPOT" else f"{base}-USDT-SWAP"
+                url = "https://www.okx.com/api/v5/market/ticker"
+                async with session.get(url, params={"instId": inst}) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json(content_type=None)
+                if not isinstance(data, dict):
+                    return None
+                arr = data.get("data") or []
+                if not arr or not isinstance(arr, list):
+                    return None
+                item = arr[0] if isinstance(arr[0], dict) else None
+                if not isinstance(item, dict):
+                    return None
+                p = item.get("last") or item.get("lastPrice")
+                return float(p) if p is not None else None
+
+            if ex == "mexc":
+                url = "https://api.mexc.com/api/v3/ticker/price"
+                async with session.get(url, params={"symbol": sym}) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json(content_type=None)
+                if not isinstance(data, dict):
+                    return None
+                p = data.get("price")
+                return float(p) if p is not None else None
+
+            if ex == "gateio":
+                pair = _gate_pair(sym)
+                url = "https://api.gateio.ws/api/v4/spot/tickers"
+                async with session.get(url, params={"currency_pair": pair}) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json(content_type=None)
+                if isinstance(data, list) and data and isinstance(data[0], dict):
+                    p = data[0].get("last")
+                    return float(p) if p is not None else None
+                return None
+
+            return None
+        except Exception:
+            return None
+
+    return await _get_cached_price(key, ttl_sec=ttl, fetch_fn=_do)
+
+
+async def _price_for_position(*, exchange: str, market_type: str, symbol: str) -> tuple[float | None, str]:
+    """Price for a specific position.
+
+    Rule:
+      1) try the position's own exchange first
+      2) if it fails, fall back to other exchanges (market-aware)
+      3) for FUTURES, if multiple fallbacks are available, use median to reduce noise
+    """
+    ex = _norm_ex_name(exchange)
+    mt = (market_type or "futures").lower().strip()
+    mkt = "SPOT" if mt == "spot" else "FUTURES"
+
+    # 1) primary
+    p0 = await _public_price_cached(exchange=ex, market=mkt, symbol=symbol)
+    if p0 is not None and float(p0) > 0:
+        return float(p0), ex.upper()
+
+    # 2) fallbacks
+    if mkt == "FUTURES":
+        candidates = ["binance", "bybit", "okx"]
+    else:
+        candidates = ["binance", "bybit", "okx", "mexc", "gateio"]
+
+    others = [c for c in candidates if c != ex]
+    vals: list[float] = []
+    srcs: list[str] = []
+    for c in others:
+        pc = await _public_price_cached(exchange=c, market=mkt, symbol=symbol)
+        if pc is not None and float(pc) > 0:
+            vals.append(float(pc))
+            srcs.append(c.upper())
+            # For SPOT, first good one is enough.
+            if mkt == "SPOT":
+                return float(pc), c.upper()
+
+    if mkt == "FUTURES" and vals:
+        # prefer median if we have >=2 sources
+        if len(vals) >= 2:
+            return float(statistics.median(vals)), "FALLBACK_MEDIAN(" + "+".join(srcs) + ")"
+        return float(vals[0]), "FALLBACK_" + srcs[0]
+
+    return None, "NO_PRICE"
+
+
 
 # --- MID trap digest sink (aggregates "MID blocked (trap)" into a periodic digest) ---
 # Bot can register a sink callback that receives structured trap events.
@@ -3345,16 +3509,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             allocated_usdt = _as_float(r.get("allocated_usdt"), 0.0)
                             px = 0.0
                             try:
-                                if ex == "binance":
-                                    px = await _binance_price(symbol, futures=(mt == "futures"))
-                                elif ex == "bybit":
-                                    px = await _bybit_price(symbol, category=("linear" if mt == "futures" else "spot"))
-                                elif ex == "okx":
-                                    px = await _okx_public_price(symbol)
-                                elif ex == "mexc":
-                                    px = await _mexc_public_price(symbol)
-                                else:
-                                    px = await _gateio_public_price(symbol)
+                                pxx, _psrc = await _price_for_position(exchange=ex, market_type=mt, symbol=symbol)
+                                px = float(pxx or 0.0)
                             except Exception:
                                 px = 0.0
                             pnl_usdt = None
@@ -3445,65 +3601,14 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         dirty = True
                     try:
                         # --- price (decision) ---
-                        # For futures, prefer a robust decision price to reduce noise:
-                        # median of available sources (Binance Futures + Bybit Linear + optional public OKX),
-                        # falling back to the trade exchange source if only one is available.
-                        if mt == "futures":
-                            srcs = []
-                            try:
-                                data_b = await _http_json("GET", "https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
-                                px_b = float((data_b or {}).get("price") or 0.0)
-                                if px_b > 0:
-                                    srcs.append(px_b)
-                            except Exception:
-                                pass
-                            try:
-                                px_y = await _bybit_price(symbol, category="linear")
-                                if float(px_y or 0.0) > 0:
-                                    srcs.append(float(px_y))
-                            except Exception:
-                                pass
-                            try:
-                                # OKX public last (best-effort)
-                                px_o = await _okx_public_price(symbol)
-                                if float(px_o or 0.0) > 0:
-                                    srcs.append(float(px_o))
-                            except Exception:
-                                pass
-                            if len(srcs) >= 2:
-                                px = float(statistics.median(srcs))
-                                ref["px_decision_src"] = "MEDIAN"
-                                dirty = True
-                            elif len(srcs) == 1:
-                                px = float(srcs[0])
-                                ref["px_decision_src"] = "SINGLE"
-                                dirty = True
-                            else:
-                                # fall back to per-exchange source
-                                if ex == "binance":
-                                    data = await _http_json("GET", "https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
-                                    px = float((data or {}).get("price") or 0.0)
-                                elif ex == "bybit":
-                                    px = await _bybit_price(symbol, category="linear")
-                                elif ex == "okx":
-                                    px = await _okx_public_price(symbol)
-                                elif ex == "mexc":
-                                    px = await _mexc_public_price(symbol)
-                                else:
-                                    px = await _gateio_public_price(symbol)
+                        # Use the position's own exchange first.
+                        # If it fails, fall back to other exchanges (market-aware) using cached + rate-limited fetches.
+                        px, psrc = await _price_for_position(exchange=ex, market_type=mt, symbol=symbol)
+                        if px is not None and float(px) > 0:
+                            ref["px_decision_src"] = str(psrc)
+                            dirty = True
                         else:
-                            # spot: keep per-exchange source
-                            if ex == "binance":
-                                data = await _http_json("GET", "https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
-                                px = float((data or {}).get("price") or 0.0)
-                            elif ex == "bybit":
-                                px = await _bybit_price(symbol, category="spot")
-                            elif ex == "okx":
-                                px = await _okx_public_price(symbol)
-                            elif ex == "mexc":
-                                px = await _mexc_public_price(symbol)
-                            else:
-                                px = await _gateio_public_price(symbol)
+                            px = 0.0
                     except Exception:
                         px = 0.0
 
