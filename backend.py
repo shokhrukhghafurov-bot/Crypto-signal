@@ -7,12 +7,19 @@ import os
 
 # --- MID extra entry filters (anti-late-entry / RSI / VWAP distance / climax) ---
 MID_LATE_ENTRY_ATR_MAX = float(os.getenv("MID_LATE_ENTRY_ATR_MAX", "2.2"))   # (close - recent_low)/ATR_30m
-MID_RSI_LONG_MAX = float(os.getenv("MID_RSI_LONG_MAX", "66"))               # RSI(5m) for LONG must be <
-MID_RSI_SHORT_MIN = float(os.getenv("MID_RSI_SHORT_MIN", "34"))             # RSI(5m) for SHORT must be >
+MID_RSI_LONG_MAX = float(os.getenv("MID_RSI_LONG_MAX", "62"))               # RSI(5m) for LONG must be <
+MID_RSI_SHORT_MIN = float(os.getenv("MID_RSI_SHORT_MIN", "48"))             # RSI(5m) for SHORT must be >
 MID_VWAP_DIST_ATR_MAX = float(os.getenv("MID_VWAP_DIST_ATR_MAX", "1.8"))     # abs(close - vwap)/ATR_30m
 MID_CLIMAX_VOL_X = float(os.getenv("MID_CLIMAX_VOL_X", "2.5"))              # last_vol / avg_vol
 MID_CLIMAX_BODY_ATR = float(os.getenv("MID_CLIMAX_BODY_ATR", "1.2"))         # abs(close-open)/ATR_30m
 MID_CLIMAX_COOLDOWN_BARS = int(os.getenv("MID_CLIMAX_COOLDOWN_BARS", "1"))   # block next N bars after climax
+
+# --- MID anti-bounce / RSI window / BB bounce guard ---
+MID_ANTI_BOUNCE_ENABLED = os.getenv("MID_ANTI_BOUNCE_ENABLED", "1").strip().lower() not in ("0","false","no","off")
+MID_ANTI_BOUNCE_ATR_MAX = float(os.getenv("MID_ANTI_BOUNCE_ATR_MAX", "1.8"))     # SHORT: (close - recent_low)/ATR_30m; LONG: (recent_high - close)/ATR_30m
+MID_RSI_LONG_MIN = float(os.getenv("MID_RSI_LONG_MIN", "36"))                    # RSI(5m) for LONG must be >
+MID_RSI_SHORT_MAX = float(os.getenv("MID_RSI_SHORT_MAX", "64"))                  # RSI(5m) for SHORT must be <
+MID_BLOCK_BB_BOUNCE = os.getenv("MID_BLOCK_BB_BOUNCE", "1").strip().lower() not in ("0","false","no","off")
 
 import random
 import re
@@ -4505,8 +4512,8 @@ FOMC_DECISION_MINUTE_ET = max(0, min(59, _env_int("FOMC_DECISION_MINUTE_ET", 0))
 
 # ------------------ Models ------------------
 def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low: float, recent_high: float,
-                      atr_30m: float, rsi_5m: float, vwap: float, last_vol: float, avg_vol: float,
-                      last_body: float, climax_recent_bars: int) -> str | None:
+                      atr_30m: float, rsi_5m: float, vwap: float, bb_pos: str | None,
+                      last_vol: float, avg_vol: float, last_body: float, climax_recent_bars: int) -> str | None:
     """Return human-readable MID BLOCKED reason (for logging + error-bot), or None if allowed."""
     try:
         if atr_30m and atr_30m > 0:
@@ -4518,6 +4525,22 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                 move_from_high = (recent_high - close) / atr_30m
                 if move_from_high > MID_LATE_ENTRY_ATR_MAX:
                     return f"late_entry_atr={move_from_high:.2f} > {MID_LATE_ENTRY_ATR_MAX:g}"
+
+            # --- Anti-bounce: block SHORT after sharp rebound from recent low (and vice versa for LONG) ---
+            if MID_ANTI_BOUNCE_ENABLED and atr_30m and atr_30m > 0:
+                if side.upper() == "SHORT":
+                    dist_low_atr = (close - recent_low) / atr_30m
+                    if dist_low_atr > MID_ANTI_BOUNCE_ATR_MAX:
+                        return f"anti_bounce_short dist_low_atr={dist_low_atr:.2f} > {MID_ANTI_BOUNCE_ATR_MAX:g}"
+                else:  # LONG
+                    dist_high_atr = (recent_high - close) / atr_30m
+                    if dist_high_atr > MID_ANTI_BOUNCE_ATR_MAX:
+                        return f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {MID_ANTI_BOUNCE_ATR_MAX:g}"
+
+            # --- BB bounce guard: avoid SHORTs in mid→high bounce zone (common SL pattern) ---
+            if MID_BLOCK_BB_BOUNCE and bb_pos:
+                if side.upper() == "SHORT" and str(bb_pos) in ("mid→high", "low→mid"):
+                    return f"bb_bounce_zone={bb_pos}"
 
             dist = abs(close - vwap) / atr_30m if vwap is not None else 0.0
             if dist > MID_VWAP_DIST_ATR_MAX:
@@ -4534,10 +4557,16 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
 
         # RSI filter (works even if ATR missing)
         if rsi_5m is not None:
-            if side.upper() == "LONG" and rsi_5m >= MID_RSI_LONG_MAX:
-                return f"rsi_long={rsi_5m:.1f} >= {MID_RSI_LONG_MAX:g}"
-            if side.upper() == "SHORT" and rsi_5m <= MID_RSI_SHORT_MIN:
-                return f"rsi_short={rsi_5m:.1f} <= {MID_RSI_SHORT_MIN:g}"
+            if side.upper() == "LONG":
+                if rsi_5m >= MID_RSI_LONG_MAX:
+                    return f"rsi_long={rsi_5m:.1f} >= {MID_RSI_LONG_MAX:g}"
+                if rsi_5m <= MID_RSI_LONG_MIN:
+                    return f"rsi_long={rsi_5m:.1f} <= {MID_RSI_LONG_MIN:g}"
+            else:  # SHORT
+                if rsi_5m <= MID_RSI_SHORT_MIN:
+                    return f"rsi_short={rsi_5m:.1f} <= {MID_RSI_SHORT_MIN:g}"
+                if rsi_5m >= MID_RSI_SHORT_MAX:
+                    return f"rsi_short={rsi_5m:.1f} >= {MID_RSI_SHORT_MAX:g}"
     except Exception:
         # if filter computation fails, don't block signal; let normal error handling deal with it
         return None
@@ -6024,6 +6053,18 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         except Exception:
             climax_recent_bars = 0
 
+        # BB position (5m) for entry-bounce filter (used only for blocking, not required for output)
+        bb_pos_for_block = "—"
+        try:
+            cl = df5i["close"].astype(float)
+            bb_mid0 = float(cl.rolling(20).mean().iloc[-1])
+            bb_std0 = float(cl.rolling(20).std(ddof=0).iloc[-1])
+            bb_low0 = bb_mid0 - 2.0 * bb_std0
+            bb_high0 = bb_mid0 + 2.0 * bb_std0
+            bb_pos_for_block = _bb_position(float(entry), float(bb_low0), float(bb_mid0), float(bb_high0))
+        except Exception:
+            bb_pos_for_block = "—"
+
         reason = _mid_block_reason(
             symbol="",
             side=str(dir_trend),
@@ -6034,6 +6075,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             atr_30m=float(atr30),
             rsi_5m=float(last5.get("rsi", np.nan)),
             vwap=float(vwap_val) if not np.isnan(vwap_val) else float(entry),
+            bb_pos=bb_pos_for_block,
             last_vol=last_vol if not np.isnan(last_vol) else 0.0,
             avg_vol=avg_vol if not np.isnan(avg_vol) else 0.0,
             last_body=float(last_body),
@@ -8342,8 +8384,7 @@ class Backend:
 
 
     async def _mid_digest_maybe_send(self, stats: dict, last_sent_at: float) -> float:
-        period = int(os.getenv("MID_TRAP_DIGEST_SEC", "21600") or 21600)
-        period = max(int(period), 21600)  # force >= 6 hours
+        period = int(os.getenv("MID_TRAP_DIGEST_SEC", "600") or 600)
         if period <= 0:
             return last_sent_at
         now = time.time()
