@@ -289,6 +289,124 @@ from cryptography.fernet import Fernet
 logger = logging.getLogger("crypto-signal")
 
 
+# --- Shared HTTP session + per-exchange rate limiting + short-lived price cache ---
+# Goal: when many users have many positions, we must NOT open a new HTTP session and hit the exchange
+# for every position. We:
+#   1) reuse one aiohttp session (keep-alive),
+#   2) throttle per exchange (binance/bybit/okx/etc) independently,
+#   3) cache last price per (exchange, market, symbol) for ~1-2 seconds and share it between positions.
+
+_HTTP_SESSION: aiohttp.ClientSession | None = None
+_HTTP_SESSION_LOCK = asyncio.Lock()
+
+async def _get_http_session() -> aiohttp.ClientSession:
+    global _HTTP_SESSION
+    if _HTTP_SESSION is not None and not _HTTP_SESSION.closed:
+        return _HTTP_SESSION
+    async with _HTTP_SESSION_LOCK:
+        if _HTTP_SESSION is not None and not _HTTP_SESSION.closed:
+            return _HTTP_SESSION
+        timeout = aiohttp.ClientTimeout(total=float(os.getenv("HTTP_TIMEOUT_SEC", "6") or 6))
+        _HTTP_SESSION = aiohttp.ClientSession(timeout=timeout)
+        return _HTTP_SESSION
+
+class _PerExchangeLimiter:
+    """Very small async rate limiter with per-exchange spacing.
+
+    It doesn't try to be perfect token-bucket; it guarantees *min interval* between requests
+    per exchange, which is what we need to avoid bursts when many positions are tracked.
+    """
+
+    def __init__(self, *, min_interval_sec: float) -> None:
+        self.min_interval = max(0.0, float(min_interval_sec))
+        self._lock = asyncio.Lock()
+        self._next_ts = 0.0
+
+    async def wait(self) -> None:
+        if self.min_interval <= 0:
+            return
+        async with self._lock:
+            now = time.time()
+            if now < self._next_ts:
+                await asyncio.sleep(self._next_ts - now)
+            self._next_ts = time.time() + self.min_interval
+
+_RATE_LIMITERS: dict[str, _PerExchangeLimiter] = {}
+
+def _limiter_for(exchange: str) -> _PerExchangeLimiter:
+    ex = (exchange or "").upper().strip()
+    if not ex:
+        ex = "GENERIC"
+    lim = _RATE_LIMITERS.get(ex)
+    if lim is not None:
+        return lim
+    # Requests per second per exchange (safe defaults).
+    # You can tune these in env without changing code.
+    env_key = f"{ex}_RPS"
+    try:
+        rps = float(os.getenv(env_key, "8") or 8)
+    except Exception:
+        rps = 8.0
+    if rps <= 0:
+        min_interval = 0.0
+    else:
+        min_interval = 1.0 / rps
+    lim = _PerExchangeLimiter(min_interval_sec=min_interval)
+    _RATE_LIMITERS[ex] = lim
+    return lim
+
+# Price cache: (exchange, market, symbol) -> (ts, price)
+_PRICE_CACHE: dict[tuple[str, str, str], tuple[float, float]] = {}
+_PRICE_INFLIGHT: dict[tuple[str, str, str], asyncio.Lock] = {}
+
+async def _get_cached_price(key: tuple[str, str, str], *, ttl_sec: float, fetch_fn) -> float | None:
+    """Return cached price or fetch once and cache.
+
+    fetch_fn must be an async callable returning float|None.
+    """
+    try:
+        ttl = float(ttl_sec)
+    except Exception:
+        ttl = 1.2
+    if ttl <= 0:
+        try:
+            return await fetch_fn()
+        except Exception:
+            return None
+
+    now = time.time()
+    hit = _PRICE_CACHE.get(key)
+    if hit is not None:
+        ts, p = hit
+        if (now - ts) <= ttl:
+            return float(p)
+
+    lock = _PRICE_INFLIGHT.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PRICE_INFLIGHT[key] = lock
+
+    async with lock:
+        # re-check after waiting
+        now2 = time.time()
+        hit2 = _PRICE_CACHE.get(key)
+        if hit2 is not None:
+            ts2, p2 = hit2
+            if (now2 - ts2) <= ttl:
+                return float(p2)
+        try:
+            p = await fetch_fn()
+        except Exception:
+            p = None
+        if p is not None:
+            try:
+                _PRICE_CACHE[key] = (time.time(), float(p))
+            except Exception:
+                pass
+        return float(p) if p is not None else None
+
+
+
 # --- MID trap digest sink (aggregates "MID blocked (trap)" into a periodic digest) ---
 # Bot can register a sink callback that receives structured trap events.
 _MID_TRAP_SINK = None  # type: ignore
@@ -7601,27 +7719,35 @@ class Backend:
             reason = coin
             until_ts = until
         return {"action": act, "reason": reason, "until_ts": until_ts}
+
     async def _fetch_rest_price(self, market: str, symbol: str) -> float | None:
-        """Binance REST fallback price (spot/futures)."""
+        """Binance REST fallback price (spot/futures), with per-exchange limiter + 1-2s cache."""
         m = (market or "FUTURES").upper()
         sym = (symbol or "").upper()
         if not sym:
             return None
+
         url = "https://api.binance.com/api/v3/ticker/price" if m == "SPOT" else "https://fapi.binance.com/fapi/v1/ticker/price"
-        try:
-            timeout = aiohttp.ClientTimeout(total=6)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(url, params={"symbol": sym}) as r:
+        key = ("BINANCE", m, sym)
+        ttl = float(os.getenv("PRICE_CACHE_TTL_SEC", "1.2") or 1.2)
+
+        async def _do() -> float | None:
+            try:
+                session = await _get_http_session()
+                await _limiter_for("BINANCE").wait()
+                async with session.get(url, params={"symbol": sym}) as r:
                     if r.status != 200:
                         return None
-                    data = await r.json()
-            p = data.get("price") if isinstance(data, dict) else None
-            return float(p) if p is not None else None
-        except Exception:
-            return None
+                    data = await r.json(content_type=None)
+                p = data.get("price") if isinstance(data, dict) else None
+                return float(p) if p is not None else None
+            except Exception:
+                return None
+
+        return await _get_cached_price(key, ttl_sec=ttl, fetch_fn=_do)
 
     async def _fetch_bybit_price(self, market: str, symbol: str) -> float | None:
-        """Bybit REST price (spot/futures). Uses V5 tickers.
+        """Bybit REST price (spot/futures). Uses V5 tickers, with limiter + short cache.
 
         market: SPOT -> category=spot
                 FUTURES -> category=linear (USDT perpetual)
@@ -7630,34 +7756,40 @@ class Backend:
         sym = (symbol or "").upper().replace("/", "")
         if not sym:
             return None
+
         category = "spot" if mkt == "SPOT" else "linear"
         url = "https://api.bybit.com/v5/market/tickers"
-        try:
-            timeout = aiohttp.ClientTimeout(total=6)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(url, params={"category": category, "symbol": sym}) as r:
+        key = ("BYBIT", mkt, sym)
+        ttl = float(os.getenv("PRICE_CACHE_TTL_SEC", "1.2") or 1.2)
+
+        async def _do() -> float | None:
+            try:
+                session = await _get_http_session()
+                await _limiter_for("BYBIT").wait()
+                async with session.get(url, params={"category": category, "symbol": sym}) as r:
                     if r.status != 200:
                         return None
-                    data = await r.json()
-            if not isinstance(data, dict):
+                    data = await r.json(content_type=None)
+                if not isinstance(data, dict):
+                    return None
+                if int(data.get("retCode", 0) or 0) != 0:
+                    return None
+                res = data.get("result") or {}
+                lst = (res.get("list") or []) if isinstance(res, dict) else []
+                if not lst:
+                    return None
+                item = lst[0] if isinstance(lst, list) else None
+                if not isinstance(item, dict):
+                    return None
+                p = item.get("lastPrice") or item.get("indexPrice") or item.get("markPrice")
+                return float(p) if p is not None else None
+            except Exception:
                 return None
-            if int(data.get("retCode", 0) or 0) != 0:
-                return None
-            res = data.get("result") or {}
-            lst = (res.get("list") or []) if isinstance(res, dict) else []
-            if not lst:
-                return None
-            item = lst[0] if isinstance(lst, list) else None
-            if not isinstance(item, dict):
-                return None
-            p = item.get("lastPrice") or item.get("indexPrice") or item.get("markPrice")
-            return float(p) if p is not None else None
-        except Exception:
-            return None
 
+        return await _get_cached_price(key, ttl_sec=ttl, fetch_fn=_do)
 
     async def _fetch_okx_price(self, market: str, symbol: str) -> float | None:
-        """OKX REST price (spot/futures).
+        """OKX REST price (spot/futures), with limiter + short cache.
 
         market: SPOT -> instId=BASE-USDT
                 FUTURES -> instId=BASE-USDT-SWAP (USDT perpetual)
@@ -7666,32 +7798,38 @@ class Backend:
         sym = (symbol or "").upper().replace("/", "")
         if not sym:
             return None
-        try:
-            if sym.endswith("USDT"):
-                base = sym[:-4]
-            else:
-                base = sym
-            inst = f"{base}-USDT" if mkt == "SPOT" else f"{base}-USDT-SWAP"
-            url = "https://www.okx.com/api/v5/market/ticker"
-            timeout = aiohttp.ClientTimeout(total=6)
-            async with aiohttp.ClientSession(timeout=timeout) as s:
-                async with s.get(url, params={"instId": inst}) as r:
+
+        key = ("OKX", mkt, sym)
+        ttl = float(os.getenv("PRICE_CACHE_TTL_SEC", "1.2") or 1.2)
+
+        async def _do() -> float | None:
+            try:
+                if sym.endswith("USDT"):
+                    base = sym[:-4]
+                else:
+                    base = sym
+                inst = f"{base}-USDT" if mkt == "SPOT" else f"{base}-USDT-SWAP"
+                url = "https://www.okx.com/api/v5/market/ticker"
+                session = await _get_http_session()
+                await _limiter_for("OKX").wait()
+                async with session.get(url, params={"instId": inst}) as r:
                     if r.status != 200:
                         return None
-                    data = await r.json()
-            if not isinstance(data, dict):
+                    data = await r.json(content_type=None)
+                if not isinstance(data, dict):
+                    return None
+                arr = data.get("data") or []
+                if not arr or not isinstance(arr, list):
+                    return None
+                item = arr[0] if arr else None
+                if not isinstance(item, dict):
+                    return None
+                p = item.get("last") or item.get("lastPrice")
+                return float(p) if p is not None else None
+            except Exception:
                 return None
-            arr = data.get("data") or []
-            if not arr or not isinstance(arr, list):
-                return None
-            item = arr[0] if arr else None
-            if not isinstance(item, dict):
-                return None
-            p = item.get("last") or item.get("lastPrice")
-            return float(p) if p is not None else None
-        except Exception:
-            return None
 
+        return await _get_cached_price(key, ttl_sec=ttl, fetch_fn=_do)
 
     async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
         """Return (price, source) for tracking.
