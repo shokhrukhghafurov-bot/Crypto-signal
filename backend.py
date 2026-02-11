@@ -5983,61 +5983,80 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         pass
 
     # ------------------ MID hard filters (reduce SL hits) ------------------
+    # NOTE: We keep the thresholds centralized in globals (MID_*), and produce
+    # a human-readable reason for logs / error-bot digest.
     try:
-        # Late entry: moved too far from recent swing (in ATRs)
         late_lookback = int(float(os.getenv("MID_LATE_ENTRY_LOOKBACK", "48") or 48))
-        late_max_atr = float(os.getenv("MID_LATE_ENTRY_MAX_ATR", "2.2") or 2.2)
-        if late_lookback >= 10 and late_max_atr > 0 and atr30 > 0 and len(df5i) >= late_lookback:
-            w = df5i.tail(late_lookback)
-            if dir_trend == "LONG":
-                recent_low = float(w["low"].astype(float).min())
-                if (entry - recent_low) / atr30 > late_max_atr:
-                    return None
-            elif dir_trend == "SHORT":
-                recent_high = float(w["high"].astype(float).max())
-                if (recent_high - entry) / atr30 > late_max_atr:
-                    return None
+        if late_lookback < 10:
+            late_lookback = 48
+
+        w = df5i.tail(late_lookback) if len(df5i) >= late_lookback else df5i
+        recent_low = float(w["low"].astype(float).min())
+        recent_high = float(w["high"].astype(float).max())
+
+        o5 = float(last5.get("open", np.nan))
+        c5 = float(last5.get("close", np.nan))
+        last_body = abs(c5 - o5) if (not np.isnan(o5) and not np.isnan(c5)) else 0.0
+
+        last_vol = float(last5.get("volume", np.nan))
+        avg_vol = float(df5i["volume"].astype(float).rolling(20).mean().iloc[-1]) if "volume" in df5i.columns and len(df5i) >= 20 else float("nan")
+
+        # Count "climax" bars in the last MID_CLIMAX_COOLDOWN_BARS bars (excluding the current one)
+        climax_recent_bars = 0
+        try:
+            n = int(MID_CLIMAX_COOLDOWN_BARS) if isinstance(MID_CLIMAX_COOLDOWN_BARS, int) else int(float(MID_CLIMAX_COOLDOWN_BARS))
+            n = max(0, n)
+            if n > 0 and atr30 > 0 and "volume" in df5i.columns:
+                tail = df5i.tail(n + 1).iloc[:-1]  # previous N bars
+                if not tail.empty:
+                    v_sma = tail["volume"].astype(float).rolling(20).mean()
+                    for i in range(len(tail)):
+                        vv = float(tail.iloc[i].get("volume", 0.0))
+                        av = float(v_sma.iloc[i]) if (i < len(v_sma) and not np.isnan(v_sma.iloc[i])) else float("nan")
+                        oo = float(tail.iloc[i].get("open", np.nan))
+                        cc = float(tail.iloc[i].get("close", np.nan))
+                        if np.isnan(oo) or np.isnan(cc) or np.isnan(av) or av <= 0:
+                            continue
+                        vol_x = vv / av
+                        body_atr = abs(cc - oo) / atr30 if atr30 > 0 else 0.0
+                        if vol_x > MID_CLIMAX_VOL_X and body_atr > MID_CLIMAX_BODY_ATR:
+                            climax_recent_bars += 1
+        except Exception:
+            climax_recent_bars = 0
+
+        reason = _mid_block_reason(
+            symbol="",
+            side=str(dir_trend),
+            close=float(entry),
+            o=o5 if not np.isnan(o5) else float(entry),
+            recent_low=recent_low,
+            recent_high=recent_high,
+            atr_30m=float(atr30),
+            rsi_5m=float(last5.get("rsi", np.nan)),
+            vwap=float(vwap_val) if not np.isnan(vwap_val) else float(entry),
+            last_vol=last_vol if not np.isnan(last_vol) else 0.0,
+            avg_vol=avg_vol if not np.isnan(avg_vol) else 0.0,
+            last_body=float(last_body),
+            climax_recent_bars=int(climax_recent_bars),
+        )
+        if reason:
+            try:
+                logger.info("MID blocked: dir=%s reason=%s entry=%.6g", dir_trend, reason, float(entry))
+                # Reuse MID trap sink/digest to show why MID hard-filters blocked entries
+                _emit_mid_trap_event({
+                    "dir": str(dir_trend),
+                    "reason": f"mid_block {reason}",
+                    "reason_key": "mid_block",
+                    "entry": float(entry),
+                })
+            except Exception:
+                pass
+            return None
     except Exception:
+        # If filters fail, do not block signal.
         pass
 
-    try:
-        # RSI extremes (5m)
-        rsi5_val = float(last5.get("rsi", np.nan))
-        rsi_max_long = float(os.getenv("MID_RSI_MAX_LONG", "66") or 66)
-        rsi_min_short = float(os.getenv("MID_RSI_MIN_SHORT", "34") or 34)
-        if not np.isnan(rsi5_val):
-            if dir_trend == "LONG" and rsi_max_long > 0 and rsi5_val >= rsi_max_long:
-                return None
-            if dir_trend == "SHORT" and rsi_min_short > 0 and rsi5_val <= rsi_min_short:
-                return None
-    except Exception:
-        pass
-
-    try:
-        # VWAP distance (30m), in ATRs
-        min_vwap_dist_atr = float(os.getenv("MID_VWAP_MIN_DIST_ATR", "0.35") or 0.35)
-        if min_vwap_dist_atr > 0 and (not np.isnan(vwap_val)) and float(vwap_val) > 0 and atr30 > 0:
-            if abs(entry - float(vwap_val)) < (atr30 * min_vwap_dist_atr):
-                return None
-    except Exception:
-        pass
-
-    try:
-        # Huge 5m body + high rel volume -> often reverses
-        culm_vol_x = float(os.getenv("MID_CULM_VOL_X", "2.5") or 2.5)
-        culm_body_atr = float(os.getenv("MID_CULM_BODY_ATR", "0.9") or 0.9)
-        if culm_vol_x > 0 and culm_body_atr > 0 and atr30 > 0:
-            o = float(last5.get("open", np.nan))
-            c = float(last5.get("close", np.nan))
-            if (not np.isnan(o)) and (not np.isnan(c)):
-                body = abs(c - o)
-                vr = float(vol_rel) if (not np.isnan(vol_rel)) else float("nan")
-                if (not np.isnan(vr)) and vr >= culm_vol_x and body >= (atr30 * culm_body_atr):
-                    return None
-    except Exception:
-        pass
-
-    # Pattern on 5m
+# Pattern on 5m
     pattern, pat_bias = _candle_pattern(df5i)
 
     # RSI divergence on 30m (more stable than 5m)
