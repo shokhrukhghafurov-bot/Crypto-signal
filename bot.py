@@ -16,6 +16,14 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+
+# Webhook integration for aiogram v3 + aiohttp.
+# If aiogram webhook helpers are unavailable (older version), we keep polling mode.
+try:
+    from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+except Exception:
+    SimpleRequestHandler = None  # type: ignore
+    setup_application = None  # type: ignore
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import datetime as dt
@@ -150,6 +158,19 @@ except (ZoneInfoNotFoundError, FileNotFoundError):
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 backend = Backend()
+
+# --- Webhook mode (optional) ---
+WEBHOOK_MODE = (os.getenv("WEBHOOK_MODE", "0").strip().lower() not in ("0", "false", "no", "off"))
+WEBHOOK_PATH = (os.getenv("WEBHOOK_PATH", "/webhook") or "/webhook").strip() or "/webhook"
+WEBHOOK_BASE_URL = (os.getenv("WEBHOOK_BASE_URL") or "").strip().rstrip("/")
+WEBHOOK_SECRET_TOKEN = (os.getenv("WEBHOOK_SECRET_TOKEN") or "").strip() or None
+
+def _webhook_url() -> str:
+    if not WEBHOOK_BASE_URL:
+        return ""
+    if not WEBHOOK_PATH.startswith("/"):
+        return f"{WEBHOOK_BASE_URL}/{WEBHOOK_PATH}"
+    return f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
 # ---------------- Admin/Error bot alerts (separate bot) ----------------
 # Send important errors / blocks to a dedicated Telegram bot to avoid polluting the main bot chat.
 ERROR_BOT_TOKEN = (os.getenv("ERROR_BOT_TOKEN") or "").strip()
@@ -4104,6 +4125,27 @@ async def main() -> None:
     async def _admin_http_app() -> web.Application:
         app = web.Application()
 
+        # ---- Telegram Webhook endpoint (optional) ----
+        # Works together with the existing Admin HTTP server on the same PORT.
+        # In WEBHOOK_MODE we do NOT run polling; Telegram pushes updates to this path.
+        if WEBHOOK_MODE:
+            if not (SimpleRequestHandler and setup_application):
+                logger.warning("WEBHOOK_MODE=1 but aiogram webhook helpers are not available; falling back to polling mode.")
+            elif not WEBHOOK_BASE_URL:
+                logger.warning("WEBHOOK_MODE=1 but WEBHOOK_BASE_URL is empty; webhook will not be set.")
+            else:
+                try:
+                    # Register webhook handler on the same aiohttp app.
+                    SimpleRequestHandler(
+                        dispatcher=dp,
+                        bot=bot,
+                        secret_token=WEBHOOK_SECRET_TOKEN,
+                    ).register(app, path=WEBHOOK_PATH)
+                    setup_application(app, dp, bot=bot)
+                    logger.info("Telegram webhook route enabled at %s", WEBHOOK_PATH)
+                except Exception:
+                    logger.exception("Failed to register Telegram webhook route")
+
         # ---- Basic Auth ----
         ADMIN_USER = os.getenv("SIGNAL_ADMIN_USER") or os.getenv("ADMIN_USER") or "admin"
         ADMIN_PASS = os.getenv("SIGNAL_ADMIN_PASS") or os.getenv("ADMIN_PASS") or "password"
@@ -5001,6 +5043,18 @@ async def main() -> None:
 
     is_primary = await _try_acquire_singleton_lock()
 
+    # In webhook mode, many replicas may accept updates. However, we still keep
+    # background loops (scanner/track/outcomes) single-instance to reduce load.
+    # Only the primary instance sets the webhook to avoid races with delete/reset.
+    if WEBHOOK_MODE and is_primary and WEBHOOK_BASE_URL and (SimpleRequestHandler and setup_application):
+        try:
+            url = _webhook_url()
+            if url:
+                await bot.set_webhook(url, secret_token=WEBHOOK_SECRET_TOKEN, drop_pending_updates=True)
+                logger.info("Webhook set to %s", url)
+        except Exception:
+            logger.exception("Failed to set Telegram webhook")
+
     if not is_primary:
         logger.warning(
             "Another instance holds the Telegram polling lock; this replica will run ONLY autotrade manager + HTTP (no polling/scanner)."
@@ -5040,7 +5094,13 @@ async def main() -> None:
 
     # Auto-trade manager (SL/TP/BE) - runs in background.
     asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
-    await dp.start_polling(bot)
+
+    if WEBHOOK_MODE and WEBHOOK_BASE_URL and (SimpleRequestHandler and setup_application):
+        # HTTP server receives Telegram updates; nothing else to run here.
+        logger.info("Webhook mode active; waiting for HTTP requests")
+        await asyncio.Event().wait()
+    else:
+        await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
