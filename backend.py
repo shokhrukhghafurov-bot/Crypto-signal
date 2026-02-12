@@ -5253,6 +5253,22 @@ class _AsyncPriceCache:
         self._inflight: dict[tuple[str, str, str], asyncio.Future] = {}
         self._mu = asyncio.Lock()
 
+    @staticmethod
+    def _consume_future_exception(fut: asyncio.Future) -> None:
+        """Prevent 'Future exception was never retrieved' warnings.
+
+        When we set_exception on an in-flight Future but no other coroutine awaits it
+        (e.g., caller fires-and-forgets), asyncio will log a noisy warning.
+        This callback eagerly reads fut.exception() to mark it as retrieved.
+        """
+        try:
+            _ = fut.exception()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+
     def get(self, ex: str, market: str, symbol: str) -> tuple[float, str] | None:
         key = (ex.lower(), market.upper(), symbol.upper())
         v = self._data.get(key)
@@ -5280,6 +5296,10 @@ class _AsyncPriceCache:
                 fut = asyncio.get_running_loop().create_future()
                 self._inflight[key] = fut
                 owner = True
+                try:
+                    fut.add_done_callback(self._consume_future_exception)
+                except Exception:
+                    pass
             else:
                 owner = False
 
