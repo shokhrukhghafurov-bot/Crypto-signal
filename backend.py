@@ -8728,17 +8728,21 @@ class Backend:
                         await db_store.set_tp1(trade_id, be_price=float(be_px), price=float(s.tp1), pnl_pct=float(calc_profit_pct(s.entry, float(s.tp1), side)))
                         continue
 
-                    # 3) After TP1: BE logic (smart hold vs close) + emergency hard SL
-                                        # Emergency hard SL (always active after TP1, even if BE-after-TP1 is disabled): prevents deep drawdown if price collapses.
+                    # 3) After TP1: emergency hard SL (always) + BE logic (optional)
                     if tp1_hit:
-                        entry_p_hsl = float(s.entry or 0.0)
+                        entry_p = float(s.entry or 0.0)
+                        be_lvl = be_price if be_price else _be_exit_price(entry_p, side, market)
+
+                        # Emergency hard SL (always active after TP1): prevents deep drawdown if price collapses,
+                        # even if BE is being held/disabled.
                         try:
                             hard_pct = float(os.getenv("SMART_HARD_SL_PCT", "2.8") or 0.0)
                         except Exception:
                             hard_pct = 0.0
                         hard_sl = 0.0
-                        if entry_p_hsl > 0 and hard_pct > 0:
-                            hard_sl = (entry_p_hsl * (1 - hard_pct / 100.0)) if side == "LONG" else (entry_p_hsl * (1 + hard_pct / 100.0))
+                        if entry_p > 0 and hard_pct > 0:
+                            hard_sl = (entry_p * (1 - hard_pct / 100.0)) if side == "LONG" else (entry_p * (1 + hard_pct / 100.0))
+
                         if hard_sl > 0 and hit_sl(float(hard_sl)):
                             import datetime as _dt
                             now_utc = _dt.datetime.now(_dt.timezone.utc)
@@ -8770,95 +8774,91 @@ class Backend:
                                 pass
                             continue
 
-if tp1_hit and _be_enabled(market):
-                        entry_p = float(s.entry or 0.0)
-                        be_lvl = be_price if be_price else _be_exit_price(entry_p, side, market)
+                        # BE logic is optional and controlled by env flags, but HARD SL above is always active.
+                        if _be_enabled(market):
+                            # Track best favorable excursion after TP1 to estimate "chance to still reach TP2".
+                            if not hasattr(self, "_tp1_peak_px"):
+                                self._tp1_peak_px = {}
+                            peak = float(self._tp1_peak_px.get(trade_id, 0.0) or 0.0)
+                            if side == "LONG":
+                                peak = max(peak, float(price_f))
+                            else:
+                                peak = float(price_f) if peak <= 0 else min(peak, float(price_f))
+                            self._tp1_peak_px[trade_id] = float(peak)
 
-                        
-                        # Track best favorable excursion after TP1 to estimate "chance to still reach TP2".
-                        if not hasattr(self, "_tp1_peak_px"):
-                            self._tp1_peak_px = {}
-                        peak = float(self._tp1_peak_px.get(trade_id, 0.0) or 0.0)
-                        if side == "LONG":
-                            peak = max(peak, float(price_f))
-                        else:
-                            peak = float(price_f) if peak <= 0 else min(peak, float(price_f))
-                        self._tp1_peak_px[trade_id] = float(peak)
+                            # Optional cooldown when we decide to "hold despite BE touch" to avoid flip-flopping.
+                            if not hasattr(self, "_be_skip_until"):
+                                self._be_skip_until = {}
+                            now_ts = time.time()
+                            if now_ts < float(self._be_skip_until.get(trade_id, 0.0) or 0.0):
+                                # During cooldown we do not close at BE (but HARD SL is still active above).
+                                pass
+                            else:
+                                be_armed_now = _be_is_armed(side=side, price=price_f, tp1=getattr(s,'tp1',None), tp2=getattr(s,'tp2',None))
+                                if be_armed_now and hit_sl(float(be_lvl)):
+                                    # Estimate probability to still reach TP2 based on progress (peak vs TP2) and pullback from peak.
+                                    prob_tp2 = 0.0
+                                    tp2_lvl = float(getattr(s, "tp2", 0.0) or 0.0)
+                                    if tp2_lvl > 0 and entry_p > 0 and tp2_lvl != entry_p:
+                                        if side == "LONG":
+                                            prog = (peak - entry_p) / (tp2_lvl - entry_p)
+                                            pullback = ((peak - price_f) / max(1e-9, peak)) * 100.0 if peak > 0 else 0.0
+                                        else:
+                                            prog = (entry_p - peak) / (entry_p - tp2_lvl)
+                                            pullback = ((price_f - peak) / max(1e-9, peak)) * 100.0 if peak > 0 else 0.0
+                                        prog = max(0.0, min(1.0, float(prog)))
+                                        try:
+                                            pb_cap = float(os.getenv("SMART_BE_PULLBACK_PCT", "1.2") or 1.2)
+                                        except Exception:
+                                            pb_cap = 1.2
+                                        pb_score = max(0.0, min(1.0, 1.0 - (max(0.0, float(pullback)) / max(0.05, float(pb_cap)))))
+                                        prob_tp2 = max(0.0, min(1.0, 0.70 * prog + 0.30 * pb_score))
 
-                        # Optional cooldown when we decide to "hold despite BE touch" to avoid flip-flopping.
-                        if not hasattr(self, "_be_skip_until"):
-                            self._be_skip_until = {}
-                        now_ts = time.time()
-                        if now_ts < float(self._be_skip_until.get(trade_id, 0.0) or 0.0):
-                            # During cooldown we do not close at BE (but HARD SL is still active above).
-                            pass
-                        else:
-                            be_armed_now = _be_is_armed(side=side, price=price_f, tp1=getattr(s,'tp1',None), tp2=getattr(s,'tp2',None))
-                            if be_armed_now and hit_sl(float(be_lvl)):
-                                # Estimate probability to still reach TP2 based on progress (peak vs TP2) and pullback from peak.
-                                prob_tp2 = 0.0
-                                tp2_lvl = float(getattr(s, "tp2", 0.0) or 0.0)
-                                if tp2_lvl > 0 and entry_p > 0 and tp2_lvl != entry_p:
-                                    if side == "LONG":
-                                        prog = (peak - entry_p) / (tp2_lvl - entry_p)
-                                        pullback = ((peak - price_f) / max(1e-9, peak)) * 100.0 if peak > 0 else 0.0
+                                    try:
+                                        hold_prob = float(os.getenv("SMART_BE_HOLD_PROB", "0.70") or 0.70)
+                                    except Exception:
+                                        hold_prob = 0.70
+                                    try:
+                                        skip_sec = float(os.getenv("SMART_BE_SKIP_COOLDOWN_SEC", "45") or 45)
+                                    except Exception:
+                                        skip_sec = 45.0
+
+                                    if prob_tp2 >= hold_prob:
+                                        # Strong chance: keep position alive, ignore this BE touch for a while.
+                                        self._be_skip_until[trade_id] = float(now_ts + max(1.0, float(skip_sec)))
                                     else:
-                                        prog = (entry_p - peak) / (entry_p - tp2_lvl)
-                                        pullback = ((price_f - peak) / max(1e-9, peak)) * 100.0 if peak > 0 else 0.0
-                                    prog = max(0.0, min(1.0, float(prog)))
-                                    try:
-                                        pb_cap = float(os.getenv("SMART_BE_PULLBACK_PCT", "1.2") or 1.2)
-                                    except Exception:
-                                        pb_cap = 1.2
-                                    pb_score = max(0.0, min(1.0, 1.0 - (max(0.0, float(pullback)) / max(0.05, float(pb_cap)))))
-                                    prob_tp2 = max(0.0, min(1.0, 0.70 * prog + 0.30 * pb_score))
+                                        import datetime as _dt
+                                        now_utc = _dt.datetime.now(_dt.timezone.utc)
+                                        txt = _trf(uid, "msg_auto_be",
+                                            symbol=s.symbol,
+                                            market=market,
+                                            be_price=f"{float(be_lvl):.6f}",
+                                            opened_time=fmt_dt_msk(row.get("opened_at")),
+                                            closed_time=fmt_dt_msk(now_utc),
+                                            status="BE",
+                                        )
+                                        if dbg:
+                                            txt += "\n\n" + dbg
+                                        await safe_send(bot, uid, txt, ctx="msg_auto_be")
+                                        trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
+                                        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(be_lvl), close_reason="BE")
+                                        await db_store.close_trade(trade_id, status="BE", price=float(be_lvl), pnl_total_pct=float(pnl))
+                                        self._sl_breach_since.pop(trade_id, None)
+                                        try:
+                                            if hasattr(self, "_tp1_peak_px"):
+                                                self._tp1_peak_px.pop(trade_id, None)
+                                            if hasattr(self, "_be_skip_until"):
+                                                self._be_skip_until.pop(trade_id, None)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            await _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=False)
+                                        except Exception:
+                                            pass
+                                        continue
 
-                                try:
-                                    hold_prob = float(os.getenv("SMART_BE_HOLD_PROB", "0.70") or 0.70)
-                                except Exception:
-                                    hold_prob = 0.70
-                                try:
-                                    skip_sec = float(os.getenv("SMART_BE_SKIP_COOLDOWN_SEC", "45") or 45)
-                                except Exception:
-                                    skip_sec = 45.0
+                    # 4) TP2 -> WIN
 
-                                if prob_tp2 >= hold_prob:
-                                    # Strong chance: keep position alive, ignore this BE touch for a while.
-                                    self._be_skip_until[trade_id] = float(now_ts + max(1.0, float(skip_sec)))
-                                else:
-                                    import datetime as _dt
-                                    now_utc = _dt.datetime.now(_dt.timezone.utc)
-                                    txt = _trf(uid, "msg_auto_be",
-                                        symbol=s.symbol,
-                                        market=market,
-                                        be_price=f"{float(be_lvl):.6f}",
-                                        opened_time=fmt_dt_msk(row.get("opened_at")),
-                                        closed_time=fmt_dt_msk(now_utc),
-                                        status="BE",
-                                    )
-                                    if txt == "msg_auto_be":
-                                        txt = f"🟡 BE\n\n{s.symbol} | {market}\nBE: {float(be_lvl):.6f}"
-                                    if dbg:
-                                        txt += "\n\n" + dbg
-                                    await safe_send(bot, uid, txt, ctx="msg_auto_be")
-                                    trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
-                                    pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(be_lvl), close_reason="BE")
-                                    await db_store.close_trade(trade_id, status="BE", price=float(be_lvl), pnl_total_pct=float(pnl))
-                                    self._sl_breach_since.pop(trade_id, None)
-                                    try:
-                                        if hasattr(self, "_tp1_peak_px"):
-                                            self._tp1_peak_px.pop(trade_id, None)
-                                        if hasattr(self, "_be_skip_until"):
-                                            self._be_skip_until.pop(trade_id, None)
-                                    except Exception:
-                                        pass
-                                    try:
-                                        await _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=False)
-                                    except Exception:
-                                        pass
-                                    continue
-
-# 4) TP2 -> WIN
                     if s.tp2 and hit_tp(float(s.tp2)):
                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
                         pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.tp2), close_reason="WIN")
