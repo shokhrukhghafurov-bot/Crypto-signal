@@ -8729,19 +8729,16 @@ class Backend:
                         continue
 
                     # 3) After TP1: BE logic (smart hold vs close) + emergency hard SL
-                    if tp1_hit and _be_enabled(market):
-                        entry_p = float(s.entry or 0.0)
-                        be_lvl = be_price if be_price else _be_exit_price(entry_p, side, market)
-
-                        # Emergency hard SL (always active after TP1): prevents deep drawdown if price collapses.
+                                        # Emergency hard SL (always active after TP1, even if BE-after-TP1 is disabled): prevents deep drawdown if price collapses.
+                    if tp1_hit:
+                        entry_p_hsl = float(s.entry or 0.0)
                         try:
                             hard_pct = float(os.getenv("SMART_HARD_SL_PCT", "2.8") or 0.0)
                         except Exception:
                             hard_pct = 0.0
                         hard_sl = 0.0
-                        if entry_p > 0 and hard_pct > 0:
-                            hard_sl = (entry_p * (1 - hard_pct / 100.0)) if side == "LONG" else (entry_p * (1 + hard_pct / 100.0))
-
+                        if entry_p_hsl > 0 and hard_pct > 0:
+                            hard_sl = (entry_p_hsl * (1 - hard_pct / 100.0)) if side == "LONG" else (entry_p_hsl * (1 + hard_pct / 100.0))
                         if hard_sl > 0 and hit_sl(float(hard_sl)):
                             import datetime as _dt
                             now_utc = _dt.datetime.now(_dt.timezone.utc)
@@ -8773,6 +8770,11 @@ class Backend:
                                 pass
                             continue
 
+if tp1_hit and _be_enabled(market):
+                        entry_p = float(s.entry or 0.0)
+                        be_lvl = be_price if be_price else _be_exit_price(entry_p, side, market)
+
+                        
                         # Track best favorable excursion after TP1 to estimate "chance to still reach TP2".
                         if not hasattr(self, "_tp1_peak_px"):
                             self._tp1_peak_px = {}
