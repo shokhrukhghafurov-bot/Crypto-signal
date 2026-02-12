@@ -3648,6 +3648,8 @@ _SIG_SL_BUFFER_PCT = float(os.getenv("SIG_SL_BUFFER_PCT", "0.0005") or 0.0005)  
 _SIG_SL_CONFIRM_SEC = max(0, int(os.getenv("SIG_SL_CONFIRM_SEC", "10") or 10))
 _SIG_SL_BREACH_SINCE: dict[int, float] = {}  # signal_id -> unix ts when SL was first breached
 
+_SIG_MAX_TRACK_AGE_HOURS = float(os.getenv("SIG_MAX_TRACK_AGE_HOURS", "72") or 72)  # auto-close stale signals
+
 _SIG_TP1_PARTIAL_PCT = float(os.getenv("SIG_TP1_PARTIAL_CLOSE_PCT", "50") or 50)  # model partial close at TP1
 _SIG_BE_ARM_PCT_TO_TP2 = max(0.0, min(1.0, float(os.getenv('BE_ARM_PCT_TO_TP2', '0') or 0.0)))
 
@@ -3982,6 +3984,9 @@ async def signal_outcome_loop() -> None:
                     side = str(t.get("side") or "LONG").upper()
                     status = str(t.get("status") or "ACTIVE").upper()
 
+                    opened_at = t.get("opened_at")
+                    opened_at_dt = _parse_iso_dt(opened_at) if isinstance(opened_at, str) else opened_at
+
                     entry = float(t.get("entry") or 0.0)
                     tp1 = float(t.get("tp1") or 0.0) if t.get("tp1") is not None else 0.0
                     tp2 = float(t.get("tp2") or 0.0) if t.get("tp2") is not None else 0.0
@@ -3989,6 +3994,29 @@ async def signal_outcome_loop() -> None:
 
                     if sid <= 0 or entry <= 0 or not symbol:
                         continue
+
+                    # Auto-close stale signals so outcomes stats do not stay at zero forever
+                    # (e.g., if a signal never reaches TP/SL or the market becomes illiquid).
+                    try:
+                        max_age_h = float(_SIG_MAX_TRACK_AGE_HOURS or 0)
+                    except Exception:
+                        max_age_h = 0.0
+                    if max_age_h > 0 and opened_at_dt is not None:
+                        try:
+                            age_sec = (now - opened_at_dt).total_seconds()
+                        except Exception:
+                            age_sec = 0.0
+                        if age_sec > max_age_h * 3600:
+                            # best-effort pnl snapshot at timeout
+                            px_to = 0.0
+                            try:
+                                px_to, _ = await _fetch_signal_price(symbol, market=market)
+                            except Exception:
+                                px_to = 0.0
+                            pnl_to = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=px_to, part_entry_to_close=1.0) if (entry > 0 and px_to > 0) else 0.0
+                            await db_store.close_signal_track(signal_id=sid, status="CLOSED", pnl_total_pct=float(pnl_to))
+                            _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            continue
 
                     px, _src = await _fetch_signal_price(symbol, market=market)
                     if px <= 0:
