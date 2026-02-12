@@ -86,7 +86,7 @@ async def ensure_schema() -> None:
           tp1   NUMERIC(18,8),
           tp2   NUMERIC(18,8),
           sl    NUMERIC(18,8),
-          status TEXT NOT NULL CHECK (status IN ('ACTIVE','TP1','BE','WIN','LOSS','CLOSED')),
+          status TEXT NOT NULL CHECK (status IN ('ACTIVE','TP1','BE','WIN','LOSS','CLOSED','HARD_SL')),
           tp1_hit BOOLEAN NOT NULL DEFAULT FALSE,
           be_price NUMERIC(18,8),
           opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -96,20 +96,18 @@ async def ensure_schema() -> None:
         );
         """)
 
+
         # --- widen trades.status CHECK constraint to include HARD_SL (migration-safe) ---
-        # Older DBs were created with a limited CHECK(...) list and will reject status='HARD_SL'.
         try:
             await conn.execute("ALTER TABLE trades DROP CONSTRAINT IF EXISTS trades_status_check;")
         except Exception:
             pass
         try:
-            await conn.execute(
-                """
-                ALTER TABLE trades
-                ADD CONSTRAINT trades_status_check
-                CHECK (status IN ('ACTIVE','TP1','BE','WIN','LOSS','CLOSED','HARD_SL'));
-                """
-            )
+            await conn.execute("""
+            ALTER TABLE trades
+            ADD CONSTRAINT trades_status_check
+            CHECK (status IN ('ACTIVE','TP1','BE','WIN','LOSS','CLOSED','HARD_SL'));
+            """)
         except Exception:
             pass
 
@@ -214,12 +212,27 @@ ON CONFLICT (id) DO NOTHING;
         CREATE TABLE IF NOT EXISTS trade_events (
           id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
           trade_id BIGINT NOT NULL REFERENCES trades(id) ON DELETE CASCADE,
-          event_type TEXT NOT NULL CHECK (event_type IN ('OPEN','TP1','BE','WIN','LOSS','CLOSE')),
+          event_type TEXT NOT NULL CHECK (event_type IN ('OPEN','TP1','BE','WIN','LOSS','CLOSE','HARD_SL')),
           price NUMERIC(18,8),
           pnl_pct NUMERIC(10,4),
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         """)
+
+        # --- widen trade_events.event_type CHECK constraint to include HARD_SL (migration-safe) ---
+        try:
+            await conn.execute("ALTER TABLE trade_events DROP CONSTRAINT IF EXISTS trade_events_event_type_check;")
+        except Exception:
+            pass
+        try:
+            await conn.execute("""
+            ALTER TABLE trade_events
+            ADD CONSTRAINT trade_events_event_type_check
+            CHECK (event_type IN ('OPEN','TP1','BE','WIN','LOSS','CLOSE','HARD_SL'));
+            """)
+        except Exception:
+            pass
+
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_trade_events_trade_time
         ON trade_events (trade_id, created_at DESC);
