@@ -21,9 +21,19 @@ MID_CLIMAX_COOLDOWN_BARS = int(os.getenv("MID_CLIMAX_COOLDOWN_BARS", "1"))   # b
 # --- MID anti-bounce / RSI window / BB bounce guard ---
 MID_ANTI_BOUNCE_ENABLED = os.getenv("MID_ANTI_BOUNCE_ENABLED", "1").strip().lower() not in ("0","false","no","off")
 MID_ANTI_BOUNCE_ATR_MAX = float(os.getenv("MID_ANTI_BOUNCE_ATR_MAX", "1.8"))     # SHORT: (close - recent_low)/ATR_30m; LONG: (recent_high - close)/ATR_30m
-MID_RSI_LONG_MIN = float(os.getenv("MID_RSI_LONG_MIN", "36"))                    # RSI(5m) for LONG must be >
+MID_RSI_LONG_MIN = float(os.getenv("MID_RSI_LONG_MIN", "45"))                    # RSI(5m) for LONG must be >
 MID_RSI_SHORT_MAX = float(os.getenv("MID_RSI_SHORT_MAX", "64"))                  # RSI(5m) for SHORT must be <
 MID_BLOCK_BB_BOUNCE = os.getenv("MID_BLOCK_BB_BOUNCE", "1").strip().lower() not in ("0","false","no","off")
+
+# Confirmation candle guard (reduces fast SL right after entry):
+# - Require direction-aligned last 5m candle (green for LONG, red for SHORT)
+# - Require minimal candle body vs ATR(30m) to avoid chop/noise entries
+MID_CONFIRM_CANDLE_ENABLED = os.getenv("MID_CONFIRM_CANDLE_ENABLED", "1").strip().lower() not in ("0","false","no","off")
+MID_CONFIRM_CANDLE_REQUIRE_DIRECTION = os.getenv("MID_CONFIRM_CANDLE_REQUIRE_DIRECTION", "1").strip().lower() not in ("0","false","no","off")
+MID_CONFIRM_CANDLE_BODY_ATR_MIN = float(os.getenv("MID_CONFIRM_CANDLE_BODY_ATR_MIN", "0.10"))  # abs(close-open)/ATR_30m
+# Require price to be on the correct side of VWAP(30m) (LONG above, SHORT below)
+MID_REQUIRE_VWAP_SIDE = os.getenv("MID_REQUIRE_VWAP_SIDE", "1").strip().lower() not in ("0","false","no","off")
+
 
 import random
 import re
@@ -4686,6 +4696,32 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                     return f"rsi_short={rsi_5m:.1f} <= {MID_RSI_SHORT_MIN:g}"
                 if rsi_5m >= MID_RSI_SHORT_MAX:
                     return f"rsi_short={rsi_5m:.1f} >= {MID_RSI_SHORT_MAX:g}"
+
+        # --- Extra quality guards (to reduce immediate SL after entry) ---
+        try:
+            if MID_REQUIRE_VWAP_SIDE and vwap is not None:
+                if side.upper() == "LONG" and close < float(vwap):
+                    return f"vwap_side_long close<{float(vwap):.6g}"
+                if side.upper() == "SHORT" and close > float(vwap):
+                    return f"vwap_side_short close>{float(vwap):.6g}"
+        except Exception:
+            pass
+
+        try:
+            if MID_CONFIRM_CANDLE_ENABLED:
+                # Direction-aligned candle
+                if MID_CONFIRM_CANDLE_REQUIRE_DIRECTION and o is not None:
+                    if side.upper() == "LONG" and close <= float(o):
+                        return "confirm_candle_long close<=open"
+                    if side.upper() == "SHORT" and close >= float(o):
+                        return "confirm_candle_short close>=open"
+                # Minimal body vs ATR to avoid chop
+                if atr_30m and atr_30m > 0 and o is not None:
+                    body_atr2 = abs(float(close) - float(o)) / float(atr_30m)
+                    if body_atr2 < MID_CONFIRM_CANDLE_BODY_ATR_MIN:
+                        return f"small_body_atr={body_atr2:.2f} < {MID_CONFIRM_CANDLE_BODY_ATR_MIN:g}"
+        except Exception:
+            pass
     except Exception:
         # if filter computation fails, don't block signal; let normal error handling deal with it
         return None
