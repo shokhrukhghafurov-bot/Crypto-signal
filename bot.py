@@ -3404,17 +3404,36 @@ def _trade_card_text(uid: int, t: dict) -> str:
                 if t.get('be_price_f') is not None or t.get('be_price') is not None:
                     hit_be = bool(t.get('hit_be'))
                     checks.append(f"{tr(uid, 'lbl_be')}: {'✅' if hit_be else '❌'}")
-                # HARD SL check (mainly for futures)
-                if market != 'SPOT' and (t.get('hard_sl_price_f') is not None):
-                    hit_hsl = bool(t.get('hit_hard_sl'))
+                # HARD SL check (emergency stop after TP1)
+                try:
+                    hard_pct = float(os.getenv("SMART_HARD_SL_PCT", "2.8") or 0.0)
+                except Exception:
+                    hard_pct = 0.0
+                hard_sl = 0.0
+                try:
+                    entry_p = float(t.get('entry') or 0.0)
+                except Exception:
+                    entry_p = 0.0
+                side = str(t.get('side') or '').upper()
+                if entry_p > 0 and hard_pct > 0 and side in ('LONG','SHORT'):
+                    hard_sl = (entry_p * (1 - hard_pct / 100.0)) if side == 'LONG' else (entry_p * (1 + hard_pct / 100.0))
+                # hit_hard_sl may be provided by backend; if not, fall back to comparing with current price
+                hit_hsl = bool(t.get('hit_hard_sl'))
+                try:
+                    px = float(t.get('last_price') or t.get('price_now') or 0.0)
+                    if not hit_hsl and hard_sl > 0 and px > 0:
+                        hit_hsl = (px <= hard_sl) if side == 'LONG' else (px >= hard_sl)
+                except Exception:
+                    pass
+                if hard_sl > 0:
                     checks.append(f"{tr(uid, 'lbl_hard_sl')}: {'✅' if hit_hsl else '❌'}")
             else:
                 if t.get('sl') is not None:
-                    checks.append(f"SL: {'✅' if hit_sl else '❌'}")
+                    checks.append(f"{tr(uid, 'lbl_sl')}: {'✅' if hit_sl else '❌'}")
             if t.get('tp1') is not None:
                 checks.append(f"{tr(uid, 'lbl_tp1')}: {'✅' if hit_tp1 else '❌'}")
             if t.get('tp2') is not None and float(t.get('tp2') or 0) > 0:
-                checks.append(f"TP2: {'✅' if hit_tp2 else '❌'}")
+                checks.append(f"{tr(uid, 'lbl_tp2')}: {'✅' if hit_tp2 else '❌'}")
             if checks:
                 parts.append(f"🧪 {tr(uid, 'lbl_check')}: " + ' '.join(checks))
             had_live_block = True
