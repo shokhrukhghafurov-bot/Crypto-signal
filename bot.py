@@ -3403,11 +3403,11 @@ def _trade_card_text(uid: int, t: dict) -> str:
                 # BE check (always relevant after TP1)
                 if t.get('be_price_f') is not None or t.get('be_price') is not None:
                     hit_be = bool(t.get('hit_be'))
-                    checks.append(f"BE: {'✅' if hit_be else '❌'}")
+                    checks.append(f"{tr(uid, 'lbl_be')}: {'✅' if hit_be else '❌'}")
                 # HARD SL check (mainly for futures)
                 if market != 'SPOT' and (t.get('hard_sl_price_f') is not None):
                     hit_hsl = bool(t.get('hit_hard_sl'))
-                    checks.append(f"HARD_SL: {'✅' if hit_hsl else '❌'}")
+                    checks.append(f"{tr(uid, 'lbl_hard_sl')}: {'✅' if hit_hsl else '❌'}")
             else:
                 if t.get('sl') is not None:
                     checks.append(f"SL: {'✅' if hit_sl else '❌'}")
