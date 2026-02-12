@@ -8020,21 +8020,18 @@ class Backend:
             return None
 
 
-
     async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
         """Return (price, source) for tracking.
 
-        Sources:
-          - BINANCE_WS / BINANCE_REST
-          - BYBIT_REST
-          - MEDIAN(BINANCE+BYBIT) / BINANCE_ONLY / BYBIT_ONLY
-          - OKX_REST
-
-        Note: if all sources fail, raises PriceUnavailableError.
+        Required policy:
+          1) Try **WS only** in priority order.
+          2) If **all WS** fail, then try **REST/public** in the same order.
 
         Selection is controlled via env:
           SPOT_PRICE_SOURCE=BINANCE|BYBIT|MEDIAN
           FUTURES_PRICE_SOURCE=BINANCE|BYBIT|MEDIAN
+
+        Note: if all sources fail, raises PriceUnavailableError.
         """
         market = (signal.market or "FUTURES").upper()
         base = float(getattr(signal, "entry", 0) or 0) or None
@@ -8055,13 +8052,11 @@ class Backend:
                     pass
 
         def _is_reasonable(p: float | None) -> bool:
-            """Sanity filter to avoid using bad ticks (e.g., 0.0) that can
-            accidentally distort MEDIAN logic and trigger false TP/SL hits.
+            """Sanity filter to avoid using bad ticks (e.g., 0.0).
 
-            We keep it intentionally permissive, but:
-              - reject non-finite / <= 0
-              - if entry is known, reject values that are wildly off-scale
-                (e.g., 10x away), which usually indicates a wrong market/symbol.
+            Permissive, but rejects:
+              - non-finite / <= 0
+              - if entry is known: values wildly off-scale (10x away)
             """
             if p is None:
                 return False
@@ -8078,32 +8073,109 @@ class Backend:
                     return False
             return True
 
-        async def get_binance() -> tuple[float | None, str]:
-            # websocket first, then cache, then REST fallback
+        # --- WS-only helpers (NO REST FALLBACK INSIDE) ---
+        async def _binance_ws_only() -> tuple[float | None, str]:
             try:
                 await self.feed.ensure_stream(market, signal.symbol, ex="binance")
                 latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec)
                 if latest is not None and float(latest) > 0:
                     src = self.feed.get_latest_source(market, signal.symbol) or "BINANCE_WS"
+                    # Normalize feed sources
                     if src == "WS":
                         src = "BINANCE_WS"
                     elif src == "REST":
-                        src = "BINANCE_REST"
+                        # In WS-only phase we must not accept REST-derived values
+                        return None, "BINANCE_WS_MISS"
                     if _is_reasonable(float(latest)):
                         _pdbg(f"BINANCE WS hit p={latest} src={src}")
-                        return float(latest), str(src)
+                        return float(latest), "BINANCE_WS"
             except Exception:
                 pass
 
-            # cache (may have BINANCE_REST from a recent fetch)
+            # cache: accept only WS-derived cached values
             try:
                 c = self._price_cache.get("binance", market, signal.symbol)
-                if c is not None and c[0] is not None and _is_reasonable(c[0]):
+                if c is not None and c[0] is not None and str(c[1]).upper().endswith("_WS") and _is_reasonable(c[0]):
                     return float(c[0]), str(c[1])
             except Exception:
                 pass
 
-            # REST
+            return None, "BINANCE_WS_MISS"
+
+        async def _bybit_ws_only() -> tuple[float | None, str]:
+            try:
+                await self.feed.ensure_stream(market, signal.symbol, ex="bybit")
+                latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="bybit")
+                if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
+                    _pdbg(f"BYBIT WS hit p={latest}")
+                    return float(latest), "BYBIT_WS"
+            except Exception:
+                pass
+            try:
+                c = self._price_cache.get("bybit", market, signal.symbol)
+                if c is not None and c[0] is not None and str(c[1]).upper().endswith("_WS") and _is_reasonable(c[0]):
+                    return float(c[0]), str(c[1])
+            except Exception:
+                pass
+            return None, "BYBIT_WS_MISS"
+
+        async def _okx_ws_only() -> tuple[float | None, str]:
+            try:
+                await self.feed.ensure_stream(market, signal.symbol, ex="okx")
+                latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="okx")
+                if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
+                    _pdbg(f"OKX WS hit p={latest}")
+                    return float(latest), "OKX_WS"
+            except Exception:
+                pass
+            try:
+                c = self._price_cache.get("okx", market, signal.symbol)
+                if c is not None and c[0] is not None and str(c[1]).upper().endswith("_WS") and _is_reasonable(c[0]):
+                    return float(c[0]), str(c[1])
+            except Exception:
+                pass
+            return None, "OKX_WS_MISS"
+
+        async def _gateio_ws_only() -> tuple[float | None, str]:
+            if market != "SPOT":
+                return None, "GATEIO_WS_MISS"
+            try:
+                await self.feed.ensure_stream(market, signal.symbol, ex="gateio")
+                latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="gateio")
+                if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
+                    _pdbg(f"GATEIO WS hit p={latest}")
+                    return float(latest), "GATEIO_WS"
+            except Exception:
+                pass
+            try:
+                c = self._price_cache.get("gateio", market, signal.symbol)
+                if c is not None and c[0] is not None and str(c[1]).upper().endswith("_WS") and _is_reasonable(c[0]):
+                    return float(c[0]), str(c[1])
+            except Exception:
+                pass
+            return None, "GATEIO_WS_MISS"
+
+        async def _mexc_ws_only() -> tuple[float | None, str]:
+            if market != "SPOT":
+                return None, "MEXC_WS_MISS"
+            try:
+                await self.feed.ensure_stream(market, signal.symbol, ex="mexc")
+                latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="mexc")
+                if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
+                    _pdbg(f"MEXC WS hit p={latest}")
+                    return float(latest), "MEXC_WS"
+            except Exception:
+                pass
+            try:
+                c = self._price_cache.get("mexc", market, signal.symbol)
+                if c is not None and c[0] is not None and str(c[1]).upper().endswith("_WS") and _is_reasonable(c[0]):
+                    return float(c[0]), str(c[1])
+            except Exception:
+                pass
+            return None, "MEXC_WS_MISS"
+
+        # --- REST-only helpers (NO WS INSIDE) ---
+        async def _binance_rest_only() -> tuple[float | None, str]:
             rest = await self._fetch_rest_price(market, signal.symbol)
             if _is_reasonable(rest):
                 try:
@@ -8116,82 +8188,27 @@ class Backend:
                 except Exception:
                     pass
                 return float(rest), "BINANCE_REST"
-            return None, "BINANCE"
-        async def get_bybit() -> tuple[float | None, str]:
-            # websocket first
-            try:
-                await self.feed.ensure_stream(market, signal.symbol, ex="bybit")
-                latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="bybit")
-                if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
-                    _pdbg(f"BYBIT WS hit p={latest}")
-                    return float(latest), "BYBIT_WS"
-            except Exception:
-                pass
+            return None, "BINANCE_REST_MISS"
 
+        async def _bybit_rest_only() -> tuple[float | None, str]:
             async def _fetch():
                 return await self._fetch_bybit_price(market, signal.symbol)
             p, _src = await self._price_cached("bybit", market, signal.symbol, _fetch, src_label="BYBIT_REST")
             if _is_reasonable(p):
                 return float(p), "BYBIT_REST"
-            return None, "BYBIT"
-        async def get_okx() -> tuple[float | None, str]:
-            # websocket first
-            try:
-                await self.feed.ensure_stream(market, signal.symbol, ex="okx")
-                latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="okx")
-                if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
-                    _pdbg(f"OKX WS hit p={latest}")
-                    return float(latest), "OKX_WS"
-            except Exception:
-                pass
+            return None, "BYBIT_REST_MISS"
 
+        async def _okx_rest_only() -> tuple[float | None, str]:
             async def _fetch():
                 return await self._fetch_okx_price(market, signal.symbol)
             p, _src = await self._price_cached("okx", market, signal.symbol, _fetch, src_label="OKX_REST")
             if _is_reasonable(p):
                 return float(p), "OKX_REST"
-            return None, "OKX"
-        async def get_mexc() -> tuple[float | None, str]:
-            # websocket first (spot-only)
-            if market == "SPOT":
-                try:
-                    await self.feed.ensure_stream(market, signal.symbol, ex="mexc")
-                    latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="mexc")
-                    if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
-                        _pdbg(f"MEXC WS hit p={latest}")
-                        return float(latest), "MEXC_WS"
-                except Exception:
-                    pass
+            return None, "OKX_REST_MISS"
 
-            # MEXC/Gate are SPOT-only fallbacks for price.
+        async def _gateio_rest_only() -> tuple[float | None, str]:
             if market != "SPOT":
-                return None, "MEXC"
-
-            async def _fetch():
-                async def _do():
-                    try:
-                        return await _mexc_public_price(signal.symbol)
-                    except Exception:
-                        return None
-                return await self._rest_limiter.run("mexc", _do)
-
-            p, _src = await self._price_cached("mexc", market, signal.symbol, _fetch, src_label="MEXC_PUBLIC")
-            if _is_reasonable(p):
-                return float(p), "MEXC_PUBLIC"
-            return None, "MEXC"
-        async def get_gateio() -> tuple[float | None, str]:
-            # websocket first (spot-only)
-            if market == "SPOT":
-                try:
-                    await self.feed.ensure_stream(market, signal.symbol, ex="gateio")
-                    latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="gateio")
-                    if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
-                        _pdbg(f"GATEIO WS hit p={latest}")
-                        return float(latest), "GATEIO_WS"
-                except Exception:
-                    pass
-            if market != "SPOT":
-                return None, "GATEIO"
+                return None, "GATEIO_REST_MISS"
 
             async def _fetch():
                 async def _do():
@@ -8204,13 +8221,24 @@ class Backend:
             p, _src = await self._price_cached("gateio", market, signal.symbol, _fetch, src_label="GATEIO_PUBLIC")
             if _is_reasonable(p):
                 return float(p), "GATEIO_PUBLIC"
-            return None, "GATEIO"
+            return None, "GATEIO_REST_MISS"
 
+        async def _mexc_rest_only() -> tuple[float | None, str]:
+            if market != "SPOT":
+                return None, "MEXC_REST_MISS"
 
-        # Selection policy:
-        # 1) Prefer WS (BINANCE/Bybit/OKX/Gate/MEXC) in priority order
-        # 2) If all WS fail, use REST/public fallbacks (same order)
-        # 3) MEDIAN mode: prefer median of BINANCE and BYBIT when both available
+            async def _fetch():
+                async def _do():
+                    try:
+                        return await _mexc_public_price(signal.symbol)
+                    except Exception:
+                        return None
+                return await self._rest_limiter.run("mexc", _do)
+
+            p, _src = await self._price_cached("mexc", market, signal.symbol, _fetch, src_label="MEXC_PUBLIC")
+            if _is_reasonable(p):
+                return float(p), "MEXC_PUBLIC"
+            return None, "MEXC_REST_MISS"
 
         spot_chain = ["BINANCE", "BYBIT", "OKX", "GATEIO", "MEXC"]
         fut_chain = ["BINANCE", "BYBIT", "OKX"]
@@ -8223,56 +8251,91 @@ class Backend:
                 return chain0[i:] + chain0[:i]
             return chain0
 
+        # Rotate only for single-source modes; MEDIAN is handled specially.
         if mode == "BINANCE":
             chain = _rotate(chain, "BINANCE")
         elif mode == "BYBIT":
             chain = _rotate(chain, "BYBIT")
-        else:
-            chain = chain  # MEDIAN handled below
 
-        async def _get_one(name: str) -> tuple[float | None, str]:
+        async def _ws_only(name: str) -> tuple[float | None, str]:
             n = name.upper()
             if n == "BINANCE":
-                return await get_binance()
+                return await _binance_ws_only()
             if n == "BYBIT":
-                return await get_bybit()
+                return await _bybit_ws_only()
             if n == "OKX":
-                return await get_okx()
+                return await _okx_ws_only()
             if n == "GATEIO":
-                return await get_gateio()
+                return await _gateio_ws_only()
             if n == "MEXC":
-                return await get_mexc()
-            return None, n
+                return await _mexc_ws_only()
+            return None, f"{n}_WS_MISS"
 
+        async def _rest_only(name: str) -> tuple[float | None, str]:
+            n = name.upper()
+            if n == "BINANCE":
+                return await _binance_rest_only()
+            if n == "BYBIT":
+                return await _bybit_rest_only()
+            if n == "OKX":
+                return await _okx_rest_only()
+            if n == "GATEIO":
+                return await _gateio_rest_only()
+            if n == "MEXC":
+                return await _mexc_rest_only()
+            return None, f"{n}_REST_MISS"
+
+        # --- PHASE A: WS-only (priority order) ---
         if mode == "MEDIAN":
-            _pdbg("mode=MEDIAN; trying BINANCE then BYBIT for median")
-            b, bsrc = await get_binance()
-            _pdbg(f"BINANCE result: p={b} src={bsrc}")
-            y, ysrc = await get_bybit()
-            _pdbg(f"BYBIT result: p={y} src={ysrc}")
+            _pdbg("mode=MEDIAN; PHASE A WS-only: try BINANCE_WS and BYBIT_WS for median")
+            b, _bsrc = await _binance_ws_only()
+            y, _ysrc = await _bybit_ws_only()
             if _is_reasonable(b) and _is_reasonable(y):
                 try:
                     med = float(statistics.median([float(b), float(y)]))
-                    return med, "MEDIAN(BINANCE+BYBIT)"
+                    return med, "MEDIAN(BINANCE_WS+BYBIT_WS)"
                 except Exception:
                     pass
             if _is_reasonable(b):
-                return float(b), bsrc
+                return float(b), "BINANCE_WS"
             if _is_reasonable(y):
-                return float(y), ysrc
+                return float(y), "BYBIT_WS"
 
-        # Normal fallback chain: try each exchange (WS inside), then its REST/public fallback (inside)
-        _pdbg(f"fallback chain order={'+'.join(chain)} mode={mode}")
+        _pdbg(f"PHASE A WS-only order={'+'.join(chain)} mode={mode}")
         for exname in chain:
-            _pdbg(f"try {exname} ...")
-            p, src = await _get_one(exname)
-            _pdbg(f"{exname} -> p={p} src={src}")
+            p, src = await _ws_only(exname)
+            _pdbg(f"WS {exname} -> p={p} src={src}")
             if _is_reasonable(p):
-                _pdbg(f"SELECTED {exname} src={src} p={p}")
+                _pdbg(f"SELECTED WS {exname} src={src} p={p}")
                 return float(p), str(src)
 
-        raise PriceUnavailableError("all price sources failed")
+        # --- PHASE B: REST/public fallback (only if ALL WS failed) ---
+        if mode == "MEDIAN":
+            _pdbg("mode=MEDIAN; PHASE B REST-only: try BINANCE_REST and BYBIT_REST for median")
+            b, _bsrc = await _binance_rest_only()
+            y, _ysrc = await _bybit_rest_only()
+            if _is_reasonable(b) and _is_reasonable(y):
+                try:
+                    med = float(statistics.median([float(b), float(y)]))
+                    return med, "MEDIAN(BINANCE_REST+BYBIT_REST)"
+                except Exception:
+                    pass
+            if _is_reasonable(b):
+                return float(b), "BINANCE_REST"
+            if _is_reasonable(y):
+                return float(y), "BYBIT_REST"
+
+        _pdbg(f"PHASE B REST-only order={'+'.join(chain)} mode={mode}")
+        for exname in chain:
+            p, src = await _rest_only(exname)
+            _pdbg(f"REST {exname} -> p={p} src={src}")
+            if _is_reasonable(p):
+                _pdbg(f"SELECTED REST {exname} src={src} p={p}")
+                return float(p), str(src)
+
         raise PriceUnavailableError(f"price unavailable market={market} symbol={signal.symbol} mode={mode}")
+
+
 
     async def _get_price(self, signal: Signal) -> float:
         price, _src = await self._get_price_with_source(signal)
