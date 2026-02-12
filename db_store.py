@@ -86,7 +86,7 @@ async def ensure_schema() -> None:
           tp1   NUMERIC(18,8),
           tp2   NUMERIC(18,8),
           sl    NUMERIC(18,8),
-          status TEXT NOT NULL CHECK (status IN ('ACTIVE','TP1','BE','WIN','LOSS','CLOSED','HARD_SL')),
+          status TEXT NOT NULL CHECK (status IN ('ACTIVE','TP1','BE','WIN','LOSS','CLOSED')),
           tp1_hit BOOLEAN NOT NULL DEFAULT FALSE,
           be_price NUMERIC(18,8),
           opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -95,21 +95,6 @@ async def ensure_schema() -> None:
           orig_text TEXT NOT NULL
         );
         """)
-
-
-        # --- widen trades.status CHECK constraint to include HARD_SL (migration-safe) ---
-        try:
-            await conn.execute("ALTER TABLE trades DROP CONSTRAINT IF EXISTS trades_status_check;")
-        except Exception:
-            pass
-        try:
-            await conn.execute("""
-            ALTER TABLE trades
-            ADD CONSTRAINT trades_status_check
-            CHECK (status IN ('ACTIVE','TP1','BE','WIN','LOSS','CLOSED','HARD_SL'));
-            """)
-        except Exception:
-            pass
 
         # --- Signal bot global settings (single row) ---
         await conn.execute("""
@@ -212,27 +197,12 @@ ON CONFLICT (id) DO NOTHING;
         CREATE TABLE IF NOT EXISTS trade_events (
           id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
           trade_id BIGINT NOT NULL REFERENCES trades(id) ON DELETE CASCADE,
-          event_type TEXT NOT NULL CHECK (event_type IN ('OPEN','TP1','BE','WIN','LOSS','CLOSE','HARD_SL')),
+          event_type TEXT NOT NULL CHECK (event_type IN ('OPEN','TP1','BE','WIN','LOSS','CLOSE')),
           price NUMERIC(18,8),
           pnl_pct NUMERIC(10,4),
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         """)
-
-        # --- widen trade_events.event_type CHECK constraint to include HARD_SL (migration-safe) ---
-        try:
-            await conn.execute("ALTER TABLE trade_events DROP CONSTRAINT IF EXISTS trade_events_event_type_check;")
-        except Exception:
-            pass
-        try:
-            await conn.execute("""
-            ALTER TABLE trade_events
-            ADD CONSTRAINT trade_events_event_type_check
-            CHECK (event_type IN ('OPEN','TP1','BE','WIN','LOSS','CLOSE','HARD_SL'));
-            """)
-        except Exception:
-            pass
-
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_trade_events_trade_time
         ON trade_events (trade_id, created_at DESC);
@@ -897,9 +867,18 @@ async def set_trade_be_price(trade_id: int, *, be_price: float) -> None:
 async def close_trade(trade_id: int, *, status: str, price: float | None = None, pnl_total_pct: float | None = None) -> None:
     """
     status: BE / WIN / LOSS / CLOSED
+
+    NOTE: Some strategies may call close_trade(..., status="HARD_SL") as an emergency stop.
+    For database consistency and statistics ("Signals closed / outcomes"), HARD_SL is recorded as LOSS.
     """
     pool = get_pool()
-    ev = "CLOSE" if status == "CLOSED" else status
+    st = (status or "").upper().strip()
+
+    # Normalize: HARD_SL should be counted as SL/LOSS everywhere.
+    if st == "HARD_SL":
+        st = "LOSS"
+
+    ev = "CLOSE" if st == "CLOSED" else st
     async with pool.acquire() as conn:
         await conn.execute(
             """
@@ -907,7 +886,7 @@ async def close_trade(trade_id: int, *, status: str, price: float | None = None,
             SET status=$2, closed_at=NOW(), pnl_total_pct=$3
             WHERE id=$1;
             """,
-            int(trade_id), status, (float(pnl_total_pct) if pnl_total_pct is not None else None),
+            int(trade_id), st, (float(pnl_total_pct) if pnl_total_pct is not None else None),
         )
         await conn.execute(
             "INSERT INTO trade_events (trade_id, event_type, price, pnl_pct) VALUES ($1,$2,$3,$4);",
