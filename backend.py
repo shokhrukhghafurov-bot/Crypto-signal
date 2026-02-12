@@ -5250,27 +5250,24 @@ class _AsyncPriceCache:
     def __init__(self, ttl_sec: float = 2.0) -> None:
         self.ttl_sec = float(ttl_sec)
         self._data: dict[tuple[str, str, str], tuple[float, str, float]] = {}
+        # Negative cache for transient "no price" situations (timeouts/429/symbol not found).
+        # Keeps the bot from hammering the same key and prevents noisy asyncio warnings.
+        self._neg: dict[tuple[str, str, str], tuple[str, float]] = {}
+        self._neg_ttl_sec = max(0.5, min(5.0, self.ttl_sec))
         self._inflight: dict[tuple[str, str, str], asyncio.Future] = {}
         self._mu = asyncio.Lock()
 
-    @staticmethod
-    def _consume_future_exception(fut: asyncio.Future) -> None:
-        """Prevent 'Future exception was never retrieved' warnings.
-
-        When we set_exception on an in-flight Future but no other coroutine awaits it
-        (e.g., caller fires-and-forgets), asyncio will log a noisy warning.
-        This callback eagerly reads fut.exception() to mark it as retrieved.
-        """
-        try:
-            _ = fut.exception()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            pass
-
-
-    def get(self, ex: str, market: str, symbol: str) -> tuple[float, str] | None:
+    def get(self, ex: str, market: str, symbol: str) -> tuple[float | None, str] | None:
         key = (ex.lower(), market.upper(), symbol.upper())
+        # Negative cache hit
+        nv = self._neg.get(key)
+        if nv:
+            nsrc, nts = nv
+            if (time.time() - float(nts)) <= self._neg_ttl_sec:
+                # caller expects (price, src); price=None indicates "not available"
+                return None, str(nsrc)
+            else:
+                self._neg.pop(key, None)
         v = self._data.get(key)
         if not v:
             return None
@@ -5294,12 +5291,18 @@ class _AsyncPriceCache:
             fut = self._inflight.get(key)
             if fut is None or fut.done():
                 fut = asyncio.get_running_loop().create_future()
+                # If some caller launches work and later drops it (create_task / cancellation),
+                # asyncio may warn "Future exception was never retrieved". Ensure we always
+                # mark exceptions as retrieved.
+                def _consume_future_exception(_f: asyncio.Future):
+                    try:
+                        _ = _f.exception()
+                    except Exception:
+                        pass
+
+                fut.add_done_callback(_consume_future_exception)
                 self._inflight[key] = fut
                 owner = True
-                try:
-                    fut.add_done_callback(self._consume_future_exception)
-                except Exception:
-                    pass
             else:
                 owner = False
 
@@ -5308,10 +5311,19 @@ class _AsyncPriceCache:
 
         try:
             p, src = await fetch_coro()
-            if p is None:
-                raise PriceUnavailableError("cache fetch returned None")
             async with self._mu:
-                self._data[key] = (float(p), str(src), time.time())
+                now = time.time()
+                if p is None:
+                    # Negative cache instead of raising: this is a normal transient state.
+                    self._neg[key] = (str(src), now)
+                    if not fut.done():
+                        fut.set_result((None, str(src)))
+                    self._inflight.pop(key, None)
+                    return None, str(src)
+
+                self._data[key] = (float(p), str(src), now)
+                # Clear negative cache on success
+                self._neg.pop(key, None)
                 if not fut.done():
                     fut.set_result((float(p), str(src)))
                 self._inflight.pop(key, None)
@@ -7769,6 +7781,8 @@ class Backend:
             c = self._price_cache.get(ex, market, symbol)
             if c is not None:
                 p, src = c
+                if p is None:
+                    return None, str(src)
                 return float(p), str(src)
         except Exception:
             pass
@@ -7779,6 +7793,8 @@ class Backend:
 
         try:
             p, src = await self._price_cache.get_or_fetch(ex, market, symbol, _do)
+            if p is None:
+                return None, str(src)
             return float(p), str(src)
         except Exception:
             return None, ex.upper()
@@ -7968,7 +7984,7 @@ class Backend:
             # cache (may have BINANCE_REST from a recent fetch)
             try:
                 c = self._price_cache.get("binance", market, signal.symbol)
-                if c is not None and _is_reasonable(c[0]):
+                if c is not None and c[0] is not None and _is_reasonable(c[0]):
                     return float(c[0]), str(c[1])
             except Exception:
                 pass
