@@ -3398,8 +3398,19 @@ def _trade_card_text(uid: int, t: dict) -> str:
             hit_tp2 = bool(t.get('hit_tp2')) or st in ('WIN','TP2')
 
             checks = []
-            if t.get('sl') is not None:
-                checks.append(f"SL: {'✅' if hit_sl else '❌'}")
+            # In TP1 state we show BE + HARD_SL instead of original SL
+            if st == 'TP1':
+                # BE check (always relevant after TP1)
+                if t.get('be_price_f') is not None or t.get('be_price') is not None:
+                    hit_be = bool(t.get('hit_be'))
+                    checks.append(f"BE: {'✅' if hit_be else '❌'}")
+                # HARD SL check (mainly for futures)
+                if market != 'SPOT' and (t.get('hard_sl_price_f') is not None):
+                    hit_hsl = bool(t.get('hit_hard_sl'))
+                    checks.append(f"HARD_SL: {'✅' if hit_hsl else '❌'}")
+            else:
+                if t.get('sl') is not None:
+                    checks.append(f"SL: {'✅' if hit_sl else '❌'}")
             if t.get('tp1') is not None:
                 checks.append(f"{tr(uid, 'lbl_tp1')}: {'✅' if hit_tp1 else '❌'}")
             if t.get('tp2') is not None and float(t.get('tp2') or 0) > 0:
