@@ -96,6 +96,23 @@ async def ensure_schema() -> None:
         );
         """)
 
+        # --- widen trades.status CHECK constraint to include HARD_SL (migration-safe) ---
+        # Older DBs were created with a limited CHECK(...) list and will reject status='HARD_SL'.
+        try:
+            await conn.execute("ALTER TABLE trades DROP CONSTRAINT IF EXISTS trades_status_check;")
+        except Exception:
+            pass
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE trades
+                ADD CONSTRAINT trades_status_check
+                CHECK (status IN ('ACTIVE','TP1','BE','WIN','LOSS','CLOSED','HARD_SL'));
+                """
+            )
+        except Exception:
+            pass
+
         # --- Signal bot global settings (single row) ---
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS signal_bot_settings (
