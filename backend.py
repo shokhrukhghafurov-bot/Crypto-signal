@@ -7779,10 +7779,24 @@ class Backend:
         try:
             await db_store.close_trade(trade_id, status="CLOSED", price=close_price, pnl_total_pct=float(row.get("pnl_total_pct") or 0.0))
             self._sl_breach_since.pop(trade_id, None)
+            try:
+                if hasattr(self, "_tp1_peak_px"):
+                    self._tp1_peak_px.pop(trade_id, None)
+                if hasattr(self, "_be_skip_until"):
+                    self._be_skip_until.pop(trade_id, None)
+            except Exception:
+                pass
         except Exception:
             # best effort
             await db_store.close_trade(trade_id, status="CLOSED")
             self._sl_breach_since.pop(trade_id, None)
+            try:
+                if hasattr(self, "_tp1_peak_px"):
+                    self._tp1_peak_px.pop(trade_id, None)
+                if hasattr(self, "_be_skip_until"):
+                    self._be_skip_until.pop(trade_id, None)
+            except Exception:
+                pass
         return True
 
 
@@ -8557,6 +8571,13 @@ class Backend:
                         close_px = float(s.entry or 0.0)
                         await db_store.close_trade(trade_id, status="CLOSED", price=close_px, pnl_total_pct=float(row.get("pnl_total_pct") or 0.0) if row.get("pnl_total_pct") is not None else 0.0)
                         self._sl_breach_since.pop(trade_id, None)
+                        try:
+                            if hasattr(self, "_tp1_peak_px"):
+                                self._tp1_peak_px.pop(trade_id, None)
+                            if hasattr(self, "_be_skip_until"):
+                                self._be_skip_until.pop(trade_id, None)
+                        except Exception:
+                            pass
                         self._price_fail_since.pop(trade_id, None)
                         continue
 
@@ -8603,6 +8624,13 @@ class Backend:
                         await db_store.close_trade(trade_id, status="WIN", price=float(s.tp2), pnl_total_pct=float(pnl))
                         self._sl_breach_since.pop(trade_id, None)
                         try:
+                            if hasattr(self, "_tp1_peak_px"):
+                                self._tp1_peak_px.pop(trade_id, None)
+                            if hasattr(self, "_be_skip_until"):
+                                self._be_skip_until.pop(trade_id, None)
+                        except Exception:
+                            pass
+                        try:
                             await _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=True)
                         except Exception:
                             pass
@@ -8622,6 +8650,13 @@ class Backend:
                                 continue
                         else:
                             self._sl_breach_since.pop(trade_id, None)
+                            try:
+                                if hasattr(self, "_tp1_peak_px"):
+                                    self._tp1_peak_px.pop(trade_id, None)
+                                if hasattr(self, "_be_skip_until"):
+                                    self._be_skip_until.pop(trade_id, None)
+                            except Exception:
+                                pass
                     else:
                         breached = False
 
@@ -8643,6 +8678,13 @@ class Backend:
                         await safe_send(bot, uid, txt, ctx="msg_auto_loss")
                         await db_store.close_trade(trade_id, status="LOSS", price=float(s.sl), pnl_total_pct=float(pnl))
                         self._sl_breach_since.pop(trade_id, None)
+                        try:
+                            if hasattr(self, "_tp1_peak_px"):
+                                self._tp1_peak_px.pop(trade_id, None)
+                            if hasattr(self, "_be_skip_until"):
+                                self._be_skip_until.pop(trade_id, None)
+                        except Exception:
+                            pass
                         try:
                             await _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=False)
                         except Exception:
@@ -8703,6 +8745,13 @@ class Backend:
                             pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(hard_sl), close_reason="HARD_SL")
                             await db_store.close_trade(trade_id, status="HARD_SL", price=float(hard_sl), pnl_total_pct=float(pnl))
                             self._sl_breach_since.pop(trade_id, None)
+                            try:
+                                if hasattr(self, "_tp1_peak_px"):
+                                    self._tp1_peak_px.pop(trade_id, None)
+                                if hasattr(self, "_be_skip_until"):
+                                    self._be_skip_until.pop(trade_id, None)
+                            except Exception:
+                                pass
                             try:
                                 await _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=False)
                             except Exception:
@@ -8780,6 +8829,13 @@ class Backend:
                                     await db_store.close_trade(trade_id, status="BE", price=float(be_lvl), pnl_total_pct=float(pnl))
                                     self._sl_breach_since.pop(trade_id, None)
                                     try:
+                                        if hasattr(self, "_tp1_peak_px"):
+                                            self._tp1_peak_px.pop(trade_id, None)
+                                        if hasattr(self, "_be_skip_until"):
+                                            self._be_skip_until.pop(trade_id, None)
+                                    except Exception:
+                                        pass
+                                    try:
                                         await _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=False)
                                     except Exception:
                                         pass
@@ -8804,6 +8860,13 @@ class Backend:
                         await safe_send(bot, uid, txt, ctx="msg_auto_win")
                         await db_store.close_trade(trade_id, status="WIN", price=float(s.tp2), pnl_total_pct=float(pnl))
                         self._sl_breach_since.pop(trade_id, None)
+                        try:
+                            if hasattr(self, "_tp1_peak_px"):
+                                self._tp1_peak_px.pop(trade_id, None)
+                            if hasattr(self, "_be_skip_until"):
+                                self._be_skip_until.pop(trade_id, None)
+                        except Exception:
+                            pass
                         continue
 
                 except Exception:
