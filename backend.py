@@ -5,6 +5,10 @@ import json
 from pathlib import Path
 import os
 
+
+# Enable verbose price source / fallback logging
+PRICE_DEBUG = os.getenv('PRICE_DEBUG', '0').strip().lower() in ('1','true','yes','on')
+
 # --- MID extra entry filters (anti-late-entry / RSI / VWAP distance / climax) ---
 MID_LATE_ENTRY_ATR_MAX = float(os.getenv("MID_LATE_ENTRY_ATR_MAX", "2.2"))   # (close - recent_low)/ATR_30m
 MID_RSI_LONG_MAX = float(os.getenv("MID_RSI_LONG_MAX", "62"))               # RSI(5m) for LONG must be <
