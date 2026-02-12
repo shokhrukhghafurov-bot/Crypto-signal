@@ -8164,7 +8164,7 @@ class Backend:
             if _is_reasonable(p):
                 return float(p), "MEXC_PUBLIC"
             return None, "MEXC"
-        async def get_gateio() ->
+        async def get_gateio() -> tuple[float | None, str]:
             # websocket first (spot-only)
             if market == "SPOT":
                 try:
@@ -8174,7 +8174,6 @@ class Backend:
                         return float(latest), "GATEIO_WS"
                 except Exception:
                     pass
- tuple[float | None, str]:
             if market != "SPOT":
                 return None, "GATEIO"
 
