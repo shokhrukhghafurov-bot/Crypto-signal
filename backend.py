@@ -4461,15 +4461,21 @@ def open_metrics(sig: "Signal") -> dict:
 
 
 
-def _price_debug_block(uid: int, *, price: float, source: str, side: str, sl: float | None, tp1: float | None, tp2: float | None) -> str:
+def _price_debug_block(uid: int, *, price: float, source: str, side: str, sl: float | None, tp1: float | None, tp2: float | None, sl_label_key: str | None = None) -> str:
+    """Human-readable debug block for a trade.
+
+    Important: all visible labels must come from i18n (see i18n.json keys).
+    """
     try:
         price_f = float(price)
     except Exception:
         return ""
 
     side_u = (side or "LONG").upper()
+
     def hit_tp(lvl: float) -> bool:
         return price_f >= lvl if side_u == "LONG" else price_f <= lvl
+
     def hit_sl(lvl: float) -> bool:
         return price_f <= lvl if side_u == "LONG" else price_f >= lvl
 
@@ -4477,19 +4483,29 @@ def _price_debug_block(uid: int, *, price: float, source: str, side: str, sl: fl
         f"💹 {_tr(uid, 'lbl_price_now')}: {price_f:.6f}",
         f"🔌 {_tr(uid, 'lbl_price_src')}: {source}",
     ]
-    checks = []
+
+    checks: list[str] = []
+
+    # SL / BE label override (e.g. after TP1 we may want to show BE instead of SL)
+    sl_key = (sl_label_key or "lbl_sl").strip() if isinstance(sl_label_key, str) else "lbl_sl"
+    sl_lbl = _tr(uid, sl_key)
+
     if sl is not None and float(sl) > 0:
         lvl = float(sl)
-        checks.append(f"SL: {lvl:.6f} {'✅' if hit_sl(lvl) else '❌'}")
+        checks.append(f"{sl_lbl}: {lvl:.6f} {'✅' if hit_sl(lvl) else '❌'}")
+
     if tp1 is not None and float(tp1) > 0:
         lvl = float(tp1)
         checks.append(f"{_tr(uid, 'lbl_tp1')}: {lvl:.6f} {'✅' if hit_tp(lvl) else '❌'}")
+
     if tp2 is not None and float(tp2) > 0:
         lvl = float(tp2)
-        checks.append(f"TP2: {lvl:.6f} {'✅' if hit_tp(lvl) else '❌'}")
+        checks.append(f"{_tr(uid, 'lbl_tp2')}: {lvl:.6f} {'✅' if hit_tp(lvl) else '❌'}")
+
     if checks:
-        lines.append(f"🧪 {_tr(uid, 'lbl_check')}:" )
+        lines.append(f"🧪 {_tr(uid, 'lbl_check')}:")
         lines.extend(["• " + c for c in checks])
+
     return "\n".join(lines)
 
 
@@ -8603,6 +8619,7 @@ class Backend:
                         sl=effective_sl,
                         tp1=(float(s.tp1) if s.tp1 else None),
                         tp2=(float(s.tp2) if s.tp2 else None),
+                        sl_label_key=('lbl_be' if (tp1_hit and be_armed) else 'lbl_sl'),
                     )
                     # 1) Before TP1: TP2 (gap) -> WIN
                     if not tp1_hit and s.tp2 and hit_tp(float(s.tp2)):
