@@ -7,6 +7,7 @@ def utcnow():
 import asyncpg
 import datetime as dt
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 _pool: Optional[asyncpg.Pool] = None
@@ -1314,12 +1315,31 @@ async def close_signal_track(*, signal_id: int, status: str, pnl_total_pct: floa
 
 
 async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
-    """Aggregate bot-level signal outcomes in [since, until)."""
+    """Aggregate bot-level signal outcomes.
+
+    Dashboard expectation: compare **signals sent** vs **signals closed** for the *same cohort*.
+
+    Many systems bucket outcomes by `closed_at` ("what closed today"). But your admin UI is labeled
+    like "Signals sent" vs "Signals closed (outcomes)", so the natural expectation is:
+
+      "From the signals we SENT in this period, how many of them have already closed and with what result."
+
+    Therefore default bucketing is **cohort-based by opened_at**.
+
+    Switch to legacy behavior via env:
+        SIGNAL_STATS_BUCKET_BY=closed
+
+    Allowed values: opened | closed
+    """
     market = str(market or "").upper()
     if market not in ("SPOT", "FUTURES"):
         market = "SPOT"
-    # In some startup/error scenarios the pool might not be initialized yet.
-    # The dashboard endpoint should not crash in that case; return empty stats.
+
+    bucket_by = (os.getenv("SIGNAL_STATS_BUCKET_BY", "opened") or "opened").strip().lower()
+    if bucket_by not in ("opened", "closed"):
+        bucket_by = "opened"
+
+    # If DB not ready, be safe for dashboard.
     try:
         pool = get_pool()
     except Exception:
@@ -1332,39 +1352,35 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
             "tp1_hits": 0,
             "sum_pnl_pct": 0.0,
         }
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
+
+    if bucket_by == "opened":
+        # Cohort: signals opened in [since,until), count terminal outcomes regardless of when they closed.
+        where_trade = "opened_at >= $2 AND opened_at < $3 AND status IN ('WIN','LOSS','BE','CLOSED') AND closed_at IS NOT NULL"
+        where_tp1 = "opened_at >= $2 AND opened_at < $3 AND tp1_hit=TRUE"
+    else:
+        # Legacy: count outcomes that closed within [since,until)
+        where_trade = "status IN ('WIN','LOSS','BE','CLOSED') AND closed_at IS NOT NULL AND closed_at >= $2 AND closed_at < $3"
+        where_tp1 = "tp1_hit=TRUE AND tp1_hit_at IS NOT NULL AND tp1_hit_at >= $2 AND tp1_hit_at < $3"
+
+    q = f"""
             SELECT
-              -- IMPORTANT: use the actual close timestamp.
-              -- Using updated_at can skew stats (e.g., background updates after close).
-              COUNT(*) FILTER (WHERE status IN ('WIN','LOSS','BE','CLOSED')
-                               AND closed_at IS NOT NULL
-                               AND closed_at >= $2 AND closed_at < $3)::int AS trades,
-              COUNT(*) FILTER (WHERE status='WIN'
-                               AND closed_at IS NOT NULL
-                               AND closed_at >= $2 AND closed_at < $3)::int AS wins,
-              COUNT(*) FILTER (WHERE status='LOSS'
-                               AND closed_at IS NOT NULL
-                               AND closed_at >= $2 AND closed_at < $3)::int AS losses,
-              COUNT(*) FILTER (WHERE status='BE'
-                               AND closed_at IS NOT NULL
-                               AND closed_at >= $2 AND closed_at < $3)::int AS be,
-              COUNT(*) FILTER (WHERE status='CLOSED'
-                               AND closed_at IS NOT NULL
-                               AND closed_at >= $2 AND closed_at < $3)::int AS closes,
-              COUNT(*) FILTER (WHERE tp1_hit=TRUE  AND tp1_hit_at >= $2 AND tp1_hit_at < $3)::int AS tp1_hits,
-              COALESCE(SUM(CASE WHEN status IN ('WIN','LOSS','BE','CLOSED')
-                                AND closed_at IS NOT NULL
-                                AND closed_at >= $2 AND closed_at < $3
-                                THEN COALESCE(pnl_total_pct,0) ELSE 0 END),0)::float AS sum_pnl_pct
+              COUNT(*) FILTER (WHERE {where_trade})::int AS trades,
+              COUNT(*) FILTER (WHERE {where_trade} AND status='WIN')::int AS wins,
+              COUNT(*) FILTER (WHERE {where_trade} AND status='LOSS')::int AS losses,
+              COUNT(*) FILTER (WHERE {where_trade} AND status='BE')::int AS be,
+              COUNT(*) FILTER (WHERE {where_trade} AND status='CLOSED')::int AS closes,
+              COUNT(*) FILTER (WHERE {where_tp1})::int AS tp1_hits,
+              COALESCE(SUM(CASE
+                    WHEN {where_trade} THEN COALESCE(pnl_total_pct,0)
+                    ELSE 0
+                  END),0)::float AS sum_pnl_pct
             FROM signal_tracks
             WHERE market=$1;
-            """,
-            market,
-            since,
-            until,
-        )
+            """
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(q, market, since, until)
+
     if not row:
         return {"trades": 0, "wins": 0, "losses": 0, "be": 0, "closes": 0, "tp1_hits": 0, "sum_pnl_pct": 0.0}
     return {
@@ -1372,11 +1388,11 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
         "wins": int(row.get("wins") or 0),
         "losses": int(row.get("losses") or 0),
         "be": int(row.get("be") or 0),
-        # Manual/forced closes (status='CLOSED')
         "closes": int(row.get("closes") or 0),
         "tp1_hits": int(row.get("tp1_hits") or 0),
         "sum_pnl_pct": float(row.get("sum_pnl_pct") or 0.0),
     }
+
 
 
 async def trade_perf_bucket_global(market: str, *, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
