@@ -4698,8 +4698,8 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
             if side.upper() == "LONG":
                 if rsi_5m >= MID_RSI_LONG_MAX:
                     return f"rsi_long={rsi_5m:.1f} >= {MID_RSI_LONG_MAX:g}"
-                if rsi_5m <= MID_RSI_LONG_MIN:
-                    return f"rsi_long={rsi_5m:.1f} <= {MID_RSI_LONG_MIN:g}"
+                if rsi_5m < MID_RSI_LONG_MIN:
+                    return f"rsi_long={rsi_5m:.1f} < {MID_RSI_LONG_MIN:g}"
             else:  # SHORT
                 if rsi_5m <= MID_RSI_SHORT_MIN:
                     return f"rsi_short={rsi_5m:.1f} <= {MID_RSI_SHORT_MIN:g}"
