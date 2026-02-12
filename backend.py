@@ -8043,6 +8043,13 @@ class Backend:
         if mode not in ("BINANCE", "BYBIT", "MEDIAN"):
             mode = "MEDIAN"
 
+        def _pdbg(msg: str):
+            if PRICE_DEBUG:
+                try:
+                    logger.info(f"[price] {market} {signal.symbol}: {msg}")
+                except Exception:
+                    pass
+
         def _is_reasonable(p: float | None) -> bool:
             """Sanity filter to avoid using bad ticks (e.g., 0.0) that can
             accidentally distort MEDIAN logic and trigger false TP/SL hits.
@@ -8079,6 +8086,7 @@ class Backend:
                     elif src == "REST":
                         src = "BINANCE_REST"
                     if _is_reasonable(float(latest)):
+                        _pdbg(f"BINANCE WS hit p={latest} src={src}")
                         return float(latest), str(src)
             except Exception:
                 pass
@@ -8111,6 +8119,7 @@ class Backend:
                 await self.feed.ensure_stream(market, signal.symbol, ex="bybit")
                 latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="bybit")
                 if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
+                    _pdbg(f"BYBIT WS hit p={latest}")
                     return float(latest), "BYBIT_WS"
             except Exception:
                 pass
@@ -8127,6 +8136,7 @@ class Backend:
                 await self.feed.ensure_stream(market, signal.symbol, ex="okx")
                 latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="okx")
                 if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
+                    _pdbg(f"OKX WS hit p={latest}")
                     return float(latest), "OKX_WS"
             except Exception:
                 pass
@@ -8144,6 +8154,7 @@ class Backend:
                     await self.feed.ensure_stream(market, signal.symbol, ex="mexc")
                     latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="mexc")
                     if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
+                        _pdbg(f"MEXC WS hit p={latest}")
                         return float(latest), "MEXC_WS"
                 except Exception:
                     pass
@@ -8171,6 +8182,7 @@ class Backend:
                     await self.feed.ensure_stream(market, signal.symbol, ex="gateio")
                     latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="gateio")
                     if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
+                        _pdbg(f"GATEIO WS hit p={latest}")
                         return float(latest), "GATEIO_WS"
                 except Exception:
                     pass
@@ -8229,8 +8241,11 @@ class Backend:
             return None, n
 
         if mode == "MEDIAN":
+            _pdbg("mode=MEDIAN; trying BINANCE then BYBIT for median")
             b, bsrc = await get_binance()
+            _pdbg(f"BINANCE result: p={b} src={bsrc}")
             y, ysrc = await get_bybit()
+            _pdbg(f"BYBIT result: p={y} src={ysrc}")
             if _is_reasonable(b) and _is_reasonable(y):
                 try:
                     med = float(statistics.median([float(b), float(y)]))
@@ -8243,9 +8258,13 @@ class Backend:
                 return float(y), ysrc
 
         # Normal fallback chain: try each exchange (WS inside), then its REST/public fallback (inside)
+        _pdbg(f"fallback chain order={'+'.join(chain)} mode={mode}")
         for exname in chain:
+            _pdbg(f"try {exname} ...")
             p, src = await _get_one(exname)
+            _pdbg(f"{exname} -> p={p} src={src}")
             if _is_reasonable(p):
+                _pdbg(f"SELECTED {exname} src={src} p={p}")
                 return float(p), str(src)
 
         raise PriceUnavailableError("all price sources failed")
