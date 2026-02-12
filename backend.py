@@ -8753,8 +8753,6 @@ class Backend:
                                 closed_time=fmt_dt_msk(now_utc),
                                 status="HARD_SL",
                             )
-                            if txt == "msg_auto_loss":
-                                txt = f"🔴 HARD SL\n\n{s.symbol} | {market}\nSL: {float(hard_sl):.6f}"
                             if dbg:
                                 txt += "\n\n" + dbg
                             await safe_send(bot, uid, txt, ctx="msg_auto_loss")
