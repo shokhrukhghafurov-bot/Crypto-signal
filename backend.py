@@ -5130,72 +5130,174 @@ class MacroCalendar:
 
 # ------------------ Price feed (WS, Binance) ------------------
 class PriceFeed:
-    def __init__(self) -> None:
-        self._prices: Dict[Tuple[str, str], float] = {}
-        self._sources: Dict[Tuple[str, str], str] = {}
-        self._ts: Dict[Tuple[str, str], float] = {}
-        self._tasks: Dict[Tuple[str, str], asyncio.Task] = {}
+    """Lightweight WS price feed with per-exchange streams.
 
-    def get_latest(self, market: str, symbol: str, *, max_age_sec: float | None = None) -> Optional[float]:
-        key = (market.upper(), symbol.upper())
+    Stores latest trade price and timestamp for (exchange, market, symbol).
+    Backwards compatible: if exchange is omitted, defaults to BINANCE.
+    """
+
+    def __init__(self) -> None:
+        self._prices: Dict[Tuple[str, str, str], float] = {}
+        self._sources: Dict[Tuple[str, str, str], str] = {}
+        self._ts: Dict[Tuple[str, str, str], float] = {}
+        self._tasks: Dict[Tuple[str, str, str], asyncio.Task] = {}
+
+    def _key(self, ex: str, market: str, symbol: str) -> Tuple[str, str, str]:
+        return (str(ex or "binance").lower().strip(), market.upper(), symbol.upper())
+
+    def get_latest(self, market: str, symbol: str, *, max_age_sec: float | None = None, ex: str = "binance") -> Optional[float]:
+        key = self._key(ex, market, symbol)
         p = self._prices.get(key)
         if p is None:
             return None
         if max_age_sec is not None:
-            try:
-                ts = float(self._ts.get(key, 0.0) or 0.0)
-            except Exception:
-                ts = 0.0
-            if ts <= 0 or (time.time() - ts) > float(max_age_sec):
+            ts = self._ts.get(key)
+            if ts is None or (time.time() - ts) > float(max_age_sec):
                 return None
-        return p
+        return float(p)
 
-    def get_latest_source(self, market: str, symbol: str) -> Optional[str]:
-        return self._sources.get((market.upper(), symbol.upper()))
+    def get_latest_source(self, market: str, symbol: str, *, ex: str = "binance") -> Optional[str]:
+        return self._sources.get(self._key(ex, market, symbol))
 
-    def get_latest_ts(self, market: str, symbol: str) -> Optional[float]:
-        return self._ts.get((market.upper(), symbol.upper()))
-
-    def _set_latest(self, market: str, symbol: str, price: float, source: str = "WS") -> None:
-        key = (market.upper(), symbol.upper())
+    def _set_latest(self, market: str, symbol: str, price: float, *, source: str = "WS", ex: str = "binance") -> None:
+        key = self._key(ex, market, symbol)
         self._prices[key] = float(price)
         self._sources[key] = str(source or "WS")
         self._ts[key] = time.time()
 
-    async def ensure_stream(self, market: str, symbol: str) -> None:
-        key = (market.upper(), symbol.upper())
+    async def ensure_stream(self, market: str, symbol: str, ex: str = "binance") -> None:
+        key = self._key(ex, market, symbol)
         t = self._tasks.get(key)
         if t and not t.done():
             return
-        self._tasks[key] = asyncio.create_task(self._run_stream(market, symbol))
+        self._tasks[key] = asyncio.create_task(self._run_stream(ex, market, symbol))
 
-    async def _run_stream(self, market: str, symbol: str) -> None:
-        m = market.upper()
-        sym = symbol.lower()
-        url = f"wss://stream.binance.com:9443/ws/{sym}@trade" if m == "SPOT" else f"wss://fstream.binance.com/ws/{sym}@trade"
+    # ---- WS helpers ----
+    def _okx_inst(self, market: str, symbol: str) -> str:
+        sym = (symbol or "").upper()
+        # BTCUSDT -> BTC-USDT
+        if sym.endswith("USDT"):
+            base, quote = sym[:-4], "USDT"
+        elif sym.endswith("USDC"):
+            base, quote = sym[:-4], "USDC"
+        else:
+            # naive split: last 3/4 as quote. fallback: raw
+            base, quote = sym[:-3], sym[-3:]
+            if len(sym) >= 4 and sym[-4:] in ("USDT", "USDC"):
+                base, quote = sym[:-4], sym[-4:]
+        inst = f"{base}-{quote}"
+        m = (market or "FUTURES").upper()
+        if m != "SPOT":
+            # OKX perpetual swap for USDT/USDC pairs is commonly *-SWAP
+            inst = inst + "-SWAP"
+        return inst
+
+    async def _run_stream(self, ex: str, market: str, symbol: str) -> None:
+        ex0 = str(ex or "binance").lower().strip()
+        m = (market or "FUTURES").upper()
+        sym_u = (symbol or "").upper()
+        sym_l = sym_u.lower()
+
         backoff = 1
         while True:
             try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
-                    backoff = 1
-                    async for msg in ws:
-                        data = json.loads(msg)
-                        p = data.get("p")
-                        if p is not None:
-                            self._set_latest(m, symbol, float(p), source="WS")
+                if ex0 == "binance":
+                    url = f"wss://stream.binance.com:9443/ws/{sym_l}@trade" if m == "SPOT" else f"wss://fstream.binance.com/ws/{sym_l}@trade"
+                    async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                        backoff = 1
+                        async for msg in ws:
+                            data = json.loads(msg)
+                            p = data.get("p")
+                            if p is not None:
+                                self._set_latest(m, sym_u, float(p), source="WS", ex="binance")
+
+                elif ex0 == "bybit":
+                    # Bybit v5 public streams. linear for futures, spot for spot.
+                    url = "wss://stream.bybit.com/v5/public/spot" if m == "SPOT" else "wss://stream.bybit.com/v5/public/linear"
+                    sub = {"op": "subscribe", "args": [f"publicTrade.{sym_u}"]}
+                    async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                        await ws.send(json.dumps(sub))
+                        backoff = 1
+                        async for msg in ws:
+                            data = json.loads(msg)
+                            # v5: {"topic":"publicTrade.BTCUSDT","data":[{"p":"..."}]}
+                            arr = data.get("data")
+                            if isinstance(arr, list) and arr:
+                                p = arr[0].get("p") or arr[0].get("price")
+                                if p is not None:
+                                    self._set_latest(m, sym_u, float(p), source="WS", ex="bybit")
+
+                elif ex0 == "okx":
+                    url = "wss://ws.okx.com:8443/ws/v5/public"
+                    inst = self._okx_inst(m, sym_u)
+                    sub = {"op": "subscribe", "args": [{"channel": "trades", "instId": inst}]}
+                    async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                        await ws.send(json.dumps(sub))
+                        backoff = 1
+                        async for msg in ws:
+                            data = json.loads(msg)
+                            # {"arg":{"channel":"trades"...},"data":[{"px":"..."}]}
+                            arr = data.get("data")
+                            if isinstance(arr, list) and arr:
+                                p = arr[0].get("px") or arr[0].get("price")
+                                if p is not None:
+                                    self._set_latest(m, sym_u, float(p), source="WS", ex="okx")
+
+                elif ex0 == "gateio":
+                    # Gate.io WS v4. Spot-only used in this project.
+                    if m != "SPOT":
+                        raise Exception("gateio ws only spot")
+                    url = "wss://api.gateio.ws/ws/v4/"
+                    sub = {"time": int(time.time()), "channel": "spot.trades", "event": "subscribe", "payload": [sym_u]}
+                    async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                        await ws.send(json.dumps(sub))
+                        backoff = 1
+                        async for msg in ws:
+                            data = json.loads(msg)
+                            res = data.get("result")
+                            if isinstance(res, dict):
+                                p = res.get("price")
+                                if p is not None:
+                                    self._set_latest(m, sym_u, float(p), source="WS", ex="gateio")
+                            elif isinstance(res, list) and res:
+                                # sometimes result is list of trades
+                                p = res[0].get("price") if isinstance(res[0], dict) else None
+                                if p is not None:
+                                    self._set_latest(m, sym_u, float(p), source="WS", ex="gateio")
+
+                elif ex0 == "mexc":
+                    # MEXC public WS (spot). Futures not used here.
+                    if m != "SPOT":
+                        raise Exception("mexc ws only spot")
+                    url = "wss://wbs.mexc.com/ws"
+                    # channel: "spot@public.deals.v3.api@{symbol}"
+                    sub = {"method": "SUBSCRIPTION", "params": [f"spot@public.deals.v3.api@{sym_u}"]}
+                    async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                        await ws.send(json.dumps(sub))
+                        backoff = 1
+                        async for msg in ws:
+                            data = json.loads(msg)
+                            d = data.get("data") or {}
+                            deals = d.get("deals") if isinstance(d, dict) else None
+                            if isinstance(deals, list) and deals:
+                                p = deals[0].get("p") or deals[0].get("price")
+                                if p is not None:
+                                    self._set_latest(m, sym_u, float(p), source="WS", ex="mexc")
+                else:
+                    raise Exception(f"unknown exchange ws: {ex0}")
+
             except Exception:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
 
     def mock_price(self, market: str, symbol: str, base: float | None = None) -> float:
-        key = ("MOCK:" + market.upper(), symbol.upper())
+        key = ("mock", market.upper(), symbol.upper())
         seed = (float(base) if base is not None and base > 0 else None)
         price = self._prices.get(key, seed if seed is not None else random.uniform(100, 50000))
         price *= random.uniform(0.996, 1.004)
         self._prices[key] = price
         self._sources[key] = "MOCK"
         return price
-
 
 # ------------------ Price caching + REST limiting ------------------
 class _RestLimiter:
@@ -7968,7 +8070,7 @@ class Backend:
         async def get_binance() -> tuple[float | None, str]:
             # websocket first, then cache, then REST fallback
             try:
-                await self.feed.ensure_stream(market, signal.symbol)
+                await self.feed.ensure_stream(market, signal.symbol, ex="binance")
                 latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec)
                 if latest is not None and float(latest) > 0:
                     src = self.feed.get_latest_source(market, signal.symbol) or "BINANCE_WS"
@@ -8004,6 +8106,15 @@ class Backend:
                 return float(rest), "BINANCE_REST"
             return None, "BINANCE"
         async def get_bybit() -> tuple[float | None, str]:
+            # websocket first
+            try:
+                await self.feed.ensure_stream(market, signal.symbol, ex="bybit")
+                latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="bybit")
+                if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
+                    return float(latest), "BYBIT_WS"
+            except Exception:
+                pass
+
             async def _fetch():
                 return await self._fetch_bybit_price(market, signal.symbol)
             p, _src = await self._price_cached("bybit", market, signal.symbol, _fetch, src_label="BYBIT_REST")
@@ -8011,6 +8122,15 @@ class Backend:
                 return float(p), "BYBIT_REST"
             return None, "BYBIT"
         async def get_okx() -> tuple[float | None, str]:
+            # websocket first
+            try:
+                await self.feed.ensure_stream(market, signal.symbol, ex="okx")
+                latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="okx")
+                if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
+                    return float(latest), "OKX_WS"
+            except Exception:
+                pass
+
             async def _fetch():
                 return await self._fetch_okx_price(market, signal.symbol)
             p, _src = await self._price_cached("okx", market, signal.symbol, _fetch, src_label="OKX_REST")
@@ -8018,6 +8138,16 @@ class Backend:
                 return float(p), "OKX_REST"
             return None, "OKX"
         async def get_mexc() -> tuple[float | None, str]:
+            # websocket first (spot-only)
+            if market == "SPOT":
+                try:
+                    await self.feed.ensure_stream(market, signal.symbol, ex="mexc")
+                    latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="mexc")
+                    if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
+                        return float(latest), "MEXC_WS"
+                except Exception:
+                    pass
+
             # MEXC/Gate are SPOT-only fallbacks for price.
             if market != "SPOT":
                 return None, "MEXC"
@@ -8034,7 +8164,17 @@ class Backend:
             if _is_reasonable(p):
                 return float(p), "MEXC_PUBLIC"
             return None, "MEXC"
-        async def get_gateio() -> tuple[float | None, str]:
+        async def get_gateio() ->
+            # websocket first (spot-only)
+            if market == "SPOT":
+                try:
+                    await self.feed.ensure_stream(market, signal.symbol, ex="gateio")
+                    latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="gateio")
+                    if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
+                        return float(latest), "GATEIO_WS"
+                except Exception:
+                    pass
+ tuple[float | None, str]:
             if market != "SPOT":
                 return None, "GATEIO"
 
@@ -8051,91 +8191,65 @@ class Backend:
                 return float(p), "GATEIO_PUBLIC"
             return None, "GATEIO"
 
+
+        # Selection policy:
+        # 1) Prefer WS (BINANCE/Bybit/OKX/Gate/MEXC) in priority order
+        # 2) If all WS fail, use REST/public fallbacks (same order)
+        # 3) MEDIAN mode: prefer median of BINANCE and BYBIT when both available
+
+        spot_chain = ["BINANCE", "BYBIT", "OKX", "GATEIO", "MEXC"]
+        fut_chain = ["BINANCE", "BYBIT", "OKX"]
+        chain = spot_chain if market == "SPOT" else fut_chain
+
+        def _rotate(chain0: list[str], first: str) -> list[str]:
+            first = (first or "").upper()
+            if first in chain0:
+                i = chain0.index(first)
+                return chain0[i:] + chain0[:i]
+            return chain0
+
         if mode == "BINANCE":
-            b, bsrc = await get_binance()
-            if b is not None:
-                return float(b), bsrc
-            m1, msrc = await get_mexc()
-            if m1 is not None:
-                return float(m1), msrc
-            g1, gsrc = await get_gateio()
-            if g1 is not None:
-                return float(g1), gsrc
-            y, ysrc = await get_bybit()
-            if y is not None:
-                return float(y), ysrc
-            o, osrc = await get_okx()
-            if o is not None:
-                return float(o), osrc
-            m1, msrc = await get_mexc()
-            if m1 is not None:
-                return float(m1), msrc
-            g1, gsrc = await get_gateio()
-            if g1 is not None:
-                return float(g1), gsrc
-
+            chain = _rotate(chain, "BINANCE")
         elif mode == "BYBIT":
-            y, ysrc = await get_bybit()
-            if y is not None:
-                return float(y), ysrc
-            o, osrc = await get_okx()
-            if o is not None:
-                return float(o), osrc
-            b, bsrc = await get_binance()
-            if b is not None:
-                return float(b), bsrc
-        else:  # MEDIAN
-            b, bsrc = await get_binance()
-            y, ysrc = await get_bybit()
+            chain = _rotate(chain, "BYBIT")
+        else:
+            chain = chain  # MEDIAN handled below
 
-            b_ok = _is_reasonable(b)
-            y_ok = _is_reasonable(y)
+        async def _get_one(name: str) -> tuple[float | None, str]:
+            n = name.upper()
+            if n == "BINANCE":
+                return await get_binance()
+            if n == "BYBIT":
+                return await get_bybit()
+            if n == "OKX":
+                return await get_okx()
+            if n == "GATEIO":
+                return await get_gateio()
+            if n == "MEXC":
+                return await get_mexc()
+            return None, n
 
-            if b_ok and y_ok:
-                fb = float(b)
-                fy = float(y)
-                # If one exchange suddenly returns a very different price
-                # (or we somehow got a stale tick), don't average it —
-                # it can create a fake mid-price and trigger TP/SL.
+        if mode == "MEDIAN":
+            b, bsrc = await get_binance()
+            y, ysrc = await get_bybit()
+            if _is_reasonable(b) and _is_reasonable(y):
                 try:
-                    div = abs(fb - fy) / max(1e-12, min(fb, fy))
+                    med = float(statistics.median([float(b), float(y)]))
+                    return med, "MEDIAN(BINANCE+BYBIT)"
                 except Exception:
-                    div = 0.0
+                    pass
+            if _is_reasonable(b):
+                return float(b), bsrc
+            if _is_reasonable(y):
+                return float(y), ysrc
 
-                max_div = float(os.getenv("PRICE_MAX_DIVERGENCE_PCT", "0.05") or 0.05)
-                if max_div < 0:
-                    max_div = 0.0
+        # Normal fallback chain: try each exchange (WS inside), then its REST/public fallback (inside)
+        for exname in chain:
+            p, src = await _get_one(exname)
+            if _is_reasonable(p):
+                return float(p), str(src)
 
-                if div > max_div:
-                    if base is not None and base > 0:
-                        # choose the one closer to entry
-                        if abs(fb - base) <= abs(fy - base):
-                            return fb, "BINANCE_ONLY(DIVERGE)"
-                        return fy, "BYBIT_ONLY(DIVERGE)"
-                    # default preference: Binance
-                    return fb, "BINANCE_ONLY(DIVERGE)"
-
-                price = float(np.median([fb, fy]))
-                return price, "MEDIAN(BINANCE+BYBIT)"
-            if b_ok:
-                return float(b), "BINANCE_ONLY"
-            if y_ok:
-                return float(y), "BYBIT_ONLY"
-
-
-            o, osrc = await get_okx()
-            if _is_reasonable(o):
-                return float(o), "OKX_ONLY"
-
-            m1, msrc = await get_mexc()
-            if _is_reasonable(m1):
-                return float(m1), "MEXC_ONLY"
-            g1, gsrc = await get_gateio()
-            if _is_reasonable(g1):
-                return float(g1), "GATEIO_ONLY"
-
-
-        # All sources failed -> let caller decide (skip tick / forced CLOSE)
+        raise PriceUnavailableError("all price sources failed")
         raise PriceUnavailableError(f"price unavailable market={market} symbol={signal.symbol} mode={mode}")
 
     async def _get_price(self, signal: Signal) -> float:
