@@ -1362,25 +1362,33 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
             "sum_pnl_pct": 0.0,
         }
 
+    # IMPORTANT (dashboard correctness):
+    # The admin UI table shows outcomes as TP2/SL/BE/TP1 and does NOT have a separate column for manual CLOSE.
+    # Previously we included status='CLOSED' inside "trades", which made TRADES bigger than TP2+SL+BE (+TP1).
+    # To keep the widget consistent, we define:
+    #   - trades = terminal outcomes only (WIN/LOSS/BE)
+    #   - closes = manual/forced closes (status='CLOSED') returned separately
     if bucket_by == "opened":
         # Cohort: signals opened in [since,until), count terminal outcomes regardless of when they closed.
-        where_trade = "opened_at >= $2 AND opened_at < $3 AND status IN ('WIN','LOSS','BE','CLOSED') AND closed_at IS NOT NULL"
+        where_outcome = "opened_at >= $2 AND opened_at < $3 AND status IN ('WIN','LOSS','BE') AND closed_at IS NOT NULL"
+        where_close = "opened_at >= $2 AND opened_at < $3 AND status='CLOSED' AND closed_at IS NOT NULL"
         where_tp1 = "opened_at >= $2 AND opened_at < $3 AND tp1_hit=TRUE"
     else:
         # Legacy: count outcomes that closed within [since,until)
-        where_trade = "status IN ('WIN','LOSS','BE','CLOSED') AND closed_at IS NOT NULL AND closed_at >= $2 AND closed_at < $3"
+        where_outcome = "status IN ('WIN','LOSS','BE') AND closed_at IS NOT NULL AND closed_at >= $2 AND closed_at < $3"
+        where_close = "status='CLOSED' AND closed_at IS NOT NULL AND closed_at >= $2 AND closed_at < $3"
         where_tp1 = "tp1_hit=TRUE AND tp1_hit_at IS NOT NULL AND tp1_hit_at >= $2 AND tp1_hit_at < $3"
 
     q = f"""
             SELECT
-              COUNT(*) FILTER (WHERE {where_trade})::int AS trades,
-              COUNT(*) FILTER (WHERE {where_trade} AND status='WIN')::int AS wins,
-              COUNT(*) FILTER (WHERE {where_trade} AND status='LOSS')::int AS losses,
-              COUNT(*) FILTER (WHERE {where_trade} AND status='BE')::int AS be,
-              COUNT(*) FILTER (WHERE {where_trade} AND status='CLOSED')::int AS closes,
+              COUNT(*) FILTER (WHERE {where_outcome})::int AS trades,
+              COUNT(*) FILTER (WHERE {where_outcome} AND status='WIN')::int AS wins,
+              COUNT(*) FILTER (WHERE {where_outcome} AND status='LOSS')::int AS losses,
+              COUNT(*) FILTER (WHERE {where_outcome} AND status='BE')::int AS be,
+              COUNT(*) FILTER (WHERE {where_close})::int AS closes,
               COUNT(*) FILTER (WHERE {where_tp1})::int AS tp1_hits,
               COALESCE(SUM(CASE
-                    WHEN {where_trade} THEN COALESCE(pnl_total_pct,0)
+                    WHEN {where_outcome} THEN COALESCE(pnl_total_pct,0)
                     ELSE 0
                   END),0)::float AS sum_pnl_pct
             FROM signal_tracks
