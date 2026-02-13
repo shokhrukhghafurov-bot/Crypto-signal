@@ -325,7 +325,6 @@ _MID_TRAP_DIGEST_WINDOW_SEC = max(_mid_trap_window_env, 21600.0)  # force >= 6 h
 _MID_TRAP_DIGEST_MAX_REASONS = int(float(os.getenv("MID_TRAP_DIGEST_MAX_REASONS", "5") or 5))
 _MID_TRAP_DIGEST_EXAMPLES_PER_REASON = int(float(os.getenv("MID_TRAP_DIGEST_EXAMPLES_PER_REASON", "2") or 2))
 _MID_TRAP_DIGEST_MAX_EVENTS = int(float(os.getenv("MID_TRAP_DIGEST_MAX_EVENTS", "500") or 500))
-_MID_TRAP_DIGEST_FIRST_FLUSH_SEC = float(os.getenv("MID_TRAP_DIGEST_FIRST_FLUSH_SEC", "900") or 900)
 
 _mid_trap_events: list[dict] = []
 _mid_trap_lock = asyncio.Lock()
@@ -387,10 +386,7 @@ def _build_mid_trap_digest(events: list[dict]) -> str:
     return "\n".join(lines)
 async def _mid_trap_digest_loop() -> None:
     global _mid_trap_last_flush_ts
-    # First digest can be sent earlier (for visibility after deploy/restart), then switch to the regular window.
-    start_ts = time.time()
-    _mid_trap_last_flush_ts = start_ts
-    first_sent = False
+    _mid_trap_last_flush_ts = time.time()
     while True:
         await asyncio.sleep(5)
         if not _MID_TRAP_DIGEST_ENABLED:
@@ -398,14 +394,7 @@ async def _mid_trap_digest_loop() -> None:
         if not (_error_bot and ERROR_BOT_ENABLED):
             continue
         now = time.time()
-        threshold = _MID_TRAP_DIGEST_WINDOW_SEC
-        if not first_sent:
-            # allow earlier first digest after restart
-            try:
-                threshold = float(min(_MID_TRAP_DIGEST_WINDOW_SEC, max(30.0, _MID_TRAP_DIGEST_FIRST_FLUSH_SEC)))
-            except Exception:
-                threshold = _MID_TRAP_DIGEST_WINDOW_SEC
-        if (now - _mid_trap_last_flush_ts) < threshold:
+        if (now - _mid_trap_last_flush_ts) < _MID_TRAP_DIGEST_WINDOW_SEC:
             continue
         async with _mid_trap_lock:
             if not _mid_trap_events:
@@ -413,7 +402,6 @@ async def _mid_trap_digest_loop() -> None:
             events = list(_mid_trap_events)
             _mid_trap_events.clear()
             _mid_trap_last_flush_ts = now
-            first_sent = True
         try:
             await _error_bot_send(_build_mid_trap_digest(events))
         except Exception:
