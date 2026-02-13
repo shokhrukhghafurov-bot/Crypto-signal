@@ -775,10 +775,18 @@ async def list_user_trades(user_id: int, *, include_closed: bool = True, limit: 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""
-            SELECT id, user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl,
-                   status, tp1_hit, be_price, opened_at, closed_at, pnl_total_pct, orig_text
-            FROM trades
-            WHERE {where}
+            SELECT t.id, t.user_id, t.signal_id, t.market, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
+                   t.status, t.tp1_hit, t.be_price, t.opened_at, t.closed_at, t.pnl_total_pct, t.orig_text,
+                   e_tp1.tp1_at
+            FROM trades t
+            LEFT JOIN LATERAL (
+              SELECT e.created_at AS tp1_at
+              FROM trade_events e
+              WHERE e.trade_id=t.id AND e.event_type='TP1'
+              ORDER BY e.created_at DESC
+              LIMIT 1
+            ) e_tp1 ON TRUE
+            WHERE {where.replace('user_id=$1', 't.user_id=$1')}
             ORDER BY opened_at DESC
             LIMIT {int(limit)};
             """,
@@ -791,10 +799,18 @@ async def get_trade_by_user_signal(user_id: int, signal_id: int) -> Optional[Dic
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id, user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl,
-                   status, tp1_hit, be_price, opened_at, closed_at, pnl_total_pct, orig_text
-            FROM trades
-            WHERE user_id=$1 AND signal_id=$2
+            SELECT t.id, t.user_id, t.signal_id, t.market, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
+                   t.status, t.tp1_hit, t.be_price, t.opened_at, t.closed_at, t.pnl_total_pct, t.orig_text,
+                   e_tp1.tp1_at
+            FROM trades t
+            LEFT JOIN LATERAL (
+              SELECT e.created_at AS tp1_at
+              FROM trade_events e
+              WHERE e.trade_id=t.id AND e.event_type='TP1'
+              ORDER BY e.created_at DESC
+              LIMIT 1
+            ) e_tp1 ON TRUE
+            WHERE t.user_id=$1 AND t.signal_id=$2
             """,
             int(user_id), int(signal_id)
         )
@@ -807,10 +823,18 @@ async def get_trade_by_id(user_id: int, trade_id: int) -> Optional[Dict[str, Any
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT id, user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl,
-                   status, tp1_hit, be_price, opened_at, closed_at, pnl_total_pct, orig_text
-            FROM trades
-            WHERE user_id=$1 AND id=$2
+            SELECT t.id, t.user_id, t.signal_id, t.market, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
+                   t.status, t.tp1_hit, t.be_price, t.opened_at, t.closed_at, t.pnl_total_pct, t.orig_text,
+                   e_tp1.tp1_at
+            FROM trades t
+            LEFT JOIN LATERAL (
+              SELECT e.created_at AS tp1_at
+              FROM trade_events e
+              WHERE e.trade_id=t.id AND e.event_type='TP1'
+              ORDER BY e.created_at DESC
+              LIMIT 1
+            ) e_tp1 ON TRUE
+            WHERE t.user_id=$1 AND t.id=$2
             """,
             int(user_id), int(trade_id)
         )
@@ -821,11 +845,19 @@ async def list_active_trades(limit: int = 500) -> List[Dict[str, Any]]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl,
-                   status, tp1_hit, be_price, opened_at, closed_at, pnl_total_pct, orig_text
-            FROM trades
-            WHERE status IN ('ACTIVE','TP1')
-            ORDER BY opened_at DESC
+            SELECT t.id, t.user_id, t.signal_id, t.market, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
+                   t.status, t.tp1_hit, t.be_price, t.opened_at, t.closed_at, t.pnl_total_pct, t.orig_text,
+                   e_tp1.tp1_at
+            FROM trades t
+            LEFT JOIN LATERAL (
+              SELECT e.created_at AS tp1_at
+              FROM trade_events e
+              WHERE e.trade_id=t.id AND e.event_type='TP1'
+              ORDER BY e.created_at DESC
+              LIMIT 1
+            ) e_tp1 ON TRUE
+            WHERE t.status IN ('ACTIVE','TP1')
+            ORDER BY t.opened_at DESC
             LIMIT $1
             """,
             int(limit),
