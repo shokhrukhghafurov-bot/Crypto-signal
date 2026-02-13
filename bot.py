@@ -3546,8 +3546,12 @@ async def trade_close(call: types.CallbackQuery) -> None:
         back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
-    removed = await backend.remove_trade_by_id(call.from_user.id, trade_id)
-    if removed:
+    res = await backend.remove_trade_by_id(call.from_user.id, trade_id)
+    if isinstance(res, dict) and res.get("ok") and res.get("text"):
+        # Send unified close card with correct TP1-aware total PnL
+        await safe_send(call.from_user.id, str(res.get("text")), reply_markup=menu_kb(call.from_user.id))
+    elif res:
+        # Backward compatible
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_removed"), reply_markup=menu_kb(call.from_user.id))
     else:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_removed_fail"), reply_markup=menu_kb(call.from_user.id))
