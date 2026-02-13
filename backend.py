@@ -4425,108 +4425,6 @@ def _trf(uid: int, key: str, **kwargs) -> str:
 
 def _market_label(uid: int, market: str) -> str:
     return _tr(uid, "lbl_spot") if str(market).upper() == "SPOT" else _tr(uid, "lbl_futures")
-
-
-def _status_emoji(status: str) -> str:
-    s = str(status or "").upper()
-    return {
-        "WIN": "🟢",
-        "TP2": "🟢",
-        "TP1": "🟡",
-        "BE": "🟡",
-        "LOSS": "🔴",
-        "SL": "🔴",
-        "HARD_SL": "🟠",
-        "CLOSED": "⚪",
-    }.get(s, "⏳")
-
-def _status_title(uid: int, status: str) -> str:
-    # Localized status label (fallback to raw)
-    s = str(status or "").upper()
-    return _tr(uid, f"status_{s.lower()}") if _tr(uid, f"status_{s.lower()}") != f"status_{s.lower()}" else s
-
-def _calc_rr(entry: float, sl: float, tp2: float, direction: str) -> float | None:
-    try:
-        e = float(entry); s = float(sl); t = float(tp2)
-    except Exception:
-        return None
-    d = str(direction or "").upper()
-    risk = (e - s) if d == "LONG" else (s - e)
-    reward = (t - e) if d == "LONG" else (e - t)
-    if risk <= 0 or reward <= 0:
-        return None
-    return reward / risk
-
-def _close_source_line(uid: int, close_source: str | None) -> str:
-    cs = (close_source or "").lower().strip()
-    if not cs:
-        return ""
-    key = {
-        "smart_manager": "close_source_smart_manager",
-        "smart_be": "close_source_smart_be",
-        "manual": "close_source_manual",
-    }.get(cs)
-    if not key:
-        return ""
-    return _tr(uid, key)
-
-def _build_trade_close_card_unified(
-    uid: int,
-    *,
-    symbol: str,
-    market: str,
-    side: str,
-    status: str,
-    pnl_total: str,
-    opened_time: str,
-    closed_time: str,
-    entry: float | None = None,
-    sl: float | None = None,
-    tp1: float | None = None,
-    tp2: float | None = None,
-    be_price: float | None = None,
-    tp1_hit: bool = False,
-    close_source: str | None = None,
-) -> str:
-    emoji = _status_emoji(status)
-    after_tp1 = _tr(uid, "lbl_after_tp1") if tp1_hit else ""
-    rr = None
-    if entry is not None and sl is not None and tp2 is not None:
-        rr = _calc_rr(float(entry), float(sl), float(tp2), side)
-    rr_line = ""
-    if rr is not None:
-        rr_line = _trf(uid, "line_rr", rr=f"{rr:.2f}")
-    close_line = _close_source_line(uid, close_source)
-    be_line = ""
-    if be_price is not None:
-        be_line = _trf(uid, "line_be", be=f"{float(be_price):.6f}")
-    # Levels (empty if unknown)
-    lvl_entry = f"{float(entry):.6f}" if entry is not None else "-"
-    lvl_sl = f"{float(sl):.6f}" if sl is not None else "-"
-    lvl_tp1 = f"{float(tp1):.6f}" if tp1 is not None else "-"
-    lvl_tp2 = f"{float(tp2):.6f}" if tp2 is not None else "-"
-
-    return _trf(
-        uid,
-        "trade_card_unified",
-        emoji=emoji,
-        symbol=symbol,
-        market=_market_label(uid, market),
-        side=str(side or "").upper(),
-        status=_status_title(uid, status),
-        after_tp1=after_tp1,
-        pnl_total=pnl_total,
-        rr_line=rr_line,
-        close_line=close_line,
-        entry=lvl_entry,
-        sl=lvl_sl,
-        tp1=lvl_tp1,
-        tp2=lvl_tp2,
-        be_line=be_line,
-        opened_time=opened_time,
-        closed_time=closed_time,
-    )
-
 # --- /i18n helpers ---
 
 
@@ -5039,6 +4937,40 @@ def _calc_effective_pnl_pct(trade: "UserTrade", close_price: float, close_reason
         pnl_rest = pnl_pct_for(close_price) * (1.0 - a)
 
     return _safe_pct(pnl_tp1 + pnl_rest)
+
+def _calc_rr_str(entry: float, sl: float, tp1: float, tp2: float) -> str:
+    """Return Risk/Reward as 'X.XX' where reward uses TP2 if present else TP1."""
+    try:
+        entry = float(entry or 0.0)
+        sl = float(sl or 0.0)
+        tp1 = float(tp1 or 0.0)
+        tp2 = float(tp2 or 0.0)
+        if entry <= 0 or sl <= 0:
+            return "-"
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return "-"
+        target = tp2 if tp2 > 0 else tp1
+        if target <= 0:
+            return "-"
+        reward = abs(target - entry)
+        rr = reward / risk if risk > 0 else 0.0
+        if rr <= 0:
+            return "-"
+        return f"{rr:.2f}"
+    except Exception:
+        return "-"
+
+def _lvl_line(label: str, value: float) -> str:
+    try:
+        v = float(value or 0.0)
+        if v > 0:
+            return f"{label}: {v:.6f}\n"
+    except Exception:
+        pass
+    return ""
+
+
 
 def _bump_stats(store: dict, market: str, ts: float, close_reason: str, pnl_pct: float, tp1_hit: bool) -> None:
     mk = _market_key(market)
@@ -8106,44 +8038,13 @@ class Backend:
         row = await db_store.get_trade_by_id(int(user_id), int(trade_id))
         if not row:
             return False
-
-        # --- Manual close: compute an accurate effective PnL (including TP1-partial if it happened) ---
-        close_price = float(row.get("entry") or 0.0)
-
-        # Try to fetch a live price for better accuracy (fallback to entry if unavailable)
+        # manual close (keep last known price if present)
+        close_price = float(row.get('entry') or 0.0)
         try:
-            s = Signal()
-            s.market = str(row.get("market") or "").upper()
-            s.symbol = str(row.get("symbol") or "")
-            s.direction = str(row.get("side") or row.get("direction") or "LONG").upper()
-            s.entry = float(row.get("entry") or 0.0)
-            s.sl = float(row.get("sl") or 0.0)
-            s.tp1 = float(row.get("tp1") or 0.0)
-            s.tp2 = float(row.get("tp2") or 0.0)
-            px, _src = self._get_price_with_source(s)
-            if px and float(px) > 0:
-                close_price = float(px)
+            await db_store.close_trade(int(trade_id), status='CLOSED', price=close_price, pnl_total_pct=float(row.get('pnl_total_pct') or 0.0))
         except Exception:
-            pass
-
-        try:
-            s2 = Signal()
-            s2.market = str(row.get("market") or "").upper()
-            s2.symbol = str(row.get("symbol") or "")
-            s2.direction = str(row.get("side") or row.get("direction") or "LONG").upper()
-            s2.entry = float(row.get("entry") or 0.0)
-            s2.sl = float(row.get("sl") or 0.0)
-            s2.tp1 = float(row.get("tp1") or 0.0)
-            s2.tp2 = float(row.get("tp2") or 0.0)
-
-            trade_ctx = UserTrade(user_id=int(user_id), signal=s2, tp1_hit=bool(row.get("tp1_hit")))
-            pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(close_price), close_reason="CLOSED")
-            await db_store.close_trade(int(trade_id), status="CLOSED", price=float(close_price), pnl_total_pct=float(pnl))
-        except Exception:
-            # best-effort close
-            await db_store.close_trade(int(trade_id), status="CLOSED", price=float(close_price))
+            await db_store.close_trade(int(trade_id), status='CLOSED')
         return True
-
 
     async def get_user_trades(self, user_id: int) -> list[dict]:
         return await db_store.list_user_trades(int(user_id), include_closed=False, limit=50)
@@ -8789,22 +8690,30 @@ class Backend:
                         pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.tp2), close_reason="WIN")
                         import datetime as _dt
                         now_utc = _dt.datetime.now(_dt.timezone.utc)
-                        txt = _build_trade_close_card_unified(
-                            uid,
+                        rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
+                        after_tp1 = _trf(uid, "after_tp1_suffix") if tp1_hit else ""
+                        close_agent = _trf(uid, "close_agent_smart_manager")
+                        be_line = (f"🛡 BE: {float(be_price):.6f}\n" if (be_price and float(be_price)>0) else "")
+                        reason_line = ""
+                        emoji = "🟢"
+                        txt = _trf(uid, "msg_auto_win",
                             symbol=s.symbol,
                             market=market,
-                            side=getattr(s, "direction", getattr(s, "side", "")) or "",
-                            status="WIN",
+                            emoji=emoji,
+                            side=str(getattr(s,'direction','') or '').upper() or "LONG",
+                            after_tp1=after_tp1,
+                            rr=rr,
+                            close_agent=close_agent,
+                            reason_line=reason_line,
+                            entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
+                            sl=f"{float(getattr(s,'sl',0.0) or 0.0):.6f}",
+                            tp1=f"{float(getattr(s,'tp1',0.0) or 0.0):.6f}",
+                            tp2=f"{float(getattr(s,'tp2',0.0) or 0.0):.6f}",
+                            be_line=be_line,
                             pnl_total=fmt_pnl_pct(float(pnl)),
                             opened_time=fmt_dt_msk(row.get("opened_at")),
                             closed_time=fmt_dt_msk(now_utc),
-                            entry=getattr(s, "entry", None),
-                            sl=getattr(s, "sl", None),
-                            tp1=getattr(s, "tp1", None),
-                            tp2=getattr(s, "tp2", None),
-                            be_price=row.get("be_price"),
-                            tp1_hit=tp1_hit,
-                            close_source="smart_manager",
+                            status="WIN",
                         )
                         if dbg:
                             txt += "\n\n" + dbg
@@ -8853,22 +8762,30 @@ class Backend:
                         pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.sl), close_reason="LOSS")
                         import datetime as _dt
                         now_utc = _dt.datetime.now(_dt.timezone.utc)
-                        txt = _build_trade_close_card_unified(
-                            uid,
+                        rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
+                        after_tp1 = ""
+                        close_agent = _trf(uid, "close_agent_smart_manager")
+                        be_line = ""
+                        reason_line = ""
+                        emoji = "🔴"
+                        txt = _trf(uid, "msg_auto_loss",
                             symbol=s.symbol,
                             market=market,
-                            side=getattr(s, "direction", getattr(s, "side", "")) or "",
-                            status="LOSS",
+                            emoji=emoji,
+                            side=str(getattr(s,'direction','') or '').upper() or "LONG",
+                            after_tp1=after_tp1,
+                            rr=rr,
+                            close_agent=close_agent,
+                            reason_line=reason_line,
+                            entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
+                            tp1=f"{float(getattr(s,'tp1',0.0) or 0.0):.6f}",
+                            tp2=f"{float(getattr(s,'tp2',0.0) or 0.0):.6f}",
+                            be_line=be_line,
                             pnl_total=fmt_pnl_pct(float(pnl)),
+                            sl=f"{float(s.sl):.6f}",
                             opened_time=fmt_dt_msk(row.get("opened_at")),
                             closed_time=fmt_dt_msk(now_utc),
-                            entry=getattr(s, "entry", None),
-                            sl=getattr(s, "sl", None),
-                            tp1=getattr(s, "tp1", None),
-                            tp2=getattr(s, "tp2", None),
-                            be_price=row.get("be_price"),
-                            tp1_hit=tp1_hit,
-                            close_source="smart_manager",
+                            status="LOSS",
                         )
                         if dbg:
                             txt += "\n\n" + dbg
@@ -8895,9 +8812,21 @@ class Backend:
                         now_utc = _dt.datetime.now(_dt.timezone.utc)
                         trade_ctx_tp1 = UserTrade(user_id=uid, signal=s, tp1_hit=True)
                         pnl = _calc_effective_pnl_pct(trade_ctx_tp1, close_price=float(be_px), close_reason="BE")
+                        rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
+                        close_agent = _trf(uid, "close_agent_smart_manager")
+                        reason = _trf(uid, "tp1_reason", closed_pct=int(_partial_close_pct(market)))
+                        reason_line = _trf(uid, "lbl_reason", reason=reason) + "\n"
                         txt = _trf(uid, "msg_auto_tp1",
                             symbol=s.symbol,
                             market=market,
+                            side=str(getattr(s,'direction','') or '').upper() or "LONG",
+                            rr=rr,
+                            close_agent=close_agent,
+                            reason_line=reason_line,
+                            entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
+                            sl=f"{float(getattr(s,'sl',0.0) or 0.0):.6f}",
+                            tp1=f"{float(getattr(s,'tp1',0.0) or 0.0):.6f}",
+                            tp2=f"{float(getattr(s,'tp2',0.0) or 0.0):.6f}",
                             pnl_total=fmt_pnl_pct(float(pnl)),
                             closed_pct=int(_partial_close_pct(market)),
                             be_price=f"{float(be_px):.6f}",
@@ -8929,28 +8858,39 @@ class Backend:
                         if hard_sl > 0 and hit_sl(float(hard_sl)):
                             import datetime as _dt
                             now_utc = _dt.datetime.now(_dt.timezone.utc)
-                            txt = _build_trade_close_card_unified(
-                                uid,
+                            trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
+                            pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(hard_sl), close_reason="HARD_SL")
+                            rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
+                            after_tp1 = _trf(uid, "after_tp1_suffix")
+                            close_agent = _trf(uid, "close_agent_smart_manager")
+                            reason = _trf(uid, "smart_hard_sl_reason", hard_pct=f"{float(hard_pct):.2f}")
+                            reason_line = _trf(uid, "lbl_reason", reason=reason) + "\n"
+                            be_line = f"🛡 BE: {float(be_lvl):.6f}\n"
+                            emoji = "🟠"
+                            txt = _trf(uid, "msg_auto_loss",
                                 symbol=s.symbol,
                                 market=market,
-                                side=getattr(s, "direction", getattr(s, "side", "")) or "",
-                                status="HARD_SL",
+                                emoji=emoji,
+                                side=str(getattr(s,'direction','') or '').upper() or "LONG",
+                                after_tp1=after_tp1,
+                                rr=rr,
+                                close_agent=close_agent,
+                                reason_line=reason_line,
+                                entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
+                                tp1=f"{float(getattr(s,'tp1',0.0) or 0.0):.6f}",
+                                tp2=f"{float(getattr(s,'tp2',0.0) or 0.0):.6f}",
+                                be_line=be_line,
                                 pnl_total=fmt_pnl_pct(float(pnl)),
+                                sl=f"{float(hard_sl):.6f}",
                                 opened_time=fmt_dt_msk(row.get("opened_at")),
                                 closed_time=fmt_dt_msk(now_utc),
-                                entry=getattr(s, "entry", None),
-                                sl=float(hard_sl),
-                                tp1=getattr(s, "tp1", None),
-                                tp2=getattr(s, "tp2", None),
-                                be_price=row.get("be_price"),
-                                tp1_hit=tp1_hit,
-                                close_source="smart_manager",
+                                status="HARD_SL",
                             )
                             if dbg:
                                 txt += "\n\n" + dbg
                             await safe_send(bot, uid, txt, ctx="msg_auto_loss")
-                            trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
-                            pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(hard_sl), close_reason="HARD_SL")
+                            # pnl already computed above
+
                             await db_store.close_trade(trade_id, status="HARD_SL", price=float(hard_sl), pnl_total_pct=float(pnl))
                             self._sl_breach_since.pop(trade_id, None)
                             try:
@@ -9021,22 +8961,268 @@ class Backend:
                                     else:
                                         import datetime as _dt
                                         now_utc = _dt.datetime.now(_dt.timezone.utc)
-                                        txt = _build_trade_close_card_unified(
-                                uid,
-                                symbol=s.symbol,
-                                market=market,
-                                side=getattr(s, "direction", getattr(s, "side", "")) or "",
-                                status="BE",
-                                pnl_total=fmt_pnl_pct(float(pnl)),
-                                opened_time=fmt_dt_msk(row.get("opened_at")),
-                                closed_time=fmt_dt_msk(now_utc),
-                                entry=getattr(s, "entry", None),
-                                sl=getattr(s, "sl", None),
-                                tp1=getattr(s, "tp1", None),
-                                tp2=getattr(s, "tp2", None),
-                                be_price=float(be_price) if be_price is not None else row.get("be_price"),
-                                tp1_hit=tp1_hit,
-                                close_source="smart_be",
+                                        # Build Smart BE close reason
+                                        _prog = float(prog) if 'prog' in locals() else 0.0
+                                        _pullback = float(pullback) if 'pullback' in locals() else 0.0
+                                        # pnl already computed above
+
+                                        rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
+                                        after_tp1 = _trf(uid, "after_tp1_suffix")
+                                        close_agent = _trf(uid, "close_agent_smart_be")
+                                        reason = _trf(uid, "smart_be_reason", prob=f"{float(prob_tp2):.2f}", hold=f"{float(hold_prob):.2f}", prog=f"{_prog:.2f}", pullback=f"{_pullback:.2f}")
+                                        reason_line = _trf(uid, "lbl_reason", reason=reason) + "\n"
+                                        be_line = f"🛡 BE: {float(be_lvl):.6f}\n"
+                                        emoji = "🟡"
+                                        txt = _trf(uid, "msg_auto_be",
+                                            symbol=s.symbol,
+                                            market=market,
+                                            emoji=emoji,
+                                            side=str(getattr(s,'direction','') or '').upper() or "LONG",
+                                            after_tp1=after_tp1,
+                                            rr=rr,
+                                            close_agent=close_agent,
+                                            reason_line=reason_line,
+                                            entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
+                                            sl=f"{float(getattr(s,'sl',0.0) or 0.0):.6f}",
+                                            tp1=f"{float(getattr(s,'tp1',0.0) or 0.0):.6f}",
+                                            tp2=f"{float(getattr(s,'tp2',0.0) or 0.0):.6f}",
+                                            be_line=be_line,
+                                            pnl_total=fmt_pnl_pct(float(pnl)),
+                                            be_price=f"{float(be_lvl):.6f}",
+                                            opened_time=fmt_dt_msk(row.get("opened_at")),
+                                            closed_time=fmt_dt_msk(now_utc),
+                                            status="BE",
+                                        )
+                                        if dbg:
+                                            txt += "\n\n" + dbg
+                                        await safe_send(bot, uid, txt, ctx="msg_auto_be")
+                                        trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
+                                        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(be_lvl), close_reason="BE")
+                                        await db_store.close_trade(trade_id, status="BE", price=float(be_lvl), pnl_total_pct=float(pnl))
+                                        self._sl_breach_since.pop(trade_id, None)
+                                        try:
+                                            if hasattr(self, "_tp1_peak_px"):
+                                                self._tp1_peak_px.pop(trade_id, None)
+                                            if hasattr(self, "_be_skip_until"):
+                                                self._be_skip_until.pop(trade_id, None)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            await _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=False)
+                                        except Exception:
+                                            pass
+                                        continue
+
+                    # 4) TP2 -> WIN
+
+                    if s.tp2 and hit_tp(float(s.tp2)):
+                        trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
+                        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.tp2), close_reason="WIN")
+                        import datetime as _dt
+                        now_utc = _dt.datetime.now(_dt.timezone.utc)
+                        rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
+                        after_tp1 = _trf(uid, "after_tp1_suffix") if tp1_hit else ""
+                        close_agent = _trf(uid, "close_agent_smart_manager")
+                        be_line = (f"🛡 BE: {float(be_price):.6f}\n" if (be_price and float(be_price)>0) else "")
+                        reason_line = ""
+                        emoji = "🟢"
+                        txt = _trf(uid, "msg_auto_win",
+                            symbol=s.symbol,
+                            market=market,
+                            emoji=emoji,
+                            side=str(getattr(s,'direction','') or '').upper() or "LONG",
+                            after_tp1=after_tp1,
+                            rr=rr,
+                            close_agent=close_agent,
+                            reason_line=reason_line,
+                            entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
+                            sl=f"{float(getattr(s,'sl',0.0) or 0.0):.6f}",
+                            tp1=f"{float(getattr(s,'tp1',0.0) or 0.0):.6f}",
+                            tp2=f"{float(getattr(s,'tp2',0.0) or 0.0):.6f}",
+                            be_line=be_line,
+                            pnl_total=fmt_pnl_pct(float(pnl)),
+                            opened_time=fmt_dt_msk(row.get("opened_at")),
+                            closed_time=fmt_dt_msk(now_utc),
+                            status="WIN",
+                        )
+                        if dbg:
+                            txt += "\n\n" + dbg
+                        await safe_send(bot, uid, txt, ctx="msg_auto_win")
+                        await db_store.close_trade(trade_id, status="WIN", price=float(s.tp2), pnl_total_pct=float(pnl))
+                        self._sl_breach_since.pop(trade_id, None)
+                        try:
+                            if hasattr(self, "_tp1_peak_px"):
+                                self._tp1_peak_px.pop(trade_id, None)
+                            if hasattr(self, "_be_skip_until"):
+                                self._be_skip_until.pop(trade_id, None)
+                        except Exception:
+                            pass
+                        continue
+
+                except Exception:
+                    logger.exception("track_loop: error while tracking trade row=%r", row)
+
+            await asyncio.sleep(TRACK_INTERVAL_SECONDS)
+
+    async def scanner_loop(self, emit_signal_cb, emit_macro_alert_cb) -> None:
+        while True:
+            start = time.time()
+            logger.info("SCAN tick start top_n=%s interval=%ss news_filter=%s macro_filter=%s", TOP_N, SCAN_INTERVAL_SECONDS, bool(NEWS_FILTER and CRYPTOPANIC_TOKEN), bool(MACRO_FILTER))
+            logger.info("[scanner] tick start TOP_N=%s interval=%ss", TOP_N, SCAN_INTERVAL_SECONDS)
+            self.last_scan_ts = start
+            try:
+                async with MultiExchangeData() as api:
+                    await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
+
+                    try:
+                        symbols = await api.get_top_usdt_symbols(TOP_N)
+                        if symbols:
+                            self._symbols_cache = list(symbols)
+                            self._symbols_cache_ts = time.time()
+                    except Exception as e:
+                        # If Binance (or other primary) is unreachable (DNS/ban), fall back to cached list.
+                        if self._symbols_cache:
+                            logger.warning("[scanner] get_top_usdt_symbols failed (%s); using cached symbols (%s)", e, len(self._symbols_cache))
+                            symbols = list(self._symbols_cache)
+                        else:
+                            raise
+                    self.scanned_symbols_last = len(symbols)
+                    logger.info("[scanner] symbols loaded: %s", self.scanned_symbols_last)
+
+                    mac_act, mac_ev, mac_win = self.macro.current_action()
+                    self.last_macro_action = mac_act
+                    if MACRO_FILTER:
+                        logger.info("[scanner] macro action=%s next=%s window=%s", mac_act, getattr(mac_ev, "name", None) if mac_ev else None, mac_win)
+
+                    if mac_act != "ALLOW" and mac_ev and mac_win and self.macro.should_notify(mac_ev):
+                        logger.info("[macro] alert: action=%s event=%s window=%s", mac_act, getattr(mac_ev, "name", None), mac_win)
+                        await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
+
+                    for sym in symbols:
+                        if not self.can_emit(sym):
+                            continue
+                        if is_blocked_symbol(sym):
+                            logger.info("[scanner] skip blocked stable pair: %s", sym)
+                            continue
+                        if mac_act == "PAUSE_ALL":
+                            continue
+
+                        # News action
+                        try:
+                            if self.news.enabled():
+                                news_act = await self.news.action_for_symbol(api.session, sym)  # type: ignore[arg-type]
+                            else:
+                                news_act = "ALLOW"
+                        except Exception:
+                            news_act = "ALLOW"
+                        self.last_news_action = news_act
+                        if news_act == "PAUSE_ALL":
+                            continue
+
+                        async def fetch_exchange(name: str):
+                            try:
+                                if name == "BINANCE":
+                                    df15 = await api.klines_binance(sym, "15m", 250)
+                                    df1h = await api.klines_binance(sym, "1h", 250)
+                                    df4h = await api.klines_binance(sym, "4h", 250)
+                                elif name == "BYBIT":
+                                    df15 = await api.klines_bybit(sym, "15m", 200)
+                                    df1h = await api.klines_bybit(sym, "1h", 200)
+                                    df4h = await api.klines_bybit(sym, "4h", 200)
+                                elif name == "OKX":
+                                    df15 = await api.klines_okx(sym, "15m", 200)
+                                    df1h = await api.klines_okx(sym, "1h", 200)
+                                    df4h = await api.klines_okx(sym, "4h", 200)
+                                elif name == "GATEIO":
+                                    df15 = await api.klines_gateio(sym, "15m", 200)
+                                    df1h = await api.klines_gateio(sym, "1h", 200)
+                                    df4h = await api.klines_gateio(sym, "4h", 200)
+                                else:  # MEXC
+                                    df15 = await api.klines_mexc(sym, "15m", 200)
+                                    df1h = await api.klines_mexc(sym, "1h", 200)
+                                    df4h = await api.klines_mexc(sym, "4h", 200)
+                                res = evaluate_on_exchange(df15, df1h, df4h)
+                                return name, res
+                            except Exception:
+                                return name, None
+
+                        # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
+                        _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
+                        scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
+                        if not scan_exchanges:
+                            scan_exchanges = ['BINANCE','BYBIT','OKX','GATEIO','MEXC']
+
+                        results = await asyncio.gather(*[fetch_exchange(ex) for ex in scan_exchanges])
+                        good = [(name, r) for (name, r) in results if r is not None]
+                        if not good:
+                            continue
+
+                        # Signal can be produced from a single exchange result.
+                        best_name, best_r = max(
+                            good,
+                            key=lambda x: (int((x[1] or {}).get("confidence", 0) or 0), float((x[1] or {}).get("rr", 0.0) or 0.0)),
+                        )
+                        best_dir = best_r["direction"]
+                        supporters = [(best_name, best_r)]
+
+                        entry = float(best_r["entry"])
+                        sl = float(best_r["sl"])
+                        tp1 = float(best_r["tp1"])
+                        tp2 = float(best_r["tp2"])
+                        rr = float(best_r["rr"])
+                        conf = int(best_r["confidence"])
+
+                        market = choose_market(float(best_r.get("adx1", 0.0) or 0.0),
+                                              float(best_r.get("atr_pct", 0.0) or 0.0))
+                        
+                        min_conf = TA_MIN_SCORE_FUTURES if market == "FUTURES" else TA_MIN_SCORE_SPOT
+
+# Orderbook confirmation (FUTURES only, enabled via ENV)
+                        if USE_ORDERBOOK and (not ORDERBOOK_FUTURES_ONLY or market == "FUTURES"):
+                            ob_allows: List[bool] = []
+                            ob_notes: List[str] = []
+                            for ex in [s[0] for s in supporters]:
+                                if ex.strip().lower() not in ORDERBOOK_EXCHANGES:
+                                    continue
+                                ok, note = await orderbook_filter(api, ex, sym, best_dir)
+                                ob_allows.append(bool(ok))
+                                ob_notes.append(note)
+                            # If we checked at least one exchange and none allowed -> block signal
+                            if ob_allows and not any(ob_allows):
+                                # keep a short reason in logs
+                                logger.info("[orderbook] block %s %s %s notes=%s", sym, market, best_dir, "; ".join(ob_notes)[:200])
+                                continue
+                        
+                        if conf < min_conf or rr < 2.0:
+                            continue
+                        
+                        risk_notes = []
+
+                        # Add TA summary (real indicators) to the signal card
+                        try:
+                            best_supporter = max(supporters, key=lambda s: int(s[1].get("confidence", 0)))
+                            ta_block = str(best_supporter[1].get("ta_block", "") or "").strip()
+                            if ta_block:
+                                risk_notes.append(ta_block)
+                        except Exception:
+                            pass
+
+
+                        if news_act == "FUTURES_OFF" and market == "FUTURES":
+                            market = "SPOT"
+                            risk_notes.append("⚠️ Futures paused due to news")
+                        if mac_act == "FUTURES_OFF" and market == "FUTURES":
+                            market = "SPOT"
+                            risk_notes.append("⚠️ Futures signals are temporarily disabled (macro)")
+
+                        # Policy: SPOT + SHORT is confusing for most users. Default behavior:
+                        # auto-convert SPOT SHORT -> FUTURES SHORT (keeps Entry/SL/TP intact).
+                        # Exception: if futures signals are currently forced OFF (news/macro), we cannot convert,
+                        # so we skip such signals to avoid sending a non-executable SPOT SHORT.
+                        if market == "SPOT" and str(best_dir).upper() == "SHORT":
+                            fut_forced_off = any(
+                                ("Futures paused" in n) or ("Futures signals are temporarily disabled" in n)
+                                for n in risk_notes
                             )
                             if fut_forced_off:
                                 logger.info(
