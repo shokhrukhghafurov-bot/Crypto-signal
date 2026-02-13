@@ -18,6 +18,20 @@ MID_CLIMAX_VOL_X = float(os.getenv("MID_CLIMAX_VOL_X", "2.5"))              # la
 MID_CLIMAX_BODY_ATR = float(os.getenv("MID_CLIMAX_BODY_ATR", "1.2"))         # abs(close-open)/ATR_30m
 MID_CLIMAX_COOLDOWN_BARS = int(os.getenv("MID_CLIMAX_COOLDOWN_BARS", "1"))   # block next N bars after climax
 
+
+# --- MID ULTRA SAFE (reduce SL dramatically; fewer but higher-quality signals) ---
+MID_ULTRA_SAFE = os.getenv("MID_ULTRA_SAFE", "0").strip().lower() in ("1","true","yes","on")
+# Strong-trend countertrend blocker (uses 30m ADX)
+MID_HTF_ALIGN_GUARD = os.getenv("MID_HTF_ALIGN_GUARD", "1").strip().lower() not in ("0","false","no","off")
+MID_HTF_STRONG_ADX_MIN = float(os.getenv("MID_HTF_STRONG_ADX_MIN", "28"))   # ADX(30m) >= -> treat as strong trend
+# Allow countertrend only if 5m shows reversal structure (BOS + candle + swing)
+MID_ALLOW_COUNTERTREND_WITH_5M_REVERSAL = os.getenv("MID_ALLOW_COUNTERTREND_WITH_5M_REVERSAL", "1").strip().lower() not in ("0","false","no","off")
+
+# More strict late-entry defaults when ULTRA SAFE is enabled (applied in code)
+MID_ULTRA_LATE_ENTRY_ATR_MAX = float(os.getenv("MID_ULTRA_LATE_ENTRY_ATR_MAX", "1.6"))
+MID_ULTRA_VWAP_DIST_ATR_MAX = float(os.getenv("MID_ULTRA_VWAP_DIST_ATR_MAX", "1.2"))
+MID_ULTRA_RSI_LONG_MAX = float(os.getenv("MID_ULTRA_RSI_LONG_MAX", "58"))
+MID_ULTRA_RSI_SHORT_MIN = float(os.getenv("MID_ULTRA_RSI_SHORT_MIN", "52"))
 # --- MID anti-bounce / RSI window / BB bounce guard ---
 MID_ANTI_BOUNCE_ENABLED = os.getenv("MID_ANTI_BOUNCE_ENABLED", "1").strip().lower() not in ("0","false","no","off")
 MID_ANTI_BOUNCE_ATR_MAX = float(os.getenv("MID_ANTI_BOUNCE_ATR_MAX", "1.8"))     # SHORT: (close - recent_low)/ATR_30m; LONG: (recent_high - close)/ATR_30m
@@ -4664,18 +4678,25 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                       atr_30m: float, rsi_5m: float, vwap: float, bb_pos: str | None,
                       ema20_5m: float | None, bos_down_5m: bool, two_red_5m: bool, lower_highs_5m: bool,
                       bos_up_5m: bool, two_green_5m: bool, higher_lows_5m: bool,
-                      last_vol: float, avg_vol: float, last_body: float, climax_recent_bars: int) -> str | None:
+                      last_vol: float, avg_vol: float, last_body: float, climax_recent_bars: int,
+                      htf_dir_1h: str | None = None, htf_dir_30m: str | None = None, adx_30m: float | None = None) -> str | None:
     """Return human-readable MID BLOCKED reason (for logging + error-bot), or None if allowed."""
     try:
+        # ULTRA SAFE: tighten filters dynamically for near-zero SL preference
+        late_entry_max = MID_ULTRA_LATE_ENTRY_ATR_MAX if MID_ULTRA_SAFE else MID_LATE_ENTRY_ATR_MAX
+        vwap_dist_max = MID_ULTRA_VWAP_DIST_ATR_MAX if MID_ULTRA_SAFE else MID_VWAP_DIST_ATR_MAX
+        rsi_long_max = MID_ULTRA_RSI_LONG_MAX if MID_ULTRA_SAFE else MID_RSI_LONG_MAX
+        rsi_short_min = MID_ULTRA_RSI_SHORT_MIN if MID_ULTRA_SAFE else MID_RSI_SHORT_MIN
+
         if atr_30m and atr_30m > 0:
             if side.upper() == "LONG":
                 move_from_low = (close - recent_low) / atr_30m
-                if move_from_low > MID_LATE_ENTRY_ATR_MAX:
-                    return f"late_entry_atr={move_from_low:.2f} > {MID_LATE_ENTRY_ATR_MAX:g}"
+                if move_from_low > late_entry_max:
+                    return f"late_entry_atr={move_from_low:.2f} > {late_entry_max:g}"
             else:  # SHORT
                 move_from_high = (recent_high - close) / atr_30m
-                if move_from_high > MID_LATE_ENTRY_ATR_MAX:
-                    return f"late_entry_atr={move_from_high:.2f} > {MID_LATE_ENTRY_ATR_MAX:g}"
+                if move_from_high > late_entry_max:
+                    return f"late_entry_atr={move_from_high:.2f} > {late_entry_max:g}"
 
             # --- Anti-bounce: block SHORT after sharp rebound from recent low (and vice versa for LONG) ---
             if MID_ANTI_BOUNCE_ENABLED and atr_30m and atr_30m > 0:
@@ -4687,6 +4708,37 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                     dist_high_atr = (recent_high - close) / atr_30m
                     if dist_high_atr > MID_ANTI_BOUNCE_ATR_MAX:
                         return f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {MID_ANTI_BOUNCE_ATR_MAX:g}"
+
+
+            # --- HTF alignment guard (ULTRA SAFE): block countertrend entries in strong trends ---
+            try:
+                if MID_HTF_ALIGN_GUARD and (adx_30m is not None) and (htf_dir_1h or htf_dir_30m):
+                    strong = False
+                    try:
+                        strong = float(adx_30m) >= float(MID_HTF_STRONG_ADX_MIN)
+                    except Exception:
+                        strong = False
+
+                    if strong:
+                        h1 = (htf_dir_1h or "").upper()
+                        h30 = (htf_dir_30m or "").upper()
+                        s = side.upper()
+
+                        # determine if this is countertrend vs HTF bias (both tf agree)
+                        if h1 in ("LONG","SHORT") and h30 in ("LONG","SHORT") and h1 == h30 and s != h1:
+                            # allow countertrend only if 5m shows clear reversal structure
+                            if MID_ALLOW_COUNTERTREND_WITH_5M_REVERSAL:
+                                if s == "SHORT":
+                                    # need bearish reversal on 5m: BOS down + red candles + lower highs
+                                    if not (bos_down_5m and two_red_5m and lower_highs_5m):
+                                        return f"htf_align_block strong_adx={float(adx_30m):.1f} htf={h1} need_5m_reversal"
+                                else:  # LONG
+                                    if not (bos_up_5m and two_green_5m and higher_lows_5m):
+                                        return f"htf_align_block strong_adx={float(adx_30m):.1f} htf={h1} need_5m_reversal"
+                            else:
+                                return f"htf_align_block strong_adx={float(adx_30m):.1f} htf={h1}"
+            except Exception:
+                pass
 
             # --- BB bounce guard (mirror): avoid entries away from BB extremes ---
             # For quality entries (less SL), we prefer:
@@ -4703,8 +4755,8 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                         return f"bb_bounce_zone={bb_pos}"
 
             dist = abs(close - vwap) / atr_30m if vwap is not None else 0.0
-            if dist > MID_VWAP_DIST_ATR_MAX:
-                return f"vwap_dist_atr={dist:.2f} > {MID_VWAP_DIST_ATR_MAX:g}"
+            if dist > vwap_dist_max:
+                return f"vwap_dist_atr={dist:.2f} > {vwap_dist_max:g}"
 
             body_atr = (abs(close - o) / atr_30m) if o is not None else 0.0
             if avg_vol and avg_vol > 0:
@@ -4718,13 +4770,13 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         # RSI filter (works even if ATR missing)
         if rsi_5m is not None:
             if side.upper() == "LONG":
-                if rsi_5m >= MID_RSI_LONG_MAX:
-                    return f"rsi_long={rsi_5m:.1f} >= {MID_RSI_LONG_MAX:g}"
+                if rsi_5m >= rsi_long_max:
+                    return f"rsi_long={rsi_5m:.1f} >= {rsi_long_max:g}"
                 if rsi_5m < MID_RSI_LONG_MIN:
                     return f"rsi_long={rsi_5m:.1f} < {MID_RSI_LONG_MIN:g}"
             else:  # SHORT
-                if rsi_5m <= MID_RSI_SHORT_MIN:
-                    return f"rsi_short={rsi_5m:.1f} <= {MID_RSI_SHORT_MIN:g}"
+                if rsi_5m <= rsi_short_min:
+                    return f"rsi_short={rsi_5m:.1f} <= {rsi_short_min:g}"
                 if rsi_5m >= MID_RSI_SHORT_MAX:
                     return f"rsi_short={rsi_5m:.1f} >= {MID_RSI_SHORT_MAX:g}"
 
@@ -6352,10 +6404,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     # Directions (trend=1h, mid=30m)
     dir_trend = _trend_dir(df1hi)
     dir_mid = _trend_dir(df30i)
-    if dir_trend is None:
-        return None
-    if dir_mid is None:
-        dir_mid = dir_trend
 
     last5 = df5i.iloc[-1]
     last30 = df30i.iloc[-1]
@@ -6389,6 +6437,34 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         adx1h = float("nan")
 
     atr_pct = (atr30 / entry) * 100.0
+
+    # Momentum override for HTF bias (prevents countertrend signals during strong trend reversals)
+    try:
+        def _momentum_override(df: pd.DataFrame, base_dir: str | None, adx_val: float) -> str | None:
+            row = df.iloc[-1]
+            close = float(row.get("close", np.nan))
+            ema20 = float(row.get("ema20", np.nan))
+            ema50 = float(row.get("ema50", np.nan))
+            ema200 = float(row.get("ema200", np.nan))
+            if np.isnan(close) or np.isnan(ema20) or np.isnan(ema50) or np.isnan(ema200):
+                return base_dir
+            if not np.isnan(adx_val) and float(adx_val) >= 25.0:
+                if close > ema200 and ema20 > ema50:
+                    return "LONG"
+                if close < ema200 and ema20 < ema50:
+                    return "SHORT"
+            return base_dir
+
+        dir_trend = _momentum_override(df1hi, dir_trend, adx1h)
+        dir_mid = _momentum_override(df30i, dir_mid, adx30)
+    except Exception:
+        pass
+
+    if dir_trend is None:
+        return None
+    if dir_mid is None:
+        dir_mid = dir_trend
+
 
 
 
@@ -6679,6 +6755,9 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             avg_vol=avg_vol if not np.isnan(avg_vol) else 0.0,
             last_body=float(last_body),
             climax_recent_bars=int(climax_recent_bars),
+            htf_dir_1h=str(dir_trend),
+            htf_dir_30m=str(dir_mid),
+            adx_30m=float(adx30) if not np.isnan(adx30) else None,
         )
         if reason:
             try:
@@ -8891,11 +8970,7 @@ class Backend:
                             except Exception:
                                 pass
                     else:
-                        # Important: if SL is not currently breached (or SL is not applicable),
-                        # reset the confirm timer. Otherwise a brief old breach can “stick” and
-                        # cause an incorrect fast SL close on the next touch.
                         breached = False
-                        self._sl_breach_since.pop(trade_id, None)
 
                     if not tp1_hit and s.sl and breached:
                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
