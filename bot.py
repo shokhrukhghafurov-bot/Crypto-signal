@@ -175,7 +175,7 @@ backend.emit_mid_digest = _mid_digest_send
 # What to forward (defaults are SAFE: only critical + scanner errors + MID blocks; ignore stablecoin SCAN_BLOCK spam)
 ERROR_BOT_ENABLED = (os.getenv("ERROR_BOT_ENABLED", "1").strip().lower() not in ("0","false","no","off"))
 ERROR_BOT_SEND_SCAN_BLOCK = (os.getenv("ERROR_BOT_SEND_SCAN_BLOCK", "0").strip().lower() not in ("0","false","no","off"))
-ERROR_BOT_SEND_MID_BLOCK = (os.getenv("ERROR_BOT_SEND_MID_BLOCK", "1").strip().lower() not in ("0","false","no","off"))
+ERROR_BOT_SEND_MID_BLOCK = (os.getenv("ERROR_BOT_SEND_MID_BLOCK", "0").strip().lower() not in ("0","false","no","off"))
 ERROR_BOT_SEND_SCANNER_ERRORS = (os.getenv("ERROR_BOT_SEND_SCANNER_ERRORS", "1").strip().lower() not in ("0","false","no","off"))
 ERROR_BOT_SEND_LEVEL = (os.getenv("ERROR_BOT_SEND_LEVEL", "ERROR") or "ERROR").upper().strip()  # ERROR/WARNING/INFO
 
@@ -246,6 +246,9 @@ def _should_forward_to_error_bot(levelno: int, msg: str) -> bool:
     if ERROR_BOT_SEND_SCANNER_ERRORS and ("error scanner" in m or "scanner error" in m):
         return True
     if ERROR_BOT_SEND_MID_BLOCK and ("mid blocked" in m or "mid_block" in m):
+        # Avoid spamming trap blocks: trap diagnostics are sent via periodic MID trap digest.
+        if "mid blocked (trap" in m or "mid blocked(trap" in m:
+            return False
         return True
     if ERROR_BOT_SEND_SCAN_BLOCK and ("scan_block" in m):
         # but still avoid stable pair spam above
