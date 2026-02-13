@@ -3505,6 +3505,7 @@ def _trade_card_text(uid: int, t: dict) -> str:
     if status == "TP1":
         locked = _trade_pnl_if_be_after_tp1(t)
         pnl_total = _fmt_pct(locked)
+        tp1_time = _fmt_dt_msk(t.get("tp1_at"))
         return trf(uid, "msg_trade_open_tp1",
             symbol=symbol,
             market=market,
@@ -3519,7 +3520,7 @@ def _trade_card_text(uid: int, t: dict) -> str:
             tp2=f"{tp2_v:.6f}" if tp2_v else "—",
             be_price=f"{be_price:.6f}" if be_price else "—",
             opened_time=opened_time,
-            event_time="—",
+            event_time=tp1_time,
         )
 
     # ACTIVE (or anything else that's not closed)
