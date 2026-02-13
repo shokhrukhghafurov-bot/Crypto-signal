@@ -265,9 +265,14 @@
     "close_agent_smart_be": "Smart BE",
     "after_tp1_suffix": " (after TP1)",
     "lbl_reason": "🧠 Reason: {reason}",
-    "smart_be_reason": "Low chance to TP2: prob={prob} < hold={hold} (prog={prog}, pullback={pullback}%)",
-    "smart_hard_sl_reason": "Emergency HARD_SL after TP1: {hard_pct}% from entry",
-    "tp1_reason": "TP1 hit → partial close {closed_pct}% and protection SL→BE"
+    "smart_be_reason": "Momentum weakened — low chance to reach TP2 (chance={prob}, need≥{hold}). Progress to TP2: {prog}, pullback: {pullback}%",
+    "smart_hard_sl_reason": "Price moved sharply against the position — emergency close (HARD_SL {hard_pct}% from entry) to cap the loss",
+    "tp1_reason": "Hit TP1 → took {closed_pct}% partial and moved protection SL→BE",
+    "sl_hit_reason": "Price hit SL — closed as planned to limit risk",
+    "sl_after_tp1_reason": "After taking TP1 partial, price reversed and hit SL — remaining size closed",
+    "tp2_hit_reason": "Price hit TP2 — profit secured",
+    "be_hit_reason": "Price returned to entry (BE) — remaining size closed flat",
+    "manual_close_reason": "Trade was closed manually by the user"
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -535,8 +540,13 @@
     "close_agent_smart_be": "Smart BE",
     "after_tp1_suffix": " (после TP1)",
     "lbl_reason": "🧠 Причина: {reason}",
-    "smart_be_reason": "Нет шанса до TP2: prob={prob} < hold={hold} (prog={prog}, pullback={pullback}%)",
-    "smart_hard_sl_reason": "Аварийный HARD_SL после TP1: {hard_pct}% от входа",
-    "tp1_reason": "Достигли TP1 → частичное закрытие {closed_pct}% и защита SL→BE"
+    "smart_be_reason": "Импульс ослаб — шанс дойти до TP2 низкий (шанс={prob}, нужно≥{hold}). Прогресс к TP2: {prog}, откат: {pullback}%",
+    "smart_hard_sl_reason": "Рынок резко пошёл против позиции — аварийно закрыли (HARD_SL {hard_pct}% от входа), чтобы ограничить убыток",
+    "tp1_reason": "Дошли до TP1 → зафиксировали {closed_pct}% и перевели защиту SL→BE",
+    "sl_hit_reason": "Цена дошла до SL — закрыли по плану, риск ограничен",
+    "sl_after_tp1_reason": "После фиксации на TP1 цена развернулась и дошла до SL — остаток закрыт",
+    "tp2_hit_reason": "Цена дошла до TP2 — фиксируем прибыль",
+    "be_hit_reason": "Цена вернулась к входу (BE) — остаток закрыт без убытка",
+    "manual_close_reason": "Сделка закрыта вручную пользователем"
   }
 }
