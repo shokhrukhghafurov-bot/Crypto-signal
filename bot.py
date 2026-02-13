@@ -3358,22 +3358,12 @@ async def trades_page(call: types.CallbackQuery) -> None:
 
 
 def _tp1_partial_close_pct_trade(market: str) -> float:
-    """Partial close pct at TP1 for AUTOTRADE cards.
-
-    Accepts both formats in env:
-      - 50   (percent)
-      - 0.5  (fraction)
-
-    We normalize to **percent** [0..100].
-    """
+    """Partial close pct at TP1 for AUTOTRADE cards (same env as backend)."""
     mk = (market or "").upper()
     try:
-        raw = os.getenv("TP1_PARTIAL_CLOSE_PCT_SPOT" if mk == "SPOT" else "TP1_PARTIAL_CLOSE_PCT_FUTURES", "50")
-        v = float(raw or 50.0)
-        # allow fraction form: 0.5 -> 50
-        if 0.0 <= v <= 1.0:
-            v *= 100.0
-        return float(max(0.0, min(100.0, v)))
+        if mk == "SPOT":
+            return float(os.getenv("TP1_PARTIAL_CLOSE_PCT_SPOT", "50") or 50.0)
+        return float(os.getenv("TP1_PARTIAL_CLOSE_PCT_FUTURES", "50") or 50.0)
     except Exception:
         return 50.0
 
@@ -3781,7 +3771,8 @@ _SIG_SL_BREACH_SINCE: dict[int, float] = {}  # signal_id -> unix ts when SL was 
 
 _SIG_MAX_TRACK_AGE_HOURS = float(os.getenv("SIG_MAX_TRACK_AGE_HOURS", "72") or 72)  # auto-close stale signals
 
-_SIG_TP1_PARTIAL_PCT = float(os.getenv("SIG_TP1_PARTIAL_CLOSE_PCT", "50") or 50)  # model partial close at TP1
+_SIG_TP1_PARTIAL_PCT_RAW = float(os.getenv("SIG_TP1_PARTIAL_CLOSE_PCT", "50") or 50)
+_SIG_TP1_PARTIAL_PCT = (_SIG_TP1_PARTIAL_PCT_RAW * 100.0) if (0 < _SIG_TP1_PARTIAL_PCT_RAW <= 1.0) else _SIG_TP1_PARTIAL_PCT_RAW  # model partial close at TP1
 _SIG_BE_ARM_PCT_TO_TP2 = max(0.0, min(1.0, float(os.getenv('BE_ARM_PCT_TO_TP2', '0') or 0.0)))
 
 def _be_is_armed_sig(side: str, price: float, tp1: float | None, tp2: float | None) -> bool:
@@ -4080,19 +4071,10 @@ def _sig_net_pnl_tp1_then_be(*, market: str, side: str, entry: float, tp1: float
     return float(pnl1 + pnl2 + entry_cost)
 
 def _model_partial_pct() -> float:
-    """Return TP1 partial close fraction in [0..1].
-
-    Accepts env SIG_TP1_PARTIAL_CLOSE_PCT in two formats:
-      - 50   (percent)
-      - 0.5  (fraction)
-    """
     try:
         p = float(_SIG_TP1_PARTIAL_PCT)
     except Exception:
         p = 50.0
-    # normalize: allow fraction form
-    if 0.0 <= p <= 1.0:
-        p *= 100.0
     return max(0.0, min(100.0, p)) / 100.0
 
 async def signal_outcome_loop() -> None:
