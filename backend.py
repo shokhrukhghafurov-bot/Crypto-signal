@@ -9064,7 +9064,7 @@ class Backend:
                         if dbg:
                             txt += "\n\n" + dbg
                         await safe_send(bot, uid, txt, ctx="msg_auto_tp1")
-                        await db_store.set_tp1(trade_id, be_price=float(be_px), price=float(s.tp1), pnl_pct=float(calc_profit_pct(s.entry, float(s.tp1), side)))
+                        await db_store.set_tp1(trade_id, be_price=float(be_px), price=float(s.tp1), pnl_pct=float(pnl))
                         continue
 
                     # 3) After TP1: emergency hard SL (always) + BE logic (optional)
