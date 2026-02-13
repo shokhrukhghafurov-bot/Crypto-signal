@@ -4665,124 +4665,136 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                       ema20_5m: float | None, bos_down_5m: bool, two_red_5m: bool, lower_highs_5m: bool,
                       bos_up_5m: bool, two_green_5m: bool, higher_lows_5m: bool,
                       last_vol: float, avg_vol: float, last_body: float, climax_recent_bars: int) -> str | None:
-    """Return human-readable MID BLOCKED reason (for logging + error-bot), or None if allowed."""
+    """Return human-readable MID BLOCKED reasons (joined with ' / '), or None if allowed."""
+    reasons: list[str] = []
     try:
+        side_u = str(side or "").upper()
+
+        # ATR-based filters
         if atr_30m and atr_30m > 0:
-            if side.upper() == "LONG":
-                move_from_low = (close - recent_low) / atr_30m
-                if move_from_low > MID_LATE_ENTRY_ATR_MAX:
-                    return f"late_entry_atr={move_from_low:.2f} > {MID_LATE_ENTRY_ATR_MAX:g}"
-            else:  # SHORT
-                move_from_high = (recent_high - close) / atr_30m
-                if move_from_high > MID_LATE_ENTRY_ATR_MAX:
-                    return f"late_entry_atr={move_from_high:.2f} > {MID_LATE_ENTRY_ATR_MAX:g}"
+            try:
+                if side_u == "LONG":
+                    move_from_low = (close - recent_low) / atr_30m
+                    if move_from_low > MID_LATE_ENTRY_ATR_MAX:
+                        reasons.append(f"late_entry_atr={move_from_low:.2f} > {MID_LATE_ENTRY_ATR_MAX:g}")
+                else:  # SHORT
+                    move_from_high = (recent_high - close) / atr_30m
+                    if move_from_high > MID_LATE_ENTRY_ATR_MAX:
+                        reasons.append(f"late_entry_atr={move_from_high:.2f} > {MID_LATE_ENTRY_ATR_MAX:g}")
+            except Exception:
+                pass
 
-            # --- Anti-bounce: block SHORT after sharp rebound from recent low (and vice versa for LONG) ---
-            if MID_ANTI_BOUNCE_ENABLED and atr_30m and atr_30m > 0:
-                if side.upper() == "SHORT":
-                    dist_low_atr = (close - recent_low) / atr_30m
-                    if dist_low_atr > MID_ANTI_BOUNCE_ATR_MAX:
-                        return f"anti_bounce_short dist_low_atr={dist_low_atr:.2f} > {MID_ANTI_BOUNCE_ATR_MAX:g}"
-                else:  # LONG
-                    dist_high_atr = (recent_high - close) / atr_30m
-                    if dist_high_atr > MID_ANTI_BOUNCE_ATR_MAX:
-                        return f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {MID_ANTI_BOUNCE_ATR_MAX:g}"
+            # Anti-bounce (mirror)
+            try:
+                if MID_ANTI_BOUNCE_ENABLED:
+                    if side_u == "SHORT":
+                        dist_low_atr = (close - recent_low) / atr_30m
+                        if dist_low_atr > MID_ANTI_BOUNCE_ATR_MAX:
+                            reasons.append(f"anti_bounce_short dist_low_atr={dist_low_atr:.2f} > {MID_ANTI_BOUNCE_ATR_MAX:g}")
+                    else:  # LONG
+                        dist_high_atr = (recent_high - close) / atr_30m
+                        if dist_high_atr > MID_ANTI_BOUNCE_ATR_MAX:
+                            reasons.append(f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {MID_ANTI_BOUNCE_ATR_MAX:g}")
+            except Exception:
+                pass
 
-            # --- BB bounce guard (mirror): avoid entries away from BB extremes ---
-            # For quality entries (less SL), we prefer:
-            #   LONG  only near/below lower band (bb_pos == '↓low')
-            #   SHORT only near/above upper band (bb_pos == '↑high')
-            # Everything inside the bands is treated as "bounce zone" and blocked.
-            if MID_BLOCK_BB_BOUNCE and bb_pos:
-                b = str(bb_pos)
-                if side.upper() == "SHORT":
-                    if b in ("mid→high", "low→mid", "↓low"):
-                        return f"bb_bounce_zone={bb_pos}"
-                else:  # LONG
-                    if b in ("mid→high", "low→mid", "↑high"):
-                        return f"bb_bounce_zone={bb_pos}"
+            # BB bounce guard
+            try:
+                if MID_BLOCK_BB_BOUNCE and bb_pos:
+                    b = str(bb_pos)
+                    if side_u == "SHORT":
+                        if b in ("mid→high", "low→mid", "↓low"):
+                            reasons.append(f"bb_bounce_zone={bb_pos}")
+                    else:  # LONG
+                        if b in ("mid→high", "low→mid", "↑high"):
+                            reasons.append(f"bb_bounce_zone={bb_pos}")
+            except Exception:
+                pass
 
-            dist = abs(close - vwap) / atr_30m if vwap is not None else 0.0
-            if dist > MID_VWAP_DIST_ATR_MAX:
-                return f"vwap_dist_atr={dist:.2f} > {MID_VWAP_DIST_ATR_MAX:g}"
+            # VWAP distance
+            try:
+                dist = abs(close - vwap) / atr_30m if vwap is not None else 0.0
+                if dist > MID_VWAP_DIST_ATR_MAX:
+                    reasons.append(f"vwap_dist_atr={dist:.2f} > {MID_VWAP_DIST_ATR_MAX:g}")
+            except Exception:
+                pass
 
-            body_atr = (abs(close - o) / atr_30m) if o is not None else 0.0
-            if avg_vol and avg_vol > 0:
-                vol_x = last_vol / avg_vol
-            else:
-                vol_x = 0.0
-            # "climax": big vol + big body; block next N bars
-            if climax_recent_bars > 0 or (vol_x > MID_CLIMAX_VOL_X and body_atr > MID_CLIMAX_BODY_ATR):
-                return f"climax vol_x={vol_x:.2f} > {MID_CLIMAX_VOL_X:g} and body_atr={body_atr:.2f} > {MID_CLIMAX_BODY_ATR:g}"
+            # Climax / cooldown
+            try:
+                body_atr = (abs(close - o) / atr_30m) if o is not None else 0.0
+                vol_x = (last_vol / avg_vol) if (avg_vol and avg_vol > 0) else 0.0
+                if climax_recent_bars > 0 or (vol_x > MID_CLIMAX_VOL_X and body_atr > MID_CLIMAX_BODY_ATR):
+                    reasons.append(f"climax vol_x={vol_x:.2f} > {MID_CLIMAX_VOL_X:g} and body_atr={body_atr:.2f} > {MID_CLIMAX_BODY_ATR:g}")
+            except Exception:
+                pass
 
         # RSI filter (works even if ATR missing)
-        if rsi_5m is not None:
-            if side.upper() == "LONG":
-                if rsi_5m >= MID_RSI_LONG_MAX:
-                    return f"rsi_long={rsi_5m:.1f} >= {MID_RSI_LONG_MAX:g}"
-                if rsi_5m < MID_RSI_LONG_MIN:
-                    return f"rsi_long={rsi_5m:.1f} < {MID_RSI_LONG_MIN:g}"
-            else:  # SHORT
-                if rsi_5m <= MID_RSI_SHORT_MIN:
-                    return f"rsi_short={rsi_5m:.1f} <= {MID_RSI_SHORT_MIN:g}"
-                if rsi_5m >= MID_RSI_SHORT_MAX:
-                    return f"rsi_short={rsi_5m:.1f} >= {MID_RSI_SHORT_MAX:g}"
+        try:
+            if rsi_5m is not None:
+                if side_u == "LONG":
+                    if rsi_5m >= MID_RSI_LONG_MAX:
+                        reasons.append(f"rsi_long={rsi_5m:.1f} >= {MID_RSI_LONG_MAX:g}")
+                    if rsi_5m < MID_RSI_LONG_MIN:
+                        reasons.append(f"rsi_long={rsi_5m:.1f} < {MID_RSI_LONG_MIN:g}")
+                else:  # SHORT
+                    if rsi_5m <= MID_RSI_SHORT_MIN:
+                        reasons.append(f"rsi_short={rsi_5m:.1f} <= {MID_RSI_SHORT_MIN:g}")
+                    if rsi_5m >= MID_RSI_SHORT_MAX:
+                        reasons.append(f"rsi_short={rsi_5m:.1f} >= {MID_RSI_SHORT_MAX:g}")
+        except Exception:
+            pass
 
-        # --- Extra quality guards (to reduce immediate SL after entry) ---
+        # Extra quality guards
         try:
             if MID_REQUIRE_VWAP_SIDE and vwap is not None:
-                if side.upper() == "LONG" and close < float(vwap):
-                    return f"vwap_side_long close<{float(vwap):.6g}"
-                if side.upper() == "SHORT" and close > float(vwap):
-                    return f"vwap_side_short close>{float(vwap):.6g}"
+                if side_u == "LONG" and close < float(vwap):
+                    reasons.append(f"vwap_side_long close<{float(vwap):.6g}")
+                if side_u == "SHORT" and close > float(vwap):
+                    reasons.append(f"vwap_side_short close>{float(vwap):.6g}")
         except Exception:
             pass
 
         try:
             if MID_CONFIRM_CANDLE_ENABLED:
-                # Direction-aligned candle
                 if MID_CONFIRM_CANDLE_REQUIRE_DIRECTION and o is not None:
-                    if side.upper() == "LONG" and close <= float(o):
-                        return "confirm_candle_long close<=open"
-                    if side.upper() == "SHORT" and close >= float(o):
-                        return "confirm_candle_short close>=open"
-                # Minimal body vs ATR to avoid chop
+                    if side_u == "LONG" and close <= float(o):
+                        reasons.append("confirm_candle_long close<=open")
+                    if side_u == "SHORT" and close >= float(o):
+                        reasons.append("confirm_candle_short close>=open")
                 if atr_30m and atr_30m > 0 and o is not None:
                     body_atr2 = abs(float(close) - float(o)) / float(atr_30m)
                     if body_atr2 < MID_CONFIRM_CANDLE_BODY_ATR_MIN:
-                        return f"small_body_atr={body_atr2:.2f} < {MID_CONFIRM_CANDLE_BODY_ATR_MIN:g}"
+                        reasons.append(f"small_body_atr={body_atr2:.2f} < {MID_CONFIRM_CANDLE_BODY_ATR_MIN:g}")
         except Exception:
             pass
 
-
-        # --- Anti-countertrend guards (5m structure) ---
+        # Anti-countertrend (5m structure)
         try:
-            if side.upper() == "LONG":
+            if side_u == "LONG":
                 if MID_BLOCK_LONG_BOS_DOWN and bos_down_5m:
-                    return "bos_down_5m"
+                    reasons.append("bos_down_5m")
                 if MID_BLOCK_LONG_BELOW_EMA20_5M and (ema20_5m is not None) and close < float(ema20_5m):
-                    return f"below_ema20_5m close<{float(ema20_5m):.6g}"
+                    reasons.append("below_ema20_5m")
                 if MID_BLOCK_LONG_2_RED_CANDLES and two_red_5m:
-                    return "two_red_candles_5m"
+                    reasons.append("two_red_candles_5m")
                 if MID_BLOCK_LONG_LOWER_HIGHS and lower_highs_5m:
-                    return "lower_highs_5m"
-            elif side.upper() == "SHORT":
+                    reasons.append("lower_highs_5m")
+            elif side_u == "SHORT":
                 if MID_BLOCK_SHORT_BOS_UP and bos_up_5m:
-                    return "bos_up_5m"
+                    reasons.append("bos_up_5m")
                 if MID_BLOCK_SHORT_ABOVE_EMA20_5M and (ema20_5m is not None) and close > float(ema20_5m):
-                    return f"above_ema20_5m close>{float(ema20_5m):.6g}"
+                    reasons.append("above_ema20_5m")
                 if MID_BLOCK_SHORT_2_GREEN_CANDLES and two_green_5m:
-                    return "two_green_candles_5m"
+                    reasons.append("two_green_candles_5m")
                 if MID_BLOCK_SHORT_HIGHER_LOWS and higher_lows_5m:
-                    return "higher_lows_5m"
+                    reasons.append("higher_lows_5m")
         except Exception:
             pass
 
     except Exception:
-        # if filter computation fails, don't block signal; let normal error handling deal with it
         return None
-    return None
 
+    return " / ".join(reasons) if reasons else None
 
 @dataclass(frozen=True)
 class Signal:
@@ -6254,7 +6266,7 @@ def _mid_structure_trap_ok(*, direction: str, entry: float, df1hi: pd.DataFrame)
     return (True, "")
 
 
-def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
+def evaluate_on_exchange_mid(symbol: str, df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
     Produces a result dict compatible with scanner_loop_mid and a rich TA block (like MAIN),
@@ -6581,7 +6593,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             pass
 
         reason = _mid_block_reason(
-            symbol="",
+            symbol=str(symbol or ""),
             side=str(dir_trend),
             close=float(entry),
             o=o5 if not np.isnan(o5) else float(entry),
@@ -6605,7 +6617,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         )
         if reason:
             try:
-                logger.info("MID blocked: dir=%s reason=%s entry=%.6g", dir_trend, reason, float(entry))
+                logger.info("MID blocked %s: symbol=%s reason=%s entry=%.6g", str(dir_trend).upper(), str(symbol or ""), str(reason), float(entry))
                 # Reuse MID trap sink/digest to show why MID hard-filters blocked entries
                 _emit_mid_trap_event({
                     "dir": str(dir_trend),
@@ -9447,7 +9459,7 @@ class Backend:
                                 if a is None or b is None or c is None or a.empty or b.empty or c.empty:
                                     no_data += 1
                                     continue
-                                r = evaluate_on_exchange_mid(a, b, c)
+                                r = evaluate_on_exchange_mid(symbol, a, b, c)
                                 if r:
                                     supporters.append((name, r))
                             except Exception:
