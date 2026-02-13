@@ -3478,12 +3478,9 @@ def _trade_card_text(uid: int, t: dict) -> str:
         if checks:
             checks_line = f"🧪 {tr(uid, 'lbl_check')}: " + " ".join(checks)
 
-    live_block = ("
-".join(live_lines) + "
+    live_block = ("\n".join(live_lines) + "\n\n") if live_lines else ""
+    checks_block = (checks_line + "\n") if checks_line else ""
 
-") if live_lines else ""
-    checks_block = (checks_line + "
-") if checks_line else ""
 
     opened_time = _fmt_dt_msk(t.get("opened_at"))
 
@@ -3494,8 +3491,7 @@ def _trade_card_text(uid: int, t: dict) -> str:
             be_price = float(t.get("be_price") or 0.0)
     except Exception:
         be_price = None
-    be_line = (f"🛡 BE: {be_price:.6f}
-" if (be_price and status == "TP1") else "")
+    be_line = (f"🛡 BE: {be_price:.6f}\n" if (be_price and status == "TP1") else "")
 
     # --- status-specific PnL ---
     def _fmt_pct(v: float | None) -> str:
