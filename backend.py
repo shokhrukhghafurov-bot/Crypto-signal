@@ -8694,7 +8694,7 @@ class Backend:
                         after_tp1 = _trf(uid, "after_tp1_suffix") if tp1_hit else ""
                         close_agent = _trf(uid, "close_agent_smart_manager")
                         be_line = (f"🛡 BE: {float(be_price):.6f}\n" if (be_price and float(be_price)>0) else "")
-                        reason_line = ""
+                        reason_line = _trf(uid, \"lbl_reason\", reason=_trf(uid, \"tp2_hit_reason\")) + \"\n\"
                         emoji = "🟢"
                         txt = _trf(uid, "msg_auto_win",
                             symbol=s.symbol,
@@ -8763,10 +8763,14 @@ class Backend:
                         import datetime as _dt
                         now_utc = _dt.datetime.now(_dt.timezone.utc)
                         rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
-                        after_tp1 = ""
+                        after_tp1 = _trf(uid, "after_tp1_suffix") if tp1_hit else ""
                         close_agent = _trf(uid, "close_agent_smart_manager")
                         be_line = ""
-                        reason_line = ""
+                        # Human-friendly reason (via i18n)
+                        _rkey = "sl_after_tp1_reason" if tp1_hit else "sl_hit_reason"
+                        reason_line = _trf(uid, "lbl_reason", reason=_trf(uid, _rkey)) + "
+"
+
                         emoji = "🔴"
                         txt = _trf(uid, "msg_auto_loss",
                             symbol=s.symbol,
