@@ -3386,117 +3386,170 @@ def _trade_pnl_if_be_after_tp1(t: dict) -> float | None:
         return None
 
 def _trade_card_text(uid: int, t: dict) -> str:
+    """Unified trade card for /my trades (open trades), matching the PRO card style.
+
+    - ACTIVE: shows status + unrealized PnL (if live price is available) + RR + live checks.
+    - TP1: shows locked total PnL (TP1 part) and BE protection + live checks.
+    """
     symbol = str(t.get("symbol") or "")
     market = str(t.get("market") or "FUTURES").upper()
     side = str(t.get("side") or "LONG").upper()
     status = str(t.get("status") or "ACTIVE").upper()
 
     entry = float(t.get("entry") or 0.0)
-    tp1 = t.get("tp1")
-    tp2 = t.get("tp2")
-    sl = t.get("sl")
+    sl_v = float(t.get("sl") or 0.0) if t.get("sl") is not None else 0.0
+    tp1_v = float(t.get("tp1") or 0.0) if t.get("tp1") is not None else 0.0
+    tp2_v = float(t.get("tp2") or 0.0) if t.get("tp2") is not None else 0.0
 
-    head = f"🪙 {symbol} | {tr_market(uid, market)}"
-    if market != "SPOT":
-        head += f" | {side}"
-
-    parts = [
-        "📌 " + tr(uid, "m_trades"),
-        "",
-        head,
-        "",
-        f"{tr(uid, 'sig_entry')}: {entry:.6f}",
-    ]
-    if sl is not None:
-        parts.append(f"SL: {float(sl):.6f}")
-    if tp1 is not None:
-        parts.append(f"TP1: {float(tp1):.6f}")
-    if tp2 is not None and float(tp2) > 0 and (tp1 is None or abs(float(tp2) - float(tp1)) > 1e-12):
-        parts.append(f"TP2: {float(tp2):.6f}")
-
-    # Live price info (shown when loaded via get_trade_live)
-    had_live_block = False
-    if t.get('price_f') is not None:
+    def _rr(entry_f: float, sl_f: float, tp2_f: float, side_s: str) -> str:
         try:
-            px = float(t.get('price_f') or 0.0)
-            src = str(t.get('price_src') or '')
-            parts.append("")
-            parts.append(f"💹 {tr(uid, 'lbl_price_now')}: {px:.6f}")
-            if src:
-                parts.append(f"🔌 {tr(uid, 'lbl_price_src')}: {src}")            # "Checks" should reflect executed state when TP/SL already happened.
-            # Otherwise it can show ❌ for TP1 after price moved away, even though TP1 was reached earlier.
-            st = str(t.get('status') or status).upper()
-            hit_sl = bool(t.get('hit_sl')) or st in ('LOSS',)
-            hit_tp1 = bool(t.get('hit_tp1')) or st in ('TP1','WIN','TP2')
-            hit_tp2 = bool(t.get('hit_tp2')) or st in ('WIN','TP2')
-
-            checks = []
-            # In TP1 state we show BE + HARD_SL instead of original SL
-            if st == 'TP1':
-                # BE check (always relevant after TP1)
-                if t.get('be_price_f') is not None or t.get('be_price') is not None:
-                    hit_be = bool(t.get('hit_be'))
-                    checks.append(f"{tr(uid, 'lbl_be')}: {'✅' if hit_be else '❌'}")
-                # HARD SL check (emergency stop after TP1)
-                try:
-                    hard_pct = float(os.getenv("SMART_HARD_SL_PCT", "2.8") or 0.0)
-                except Exception:
-                    hard_pct = 0.0
-                hard_sl = 0.0
-                try:
-                    entry_p = float(t.get('entry') or 0.0)
-                except Exception:
-                    entry_p = 0.0
-                side = str(t.get('side') or '').upper()
-                if entry_p > 0 and hard_pct > 0 and side in ('LONG','SHORT'):
-                    hard_sl = (entry_p * (1 - hard_pct / 100.0)) if side == 'LONG' else (entry_p * (1 + hard_pct / 100.0))
-                # hit_hard_sl may be provided by backend; if not, fall back to comparing with current price
-                hit_hsl = bool(t.get('hit_hard_sl'))
-                try:
-                    px = float(t.get('last_price') or t.get('price_now') or 0.0)
-                    if not hit_hsl and hard_sl > 0 and px > 0:
-                        hit_hsl = (px <= hard_sl) if side == 'LONG' else (px >= hard_sl)
-                except Exception:
-                    pass
-                if hard_sl > 0:
-                    checks.append(f"{tr(uid, 'lbl_hard_sl')}: {'✅' if hit_hsl else '❌'}")
+            if entry_f <= 0 or sl_f <= 0 or tp2_f <= 0:
+                return "—"
+            if side_s == "SHORT":
+                risk = sl_f - entry_f
+                reward = entry_f - tp2_f
             else:
-                if t.get('sl') is not None:
-                    checks.append(f"{tr(uid, 'lbl_sl')}: {'✅' if hit_sl else '❌'}")
-            if t.get('tp1') is not None:
-                checks.append(f"{tr(uid, 'lbl_tp1')}: {'✅' if hit_tp1 else '❌'}")
-            if t.get('tp2') is not None and float(t.get('tp2') or 0) > 0:
-                checks.append(f"{tr(uid, 'lbl_tp2')}: {'✅' if hit_tp2 else '❌'}")
-            if checks:
-                parts.append(f"🧪 {tr(uid, 'lbl_check')}: " + ' '.join(checks))
-            had_live_block = True
+                risk = entry_f - sl_f
+                reward = tp2_f - entry_f
+            if risk <= 0 or reward <= 0:
+                return "—"
+            return f"{(reward / risk):.2f}"
         except Exception:
-            pass
+            return "—"
 
-    # Opened datetime (MSK)
-    opened_at = _fmt_dt_msk(t.get('opened_at'))
-    opened_lbl = tr(uid, 'trade_opened_at')
-    opened_line = f"🕒 {opened_lbl}: {opened_at} (MSK)"
-    if opened_at and opened_at != "—":
-        parts.append(opened_line)
+    rr = _rr(entry, sl_v, tp2_v, side)
 
-    parts += [
-        "",
-        f"{tr(uid, 'sig_status')}: {status} {_trade_status_emoji(status)}",
-    ]
+    # --- live price + checks ---
+    live_lines: list[str] = []
+    checks_line = ""
+    px = None
+    src = ""
+    try:
+        if t.get("price_f") is not None:
+            px = float(t.get("price_f") or 0.0)
+            src = str(t.get("price_src") or "")
+    except Exception:
+        px = None
 
-    pnl = t.get("pnl_total_pct")
-    if pnl is not None and status in ("WIN","LOSS","BE","CLOSED","HARD_SL"):
+    if px is not None and px > 0:
+        live_lines.append(f"💹 {tr(uid, 'lbl_price_now')}: {px:.6f}")
+        if src:
+            live_lines.append(f"🔌 {tr(uid, 'lbl_price_src')}: {src}")
+
+        # Checks should reflect executed state if TP already happened (TP1/TP2 flags), otherwise it can lie.
+        st = str(t.get("status") or status).upper()
+        hit_sl = bool(t.get("hit_sl")) or st in ("LOSS",)
+        hit_tp1 = bool(t.get("hit_tp1")) or st in ("TP1", "WIN", "TP2")
+        hit_tp2 = bool(t.get("hit_tp2")) or st in ("WIN", "TP2")
+
+        checks: list[str] = []
+
+        # In TP1 state we show BE + HARD_SL instead of original SL
+        if st == "TP1":
+            # BE
+            if t.get("be_price") is not None:
+                hit_be = bool(t.get("hit_be"))
+                checks.append(f"{tr(uid, 'lbl_be')}: {'✅' if hit_be else '❌'}")
+            # HARD SL (after TP1)
+            try:
+                hard_pct = float(os.getenv("SMART_HARD_SL_PCT", "2.8") or 0.0)
+            except Exception:
+                hard_pct = 0.0
+            hard_sl = 0.0
+            if entry > 0 and hard_pct > 0 and side in ("LONG", "SHORT"):
+                hard_sl = (entry * (1 - hard_pct / 100.0)) if side == "LONG" else (entry * (1 + hard_pct / 100.0))
+            if hard_sl > 0:
+                hit_hsl = bool(t.get("hit_hard_sl"))
+                if not hit_hsl:
+                    try:
+                        hit_hsl = (px <= hard_sl) if side == "LONG" else (px >= hard_sl)
+                    except Exception:
+                        hit_hsl = False
+                checks.append(f"{tr(uid, 'lbl_hard_sl')}: {'✅' if hit_hsl else '❌'}")
+        else:
+            if t.get("sl") is not None:
+                checks.append(f"{tr(uid, 'lbl_sl')}: {'✅' if hit_sl else '❌'}")
+
+        if t.get("tp1") is not None:
+            checks.append(f"{tr(uid, 'lbl_tp1')}: {'✅' if hit_tp1 else '❌'}")
+        if t.get("tp2") is not None and float(t.get("tp2") or 0) > 0:
+            checks.append(f"{tr(uid, 'lbl_tp2')}: {'✅' if hit_tp2 else '❌'}")
+
+        if checks:
+            checks_line = f"🧪 {tr(uid, 'lbl_check')}: " + " ".join(checks)
+
+    live_block = ("
+".join(live_lines) + "
+
+") if live_lines else ""
+    checks_block = (checks_line + "
+") if checks_line else ""
+
+    opened_time = _fmt_dt_msk(t.get("opened_at"))
+
+    # --- BE line for details ---
+    be_price = None
+    try:
+        if t.get("be_price") is not None:
+            be_price = float(t.get("be_price") or 0.0)
+    except Exception:
+        be_price = None
+    be_line = (f"🛡 BE: {be_price:.6f}
+" if (be_price and status == "TP1") else "")
+
+    # --- status-specific PnL ---
+    def _fmt_pct(v: float | None) -> str:
+        if v is None:
+            return "—"
         try:
-            parts.append(f"{tr(uid,'lbl_total_pnl')}: {float(pnl):+.2f}%")
+            return f"{float(v):+.2f}%"
         except Exception:
-            pass
-    elif status == "TP1":
-        est = _trade_pnl_if_be_after_tp1(t)
-        if est is not None:
-            parts.append(f"{tr(uid,'lbl_total_pnl_if_be')}: {float(est):+.2f}%")
+            return "—"
 
-    return "\n".join(parts)
+    if status == "TP1":
+        locked = _trade_pnl_if_be_after_tp1(t)
+        pnl_total = _fmt_pct(locked)
+        return _trf(uid, "msg_trade_open_tp1",
+            symbol=symbol,
+            market=market,
+            side=side,
+            rr=rr,
+            pnl_total=pnl_total,
+            live_block=live_block,
+            checks_block=checks_block,
+            entry=f"{entry:.6f}",
+            sl=f"{sl_v:.6f}",
+            tp1=f"{tp1_v:.6f}" if tp1_v else "—",
+            tp2=f"{tp2_v:.6f}" if tp2_v else "—",
+            be_price=f"{be_price:.6f}" if be_price else "—",
+            opened_time=opened_time,
+            event_time="—",
+        )
+
+    # ACTIVE (or anything else that's not closed)
+    pnl_unreal = None
+    if px is not None and px > 0 and entry > 0 and side in ("LONG","SHORT"):
+        pnl_unreal = ((px - entry) / entry * 100.0) if side == "LONG" else ((entry - px) / entry * 100.0)
+
+    emoji = "🟢" if side == "LONG" else "🔴"
+    return _trf(uid, "msg_trade_open",
+        emoji=emoji,
+        symbol=symbol,
+        market=market,
+        side=side,
+        status=status,
+        pnl_unreal=_fmt_pct(pnl_unreal),
+        rr=rr,
+        live_block=live_block,
+        checks_block=checks_block,
+        entry=f"{entry:.6f}",
+        sl=f"{sl_v:.6f}" if sl_v else "—",
+        tp1=f"{tp1_v:.6f}" if tp1_v else "—",
+        tp2=f"{tp2_v:.6f}" if tp2_v else "—",
+        be_line="",
+        opened_time=opened_time,
+    )
+
 
 def _trade_card_kb(uid: int, trade_id: int, back_offset: int = 0) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
