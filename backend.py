@@ -7819,29 +7819,56 @@ class Backend:
         if not row:
             return False
         trade_id = int(row["id"])
-        # manual close (keep last known price if present)
+
+        # Manual close: try to use live price; if unavailable fall back to entry.
         close_price = float(row.get("entry") or 0.0)
+        s = None  # will be built for live price/pnl calc
         try:
-            await db_store.close_trade(trade_id, status="CLOSED", price=close_price, pnl_total_pct=float(row.get("pnl_total_pct") or 0.0))
-            self._sl_breach_since.pop(trade_id, None)
-            try:
-                if hasattr(self, "_tp1_peak_px"):
-                    self._tp1_peak_px.pop(trade_id, None)
-                if hasattr(self, "_be_skip_until"):
-                    self._be_skip_until.pop(trade_id, None)
-            except Exception:
-                pass
+            s = Signal(
+                signal_id=int(row.get('signal_id') or 0),
+                market=str(row.get('market') or 'FUTURES').upper(),
+                symbol=str(row.get('symbol') or '').upper(),
+                direction=str(row.get('direction') or row.get('side') or 'LONG').upper(),
+                timeframe=str(row.get('timeframe') or ''),
+                entry=float(row.get('entry') or 0.0),
+                sl=float(row.get('sl') or 0.0),
+                tp1=float(row.get('tp1') or 0.0),
+                tp2=float(row.get('tp2') or 0.0),
+                rr=0.0,
+                confidence=0,
+                confirmations='',
+                risk_note='',
+                ts=float(dt.datetime.now(dt.timezone.utc).timestamp()),
+            )
+            px, _src = await self._get_price_with_source(s)
+            if px is not None and float(px) > 0:
+                close_price = float(px)
+        except Exception:
+            pass
+
+        # If TP1 was hit, include TP1 partial PnL + remainder close PnL into total.
+        try:
+            tp1_hit = bool(row.get("tp1_hit") or False)
+            trade_ctx = UserTrade(user_id=int(user_id), signal=s, tp1_hit=tp1_hit)
+            pnl_total = _calc_effective_pnl_pct(trade_ctx, close_price=float(close_price), close_reason="CLOSED")
+        except Exception:
+            pnl_total = float(row.get("pnl_total_pct") or 0.0)
+
+        try:
+            await db_store.close_trade(trade_id, status="CLOSED", price=float(close_price), pnl_total_pct=float(pnl_total))
         except Exception:
             # best effort
             await db_store.close_trade(trade_id, status="CLOSED")
-            self._sl_breach_since.pop(trade_id, None)
-            try:
-                if hasattr(self, "_tp1_peak_px"):
-                    self._tp1_peak_px.pop(trade_id, None)
-                if hasattr(self, "_be_skip_until"):
-                    self._be_skip_until.pop(trade_id, None)
-            except Exception:
-                pass
+
+        # cleanup trackers
+        self._sl_breach_since.pop(trade_id, None)
+        try:
+            if hasattr(self, "_tp1_peak_px"):
+                self._tp1_peak_px.pop(trade_id, None)
+            if hasattr(self, "_be_skip_until"):
+                self._be_skip_until.pop(trade_id, None)
+        except Exception:
+            pass
         return True
 
 
@@ -8004,12 +8031,52 @@ class Backend:
         row = await db_store.get_trade_by_id(int(user_id), int(trade_id))
         if not row:
             return False
-        # manual close (keep last known price if present)
-        close_price = float(row.get('entry') or 0.0)
+
+        close_price = float(row.get("entry") or 0.0)
+        s = None  # will be built for live price/pnl calc
         try:
-            await db_store.close_trade(int(trade_id), status='CLOSED', price=close_price, pnl_total_pct=float(row.get('pnl_total_pct') or 0.0))
+            s = Signal(
+                signal_id=int(row.get('signal_id') or 0),
+                market=str(row.get('market') or 'FUTURES').upper(),
+                symbol=str(row.get('symbol') or '').upper(),
+                direction=str(row.get('direction') or row.get('side') or 'LONG').upper(),
+                timeframe=str(row.get('timeframe') or ''),
+                entry=float(row.get('entry') or 0.0),
+                sl=float(row.get('sl') or 0.0),
+                tp1=float(row.get('tp1') or 0.0),
+                tp2=float(row.get('tp2') or 0.0),
+                rr=0.0,
+                confidence=0,
+                confirmations='',
+                risk_note='',
+                ts=float(dt.datetime.now(dt.timezone.utc).timestamp()),
+            )
+            px, _src = await self._get_price_with_source(s)
+            if px is not None and float(px) > 0:
+                close_price = float(px)
         except Exception:
-            await db_store.close_trade(int(trade_id), status='CLOSED')
+            pass
+
+        try:
+            tp1_hit = bool(row.get("tp1_hit") or False)
+            trade_ctx = UserTrade(user_id=int(user_id), signal=s, tp1_hit=tp1_hit)
+            pnl_total = _calc_effective_pnl_pct(trade_ctx, close_price=float(close_price), close_reason="CLOSED")
+        except Exception:
+            pnl_total = float(row.get("pnl_total_pct") or 0.0)
+
+        try:
+            await db_store.close_trade(int(trade_id), status="CLOSED", price=float(close_price), pnl_total_pct=float(pnl_total))
+        except Exception:
+            await db_store.close_trade(int(trade_id), status="CLOSED")
+
+        self._sl_breach_since.pop(int(trade_id), None)
+        try:
+            if hasattr(self, "_tp1_peak_px"):
+                self._tp1_peak_px.pop(int(trade_id), None)
+            if hasattr(self, "_be_skip_until"):
+                self._be_skip_until.pop(int(trade_id), None)
+        except Exception:
+            pass
         return True
 
     async def get_user_trades(self, user_id: int) -> list[dict]:
@@ -8779,10 +8846,12 @@ class Backend:
                         if hard_sl > 0 and hit_sl(float(hard_sl)):
                             import datetime as _dt
                             now_utc = _dt.datetime.now(_dt.timezone.utc)
+                            trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
+                            pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(hard_sl), close_reason="HARD_SL")
                             txt = _trf(uid, "msg_auto_loss",
                                 symbol=s.symbol,
                                 market=market,
-                            pnl_total=fmt_pnl_pct(float(pnl)),
+                                pnl_total=fmt_pnl_pct(float(pnl)),
                                 sl=f"{float(hard_sl):.6f}",
                                 opened_time=fmt_dt_msk(row.get("opened_at")),
                                 closed_time=fmt_dt_msk(now_utc),
@@ -8791,8 +8860,6 @@ class Backend:
                             if dbg:
                                 txt += "\n\n" + dbg
                             await safe_send(bot, uid, txt, ctx="msg_auto_loss")
-                            trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
-                            pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(hard_sl), close_reason="HARD_SL")
                             await db_store.close_trade(trade_id, status="HARD_SL", price=float(hard_sl), pnl_total_pct=float(pnl))
                             self._sl_breach_since.pop(trade_id, None)
                             try:
@@ -8863,6 +8930,8 @@ class Backend:
                                     else:
                                         import datetime as _dt
                                         now_utc = _dt.datetime.now(_dt.timezone.utc)
+                                        trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
+                                        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(be_lvl), close_reason="BE")
                                         txt = _trf(uid, "msg_auto_be",
                                             symbol=s.symbol,
                                             market=market,
@@ -8875,8 +8944,6 @@ class Backend:
                                         if dbg:
                                             txt += "\n\n" + dbg
                                         await safe_send(bot, uid, txt, ctx="msg_auto_be")
-                                        trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
-                                        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(be_lvl), close_reason="BE")
                                         await db_store.close_trade(trade_id, status="BE", price=float(be_lvl), pnl_total_pct=float(pnl))
                                         self._sl_breach_since.pop(trade_id, None)
                                         try:
