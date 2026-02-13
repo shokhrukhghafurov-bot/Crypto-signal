@@ -870,10 +870,11 @@ async def set_tp1(trade_id: int, *, be_price: float, price: float | None = None,
         await conn.execute(
             """
             UPDATE trades
-            SET status='TP1', tp1_hit=TRUE, be_price=$2
+            SET status='TP1', tp1_hit=TRUE, be_price=$2,
+                pnl_total_pct=COALESCE($3, pnl_total_pct)
             WHERE id=$1;
             """,
-            int(trade_id), float(be_price)
+            int(trade_id), float(be_price), (float(pnl_pct) if pnl_pct is not None else None)
         )
         await conn.execute(
             "INSERT INTO trade_events (trade_id, event_type, price, pnl_pct) VALUES ($1,'TP1',$2,$3);",
