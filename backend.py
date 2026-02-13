@@ -4592,11 +4592,11 @@ SPOT_PRICE_SOURCE = (os.getenv("SPOT_PRICE_SOURCE", "MEDIAN").strip().upper() or
 FUTURES_PRICE_SOURCE = (os.getenv("FUTURES_PRICE_SOURCE", "MEDIAN").strip().upper() or "MEDIAN")
 TRACK_INTERVAL_SECONDS = max(1, _env_int("TRACK_INTERVAL_SECONDS", 3))
 # Backward-compatible default partial close percent (legacy)
-TP1_PARTIAL_CLOSE_PCT = max(0.0, min(100.0, (_env_float("TP1_PARTIAL_CLOSE_PCT", 50.0) * 100.0 if 0 < _env_float("TP1_PARTIAL_CLOSE_PCT", 50.0) <= 1.0 else _env_float("TP1_PARTIAL_CLOSE_PCT", 50.0))))
+TP1_PARTIAL_CLOSE_PCT = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT", 50)))
 
 # New per-market settings
-TP1_PARTIAL_CLOSE_PCT_SPOT = max(0.0, min(100.0, (_env_float("TP1_PARTIAL_CLOSE_PCT_SPOT", float(TP1_PARTIAL_CLOSE_PCT)) * 100.0 if 0 < _env_float("TP1_PARTIAL_CLOSE_PCT_SPOT", float(TP1_PARTIAL_CLOSE_PCT)) <= 1.0 else _env_float("TP1_PARTIAL_CLOSE_PCT_SPOT", float(TP1_PARTIAL_CLOSE_PCT)))))
-TP1_PARTIAL_CLOSE_PCT_FUTURES = max(0.0, min(100.0, (_env_float("TP1_PARTIAL_CLOSE_PCT_FUTURES", float(TP1_PARTIAL_CLOSE_PCT)) * 100.0 if 0 < _env_float("TP1_PARTIAL_CLOSE_PCT_FUTURES", float(TP1_PARTIAL_CLOSE_PCT)) <= 1.0 else _env_float("TP1_PARTIAL_CLOSE_PCT_FUTURES", float(TP1_PARTIAL_CLOSE_PCT)))))
+TP1_PARTIAL_CLOSE_PCT_SPOT = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT_SPOT", TP1_PARTIAL_CLOSE_PCT)))
+TP1_PARTIAL_CLOSE_PCT_FUTURES = max(0, min(100, _env_int("TP1_PARTIAL_CLOSE_PCT_FUTURES", TP1_PARTIAL_CLOSE_PCT)))
 
 BE_AFTER_TP1_SPOT = _env_bool("BE_AFTER_TP1_SPOT", True)
 BE_AFTER_TP1_FUTURES = _env_bool("BE_AFTER_TP1_FUTURES", True)
@@ -9064,7 +9064,12 @@ class Backend:
                         if dbg:
                             txt += "\n\n" + dbg
                         await safe_send(bot, uid, txt, ctx="msg_auto_tp1")
-                        await db_store.set_tp1(trade_id, be_price=float(be_px), price=float(s.tp1), pnl_pct=float(pnl))
+                        # TP1 event: store FIXED PnL (partial TP1 close) so cards show correct 'зафиксировано'
+                        _p = max(0.0, min(100.0, float(_tp1_partial_close_pct(s.market))))
+                        _has_tp2 = bool(getattr(s, 'tp2', 0.0) or 0.0)
+                        _full_tp1 = float(calc_profit_pct(s.entry, float(s.tp1), side))
+                        _fixed_tp1 = (_full_tp1 * (_p/100.0)) if _has_tp2 else _full_tp1
+                        await db_store.set_tp1(trade_id, be_price=float(be_px), price=float(s.tp1), pnl_pct=float(_fixed_tp1))
                         continue
 
                     # 3) After TP1: emergency hard SL (always) + BE logic (optional)
