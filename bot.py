@@ -3358,12 +3358,22 @@ async def trades_page(call: types.CallbackQuery) -> None:
 
 
 def _tp1_partial_close_pct_trade(market: str) -> float:
-    """Partial close pct at TP1 for AUTOTRADE cards (same env as backend)."""
+    """Partial close pct at TP1 for AUTOTRADE cards.
+
+    Accepts both formats in env:
+      - 50   (percent)
+      - 0.5  (fraction)
+
+    We normalize to **percent** [0..100].
+    """
     mk = (market or "").upper()
     try:
-        if mk == "SPOT":
-            return float(os.getenv("TP1_PARTIAL_CLOSE_PCT_SPOT", "50") or 50.0)
-        return float(os.getenv("TP1_PARTIAL_CLOSE_PCT_FUTURES", "50") or 50.0)
+        raw = os.getenv("TP1_PARTIAL_CLOSE_PCT_SPOT" if mk == "SPOT" else "TP1_PARTIAL_CLOSE_PCT_FUTURES", "50")
+        v = float(raw or 50.0)
+        # allow fraction form: 0.5 -> 50
+        if 0.0 <= v <= 1.0:
+            v *= 100.0
+        return float(max(0.0, min(100.0, v)))
     except Exception:
         return 50.0
 
@@ -4070,10 +4080,19 @@ def _sig_net_pnl_tp1_then_be(*, market: str, side: str, entry: float, tp1: float
     return float(pnl1 + pnl2 + entry_cost)
 
 def _model_partial_pct() -> float:
+    """Return TP1 partial close fraction in [0..1].
+
+    Accepts env SIG_TP1_PARTIAL_CLOSE_PCT in two formats:
+      - 50   (percent)
+      - 0.5  (fraction)
+    """
     try:
         p = float(_SIG_TP1_PARTIAL_PCT)
     except Exception:
         p = 50.0
+    # normalize: allow fraction form
+    if 0.0 <= p <= 1.0:
+        p *= 100.0
     return max(0.0, min(100.0, p)) / 100.0
 
 async def signal_outcome_loop() -> None:
