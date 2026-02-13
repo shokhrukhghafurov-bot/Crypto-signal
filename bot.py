@@ -3771,8 +3771,7 @@ _SIG_SL_BREACH_SINCE: dict[int, float] = {}  # signal_id -> unix ts when SL was 
 
 _SIG_MAX_TRACK_AGE_HOURS = float(os.getenv("SIG_MAX_TRACK_AGE_HOURS", "72") or 72)  # auto-close stale signals
 
-_SIG_TP1_PARTIAL_PCT_RAW = float(os.getenv("SIG_TP1_PARTIAL_CLOSE_PCT", "50") or 50)
-_SIG_TP1_PARTIAL_PCT = (_SIG_TP1_PARTIAL_PCT_RAW * 100.0) if (0 < _SIG_TP1_PARTIAL_PCT_RAW <= 1.0) else _SIG_TP1_PARTIAL_PCT_RAW  # model partial close at TP1
+_SIG_TP1_PARTIAL_PCT = float(os.getenv("SIG_TP1_PARTIAL_CLOSE_PCT", "50") or 50)  # model partial close at TP1
 _SIG_BE_ARM_PCT_TO_TP2 = max(0.0, min(1.0, float(os.getenv('BE_ARM_PCT_TO_TP2', '0') or 0.0)))
 
 def _be_is_armed_sig(side: str, price: float, tp1: float | None, tp2: float | None) -> bool:
