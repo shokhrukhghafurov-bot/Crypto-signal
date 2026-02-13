@@ -3505,7 +3505,7 @@ def _trade_card_text(uid: int, t: dict) -> str:
     if status == "TP1":
         locked = _trade_pnl_if_be_after_tp1(t)
         pnl_total = _fmt_pct(locked)
-        return _trf(uid, "msg_trade_open_tp1",
+        return trf(uid, "msg_trade_open_tp1",
             symbol=symbol,
             market=market,
             side=side,
@@ -3528,7 +3528,7 @@ def _trade_card_text(uid: int, t: dict) -> str:
         pnl_unreal = ((px - entry) / entry * 100.0) if side == "LONG" else ((entry - px) / entry * 100.0)
 
     emoji = "🟢" if side == "LONG" else "🔴"
-    return _trf(uid, "msg_trade_open",
+    return trf(uid, "msg_trade_open",
         emoji=emoji,
         symbol=symbol,
         market=market,
