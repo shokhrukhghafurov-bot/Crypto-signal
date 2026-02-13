@@ -40,6 +40,11 @@ MID_BLOCK_LONG_BELOW_EMA20_5M = os.getenv("MID_BLOCK_LONG_BELOW_EMA20_5M", "1").
 MID_BLOCK_LONG_2_RED_CANDLES = os.getenv("MID_BLOCK_LONG_2_RED_CANDLES", "1").strip().lower() not in ("0","false","no","off")
 MID_BLOCK_LONG_LOWER_HIGHS = os.getenv("MID_BLOCK_LONG_LOWER_HIGHS", "1").strip().lower() not in ("0","false","no","off")
 MID_LOWER_HIGHS_LOOKBACK = int(os.getenv("MID_LOWER_HIGHS_LOOKBACK", "4") or 4)  # count of last highs to compare
+MID_BLOCK_SHORT_BOS_UP = os.getenv("MID_BLOCK_SHORT_BOS_UP", "1").strip().lower() not in ("0","false","no","off")
+MID_BLOCK_SHORT_ABOVE_EMA20_5M = os.getenv("MID_BLOCK_SHORT_ABOVE_EMA20_5M", "1").strip().lower() not in ("0","false","no","off")
+MID_BLOCK_SHORT_2_GREEN_CANDLES = os.getenv("MID_BLOCK_SHORT_2_GREEN_CANDLES", "1").strip().lower() not in ("0","false","no","off")
+MID_BLOCK_SHORT_HIGHER_LOWS = os.getenv("MID_BLOCK_SHORT_HIGHER_LOWS", "1").strip().lower() not in ("0","false","no","off")
+MID_HIGHER_LOWS_LOOKBACK = int(os.getenv("MID_HIGHER_LOWS_LOOKBACK", str(MID_LOWER_HIGHS_LOOKBACK)) or MID_LOWER_HIGHS_LOOKBACK)
 
 
 
@@ -4658,6 +4663,7 @@ FOMC_DECISION_MINUTE_ET = max(0, min(59, _env_int("FOMC_DECISION_MINUTE_ET", 0))
 def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low: float, recent_high: float,
                       atr_30m: float, rsi_5m: float, vwap: float, bb_pos: str | None,
                       ema20_5m: float | None, bos_down_5m: bool, two_red_5m: bool, lower_highs_5m: bool,
+                      bos_up_5m: bool, two_green_5m: bool, higher_lows_5m: bool,
                       last_vol: float, avg_vol: float, last_body: float, climax_recent_bars: int) -> str | None:
     """Return human-readable MID BLOCKED reason (for logging + error-bot), or None if allowed."""
     try:
@@ -4760,6 +4766,15 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                     return "two_red_candles_5m"
                 if MID_BLOCK_LONG_LOWER_HIGHS and lower_highs_5m:
                     return "lower_highs_5m"
+            elif side.upper() == "SHORT":
+                if MID_BLOCK_SHORT_BOS_UP and bos_up_5m:
+                    return "bos_up_5m"
+                if MID_BLOCK_SHORT_ABOVE_EMA20_5M and (ema20_5m is not None) and close > float(ema20_5m):
+                    return f"above_ema20_5m close>{float(ema20_5m):.6g}"
+                if MID_BLOCK_SHORT_2_GREEN_CANDLES and two_green_5m:
+                    return "two_green_candles_5m"
+                if MID_BLOCK_SHORT_HIGHER_LOWS and higher_lows_5m:
+                    return "higher_lows_5m"
         except Exception:
             pass
 
@@ -6522,8 +6537,11 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         # --- 5m structure signals (used only for MID anti-countertrend blocking) ---
         ema20_5m = None
         bos_down_5m = False
+        bos_up_5m = False
         two_red_5m = False
+        two_green_5m = False
         lower_highs_5m = False
+        higher_lows_5m = False
         try:
             op = df5i["open"].astype(float)
             hi = df5i["high"].astype(float)
@@ -6537,6 +6555,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             # Two red candles in a row (close < open)
             if len(cl) >= 2 and len(op) >= 2:
                 two_red_5m = (float(cl.iloc[-1]) < float(op.iloc[-1])) and (float(cl.iloc[-2]) < float(op.iloc[-2]))
+                two_green_5m = (float(cl.iloc[-1]) > float(op.iloc[-1])) and (float(cl.iloc[-2]) > float(op.iloc[-2]))
 
             # BOS down heuristic: last bar breaks below previous lookback low
             lb = 20
@@ -6545,12 +6564,19 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 last_low = float(lo.iloc[-1])
                 last_close = float(cl.iloc[-1])
                 bos_down_5m = (last_low < prev_low) and (last_close < prev_low)
+                prev_high = float(hi.iloc[-(lb+1):-1].max())
+                last_high = float(hi.iloc[-1])
+                bos_up_5m = (last_high > prev_high) and (last_close > prev_high)
 
             # Lower highs heuristic over last N highs (strictly decreasing)
             nlh = max(3, int(MID_LOWER_HIGHS_LOOKBACK))
             if len(hi) >= nlh:
                 hh = [float(x) for x in hi.iloc[-nlh:].tolist()]
                 lower_highs_5m = all(hh[i] < hh[i-1] for i in range(1, len(hh)))
+            nhl = max(3, int(MID_HIGHER_LOWS_LOOKBACK))
+            if len(lo) >= nhl:
+                ll = [float(x) for x in lo.iloc[-nhl:].tolist()]
+                higher_lows_5m = all(ll[i] > ll[i-1] for i in range(1, len(ll)))
         except Exception:
             pass
 
@@ -6569,6 +6595,9 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             bos_down_5m=bool(bos_down_5m),
             two_red_5m=bool(two_red_5m),
             lower_highs_5m=bool(lower_highs_5m),
+            bos_up_5m=bool(bos_up_5m),
+            two_green_5m=bool(two_green_5m),
+            higher_lows_5m=bool(higher_lows_5m),
             last_vol=last_vol if not np.isnan(last_vol) else 0.0,
             avg_vol=avg_vol if not np.isnan(avg_vol) else 0.0,
             last_body=float(last_body),
