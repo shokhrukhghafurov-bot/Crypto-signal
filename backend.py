@@ -8714,6 +8714,7 @@ class Backend:
                         txt = _trf(uid, "msg_auto_loss",
                             symbol=s.symbol,
                             market=market,
+                            pnl_total=fmt_pnl_pct(float(pnl)),
                             sl=f"{float(s.sl):.6f}",
                             opened_time=fmt_dt_msk(row.get("opened_at")),
                             closed_time=fmt_dt_msk(now_utc),
@@ -8742,9 +8743,12 @@ class Backend:
                         be_px = _be_exit_price(s.entry, side, market)
                         import datetime as _dt
                         now_utc = _dt.datetime.now(_dt.timezone.utc)
+                        trade_ctx_tp1 = UserTrade(user_id=uid, signal=s, tp1_hit=True)
+                        pnl = _calc_effective_pnl_pct(trade_ctx_tp1, close_price=float(be_px), close_reason="BE")
                         txt = _trf(uid, "msg_auto_tp1",
                             symbol=s.symbol,
                             market=market,
+                            pnl_total=fmt_pnl_pct(float(pnl)),
                             closed_pct=int(_partial_close_pct(market)),
                             be_price=f"{float(be_px):.6f}",
                             opened_time=fmt_dt_msk(row.get("opened_at")),
@@ -8778,6 +8782,7 @@ class Backend:
                             txt = _trf(uid, "msg_auto_loss",
                                 symbol=s.symbol,
                                 market=market,
+                            pnl_total=fmt_pnl_pct(float(pnl)),
                                 sl=f"{float(hard_sl):.6f}",
                                 opened_time=fmt_dt_msk(row.get("opened_at")),
                                 closed_time=fmt_dt_msk(now_utc),
@@ -8861,6 +8866,7 @@ class Backend:
                                         txt = _trf(uid, "msg_auto_be",
                                             symbol=s.symbol,
                                             market=market,
+                                            pnl_total=fmt_pnl_pct(float(pnl)),
                                             be_price=f"{float(be_lvl):.6f}",
                                             opened_time=fmt_dt_msk(row.get("opened_at")),
                                             closed_time=fmt_dt_msk(now_utc),
