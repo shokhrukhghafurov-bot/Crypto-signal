@@ -3355,6 +3355,36 @@ async def trades_page(call: types.CallbackQuery) -> None:
 
 # ---------------- trade card ----------------
 
+
+
+def _tp1_partial_close_pct_trade(market: str) -> float:
+    """Partial close pct at TP1 for AUTOTRADE cards (same env as backend)."""
+    mk = (market or "").upper()
+    try:
+        if mk == "SPOT":
+            return float(os.getenv("TP1_PARTIAL_CLOSE_PCT_SPOT", "50") or 50.0)
+        return float(os.getenv("TP1_PARTIAL_CLOSE_PCT_FUTURES", "50") or 50.0)
+    except Exception:
+        return 50.0
+
+def _trade_pnl_if_be_after_tp1(t: dict) -> float | None:
+    """Estimate total PnL% if TP1 is hit and remainder closes at BE (no fees)."""
+    try:
+        entry = float(t.get("entry") or 0.0)
+        tp1 = float(t.get("tp1") or 0.0)
+        if entry <= 0 or tp1 <= 0:
+            return None
+        side = str(t.get("direction") or t.get("side") or "LONG").upper()
+        market = str(t.get("market") or "FUTURES").upper()
+        a = max(0.0, min(100.0, _tp1_partial_close_pct_trade(market))) / 100.0
+        if side == "SHORT":
+            pnl_tp1 = (entry - tp1) / entry * 100.0
+        else:
+            pnl_tp1 = (tp1 - entry) / entry * 100.0
+        return float(pnl_tp1 * a)
+    except Exception:
+        return None
+
 def _trade_card_text(uid: int, t: dict) -> str:
     symbol = str(t.get("symbol") or "")
     market = str(t.get("market") or "FUTURES").upper()
@@ -3456,11 +3486,15 @@ def _trade_card_text(uid: int, t: dict) -> str:
     ]
 
     pnl = t.get("pnl_total_pct")
-    if pnl is not None and status in ("WIN","LOSS","BE","CLOSED"):
+    if pnl is not None and status in ("WIN","LOSS","BE","CLOSED","HARD_SL"):
         try:
-            parts.append(f"PnL: {float(pnl):+.2f}%")
+            parts.append(f"{tr(uid,'lbl_total_pnl')}: {float(pnl):+.2f}%")
         except Exception:
             pass
+    elif status == "TP1":
+        est = _trade_pnl_if_be_after_tp1(t)
+        if est is not None:
+            parts.append(f"{tr(uid,'lbl_total_pnl_if_be')}: {float(est):+.2f}%")
 
     return "\n".join(parts)
 
