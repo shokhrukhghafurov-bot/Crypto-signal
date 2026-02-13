@@ -7896,10 +7896,26 @@ class Backend:
         if not row:
             return False
         trade_id = int(row["id"])
-        # manual close (keep last known price if present)
-        close_price = float(row.get("entry") or 0.0)
+        # manual close: use current price + proper TP1-aware PnL
+        s = Signal(
+            symbol=str(row.get("symbol") or ""),
+            market=str(row.get("market") or "FUTURES").upper(),
+            direction=str(row.get("side") or "LONG").upper(),
+            entry=float(row.get("entry") or 0.0),
+            tp1=float(row.get("tp1")) if row.get("tp1") is not None else None,
+            tp2=float(row.get("tp2")) if row.get("tp2") is not None else None,
+            sl=float(row.get("sl")) if row.get("sl") is not None else None,
+        )
         try:
-            await db_store.close_trade(trade_id, status="CLOSED", price=close_price, pnl_total_pct=float(row.get("pnl_total_pct") or 0.0))
+            close_price, _src = await self._get_price_with_source(s)
+            close_price = float(close_price)
+        except Exception:
+            close_price = float(row.get("entry") or 0.0)
+
+        trade_ctx = UserTrade(user_id=int(user_id), signal=s, tp1_hit=bool(row.get("tp1_hit")))
+        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(close_price), close_reason="CLOSED")
+        try:
+            await db_store.close_trade(trade_id, status="CLOSED", price=float(close_price), pnl_total_pct=float(pnl))
             self._sl_breach_since.pop(trade_id, None)
             try:
                 if hasattr(self, "_tp1_peak_px"):
@@ -8077,17 +8093,93 @@ class Backend:
         except Exception:
             return dict(t)
 
-    async def remove_trade_by_id(self, user_id: int, trade_id: int) -> bool:
+    async def remove_trade_by_id(self, user_id: int, trade_id: int) -> dict | None:
+        """Manual close from UI button.
+
+        IMPORTANT:
+        - Must use *current* price (not entry)
+        - Must compute total PnL correctly even if TP1 partial happened
+        - Returns a ready-to-send unified card text (or None on failure)
+        """
         row = await db_store.get_trade_by_id(int(user_id), int(trade_id))
         if not row:
-            return False
-        # manual close (keep last known price if present)
-        close_price = float(row.get('entry') or 0.0)
+            return None
+
+        # Build a minimal Signal-like object for price + pnl calculation
+        s = Signal(
+            symbol=str(row.get("symbol") or ""),
+            market=str(row.get("market") or "FUTURES").upper(),
+            direction=str(row.get("side") or "LONG").upper(),
+            entry=float(row.get("entry") or 0.0),
+            tp1=float(row.get("tp1")) if row.get("tp1") is not None else None,
+            tp2=float(row.get("tp2")) if row.get("tp2") is not None else None,
+            sl=float(row.get("sl")) if row.get("sl") is not None else None,
+        )
+
         try:
-            await db_store.close_trade(int(trade_id), status='CLOSED', price=close_price, pnl_total_pct=float(row.get('pnl_total_pct') or 0.0))
+            close_px, close_src = await self._get_price_with_source(s)
+            close_px = float(close_px)
         except Exception:
-            await db_store.close_trade(int(trade_id), status='CLOSED')
-        return True
+            # Best-effort fallback: use entry if price is unavailable
+            close_px, close_src = float(row.get("entry") or 0.0), ""
+
+        tp1_hit = bool(row.get("tp1_hit"))
+        trade_ctx = UserTrade(user_id=int(user_id), signal=s, tp1_hit=tp1_hit)
+        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(close_px), close_reason="CLOSED")
+
+        try:
+            await db_store.close_trade(int(trade_id), status="CLOSED", price=float(close_px), pnl_total_pct=float(pnl))
+        except Exception:
+            # If DB fails, still return a message so user sees what happened.
+            try:
+                await db_store.close_trade(int(trade_id), status="CLOSED")
+            except Exception:
+                pass
+
+        # Build unified card (same style as auto close cards)
+        import datetime as _dt
+        now_utc = _dt.datetime.now(_dt.timezone.utc)
+        rr = _calc_rr_str(float(getattr(s, "entry", 0.0) or 0.0), float(getattr(s, "sl", 0.0) or 0.0), float(getattr(s, "tp1", 0.0) or 0.0), float(getattr(s, "tp2", 0.0) or 0.0))
+        after_tp1 = _trf(int(user_id), "after_tp1_suffix") if tp1_hit else ""
+        close_agent = _trf(int(user_id), "close_agent_manual")
+
+        # Status string should explicitly mention manual close
+        status_txt = _trf(int(user_id), "status_closed_manual")
+
+        # Optional: show price source for transparency (PRO users love this)
+        reason_line = ""
+        try:
+            if close_src:
+                _r = _trf(int(user_id), "reason_manual_close", source=str(close_src))
+                reason_line = (_trf(int(user_id), "lbl_reason", reason=_r) + "\n") if _r else ""
+        except Exception:
+            reason_line = ""
+
+        emoji = "⚪️"
+        be_price = float(row.get("be_price") or 0.0) if row.get("be_price") is not None else 0.0
+        be_line = (f"🛡 BE: {float(be_price):.6f}\n" if (be_price and float(be_price) > 0) else "")
+        txt = _trf(int(user_id),
+            "msg_manual_close",
+            symbol=s.symbol,
+            market=str(getattr(s, "market", "FUTURES") or "FUTURES").upper(),
+            emoji=emoji,
+            side=str(getattr(s, "direction", "LONG") or "LONG").upper(),
+            after_tp1=after_tp1,
+            rr=rr,
+            close_agent=close_agent,
+            reason_line=reason_line,
+            entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
+            sl=f"{float(getattr(s,'sl',0.0) or 0.0):.6f}",
+            tp1=f"{float(getattr(s,'tp1',0.0) or 0.0):.6f}",
+            tp2=f"{float(getattr(s,'tp2',0.0) or 0.0):.6f}",
+            be_line=be_line,
+            pnl_total=fmt_pnl_pct(float(pnl)),
+            opened_time=fmt_dt_msk(row.get("opened_at")),
+            closed_time=fmt_dt_msk(now_utc),
+            status=status_txt,
+        )
+
+        return {"ok": True, "text": txt, "pnl_total_pct": float(pnl), "close_price": float(close_px)}
 
     async def get_user_trades(self, user_id: int) -> list[dict]:
         return await db_store.list_user_trades(int(user_id), include_closed=False, limit=50)
