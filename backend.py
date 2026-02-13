@@ -8171,7 +8171,7 @@ class Backend:
             entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
             sl=f"{float(getattr(s,'sl',0.0) or 0.0):.6f}",
             tp1=f"{float(getattr(s,'tp1',0.0) or 0.0):.6f}",
-            tp2=f"{float(getattr(s,'tp2',0.0) or 0.0):.6f}",
+            tp2=tp2_disp,
             be_line=be_line,
             pnl_total=fmt_pnl_pct(float(pnl)),
             opened_time=fmt_dt_msk(row.get("opened_at")),
@@ -8844,7 +8844,7 @@ class Backend:
                             entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
                             sl=f"{float(getattr(s,'sl',0.0) or 0.0):.6f}",
                             tp1=f"{float(getattr(s,'tp1',0.0) or 0.0):.6f}",
-                            tp2=f"{float(getattr(s,'tp2',0.0) or 0.0):.6f}",
+                            tp2=tp2_disp,
                             be_line=be_line,
                             pnl_total=fmt_pnl_pct(float(pnl)),
                             opened_time=fmt_dt_msk(row.get("opened_at")),
@@ -8916,7 +8916,7 @@ class Backend:
                             reason_line=reason_line,
                             entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
                             tp1=f"{float(getattr(s,'tp1',0.0) or 0.0):.6f}",
-                            tp2=f"{float(getattr(s,'tp2',0.0) or 0.0):.6f}",
+                            tp2=tp2_disp,
                             be_line=be_line,
                             pnl_total=fmt_pnl_pct(float(pnl)),
                             sl=f"{float(s.sl):.6f}",
@@ -8945,6 +8945,11 @@ class Backend:
                     # 3) TP1 -> partial close + BE
                     if not tp1_hit and s.tp1 and hit_tp(float(s.tp1)):
                         be_px = _be_exit_price(s.entry, side, market)
+                        tp2_val = float(getattr(s,'tp2',0.0) or 0.0)
+                        tp2_disp = (f"{tp2_val:.6f}" if tp2_val > 0 else "-")
+                        sl_ok = "✅" if (float(getattr(s,'sl',0.0) or 0.0) > 0 and hit_sl(float(getattr(s,'sl',0.0) or 0.0))) else "❌"
+                        tp1_ok = "✅"
+                        tp2_ok = "✅" if (tp2_val > 0 and hit_tp(float(tp2_val))) else "❌"
                         import datetime as _dt
                         now_utc = _dt.datetime.now(_dt.timezone.utc)
                         trade_ctx_tp1 = UserTrade(user_id=uid, signal=s, tp1_hit=True)
@@ -8964,10 +8969,15 @@ class Backend:
                             entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
                             sl=f"{float(getattr(s,'sl',0.0) or 0.0):.6f}",
                             tp1=f"{float(getattr(s,'tp1',0.0) or 0.0):.6f}",
-                            tp2=f"{float(getattr(s,'tp2',0.0) or 0.0):.6f}",
+                            tp2=tp2_disp,
                             pnl_total=fmt_pnl_pct(float(pnl)),
                             closed_pct=int(_partial_close_pct(market)),
                             be_price=f"{float(be_px):.6f}",
+                            price_now=f"{float(price_f):.6f}",
+                            price_source=str(price_src),
+                            sl_ok=sl_ok,
+                            tp1_ok=tp1_ok,
+                            tp2_ok=tp2_ok,
                             opened_time=fmt_dt_msk(row.get("opened_at")),
                             event_time=fmt_dt_msk(now_utc),
                             status="TP1",
@@ -9024,7 +9034,7 @@ class Backend:
                                 reason_line=reason_line,
                                 entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
                                 tp1=f"{float(getattr(s,'tp1',0.0) or 0.0):.6f}",
-                                tp2=f"{float(getattr(s,'tp2',0.0) or 0.0):.6f}",
+                                tp2=tp2_disp,
                                 be_line=be_line,
                                 pnl_total=fmt_pnl_pct(float(pnl)),
                                 sl=f"{float(hard_sl):.6f}",
@@ -9140,7 +9150,7 @@ class Backend:
                                             entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
                                             sl=f"{float(getattr(s,'sl',0.0) or 0.0):.6f}",
                                             tp1=f"{float(getattr(s,'tp1',0.0) or 0.0):.6f}",
-                                            tp2=f"{float(getattr(s,'tp2',0.0) or 0.0):.6f}",
+                                            tp2=tp2_disp,
                                             be_line=be_line,
                                             pnl_total=fmt_pnl_pct(float(pnl)),
                                             be_price=f"{float(be_lvl):.6f}",
@@ -9194,7 +9204,7 @@ class Backend:
                             entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
                             sl=f"{float(getattr(s,'sl',0.0) or 0.0):.6f}",
                             tp1=f"{float(getattr(s,'tp1',0.0) or 0.0):.6f}",
-                            tp2=f"{float(getattr(s,'tp2',0.0) or 0.0):.6f}",
+                            tp2=tp2_disp,
                             be_line=be_line,
                             pnl_total=fmt_pnl_pct(float(pnl)),
                             opened_time=fmt_dt_msk(row.get("opened_at")),
