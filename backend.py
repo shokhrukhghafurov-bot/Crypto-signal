@@ -9105,8 +9105,26 @@ class Backend:
                         _ex_order = ["BINANCE", "BYBIT", "OKX"] if market == "FUTURES" else ["BINANCE", "BYBIT", "OKX", "GATEIO", "MEXC"]
                         _oks = await asyncio.gather(*[_pair_exists(x) for x in _ex_order])
                         _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
+
+                        # ✅ Policy: never emit a FUTURES signal if no futures contract exists.
+                        # If futures contract is missing but spot exists -> downgrade to SPOT.
+                        if market == "FUTURES" and not _pair_exchanges:
+                            _spot_order = ["BINANCE", "BYBIT", "OKX", "GATEIO", "MEXC"]
+                            _spot_oks = await asyncio.gather(*[_pair_exists(x) for x in _spot_order])
+                            _spot_exchanges = [x for x, ok in zip(_spot_order, _spot_oks) if ok]
+                            if _spot_exchanges:
+                                market = "SPOT"
+                                _pair_exchanges = _spot_exchanges
+                                risk_notes.append("⚠️ No futures contract — downgraded to SPOT")
+                            else:
+                                logger.info("[signal] skip %s %s %s reason=no_futures_contract", sym, market, best_dir)
+                                continue
+
+                        # For SPOT, if we somehow can't confirm on any venue, fall back to the source exchange
+                        # (best-effort visibility), but never for FUTURES.
                         if not _pair_exchanges:
                             _pair_exchanges = [best_name]
+
                         conf_names = "+".join(_pair_exchanges)
 
 
@@ -9585,8 +9603,26 @@ class Backend:
                         _ex_order = ['BINANCE', 'BYBIT', 'OKX'] if market == 'FUTURES' else ['BINANCE', 'BYBIT', 'OKX', 'GATEIO', 'MEXC']
                         _oks = await asyncio.gather(*[_pair_exists(x) for x in _ex_order])
                         _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
+
+                        # ✅ Policy: never emit a FUTURES signal if no futures contract exists.
+                        # If futures contract is missing but spot exists -> downgrade to SPOT.
+                        if market == 'FUTURES' and not _pair_exchanges:
+                            _spot_order = ['BINANCE', 'BYBIT', 'OKX', 'GATEIO', 'MEXC']
+                            _spot_oks = await asyncio.gather(*[_pair_exists(x) for x in _spot_order])
+                            _spot_exchanges = [x for x, ok in zip(_spot_order, _spot_oks) if ok]
+                            if _spot_exchanges:
+                                market = 'SPOT'
+                                _pair_exchanges = _spot_exchanges
+                                risk_notes.append('⚠️ No futures contract — downgraded to SPOT')
+                            else:
+                                logger.info('[mid][signal] skip %s %s %s reason=no_futures_contract', sym, market, direction)
+                                continue
+
+                        # For SPOT, if we somehow can't confirm on any venue, fall back to the source exchange
+                        # (best-effort visibility), but never for FUTURES.
                         if not _pair_exchanges:
                             _pair_exchanges = [best_name]
+
                         conf_names = '+'.join(_pair_exchanges)
                         sig = Signal(
                         signal_id=self.next_signal_id(),
