@@ -4549,13 +4549,17 @@ async def main() -> None:
                 for k, (since, until) in ranges.items():
                     # Bot-level outcomes are tracked in signal_tracks.
                     b = await db_store.signal_perf_bucket_global(market, since=since, until=until)
-                    # trades = total closed signals (WIN/LOSS/BE/CLOSED) in window
-                    trades = int(b.get('trades') or 0)
+                    # IMPORTANT (dashboard correctness):
+                    # signal_perf_bucket_global() returns:
+                    #   - trades: terminal outcomes only (WIN/LOSS/BE)
+                    #   - closes: manual/forced closes (status='CLOSED') separately
                     tp2 = int(b.get('wins') or 0)       # WIN (final target reached)
                     sl = int(b.get('losses') or 0)      # LOSS (SL)
                     be = int(b.get('be') or 0)          # BE
                     tp1 = int(b.get('tp1_hits') or 0)   # TP1 hit (partial)
-                    closes = int(b.get('closes') or 0)  # CLOSE (manual/expired/forced)
+                    trades = int(b.get('trades') or (tp2 + sl + be))  # visible outcomes in table
+                    closes = int(b.get('closes') or 0)  # manual/expired/forced
+                    closed_total = trades + closes
                     sum_pnl = float(b.get('sum_pnl_pct') or 0.0)
                     avg_pnl = (sum_pnl / trades) if trades else 0.0
                     out[k] = {
@@ -4564,8 +4568,9 @@ async def main() -> None:
                         "sl": sl,
                         "be": be,
                         "tp1": tp1,
-                        "manual": trades,      # back-compat: some dashboards use this as "closed"
-                        "closed": trades,      # total closed outcomes
+                        # back-compat fields used by older dashboards
+                        "manual": closed_total,      # legacy: "closed" total
+                        "closed": closed_total,      # total closed (including manual/forced)
                         "manual_close": closes,
                         "sum_pnl_pct": sum_pnl,
                         "avg_pnl_pct": avg_pnl,
@@ -4581,8 +4586,9 @@ async def main() -> None:
             closed: dict = {}
             try:
                 for k in ("day","week","month"):
-                    spot_closed = int(((perf.get("spot") or {}).get(k) or {}).get("trades") or 0)
-                    fut_closed = int(((perf.get("futures") or {}).get(k) or {}).get("trades") or 0)
+                    # Use "closed" (includes manual/forced closes) for the left-side widget totals.
+                    spot_closed = int(((perf.get("spot") or {}).get(k) or {}).get("closed") or 0)
+                    fut_closed = int(((perf.get("futures") or {}).get(k) or {}).get("closed") or 0)
                     total_closed = spot_closed + fut_closed
                     closed[k] = total_closed  # legacy
                     closed[f"{k}_total"] = total_closed
