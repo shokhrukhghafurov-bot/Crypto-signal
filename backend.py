@@ -8891,7 +8891,11 @@ class Backend:
                             except Exception:
                                 pass
                     else:
+                        # Important: if SL is not currently breached (or SL is not applicable),
+                        # reset the confirm timer. Otherwise a brief old breach can “stick” and
+                        # cause an incorrect fast SL close on the next touch.
                         breached = False
+                        self._sl_breach_since.pop(trade_id, None)
 
                     if not tp1_hit and s.sl and breached:
                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
