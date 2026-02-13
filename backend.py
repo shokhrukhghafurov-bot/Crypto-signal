@@ -4535,6 +4535,39 @@ def fmt_pnl_pct(p: float) -> str:
     except Exception:
         return "0.0%"
 
+
+def _calc_rr_str(sig) -> str:
+    """Risk/Reward as '1 : X.XX' using TP2 if present else TP1.
+
+    Returns empty string if cannot compute.
+    """
+    try:
+        entry = float(getattr(sig, 'entry', None) or 0.0)
+        sl = float(getattr(sig, 'sl', None) or 0.0)
+        tp2 = getattr(sig, 'tp2', None)
+        tp1 = getattr(sig, 'tp1', None)
+        target = float(tp2) if tp2 not in (None, "", 0, 0.0) else (float(tp1) if tp1 not in (None, "", 0, 0.0) else None)
+        if not entry or not sl or target is None:
+            return ""
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return ""
+        reward = abs(target - entry)
+        rr = reward / risk
+        if rr <= 0 or rr != rr:
+            return ""
+        return f"1 : {rr:.2f}"
+    except Exception:
+        return ""
+
+
+def _status_line(status: str, tp1_hit: bool) -> str:
+    st = (status or "").upper()
+    if tp1_hit and st not in ("TP1", "ACTIVE"):
+        # show 'after TP1' hint for any later close
+        return f"{st} (после TP1)"
+    return st
+
 TOP_N = _env_int("TOP_N", 50)
 # TOP_N controls how many USDT symbols to scan. Set TOP_N=0 to scan ALL USDT pairs.
 SCAN_INTERVAL_SECONDS = max(30, _env_int("SCAN_INTERVAL_SECONDS", 150))
@@ -8723,13 +8756,25 @@ class Backend:
                         pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.tp2), close_reason="WIN")
                         import datetime as _dt
                         now_utc = _dt.datetime.now(_dt.timezone.utc)
+                        rr = _calc_rr_str(s)
+                        rr_line = (f"📊 Risk/Reward: {rr}\n" if rr else "")
+                        close_line = "⚡ Закрытие: Smart Manager\n"
                         txt = _trf(uid, "msg_auto_win",
                             symbol=s.symbol,
                             market=market,
+                            side=side,
+                            status_line=_status_line("WIN", tp1_hit),
                             pnl_total=fmt_pnl_pct(float(pnl)),
                             opened_time=fmt_dt_msk(row.get("opened_at")),
                             closed_time=fmt_dt_msk(now_utc),
                             status="WIN",
+                            entry=f"{float(s.entry):.6f}" if s.entry is not None else "—",
+                            sl=f"{float(s.sl):.6f}" if s.sl is not None else "—",
+                            tp1=f"{float(s.tp1):.6f}" if s.tp1 is not None else "—",
+                            tp2=f"{float(s.tp2):.6f}" if s.tp2 is not None else "—",
+                            be_line=(f"🛡 BE: {be_price:.6f}\n" if (tp1_hit and be_price > 0) else ""),
+                            rr_line=rr_line,
+                            close_line=close_line,
                         )
                         if dbg:
                             txt += "\n\n" + dbg
@@ -8778,14 +8823,25 @@ class Backend:
                         pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.sl), close_reason="LOSS")
                         import datetime as _dt
                         now_utc = _dt.datetime.now(_dt.timezone.utc)
+                        rr = _calc_rr_str(s)
+                        rr_line = (f"📊 Risk/Reward: {rr}\n" if rr else "")
+                        close_line = "⚡ Закрытие: Smart Manager\n"
                         txt = _trf(uid, "msg_auto_loss",
                             symbol=s.symbol,
                             market=market,
+                            side=side,
+                            status_line=_status_line("LOSS", tp1_hit),
                             pnl_total=fmt_pnl_pct(float(pnl)),
                             sl=f"{float(s.sl):.6f}",
                             opened_time=fmt_dt_msk(row.get("opened_at")),
                             closed_time=fmt_dt_msk(now_utc),
                             status="LOSS",
+                            entry=f"{float(s.entry):.6f}" if s.entry is not None else "—",
+                            tp1=f"{float(s.tp1):.6f}" if s.tp1 is not None else "—",
+                            tp2=f"{float(s.tp2):.6f}" if s.tp2 is not None else "—",
+                            be_line=(f"🛡 BE: {be_price:.6f}\n" if (tp1_hit and be_price > 0) else ""),
+                            rr_line=rr_line,
+                            close_line=close_line,
                         )
                         if dbg:
                             txt += "\n\n" + dbg
@@ -8812,15 +8868,27 @@ class Backend:
                         now_utc = _dt.datetime.now(_dt.timezone.utc)
                         trade_ctx_tp1 = UserTrade(user_id=uid, signal=s, tp1_hit=True)
                         pnl = _calc_effective_pnl_pct(trade_ctx_tp1, close_price=float(be_px), close_reason="BE")
+                        rr = _calc_rr_str(s)
+                        rr_line = (f"📊 Risk/Reward: {rr}\n" if rr else "")
+                        close_line = "⚡ Закрытие: Smart Manager\n"
                         txt = _trf(uid, "msg_auto_tp1",
                             symbol=s.symbol,
                             market=market,
+                            side=side,
+                            status_line=_status_line("TP1", False),
                             pnl_total=fmt_pnl_pct(float(pnl)),
                             closed_pct=int(_partial_close_pct(market)),
                             be_price=f"{float(be_px):.6f}",
                             opened_time=fmt_dt_msk(row.get("opened_at")),
                             event_time=fmt_dt_msk(now_utc),
                             status="TP1",
+                            entry=f"{float(s.entry):.6f}" if s.entry is not None else "—",
+                            sl=f"{float(s.sl):.6f}" if s.sl is not None else "—",
+                            tp1=f"{float(s.tp1):.6f}" if s.tp1 is not None else "—",
+                            tp2=f"{float(s.tp2):.6f}" if s.tp2 is not None else "—",
+                            be_line=f"🛡 BE: {float(be_px):.6f}\n",
+                            rr_line=rr_line,
+                            close_line=close_line,
                         )
                         if dbg:
                             txt += "\n\n" + dbg
@@ -8848,14 +8916,25 @@ class Backend:
                             now_utc = _dt.datetime.now(_dt.timezone.utc)
                             trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
                             pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(hard_sl), close_reason="HARD_SL")
+                            rr = _calc_rr_str(s)
+                            rr_line = (f"📊 Risk/Reward: {rr}\n" if rr else "")
+                            close_line = "⚡ Закрытие: Smart Manager\n"
                             txt = _trf(uid, "msg_auto_loss",
                                 symbol=s.symbol,
                                 market=market,
+                                side=side,
+                                status_line=_status_line("HARD_SL", tp1_hit),
                                 pnl_total=fmt_pnl_pct(float(pnl)),
                                 sl=f"{float(hard_sl):.6f}",
                                 opened_time=fmt_dt_msk(row.get("opened_at")),
                                 closed_time=fmt_dt_msk(now_utc),
                                 status="HARD_SL",
+                                entry=f"{float(s.entry):.6f}" if s.entry is not None else "—",
+                                tp1=f"{float(s.tp1):.6f}" if s.tp1 is not None else "—",
+                                tp2=f"{float(s.tp2):.6f}" if s.tp2 is not None else "—",
+                                be_line=(f"🛡 BE: {be_price:.6f}\n" if (tp1_hit and be_price > 0) else ""),
+                                rr_line=rr_line,
+                                close_line=close_line,
                             )
                             if dbg:
                                 txt += "\n\n" + dbg
@@ -8932,14 +9011,26 @@ class Backend:
                                         now_utc = _dt.datetime.now(_dt.timezone.utc)
                                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
                                         pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(be_lvl), close_reason="BE")
+                                        rr = _calc_rr_str(s)
+                                        rr_line = (f"📊 Risk/Reward: {rr}\n" if rr else "")
+                                        close_line = "🧠 Закрыто по Smart BE\n"
                                         txt = _trf(uid, "msg_auto_be",
                                             symbol=s.symbol,
                                             market=market,
+                                            side=side,
+                                            status_line=_status_line("BE", tp1_hit),
                                             pnl_total=fmt_pnl_pct(float(pnl)),
                                             be_price=f"{float(be_lvl):.6f}",
                                             opened_time=fmt_dt_msk(row.get("opened_at")),
                                             closed_time=fmt_dt_msk(now_utc),
                                             status="BE",
+                                            entry=f"{float(s.entry):.6f}" if s.entry is not None else "—",
+                                            sl=f"{float(s.sl):.6f}" if s.sl is not None else "—",
+                                            tp1=f"{float(s.tp1):.6f}" if s.tp1 is not None else "—",
+                                            tp2=f"{float(s.tp2):.6f}" if s.tp2 is not None else "—",
+                                            be_line=(f"🛡 BE: {be_price:.6f}\n" if (tp1_hit and be_price > 0) else ""),
+                                            rr_line=rr_line,
+                                            close_line=close_line,
                                         )
                                         if dbg:
                                             txt += "\n\n" + dbg
@@ -8966,13 +9057,25 @@ class Backend:
                         pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.tp2), close_reason="WIN")
                         import datetime as _dt
                         now_utc = _dt.datetime.now(_dt.timezone.utc)
+                        rr = _calc_rr_str(s)
+                        rr_line = (f"📊 Risk/Reward: {rr}\n" if rr else "")
+                        close_line = "⚡ Закрытие: Smart Manager\n"
                         txt = _trf(uid, "msg_auto_win",
                             symbol=s.symbol,
                             market=market,
+                            side=side,
+                            status_line=_status_line("WIN", tp1_hit),
                             pnl_total=fmt_pnl_pct(float(pnl)),
                             opened_time=fmt_dt_msk(row.get("opened_at")),
                             closed_time=fmt_dt_msk(now_utc),
                             status="WIN",
+                            entry=f"{float(s.entry):.6f}" if s.entry is not None else "—",
+                            sl=f"{float(s.sl):.6f}" if s.sl is not None else "—",
+                            tp1=f"{float(s.tp1):.6f}" if s.tp1 is not None else "—",
+                            tp2=f"{float(s.tp2):.6f}" if s.tp2 is not None else "—",
+                            be_line=(f"🛡 BE: {be_price:.6f}\n" if (tp1_hit and be_price > 0) else ""),
+                            rr_line=rr_line,
+                            close_line=close_line,
                         )
                         if dbg:
                             txt += "\n\n" + dbg
