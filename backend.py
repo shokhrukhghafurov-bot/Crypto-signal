@@ -4961,6 +4961,49 @@ def _calc_rr_str(entry: float, sl: float, tp1: float, tp2: float) -> str:
     except Exception:
         return "-"
 
+
+# ------------------ Human-friendly close reasons (i18n) ------------------
+
+def _human_close_reason(uid: int, code: str | None, **kv: Any) -> str:
+    """Return a short, user-friendly reason string using i18n.
+
+    `code` is a stable internal identifier (e.g. 'TP2_REACHED').
+    We map codes to i18n keys, and keep optional numeric details in `kv`.
+    """
+    if not code:
+        return ""
+    c = str(code).upper().strip()
+
+    # Map internal codes to i18n keys (keep keys stable)
+    key_map = {
+        "TP2_REACHED": "reason_tp2_reached",
+        "SL_REACHED": "reason_sl_reached",
+        "SL_AFTER_TP1": "reason_sl_after_tp1",
+        "TP1_PARTIAL": "reason_tp1_partial",
+        "TP1_HOLD": "reason_tp1_hold_to_tp2",
+        "SMART_BE": "reason_smart_be",
+        "SMART_HARD_SL": "reason_smart_hard_sl",
+        "TRAIL_EXIT": "reason_trail_exit",
+        "REVERSAL_EXIT": "reason_reversal_exit",
+        "EARLY_EXIT_MOM": "reason_early_exit_momentum",
+        "STRUCTURE_BREAK": "reason_structure_break",
+        "TRAP_DETECTED": "reason_trap_detected",
+        "VOLUME_DROPPED": "reason_volume_dropped",
+        "BOS_AGAINST": "reason_bos_against",
+    }
+
+    k = key_map.get(c)
+    if not k:
+        # fallback: show code as-is (still better than nothing)
+        return str(code)
+    try:
+        return _trf(uid, k, **kv)
+    except Exception:
+        try:
+            return _trf(uid, k)
+        except Exception:
+            return str(code)
+
 def _lvl_line(label: str, value: float) -> str:
     try:
         v = float(value or 0.0)
@@ -8694,7 +8737,8 @@ class Backend:
                         after_tp1 = _trf(uid, "after_tp1_suffix") if tp1_hit else ""
                         close_agent = _trf(uid, "close_agent_smart_manager")
                         be_line = (f"🛡 BE: {float(be_price):.6f}\n" if (be_price and float(be_price)>0) else "")
-                        reason_line = _trf(uid, \"lbl_reason\", reason=_trf(uid, \"tp2_hit_reason\")) + \"\n\"
+                        _r = _human_close_reason(uid, "TP2_REACHED")
+                        reason_line = (_trf(uid, "lbl_reason", reason=_r) + "\n") if _r else ""
                         emoji = "🟢"
                         txt = _trf(uid, "msg_auto_win",
                             symbol=s.symbol,
@@ -8763,14 +8807,11 @@ class Backend:
                         import datetime as _dt
                         now_utc = _dt.datetime.now(_dt.timezone.utc)
                         rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
-                        after_tp1 = _trf(uid, "after_tp1_suffix") if tp1_hit else ""
+                        after_tp1 = ""
                         close_agent = _trf(uid, "close_agent_smart_manager")
                         be_line = ""
-                        # Human-friendly reason (via i18n)
-                        _rkey = "sl_after_tp1_reason" if tp1_hit else "sl_hit_reason"
-                        reason_line = _trf(uid, "lbl_reason", reason=_trf(uid, _rkey)) + "
-"
-
+                        _r = _human_close_reason(uid, "SL_REACHED")
+                        reason_line = (_trf(uid, "lbl_reason", reason=_r) + "\n") if _r else ""
                         emoji = "🔴"
                         txt = _trf(uid, "msg_auto_loss",
                             symbol=s.symbol,
@@ -8818,8 +8859,9 @@ class Backend:
                         pnl = _calc_effective_pnl_pct(trade_ctx_tp1, close_price=float(be_px), close_reason="BE")
                         rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
                         close_agent = _trf(uid, "close_agent_smart_manager")
-                        reason = _trf(uid, "tp1_reason", closed_pct=int(_partial_close_pct(market)))
-                        reason_line = _trf(uid, "lbl_reason", reason=reason) + "\n"
+                        _pct = int(_partial_close_pct(market))
+                        reason = _human_close_reason(uid, "TP1_PARTIAL", closed_pct=_pct)
+                        reason_line = (_trf(uid, "lbl_reason", reason=reason) + "\n") if reason else ""
                         txt = _trf(uid, "msg_auto_tp1",
                             symbol=s.symbol,
                             market=market,
@@ -8867,8 +8909,16 @@ class Backend:
                             rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
                             after_tp1 = _trf(uid, "after_tp1_suffix")
                             close_agent = _trf(uid, "close_agent_smart_manager")
-                            reason = _trf(uid, "smart_hard_sl_reason", hard_pct=f"{float(hard_pct):.2f}")
-                            reason_line = _trf(uid, "lbl_reason", reason=reason) + "\n"
+                            reason = _human_close_reason(uid, "SMART_HARD_SL", hard_pct=f"{float(hard_pct):.2f}")
+                            # Optional tech details via SMART_REASON_TECH_DETAILS=1
+                            tech = ""
+                            try:
+                                if os.getenv("SMART_REASON_TECH_DETAILS", "0").strip() not in ("0","false","no","off"):
+                                    tech = " " + _trf(uid, "smart_hard_sl_reason", hard_pct=f"{float(hard_pct):.2f}")
+                            except Exception:
+                                tech = ""
+                            reason = (str(reason) + str(tech)).strip()
+                            reason_line = (_trf(uid, "lbl_reason", reason=reason) + "\n") if reason else ""
                             be_line = f"🛡 BE: {float(be_lvl):.6f}\n"
                             emoji = "🟠"
                             txt = _trf(uid, "msg_auto_loss",
@@ -8973,8 +9023,17 @@ class Backend:
                                         rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
                                         after_tp1 = _trf(uid, "after_tp1_suffix")
                                         close_agent = _trf(uid, "close_agent_smart_be")
-                                        reason = _trf(uid, "smart_be_reason", prob=f"{float(prob_tp2):.2f}", hold=f"{float(hold_prob):.2f}", prog=f"{_prog:.2f}", pullback=f"{_pullback:.2f}")
-                                        reason_line = _trf(uid, "lbl_reason", reason=reason) + "\n"
+                                        # Human-friendly reason + optional technical details (for admins)
+                                        reason = _human_close_reason(uid, "SMART_BE")
+                                        # You can enable technical details via ENV SMART_REASON_TECH_DETAILS=1
+                                        tech = ""
+                                        try:
+                                            if os.getenv("SMART_REASON_TECH_DETAILS", "0").strip() not in ("0","false","no","off"):
+                                                tech = " " + _trf(uid, "smart_be_reason", prob=f"{float(prob_tp2):.2f}", hold=f"{float(hold_prob):.2f}", prog=f"{_prog:.2f}", pullback=f"{_pullback:.2f}")
+                                        except Exception:
+                                            tech = ""
+                                        reason = (str(reason) + str(tech)).strip()
+                                        reason_line = (_trf(uid, "lbl_reason", reason=reason) + "\n") if reason else ""
                                         be_line = f"🛡 BE: {float(be_lvl):.6f}\n"
                                         emoji = "🟡"
                                         txt = _trf(uid, "msg_auto_be",
@@ -9028,7 +9087,8 @@ class Backend:
                         after_tp1 = _trf(uid, "after_tp1_suffix") if tp1_hit else ""
                         close_agent = _trf(uid, "close_agent_smart_manager")
                         be_line = (f"🛡 BE: {float(be_price):.6f}\n" if (be_price and float(be_price)>0) else "")
-                        reason_line = ""
+                        _r = _human_close_reason(uid, "TP2_REACHED")
+                        reason_line = (_trf(uid, "lbl_reason", reason=_r) + "\n") if _r else ""
                         emoji = "🟢"
                         txt = _trf(uid, "msg_auto_win",
                             symbol=s.symbol,
