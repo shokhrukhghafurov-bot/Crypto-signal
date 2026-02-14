@@ -242,6 +242,37 @@ def _should_forward_to_error_bot(levelno: int, msg: str) -> bool:
     if levelno >= min_level and min_level >= logging.WARNING:
         return True
 
+def _asyncio_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """Forward unhandled asyncio exceptions (e.g. 'Task exception was never retrieved') to the error bot."""
+    try:
+        msg = str(context.get("message") or "asyncio exception")
+        exc = context.get("exception")
+        details = []
+        if msg:
+            details.append(msg)
+        if exc is not None:
+            details.append("exc=" + repr(exc))
+        fut = context.get("future") or context.get("task")
+        if fut is not None:
+            try:
+                details.append(f"task={getattr(fut, 'get_name', lambda: None)() or fut!r}")
+            except Exception:
+                details.append(f"task={fut!r}")
+        text_msg = " | ".join(details) if details else "asyncio exception"
+
+        # also log so it appears in stdout
+        logger.error("[asyncio] %s", text_msg, exc_info=exc)
+
+        if ERROR_BOT_ENABLED and _error_bot and _should_forward_to_error_bot(text_msg):
+            try:
+                loop.create_task(_error_bot_send("⚠️ asyncio: " + text_msg))
+            except Exception:
+                # best-effort only
+                pass
+    except Exception:
+        pass
+
+
     # Allow selected INFO/WARNING markers
     if ERROR_BOT_SEND_SCANNER_ERRORS and ("error scanner" in m or "scanner error" in m):
         return True
@@ -1066,7 +1097,7 @@ async def _autotrade_bot_global_loop() -> None:
             await _refresh_autotrade_bot_global_once()
         except Exception:
             # keep loop alive
-            logger.exception("[autotrade-global] refresh failed tick=%s", tick)
+            logger.exception("[autotrade-global] refresh failed tick=%s", locals().get("tick", "?"))
         await asyncio.sleep(5)
 
 
@@ -1985,9 +2016,11 @@ async def broadcast_signal(sig: Signal) -> None:
                             logger.info("Auto-trade skipped by global setting (pause/maintenance) uid=%s", _uid)
                             return
                     except Exception:
-                        # FAIL-CLOSED: if DB read failed, do NOT open new trades.
-                        logger.exception("Auto-trade skipped: failed to read global pause/maintenance (fail-closed) uid=%s", _uid)
-                        return
+                        # If DB read failed, we can either fail-closed (safer) or fail-open (more uptime).
+                        if AUTOTRADE_FAIL_CLOSED_GLOBAL:
+                            logger.exception("Auto-trade skipped: failed to read global pause/maintenance (fail-closed) uid=%s", _uid)
+                            return
+                        logger.exception("Auto-trade global settings read failed; proceeding (fail-open) uid=%s", _uid)
 
                     res = await autotrade_execute(_uid, _sig)
 
@@ -1997,6 +2030,7 @@ async def broadcast_signal(sig: Signal) -> None:
                         logger.info("Auto-trade skipped uid=%s reason=%s symbol=%s market=%s", _uid, reason, getattr(_sig, "symbol", None), getattr(_sig, "market", None))
                         try:
                             send_skips = (os.getenv("AUTOTRADE_SEND_SKIPS_TO_ERROR_BOT", "0") or "0").strip().lower() not in ("0","false","no","off")
+AUTOTRADE_FAIL_CLOSED_GLOBAL = (os.getenv("AUTOTRADE_FAIL_CLOSED_GLOBAL", "0") or "0").strip().lower() not in ("0","false","no","off")
                             if send_skips:
                                 import time as _t
                                 k = (int(_uid), reason)
@@ -4405,6 +4439,12 @@ async def main() -> None:
     import time
     
     logger.info("Bot starting; TZ=%s", TZ_NAME)
+
+    # Forward unhandled asyncio task exceptions to the error bot
+    try:
+        asyncio.get_running_loop().set_exception_handler(_asyncio_exception_handler)
+    except Exception:
+        pass
     await init_db()
     load_langs()
 
