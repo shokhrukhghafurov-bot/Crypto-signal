@@ -163,6 +163,21 @@ def _attach_task_monitor(name: str, task: asyncio.Task) -> None:
 # --- i18n template safety guard (prevents leaking {placeholders} to users) ---
 _UNFILLED_RE = re.compile(r'(?<!\{)\{[a-zA-Z0-9_]+\}(?!\})')
 
+
+async def _task_heartbeat_loop(task_name: str, *, interval_sec: float = 5.0) -> None:
+    """Keeps health 'last_ok' fresh while the task is alive (prevents false DEAD)."""
+    while True:
+        try:
+            await asyncio.sleep(max(1.0, float(interval_sec)))
+            t = TASKS.get(task_name)
+            if t and not t.done():
+                _health_mark_ok(task_name)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # never crash the heartbeat
+            pass
+
 def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
     """Guard against unfilled {placeholders} leaking to users."""
     if not text:
@@ -5650,6 +5665,8 @@ async def main() -> None:
         TASKS["autotrade-manager"] = asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error), name="autotrade-manager")
         _health_mark_ok("autotrade-manager")
         _attach_task_monitor("autotrade-manager", TASKS["autotrade-manager"])
+        TASKS["autotrade-manager-heartbeat"] = asyncio.create_task(_task_heartbeat_loop("autotrade-manager", interval_sec=5.0), name="autotrade-manager-heartbeat")
+
         TASKS["health-status"] = asyncio.create_task(_health_status_loop(), name="health-status")
         _attach_task_monitor("health-status", TASKS["health-status"])
 
