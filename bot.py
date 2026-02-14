@@ -337,50 +337,89 @@ async def _error_bot_send(text: str) -> None:
                 return
 
 def _should_forward_to_error_bot(levelno: int, msg: str) -> bool:
-    m = (msg or "").lower()
-    is_health = ("[health]" in m)
+    """
+    Production rules:
+    - Do NOT spam @errorrrrrrg_bot with normal diagnostics (MID blocked, autotrade skipped, health RUNNING).
+    - Send only REAL problems: exceptions/tracebacks, balance/order/exchange errors, or health transition RUNNING->DEAD.
+    """
+    text = (msg or "")
+    m = text.lower()
+
+    # 1) Always ignore very common non-error noise
+    if "mid blocked" in m:
+        return False
+    if "[scanner] skip" in m or "blocked stable pair" in m:
+        return False
+
+    # 2) Health messages: send ONLY when a service transitions to DEAD
+    if m.startswith("[health]") or "[health]" in m:
+        if os.getenv("ERROR_BOT_SEND_HEALTH_DEAD", "1").strip().lower() in ("0", "false", "no", "off"):
+            return False
+        # parse statuses like autotrade="RUNNING" / autotrade_mgr="DEAD" / smart_manager="RUNNING"
+        changed_to_dead = False
+        for name, status in re.findall(r'(autotrade_mgr|autotrade|smart_manager)\s*=\s*"(RUNNING|DEAD)"', text):
+            prev = _HEALTH_LAST_STATUS.get(name)
+            _HEALTH_LAST_STATUS[name] = status
+            if status == "DEAD" and prev != "DEAD":
+                changed_to_dead = True
+        return changed_to_dead
+
+    # 3) Autotrade skipped is NOT an error (autotrade disabled / filtered / no confirmations, etc.)
+    if ("[autotrade]" in m or "auto-trade" in m or "autotrade " in m or "autotrade_" in m):
+        if os.getenv("ERROR_BOT_IGNORE_AUTOTRADE_SKIPPED", "1").strip().lower() not in ("0","false","no","off"):
+            if " reason=skipped" in m or "[autotrade] skipped" in m or "autotrade skipped" in m:
+                return False
+            # some logs format: "Auto-trade skipped: <reason>"
+            if "auto-trade skipped" in m and ("cannot read balance" not in m and "balance" not in m):
+                return False
+
+    # 4) Ignore default substrings (unless it's clearly an error)
     is_autotrade = ("[autotrade]" in m or "auto-trade" in m or "autotrade " in m or "autotrade_" in m)
     is_smart = ("[smart-manager]" in m or "smart manager" in m or "smart_be" in m or "smart-be" in m)
 
-    # Health messages are informational; forward ONLY when something is actually DEAD.
-    if is_health:
-        # forward if any component is dead (either explicit status or red cross)
-        if ('"dead"' in m) or ("❌" in (msg or "")) or (" dead" in m):
-            return True
-        return False
-    # ignore stablecoin scan blocks unless explicitly enabled
     if "scan_block" in m and any(x in m for x in _ERROR_BOT_IGNORE_SCAN_BLOCK):
         return False
-    # ignore only global noise; do NOT suppress autotrade/smart-manager diagnostics
+
     if not is_autotrade and not is_smart:
         if any(x in m for x in _ERROR_BOT_IGNORE_DEFAULT):
             return False
         if _ERROR_BOT_IGNORE_SUBSTRINGS and any(x in m for x in _ERROR_BOT_IGNORE_SUBSTRINGS):
             return False
 
-    # Always forward ERROR+
+    # 5) Define "real error" markers for non-ERROR logs
+    real_error_markers = (
+        "traceback", "exception", "exchangeapier", "cannot read balance", "balance error",
+        "invalid key", "api key", "permission", "timeout", "timed out",
+        "order failed", "failed to place", "failed to execute", "connection error",
+        "network", "http 5", "rate limit", "too many requests", "denied",
+        "dead"
+    )
+    is_real_error = any(x in m for x in real_error_markers)
+
+    # 6) Always forward ERROR+ (respect configured level), but still avoid noisy warnings/info unless real error
     min_level = getattr(logging, ERROR_BOT_SEND_LEVEL, logging.ERROR)
-    if levelno >= min_level and min_level >= logging.WARNING:
+    if levelno >= logging.ERROR:
         return True
 
-    # Allow selected INFO/WARNING markers
+    if levelno >= min_level and is_real_error:
+        return True
+
+    # 7) Optional: scanner/mid/scan_block forwarding (still filtered above)
     if ERROR_BOT_SEND_SCANNER_ERRORS and ("error scanner" in m or "scanner error" in m):
         return True
     if ERROR_BOT_SEND_MID_BLOCK and ("mid blocked" in m or "mid_block" in m):
-        # Avoid spamming trap blocks: trap diagnostics are sent via periodic MID trap digest.
-        if "mid blocked (trap" in m or "mid blocked(trap" in m:
-            return False
-        return True
+        return False  # handled earlier (we don't forward these)
     if ERROR_BOT_SEND_SCAN_BLOCK and ("scan_block" in m):
-        # but still avoid stable pair spam above
         return True
 
-    if ERROR_BOT_SEND_AUTOTRADE_ERRORS and is_autotrade:
+    # 8) Autotrade/Smart: forward ONLY when it's a real error
+    if ERROR_BOT_SEND_AUTOTRADE_ERRORS and is_autotrade and is_real_error:
         return True
-    if ERROR_BOT_SEND_SMART_ERRORS and is_smart:
+    if ERROR_BOT_SEND_SMART_ERRORS and is_smart and is_real_error:
         return True
 
     return False
+
 
 # --- Error-bot aggregation (anti-spam) ---
 _ERROR_AGG_ENABLED = (os.getenv("ERROR_BOT_AGG_ENABLED", "1").strip().lower() not in ("0","false","no","off"))
