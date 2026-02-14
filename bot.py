@@ -1057,12 +1057,16 @@ async def _refresh_autotrade_bot_global_once() -> None:
         return
 
 async def _autotrade_bot_global_loop() -> None:
+    """Background loop that refreshes global auto-trade pause/maintenance flags."""
+    tick = 0
+    logger.info("[autotrade-global] loop started interval=5s")
     while True:
         tick += 1
         try:
             await _refresh_autotrade_bot_global_once()
         except Exception:
-            pass
+            # keep loop alive
+            logger.exception("[autotrade-global] refresh failed tick=%s", tick)
         await asyncio.sleep(5)
 
 
