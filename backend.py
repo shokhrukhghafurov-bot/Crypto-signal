@@ -1893,13 +1893,20 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     uid = int(user_id)
     market = (getattr(sig, "market", "") or "").upper()
     if market not in ("SPOT", "FUTURES"):
-        return {"ok": False, "skipped": True, "api_error": None}
+        return {"ok": False, "skipped": True, "api_error": None, "skip_reason": "bad_market", "details": {"market": market}}
+
+    def _skip(reason: str, **details) -> dict:
+        return {"ok": False, "skipped": True, "api_error": None, "skip_reason": reason, "details": details or {}}
+
+    def _fail(api_error: str, **details) -> dict:
+        return {"ok": False, "skipped": False, "api_error": api_error, "details": details or {}}
+
 
     # Hard block: stable-vs-stable pairs (fail-safe)
     sym = (getattr(sig, "symbol", "") or "").upper().strip()
     if is_blocked_symbol(sym):
         logger.warning("[autotrade] blocked stable pair skip: %s", sym)
-        return {"ok": False, "skipped": True, "api_error": None, "reason": "blocked_symbol"}
+        return _skip("blocked_symbol", symbol=sym)
 
     st = await db_store.get_autotrade_settings(uid)
     mt = "spot" if market == "SPOT" else "futures"
@@ -1930,11 +1937,11 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     try:
         acc = await db_store.get_autotrade_access(uid)
         if bool(acc.get("is_blocked")):
-            return {"ok": False, "skipped": True, "api_error": None}
+            return _skip("skipped")
         if not bool(acc.get("autotrade_enabled")):
-            return {"ok": False, "skipped": True, "api_error": None}
+            return _skip("skipped")
         if bool(acc.get("autotrade_stop_after_close")):
-            return {"ok": False, "skipped": True, "api_error": None}
+            return _skip("skipped")
         exp = acc.get("autotrade_expires_at")
         if exp is not None:
             import datetime as _dt
@@ -1943,16 +1950,16 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 if exp.tzinfo is None:
                     exp = exp.replace(tzinfo=_dt.timezone.utc)
                 if exp <= now:
-                    return {"ok": False, "skipped": True, "api_error": None}
+                    return _skip("skipped")
             except Exception:
-                return {"ok": False, "skipped": True, "api_error": None}
+                return _skip("skipped")
     except Exception:
         # best-effort: if access columns not ready, default to allow
         pass
 
     enabled = bool(st.get("spot_enabled")) if mt == "spot" else bool(st.get("futures_enabled"))
     if not enabled:
-        return {"ok": False, "skipped": True, "api_error": None}
+        return _skip("skipped")
 
     
     exchange = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "binance").lower().strip()
@@ -2022,7 +2029,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             break
 
         if not chosen:
-            return {"ok": True, "skipped": True, "api_error": None}
+            return _skip("no_exchange_available", market=market)
         exchange = chosen
 
     # FUTURES: choose exchange based on where the futures contract actually exists
@@ -2078,7 +2085,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                         chosen = ex
                         break
                 if not chosen:
-                    return {"ok": True, "skipped": True, "api_error": None}
+                    return _skip("no_exchange_available", market=market)
                 exchange = chosen
         else:
             # No confirmations in signal (old signals / compatibility): just require keys on selected exchange.
@@ -2089,7 +2096,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                         chosen = ex
                         break
                 if not chosen:
-                    return {"ok": True, "skipped": True, "api_error": None}
+                    return _skip("no_exchange_available", market=market)
                 exchange = chosen
 
     # amounts
@@ -2110,16 +2117,16 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
     # Hard minimums (validated in bot UI and DB, but re-checked here for safety)
     if mt == "spot" and 0 < need_usdt < 15:
-        return {"ok": False, "skipped": True, "api_error": None}
+        return _skip("skipped")
     if mt == "futures" and 0 < need_usdt < 10:
-        return {"ok": False, "skipped": True, "api_error": None}
+        return _skip("skipped")
     if need_usdt <= 0:
-        return {"ok": False, "skipped": True, "api_error": None}
+        return _skip("skipped")
 
     # fetch keys
     row = await db_store.get_autotrade_keys_row(user_id=uid, exchange=exchange, market_type=mt)
     if not row or not bool(row.get("is_active")):
-        return {"ok": False, "skipped": True, "api_error": None}
+        return _skip("skipped")
     try:
         api_key = _decrypt_token(row.get("api_key_enc"))
         api_secret = _decrypt_token(row.get("api_secret_enc"))
@@ -2135,7 +2142,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
     symbol = str(getattr(sig, "symbol", "") or "").upper().replace("/", "")
     if not symbol:
-        return {"ok": False, "skipped": True, "api_error": None}
+        return _skip("skipped")
 
     direction = str(getattr(sig, "direction", "LONG") or "LONG").upper()
     entry = float(getattr(sig, "entry", 0.0) or 0.0)
@@ -2149,7 +2156,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             # Futures cap is user-defined (by margin). Spot cap is implicit (wallet balance).
             free = await _bybit_available_usdt(api_key, api_secret)
             if free < need_usdt:
-                return {"ok": False, "skipped": True, "api_error": None}
+                return _skip("insufficient_balance", free_usdt=float(free), need_usdt=float(need_usdt), exchange=exchange, market=market)
 
             cap_decreased = False
             prev_eff_val = None
@@ -2405,7 +2412,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
         # -------- OKX / MEXC / Gate.io (SPOT) --------
         if exchange in ("okx", "mexc", "gateio"):
             if mt != "spot":
-                return {"ok": False, "skipped": True, "api_error": None}
+                return _skip("skipped")
 
             # Futures cap is irrelevant for SPOT; spot cap is wallet balance.
             symbol = _normalize_symbol(getattr(sig, "symbol", "") or "")
@@ -2430,7 +2437,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             # Execute market entry
             if direction == "SHORT":
                 # Spot short is not supported in this bot (requires margin). Skip safely.
-                return {"ok": False, "skipped": True, "api_error": None}
+                return _skip("skipped")
 
             if exchange == "okx":
                 passphrase = _decrypt_token(row.get("passphrase_enc"))
@@ -2478,13 +2485,13 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
         # Safety guard: never fall through into Binance execution for other exchanges
         if exchange != "binance":
-            return {"ok": False, "skipped": True, "api_error": None}
+            return _skip("skipped")
 
 # -------- Binance --------
         if mt == "spot":
             free = await _binance_spot_free_usdt(api_key, api_secret)
             if free < need_usdt:
-                return {"ok": False, "skipped": True, "api_error": None}
+                return _skip("insufficient_balance", free_usdt=float(free), need_usdt=float(need_usdt), exchange=exchange, market=market)
 
             info = await _binance_exchange_info(futures=False)
             qty_step, min_qty, tick, min_notional = _binance_symbol_filters(info, symbol)
@@ -2638,11 +2645,11 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
         # futures
         used = await db_store.get_autotrade_used_usdt(uid, "futures")
         if fut_cap > 0 and used + need_usdt > fut_cap:
-            return {"ok": False, "skipped": True, "api_error": None}
+            return _skip("skipped")
 
         avail = await _binance_futures_available_margin(api_key, api_secret)
         if avail < need_usdt:
-            return {"ok": False, "skipped": True, "api_error": None}
+            return _skip("skipped")
 
         await _binance_futures_set_leverage(api_key=api_key, api_secret=api_secret, symbol=symbol, leverage=fut_lev)
 
@@ -2800,7 +2807,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             error=err,
             deactivate=_should_deactivate_key(err),
         )
-        return {"ok": False, "skipped": False, "api_error": err}
+        return _fail(err, exchange=exchange, market=market)
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
         await db_store.mark_autotrade_key_error(
