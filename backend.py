@@ -58,6 +58,11 @@ MID_BLOCK_SHORT_BOS_UP = os.getenv("MID_BLOCK_SHORT_BOS_UP", "1").strip().lower(
 MID_BLOCK_SHORT_ABOVE_EMA20_5M = os.getenv("MID_BLOCK_SHORT_ABOVE_EMA20_5M", "1").strip().lower() not in ("0","false","no","off")
 MID_BLOCK_SHORT_2_GREEN_CANDLES = os.getenv("MID_BLOCK_SHORT_2_GREEN_CANDLES", "1").strip().lower() not in ("0","false","no","off")
 MID_BLOCK_SHORT_HIGHER_LOWS = os.getenv("MID_BLOCK_SHORT_HIGHER_LOWS", "1").strip().lower() not in ("0","false","no","off")
+# --- MID microstructure robustness ---
+MID_BOS_RECENT_BARS = int(os.getenv("MID_BOS_RECENT_BARS", "6") or 6)  # consider BOS within last N bars
+MID_HL_TOL_PCT = float(os.getenv("MID_HL_TOL_PCT", "0.001") or 0.001)  # allow equal-ish highs/lows (0.1%)
+MID_REQUIRE_5M_CONFIRM = os.getenv("MID_REQUIRE_5M_CONFIRM", "1").strip().lower() not in ("0","false","no","off")
+MID_FAIL_CLOSED = os.getenv("MID_FAIL_CLOSED", "1").strip().lower() not in ("0","false","no","off")
 MID_HIGHER_LOWS_LOOKBACK = int(os.getenv("MID_HIGHER_LOWS_LOOKBACK", str(MID_LOWER_HIGHS_LOOKBACK)) or MID_LOWER_HIGHS_LOOKBACK)
 
 
@@ -4875,10 +4880,28 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                     return "higher_lows_5m"
         except Exception:
             pass
+        # --- Require 5m confirmation (prevents SHORT into bullish microtrend / LONG into bearish microtrend) ---
+        try:
+            if MID_REQUIRE_5M_CONFIRM:
+                s = side.upper()
+                if s == "SHORT":
+                    bear = bool(bos_down_5m) or bool(two_red_5m) or bool(lower_highs_5m) or ((ema20_5m is not None) and (close < float(ema20_5m)))
+                    if not bear:
+                        return "no_bear_5m_confirm"
+                elif s == "LONG":
+                    bull = bool(bos_up_5m) or bool(two_green_5m) or bool(higher_lows_5m) or ((ema20_5m is not None) and (close > float(ema20_5m)))
+                    if not bull:
+                        return "no_bull_5m_confirm"
+        except Exception:
+            # if confirmation calc fails, respect fail-closed flag
+            if MID_FAIL_CLOSED:
+                return "mid_5m_confirm_error"
+            pass
+
 
     except Exception:
-        # if filter computation fails, don't block signal; let normal error handling deal with it
-        return None
+        # if filter computation fails, respect fail-closed flag
+        return "mid_filter_error" if MID_FAIL_CLOSED else None
     return None
 
 
@@ -6760,26 +6783,38 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 two_red_5m = (float(cl.iloc[-1]) < float(op.iloc[-1])) and (float(cl.iloc[-2]) < float(op.iloc[-2]))
                 two_green_5m = (float(cl.iloc[-1]) > float(op.iloc[-1])) and (float(cl.iloc[-2]) > float(op.iloc[-2]))
 
-            # BOS down heuristic: last bar breaks below previous lookback low
+            # BOS heuristic: consider breaks within last MID_BOS_RECENT_BARS bars (more robust than last-bar only)
             lb = 20
-            if len(lo) >= lb + 2:
-                prev_low = float(lo.iloc[-(lb+1):-1].min())
-                last_low = float(lo.iloc[-1])
-                last_close = float(cl.iloc[-1])
-                bos_down_5m = (last_low < prev_low) and (last_close < prev_low)
-                prev_high = float(hi.iloc[-(lb+1):-1].max())
-                last_high = float(hi.iloc[-1])
-                bos_up_5m = (last_high > prev_high) and (last_close > prev_high)
-
-            # Lower highs heuristic over last N highs (strictly decreasing)
+            k = max(2, int(MID_BOS_RECENT_BARS))
+            if len(lo) >= lb + k + 1:
+                # previous extremes excluding the last k bars
+                prev_low = float(lo.iloc[-(lb+k+1):-(k)].min())
+                prev_high = float(hi.iloc[-(lb+k+1):-(k)].max())
+                bos_down_5m = False
+                bos_up_5m = False
+                # scan last k bars for a decisive close beyond the previous extreme
+                for j in range(-k, 0):
+                    try:
+                        _low = float(lo.iloc[j])
+                        _high = float(hi.iloc[j])
+                        _close = float(cl.iloc[j])
+                        if (_low < prev_low) and (_close < prev_low):
+                            bos_down_5m = True
+                        if (_high > prev_high) and (_close > prev_high):
+                            bos_up_5m = True
+                    except Exception:
+                        continue
+            
+            # Lower highs / higher lows with small tolerance to avoid false negatives on equal-ish pivots
+            tol = max(0.0, float(MID_HL_TOL_PCT))
             nlh = max(3, int(MID_LOWER_HIGHS_LOOKBACK))
             if len(hi) >= nlh:
                 hh = [float(x) for x in hi.iloc[-nlh:].tolist()]
-                lower_highs_5m = all(hh[i] < hh[i-1] for i in range(1, len(hh)))
+                lower_highs_5m = all(hh[i] <= hh[i-1] * (1.0 + tol) for i in range(1, len(hh)))
             nhl = max(3, int(MID_HIGHER_LOWS_LOOKBACK))
             if len(lo) >= nhl:
                 ll = [float(x) for x in lo.iloc[-nhl:].tolist()]
-                higher_lows_5m = all(ll[i] > ll[i-1] for i in range(1, len(ll)))
+                higher_lows_5m = all(ll[i] >= ll[i-1] * (1.0 - tol) for i in range(1, len(ll)))
         except Exception:
             pass
 
