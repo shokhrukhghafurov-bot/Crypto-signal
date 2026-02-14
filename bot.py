@@ -4189,14 +4189,15 @@ async def signal_outcome_loop() -> None:
     last_beat = _time.monotonic()
     tick = 0
     while True:
-        tick += 1
         try:
+            tick += 1
             rows = await db_store.list_open_signal_tracks(limit=1000)
+            open_tracks = len(rows)
+            # heartbeat: show loop is alive even when open_tracks=0
+            if _time.monotonic() - last_beat >= 60:
+                last_beat = _time.monotonic()
+                logger.info("[sig-outcome] alive tick=%s open_tracks=%s", tick, open_tracks)
             if not rows:
-                # heartbeat (shows loop is alive even when there are no open tracks)
-                if _time.monotonic() - last_beat >= 60:
-                    last_beat = _time.monotonic()
-                    logger.info("[sig-outcome] alive tick=%s open_tracks=0", tick)
                 await asyncio.sleep(_SIG_WATCH_INTERVAL_SEC)
                 continue
 
@@ -4389,7 +4390,6 @@ async def signal_outcome_loop() -> None:
             # heartbeat / visibility (once per minute)
             if _time.monotonic() - last_beat >= 60:
                 last_beat = _time.monotonic()
-                logger.info("[sig-outcome] alive tick=%s open_tracks=%s", tick, len(rows))
                 logger.info(
                     "signal_outcome_loop heartbeat: open_tracks=%s processed=%s price_miss=%s tp1=%s win=%s loss=%s be=%s timeout=%s",
                     len(rows), processed, price_miss, tp1_marked, closed_win, closed_loss, closed_be, closed_timeout,
