@@ -8888,16 +8888,24 @@ class Backend:
                     # The debug block should reflect the *active* protective level, not the original signal SL.
                     be_armed = _be_is_armed(side=side, price=price_f, tp1=(float(s.tp1) if s.tp1 else None), tp2=(float(s.tp2) if s.tp2 else None))
                     effective_sl = (be_price if (tp1_hit and _be_enabled(market) and be_price > 0 and be_armed) else (float(s.sl) if s.sl else None))
-                    dbg = _price_debug_block(
-                        uid,
-                        price=price_f,
-                        source=price_src,
-                        side=side,
-                        sl=effective_sl,
-                        tp1=(float(s.tp1) if s.tp1 else None),
-                        tp2=(float(s.tp2) if s.tp2 else None),
-                        sl_label_key=('lbl_be' if (tp1_hit and be_armed) else 'lbl_sl'),
-                    )
+                    dbg = ""
+                    try:
+                        _pd = (os.getenv("PRICE_DEBUG", "0") or "").strip().lower()
+                        _price_dbg_on = _pd not in ("", "0", "false", "no", "off")
+                    except Exception:
+                        _price_dbg_on = False
+                    if _price_dbg_on:
+                        dbg = _price_debug_block(
+                            uid,
+                            price=price_f,
+                            source=price_src,
+                            side=side,
+                            sl=effective_sl,
+                            tp1=(float(s.tp1) if s.tp1 else None),
+                            tp2=(float(s.tp2) if s.tp2 else None),
+                            sl_label_key=('lbl_be' if (tp1_hit and be_armed) else 'lbl_sl'),
+                        )
+
                     # 1) Before TP1: TP2 (gap) -> WIN
                     if not tp1_hit and s.tp2 and hit_tp(float(s.tp2)):
                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
