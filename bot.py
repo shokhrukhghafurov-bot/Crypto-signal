@@ -311,6 +311,8 @@ if ERROR_BOT_TOKEN and ERROR_BOT_ENABLED:
 # Simple per-chat rate limiter for error bot sends (prevents Telegram flood control)
 _ERROR_SEND_LOCKS: dict[int, asyncio.Lock] = {}
 _ERROR_LAST_SENT_AT: dict[int, float] = {}
+_HEALTH_LAST_STATUS: dict[str, str] = {}
+
 _ERROR_MIN_INTERVAL_SEC = float(os.getenv("ERROR_BOT_MIN_INTERVAL_SEC", "0.8") or 0.8)
 
 async def _error_bot_send(text: str) -> None:
