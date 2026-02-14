@@ -4189,6 +4189,7 @@ async def signal_outcome_loop() -> None:
     last_beat = _time.monotonic()
     tick = 0
     while True:
+        tick += 1
         try:
             rows = await db_store.list_open_signal_tracks(limit=1000)
             if not rows:
@@ -4388,6 +4389,7 @@ async def signal_outcome_loop() -> None:
             # heartbeat / visibility (once per minute)
             if _time.monotonic() - last_beat >= 60:
                 last_beat = _time.monotonic()
+                logger.info("[sig-outcome] alive tick=%s open_tracks=%s", tick, len(rows))
                 logger.info(
                     "signal_outcome_loop heartbeat: open_tracks=%s processed=%s price_miss=%s tp1=%s win=%s loss=%s be=%s timeout=%s",
                     len(rows), processed, price_miss, tp1_marked, closed_win, closed_loss, closed_be, closed_timeout,
