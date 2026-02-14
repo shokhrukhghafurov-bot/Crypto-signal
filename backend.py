@@ -4750,7 +4750,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         rsi_long_min = MID_ULTRA_RSI_LONG_MIN if MID_ULTRA_SAFE else MID_RSI_LONG_MIN
         rsi_short_min = MID_ULTRA_RSI_SHORT_MIN if MID_ULTRA_SAFE else MID_RSI_SHORT_MIN
         rsi_short_max = MID_ULTRA_RSI_SHORT_MAX if MID_ULTRA_SAFE else MID_RSI_SHORT_MAX
-        confirm_body_min = MID_ULTRA_CONFIRM_CANDLE_BODY_ATR_MIN if MID_ULTRA_SAFE else confirm_body_min
+        confirm_body_min = MID_ULTRA_CONFIRM_CANDLE_BODY_ATR_MIN if MID_ULTRA_SAFE else MID_CONFIRM_CANDLE_BODY_ATR_MIN
 
         if atr_30m and atr_30m > 0:
             if side.upper() == "LONG":
@@ -4854,12 +4854,12 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                 if rsi_5m >= rsi_long_max:
                     return f"rsi_long={rsi_5m:.1f} >= {rsi_long_max:g}"
                 if rsi_5m < rsi_long_min:
-                    return f"rsi_long={rsi_5m:.1f} < {MID_RSI_LONG_MIN:g}"
+                    return f"rsi_long={rsi_5m:.1f} < {rsi_long_min:g}"
             else:  # SHORT
                 if rsi_5m <= rsi_short_min:
                     return f"rsi_short={rsi_5m:.1f} <= {rsi_short_min:g}"
-                if rsi_5m >= MID_RSI_SHORT_MAX:
-                    return f"rsi_short={rsi_5m:.1f} >= {MID_RSI_SHORT_MAX:g}"
+                if rsi_5m >= rsi_short_max:
+                    return f"rsi_short={rsi_5m:.1f} >= {rsi_short_max:g}"
 
         # --- Extra quality guards (to reduce immediate SL after entry) ---
         try:
