@@ -1888,18 +1888,12 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     """Execute real trading orders for a signal for a single user.
 
     Returns dict:
-      {"ok": bool, "skipped": bool, "api_error": str|None, "skip_reason": str|None, "details": dict|None}
+      {"ok": bool, "skipped": bool, "api_error": str|None}
     """
     uid = int(user_id)
     market = (getattr(sig, "market", "") or "").upper()
-
-    def _skip(reason: str, *, details: dict | None = None, ok: bool = False) -> dict:
-        return {"ok": bool(ok), "skipped": True, "api_error": None, "skip_reason": str(reason), "details": details}
-
-    # Feature flag: admin access gate (users.autotrade_enabled / expires / blocked / stop_after_close)
-    _gate = (os.getenv("AUTOTRADE_ACCESS_GATE", "1") or "1").strip().lower() not in ("0","false","no","off")
     if market not in ("SPOT", "FUTURES"):
-        return _skip("bad_market", details={"market": market})
+        return {"ok": False, "skipped": True, "api_error": None}
 
     # Hard block: stable-vs-stable pairs (fail-safe)
     sym = (getattr(sig, "symbol", "") or "").upper().strip()
@@ -1932,34 +1926,33 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     atr_pct_sig = _sig_ta_float("atr_pct")
     # --- Admin gate (like SIGNAL): global per-user Auto-trade allow/deny + expiry ---
     # This is independent from per-market toggles in autotrade_settings.
-    # If disabled/expired/blocked -> skip with reason.
-    if _gate:
-        try:
-            acc = await db_store.get_autotrade_access(uid)
-            if bool(acc.get("is_blocked")):
-                return _skip("access_blocked")
-            if not bool(acc.get("autotrade_enabled")):
-                return _skip("access_disabled")
-            if bool(acc.get("autotrade_stop_after_close")):
-                return _skip("access_stop_after_close")
-            exp = acc.get("autotrade_expires_at")
-            if exp is not None:
-                import datetime as _dt
-                now = _dt.datetime.now(_dt.timezone.utc)
-                try:
-                    if exp.tzinfo is None:
-                        exp = exp.replace(tzinfo=_dt.timezone.utc)
-                    if exp <= now:
-                        return _skip("access_expired")
-                except Exception:
-                    return _skip("access_expired")
-        except Exception as e:
-            # best-effort: if access columns not ready, default to allow
-            logger.exception("autotrade_execute: access gate check failed uid=%s: %s", uid, e)
+    # If disabled/expired/blocked -> skip silently.
+    try:
+        acc = await db_store.get_autotrade_access(uid)
+        if bool(acc.get("is_blocked")):
+            return {"ok": False, "skipped": True, "api_error": None}
+        if not bool(acc.get("autotrade_enabled")):
+            return {"ok": False, "skipped": True, "api_error": None}
+        if bool(acc.get("autotrade_stop_after_close")):
+            return {"ok": False, "skipped": True, "api_error": None}
+        exp = acc.get("autotrade_expires_at")
+        if exp is not None:
+            import datetime as _dt
+            now = _dt.datetime.now(_dt.timezone.utc)
+            try:
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=_dt.timezone.utc)
+                if exp <= now:
+                    return {"ok": False, "skipped": True, "api_error": None}
+            except Exception:
+                return {"ok": False, "skipped": True, "api_error": None}
+    except Exception:
+        # best-effort: if access columns not ready, default to allow
+        pass
 
     enabled = bool(st.get("spot_enabled")) if mt == "spot" else bool(st.get("futures_enabled"))
     if not enabled:
-        return _skip("market_toggle_off", details={"mt": mt})
+        return {"ok": False, "skipped": True, "api_error": None}
 
     
     exchange = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "binance").lower().strip()
@@ -1988,7 +1981,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
         # Require at least one confirmation exchange; otherwise skip auto-trade
         if not conf_set:
-            return _skip("no_confirmations", details={"mt": mt})
+            return {"ok": False, "skipped": True, "api_error": None}
 
 
         # Priority list from DB (comma-separated)
@@ -2021,7 +2014,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             break
 
         if not chosen:
-            return _skip("no_keys_confirmed", details={"mt": mt})
+            return {"ok": True, "skipped": True, "api_error": None}
         exchange = chosen
 
     # FUTURES: choose exchange based on where the futures contract actually exists
@@ -8839,6 +8832,13 @@ class Backend:
                         risk_note="",
                         ts=float(dt.datetime.now(dt.timezone.utc).timestamp()),
                     )
+
+                    # Pre-format TP2 for templates (prevents UnboundLocalError in close messages)
+                    try:
+                        _tp2v = float(getattr(s, 'tp2', 0.0) or 0.0)
+                    except Exception:
+                        _tp2v = 0.0
+                    tp2_disp = (f"{_tp2v:.6f}" if _tp2v > 0 else "-")
 
                     try:
                         price_f, price_src = await self._get_price_with_source(s)
