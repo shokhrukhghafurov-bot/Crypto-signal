@@ -1027,6 +1027,11 @@ AUTOTRADE_STATS_STATE: Dict[int, Dict[str, str]] = {}
 AUTOTRADE_API_ERR_LAST: Dict[tuple[int, str, str], float] = {}
 AUTOTRADE_API_ERR_COOLDOWN_SEC = 300
 
+# Notify (optional) when Auto-trade is SKIPPED due to access/keys/confirmations (diagnostics)
+AUTOTRADE_SKIP_LAST: Dict[tuple[int, str], float] = {}  # (uid, reason) -> last_ts
+AUTOTRADE_SKIP_COOLDOWN_SEC = int(os.getenv("AUTOTRADE_SKIP_COOLDOWN_SEC", "900") or 900)  # 15m
+
+
 # Global Auto-trade bot settings cache (admin panel)
 AUTOTRADE_BOT_GLOBAL: Dict[str, object] = {
     "pause_autotrade": False,
@@ -1126,6 +1131,13 @@ async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str,
     msg = f"{title} ({ex} {mt})\n{error_text}"
     try:
         await safe_send(uid, msg)
+    except Exception:
+        pass
+    # Also forward to @errorrrrrrg_bot (admin error bot), if enabled
+    try:
+        send_to_err = (os.getenv("AUTOTRADE_SEND_API_ERRORS_TO_ERROR_BOT", "1") or "1").strip().lower() not in ("0","false","no","off")
+        if send_to_err:
+            await _error_bot_send(f"🤖 Auto-trade API ERROR\nuid={uid}\n{title} ({ex} {mt})\n{error_text}"[:3900])
     except Exception:
         pass
 
@@ -1954,19 +1966,38 @@ async def broadcast_signal(sig: Signal) -> None:
                         return
 
                     res = await autotrade_execute(_uid, _sig)
+
+                    # If skipped, log (and optionally forward to error bot) with a human reason.
+                    if isinstance(res, dict) and bool(res.get("skipped")) and res.get("skip_reason"):
+                        reason = str(res.get("skip_reason") or "").strip() or "skipped"
+                        logger.info("Auto-trade skipped uid=%s reason=%s symbol=%s market=%s", _uid, reason, getattr(_sig, "symbol", None), getattr(_sig, "market", None))
+                        try:
+                            send_skips = (os.getenv("AUTOTRADE_SEND_SKIPS_TO_ERROR_BOT", "0") or "0").strip().lower() not in ("0","false","no","off")
+                            if send_skips:
+                                import time as _t
+                                k = (int(_uid), reason)
+                                now = _t.time()
+                                last = AUTOTRADE_SKIP_LAST.get(k, 0.0)
+                                if now - last >= float(AUTOTRADE_SKIP_COOLDOWN_SEC):
+                                    AUTOTRADE_SKIP_LAST[k] = now
+                                    det = res.get("details") if isinstance(res.get("details"), dict) else {}
+                                    await _error_bot_send(f"🤖 Auto-trade SKIP\nuid={_uid}\nreason={reason}\nmarket={getattr(_sig,'market',None)}\nsymbol={getattr(_sig,'symbol',None)}\ndetails={det}"[:3900])
+                        except Exception:
+                            pass
+
                     err = res.get("api_error") if isinstance(res, dict) else None
                     if err:
                         # notify ONLY for API errors
                         st = await db_store.get_autotrade_settings(_uid)
                         mt = "spot" if _sig.market == "SPOT" else "futures"
                         ex = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "").lower()
-                        await _notify_autotrade_api_error(_uid, ex, mt, str(err)[:500])
+                        await _notify_autotrade_api_error(_uid, ex, mt, f"{getattr(_sig,'symbol','')} {getattr(_sig,'market','')}: {str(err)}"[:500])
                 except Exception as e:
                     # unexpected errors are treated as API errors for visibility
                     st = await db_store.get_autotrade_settings(_uid)
                     mt = "spot" if _sig.market == "SPOT" else "futures"
                     ex = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "").lower()
-                    await _notify_autotrade_api_error(_uid, ex, mt, f"{type(e).__name__}: {e}"[:500])
+                    await _notify_autotrade_api_error(_uid, ex, mt, f"{getattr(_sig,'symbol','')} {getattr(_sig,'market','')}: {type(e).__name__}: {e}"[:500])
 
             asyncio.create_task(_run_autotrade(uid, sig))
         except (TelegramForbiddenError, TelegramBadRequest) as e:
