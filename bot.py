@@ -3952,11 +3952,42 @@ def _parse_price_order(env_name: str, default: str) -> list[str]:
 
 
 async def _fetch_signal_price(symbol: str, *, market: str) -> tuple[float, str]:
-    """Get price with fallback sources. Returns (price, source)."""
+    """Get price for bot-level signal tracking. Returns (price, source).
+
+    This is used by `signal_outcome_loop` (global bot stats). It MUST use the
+    same price policy as live tracking:
+      1) Prefer Backend WS-first oracle (MEDIAN/BINANCE/BYBIT as configured).
+      2) If it fails, fall back to lightweight REST fetchers.
+    """
     m = (market or "SPOT").upper()
     sym = str(symbol or "").upper().strip()
     if not sym:
         return 0.0, ""
+
+    # 1) Prefer backend WS-first oracle (same policy as live tracking)
+    try:
+        # Minimal Signal instance for the oracle. Only market/symbol/entry are used.
+        sig0 = Signal(
+            market=("SPOT" if m == "SPOT" else "FUTURES"),
+            symbol=sym,
+            entry=0.0,
+            sl=None,
+            tp1=None,
+            tp2=None,
+            direction="LONG",
+            rr=0.0,
+            confidence="",
+            timeframe="",
+            confirmations=[],
+            signal_id=0,
+        )
+        px, src = await backend._get_price_with_source(sig0)  # type: ignore[attr-defined]
+        px = float(px or 0.0)
+        if px > 0:
+            return px, str(src or "")
+    except Exception:
+        # fall back to REST helpers below
+        pass
 
     async def _safe(coro) -> float:
         try:
@@ -4118,18 +4149,33 @@ async def signal_outcome_loop() -> None:
     import datetime as _dt
     import time as _time
     logger.info("Starting signal_outcome_loop interval=%ss buffer_pct=%s confirm_sec=%s", _SIG_WATCH_INTERVAL_SEC, _BE_BUFFER_PCT, _BE_CONFIRM_SEC)
+    last_beat = _time.monotonic()
     while True:
         try:
             rows = await db_store.list_open_signal_tracks(limit=1000)
             if not rows:
+                # heartbeat (shows loop is alive even when there are no open tracks)
+                if _time.monotonic() - last_beat >= 60:
+                    last_beat = _time.monotonic()
+                    logger.info("signal_outcome_loop heartbeat: open_tracks=0")
                 await asyncio.sleep(_SIG_WATCH_INTERVAL_SEC)
                 continue
+
+            # per-iteration counters for visibility
+            processed = 0
+            price_miss = 0
+            tp1_marked = 0
+            closed_win = 0
+            closed_loss = 0
+            closed_be = 0
+            closed_timeout = 0
 
             now = _dt.datetime.now(_dt.timezone.utc)
             part = _model_partial_pct()
 
             for t in rows:
                 try:
+                    processed += 1
                     sid = int(t.get("signal_id") or 0)
                     market = str(t.get("market") or "SPOT").upper()
                     symbol = str(t.get("symbol") or "").upper()
@@ -4168,10 +4214,12 @@ async def signal_outcome_loop() -> None:
                             pnl_to = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=px_to, part_entry_to_close=1.0) if (entry > 0 and px_to > 0) else 0.0
                             await db_store.close_signal_track(signal_id=sid, status="CLOSED", pnl_total_pct=float(pnl_to))
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            closed_timeout += 1
                             continue
 
                     px, _src = await _fetch_signal_price(symbol, market=market)
                     if px <= 0:
+                        price_miss += 1
                         continue
 
                     # Prefer TPC: if tp2 missing but tp1 exists, treat tp1 as final target
@@ -4185,12 +4233,14 @@ async def signal_outcome_loop() -> None:
                             pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if (eff_tp1 > 0 and eff_tp2 > 0) else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            closed_win += 1
                             continue
                         if eff_tp2 <= 0 and eff_tp1 > 0 and _hit_tp(side, px, eff_tp1):
                             # single-target win at TP1
                             pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp1, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            closed_win += 1
                             continue
                         # LOSS by SL (only before TP1 in strict mode)
                         if sl > 0:
@@ -4212,11 +4262,13 @@ async def signal_outcome_loop() -> None:
                                     pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
                                     await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
                                     _SIG_SL_BREACH_SINCE.pop(sid, None)
+                                    closed_loss += 1
                                     continue
                         # TP1 hit -> arm BE
                         if eff_tp1 > 0 and _hit_tp(side, px, eff_tp1):
                             await db_store.mark_signal_tp1(signal_id=sid, be_price=float(entry))
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            tp1_marked += 1
                             continue
 
                     # TP1 stage (BE armed)
@@ -4226,6 +4278,7 @@ async def signal_outcome_loop() -> None:
                             pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            closed_win += 1
                             continue
 
                         if not _be_is_armed_sig(side, px, eff_tp1, eff_tp2):
@@ -4252,17 +4305,27 @@ async def signal_outcome_loop() -> None:
                                 pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
                                 await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
                                 _SIG_SL_BREACH_SINCE.pop(sid, None)
+                                closed_be += 1
                                 continue
                         if crossed and crossed_at_dt is not None and _BE_CONFIRM_SEC == 0:
                             pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            closed_be += 1
                             continue
 
                 except Exception:
                     # keep loop alive
                     logger.exception("signal_outcome_loop: item error")
                     continue
+
+            # heartbeat / visibility (once per minute)
+            if _time.monotonic() - last_beat >= 60:
+                last_beat = _time.monotonic()
+                logger.info(
+                    "signal_outcome_loop heartbeat: open_tracks=%s processed=%s price_miss=%s tp1=%s win=%s loss=%s be=%s timeout=%s",
+                    len(rows), processed, price_miss, tp1_marked, closed_win, closed_loss, closed_be, closed_timeout,
+                )
 
         except Exception:
             logger.exception("signal_outcome_loop error")
