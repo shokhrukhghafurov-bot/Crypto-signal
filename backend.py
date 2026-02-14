@@ -7946,6 +7946,10 @@ class Backend:
         self.trade_stats: dict = {}
         self._load_trade_stats()
 
+        # Optional heartbeat callback (set by bot.py) to report Smart Manager liveness.
+        # Called best-effort once per track_loop cycle.
+        self.health_tick_cb = None
+
 
 
     def set_mid_trap_sink(self, cb) -> None:
@@ -8817,6 +8821,13 @@ class Backend:
     async def track_loop(self, bot) -> None:
         """Main tracker loop. Reads ACTIVE/TP1 trades from PostgreSQL and updates their status."""
         while True:
+            # heartbeat for health log (best effort)
+            try:
+                cb = getattr(self, "health_tick_cb", None)
+                if callable(cb):
+                    cb()
+            except Exception:
+                pass
             try:
                 rows = await db_store.list_active_trades(limit=500)
             except Exception:
