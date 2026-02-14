@@ -1963,7 +1963,9 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
         # Parse confirmations like "BYBIT+OKX" to {"bybit","okx"}
         conf_raw = str((getattr(sig, "available_exchanges", "") or getattr(sig, "confirmations", "") or "")).strip()
         conf_set: set[str] = set()
-        for part in re.split(r"[+ ,;/|]+", conf_raw.strip()):
+        # confirmations may arrive in UI formats like "Binance • Bybit • OKX".
+        # include common separators (bullets, middle dot) to avoid false empty conf_set.
+        for part in re.split(r"[+ ,;/|•·]+", conf_raw.strip()):
             p = part.strip().lower()
             if not p:
                 continue
@@ -1981,7 +1983,13 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
         # Require at least one confirmation exchange; otherwise skip auto-trade
         if not conf_set:
-            return {"ok": False, "skipped": True, "api_error": None}
+            return {
+                "ok": False,
+                "skipped": True,
+                "skip_reason": "no_confirmations",
+                "details": {"confirmations_raw": conf_raw},
+                "api_error": None,
+            }
 
 
         # Priority list from DB (comma-separated)
@@ -2027,7 +2035,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
         # Parse venues like "BINANCE+OKX" -> {"binance","okx"}
         conf_raw = str((getattr(sig, "available_exchanges", "") or getattr(sig, "confirmations", "") or "")).strip()
         conf_set: set[str] = set()
-        for part in re.split(r"[+ ,;/|]+", conf_raw.strip()):
+        for part in re.split(r"[+ ,;/|•·]+", conf_raw.strip()):
             p = part.strip().lower()
             if not p:
                 continue
