@@ -4352,7 +4352,7 @@ async def signal_outcome_loop() -> None:
                         if crossed and crossed_at_dt is not None and _BE_CONFIRM_SEC == 0:
                             pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
-                                logger.info("[sig-outcome] BE sid=%s %s %s px=%s be=%s tp1=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(entry), _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
+                            logger.info("[sig-outcome] BE sid=%s %s %s px=%s be=%s tp1=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(entry), _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_be += 1
                             continue
