@@ -338,8 +338,16 @@ async def _error_bot_send(text: str) -> None:
 
 def _should_forward_to_error_bot(levelno: int, msg: str) -> bool:
     m = (msg or "").lower()
+    is_health = ("[health]" in m)
     is_autotrade = ("[autotrade]" in m or "auto-trade" in m or "autotrade " in m or "autotrade_" in m)
     is_smart = ("[smart-manager]" in m or "smart manager" in m or "smart_be" in m or "smart-be" in m)
+
+    # Health messages are informational; forward ONLY when something is actually DEAD.
+    if is_health:
+        # forward if any component is dead (either explicit status or red cross)
+        if ('"dead"' in m) or ("❌" in (msg or "")) or (" dead" in m):
+            return True
+        return False
     # ignore stablecoin scan blocks unless explicitly enabled
     if "scan_block" in m and any(x in m for x in _ERROR_BOT_IGNORE_SCAN_BLOCK):
         return False
