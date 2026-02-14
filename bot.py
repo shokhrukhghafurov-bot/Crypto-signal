@@ -65,6 +65,53 @@ logging.basicConfig(
 )
 logger = logging.getLogger("bot")
 
+# --- runtime health/status (autotrade & smart-manager) ---
+TASKS: dict[str, asyncio.Task] = {}
+HEALTH: dict[str, float] = {"bot_start": time.time()}
+HEALTH_LAST_ERR: dict[str, str] = {}
+
+def _health_mark_ok(name: str) -> None:
+    HEALTH[f"{name}_last_ok"] = time.time()
+
+def _health_mark_err(name: str, err: str) -> None:
+    HEALTH_LAST_ERR[name] = (err or "").strip()[:500]
+    HEALTH[f"{name}_last_err"] = time.time()
+
+def _task_state(t: asyncio.Task | None) -> str:
+    if not t:
+        return "missing"
+    if t.cancelled():
+        return "cancelled"
+    if t.done():
+        exc = t.exception()
+        return f"done(exc={type(exc).__name__})" if exc else "done(ok)"
+    return "running"
+
+async def _health_status_loop() -> None:
+    interval = int(os.getenv("HEALTH_STATUS_INTERVAL_SEC", "60") or 60)
+    # don't spam on boot
+    await asyncio.sleep(5)
+    while True:
+        try:
+            now = time.time()
+            at_global = TASKS.get("autotrade-global")
+            smart = TASKS.get("smart-manager")
+            at_mgr = TASKS.get("autotrade-manager")
+            # last ok ages
+            def age(key): 
+                t = HEALTH.get(key, 0.0) or 0.0
+                return None if t <= 0 else max(0, now - t)
+            msg = (
+                "[health] "
+                f"autotrade-global={_task_state(at_global)} ok_age={age('autotrade-global_last_ok')} err_age={age('autotrade-global_last_err')} "
+                f"autotrade-manager={_task_state(at_mgr)} ok_age={age('autotrade-manager_last_ok')} err_age={age('autotrade-manager_last_err')} "
+                f"smart-manager={_task_state(smart)} ok_age={age('smart-manager_last_ok')} err_age={age('smart-manager_last_err')}"
+            )
+            logger.info(msg)
+        except Exception:
+            logger.exception("[health] status loop failed")
+        await asyncio.sleep(max(10, interval))
+
 # --- i18n template safety guard (prevents leaking {placeholders} to users) ---
 _UNFILLED_RE = re.compile(r'(?<!\{)\{[a-zA-Z0-9_]+\}(?!\})')
 
@@ -177,6 +224,8 @@ ERROR_BOT_ENABLED = (os.getenv("ERROR_BOT_ENABLED", "1").strip().lower() not in 
 ERROR_BOT_SEND_SCAN_BLOCK = (os.getenv("ERROR_BOT_SEND_SCAN_BLOCK", "0").strip().lower() not in ("0","false","no","off"))
 ERROR_BOT_SEND_MID_BLOCK = (os.getenv("ERROR_BOT_SEND_MID_BLOCK", "0").strip().lower() not in ("0","false","no","off"))
 ERROR_BOT_SEND_SCANNER_ERRORS = (os.getenv("ERROR_BOT_SEND_SCANNER_ERRORS", "1").strip().lower() not in ("0","false","no","off"))
+ERROR_BOT_SEND_AUTOTRADE_ERRORS = (os.getenv("ERROR_BOT_SEND_AUTOTRADE_ERRORS", "1").strip().lower() not in ("0","false","no","off"))
+ERROR_BOT_SEND_SMART_ERRORS = (os.getenv("ERROR_BOT_SEND_SMART_ERRORS", "1").strip().lower() not in ("0","false","no","off"))
 ERROR_BOT_SEND_LEVEL = (os.getenv("ERROR_BOT_SEND_LEVEL", "ERROR") or "ERROR").upper().strip()  # ERROR/WARNING/INFO
 
 # Patterns we NEVER forward (noisy, user/API-key problems, stablecoin scan blocks)
@@ -242,37 +291,6 @@ def _should_forward_to_error_bot(levelno: int, msg: str) -> bool:
     if levelno >= min_level and min_level >= logging.WARNING:
         return True
 
-def _asyncio_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
-    """Forward unhandled asyncio exceptions (e.g. 'Task exception was never retrieved') to the error bot."""
-    try:
-        msg = str(context.get("message") or "asyncio exception")
-        exc = context.get("exception")
-        details = []
-        if msg:
-            details.append(msg)
-        if exc is not None:
-            details.append("exc=" + repr(exc))
-        fut = context.get("future") or context.get("task")
-        if fut is not None:
-            try:
-                details.append(f"task={getattr(fut, 'get_name', lambda: None)() or fut!r}")
-            except Exception:
-                details.append(f"task={fut!r}")
-        text_msg = " | ".join(details) if details else "asyncio exception"
-
-        # also log so it appears in stdout
-        logger.error("[asyncio] %s", text_msg, exc_info=exc)
-
-        if ERROR_BOT_ENABLED and _error_bot and _should_forward_to_error_bot(text_msg):
-            try:
-                loop.create_task(_error_bot_send("⚠️ asyncio: " + text_msg))
-            except Exception:
-                # best-effort only
-                pass
-    except Exception:
-        pass
-
-
     # Allow selected INFO/WARNING markers
     if ERROR_BOT_SEND_SCANNER_ERRORS and ("error scanner" in m or "scanner error" in m):
         return True
@@ -283,6 +301,11 @@ def _asyncio_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -
         return True
     if ERROR_BOT_SEND_SCAN_BLOCK and ("scan_block" in m):
         # but still avoid stable pair spam above
+        return True
+
+    if ERROR_BOT_SEND_AUTOTRADE_ERRORS and ("[autotrade]" in m or "auto-trade" in m or "autotrade " in m or "autotrade_" in m):
+        return True
+    if ERROR_BOT_SEND_SMART_ERRORS and ("[smart-manager]" in m or "smart manager" in m or "smart_be" in m or "smart-be" in m):
         return True
 
     return False
@@ -1090,14 +1113,14 @@ async def _refresh_autotrade_bot_global_once() -> None:
 async def _autotrade_bot_global_loop() -> None:
     """Background loop that refreshes global auto-trade pause/maintenance flags."""
     tick = 0
-    logger.info("[autotrade-global] loop started interval=5s")
+    logger.info("[autotrade-global] loop started interval=5s"); _health_mark_ok("autotrade-global")
     while True:
         tick += 1
         try:
-            await _refresh_autotrade_bot_global_once()
+            await _refresh_autotrade_bot_global_once(); _health_mark_ok("autotrade-global")
         except Exception:
             # keep loop alive
-            logger.exception("[autotrade-global] refresh failed tick=%s", locals().get("tick", "?"))
+            logger.exception("[autotrade-global] refresh failed tick=%s", tick); _health_mark_err("autotrade-global", "refresh_failed")
         await asyncio.sleep(5)
 
 
@@ -1165,6 +1188,8 @@ async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str,
     ex = (exchange or '').upper()
     mt = (market_type or '').upper()
     msg = f"{title} ({ex} {mt})\n{error_text}"
+    logger.error("[autotrade] api_error uid=%s ex=%s mt=%s err=%s", uid, ex, mt, (error_text or "")[:500])
+    _health_mark_err("autotrade-manager", "api_error")
     try:
         await safe_send(uid, msg)
     except Exception:
@@ -2016,21 +2041,24 @@ async def broadcast_signal(sig: Signal) -> None:
                             logger.info("Auto-trade skipped by global setting (pause/maintenance) uid=%s", _uid)
                             return
                     except Exception:
-                        # If DB read failed, we can either fail-closed (safer) or fail-open (more uptime).
-                        if AUTOTRADE_FAIL_CLOSED_GLOBAL:
-                            logger.exception("Auto-trade skipped: failed to read global pause/maintenance (fail-closed) uid=%s", _uid)
-                            return
-                        logger.exception("Auto-trade global settings read failed; proceeding (fail-open) uid=%s", _uid)
+                        # FAIL-CLOSED: if DB read failed, do NOT open new trades.
+                        logger.exception("Auto-trade skipped: failed to read global pause/maintenance (fail-closed) uid=%s", _uid)
+                        return
 
                     res = await autotrade_execute(_uid, _sig)
+                    try:
+                        if isinstance(res, dict) and bool(res.get("ok")) and not bool(res.get("skipped")):
+                            logger.info("[autotrade] executed uid=%s market=%s symbol=%s", _uid, getattr(_sig,"market",None), getattr(_sig,"symbol",None))
+                            _health_mark_ok("autotrade-manager")
+                    except Exception:
+                        pass
 
                     # If skipped, log (and optionally forward to error bot) with a human reason.
                     if isinstance(res, dict) and bool(res.get("skipped")) and res.get("skip_reason"):
                         reason = str(res.get("skip_reason") or "").strip() or "skipped"
-                        logger.info("Auto-trade skipped uid=%s reason=%s symbol=%s market=%s", _uid, reason, getattr(_sig, "symbol", None), getattr(_sig, "market", None))
+                        logger.warning("[autotrade] skipped uid=%s reason=%s symbol=%s market=%s", _uid, reason, getattr(_sig, "symbol", None), getattr(_sig, "market", None))
                         try:
-                            send_skips = (os.getenv("AUTOTRADE_SEND_SKIPS_TO_ERROR_BOT", "0") or "0").strip().lower() not in ("0","false","no","off")
-AUTOTRADE_FAIL_CLOSED_GLOBAL = (os.getenv("AUTOTRADE_FAIL_CLOSED_GLOBAL", "0") or "0").strip().lower() not in ("0","false","no","off")
+                            send_skips = (os.getenv("AUTOTRADE_SEND_SKIPS_TO_ERROR_BOT", "1") or "0").strip().lower() not in ("0","false","no","off")
                             if send_skips:
                                 import time as _t
                                 k = (int(_uid), reason)
@@ -4439,18 +4467,27 @@ async def main() -> None:
     import time
     
     logger.info("Bot starting; TZ=%s", TZ_NAME)
-
-    # Forward unhandled asyncio task exceptions to the error bot
-    try:
-        asyncio.get_running_loop().set_exception_handler(_asyncio_exception_handler)
-    except Exception:
-        pass
     await init_db()
     load_langs()
 
+    # Forward unhandled asyncio task exceptions to error-bot (so "Task exception was never retrieved" is not lost)
+    def _loop_exc_handler(loop, context):
+        try:
+            msg = str(context.get("message") or "asyncio exception")
+            exc = context.get("exception")
+            logger.error("[asyncio] %s", msg, exc_info=exc)
+            # fire-and-forget; protected by _error_bot_send internals
+            asyncio.create_task(_error_bot_send(f"❗ asyncio\n{msg}\n{repr(exc)}"[:3900]))
+        except Exception:
+            pass
+    try:
+        asyncio.get_running_loop().set_exception_handler(_loop_exc_handler)
+    except Exception:
+        pass
+
     # Refresh global Auto-trade pause/maintenance flags in background
-    asyncio.create_task(_autotrade_bot_global_loop())
-    await _refresh_autotrade_bot_global_once()
+    TASKS["autotrade-global"] = asyncio.create_task(_autotrade_bot_global_loop(), name="autotrade-global")
+    await _refresh_autotrade_bot_global_once(); _health_mark_ok("autotrade-global")
 
     # --- Admin HTTP API for Status panel (Signal bot access) ---
     # NOTE: Railway public domain requires an HTTP server listening on $PORT.
@@ -5533,7 +5570,8 @@ async def main() -> None:
 
             logger.info("Starting track_loop")
             if hasattr(backend, "track_loop"):
-                asyncio.create_task(backend.track_loop(bot))
+                TASKS["smart-manager"] = asyncio.create_task(backend.track_loop(bot), name="smart-manager")
+                _health_mark_ok("smart-manager")
             else:
                 logger.warning("Backend has no track_loop; skipping")
 
@@ -5553,7 +5591,9 @@ async def main() -> None:
             asyncio.create_task(signal_outcome_loop())
 
         # Auto-trade manager can run on all replicas (cluster-safe via DB lease/locks)
-        asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
+        TASKS["autotrade-manager"] = asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error), name="autotrade-manager")
+        _health_mark_ok("autotrade-manager")
+        TASKS["health-status"] = asyncio.create_task(_health_status_loop(), name="health-status")
 
         logger.info("Webhook mode active; waiting for HTTP requests")
         await asyncio.Event().wait()
@@ -5567,7 +5607,8 @@ async def main() -> None:
             "Another instance holds the Telegram polling lock; this replica will run ONLY autotrade manager + HTTP (no polling/scanner)."
         )
         try:
-            asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
+            TASKS["autotrade-manager"] = asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error), name="autotrade-manager")
+            _health_mark_ok("autotrade-manager")
         except Exception:
             pass
         await asyncio.Event().wait()
