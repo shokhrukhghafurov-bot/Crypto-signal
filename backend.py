@@ -331,6 +331,37 @@ logger = logging.getLogger("crypto-signal")
 
 
 # --- MID trap digest sink (aggregates "MID blocked (trap)" into a periodic digest) ---
+
+# Trap log dedup (avoid spamming the same message every second)
+_MID_TRAP_LAST_LOG: Dict[str, float] = {}
+
+
+def _mid_trap_log_cooldown_sec() -> float:
+    try:
+        return float(os.getenv("MID_TRAP_LOG_COOLDOWN_SEC", "10") or 10)
+    except Exception:
+        return 10.0
+
+
+def _mid_trap_should_log(key: str) -> bool:
+    try:
+        now = time.time()
+        cd = max(0.0, float(_mid_trap_log_cooldown_sec()))
+        if cd <= 0:
+            return True
+        last = _MID_TRAP_LAST_LOG.get(key, 0.0)
+        if now - last < cd:
+            return False
+        _MID_TRAP_LAST_LOG[key] = now
+        # light purge
+        if len(_MID_TRAP_LAST_LOG) > 2000:
+            cutoff = now - max(cd, 30.0)
+            for k, ts in list(_MID_TRAP_LAST_LOG.items())[:500]:
+                if ts < cutoff:
+                    _MID_TRAP_LAST_LOG.pop(k, None)
+        return True
+    except Exception:
+        return True
 # Bot can register a sink callback that receives structured trap events.
 _MID_TRAP_SINK = None  # type: ignore
 def set_mid_trap_sink(cb):
@@ -6503,7 +6534,11 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     ok_trap, trap_reason = _mid_structure_trap_ok(direction=dir_trend, entry=entry, df1hi=df1hi)
     if not ok_trap:
         try:
-            logger.info("MID blocked (trap): dir=%s reason=%s entry=%.6g", dir_trend, trap_reason, float(entry))
+            
+            _trap_msg = f"{dir_trend}|{_mid_trap_reason_key(str(trap_reason))}|{float(entry):.8g}"
+            if _mid_trap_should_log(_trap_msg):
+                logger.info("MID blocked (trap): dir=%s reason=%s entry=%.6g", dir_trend, trap_reason, float(entry))
+
             _emit_mid_trap_event({"dir": str(dir_trend), "reason": str(trap_reason), "reason_key": _mid_trap_reason_key(str(trap_reason)), "entry": float(entry)})
         except Exception:
             pass
