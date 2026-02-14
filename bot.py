@@ -89,6 +89,7 @@ def _task_state(t: asyncio.Task | None) -> str:
 
 async def _health_status_loop() -> None:
     interval = int(os.getenv("HEALTH_STATUS_INTERVAL_SEC", "60") or 60)
+    dead_after = float(os.getenv("HEALTH_DEAD_AFTER_SEC", "300") or 300)
     # don't spam on boot
     await asyncio.sleep(5)
     while True:
@@ -97,20 +98,67 @@ async def _health_status_loop() -> None:
             at_global = TASKS.get("autotrade-global")
             smart = TASKS.get("smart-manager")
             at_mgr = TASKS.get("autotrade-manager")
-            # last ok ages
-            def age(key): 
-                t = HEALTH.get(key, 0.0) or 0.0
-                return None if t <= 0 else max(0, now - t)
+            def age(key: str) -> float | None:
+                t = float(HEALTH.get(key, 0.0) or 0.0)
+                return None if t <= 0 else max(0.0, now - t)
+
+            def fmt_age(v: float | None) -> str:
+                return "n/a" if v is None else f"{int(v)}s"
+
+            def status(task: asyncio.Task | None, ok_age: float | None) -> str:
+                if not task:
+                    return "MISSING"
+                if task.cancelled():
+                    return "CANCELLED"
+                if task.done():
+                    return "DEAD"
+                if ok_age is None:
+                    return "RUNNING"
+                return "DEAD" if ok_age >= dead_after else "RUNNING"
+
+            at_ok = age("autotrade-global_last_ok")
+            at_mgr_ok = age("autotrade-manager_last_ok")
+            sm_ok = age("smart-manager_last_ok")
+
             msg = (
                 "[health] "
-                f"autotrade-global={_task_state(at_global)} ok_age={age('autotrade-global_last_ok')} err_age={age('autotrade-global_last_err')} "
-                f"autotrade-manager={_task_state(at_mgr)} ok_age={age('autotrade-manager_last_ok')} err_age={age('autotrade-manager_last_err')} "
-                f"smart-manager={_task_state(smart)} ok_age={age('smart-manager_last_ok')} err_age={age('smart-manager_last_err')}"
+                f"{'✅' if status(at_global, at_ok)=='RUNNING' else '❌'} autotrade=\"{status(at_global, at_ok)}\" last_ok={fmt_age(at_ok)} "
+                f"| {'✅' if status(at_mgr, at_mgr_ok)=='RUNNING' else '❌'} autotrade_mgr=\"{status(at_mgr, at_mgr_ok)}\" last_ok={fmt_age(at_mgr_ok)} "
+                f"| {'✅' if status(smart, sm_ok)=='RUNNING' else '❌'} smart_manager=\"{status(smart, sm_ok)}\" last_ok={fmt_age(sm_ok)}"
             )
             logger.info(msg)
         except Exception:
             logger.exception("[health] status loop failed")
         await asyncio.sleep(max(10, interval))
+
+
+def _attach_task_monitor(name: str, task: asyncio.Task) -> None:
+    """Ensure crashes are visible (log + error-bot) and reflected in health."""
+    try:
+        def _cb(t: asyncio.Task) -> None:
+            try:
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if not exc:
+                    return
+                if name.startswith("autotrade"):
+                    logger.error("[autotrade] task crashed name=%s exc=%s", name, repr(exc), exc_info=exc)
+                    if "manager" in name:
+                        _health_mark_err("autotrade-manager", f"task_crash:{type(exc).__name__}")
+                    else:
+                        _health_mark_err("autotrade-global", f"task_crash:{type(exc).__name__}")
+                elif name == "smart-manager":
+                    logger.error("[smart-manager] task crashed exc=%s", repr(exc), exc_info=exc)
+                    _health_mark_err("smart-manager", f"task_crash:{type(exc).__name__}")
+                else:
+                    logger.error("[task] crashed name=%s exc=%s", name, repr(exc), exc_info=exc)
+            except Exception:
+                return
+
+        task.add_done_callback(_cb)
+    except Exception:
+        return
 
 # --- i18n template safety guard (prevents leaking {placeholders} to users) ---
 _UNFILLED_RE = re.compile(r'(?<!\{)\{[a-zA-Z0-9_]+\}(?!\})')
@@ -235,8 +283,6 @@ _ERROR_BOT_IGNORE_DEFAULT = (
     "telegramconflicterror",
     "terminated by other getupdates request",
     "other getupdates request",
-    "invalid api-key", "invalid api key", "api-key invalid", "signature", "whitelist", "ip not allowed",
-    "permission", "not authorized", "rate limit", "too many requests", "time mismatch", "timestamp",
 )
 _ERROR_BOT_IGNORE_SCAN_BLOCK = ("scan_block", "blocked_stable_pair", "blocked_symbol_list")  # stablecoin & hardblock noise
 
@@ -277,14 +323,17 @@ async def _error_bot_send(text: str) -> None:
 
 def _should_forward_to_error_bot(levelno: int, msg: str) -> bool:
     m = (msg or "").lower()
+    is_autotrade = ("[autotrade]" in m or "auto-trade" in m or "autotrade " in m or "autotrade_" in m)
+    is_smart = ("[smart-manager]" in m or "smart manager" in m or "smart_be" in m or "smart-be" in m)
     # ignore stablecoin scan blocks unless explicitly enabled
     if "scan_block" in m and any(x in m for x in _ERROR_BOT_IGNORE_SCAN_BLOCK):
         return False
-    # ignore common credential/noise issues
-    if any(x in m for x in _ERROR_BOT_IGNORE_DEFAULT):
-        return False
-    if _ERROR_BOT_IGNORE_SUBSTRINGS and any(x in m for x in _ERROR_BOT_IGNORE_SUBSTRINGS):
-        return False
+    # ignore only global noise; do NOT suppress autotrade/smart-manager diagnostics
+    if not is_autotrade and not is_smart:
+        if any(x in m for x in _ERROR_BOT_IGNORE_DEFAULT):
+            return False
+        if _ERROR_BOT_IGNORE_SUBSTRINGS and any(x in m for x in _ERROR_BOT_IGNORE_SUBSTRINGS):
+            return False
 
     # Always forward ERROR+
     min_level = getattr(logging, ERROR_BOT_SEND_LEVEL, logging.ERROR)
@@ -303,9 +352,9 @@ def _should_forward_to_error_bot(levelno: int, msg: str) -> bool:
         # but still avoid stable pair spam above
         return True
 
-    if ERROR_BOT_SEND_AUTOTRADE_ERRORS and ("[autotrade]" in m or "auto-trade" in m or "autotrade " in m or "autotrade_" in m):
+    if ERROR_BOT_SEND_AUTOTRADE_ERRORS and is_autotrade:
         return True
-    if ERROR_BOT_SEND_SMART_ERRORS and ("[smart-manager]" in m or "smart manager" in m or "smart_be" in m or "smart-be" in m):
+    if ERROR_BOT_SEND_SMART_ERRORS and is_smart:
         return True
 
     return False
@@ -2038,11 +2087,11 @@ async def broadcast_signal(sig: Signal) -> None:
                     try:
                         gst = await db_store.get_autotrade_bot_settings()
                         if bool(gst.get("pause_autotrade")) or bool(gst.get("maintenance_mode")):
-                            logger.info("Auto-trade skipped by global setting (pause/maintenance) uid=%s", _uid)
+                            logger.info("[autotrade] skipped by global setting (pause/maintenance) uid=%s", _uid)
                             return
                     except Exception:
                         # FAIL-CLOSED: if DB read failed, do NOT open new trades.
-                        logger.exception("Auto-trade skipped: failed to read global pause/maintenance (fail-closed) uid=%s", _uid)
+                        logger.exception("[autotrade] skipped: failed to read global pause/maintenance (fail-closed) uid=%s", _uid)
                         return
 
                     res = await autotrade_execute(_uid, _sig)
@@ -4487,6 +4536,7 @@ async def main() -> None:
 
     # Refresh global Auto-trade pause/maintenance flags in background
     TASKS["autotrade-global"] = asyncio.create_task(_autotrade_bot_global_loop(), name="autotrade-global")
+    _attach_task_monitor("autotrade-global", TASKS["autotrade-global"])
     await _refresh_autotrade_bot_global_once(); _health_mark_ok("autotrade-global")
 
     # --- Admin HTTP API for Status panel (Signal bot access) ---
@@ -5570,8 +5620,14 @@ async def main() -> None:
 
             logger.info("Starting track_loop")
             if hasattr(backend, "track_loop"):
+                # Let backend report liveness for Smart Manager (once per cycle)
+                try:
+                    backend.health_tick_cb = lambda: _health_mark_ok("smart-manager")
+                except Exception:
+                    pass
                 TASKS["smart-manager"] = asyncio.create_task(backend.track_loop(bot), name="smart-manager")
                 _health_mark_ok("smart-manager")
+                _attach_task_monitor("smart-manager", TASKS["smart-manager"])
             else:
                 logger.warning("Backend has no track_loop; skipping")
 
@@ -5593,7 +5649,9 @@ async def main() -> None:
         # Auto-trade manager can run on all replicas (cluster-safe via DB lease/locks)
         TASKS["autotrade-manager"] = asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error), name="autotrade-manager")
         _health_mark_ok("autotrade-manager")
+        _attach_task_monitor("autotrade-manager", TASKS["autotrade-manager"])
         TASKS["health-status"] = asyncio.create_task(_health_status_loop(), name="health-status")
+        _attach_task_monitor("health-status", TASKS["health-status"])
 
         logger.info("Webhook mode active; waiting for HTTP requests")
         await asyncio.Event().wait()
