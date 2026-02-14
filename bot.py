@@ -1270,13 +1270,32 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
     # Build keys status block based on last signal confirmations (if available)
     lang = (LANG.get(int(uid), "ru") if isinstance(uid, int) else "ru")
     def _conf_set(sig_obj: Any) -> set[str]:
+        """Parse confirmations / available_exchanges into a normalized set.
+
+        Important: the UI may format venues as "Binance • Bybit • OKX • MEXC" (bullets),
+        so we must split on bullets too.
+        """
         if not sig_obj:
             return set()
-        # Prefer explicit per-market venue list if present
-        conf = str((getattr(sig_obj, "available_exchanges", "") or getattr(sig_obj, "confirmations", "") or "")).strip()
-        if not conf:
+        conf_raw = str((getattr(sig_obj, "available_exchanges", "") or getattr(sig_obj, "confirmations", "") or "")).strip()
+        if not conf_raw:
             return set()
-        return {p.strip().lower() for p in conf.split("+") if p.strip()}
+        out: set[str] = set()
+        for part in re.split(r"[+ ,;/|•·]+", conf_raw.strip()):
+            p = part.strip().lower()
+            if not p:
+                continue
+            if p in ("binance", "bnb"):
+                out.add("binance")
+            elif p in ("bybit", "byb"):
+                out.add("bybit")
+            elif p in ("okx",):
+                out.add("okx")
+            elif p in ("mexc",):
+                out.add("mexc")
+            elif p in ("gateio", "gate", "gate.io", "gateio.ws"):
+                out.add("gateio")
+        return out
 
     allowed_spot = ["binance", "bybit", "okx", "mexc", "gateio"]
     allowed_fut = ["binance", "bybit", "okx"]
