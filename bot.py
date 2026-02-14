@@ -1058,6 +1058,7 @@ async def _refresh_autotrade_bot_global_once() -> None:
 
 async def _autotrade_bot_global_loop() -> None:
     while True:
+        tick += 1
         try:
             await _refresh_autotrade_bot_global_once()
         except Exception:
@@ -4131,6 +4132,19 @@ def _sig_net_pnl_tp1_then_be(*, market: str, side: str, entry: float, tp1: float
     entry_cost = (fee + slip) * L
     return float(pnl1 + pnl2 + entry_cost)
 
+def _sig_net_pnl_tp1_then_sl(*, market: str, side: str, entry: float, tp1: float, sl: float, part: float) -> float:
+    """Net PnL for partial TP1 then close remainder at SL."""
+    p = max(0.0, min(1.0, float(part)))
+    pnl1 = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=tp1, part_entry_to_close=p)
+    pnl2 = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=(1.0 - p))
+    # Fix double-counted entry cost (same idea as _sig_net_pnl_two_targets)
+    L = _sig_leverage(market)
+    fee = max(0.0, _sig_fee_pct(market))
+    slip = max(0.0, float(_SIG_SLIPPAGE_PCT))
+    entry_cost = (fee + slip) * L
+    return float(pnl1 + pnl2 + entry_cost)
+
+
 def _model_partial_pct() -> float:
     try:
         p = float(_SIG_TP1_PARTIAL_PCT)
@@ -4148,8 +4162,9 @@ async def signal_outcome_loop() -> None:
     """
     import datetime as _dt
     import time as _time
-    logger.info("Starting signal_outcome_loop interval=%ss buffer_pct=%s confirm_sec=%s", _SIG_WATCH_INTERVAL_SEC, _BE_BUFFER_PCT, _BE_CONFIRM_SEC)
+    logger.info("[sig-outcome] loop started (heartbeat=60s transitions=True) interval=%ss buffer_pct=%s be_confirm_sec=%s sl_confirm_sec=%s", _SIG_WATCH_INTERVAL_SEC, _BE_BUFFER_PCT, _BE_CONFIRM_SEC, _SIG_SL_CONFIRM_SEC)
     last_beat = _time.monotonic()
+    tick = 0
     while True:
         try:
             rows = await db_store.list_open_signal_tracks(limit=1000)
@@ -4157,7 +4172,7 @@ async def signal_outcome_loop() -> None:
                 # heartbeat (shows loop is alive even when there are no open tracks)
                 if _time.monotonic() - last_beat >= 60:
                     last_beat = _time.monotonic()
-                    logger.info("signal_outcome_loop heartbeat: open_tracks=0")
+                    logger.info("[sig-outcome] alive tick=%s open_tracks=0", tick)
                 await asyncio.sleep(_SIG_WATCH_INTERVAL_SEC)
                 continue
 
@@ -4232,6 +4247,7 @@ async def signal_outcome_loop() -> None:
                         if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
                             pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if (eff_tp1 > 0 and eff_tp2 > 0) else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            logger.info("[sig-outcome] WIN sid=%s %s %s px=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_win += 1
                             continue
@@ -4239,6 +4255,7 @@ async def signal_outcome_loop() -> None:
                             # single-target win at TP1
                             pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp1, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            logger.info("[sig-outcome] WIN sid=%s %s %s px=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_win += 1
                             continue
@@ -4261,12 +4278,15 @@ async def signal_outcome_loop() -> None:
                                 if _SIG_SL_CONFIRM_SEC == 0 or (since is not None and (_time.time() - since) >= _SIG_SL_CONFIRM_SEC):
                                     pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
                                     await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
+                                    logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
+                                    logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                                     _SIG_SL_BREACH_SINCE.pop(sid, None)
                                     closed_loss += 1
                                     continue
                         # TP1 hit -> arm BE
                         if eff_tp1 > 0 and _hit_tp(side, px, eff_tp1):
                             await db_store.mark_signal_tp1(signal_id=sid, be_price=float(entry))
+                            logger.info("[sig-outcome] TP1 sid=%s %s %s px=%s tp1=%s -> arm BE@%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(entry), _src)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
                             tp1_marked += 1
                             continue
@@ -4277,9 +4297,30 @@ async def signal_outcome_loop() -> None:
                         if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
                             pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            logger.info("[sig-outcome] WIN sid=%s %s %s px=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_win += 1
                             continue
+
+                        # LOSS by SL (can happen after TP1; model partial TP1 then SL on remainder)
+                        if sl > 0:
+                            trigger = sl * (1.0 - _SIG_SL_BUFFER_PCT) if side == "LONG" else sl * (1.0 + _SIG_SL_BUFFER_PCT)
+                            crossed = bool(px <= trigger) if side == "LONG" else bool(px >= trigger)
+
+                            since = _SIG_SL_BREACH_SINCE.get(sid)
+                            if crossed and since is None:
+                                _SIG_SL_BREACH_SINCE[sid] = _time.time()
+                                continue
+                            if not crossed and since is not None:
+                                _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            if crossed:
+                                if _SIG_SL_CONFIRM_SEC == 0 or (since is not None and (_time.time() - since) >= _SIG_SL_CONFIRM_SEC):
+                                    pnl = _sig_net_pnl_tp1_then_sl(market=market, side=side, entry=entry, tp1=eff_tp1, sl=sl, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
+                                    await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
+                                    logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
+                                    _SIG_SL_BREACH_SINCE.pop(sid, None)
+                                    closed_loss += 1
+                                    continue
 
                         if not _be_is_armed_sig(side, px, eff_tp1, eff_tp2):
                             # Not armed yet: don't allow BE close; reset pending BE timer if any.
@@ -4304,12 +4345,14 @@ async def signal_outcome_loop() -> None:
                             if (now - crossed_at_dt).total_seconds() >= _BE_CONFIRM_SEC:
                                 pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
                                 await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
+                                logger.info("[sig-outcome] BE sid=%s %s %s px=%s be=%s tp1=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(entry), _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
                                 _SIG_SL_BREACH_SINCE.pop(sid, None)
                                 closed_be += 1
                                 continue
                         if crossed and crossed_at_dt is not None and _BE_CONFIRM_SEC == 0:
                             pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
+                                logger.info("[sig-outcome] BE sid=%s %s %s px=%s be=%s tp1=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(entry), _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_be += 1
                             continue
