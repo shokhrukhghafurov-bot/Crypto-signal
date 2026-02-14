@@ -32,6 +32,16 @@ MID_ULTRA_LATE_ENTRY_ATR_MAX = float(os.getenv("MID_ULTRA_LATE_ENTRY_ATR_MAX", "
 MID_ULTRA_VWAP_DIST_ATR_MAX = float(os.getenv("MID_ULTRA_VWAP_DIST_ATR_MAX", "1.2"))
 MID_ULTRA_RSI_LONG_MAX = float(os.getenv("MID_ULTRA_RSI_LONG_MAX", "58"))
 MID_ULTRA_RSI_SHORT_MIN = float(os.getenv("MID_ULTRA_RSI_SHORT_MIN", "52"))
+
+# Additional ULTRA SAFE tightening knobs (optional)
+MID_ULTRA_RSI_LONG_MIN = float(os.getenv("MID_ULTRA_RSI_LONG_MIN", "48"))   # RSI(5m) for LONG must be >=
+MID_ULTRA_RSI_SHORT_MAX = float(os.getenv("MID_ULTRA_RSI_SHORT_MAX", "58")) # RSI(5m) for SHORT must be <=
+MID_ULTRA_CONFIRM_CANDLE_BODY_ATR_MIN = float(os.getenv("MID_ULTRA_CONFIRM_CANDLE_BODY_ATR_MIN", "0.15"))
+
+# Near-extremes blocker (avoid LONG right under resistance / SHORT right above support)
+MID_BLOCK_NEAR_EXTREMES = os.getenv("MID_BLOCK_NEAR_EXTREMES", "1").strip().lower() not in ("0","false","no","off")
+MID_NEAR_EXTREME_ATR_MIN = float(os.getenv("MID_NEAR_EXTREME_ATR_MIN", "0.35"))   # dist to recent extreme in ATR(30m)
+MID_ULTRA_NEAR_EXTREME_ATR_MIN = float(os.getenv("MID_ULTRA_NEAR_EXTREME_ATR_MIN", "0.55"))
 # --- MID anti-bounce / RSI window / BB bounce guard ---
 MID_ANTI_BOUNCE_ENABLED = os.getenv("MID_ANTI_BOUNCE_ENABLED", "1").strip().lower() not in ("0","false","no","off")
 MID_ANTI_BOUNCE_ATR_MAX = float(os.getenv("MID_ANTI_BOUNCE_ATR_MAX", "1.8"))     # SHORT: (close - recent_low)/ATR_30m; LONG: (recent_high - close)/ATR_30m
@@ -4737,7 +4747,10 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         late_entry_max = MID_ULTRA_LATE_ENTRY_ATR_MAX if MID_ULTRA_SAFE else MID_LATE_ENTRY_ATR_MAX
         vwap_dist_max = MID_ULTRA_VWAP_DIST_ATR_MAX if MID_ULTRA_SAFE else MID_VWAP_DIST_ATR_MAX
         rsi_long_max = MID_ULTRA_RSI_LONG_MAX if MID_ULTRA_SAFE else MID_RSI_LONG_MAX
+        rsi_long_min = MID_ULTRA_RSI_LONG_MIN if MID_ULTRA_SAFE else MID_RSI_LONG_MIN
         rsi_short_min = MID_ULTRA_RSI_SHORT_MIN if MID_ULTRA_SAFE else MID_RSI_SHORT_MIN
+        rsi_short_max = MID_ULTRA_RSI_SHORT_MAX if MID_ULTRA_SAFE else MID_RSI_SHORT_MAX
+        confirm_body_min = MID_ULTRA_CONFIRM_CANDLE_BODY_ATR_MIN if MID_ULTRA_SAFE else confirm_body_min
 
         if atr_30m and atr_30m > 0:
             if side.upper() == "LONG":
@@ -4749,6 +4762,23 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                 if move_from_high > late_entry_max:
                     return f"late_entry_atr={move_from_high:.2f} > {late_entry_max:g}"
 
+
+            # --- Near-extremes: avoid LONG right under resistance / SHORT right above support ---
+            try:
+                if MID_BLOCK_NEAR_EXTREMES and atr_30m and atr_30m > 0:
+                    thr = MID_ULTRA_NEAR_EXTREME_ATR_MIN if MID_ULTRA_SAFE else MID_NEAR_EXTREME_ATR_MIN
+                    if side.upper() == "LONG":
+                        dist_to_high = (recent_high - close) / atr_30m
+                        if dist_to_high >= 0 and dist_to_high < thr:
+                            return f"near_recent_high dist_atr={dist_to_high:.2f} < {thr:g}"
+                    else:
+                        dist_to_low = (close - recent_low) / atr_30m
+                        if dist_to_low >= 0 and dist_to_low < thr:
+                            return f"near_recent_low dist_atr={dist_to_low:.2f} < {thr:g}"
+            except Exception:
+                if MID_FAIL_CLOSED:
+                    return "mid_near_extreme_error"
+                pass
             # --- Anti-bounce: block SHORT after sharp rebound from recent low (and vice versa for LONG) ---
             if MID_ANTI_BOUNCE_ENABLED and atr_30m and atr_30m > 0:
                 if side.upper() == "SHORT":
@@ -4823,7 +4853,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
             if side.upper() == "LONG":
                 if rsi_5m >= rsi_long_max:
                     return f"rsi_long={rsi_5m:.1f} >= {rsi_long_max:g}"
-                if rsi_5m < MID_RSI_LONG_MIN:
+                if rsi_5m < rsi_long_min:
                     return f"rsi_long={rsi_5m:.1f} < {MID_RSI_LONG_MIN:g}"
             else:  # SHORT
                 if rsi_5m <= rsi_short_min:
@@ -4852,8 +4882,8 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                 # Minimal body vs ATR to avoid chop
                 if atr_30m and atr_30m > 0 and o is not None:
                     body_atr2 = abs(float(close) - float(o)) / float(atr_30m)
-                    if body_atr2 < MID_CONFIRM_CANDLE_BODY_ATR_MIN:
-                        return f"small_body_atr={body_atr2:.2f} < {MID_CONFIRM_CANDLE_BODY_ATR_MIN:g}"
+                    if body_atr2 < confirm_body_min:
+                        return f"small_body_atr={body_atr2:.2f} < {confirm_body_min:g}"
         except Exception:
             pass
 
@@ -4882,16 +4912,38 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
             pass
         # --- Require 5m confirmation (prevents SHORT into bullish microtrend / LONG into bearish microtrend) ---
         try:
+
             if MID_REQUIRE_5M_CONFIRM:
                 s = side.upper()
-                if s == "SHORT":
-                    bear = bool(bos_down_5m) or bool(two_red_5m) or bool(lower_highs_5m) or ((ema20_5m is not None) and (close < float(ema20_5m)))
-                    if not bear:
-                        return "no_bear_5m_confirm"
-                elif s == "LONG":
-                    bull = bool(bos_up_5m) or bool(two_green_5m) or bool(higher_lows_5m) or ((ema20_5m is not None) and (close > float(ema20_5m)))
-                    if not bull:
-                        return "no_bull_5m_confirm"
+                if MID_ULTRA_SAFE:
+                    # ULTRA SAFE: require real continuation/reversal structure, not just EMA touch
+                    if s == "SHORT":
+                        score = 0
+                        if bos_down_5m: score += 1
+                        if lower_highs_5m: score += 1
+                        if two_red_5m: score += 1
+                        if score < 2:
+                            return "no_bear_5m_structure"
+                        if (ema20_5m is not None) and not (close < float(ema20_5m)):
+                            return "short_above_ema20_5m"
+                    elif s == "LONG":
+                        score = 0
+                        if bos_up_5m: score += 1
+                        if higher_lows_5m: score += 1
+                        if two_green_5m: score += 1
+                        if score < 2:
+                            return "no_bull_5m_structure"
+                        if (ema20_5m is not None) and not (close > float(ema20_5m)):
+                            return "long_below_ema20_5m"
+                else:
+                    if s == "SHORT":
+                        bear = bool(bos_down_5m) or bool(two_red_5m) or bool(lower_highs_5m) or ((ema20_5m is not None) and (close < float(ema20_5m)))
+                        if not bear:
+                            return "no_bear_5m_confirm"
+                    elif s == "LONG":
+                        bull = bool(bos_up_5m) or bool(two_green_5m) or bool(higher_lows_5m) or ((ema20_5m is not None) and (close > float(ema20_5m)))
+                        if not bull:
+                            return "no_bull_5m_confirm"
         except Exception:
             # if confirmation calc fails, respect fail-closed flag
             if MID_FAIL_CLOSED:
@@ -4903,8 +4955,6 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         # if filter computation fails, respect fail-closed flag
         return "mid_filter_error" if MID_FAIL_CLOSED else None
     return None
-
-
 @dataclass(frozen=True)
 class Signal:
     # NOTE: All fields have defaults to avoid dataclass ordering issues
@@ -6860,23 +6910,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 pass
             return None
     except Exception:
-        # Fail-closed (safer): if MID computations crash/NaN, BLOCK instead of letting signal slip through.
-        if MID_FAIL_CLOSED:
-            try:
-                _r = "mid_eval_error"
-                _dir = locals().get("dir_trend", None) or locals().get("dir_mid", None) or "—"
-                _entry = float(locals().get("entry", 0.0) or 0.0)
-                logger.info("MID blocked: dir=%s reason=%s entry=%.6g", _dir, _r, _entry)
-                _emit_mid_trap_event({
-                    "dir": str(_dir),
-                    "reason": str(_r),
-                    "reason_key": _mid_trap_reason_key(str(_r)),
-                    "entry": float(_entry),
-                })
-            except Exception:
-                pass
-            return None
-        # Fail-open (legacy): allow signal when MID filter calc fails.
+        # If filters fail, do not block signal.
         pass
 
 # Pattern on 5m
