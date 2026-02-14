@@ -6860,7 +6860,23 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 pass
             return None
     except Exception:
-        # If filters fail, do not block signal.
+        # Fail-closed (safer): if MID computations crash/NaN, BLOCK instead of letting signal slip through.
+        if MID_FAIL_CLOSED:
+            try:
+                _r = "mid_eval_error"
+                _dir = locals().get("dir_trend", None) or locals().get("dir_mid", None) or "—"
+                _entry = float(locals().get("entry", 0.0) or 0.0)
+                logger.info("MID blocked: dir=%s reason=%s entry=%.6g", _dir, _r, _entry)
+                _emit_mid_trap_event({
+                    "dir": str(_dir),
+                    "reason": str(_r),
+                    "reason_key": _mid_trap_reason_key(str(_r)),
+                    "entry": float(_entry),
+                })
+            except Exception:
+                pass
+            return None
+        # Fail-open (legacy): allow signal when MID filter calc fails.
         pass
 
 # Pattern on 5m
