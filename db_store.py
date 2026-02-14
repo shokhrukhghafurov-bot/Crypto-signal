@@ -1366,14 +1366,9 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
 
       "From the signals we SENT in this period, how many of them have already closed and with what result."
 
-    In practice, admins expect the widget **"Signals closed (outcomes)"** to mean
-    **"what closed during this period"** (today / this week / this month), regardless
-    of when the signal was originally sent.
+    Therefore default bucketing is **by closed_at** ("what closed in this period").
 
-    Therefore the default bucketing is **by closed_at**.
-
-    If you want cohort-style analytics ("signals sent in the period" → "how they ended"),
-    switch via env:
+    Switch to cohort behavior via env:
         SIGNAL_STATS_BUCKET_BY=opened
 
     Allowed values: closed | opened
@@ -1382,10 +1377,9 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
     if market not in ("SPOT", "FUTURES"):
         market = "SPOT"
 
-    # Default = "closed" to match admin expectation for the daily/weekly/monthly outcome widgets.
     bucket_by = (os.getenv("SIGNAL_STATS_BUCKET_BY", "closed") or "closed").strip().lower()
     if bucket_by not in ("opened", "closed"):
-        bucket_by = "closed"
+        bucket_by = "opened"
 
     # If DB not ready, be safe for dashboard.
     try:
