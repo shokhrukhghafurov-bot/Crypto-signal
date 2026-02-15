@@ -6502,7 +6502,7 @@ def _mid_structure_trap_ok(*, direction: str, entry: float, df1hi: pd.DataFrame)
     return (True, "")
 
 
-def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
+def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame, symbol: str = "") -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
     Produces a result dict compatible with scanner_loop_mid and a rich TA block (like MAIN),
@@ -6556,6 +6556,13 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         adx1h = float("nan")
 
     atr_pct = (atr30 / entry) * 100.0
+
+    # Market hint for MID (used by autotune params / guards)
+    try:
+        market = choose_market(float(adx30) if not np.isnan(adx30) else float('nan'), float(atr_pct))
+    except Exception:
+        market = "FUTURES"
+
 
     # Momentum override for HTF bias (prevents countertrend signals during strong trend reversals)
     try:
@@ -6869,7 +6876,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             pass
 
         reason = _mid_block_reason(
-            symbol="",
+            symbol=symbol,
             side=str(dir_trend),
             close=float(entry),
             o=o5 if not np.isnan(o5) else float(entry),
@@ -9737,6 +9744,11 @@ class Backend:
                             self.last_futures_signal = sig
 
                         logger.info("[scan][emit] %s market=%s dir=%s conf=%s rr=%.2f notes=%s", sig.symbol, sig.market, sig.direction, sig.confidence, float(sig.rr), (sig.risk_note or "-")[:120])
+                        try:
+                            logger.info("[mid][emit] %s market=%s dir=%s conf=%s rr=%.2f exch=%s notes=%s entry=%.6g",
+                                        sym, sig.market, str(sig.direction).upper(), int(sig.confidence), float(sig.rr), str(sig.source_exchange), str(sig.risk_note or ""), float(sig.entry))
+                        except Exception:
+                            pass
                         await emit_signal_cb(sig)
                         await asyncio.sleep(2)
 
@@ -10001,7 +10013,7 @@ class Backend:
                                 if a is None or b is None or c is None or a.empty or b.empty or c.empty:
                                     no_data += 1
                                     continue
-                                r = evaluate_on_exchange_mid(a, b, c)
+                                r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
                                 if r:
                                     supporters.append((name, r))
                             except Exception:
