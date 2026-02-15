@@ -4342,6 +4342,38 @@ def _sig_net_pnl_tp1_then_sl(*, market: str, side: str, entry: float, tp1: float
     entry_cost = (fee + slip) * L
     return float(pnl1 + pnl2 + entry_cost)
 
+def _sig_leg_pnl_no_entry(*, market: str, side: str, entry: float, close: float, part: float) -> float:
+    """Incremental PnL% for a partial close leg WITHOUT charging the entry cost.
+
+    Used to store TP1-fixed PnL so that later we can add the remainder leg (which will include
+    the full entry cost once).
+    """
+    p = max(0.0, min(1.0, float(part)))
+    if entry <= 0 or p <= 0:
+        return 0.0
+    L = _sig_leverage(market)
+    fee = max(0.0, _sig_fee_pct(market))
+    slip = max(0.0, float(_SIG_SLIPPAGE_PCT))
+    move = _pnl_pct(side, entry, close) * L
+    exit_cost = (fee + slip) * L * p
+    return float(move * p - exit_cost)
+
+def _sig_leg_pnl_with_entry(*, market: str, side: str, entry: float, close: float, part: float) -> float:
+    """Incremental PnL% for a partial close leg WITH full entry cost.
+
+    This is used for the remainder leg after TP1 so that:
+      total = tp1_fixed_no_entry + remainder_with_entry
+    """
+    p = max(0.0, min(1.0, float(part)))
+    if entry <= 0 or p <= 0:
+        return 0.0
+    L = _sig_leverage(market)
+    fee = max(0.0, _sig_fee_pct(market))
+    slip = max(0.0, float(_SIG_SLIPPAGE_PCT))
+    move = _pnl_pct(side, entry, close) * L
+    cost = (fee + slip) * L * (1.0 + p)  # entry(full) + exit(part)
+    return float(move * p - cost)
+
 
 def _model_partial_pct() -> float:
     try:
@@ -4483,9 +4515,17 @@ async def signal_outcome_loop() -> None:
                                     _SIG_SL_BREACH_SINCE.pop(sid, None)
                                     closed_loss += 1
                                     continue
-                        # TP1 hit -> arm BE
+                        # TP1 hit -> partial close (model) + arm BE
                         if eff_tp1 > 0 and _hit_tp(side, px, eff_tp1):
-                            await db_store.mark_signal_tp1(signal_id=sid, be_price=float(entry))
+                            # Store TP1-fixed PnL immediately (partial close), then add remainder at final close.
+                            tp1_fixed = 0.0
+                            try:
+                                # Only meaningful when we have TP2 (2-target model). If TP2 is missing, we close WIN above.
+                                if eff_tp2 > 0:
+                                    tp1_fixed = _sig_leg_pnl_no_entry(market=market, side=side, entry=entry, close=eff_tp1, part=part)
+                            except Exception:
+                                tp1_fixed = 0.0
+                            await db_store.mark_signal_tp1(signal_id=sid, be_price=float(entry), pnl_total_pct=float(tp1_fixed) if tp1_fixed != 0.0 else None)
                             logger.info("[sig-outcome] TP1 sid=%s %s %s px=%s tp1=%s -> arm BE@%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(entry), _src)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
                             tp1_marked += 1
@@ -4495,7 +4535,15 @@ async def signal_outcome_loop() -> None:
                     if status == "TP1":
                         # WIN by TP2 if exists
                         if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
-                            pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
+                            if eff_tp1 > 0:
+                                fixed = float(t.get("pnl_total_pct") or 0.0)
+                                if fixed == 0.0:
+                                    # Backward-compat if TP1-fixed was not stored
+                                    fixed = _sig_leg_pnl_no_entry(market=market, side=side, entry=entry, close=eff_tp1, part=part)
+                                rem = _sig_leg_pnl_with_entry(market=market, side=side, entry=entry, close=eff_tp2, part=(1.0 - part))
+                                pnl = float(fixed + rem)
+                            else:
+                                pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
                             logger.info("[sig-outcome] WIN sid=%s %s %s px=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
@@ -4515,7 +4563,14 @@ async def signal_outcome_loop() -> None:
                                 _SIG_SL_BREACH_SINCE.pop(sid, None)
                             if crossed:
                                 if _SIG_SL_CONFIRM_SEC == 0 or (since is not None and (_time.time() - since) >= _SIG_SL_CONFIRM_SEC):
-                                    pnl = _sig_net_pnl_tp1_then_sl(market=market, side=side, entry=entry, tp1=eff_tp1, sl=sl, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
+                                    if eff_tp1 > 0:
+                                        fixed = float(t.get("pnl_total_pct") or 0.0)
+                                        if fixed == 0.0:
+                                            fixed = _sig_leg_pnl_no_entry(market=market, side=side, entry=entry, close=eff_tp1, part=part)
+                                        rem = _sig_leg_pnl_with_entry(market=market, side=side, entry=entry, close=sl, part=(1.0 - part))
+                                        pnl = float(fixed + rem)
+                                    else:
+                                        pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
                                     await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
                                     logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                                     _SIG_SL_BREACH_SINCE.pop(sid, None)
@@ -4543,14 +4598,28 @@ async def signal_outcome_loop() -> None:
                             continue
                         if crossed and crossed_at_dt is not None and _BE_CONFIRM_SEC > 0:
                             if (now - crossed_at_dt).total_seconds() >= _BE_CONFIRM_SEC:
-                                pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
+                                if eff_tp1 > 0:
+                                    fixed = float(t.get("pnl_total_pct") or 0.0)
+                                    if fixed == 0.0:
+                                        fixed = _sig_leg_pnl_no_entry(market=market, side=side, entry=entry, close=eff_tp1, part=part)
+                                    rem = _sig_leg_pnl_with_entry(market=market, side=side, entry=entry, close=entry, part=(1.0 - part))
+                                    pnl = float(fixed + rem)
+                                else:
+                                    pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
                                 await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
                                 logger.info("[sig-outcome] BE sid=%s %s %s px=%s be=%s tp1=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(entry), _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
                                 _SIG_SL_BREACH_SINCE.pop(sid, None)
                                 closed_be += 1
                                 continue
                         if crossed and crossed_at_dt is not None and _BE_CONFIRM_SEC == 0:
-                            pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
+                            if eff_tp1 > 0:
+                                fixed = float(t.get("pnl_total_pct") or 0.0)
+                                if fixed == 0.0:
+                                    fixed = _sig_leg_pnl_no_entry(market=market, side=side, entry=entry, close=eff_tp1, part=part)
+                                rem = _sig_leg_pnl_with_entry(market=market, side=side, entry=entry, close=entry, part=(1.0 - part))
+                                pnl = float(fixed + rem)
+                            else:
+                                pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
                             logger.info("[sig-outcome] BE sid=%s %s %s px=%s be=%s tp1=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(entry), _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
