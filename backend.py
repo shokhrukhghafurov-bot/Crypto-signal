@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 import os
 
-
 # Enable verbose price source / fallback logging
 PRICE_DEBUG = os.getenv('PRICE_DEBUG', '0').strip().lower() in ('1','true','yes','on')
 
@@ -17,7 +16,6 @@ MID_VWAP_DIST_ATR_MAX = float(os.getenv("MID_VWAP_DIST_ATR_MAX", "1.8"))     # a
 MID_CLIMAX_VOL_X = float(os.getenv("MID_CLIMAX_VOL_X", "2.5"))              # last_vol / avg_vol
 MID_CLIMAX_BODY_ATR = float(os.getenv("MID_CLIMAX_BODY_ATR", "1.2"))         # abs(close-open)/ATR_30m
 MID_CLIMAX_COOLDOWN_BARS = int(os.getenv("MID_CLIMAX_COOLDOWN_BARS", "1"))   # block next N bars after climax
-
 
 # --- MID ULTRA SAFE (reduce SL dramatically; fewer but higher-quality signals) ---
 MID_ULTRA_SAFE = os.getenv("MID_ULTRA_SAFE", "0").strip().lower() in ("1","true","yes","on")
@@ -74,8 +72,6 @@ MID_HL_TOL_PCT = float(os.getenv("MID_HL_TOL_PCT", "0.001") or 0.001)  # allow e
 MID_REQUIRE_5M_CONFIRM = os.getenv("MID_REQUIRE_5M_CONFIRM", "1").strip().lower() not in ("0","false","no","off")
 MID_FAIL_CLOSED = os.getenv("MID_FAIL_CLOSED", "1").strip().lower() not in ("0","false","no","off")
 MID_HIGHER_LOWS_LOOKBACK = int(os.getenv("MID_HIGHER_LOWS_LOOKBACK", str(MID_LOWER_HIGHS_LOOKBACK)) or MID_LOWER_HIGHS_LOOKBACK)
-
-
 
 import random
 import re
@@ -321,7 +317,6 @@ async def _mid_autotune_update_on_close(*, market: str, orig_text: str, timefram
     except Exception:
         pass
 
-
 import aiohttp
 import hmac
 import hashlib
@@ -344,19 +339,16 @@ from cryptography.fernet import Fernet
 
 logger = logging.getLogger("crypto-signal")
 
-
 # --- MID trap digest sink (aggregates "MID blocked (trap)" into a periodic digest) ---
 
 # Trap log dedup (avoid spamming the same message every second)
 _MID_TRAP_LAST_LOG: Dict[str, float] = {}
-
 
 def _mid_trap_log_cooldown_sec() -> float:
     try:
         return float(os.getenv("MID_TRAP_LOG_COOLDOWN_SEC", "10") or 10)
     except Exception:
         return 10.0
-
 
 def _mid_trap_should_log(key: str) -> bool:
     try:
@@ -453,13 +445,10 @@ def is_blocked_symbol(symbol: str) -> bool:
         return True
     return False
 
-
-
 # ------------------ Auto-trade exchange API helpers ------------------
 
 class ExchangeAPIError(RuntimeError):
     """Raised when an exchange API call fails (network / auth / rate limit / etc.)."""
-
 
 def _extract_signal_id(sig: object) -> int:
     """Extract a stable, non-null signal id from a signal object."""
@@ -471,7 +460,6 @@ def _extract_signal_id(sig: object) -> int:
         return v if v > 0 else 0
     except Exception:
         return 0
-
 
 def _should_deactivate_key(err_text: str) -> bool:
     """Return True only for credential/permission/IP-whitelist failures."""
@@ -493,7 +481,6 @@ def _should_deactivate_key(err_text: str) -> bool:
         "whitelist",
     )
     return any(n in t for n in needles)
-
 
 # ------------------ Smart FUTURES Cap (effective cap) ------------------
 # In-memory cache: last effective cap per user (resets on restart).
@@ -529,7 +516,6 @@ _VIRTUAL_SLTP_ALL = (os.getenv("VIRTUAL_SLTP_ALL", "1").strip().lower() not in (
 # The manager will cancel existing TP/SL child orders (when supported) and manage the position like virtual mode.
 _SMART_PRO_CONTROL_REAL = (os.getenv("SMART_PRO_CONTROL_REAL", "1").strip().lower() not in ("0","false","no","off"))
 
-
 # Break-even fee buffer (percent). Example: 0.05 means +0.05% for LONG, -0.05% for SHORT.
 _BE_FEE_BUFFER_PCT = float(os.getenv("BE_FEE_BUFFER_PCT", "0.05") or 0.05)
 
@@ -538,8 +524,6 @@ _BE_FEE_BUFFER_PCT = float(os.getenv("BE_FEE_BUFFER_PCT", "0.05") or 0.05)
 # SL_BUFFER_PCT: extra buffer around SL in percent (0.03 means 0.03%).
 _SL_CONFIRM_SEC = int(float(os.getenv("SL_CONFIRM_SEC", "0") or 0))
 _SL_BUFFER_PCT = float(os.getenv("SL_BUFFER_PCT", "0") or 0.0)
-
-
 
 # =======================
 # Smart Trade Manager PRO — ENV (SAFE DEFAULTS)
@@ -570,7 +554,6 @@ def _smartpro_env_bool(name: str, default: bool) -> bool:
         return v not in ("0", "false", "no", "off")
     except Exception:
         return bool(default)
-
 
 def _is_mid_tf(tf: str) -> bool:
     tf = (tf or "").strip().lower()
@@ -716,8 +699,6 @@ def _calc_effective_futures_cap(*, balance_usdt: float, ui_cap_usdt: float, winr
         eff = min(eff, ui)
     return float(max(0.0, eff))
 
-
-
 async def _binance_signed_request(
     session: aiohttp.ClientSession,
     *,
@@ -745,7 +726,6 @@ async def _binance_signed_request(
         raise
     except Exception as e:
         raise ExchangeAPIError(f"Binance API error: {e}")
-
 
 async def _bybit_signed_request(
     session: aiohttp.ClientSession,
@@ -785,7 +765,6 @@ async def _bybit_signed_request(
         raise
     except Exception as e:
         raise ExchangeAPIError(f"Bybit API error: {e}")
-
 
 async def _bybit_v5_request(
     session: aiohttp.ClientSession,
@@ -837,8 +816,6 @@ async def _bybit_v5_request(
         raise
     except Exception as e:
         raise ExchangeAPIError(f"Bybit API error: {e}")
-
-
 
 # ------------------ OKX / MEXC / Gate.io signed request helpers (SPOT auto-trade) ------------------
 
@@ -1015,7 +992,6 @@ async def _gateio_public_price(symbol: str) -> float:
         return float(data[0].get("last") or 0.0)
     return 0.0
 
-
 async def validate_autotrade_keys(
     *,
     exchange: str,
@@ -1158,20 +1134,17 @@ async def validate_autotrade_keys(
     except ExchangeAPIError as e:
         return {"ok": False, "read_ok": False, "trade_ok": False, "error": str(e)}
 
-
 def _autotrade_fernet() -> Fernet:
     k = (os.getenv("AUTOTRADE_MASTER_KEY") or "").strip()
     if not k:
         raise RuntimeError("AUTOTRADE_MASTER_KEY env is missing")
     return Fernet(k.encode("utf-8"))
 
-
 def _decrypt_token(token: str | None) -> str:
     if not token:
         return ""
     f = _autotrade_fernet()
     return f.decrypt(token.encode("utf-8")).decode("utf-8")
-
 
 async def _http_json(method: str, url: str, *, params: dict | None = None, json_body: dict | None = None, headers: dict | None = None, timeout_s: int = 10) -> dict:
     timeout = aiohttp.ClientTimeout(total=timeout_s)
@@ -1182,13 +1155,11 @@ async def _http_json(method: str, url: str, *, params: dict | None = None, json_
                 raise ExchangeAPIError(f"HTTP {r.status} {url}: {data}")
             return data if isinstance(data, dict) else {"data": data}
 
-
 def _round_step(qty: float, step: float) -> float:
     """Round quantity down to the nearest step."""
     if step <= 0:
         return float(qty)
     return math.floor(float(qty) / float(step)) * float(step)
-
 
 def _round_tick(price: float, tick: float) -> float:
     """Round price down to the nearest tick."""
@@ -1196,9 +1167,7 @@ def _round_tick(price: float, tick: float) -> float:
         return float(price)
     return math.floor(float(price) / float(tick)) * float(tick)
 
-
 _BINANCE_INFO_CACHE: dict[str, dict] = {}
-
 
 async def _binance_exchange_info(*, futures: bool) -> dict:
     key = "futures" if futures else "spot"
@@ -1209,7 +1178,6 @@ async def _binance_exchange_info(*, futures: bool) -> dict:
     data["_ts"] = time.time()
     _BINANCE_INFO_CACHE[key] = data
     return data
-
 
 def _binance_symbol_filters(info: dict, symbol: str) -> tuple[float, float, float, float]:
     """Return (qty_step, min_qty, tick_size, min_notional) for symbol. Best-effort."""
@@ -1238,14 +1206,11 @@ def _binance_symbol_filters(info: dict, symbol: str) -> tuple[float, float, floa
             return step, min_qty, tick, min_notional
     return 0.0, 0.0, 0.0, 0.0
 
-
 async def _binance_price(symbol: str, *, futures: bool) -> float:
     sym = symbol.upper()
     url = "https://fapi.binance.com/fapi/v1/ticker/price" if futures else "https://api.binance.com/api/v3/ticker/price"
     data = await _http_json("GET", url, params={"symbol": sym}, timeout_s=8)
     return float(data.get("price") or 0.0)
-
-
 
 # ------------------ Generic order sizing helpers ------------------
 
@@ -1270,7 +1235,6 @@ def _log_rate_limited(key: str, message: str, *, every_s: int = 60, level: str =
     except Exception:
         # Logging must never break trading loop
         pass
-
 
 _OKX_FILTER_CACHE: dict[str, dict] = {}
 async def _okx_instrument_filters(*, inst_type: str, symbol: str) -> tuple[float, float, float]:
@@ -1305,7 +1269,6 @@ async def _okx_instrument_filters(*, inst_type: str, symbol: str) -> tuple[float
 
     _OKX_FILTER_CACHE[key] = {"_ts": time.time(), "qty_step": qty_step, "min_qty": min_qty, "tick": tick}
     return qty_step, min_qty, tick
-
 
 _MEXC_FILTER_CACHE: dict[str, dict] = {}
 async def _mexc_symbol_filters(symbol: str) -> tuple[float, float, float, float]:
@@ -1353,7 +1316,6 @@ async def _mexc_symbol_filters(symbol: str) -> tuple[float, float, float, float]
     _MEXC_FILTER_CACHE[sym] = {"_ts": time.time(), "qty_step": step, "min_qty": min_qty, "tick": tick, "min_notional": min_notional}
     return step, min_qty, tick, min_notional
 
-
 _GATE_FILTER_CACHE: dict[str, dict] = {}
 async def _gate_symbol_filters(symbol: str) -> tuple[float, float, float, float]:
     """Return (qty_step, min_qty, tick, min_notional) for Gate.io spot symbol (best-effort)."""
@@ -1400,7 +1362,6 @@ async def _gate_symbol_filters(symbol: str) -> tuple[float, float, float, float]
     _GATE_FILTER_CACHE[pair] = {"_ts": time.time(), "qty_step": qty_step, "min_qty": min_qty, "tick": tick, "min_notional": min_notional}
     return qty_step, min_qty, tick, min_notional
 
-
 async def _normalize_close_qty(*, ex: str, mt: str, symbol: str, qty: float, px: float) -> float:
     """Best-effort: round down by step, and ensure >= min qty and >= min notional floor (spot 15 USDT, futures 10 USDT)."""
     q = max(0.0, float(qty))
@@ -1443,7 +1404,6 @@ async def _normalize_close_qty(*, ex: str, mt: str, symbol: str, qty: float, px:
 
     return float(q)
 
-
 # ------------------ Bybit trading helpers (V5, unified API) ------------------
 
 async def _bybit_price(symbol: str, *, category: str) -> float:
@@ -1459,9 +1419,7 @@ async def _bybit_price(symbol: str, *, category: str) -> float:
         return float(lst[0].get("lastPrice") or 0.0)
     return 0.0
 
-
 _BYBIT_INFO_CACHE: dict[str, dict] = {}
-
 
 async def _bybit_instrument_filters(*, category: str, symbol: str) -> tuple[float, float, float]:
     """Return (qty_step, min_qty, tick_size) for a Bybit V5 instrument."""
@@ -1500,7 +1458,6 @@ async def _bybit_instrument_filters(*, category: str, symbol: str) -> tuple[floa
     _BYBIT_INFO_CACHE[key] = {"_ts": time.time(), "qty_step": qty_step, "min_qty": min_qty, "tick": tick}
     return qty_step, min_qty, tick
 
-
 async def _bybit_available_usdt(api_key: str, api_secret: str) -> float:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
@@ -1533,7 +1490,6 @@ async def _bybit_available_usdt(api_key: str, api_secret: str) -> float:
             return float(lst[0].get("totalAvailableBalance") or 0.0)
         except Exception:
             return 0.0
-
 
 async def _bybit_order_create(
     *,
@@ -1576,7 +1532,6 @@ async def _bybit_order_create(
             json_body=body,
         )
 
-
 async def _bybit_order_status(*, api_key: str, api_secret: str, category: str, symbol: str, order_id: str) -> dict:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
@@ -1589,7 +1544,6 @@ async def _bybit_order_status(*, api_key: str, api_secret: str, category: str, s
             params={"category": category, "symbol": symbol.upper(), "orderId": str(order_id)},
         )
 
-
 async def _bybit_cancel_order(*, api_key: str, api_secret: str, category: str, symbol: str, order_id: str) -> None:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
@@ -1601,7 +1555,6 @@ async def _bybit_cancel_order(*, api_key: str, api_secret: str, category: str, s
             api_secret=api_secret,
             json_body={"category": category, "symbol": symbol.upper(), "orderId": str(order_id)},
         )
-
 
 async def _binance_spot_free_usdt(api_key: str, api_secret: str) -> float:
     timeout = aiohttp.ClientTimeout(total=8)
@@ -1620,7 +1573,6 @@ async def _binance_spot_free_usdt(api_key: str, api_secret: str) -> float:
                 return float(b.get("free") or 0.0)
     return 0.0
 
-
 async def _binance_futures_available_margin(api_key: str, api_secret: str) -> float:
     timeout = aiohttp.ClientTimeout(total=8)
     async with aiohttp.ClientSession(timeout=timeout) as s:
@@ -1638,7 +1590,6 @@ async def _binance_futures_available_margin(api_key: str, api_secret: str) -> fl
             return float(acc.get("availableBalance") or 0.0)
         except Exception:
             return 0.0
-
 
 async def _binance_spot_market_buy_quote(
     *,
@@ -1665,7 +1616,6 @@ async def _binance_spot_market_buy_quote(
                 "recvWindow": "5000",
             },
         )
-
 
 async def _binance_spot_market_sell_base(
     *,
@@ -1694,7 +1644,6 @@ async def _binance_spot_market_sell_base(
             },
         )
 
-
 async def _binance_spot_limit_sell(
     *,
     api_key: str,
@@ -1722,7 +1671,6 @@ async def _binance_spot_limit_sell(
                 "recvWindow": "5000",
             },
         )
-
 
 async def _binance_spot_stop_loss_limit_sell(
     *,
@@ -1755,7 +1703,6 @@ async def _binance_spot_stop_loss_limit_sell(
             },
         )
 
-
 async def _binance_futures_set_leverage(*, api_key: str, api_secret: str, symbol: str, leverage: int) -> None:
     lev = int(leverage or 1)
     if lev < 1:
@@ -1773,7 +1720,6 @@ async def _binance_futures_set_leverage(*, api_key: str, api_secret: str, symbol
             api_secret=api_secret,
             params={"symbol": symbol.upper(), "leverage": str(lev), "recvWindow": "5000"},
         )
-
 
 async def _binance_futures_market_open(
     *,
@@ -1800,7 +1746,6 @@ async def _binance_futures_market_open(
                 "recvWindow": "5000",
             },
         )
-
 
 async def _binance_futures_reduce_limit(
     *,
@@ -1832,7 +1777,6 @@ async def _binance_futures_reduce_limit(
             },
         )
 
-
 async def _binance_futures_reduce_market(
     *,
     api_key: str,
@@ -1860,7 +1804,6 @@ async def _binance_futures_reduce_market(
                 "recvWindow": "5000",
             },
         )
-
 
 async def _binance_futures_stop_market_close_all(
     *,
@@ -1890,7 +1833,6 @@ async def _binance_futures_stop_market_close_all(
             },
         )
 
-
 async def _binance_order_status(
     *,
     api_key: str,
@@ -1913,7 +1855,6 @@ async def _binance_order_status(
             params={"symbol": symbol.upper(), "orderId": str(int(order_id)), "recvWindow": "5000"},
         )
 
-
 async def _binance_cancel_order(*, api_key: str, api_secret: str, symbol: str, order_id: int, futures: bool) -> None:
     timeout = aiohttp.ClientTimeout(total=10)
     base_url = "https://fapi.binance.com" if futures else "https://api.binance.com"
@@ -1928,7 +1869,6 @@ async def _binance_cancel_order(*, api_key: str, api_secret: str, symbol: str, o
             api_secret=api_secret,
             params={"symbol": symbol.upper(), "orderId": str(int(order_id)), "recvWindow": "5000"},
         )
-
 
 async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     """Execute real trading orders for a signal for a single user.
@@ -1947,7 +1887,6 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     def _fail(api_error: str, **details) -> dict:
         return {"ok": False, "skipped": False, "api_error": api_error, "details": details or {}}
 
-
     # Hard block: stable-vs-stable pairs (fail-safe)
     sym = (getattr(sig, "symbol", "") or "").upper().strip()
     if is_blocked_symbol(sym):
@@ -1956,7 +1895,6 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
     st = await db_store.get_autotrade_settings(uid)
     mt = "spot" if market == "SPOT" else "futures"
-
 
     # Extract TA extras (ATR 5m) from confirmations JSON for smarter manager (trailing, near-TP2).
     def _sig_ta_float(name: str) -> float:
@@ -2043,7 +1981,6 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 "details": {"confirmations_raw": conf_raw},
                 "api_error": None,
             }
-
 
         # Priority list from DB (comma-separated)
         pr_csv = str(st.get("spot_exchange_priority") or "binance,bybit,okx,mexc,gateio")
@@ -2327,7 +2264,6 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                     api_order_ref=json.dumps(ref),
                 )
                 return {"ok": True, "skipped": False, "api_error": None}
-
 
             # Place SL first; if SL fails, immediately close to avoid unprotected exposure.
             try:
@@ -2617,7 +2553,6 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 )
                 return {"ok": True, "skipped": False, "api_error": None}
 
-
             # Place SL first; if SL fails, immediately close (sell) to avoid an unprotected position.
             try:
                 sl_res = await _binance_spot_stop_loss_limit_sell(
@@ -2752,7 +2687,6 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             )
             return {"ok": True, "skipped": False, "api_error": None}
 
-
         # Place SL first; if SL fails, immediately close position to avoid unprotected exposure.
         try:
             sl_res = await _binance_futures_stop_market_close_all(
@@ -2864,7 +2798,6 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             deactivate=_should_deactivate_key(err),
         )
         return {"ok": False, "skipped": False, "api_error": err}
-
 
 # ------------------ Auto-trade soft reconcile (manual close sync) ------------------
 # If a user closes a position manually on the exchange, SL/TP orders may never be FILLED,
@@ -4374,7 +4307,6 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
 
         await asyncio.sleep(10)
 
-
 # --- i18n template safety guard (prevents leaking {placeholders} to users) ---
 _UNFILLED_RE = re.compile(r'(?<!\{)\{[a-zA-Z0-9_]+\}(?!\})')
 
@@ -4393,8 +4325,6 @@ async def safe_send(bot, chat_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
     # Never recurse. Send via bot API.
     return await bot.send_message(chat_id, text, **kwargs)
-
-
 
 # ------------------ ENV helpers ------------------
 def _env_int(name: str, default: int) -> int:
@@ -4415,7 +4345,6 @@ def _env_float(name: str, default: float) -> float:
     except Exception:
         return default
 
-
 def _env_str(name: str, default: str) -> str:
     v = os.getenv(name, "").strip()
     return v if v else default
@@ -4424,7 +4353,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if v == "":
         return default
     return v in ("1", "true", "yes", "y", "on")
-
 
 # --- i18n helpers (loaded from i18n.json; no hardcoded auto-close texts) ---
 I18N_FILE = Path(__file__).with_name("i18n.json")
@@ -4502,7 +4430,6 @@ def _market_label(uid: int, market: str) -> str:
     return _tr(uid, "lbl_spot") if str(market).upper() == "SPOT" else _tr(uid, "lbl_futures")
 # --- /i18n helpers ---
 
-
 # ------------------ backend-only metrics helpers ------------------
 
 def calc_profit_pct(entry: float, tp: float, direction: str) -> float:
@@ -4538,8 +4465,6 @@ def open_metrics(sig: "Signal") -> dict:
         "lev": default_futures_leverage(),
         "rr": round(float(getattr(sig, "rr", 0.0) or 0.0), 1),
     }
-
-
 
 def _price_debug_block(uid: int, *, price: float, source: str, side: str, sl: float | None, tp1: float | None, tp2: float | None, sl_label_key: str | None = None) -> str:
     """Human-readable debug block for a trade.
@@ -4587,7 +4512,6 @@ def _price_debug_block(uid: int, *, price: float, source: str, side: str, sl: fl
         lines.extend(["• " + c for c in checks])
 
     return "\n".join(lines)
-
 
 from zoneinfo import ZoneInfo
 MSK = ZoneInfo("Europe/Moscow")
@@ -4762,7 +4686,6 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                 if move_from_high > late_entry_max:
                     return f"late_entry_atr={move_from_high:.2f} > {late_entry_max:g}"
 
-
             # --- Near-extremes: avoid LONG right under resistance / SHORT right above support ---
             try:
                 if MID_BLOCK_NEAR_EXTREMES and atr_30m and atr_30m > 0:
@@ -4789,7 +4712,6 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                     dist_high_atr = (recent_high - close) / atr_30m
                     if dist_high_atr > MID_ANTI_BOUNCE_ATR_MAX:
                         return f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {MID_ANTI_BOUNCE_ATR_MAX:g}"
-
 
             # --- HTF alignment guard (ULTRA SAFE): block countertrend entries in strong trends ---
             try:
@@ -4887,7 +4809,6 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         except Exception:
             pass
 
-
         # --- Anti-countertrend guards (5m structure) ---
         try:
             if side.upper() == "LONG":
@@ -4950,7 +4871,6 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                 return "mid_5m_confirm_error"
             pass
 
-
     except Exception:
         # if filter computation fails, respect fail-closed flag
         return "mid_filter_error" if MID_FAIL_CLOSED else None
@@ -4991,7 +4911,6 @@ class UserTrade:
     last_price: float = 0.0
     opened_ts: float = 0.0
 
-
 # ------------------ Trade performance stats (spot/futures) ------------------
 TRADE_STATS_FILE = Path("trade_stats.json")
 
@@ -5019,21 +4938,17 @@ def _market_key(market: str) -> str:
     m = (market or "FUTURES").strip().upper()
     return "spot" if m == "SPOT" else "futures"
 
-
 def _tp1_partial_close_pct(market: str) -> float:
     mk = _market_key(market)
     return float(TP1_PARTIAL_CLOSE_PCT_SPOT if mk == "spot" else TP1_PARTIAL_CLOSE_PCT_FUTURES)
-
 
 # Backward-compat alias (older code referenced _partial_close_pct)
 def _partial_close_pct(market: str) -> float:
     return _tp1_partial_close_pct(market)
 
-
 # Backward-compat alias (older code referenced _be_enabled)
 def _be_enabled(market: str) -> bool:
     return _be_after_tp1(market)
-
 
 def _be_after_tp1(market: str) -> bool:
     mk = _market_key(market)
@@ -5061,7 +4976,6 @@ def _be_exit_price(entry: float, side: str, market: str) -> float:
     if side == "SHORT":
         return entry * (1.0 + buf)
     return entry * (1.0 - buf)
-
 
 def _day_key_tz(ts: float) -> str:
     d = dt.datetime.fromtimestamp(ts, tz=ZoneInfo(TZ_NAME)).date()
@@ -5132,7 +5046,6 @@ def _calc_rr_str(entry: float, sl: float, tp1: float, tp2: float) -> str:
     except Exception:
         return "-"
 
-
 # ------------------ Human-friendly close reasons (i18n) ------------------
 
 def _human_close_reason(uid: int, code: str | None, **kv: Any) -> str:
@@ -5183,8 +5096,6 @@ def _lvl_line(label: str, value: float) -> str:
     except Exception:
         pass
     return ""
-
-
 
 def _bump_stats(store: dict, market: str, ts: float, close_reason: str, pnl_pct: float, tp1_hit: bool) -> None:
     mk = _market_key(market)
@@ -5689,7 +5600,6 @@ class _RestLimiter:
                     self._next_ts[exn] = time.time() + min_interval
             return await fn()
 
-
 class _AsyncPriceCache:
     """Cache for (exchange, market, symbol) -> (price, source, ts) with anti-storm in-flight dedupe."""
 
@@ -6033,7 +5943,6 @@ class MultiExchangeData:
         rows = list(reversed(rows))
         return self._df_from_ohlcv(rows, "okx")
 
-
     async def klines_mexc(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
         """Fetch klines from MEXC Spot (Binance-compatible /api/v3/klines).
 
@@ -6059,7 +5968,6 @@ class MultiExchangeData:
             quote_v = r[7] if len(r) > 7 else None
             norm.append([open_t, o, h, l, c, v, close_t, quote_v, 0, 0, 0, 0])
         return self._df_from_ohlcv(norm, "binance")
-
 
     async def klines_gateio(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
         """Fetch klines from Gate.io Spot API v4 /spot/candlesticks.
@@ -6110,7 +6018,6 @@ class MultiExchangeData:
             norm.append([t_ms, o, h, l, c, v, close_ms, 0, 0, 0, 0, 0])
 
         return self._df_from_ohlcv(norm, "binance")
-
 
 # ------------------ Indicators / engine ------------------
 def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -6201,7 +6108,6 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
 def _trend_dir(df: pd.DataFrame) -> Optional[str]:
     row = df.iloc[-1]
     if pd.isna(row["ema50"]) or pd.isna(row["ema200"]):
@@ -6283,8 +6189,6 @@ def _trigger_15m(direction: str, df15i: pd.DataFrame) -> bool:
         return False
 
     return True
-
-
 
 # ------------------ MID anti top/bottom-trap filters (1H structure) ------------------
 # Goal: reduce SL frequency by blocking MID entries that occur too close to local extremes
@@ -6501,7 +6405,6 @@ def _mid_structure_trap_ok(*, direction: str, entry: float, df1hi: pd.DataFrame)
 
     return (True, "")
 
-
 def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
@@ -6584,9 +6487,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     if dir_mid is None:
         dir_mid = dir_trend
 
-
-
-
     # ATR on 5m (for smart trailing / near-TP2 logic in autotrade manager)
     atr5 = float(last5.get("atr", np.nan))
     if np.isnan(atr5) or atr5 <= 0:
@@ -6616,7 +6516,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         except Exception:
             pass
         return None
-
 
     # Quality gate: avoid choppy markets (helps TP2 hit-rate)
     try:
@@ -6961,7 +6860,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     except Exception:
         pass
 
-
     # Score / confidence: use unified TA score to avoid constant 100s
     ta_score = _ta_score(
         direction=dir_trend,
@@ -7034,7 +6932,6 @@ def choose_market(adx1_max: float, atr_pct_max: float) -> str:
         url = f"{self.BYBIT}/v5/market/orderbook"
         params = {"category": "linear", "symbol": symbol, "limit": str(limit)}
         return await self._get_json(url, params=params)
-
 
 # ------------------ Orderbook filter helpers ------------------
 def _orderbook_metrics(bids: List[List[Any]], asks: List[List[Any]], *, levels: int) -> Dict[str, float]:
@@ -7157,7 +7054,6 @@ def _candle_pattern(df: pd.DataFrame) -> Tuple[str, int]:
     except Exception:
         return ("—", 0)
 
-
 def _nearest_levels(df: pd.DataFrame, lookback: int = 180, swing: int = 3) -> Tuple[Optional[float], Optional[float]]:
     """
     Finds nearest swing support/resistance levels using simple local extrema on 'high'/'low'.
@@ -7198,7 +7094,6 @@ def _nearest_levels(df: pd.DataFrame, lookback: int = 180, swing: int = 3) -> Tu
     except Exception:
         return (None, None)
 
-
 def _pivot_points(series: np.ndarray, *, left: int = 3, right: int = 3, mode: str = "high") -> List[Tuple[int, float]]:
     """Return pivot highs/lows as (index, value) using simple local extrema."""
     pts: List[Tuple[int, float]] = []
@@ -7215,7 +7110,6 @@ def _pivot_points(series: np.ndarray, *, left: int = 3, right: int = 3, mode: st
             if v == np.min(window):
                 pts.append((i, float(v)))
     return pts
-
 
 def _rsi_divergence(df: pd.DataFrame, *, lookback: int = 120, pivot: int = 3) -> str:
     """Detect basic bullish/bearish RSI divergence on recent pivots. Returns 'BULL', 'BEAR' or '—'."""
@@ -7242,7 +7136,6 @@ def _rsi_divergence(df: pd.DataFrame, *, lookback: int = 120, pivot: int = 3) ->
         return "—"
     except Exception:
         return "—"
-
 
 def _linreg_channel(df: pd.DataFrame, *, window: int = 120, k: float = 2.0) -> Tuple[str, float, float]:
     """Linear regression channel on close. Returns (label, pos, slope). label like 'desc@upper'."""
@@ -7278,7 +7171,6 @@ def _linreg_channel(df: pd.DataFrame, *, window: int = 120, k: float = 2.0) -> T
     except Exception:
         return ("—", float("nan"), float("nan"))
 
-
 def _market_structure(df: pd.DataFrame, *, lookback: int = 180, swing: int = 3) -> str:
     """Minimal market-structure label from swing highs/lows: 'HH-HL', 'LH-LL', or '—'."""
     try:
@@ -7306,7 +7198,6 @@ def _market_structure(df: pd.DataFrame, *, lookback: int = 180, swing: int = 3) 
     except Exception:
         return "—"
 
-
 def _bb_position(close: float, bb_low: float, bb_mid: float, bb_high: float) -> str:
     try:
         if any(np.isnan(x) for x in [close, bb_low, bb_mid, bb_high]):
@@ -7320,7 +7211,6 @@ def _bb_position(close: float, bb_low: float, bb_mid: float, bb_high: float) -> 
         return "low→mid"
     except Exception:
         return "—"
-
 
 def _ta_score(*,
               direction: str,
@@ -7529,7 +7419,6 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
         return "\n".join(lines)
     except Exception:
         return ""
-
 
 def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
     score = 0
@@ -7773,7 +7662,6 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
             pass
         return None
 
-
     # --- TA extras (MAIN-like) ---
     # RSI/MACD on 5m
     rsi5 = float(last5.get("rsi", np.nan))
@@ -7909,7 +7797,6 @@ def choose_market(adx1_max: float, atr_pct_max: float) -> str:
         params = {"category": "linear", "symbol": symbol, "limit": str(limit)}
         return await self._get_json(url, params=params)
 
-
 # ------------------ Orderbook filter helpers ------------------
 def _orderbook_metrics(bids: List[List[Any]], asks: List[List[Any]], *, levels: int) -> Dict[str, float]:
     """Return imbalance (bids/asks notional), spread_pct, bid_wall_ratio, ask_wall_ratio, bid_wall_near, ask_wall_near."""
@@ -8027,8 +7914,6 @@ async def orderbook_filter(api: "MultiExchangeData", exchange: str, symbol: str,
 
     return (True, f"OB {exchange}: ok imb {imb:.2f}x spr {spread:.3f}%")
 
-
-
 class PriceUnavailableError(Exception):
     """Raised when all price sources failed for a symbol/market."""
     pass
@@ -8052,7 +7937,6 @@ class Backend:
         # Track first moment when price breached SL per trade_id (for SL confirmation).
         self._sl_breach_since: Dict[int, float] = {}
 
-
         self.last_signal: Optional[Signal] = None
         self.last_spot_signal: Optional[Signal] = None
         self.last_futures_signal: Optional[Signal] = None
@@ -8071,15 +7955,12 @@ class Backend:
         # Called best-effort once per track_loop cycle.
         self.health_tick_cb = None
 
-
-
     def set_mid_trap_sink(self, cb) -> None:
         """Register sink for MID trap events (used by bot to build periodic digest (>=6h))."""
         try:
             set_mid_trap_sink(cb)
         except Exception:
             pass
-
 
     def next_signal_id(self) -> int:
         sid = self._signal_seq
@@ -8108,7 +7989,6 @@ class Backend:
             orig_text=orig_text or "",
         )
         return bool(inserted)
-
 
     async def remove_trade(self, user_id: int, signal_id: int) -> bool:
         row = await db_store.get_trade_by_user_signal(int(user_id), int(signal_id))
@@ -8155,7 +8035,6 @@ class Backend:
             except Exception:
                 pass
         return True
-
 
     # ---------------- trade stats helpers ----------------
     def _load_trade_stats(self) -> None:
@@ -8266,7 +8145,6 @@ class Backend:
             return out
         except Exception:
             return dict(t)
-
 
     async def get_trade_live_by_id(self, user_id: int, trade_id: int) -> Optional[dict]:
         """Return trade row (by DB id) with live price + price source + hit checks."""
@@ -8479,7 +8357,6 @@ class Backend:
         except Exception:
             return None
 
-
     async def _fetch_bybit_price(self, market: str, symbol: str) -> float | None:
         """Bybit REST price (spot/futures). Uses V5 tickers.
 
@@ -8521,7 +8398,6 @@ class Backend:
             return await self._rest_limiter.run("bybit", _do_req)
         except Exception:
             return None
-
 
     async def _fetch_okx_price(self, market: str, symbol: str) -> float | None:
         """OKX REST price (spot/futures).
@@ -8566,7 +8442,6 @@ class Backend:
             return await self._rest_limiter.run("okx", _do_req)
         except Exception:
             return None
-
 
     async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
         """Return (price, source) for tracking.
@@ -8882,8 +8757,6 @@ class Backend:
                 return float(p), str(src)
 
         raise PriceUnavailableError(f"price unavailable market={market} symbol={signal.symbol} mode={mode}")
-
-
 
     async def _get_price(self, signal: Signal) -> float:
         price, _src = await self._get_price_with_source(signal)
@@ -9619,7 +9492,6 @@ class Backend:
                         except Exception:
                             pass
 
-
                         if news_act == "FUTURES_OFF" and market == "FUTURES":
                             market = "SPOT"
                             risk_notes.append("⚠️ Futures paused due to news")
@@ -9708,7 +9580,6 @@ class Backend:
                             _pair_exchanges = [best_name]
                         conf_names = "+".join(_pair_exchanges)
 
-
                         sid = self.next_signal_id()
                         sig = Signal(
                             signal_id=sid,
@@ -9740,7 +9611,7 @@ class Backend:
                         logger.info("[mid][emit] %s market=%s dir=%s conf=%s rr=%.2f exch=%s notes=%s",
             sig.symbol, sig.market, sig.direction, sig.confidence, float(sig.rr), sig.confirmations,
             (sig.risk_note or "-")[:120])
-_mid_emitted += 1
+
                         await emit_signal_cb(sig)
                         await asyncio.sleep(2)
 
@@ -9751,9 +9622,7 @@ _mid_emitted += 1
             logger.info("SCAN tick done scanned=%s elapsed=%.1fs last_news=%s last_macro=%s", int(getattr(self, "scanned_symbols_last", 0) or 0), elapsed, getattr(self, "last_news_action", "?"), getattr(self, "last_macro_action", "?"))
             await asyncio.sleep(max(5, SCAN_INTERVAL_SECONDS - elapsed))
 
-
 # ------------------ Auto-trade diagnostics (admin) ------------------
-
 
     def can_emit_mid(self, symbol: str) -> bool:
         cooldown_min = int(os.getenv("MID_COOLDOWN_MINUTES", "180"))
@@ -9770,7 +9639,6 @@ _mid_emitted += 1
             self._last_emit_mid = {}
             m = self._last_emit_mid
         m[symbol] = time.time()
-
 
     # ---------------- MID trap/blocked digest (anti-spam analytics) ----------------
     def _mid_reason_key(self, reason: str) -> str:
@@ -9801,7 +9669,6 @@ _mid_emitted += 1
             en_txt = "—"
         r = (reason or "").strip()
         ent["examples"].append(f"{sym} {d} entry={en_txt} {r}".strip())
-
 
     async def _mid_digest_maybe_send(self, stats: dict, last_sent_at: float) -> float:
         period = int(os.getenv("MID_TRAP_DIGEST_SEC", "21600") or 21600)
@@ -9848,8 +9715,6 @@ _mid_emitted += 1
             pass
         stats.clear()
         return now
-
-
 
     async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         tf_trigger, tf_mid, tf_trend = "5m", "30m", "1h"
@@ -10228,7 +10093,6 @@ _mid_emitted += 1
                         await asyncio.sleep(2)
             except Exception:
                 logger.exception("[mid] scanner_loop_mid error")
-
 
             # --- send digest every MID_TRAP_DIGEST_SEC ---
             try:
