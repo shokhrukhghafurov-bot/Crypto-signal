@@ -7657,7 +7657,7 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     }
     return ta
 
-def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
+def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
     Produces a result dict compatible with scanner_loop_mid and a rich TA block (like MAIN),
@@ -7761,7 +7761,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     if not bool(trap_ok):
         # Block obvious top/bottom traps. Also emit a structured event so bot can build a digest.
         try:
-            logger.info('MID blocked (trap): dir=%s reason=%s entry=%.6g', str(dir_trend).upper(), str(trap_reason), float(entry))
+            if os.getenv("MID_INTERNAL_TRAP_LOG","0").strip().lower() not in ("0","false","no","off"):
+                logger.info('MID blocked (trap): dir=%s reason=%s entry=%.6g', str(dir_trend).upper(), str(trap_reason), float(entry))
             _emit_mid_trap_event({
                 'dir': str(dir_trend).upper(),
                 'reason': str(trap_reason),
@@ -10261,3 +10262,4 @@ async def autotrade_stress_test(*, user_id: int, symbol: str, market_type: str =
     This build keeps production stable: stress-test is disabled here to avoid accidental trading.
     """
     return {"ok": False, "error": "stress_test_disabled_in_production"}
+
