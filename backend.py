@@ -352,10 +352,20 @@ _MID_TRAP_LAST_LOG: Dict[str, float] = {}
 
 
 def _mid_trap_log_cooldown_sec() -> float:
+    """Cooldown (seconds) for MID log de-duplication.
+
+    Priority:
+      1) MID_LOG_DEDUP_SEC (new, applies to ALL MID log types: trap/block/emit)
+      2) MID_TRAP_LOG_COOLDOWN_SEC (legacy, kept for backward compatibility)
+    """
     try:
+        v = (os.getenv("MID_LOG_DEDUP_SEC") or "").strip()
+        if v:
+            return float(v)
         return float(os.getenv("MID_TRAP_LOG_COOLDOWN_SEC", "10") or 10)
     except Exception:
         return 10.0
+
 
 
 def _mid_trap_should_log(key: str) -> bool:
@@ -6903,7 +6913,9 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         )
         if reason:
             try:
-                logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, reason, float(entry))
+                _k = f"block|{symbol}|{dir_trend}|{_mid_trap_reason_key(str(reason))}"
+                if _mid_trap_should_log(_k):
+                    logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, reason, float(entry))
                 # Reuse MID trap sink/digest to show why MID hard-filters blocked entries
                 _emit_mid_trap_event({
                     "dir": str(dir_trend),
@@ -7769,7 +7781,9 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         # Block obvious top/bottom traps. Also emit a structured event so bot can build a digest.
         try:
             if os.getenv("MID_INTERNAL_TRAP_LOG","0").strip().lower() not in ("0","false","no","off"):
-                logger.info('[mid][trap] %s dir=%s reason=%s entry=%.6g', symbol, str(dir_trend).upper(), str(trap_reason), float(entry))
+                _k = f"trap|{symbol}|{str(dir_trend).upper()}|{_mid_trap_reason_key(str(trap_reason))}"
+                if _mid_trap_should_log(_k):
+                    logger.info('[mid][trap] %s dir=%s reason=%s entry=%.6g', symbol, str(dir_trend).upper(), str(trap_reason), float(entry))
             _emit_mid_trap_event({
                 'dir': str(dir_trend).upper(),
                 'reason': str(trap_reason),
