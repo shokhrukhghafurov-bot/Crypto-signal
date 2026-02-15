@@ -92,6 +92,7 @@ async def ensure_schema() -> None:
           opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           closed_at TIMESTAMPTZ,
           pnl_total_pct NUMERIC(10,4),
+          tp1_pnl_pct NUMERIC(10,4),
           orig_text TEXT NOT NULL
         );
         """)
@@ -458,6 +459,7 @@ ON CONFLICT (id) DO NOTHING;
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS be_crossed_at TIMESTAMPTZ;")
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS pnl_total_pct NUMERIC(10,4);")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS tp1_pnl_pct NUMERIC(10,4);")
         except Exception:
             pass
 
@@ -913,40 +915,20 @@ async def close_trade(trade_id: int, *, status: str, price: float | None = None,
 
     ev = "CLOSE" if st == "CLOSED" else st
     async with pool.acquire() as conn:
-        # If TP1 fixed PnL was already recorded, make the final event incremental
-        # so that: SUM(trade_events.pnl_pct) == final trades.pnl_total_pct.
-        prev_fixed: float | None = None
-        try:
-            row = await conn.fetchrow("SELECT status, pnl_total_pct FROM trades WHERE id=$1;", int(trade_id))
-            if row:
-                prev_status = str(row.get("status") or "").upper()
-                if prev_status == "TP1":
-                    prev_fixed = float(row.get("pnl_total_pct")) if row.get("pnl_total_pct") is not None else None
-        except Exception:
-            prev_fixed = None
-
-        final_total = (float(pnl_total_pct) if pnl_total_pct is not None else None)
-        ev_pnl = final_total
-        if final_total is not None and prev_fixed is not None:
-            try:
-                ev_pnl = float(final_total) - float(prev_fixed)
-            except Exception:
-                ev_pnl = final_total
-
         await conn.execute(
             """
             UPDATE trades
             SET status=$2, closed_at=NOW(), pnl_total_pct=$3
             WHERE id=$1;
             """,
-            int(trade_id), st, final_total,
+            int(trade_id), st, (float(pnl_total_pct) if pnl_total_pct is not None else None),
         )
         await conn.execute(
             "INSERT INTO trade_events (trade_id, event_type, price, pnl_pct) VALUES ($1,$2,$3,$4);",
             int(trade_id),
             ev,
             (float(price) if price is not None else None),
-            (float(ev_pnl) if ev_pnl is not None else None),
+            (float(pnl_total_pct) if pnl_total_pct is not None else None),
         )
 
 async def perf_bucket(user_id: int, market: str, *, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
@@ -1307,7 +1289,7 @@ async def list_open_signal_tracks(*, limit: int = 500) -> List[dict]:
     return [dict(r) for r in rows]
 
 
-async def mark_signal_tp1(*, signal_id: int, be_price: float | None = None, pnl_total_pct: float | None = None) -> None:
+async def mark_signal_tp1(*, signal_id: int, be_price: float | None = None, tp1_pnl_pct: float | None = None) -> None:
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -1317,14 +1299,14 @@ async def mark_signal_tp1(*, signal_id: int, be_price: float | None = None, pnl_
                 tp1_hit=TRUE,
                 tp1_hit_at=COALESCE(tp1_hit_at, NOW()),
                 be_price=COALESCE($2, be_price),
+                tp1_pnl_pct=COALESCE($3, tp1_pnl_pct),
                 be_armed_at=COALESCE(be_armed_at, NOW()),
-                pnl_total_pct=COALESCE($3, pnl_total_pct),
                 updated_at=NOW()
             WHERE signal_id=$1 AND status='ACTIVE';
             """,
             int(signal_id),
             (float(be_price) if be_price is not None else None),
-            (float(pnl_total_pct) if pnl_total_pct is not None else None),
+            (float(tp1_pnl_pct) if tp1_pnl_pct is not None else None),
         )
 
 
@@ -1442,10 +1424,16 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
               COUNT(*) FILTER (WHERE {where_outcome} AND status='BE')::int AS be,
               COUNT(*) FILTER (WHERE {where_close})::int AS closes,
               COUNT(*) FILTER (WHERE {where_tp1})::int AS tp1_hits,
-              COALESCE(SUM(CASE
-                    WHEN {where_outcome} THEN COALESCE(pnl_total_pct,0)
+              (
+                COALESCE(SUM(CASE
+                    WHEN {where_outcome} THEN (COALESCE(pnl_total_pct,0) - COALESCE(tp1_pnl_pct,0))
                     ELSE 0
-                  END),0)::float AS sum_pnl_pct
+                  END),0)
+                + COALESCE(SUM(CASE
+                    WHEN {where_tp1} THEN COALESCE(tp1_pnl_pct,0)
+                    ELSE 0
+                  END),0)
+              )::float AS sum_pnl_pct
             FROM signal_tracks
             WHERE market=$1;
             """
