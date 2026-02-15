@@ -344,10 +344,6 @@ from cryptography.fernet import Fernet
 
 logger = logging.getLogger("crypto-signal")
 
-# If enabled, emit legacy "MID blocked:" logs from inside evaluate_on_exchange_mid.
-# Default off because [mid][block]/[mid][trap] logs already cover block reasons and avoid spam.
-MID_INTERNAL_BLOCK_LOG = os.getenv("MID_INTERNAL_BLOCK_LOG", "0").strip().lower() in ("1","true","yes","on")
-
 
 # --- MID trap digest sink (aggregates "MID blocked (trap)" into a periodic digest) ---
 
@@ -6612,7 +6608,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     if not ok_trap:
         try:
             
-            _trap_msg = f"{dir_trend}|{_mid_trap_reason_key(str(trap_reason))}|{float(entry):.8g}"
+            _trap_msg = f"{symbol}|{dir_trend}|{_mid_trap_reason_key(str(trap_reason))}"
             if _mid_trap_should_log(_trap_msg):
                 logger.info("MID blocked (trap): dir=%s reason=%s entry=%.6g", dir_trend, trap_reason, float(entry))
 
@@ -6899,19 +6895,19 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             adx_30m=float(adx30) if not np.isnan(adx30) else None,
         )
         if reason:
-            # Block signal. Logging is handled by the MID scanner wrapper via [mid][block]/[mid][trap].
-            # Keep optional legacy logs behind a flag to avoid spam.
-            if MID_INTERNAL_BLOCK_LOG:
-                try:
-                    logger.info("MID blocked: dir=%s reason=%s entry=%.6g", dir_trend, reason, float(entry))
-                    _emit_mid_trap_event({
-                        "dir": str(dir_trend),
-                        "reason": str(reason),
-                        "reason_key": _mid_trap_reason_key(str(reason)),
-                        "entry": float(entry),
-                    })
-                except Exception:
-                    pass
+            try:
+                logger.info("MID blocked: dir=%s reason=%s entry=%.6g", dir_trend, reason, float(entry))
+                # Reuse MID trap sink/digest to show why MID hard-filters blocked entries
+                _emit_mid_trap_event({
+                    "dir": str(dir_trend),
+                    # Keep the raw reason so the digest can bucket by the *actual* filter
+                    # (anti_bounce_short / rsi_short / bb_bounce_zone / etc.)
+                    "reason": str(reason),
+                    "reason_key": _mid_trap_reason_key(str(reason)),
+                    "entry": float(entry),
+                })
+            except Exception:
+                pass
             return None
     except Exception:
         # If filters fail, do not block signal.
