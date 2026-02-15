@@ -913,20 +913,40 @@ async def close_trade(trade_id: int, *, status: str, price: float | None = None,
 
     ev = "CLOSE" if st == "CLOSED" else st
     async with pool.acquire() as conn:
+        # If TP1 fixed PnL was already recorded, make the final event incremental
+        # so that: SUM(trade_events.pnl_pct) == final trades.pnl_total_pct.
+        prev_fixed: float | None = None
+        try:
+            row = await conn.fetchrow("SELECT status, pnl_total_pct FROM trades WHERE id=$1;", int(trade_id))
+            if row:
+                prev_status = str(row.get("status") or "").upper()
+                if prev_status == "TP1":
+                    prev_fixed = float(row.get("pnl_total_pct")) if row.get("pnl_total_pct") is not None else None
+        except Exception:
+            prev_fixed = None
+
+        final_total = (float(pnl_total_pct) if pnl_total_pct is not None else None)
+        ev_pnl = final_total
+        if final_total is not None and prev_fixed is not None:
+            try:
+                ev_pnl = float(final_total) - float(prev_fixed)
+            except Exception:
+                ev_pnl = final_total
+
         await conn.execute(
             """
             UPDATE trades
             SET status=$2, closed_at=NOW(), pnl_total_pct=$3
             WHERE id=$1;
             """,
-            int(trade_id), st, (float(pnl_total_pct) if pnl_total_pct is not None else None),
+            int(trade_id), st, final_total,
         )
         await conn.execute(
             "INSERT INTO trade_events (trade_id, event_type, price, pnl_pct) VALUES ($1,$2,$3,$4);",
             int(trade_id),
             ev,
             (float(price) if price is not None else None),
-            (float(pnl_total_pct) if pnl_total_pct is not None else None),
+            (float(ev_pnl) if ev_pnl is not None else None),
         )
 
 async def perf_bucket(user_id: int, market: str, *, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
@@ -1287,7 +1307,7 @@ async def list_open_signal_tracks(*, limit: int = 500) -> List[dict]:
     return [dict(r) for r in rows]
 
 
-async def mark_signal_tp1(*, signal_id: int, be_price: float | None = None) -> None:
+async def mark_signal_tp1(*, signal_id: int, be_price: float | None = None, pnl_total_pct: float | None = None) -> None:
     pool = get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -1298,11 +1318,13 @@ async def mark_signal_tp1(*, signal_id: int, be_price: float | None = None) -> N
                 tp1_hit_at=COALESCE(tp1_hit_at, NOW()),
                 be_price=COALESCE($2, be_price),
                 be_armed_at=COALESCE(be_armed_at, NOW()),
+                pnl_total_pct=COALESCE($3, pnl_total_pct),
                 updated_at=NOW()
             WHERE signal_id=$1 AND status='ACTIVE';
             """,
             int(signal_id),
             (float(be_price) if be_price is not None else None),
+            (float(pnl_total_pct) if pnl_total_pct is not None else None),
         )
 
 
