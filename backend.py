@@ -4743,6 +4743,39 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                       htf_dir_1h: str | None = None, htf_dir_30m: str | None = None, adx_30m: float | None = None) -> str | None:
     """Return human-readable MID BLOCKED reason (for logging + error-bot), or None if allowed."""
     try:
+        # Normalize inputs (treat NaN/inf as missing)
+        try:
+            if rsi_5m is not None:
+                r = float(rsi_5m)
+                if not math.isfinite(r):
+                    rsi_5m = None
+                else:
+                    rsi_5m = r
+        except Exception:
+            rsi_5m = None
+        try:
+            if vwap is not None:
+                v = float(vwap)
+                if not math.isfinite(v) or v <= 0:
+                    vwap = None
+                else:
+                    vwap = v
+        except Exception:
+            vwap = None
+        try:
+            a = float(atr_30m) if atr_30m is not None else 0.0
+            atr_30m = a
+        except Exception:
+            atr_30m = 0.0
+
+        # Fail-closed on missing critical metrics (prevents "filters silently bypassed")
+        if MID_FAIL_CLOSED:
+            if not atr_30m or atr_30m <= 0:
+                return "missing_atr_30m"
+            # If VWAP-based guards are enabled, require VWAP
+            if (MID_REQUIRE_VWAP_SIDE or (MID_VWAP_DIST_ATR_MAX > 0) or (MID_ULTRA_SAFE and MID_ULTRA_VWAP_DIST_ATR_MAX > 0)) and (vwap is None):
+                return "missing_vwap_30m"
+
         # ULTRA SAFE: tighten filters dynamically for near-zero SL preference
         late_entry_max = MID_ULTRA_LATE_ENTRY_ATR_MAX if MID_ULTRA_SAFE else MID_LATE_ENTRY_ATR_MAX
         vwap_dist_max = MID_ULTRA_VWAP_DIST_ATR_MAX if MID_ULTRA_SAFE else MID_VWAP_DIST_ATR_MAX
@@ -6908,7 +6941,30 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 })
             except Exception:
                 pass
-            return None
+
+            # IMPORTANT: return a "blocked" payload so scanner_loop_mid can log + digest the reason
+            try:
+                vwap_num = float(vwap_val) if (not np.isnan(vwap_val)) else float("nan")
+                vwap_dist_atr = (abs(float(entry) - vwap_num) / float(atr30)) if (math.isfinite(vwap_num) and atr30 and atr30 > 0) else float("nan")
+            except Exception:
+                vwap_num = float("nan")
+                vwap_dist_atr = float("nan")
+
+            return {
+                "blocked": True,
+                "block_reason": str(reason),
+                "direction": str(dir_trend).upper(),
+                "entry": float(entry),
+                "atr_30m": float(atr30),
+                "vwap_val": (float(vwap_val) if (not np.isnan(vwap_val)) else 0.0),
+                "vwap_dist_atr": (float(vwap_dist_atr) if (not np.isnan(vwap_dist_atr)) else 0.0),
+                "rsi": (float(last5.get("rsi", 0.0) or 0.0) if (not np.isnan(float(last5.get("rsi", np.nan)))) else 0.0),
+                "recent_low": float(recent_low),
+                "recent_high": float(recent_high),
+                "confidence": 0,
+                "rr": 0,
+                "trap_ok": True,
+            }
     except Exception:
         # If filters fail, do not block signal.
         pass
@@ -7657,7 +7713,7 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     }
     return ta
 
-def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
+def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
     Produces a result dict compatible with scanner_loop_mid and a rich TA block (like MAIN),
@@ -10023,7 +10079,25 @@ class Backend:
                                 self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), str(_r))
                             except Exception:
                                 pass
-                            logger.info("[mid][trap] %s %s blocked=%s reason=%s src_best=%s", sym, str(base_r.get("direction","")).upper(), base_r.get("blocked"), base_r.get("trap_reason",""), best_name)
+                            # extra structured log when blocked by MID hard-filters (vwap/late-entry/near-extreme/etc.)
+                            try:
+                                if base_r.get("blocked") is True:
+                                    logger.info(
+                                        "[mid][block] %s dir=%s reason=%s entry=%.6g vwap=%.6g dist_atr=%.2f atr30=%.6g rsi=%.1f src_best=%s",
+                                        sym,
+                                        str(base_r.get("direction","")).upper(),
+                                        str(base_r.get("block_reason","") or ""),
+                                        float(base_r.get("entry") or 0.0),
+                                        float(base_r.get("vwap_val") or 0.0),
+                                        float(base_r.get("vwap_dist_atr") or 0.0),
+                                        float(base_r.get("atr_30m") or 0.0),
+                                        float(base_r.get("rsi") or 0.0),
+                                        str(best_name),
+                                    )
+                            except Exception:
+                                pass
+
+                            logger.info("[mid][trap] %s %s blocked=%s reason=%s src_best=%s", sym, str(base_r.get("direction","")).upper(), base_r.get("blocked"), (base_r.get("trap_reason","") or base_r.get("block_reason","") or ""), best_name)
                             continue
                         if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
                             _mid_f_align += 1
