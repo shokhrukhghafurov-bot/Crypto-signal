@@ -6610,7 +6610,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             
             _trap_msg = f"{symbol}|{dir_trend}|{_mid_trap_reason_key(str(trap_reason))}"
             if _mid_trap_should_log(_trap_msg):
-                logger.info("MID blocked (trap): dir=%s reason=%s entry=%.6g", dir_trend, trap_reason, float(entry))
+                logger.info("[mid][trap] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, trap_reason, float(entry))
 
             _emit_mid_trap_event({"dir": str(dir_trend), "reason": str(trap_reason), "reason_key": _mid_trap_reason_key(str(trap_reason)), "entry": float(entry)})
         except Exception:
@@ -6896,7 +6896,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         )
         if reason:
             try:
-                logger.info("MID blocked: dir=%s reason=%s entry=%.6g", dir_trend, reason, float(entry))
+                logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, reason, float(entry))
                 # Reuse MID trap sink/digest to show why MID hard-filters blocked entries
                 _emit_mid_trap_event({
                     "dir": str(dir_trend),
@@ -7762,7 +7762,7 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         # Block obvious top/bottom traps. Also emit a structured event so bot can build a digest.
         try:
             if os.getenv("MID_INTERNAL_TRAP_LOG","0").strip().lower() not in ("0","false","no","off"):
-                logger.info('MID blocked (trap): dir=%s reason=%s entry=%.6g', str(dir_trend).upper(), str(trap_reason), float(entry))
+                logger.info('[mid][trap] %s dir=%s reason=%s entry=%.6g', symbol, str(dir_trend).upper(), str(trap_reason), float(entry))
             _emit_mid_trap_event({
                 'dir': str(dir_trend).upper(),
                 'reason': str(trap_reason),
@@ -9737,8 +9737,10 @@ class Backend:
                             self.last_futures_signal = sig
 
                         logger.info("[signal] emit %s %s %s conf=%s rr=%.2f notes=%s", sig.symbol, sig.market, sig.direction, sig.confidence, sig.rr, (sig.risk_note or "-")[:120])
-                        logger.info("SIGNAL %s %s %s conf=%s rr=%.2f notes=%s", sig.market, sig.symbol, sig.direction, sig.confidence, sig.rr, (sig.risk_note or "-"))
-                        logger.info("SIGNAL found %s %s %s conf=%s rr=%.2f exch=%s", sig.market, sig.symbol, sig.direction, sig.confidence, float(sig.rr), sig.confirmations)
+                        logger.info("[mid][emit] %s market=%s dir=%s conf=%s rr=%.2f exch=%s notes=%s",
+            sig.symbol, sig.market, sig.direction, sig.confidence, float(sig.rr), sig.confirmations,
+            (sig.risk_note or "-")[:120])
+_mid_emitted += 1
                         await emit_signal_cb(sig)
                         await asyncio.sleep(2)
 
@@ -10262,4 +10264,3 @@ async def autotrade_stress_test(*, user_id: int, symbol: str, market_type: str =
     This build keeps production stable: stress-test is disabled here to avoid accidental trading.
     """
     return {"ok": False, "error": "stress_test_disabled_in_production"}
-
