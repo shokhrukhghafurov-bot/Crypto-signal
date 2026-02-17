@@ -9920,13 +9920,14 @@ class Backend:
         mid_symbol_timeout_sec = _parse_seconds_env('MID_SYMBOL_TIMEOUT_SEC', 0.0)
 
         while True:
+            interval_sec = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45") or 45)
             async def _mid_tick_body():
                 start = time.time()
                 if os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() in ("0","false","no"):
                     await asyncio.sleep(10)
                     return
 
-                interval = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45"))
+                interval = interval_sec
                 top_n = int(os.getenv("MID_TOP_N", "50"))
 
                 # --- MID trap digest state (persists across ticks) ---
