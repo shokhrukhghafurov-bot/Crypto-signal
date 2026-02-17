@@ -10327,7 +10327,7 @@ class Backend:
                 # Do not crash the loop; just continue to next tick.
                 tick_elapsed = None
             spent = float(tick_elapsed if tick_elapsed is not None else (mid_tick_timeout_sec or 0.0))
-            await asyncio.sleep(max(1, interval - int(spent)))
+            await asyncio.sleep(max(1, interval_sec - int(spent)))
 async def autotrade_healthcheck() -> dict:
     """DB-only health snapshot for autotrade. Never places orders."""
     try:
