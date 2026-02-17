@@ -28,7 +28,7 @@ from aiohttp import web
 
 import db_store
 
-from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test
+from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test, mid_summary_heartbeat_loop
 import time
 
 load_dotenv()
@@ -5716,15 +5716,9 @@ async def main() -> None:
                 if hasattr(backend, 'scanner_loop_mid'):
                     logger.info("Starting MID scanner_loop (5m/30m/1h) interval=%ss top_n=%s", os.getenv('MID_SCAN_INTERVAL_SECONDS',''), os.getenv('MID_TOP_N',''))
                     asyncio.create_task(backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert))
+                    # repeat last MID tick summary in logs so it doesn't get lost
+                    asyncio.create_task(mid_summary_heartbeat_loop())
 
-                    # Keep the MID tick summary visible in Railway logs by re-printing it periodically.
-                    try:
-                        mid_summary_every = int((os.getenv("MID_SUMMARY_EVERY_SEC", "0") or "0").strip())
-                    except Exception:
-                        mid_summary_every = 0
-                    if mid_summary_every > 0 and hasattr(backend, "mid_summary_heartbeat_loop"):
-                        logger.info("Starting MID summary heartbeat every=%ss", mid_summary_every)
-                        asyncio.create_task(backend.mid_summary_heartbeat_loop())
                 else:
                     logger.warning('MID_SCANNER_ENABLED=1 but Backend has no scanner_loop_mid; skipping')
 
