@@ -9899,401 +9899,422 @@ class Backend:
 
     async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         tf_trigger, tf_mid, tf_trend = "5m", "30m", "1h"
+
+        # Hard timeout for a whole MID tick (prevents 200s+ overruns).
+        # 0 = disabled.
+        mid_tick_timeout_sec = float(os.getenv("MID_TICK_TIMEOUT_SEC", "0") or "0")
+
+        # Soft timeout per symbol (skips symbols whose data fetch is too slow).
+        # 0 = disabled.
+        mid_symbol_timeout_sec = float(os.getenv("MID_SYMBOL_TIMEOUT_SEC", "0") or "0")
+
         while True:
-            start = time.time()
-            if os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() in ("0","false","no"):
-                await asyncio.sleep(10)
-                continue
+            async def _mid_tick_body():
+                start = time.time()
+                if os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() in ("0","false","no"):
+                    await asyncio.sleep(10)
+                    continue
 
-            interval = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45"))
-            top_n = int(os.getenv("MID_TOP_N", "50"))
+                interval = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45"))
+                top_n = int(os.getenv("MID_TOP_N", "50"))
 
-            # --- MID trap digest state (persists across ticks) ---
-            if not hasattr(self, "_mid_trap_digest_stats"):
-                self._mid_trap_digest_stats = {}
-            if not hasattr(self, "_mid_trap_digest_last_sent"):
-                self._mid_trap_digest_last_sent = time.time()
+                # --- MID trap digest state (persists across ticks) ---
+                if not hasattr(self, "_mid_trap_digest_stats"):
+                    self._mid_trap_digest_stats = {}
+                if not hasattr(self, "_mid_trap_digest_last_sent"):
+                    self._mid_trap_digest_last_sent = time.time()
 
-            mode = (os.getenv("MID_SIGNAL_MODE","").strip().lower()
-                    or os.getenv("SIGNAL_MODE","").strip().lower()
-                    or "strict")
-            if os.getenv("MID_STRICT","0").strip() in ("1","true","yes"):
-                mode = "strict"
+                mode = (os.getenv("MID_SIGNAL_MODE","").strip().lower()
+                        or os.getenv("SIGNAL_MODE","").strip().lower()
+                        or "strict")
+                if os.getenv("MID_STRICT","0").strip() in ("1","true","yes"):
+                    mode = "strict"
 
-            # 1:1 thresholds with MAIN scanner by default
-            use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
-            if use_main:
-                min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
-                min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
-            else:
-                min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76"))
-                min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72"))
-            min_rr = float(os.getenv("MID_MIN_RR","2.0"))
+                # 1:1 thresholds with MAIN scanner by default
+                use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
+                if use_main:
+                    min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
+                    min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
+                else:
+                    min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76"))
+                    min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72"))
+                min_rr = float(os.getenv("MID_MIN_RR","2.0"))
 
-            min_adx_30m = float(os.getenv("MID_MIN_ADX_30M","0") or "0")
-            min_adx_1h = float(os.getenv("MID_MIN_ADX_1H","0") or "0")
-            min_atr_pct = float(os.getenv("MID_MIN_ATR_PCT","0") or "0")
-            # HARD MID TP2-first extra filters
-            mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or "0")
-            mid_require_vwap_bias = os.getenv("MID_REQUIRE_VWAP_BIAS", "1").strip().lower() not in ("0","false","no","off")
-            mid_min_vwap_dist_atr = float(os.getenv("MID_MIN_VWAP_DIST_ATR", "0") or "0")
+                min_adx_30m = float(os.getenv("MID_MIN_ADX_30M","0") or "0")
+                min_adx_1h = float(os.getenv("MID_MIN_ADX_1H","0") or "0")
+                min_atr_pct = float(os.getenv("MID_MIN_ATR_PCT","0") or "0")
+                # HARD MID TP2-first extra filters
+                mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or "0")
+                mid_require_vwap_bias = os.getenv("MID_REQUIRE_VWAP_BIAS", "1").strip().lower() not in ("0","false","no","off")
+                mid_min_vwap_dist_atr = float(os.getenv("MID_MIN_VWAP_DIST_ATR", "0") or "0")
 
-            require_align = os.getenv("MID_REQUIRE_30M_TREND","1").strip().lower() not in ("0","false","no")
-            allow_futures = os.getenv("MID_ALLOW_FUTURES","1").strip().lower() not in ("0","false","no")
+                require_align = os.getenv("MID_REQUIRE_30M_TREND","1").strip().lower() not in ("0","false","no")
+                allow_futures = os.getenv("MID_ALLOW_FUTURES","1").strip().lower() not in ("0","false","no")
 
-            tp_policy = (os.getenv("MID_TP_POLICY","R") or "R").strip().upper()
-            tp1_r = float(os.getenv("MID_TP1_R","1.2"))
-            tp2_r = float(os.getenv("MID_TP2_R","2.8"))
+                tp_policy = (os.getenv("MID_TP_POLICY","R") or "R").strip().upper()
+                tp1_r = float(os.getenv("MID_TP1_R","1.2"))
+                tp2_r = float(os.getenv("MID_TP2_R","2.8"))
 
-            # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
-            _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
-            scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
-            if not scan_exchanges:
-                scan_exchanges = ['BINANCE','BYBIT','OKX','GATEIO','MEXC']
+                # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
+                _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
+                scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
+                if not scan_exchanges:
+                    scan_exchanges = ['BINANCE','BYBIT','OKX','GATEIO','MEXC']
 
-            try:
-                async with MultiExchangeData() as api:
-                    await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
-                    # Same best-effort symbols loading as MAIN scanner.
-                    try:
-                        symbols = await api.get_top_usdt_symbols(top_n)
-                        if symbols:
-                            self._symbols_cache = list(symbols)
-                            self._symbols_cache_ts = time.time()
-                    except Exception as e:
-                        if self._symbols_cache:
-                            logger.warning("[mid] get_top_usdt_symbols failed (%s); using cached symbols (%s)", e, len(self._symbols_cache))
-                            symbols = list(self._symbols_cache)
-                        else:
-                            raise
-                    # --- MID tick counters / diagnostics ---
-                    _mid_scanned = len(symbols)
-                    _mid_emitted = 0
-                    _mid_skip_blocked = 0
-                    _mid_skip_cooldown = 0
-                    _mid_skip_macro = 0
-                    _mid_skip_news = 0
-                    _mid_skip_trap = 0
-                    _mid_f_align = 0
-                    _mid_f_score = 0
-                    _mid_f_rr = 0
-                    _mid_f_adx = 0
-                    _mid_f_atr = 0
-                    _mid_f_futoff = 0
-                    logger.info("[mid] tick start TOP_N=%s interval=%ss scanned=%s", top_n, interval, _mid_scanned)
-                    mac_act, mac_ev, mac_win = self.macro.current_action()
-                    self.last_macro_action = mac_act
-                    if MACRO_FILTER:
-                        logger.info("[mid] macro action=%s next=%s window=%s", mac_act, getattr(mac_ev, "name", None) if mac_ev else None, mac_win)
-                        if mac_act != "ALLOW" and mac_ev and mac_win and self.macro.should_notify(mac_ev):
-                            logger.info("[mid][macro] alert: action=%s event=%s window=%s", mac_act, getattr(mac_ev, "name", None), mac_win)
-                            await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
+                try:
+                    async with MultiExchangeData() as api:
+                        await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
+                        # Same best-effort symbols loading as MAIN scanner.
+                        try:
+                            symbols = await api.get_top_usdt_symbols(top_n)
+                            if symbols:
+                                self._symbols_cache = list(symbols)
+                                self._symbols_cache_ts = time.time()
+                        except Exception as e:
+                            if self._symbols_cache:
+                                logger.warning("[mid] get_top_usdt_symbols failed (%s); using cached symbols (%s)", e, len(self._symbols_cache))
+                                symbols = list(self._symbols_cache)
+                            else:
+                                raise
+                        # --- MID tick counters / diagnostics ---
+                        _mid_scanned = len(symbols)
+                        _mid_emitted = 0
+                        _mid_skip_blocked = 0
+                        _mid_skip_cooldown = 0
+                        _mid_skip_macro = 0
+                        _mid_skip_news = 0
+                        _mid_skip_trap = 0
+                        _mid_f_align = 0
+                        _mid_f_score = 0
+                        _mid_f_rr = 0
+                        _mid_f_adx = 0
+                        _mid_f_atr = 0
+                        _mid_f_futoff = 0
+                        logger.info("[mid] tick start TOP_N=%s interval=%ss scanned=%s", top_n, interval, _mid_scanned)
+                        mac_act, mac_ev, mac_win = self.macro.current_action()
+                        self.last_macro_action = mac_act
+                        if MACRO_FILTER:
+                            logger.info("[mid] macro action=%s next=%s window=%s", mac_act, getattr(mac_ev, "name", None) if mac_ev else None, mac_win)
+                            if mac_act != "ALLOW" and mac_ev and mac_win and self.macro.should_notify(mac_ev):
+                                logger.info("[mid][macro] alert: action=%s event=%s window=%s", mac_act, getattr(mac_ev, "name", None), mac_win)
+                                await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
 
-                    for sym in symbols:
-                        if is_blocked_symbol(sym):
-                            _mid_skip_blocked += 1
-                            try:
-                                self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "blocked_symbol")
-                            except Exception:
-                                pass
-                            continue
-                        if not self.can_emit_mid(sym):
-                            _mid_skip_cooldown += 1
-                            try:
-                                self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "cooldown")
-                            except Exception:
-                                pass
-                            continue
-
-                        if MACRO_FILTER and mac_act == "PAUSE_ALL":
-                            _mid_skip_macro += 1
-                            try:
-                                self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "macro_pause_all")
-                            except Exception:
-                                pass
-                            continue
-                        news_act = "OK"
-                        if NEWS_FILTER and CRYPTOPANIC_TOKEN:
-                            news_act = await self.news.action_for_symbol(api.session, sym)
-                            if news_act == "PAUSE_ALL":
-                                _mid_skip_news += 1
+                        for sym in symbols:
+                            if is_blocked_symbol(sym):
+                                _mid_skip_blocked += 1
                                 try:
-                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "news_pause_all")
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "blocked_symbol")
+                                except Exception:
+                                    pass
+                                continue
+                            if not self.can_emit_mid(sym):
+                                _mid_skip_cooldown += 1
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "cooldown")
                                 except Exception:
                                     pass
                                 continue
 
-                        supporters = []
-                        for name in scan_exchanges:
-                            try:
-                                if name == "BINANCE":
-                                    a = await api.klines_binance(sym, tf_trigger, 250)
-                                    b = await api.klines_binance(sym, tf_mid, 250)
-                                    c = await api.klines_binance(sym, tf_trend, 250)
-                                elif name == "BYBIT":
-                                    a = await api.klines_bybit(sym, tf_trigger, 250)
-                                    b = await api.klines_bybit(sym, tf_mid, 250)
-                                    c = await api.klines_bybit(sym, tf_trend, 250)
-                                elif name == "OKX":
-                                    a = await api.klines_okx(sym, tf_trigger, 250)
-                                    b = await api.klines_okx(sym, tf_mid, 250)
-                                    c = await api.klines_okx(sym, tf_trend, 250)
-                                elif name == "GATEIO":
-                                    a = await api.klines_gateio(sym, tf_trigger, 250)
-                                    b = await api.klines_gateio(sym, tf_mid, 250)
-                                    c = await api.klines_gateio(sym, tf_trend, 250)
-                                elif name == "MEXC":
-                                    a = await api.klines_mexc(sym, tf_trigger, 250)
-                                    b = await api.klines_mexc(sym, tf_mid, 250)
-                                    c = await api.klines_mexc(sym, tf_trend, 250)
-                                else:
-                                    continue
-                                if a is None or b is None or c is None or a.empty or b.empty or c.empty:
-                                    no_data += 1
-                                    continue
-                                r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
-                                if r:
-                                    supporters.append((name, r))
-                            except Exception:
+                            if MACRO_FILTER and mac_act == "PAUSE_ALL":
+                                _mid_skip_macro += 1
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "macro_pause_all")
+                                except Exception:
+                                    pass
                                 continue
-                        if not supporters:
-                            continue
-
-                        best_name, best_r = max(supporters, key=lambda x: (float(x[1].get("confidence",0)), float(x[1].get("rr",0))))
-                        binance_r = next((r for n, r in supporters if n == "BINANCE"), None)
-                        base_r = binance_r or best_r
-                        # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
-                        if base_r.get("trap_ok") is False or base_r.get("blocked") is True:
-                            _mid_skip_trap += 1
-
-                            # collect digest stats (DO NOT forward to error-bot)
-                            _r = (base_r.get("trap_reason") or base_r.get("block_reason") or "")
-                            try:
-                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), str(_r))
-                            except Exception:
-                                pass
-                            logger.info("[mid][trap] %s %s blocked=%s reason=%s src_best=%s", sym, str(base_r.get("direction","")).upper(), base_r.get("blocked"), base_r.get("trap_reason",""), best_name)
-                            continue
-                        if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
-                            _mid_f_align += 1
-                            try:
-                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), "align_mismatch")
-                            except Exception:
-                                pass
-                            continue
-
-                        conf = float(base_r.get("confidence",0) or 0)
-                        rr = float(base_r.get("rr",0) or 0)
-                        adx30 = float(base_r.get("adx1",0) or 0)
-                        adx1h = float(base_r.get("adx4",0) or 0)
-                        atrp = float(base_r.get("atr_pct",0) or 0)
-
-                        if min_adx_30m and adx30 < min_adx_30m:
-                            _mid_f_adx += 1
-                            try:
-                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx30<{min_adx_30m:g} adx={adx30:g}")
-                            except Exception:
-                                pass
-                            continue
-                        if min_adx_1h and adx1h < min_adx_1h:
-                            _mid_f_adx += 1
-                            try:
-                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx1h<{min_adx_1h:g} adx={adx1h:g}")
-                            except Exception:
-                                pass
-                            continue
-                        if min_atr_pct and atrp < min_atr_pct:
-                            _mid_f_atr += 1
-                            try:
-                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"atr_pct<{min_atr_pct:g} atr%={atrp:g}")
-                            except Exception:
-                                pass
-                            continue
-
-                        market = choose_market(adx30, atrp)
-                        if not allow_futures:
-                            market = "SPOT"
-                        if market == "FUTURES" and (news_act == "FUTURES_OFF" or mac_act == "FUTURES_OFF"):
-                            _mid_f_futoff += 1
-                            market = "SPOT"
-
-                        min_conf = min_score_fut if market == "FUTURES" else min_score_spot
-                        if conf < float(min_conf):
-                            _mid_f_score += 1
-                            try:
-                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"score<{float(min_conf):g} score={conf:g}")
-                            except Exception:
-                                pass
-                            continue
-                        if rr < float(min_rr):
-                            _mid_f_rr += 1
-                            try:
-                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"rr<{float(min_rr):g} rr={rr:g}")
-                            except Exception:
-                                pass
-                            continue
-
-                        direction = str(base_r.get("direction","")).upper()
-                        entry = float(base_r["entry"]); sl = float(base_r["sl"])
-                        tp1 = float(base_r["tp1"]); tp2 = float(base_r["tp2"])
-                        # --- HARD MID filters (TP2-first) ---
-                        # 1) Volume must be real, иначе TP2 часто не добивает
-                        volx = float(base_r.get("rel_vol", 0.0) or 0.0)
-                        if mid_min_vol_x and volx < mid_min_vol_x:
-                            _mid_f_score += 1
-                            try:
-                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"vol_x<{mid_min_vol_x:g} vol_x={volx:g}")
-                            except Exception:
-                                pass
-                            continue
-
-                        # 2) Must be on the correct side of VWAP + far enough from VWAP (avoid chop)
-                        vwap_val_num = float(base_r.get("vwap_val", 0.0) or 0.0)
-                        atr30 = abs(entry) * (abs(atrp) / 100.0) if entry > 0 else 0.0
-                        if vwap_val_num > 0 and atr30 > 0:
-                            if mid_require_vwap_bias:
-                                if direction == "SHORT" and not (entry < vwap_val_num):
-                                    _mid_f_align += 1
+                            news_act = "OK"
+                            if NEWS_FILTER and CRYPTOPANIC_TOKEN:
+                                news_act = await self.news.action_for_symbol(api.session, sym)
+                                if news_act == "PAUSE_ALL":
+                                    _mid_skip_news += 1
                                     try:
-                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_short entry>=vwap vwap={vwap_val_num:g}")
-                                    except Exception:
-                                        pass
-                                    continue
-                                if direction == "LONG" and not (entry > vwap_val_num):
-                                    _mid_f_align += 1
-                                    try:
-                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_long entry<=vwap vwap={vwap_val_num:g}")
-                                    except Exception:
-                                        pass
-                                    continue
-                            if mid_min_vwap_dist_atr > 0:
-                                if abs(entry - vwap_val_num) < (atr30 * mid_min_vwap_dist_atr):
-                                    _mid_f_atr += 1
-                                    try:
-                                        dist = abs(entry - vwap_val_num) / atr30 if atr30 else 0.0
-                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_far {dist:.2g}atr")
+                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "news_pause_all")
                                     except Exception:
                                         pass
                                     continue
 
-                        if tp_policy == "R":
-                            risk = abs(entry-sl)
-                            if risk <= 0:
-                                continue
-                            if direction == "LONG":
-                                tp1 = entry + risk*tp1_r; tp2 = entry + risk*tp2_r
-                            else:
-                                tp1 = entry - risk*tp1_r; tp2 = entry - risk*tp2_r
-
-                        
-                        # Policy: SPOT + SHORT is confusing (spot has no short). Auto-convert to FUTURES.
-                        risk_note = _fmt_ta_block_mid(base_r, mode)
-                        if market == "SPOT" and str(direction).upper() == "SHORT":
-                            fut_forced_off = (not allow_futures) or (news_act == "FUTURES_OFF") or (mac_act == "FUTURES_OFF")
-                            if fut_forced_off:
-                                _mid_f_futoff += 1
-                                continue
-                            market = "FUTURES"
-                            if risk_note:
-                                risk_note = risk_note + "\n" + "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
-                            else:
-                                risk_note = "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
-
-                        # Exchanges where the symbol exists (used for display and SPOT autotrade routing).
-                        async def _pair_exists(ex: str) -> bool:
-                            try:
-                                exu = (ex or '').upper().strip()
-                                if market == 'FUTURES':
-                                    if exu == 'BINANCE':
-                                        p = await self._fetch_rest_price('FUTURES', sym)
-                                    elif exu == 'BYBIT':
-                                        p = await self._fetch_bybit_price('FUTURES', sym)
-                                    elif exu == 'OKX':
-                                        p = await self._fetch_okx_price('FUTURES', sym)
+                            supporters = []
+                            for name in scan_exchanges:
+                                try:
+                                    if name == "BINANCE":
+                                        a = await api.klines_binance(sym, tf_trigger, 250)
+                                        b = await api.klines_binance(sym, tf_mid, 250)
+                                        c = await api.klines_binance(sym, tf_trend, 250)
+                                    elif name == "BYBIT":
+                                        a = await api.klines_bybit(sym, tf_trigger, 250)
+                                        b = await api.klines_bybit(sym, tf_mid, 250)
+                                        c = await api.klines_bybit(sym, tf_trend, 250)
+                                    elif name == "OKX":
+                                        a = await api.klines_okx(sym, tf_trigger, 250)
+                                        b = await api.klines_okx(sym, tf_mid, 250)
+                                        c = await api.klines_okx(sym, tf_trend, 250)
+                                    elif name == "GATEIO":
+                                        a = await api.klines_gateio(sym, tf_trigger, 250)
+                                        b = await api.klines_gateio(sym, tf_mid, 250)
+                                        c = await api.klines_gateio(sym, tf_trend, 250)
+                                    elif name == "MEXC":
+                                        a = await api.klines_mexc(sym, tf_trigger, 250)
+                                        b = await api.klines_mexc(sym, tf_mid, 250)
+                                        c = await api.klines_mexc(sym, tf_trend, 250)
                                     else:
-                                        return False
-                                    return bool(p and float(p) > 0)
-                                # SPOT
-                                if exu == 'BINANCE':
-                                    p = await self._fetch_rest_price('SPOT', sym)
-                                elif exu == 'BYBIT':
-                                    p = await self._fetch_bybit_price('SPOT', sym)
-                                elif exu == 'OKX':
-                                    p = await self._fetch_okx_price('SPOT', sym)
-                                elif exu == 'MEXC':
-                                    p = await _mexc_public_price(sym)
-                                else:  # GATEIO
-                                    p = await _gateio_public_price(sym)
-                                return bool(p and float(p) > 0)
-                            except Exception:
-                                return False
-
-                        
-                        # --- HARD BLOCK: FUTURES signal must have a real futures contract on executable venues ---
-                        # If choose_market() selected FUTURES but the symbol has no futures instrument on
-                        # Binance/Bybit/OKX, we skip emitting this signal. (No auto-downgrade to SPOT.)
-                        if market == "FUTURES":
-                            try:
-                                _fut_ok = await asyncio.gather(_pair_exists("BINANCE"), _pair_exists("BYBIT"), _pair_exists("OKX"))
-                                if not any(bool(x) for x in _fut_ok):
-                                    logger.info("[scanner] skip %s FUTURES: no contract on BINANCE/BYBIT/OKX (best_source=%s)", sym, best_name)
+                                        continue
+                                    if a is None or b is None or c is None or a.empty or b.empty or c.empty:
+                                        no_data += 1
+                                        continue
+                                    r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
+                                    if r:
+                                        supporters.append((name, r))
+                                except Exception:
                                     continue
-                            except Exception as _e:
-                                logger.info("[scanner] skip %s FUTURES: futures existence check failed: %s", sym, _e)
+                            if not supporters:
                                 continue
 
-# Exchanges where the instrument exists for the given market.
-                        _ex_order = ['BINANCE', 'BYBIT', 'OKX'] if market == 'FUTURES' else ['BINANCE', 'BYBIT', 'OKX', 'GATEIO', 'MEXC']
-                        _oks = await asyncio.gather(*[_pair_exists(x) for x in _ex_order])
-                        _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
-                        if not _pair_exchanges:
-                            _pair_exchanges = [best_name]
-                        conf_names = '+'.join(_pair_exchanges)
-                        sig = Signal(
-                        signal_id=self.next_signal_id(),
-                        market=market,
-                        symbol=sym,
-                        direction=direction,
-                        timeframe=f"{tf_trigger}/{tf_mid}/{tf_trend}",
-                        entry=entry, sl=sl, tp1=float(tp1), tp2=float(tp2),
-                        rr=float(tp2_r if tp_policy=="R" else rr),
-                        confidence=int(round(conf)),
-                        confirmations=conf_names,
-                        source_exchange=best_name,
-                        available_exchanges=conf_names,
-                        risk_note=risk_note,
-                        ts=time.time(),
-                        )
-                        self.mark_emitted_mid(sym)
-                        self.last_signal = sig
-                        if sig.market == "SPOT":
-                            self.last_spot_signal = sig
-                        else:
-                            self.last_futures_signal = sig
-                        await emit_signal_cb(sig)
-                        await asyncio.sleep(2)
-            except Exception:
-                logger.exception("[mid] scanner_loop_mid error")
+                            best_name, best_r = max(supporters, key=lambda x: (float(x[1].get("confidence",0)), float(x[1].get("rr",0))))
+                            binance_r = next((r for n, r in supporters if n == "BINANCE"), None)
+                            base_r = binance_r or best_r
+                            # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
+                            if base_r.get("trap_ok") is False or base_r.get("blocked") is True:
+                                _mid_skip_trap += 1
+
+                                # collect digest stats (DO NOT forward to error-bot)
+                                _r = (base_r.get("trap_reason") or base_r.get("block_reason") or "")
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), str(_r))
+                                except Exception:
+                                    pass
+                                logger.info("[mid][trap] %s %s blocked=%s reason=%s src_best=%s", sym, str(base_r.get("direction","")).upper(), base_r.get("blocked"), base_r.get("trap_reason",""), best_name)
+                                continue
+                            if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
+                                _mid_f_align += 1
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), "align_mismatch")
+                                except Exception:
+                                    pass
+                                continue
+
+                            conf = float(base_r.get("confidence",0) or 0)
+                            rr = float(base_r.get("rr",0) or 0)
+                            adx30 = float(base_r.get("adx1",0) or 0)
+                            adx1h = float(base_r.get("adx4",0) or 0)
+                            atrp = float(base_r.get("atr_pct",0) or 0)
+
+                            if min_adx_30m and adx30 < min_adx_30m:
+                                _mid_f_adx += 1
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx30<{min_adx_30m:g} adx={adx30:g}")
+                                except Exception:
+                                    pass
+                                continue
+                            if min_adx_1h and adx1h < min_adx_1h:
+                                _mid_f_adx += 1
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx1h<{min_adx_1h:g} adx={adx1h:g}")
+                                except Exception:
+                                    pass
+                                continue
+                            if min_atr_pct and atrp < min_atr_pct:
+                                _mid_f_atr += 1
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"atr_pct<{min_atr_pct:g} atr%={atrp:g}")
+                                except Exception:
+                                    pass
+                                continue
+
+                            market = choose_market(adx30, atrp)
+                            if not allow_futures:
+                                market = "SPOT"
+                            if market == "FUTURES" and (news_act == "FUTURES_OFF" or mac_act == "FUTURES_OFF"):
+                                _mid_f_futoff += 1
+                                market = "SPOT"
+
+                            min_conf = min_score_fut if market == "FUTURES" else min_score_spot
+                            if conf < float(min_conf):
+                                _mid_f_score += 1
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"score<{float(min_conf):g} score={conf:g}")
+                                except Exception:
+                                    pass
+                                continue
+                            if rr < float(min_rr):
+                                _mid_f_rr += 1
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"rr<{float(min_rr):g} rr={rr:g}")
+                                except Exception:
+                                    pass
+                                continue
+
+                            direction = str(base_r.get("direction","")).upper()
+                            entry = float(base_r["entry"]); sl = float(base_r["sl"])
+                            tp1 = float(base_r["tp1"]); tp2 = float(base_r["tp2"])
+                            # --- HARD MID filters (TP2-first) ---
+                            # 1) Volume must be real, иначе TP2 часто не добивает
+                            volx = float(base_r.get("rel_vol", 0.0) or 0.0)
+                            if mid_min_vol_x and volx < mid_min_vol_x:
+                                _mid_f_score += 1
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"vol_x<{mid_min_vol_x:g} vol_x={volx:g}")
+                                except Exception:
+                                    pass
+                                continue
+
+                            # 2) Must be on the correct side of VWAP + far enough from VWAP (avoid chop)
+                            vwap_val_num = float(base_r.get("vwap_val", 0.0) or 0.0)
+                            atr30 = abs(entry) * (abs(atrp) / 100.0) if entry > 0 else 0.0
+                            if vwap_val_num > 0 and atr30 > 0:
+                                if mid_require_vwap_bias:
+                                    if direction == "SHORT" and not (entry < vwap_val_num):
+                                        _mid_f_align += 1
+                                        try:
+                                            self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_short entry>=vwap vwap={vwap_val_num:g}")
+                                        except Exception:
+                                            pass
+                                        continue
+                                    if direction == "LONG" and not (entry > vwap_val_num):
+                                        _mid_f_align += 1
+                                        try:
+                                            self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_long entry<=vwap vwap={vwap_val_num:g}")
+                                        except Exception:
+                                            pass
+                                        continue
+                                if mid_min_vwap_dist_atr > 0:
+                                    if abs(entry - vwap_val_num) < (atr30 * mid_min_vwap_dist_atr):
+                                        _mid_f_atr += 1
+                                        try:
+                                            dist = abs(entry - vwap_val_num) / atr30 if atr30 else 0.0
+                                            self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_far {dist:.2g}atr")
+                                        except Exception:
+                                            pass
+                                        continue
+
+                            if tp_policy == "R":
+                                risk = abs(entry-sl)
+                                if risk <= 0:
+                                    continue
+                                if direction == "LONG":
+                                    tp1 = entry + risk*tp1_r; tp2 = entry + risk*tp2_r
+                                else:
+                                    tp1 = entry - risk*tp1_r; tp2 = entry - risk*tp2_r
+
+                        
+                            # Policy: SPOT + SHORT is confusing (spot has no short). Auto-convert to FUTURES.
+                            risk_note = _fmt_ta_block_mid(base_r, mode)
+                            if market == "SPOT" and str(direction).upper() == "SHORT":
+                                fut_forced_off = (not allow_futures) or (news_act == "FUTURES_OFF") or (mac_act == "FUTURES_OFF")
+                                if fut_forced_off:
+                                    _mid_f_futoff += 1
+                                    continue
+                                market = "FUTURES"
+                                if risk_note:
+                                    risk_note = risk_note + "\n" + "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
+                                else:
+                                    risk_note = "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
+
+                            # Exchanges where the symbol exists (used for display and SPOT autotrade routing).
+                            async def _pair_exists(ex: str) -> bool:
+                                try:
+                                    exu = (ex or '').upper().strip()
+                                    if market == 'FUTURES':
+                                        if exu == 'BINANCE':
+                                            p = await self._fetch_rest_price('FUTURES', sym)
+                                        elif exu == 'BYBIT':
+                                            p = await self._fetch_bybit_price('FUTURES', sym)
+                                        elif exu == 'OKX':
+                                            p = await self._fetch_okx_price('FUTURES', sym)
+                                        else:
+                                            return False
+                                        return bool(p and float(p) > 0)
+                                    # SPOT
+                                    if exu == 'BINANCE':
+                                        p = await self._fetch_rest_price('SPOT', sym)
+                                    elif exu == 'BYBIT':
+                                        p = await self._fetch_bybit_price('SPOT', sym)
+                                    elif exu == 'OKX':
+                                        p = await self._fetch_okx_price('SPOT', sym)
+                                    elif exu == 'MEXC':
+                                        p = await _mexc_public_price(sym)
+                                    else:  # GATEIO
+                                        p = await _gateio_public_price(sym)
+                                    return bool(p and float(p) > 0)
+                                except Exception:
+                                    return False
+
+                        
+                            # --- HARD BLOCK: FUTURES signal must have a real futures contract on executable venues ---
+                            # If choose_market() selected FUTURES but the symbol has no futures instrument on
+                            # Binance/Bybit/OKX, we skip emitting this signal. (No auto-downgrade to SPOT.)
+                            if market == "FUTURES":
+                                try:
+                                    _fut_ok = await asyncio.gather(_pair_exists("BINANCE"), _pair_exists("BYBIT"), _pair_exists("OKX"))
+                                    if not any(bool(x) for x in _fut_ok):
+                                        logger.info("[scanner] skip %s FUTURES: no contract on BINANCE/BYBIT/OKX (best_source=%s)", sym, best_name)
+                                        continue
+                                except Exception as _e:
+                                    logger.info("[scanner] skip %s FUTURES: futures existence check failed: %s", sym, _e)
+                                    continue
+
+    # Exchanges where the instrument exists for the given market.
+                            _ex_order = ['BINANCE', 'BYBIT', 'OKX'] if market == 'FUTURES' else ['BINANCE', 'BYBIT', 'OKX', 'GATEIO', 'MEXC']
+                            _oks = await asyncio.gather(*[_pair_exists(x) for x in _ex_order])
+                            _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
+                            if not _pair_exchanges:
+                                _pair_exchanges = [best_name]
+                            conf_names = '+'.join(_pair_exchanges)
+                            sig = Signal(
+                            signal_id=self.next_signal_id(),
+                            market=market,
+                            symbol=sym,
+                            direction=direction,
+                            timeframe=f"{tf_trigger}/{tf_mid}/{tf_trend}",
+                            entry=entry, sl=sl, tp1=float(tp1), tp2=float(tp2),
+                            rr=float(tp2_r if tp_policy=="R" else rr),
+                            confidence=int(round(conf)),
+                            confirmations=conf_names,
+                            source_exchange=best_name,
+                            available_exchanges=conf_names,
+                            risk_note=risk_note,
+                            ts=time.time(),
+                            )
+                            self.mark_emitted_mid(sym)
+                            self.last_signal = sig
+                            if sig.market == "SPOT":
+                                self.last_spot_signal = sig
+                            else:
+                                self.last_futures_signal = sig
+                            await emit_signal_cb(sig)
+                            await asyncio.sleep(2)
+                except Exception:
+                    logger.exception("[mid] scanner_loop_mid error")
 
 
-            # --- send digest every MID_TRAP_DIGEST_SEC ---
-            try:
-                self._mid_trap_digest_last_sent = await self._mid_digest_maybe_send(
-                    self._mid_trap_digest_stats, float(getattr(self, "_mid_trap_digest_last_sent", time.time()))
-                )
-            except Exception:
-                pass
-
-            elapsed = time.time() - start
-            try:
-                summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} elapsed={float(elapsed):.1f}s"
-                logger.info("[mid] %s", summary)
+                # --- send digest every MID_TRAP_DIGEST_SEC ---
                 try:
-                    _mid_set_last_summary(summary)
+                    self._mid_trap_digest_last_sent = await self._mid_digest_maybe_send(
+                        self._mid_trap_digest_stats, float(getattr(self, "_mid_trap_digest_last_sent", time.time()))
+                    )
                 except Exception:
                     pass
-            except Exception:
-                pass
+
+                elapsed = time.time() - start
+                try:
+                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} elapsed={float(elapsed):.1f}s"
+                    logger.info("[mid] %s", summary)
+                    try:
+                        _mid_set_last_summary(summary)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                return elapsed
+            tick_elapsed = None
+            try:
+                if mid_tick_timeout_sec and mid_tick_timeout_sec > 0:
+                    tick_elapsed = await asyncio.wait_for(_mid_tick_body(), timeout=mid_tick_timeout_sec)
+                else:
+                    tick_elapsed = await _mid_tick_body()
+            except asyncio.TimeoutError:
+                logger.warning(f"[mid] tick TIMEOUT after {mid_tick_timeout_sec:.1f}s; skipped (set MID_TICK_TIMEOUT_SEC=0 to disable)")
+                # Do not crash the loop; just continue to next tick.
+                tick_elapsed = None
             await asyncio.sleep(max(1, interval - int(elapsed)))
 async def autotrade_healthcheck() -> dict:
     """DB-only health snapshot for autotrade. Never places orders."""
