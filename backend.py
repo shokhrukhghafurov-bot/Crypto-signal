@@ -344,6 +344,35 @@ from cryptography.fernet import Fernet
 
 logger = logging.getLogger("crypto-signal")
 
+# --- MID summary heartbeat (to keep tick summary visible in short-lived log UIs like Railway) ---
+MID_LAST_SUMMARY = None
+MID_LAST_SUMMARY_AT = 0.0
+
+async def mid_summary_heartbeat_loop():
+    """Periodically re-print the last MID tick summary so it doesn't 'flash' in log UIs."""
+    try:
+        every = int((os.getenv("MID_SUMMARY_EVERY_SEC", "0") or "0").strip())
+    except Exception:
+        every = 0
+    if every <= 0:
+        return
+
+    # Avoid ultra-spam: minimum 2s
+    every = max(2, every)
+
+    while True:
+        await asyncio.sleep(every)
+        try:
+            if not MID_LAST_SUMMARY:
+                continue
+            age = (time.time() - float(MID_LAST_SUMMARY_AT or 0.0)) if MID_LAST_SUMMARY_AT else 0.0
+            # If summary is very old, stop repeating it frequently (still keep loop alive)
+            if age > max(120, every * 10):
+                continue
+            logger.info("[mid][summary] %s", MID_LAST_SUMMARY)
+        except Exception:
+            pass
+
 
 # --- MID trap digest sink (aggregates "MID blocked (trap)" into a periodic digest) ---
 
@@ -10265,6 +10294,19 @@ class Backend:
                 logger.info("[mid] tick done scanned=%s emitted=%s blocked=%s cooldown=%s macro=%s news=%s align=%s score=%s rr=%s adx=%s atr=%s futoff=%s elapsed=%.1fs",
                             _mid_scanned, _mid_emitted, _mid_skip_blocked, _mid_skip_cooldown, _mid_skip_macro, _mid_skip_news,
                             _mid_f_align, _mid_f_score, _mid_f_rr, _mid_f_adx, _mid_f_atr, _mid_f_futoff, float(elapsed))
+                # Store last summary for heartbeat re-print
+                try:
+                    global MID_LAST_SUMMARY, MID_LAST_SUMMARY_AT
+                    MID_LAST_SUMMARY = (
+                        f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} "
+                        f"cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} "
+                        f"align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} "
+                        f"atr={_mid_f_atr} futoff={_mid_f_futoff} elapsed={float(elapsed):.1f}s"
+                    )
+                    MID_LAST_SUMMARY_AT = time.time()
+                except Exception:
+                    pass
+
             except Exception:
                 pass
             await asyncio.sleep(max(1, interval - int(elapsed)))
