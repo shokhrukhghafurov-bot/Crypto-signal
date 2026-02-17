@@ -9899,21 +9899,32 @@ class Backend:
 
     async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         tf_trigger, tf_mid, tf_trend = "5m", "30m", "1h"
+        def _parse_seconds_env(name: str, default: float) -> float:
+            raw = os.getenv(name, "").strip()
+            if raw == "":
+                return float(default)
+            if raw.lower().endswith("s"):
+                raw = raw[:-1].strip()
+            try:
+                return float(raw)
+            except Exception:
+                return float(default)
+
 
         # Hard timeout for a whole MID tick (prevents 200s+ overruns).
         # 0 = disabled.
-        mid_tick_timeout_sec = float(os.getenv("MID_TICK_TIMEOUT_SEC", "0") or "0")
+        mid_tick_timeout_sec = _parse_seconds_env('MID_TICK_TIMEOUT_SEC', 0.0)
 
         # Soft timeout per symbol (skips symbols whose data fetch is too slow).
         # 0 = disabled.
-        mid_symbol_timeout_sec = float(os.getenv("MID_SYMBOL_TIMEOUT_SEC", "0") or "0")
+        mid_symbol_timeout_sec = _parse_seconds_env('MID_SYMBOL_TIMEOUT_SEC', 0.0)
 
         while True:
             async def _mid_tick_body():
                 start = time.time()
                 if os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() in ("0","false","no"):
                     await asyncio.sleep(10)
-                    continue
+                    return
 
                 interval = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45"))
                 top_n = int(os.getenv("MID_TOP_N", "50"))
@@ -10315,7 +10326,8 @@ class Backend:
                 logger.warning(f"[mid] tick TIMEOUT after {mid_tick_timeout_sec:.1f}s; skipped (set MID_TICK_TIMEOUT_SEC=0 to disable)")
                 # Do not crash the loop; just continue to next tick.
                 tick_elapsed = None
-            await asyncio.sleep(max(1, interval - int(elapsed)))
+            spent = float(tick_elapsed if tick_elapsed is not None else (mid_tick_timeout_sec or 0.0))
+            await asyncio.sleep(max(1, interval - int(spent)))
 async def autotrade_healthcheck() -> dict:
     """DB-only health snapshot for autotrade. Never places orders."""
     try:
