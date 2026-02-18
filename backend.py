@@ -9833,6 +9833,7 @@ class Backend:
                         except Exception:
                             pass
                         await emit_signal_cb(sig)
+                        _mid_emitted += 1
                         await asyncio.sleep(2)
 
             except Exception:
@@ -10367,7 +10368,7 @@ class Backend:
                 elapsed = time.time() - start
                 try:
                     summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} elapsed={float(elapsed):.1f}s"
-                    logger.info("[mid] %s", summary)
+                    logger.info("[mid][summary] %s", summary)
                     try:
                         _mid_set_last_summary(summary)
                     except Exception:
