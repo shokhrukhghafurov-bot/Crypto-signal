@@ -414,6 +414,24 @@ async def mid_summary_heartbeat_loop() -> None:
             logger.info("[mid][summary] %s (age=%.0fs)", MID_LAST_SUMMARY, age)
 
 
+
+# --- MID hard-block counter (for honest [mid][summary] metrics) ---
+# Counts cases where evaluate_on_exchange_mid_v2() rejected a candidate via _mid_block_reason(...).
+_MID_HARD_BLOCK_TOTAL = 0
+
+def _mid_inc_hard_block(n: int = 1) -> None:
+    global _MID_HARD_BLOCK_TOTAL
+    try:
+        _MID_HARD_BLOCK_TOTAL += int(n)
+    except Exception:
+        pass
+
+def _mid_hard_block_total() -> int:
+    try:
+        return int(_MID_HARD_BLOCK_TOTAL)
+    except Exception:
+        return 0
+
 # --- MID trap digest sink (aggregates "MID blocked (trap)" into a periodic digest) ---
 
 # Trap log dedup (avoid spamming the same message every second)
@@ -6982,6 +7000,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         )
         if reason:
             try:
+                _mid_inc_hard_block(1)
                 _k = f"block|{symbol}|{dir_trend}|{_mid_trap_reason_key(str(reason))}"
                 if _mid_trap_should_log(_k):
                     logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, reason, float(entry))
@@ -10060,6 +10079,8 @@ class Backend:
                         _mid_f_adx = 0
                         _mid_f_atr = 0
                         _mid_f_futoff = 0
+                        _mid_hard_block0 = _mid_hard_block_total()
+                        _mid_hard_block = 0
                         logger.info("[mid] tick start TOP_N=%s interval=%ss pool=%s scanned=%s (MID_TOP_N_SYMBOLS=%s)", top_n, interval, _mid_pool, _mid_scanned, top_n_symbols)
                         logger.info("[mid][scanner] symbols loaded: %s (pool=%s)", _mid_scanned, _mid_pool)
                         mac_act, mac_ev, mac_win = self.macro.current_action()
@@ -10367,8 +10388,9 @@ class Backend:
 
                 elapsed = time.time() - start
                 try:
-                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} elapsed={float(elapsed):.1f}s"
-                    logger.info("[mid][summary] %s", summary)
+                    _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
+                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} elapsed={float(elapsed):.1f}s"
+                    logger.info("[mid] %s", summary)
                     try:
                         _mid_set_last_summary(summary)
                     except Exception:
