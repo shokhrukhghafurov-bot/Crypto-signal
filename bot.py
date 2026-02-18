@@ -5714,7 +5714,7 @@ async def main() -> None:
             mid_enabled = os.getenv('MID_SCANNER_ENABLED', '1').strip().lower() not in ('0','false','no','off')
             if mid_enabled:
                 if hasattr(backend, 'scanner_loop_mid'):
-                    logger.info("Starting MID scanner_loop (5m/30m/1h) interval=%ss top_n=%s", int(os.getenv('MID_SCAN_INTERVAL_SECONDS','45')), int(os.getenv('MID_TOP_N','70')))
+                    logger.info("Starting MID scanner_loop (5m/30m/1h) interval=%ss top_n=%s", int((os.getenv("MID_SCAN_INTERVAL_SECONDS","").strip() or os.getenv("MID_SCAN_INTERVAL_SEC","45").strip()) or 45), int(os.getenv("MID_TOP_N","70")))
                     asyncio.create_task(backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert))
                     # repeat last MID tick summary in logs so it doesn't get lost
                     asyncio.create_task(mid_summary_heartbeat_loop())
