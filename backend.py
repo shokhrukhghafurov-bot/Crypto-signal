@@ -9920,7 +9920,7 @@ class Backend:
         mid_symbol_timeout_sec = _parse_seconds_env('MID_SYMBOL_TIMEOUT_SEC', 0.0)
 
         while True:
-            interval_sec = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45") or 45)
+            interval_sec = int((os.getenv("MID_SCAN_INTERVAL_SECONDS", "").strip() or os.getenv("MID_SCAN_INTERVAL_SEC", "45").strip()) or 45)
             async def _mid_tick_body():
                 start = time.time()
                 if os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() in ("0","false","no"):
@@ -10010,6 +10010,7 @@ class Backend:
                         _mid_skip_trap = 0
                         _mid_f_align = 0
                         _mid_f_score = 0
+                        _mid_f_vol = 0
                         _mid_f_rr = 0
                         _mid_f_adx = 0
                         _mid_f_atr = 0
@@ -10154,7 +10155,7 @@ class Backend:
 
                             min_conf = min_score_fut if market == "FUTURES" else min_score_spot
                             if conf < float(min_conf):
-                                _mid_f_score += 1
+                                _mid_f_vol += 1
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"score<{float(min_conf):g} score={conf:g}")
                                 except Exception:
@@ -10175,7 +10176,7 @@ class Backend:
                             # 1) Volume must be real, иначе TP2 часто не добивает
                             volx = float(base_r.get("rel_vol", 0.0) or 0.0)
                             if mid_min_vol_x and volx < mid_min_vol_x:
-                                _mid_f_score += 1
+                                _mid_f_vol += 1
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"vol_x<{mid_min_vol_x:g} vol_x={volx:g}")
                                 except Exception:
@@ -10321,7 +10322,7 @@ class Backend:
 
                 elapsed = time.time() - start
                 try:
-                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} elapsed={float(elapsed):.1f}s"
+                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} vol={_mid_f_vol} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} elapsed={float(elapsed):.1f}s"
                     logger.info("[mid] %s", summary)
                     try:
                         _mid_set_last_summary(summary)
