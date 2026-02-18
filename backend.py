@@ -9544,7 +9544,7 @@ class Backend:
                         else:
                             raise
                     self.scanned_symbols_last = len(symbols)
-                    logger.info("[scanner] symbols loaded: %s", self.scanned_symbols_last)
+                    logger.info("[main][scanner] symbols loaded: %s (TOP_N=%s)", self.scanned_symbols_last, TOP_N)
 
                     mac_act, mac_ev, mac_win = self.macro.current_action()
                     self.last_macro_action = mac_act
@@ -9929,6 +9929,11 @@ class Backend:
 
                 interval = interval_sec
                 top_n = int(os.getenv("MID_TOP_N", "50"))
+                top_n_symbols = int(os.getenv("MID_TOP_N_SYMBOLS", str(top_n)) or top_n)
+                # MID_TOP_N_SYMBOLS defines the *universe* size to load (e.g. 200).
+                # MID_TOP_N defines how many of that universe to actually scan each tick (e.g. 70).
+                if top_n_symbols < top_n:
+                    top_n_symbols = top_n
 
                 # --- MID trap digest state (persists across ticks) ---
                 if not hasattr(self, "_mid_trap_digest_stats"):
@@ -9977,19 +9982,26 @@ class Backend:
                     async with MultiExchangeData() as api:
                         await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
                         # Same best-effort symbols loading as MAIN scanner.
+                        # --- MID symbols pool (independent from MAIN scanner cache) ---
+                        if not hasattr(self, "_mid_symbols_cache"):
+                            self._mid_symbols_cache = []
+                            self._mid_symbols_cache_ts = 0.0
                         try:
-                            symbols = await api.get_top_usdt_symbols(top_n)
-                            if symbols:
-                                self._symbols_cache = list(symbols)
-                                self._symbols_cache_ts = time.time()
+                            symbols_pool = await api.get_top_usdt_symbols(top_n_symbols)
+                            if symbols_pool:
+                                self._mid_symbols_cache = list(symbols_pool)
+                                self._mid_symbols_cache_ts = time.time()
                         except Exception as e:
-                            if self._symbols_cache:
-                                logger.warning("[mid] get_top_usdt_symbols failed (%s); using cached symbols (%s)", e, len(self._symbols_cache))
-                                symbols = list(self._symbols_cache)
+                            if getattr(self, "_mid_symbols_cache", None):
+                                logger.warning("[mid] get_top_usdt_symbols failed (%s); using cached symbols (%s)", e, len(self._mid_symbols_cache))
+                                symbols_pool = list(self._mid_symbols_cache)
                             else:
                                 raise
+                        # Scan only first MID_TOP_N symbols from the loaded universe.
+                        symbols = list(symbols_pool[:max(0, int(top_n))])
                         # --- MID tick counters / diagnostics ---
                         _mid_scanned = len(symbols)
+                        _mid_pool = len(symbols_pool)
                         _mid_emitted = 0
                         _mid_skip_blocked = 0
                         _mid_skip_cooldown = 0
@@ -10002,7 +10014,8 @@ class Backend:
                         _mid_f_adx = 0
                         _mid_f_atr = 0
                         _mid_f_futoff = 0
-                        logger.info("[mid] tick start TOP_N=%s interval=%ss scanned=%s", top_n, interval, _mid_scanned)
+                        logger.info("[mid] tick start TOP_N=%s interval=%ss pool=%s scanned=%s (MID_TOP_N_SYMBOLS=%s)", top_n, interval, _mid_pool, _mid_scanned, top_n_symbols)
+                        logger.info("[mid][scanner] symbols loaded: %s (pool=%s)", _mid_scanned, _mid_pool)
                         mac_act, mac_ev, mac_win = self.macro.current_action()
                         self.last_macro_action = mac_act
                         if MACRO_FILTER:
@@ -10324,8 +10337,12 @@ class Backend:
                 else:
                     tick_elapsed = await _mid_tick_body()
             except asyncio.TimeoutError:
-                logger.warning(f"[mid] tick TIMEOUT after {mid_tick_timeout_sec:.1f}s; skipped (set MID_TICK_TIMEOUT_SEC=0 to disable)")
-                # Do not crash the loop; just continue to next tick.
+                summary = f"tick TIMEOUT after {mid_tick_timeout_sec:.1f}s (TOP_N={int(os.getenv('MID_TOP_N','50') or 50)} MID_TOP_N_SYMBOLS={int(os.getenv('MID_TOP_N_SYMBOLS', os.getenv('MID_TOP_N','50')) or (os.getenv('MID_TOP_N','50') or 50))})"
+                logger.warning("[mid][summary] %s; skipped (set MID_TICK_TIMEOUT_SEC=0 to disable)", summary)
+                try:
+                    _mid_set_last_summary(summary)
+                except Exception:
+                    pass
                 tick_elapsed = None
             spent = float(tick_elapsed if tick_elapsed is not None else (mid_tick_timeout_sec or 0.0))
             sleep_for = max(1, (interval_sec if interval_sec > 0 else 1) - int(spent))
