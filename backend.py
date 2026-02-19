@@ -10121,6 +10121,81 @@ class Backend:
                 scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
                 if not scan_exchanges:
                     scan_exchanges = ['BINANCE','BYBIT','OKX','GATEIO','MEXC']
+                # --- MID candles routing: stable primary (hash) BINANCE/BYBIT + fallback + smart cache ---
+                _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT") or "").strip()
+                mid_primary_exchanges = [x.strip().upper() for x in _primary_ex.split(",") if x.strip()]
+                if len(mid_primary_exchanges) < 2:
+                    mid_primary_exchanges = ["BINANCE", "BYBIT"]
+                # keep only those available in scan_exchanges
+                mid_primary_exchanges = [x for x in mid_primary_exchanges if x in scan_exchanges] or ["BINANCE", "BYBIT"]
+                mid_fallback_exchanges = [x for x in scan_exchanges if x not in mid_primary_exchanges]
+
+                mid_primary_mode = (os.getenv("MID_PRIMARY_MODE", "hash") or "hash").strip().lower()
+                mid_candles_retry = int(os.getenv("MID_CANDLES_RETRY", "1") or "1")
+                mid_cache_ttl_5m = int(os.getenv("MID_CANDLES_CACHE_TTL_5M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "60")) or "60")
+                mid_cache_ttl_30m = int(os.getenv("MID_CANDLES_CACHE_TTL_30M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "180")) or "180")
+                mid_cache_ttl_1h = int(os.getenv("MID_CANDLES_CACHE_TTL_1H", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "300")) or "300")
+                mid_cache_stale_sec = int(os.getenv("MID_CANDLES_CACHE_STALE_SEC", "900") or "900")
+
+                _mid_candles_cache: Dict[Tuple[str,str,str,int], Tuple[float, pd.DataFrame]] = {}
+
+                def _mid_cache_ttl(tf: str) -> int:
+                    t = (tf or "").lower()
+                    if t in ("5m", "5min", "5"):
+                        return mid_cache_ttl_5m
+                    if t in ("30m", "30min", "30"):
+                        return mid_cache_ttl_30m
+                    return mid_cache_ttl_1h
+
+                def _mid_primary_for_symbol(symb: str) -> str:
+                    # Stable routing: hash(symbol) -> primary exchange from MID_PRIMARY_EXCHANGES
+                    if not mid_primary_exchanges:
+                        return "BINANCE"
+                    if mid_primary_mode not in ("hash", "round_robin"):
+                        # unknown mode -> hash
+                        pass
+                    try:
+                        h = int.from_bytes(hashlib.sha1(symb.encode("utf-8")).digest()[:4], "big")
+                    except Exception:
+                        h = sum(ord(c) for c in symb)
+                    return mid_primary_exchanges[h % len(mid_primary_exchanges)]
+
+                async def _mid_fetch_klines_rest(ex_name: str, symb: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
+                    try:
+                        if ex_name == "BINANCE":
+                            return await api.klines_binance(symb, tf, limit)
+                        if ex_name == "BYBIT":
+                            return await api.klines_bybit(symb, tf, limit)
+                        if ex_name == "OKX":
+                            return await api.klines_okx(symb, tf, limit)
+                        if ex_name == "GATEIO":
+                            return await api.klines_gateio(symb, tf, limit)
+                        # default MEXC
+                        return await api.klines_mexc(symb, tf, limit)
+                    except Exception:
+                        return None
+
+                async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
+                    key = (ex_name, symb, tf, int(limit))
+                    now = time.time()
+                    ttl = _mid_cache_ttl(tf)
+                    cached = _mid_candles_cache.get(key)
+                    if cached:
+                        ts, df = cached
+                        if (now - ts) <= ttl and df is not None and not df.empty:
+                            return df
+                    last = None
+                    for _ in range(max(0, mid_candles_retry) + 1):
+                        last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit)
+                        if last is not None and not last.empty:
+                            _mid_candles_cache[key] = (now, last)
+                            return last
+                    # fallback to stale cache if available and not too old
+                    if cached:
+                        ts, df = cached
+                        if (now - ts) <= mid_cache_stale_sec and df is not None and not df.empty:
+                            return df
+                    return None
 
                 try:
                     async with MultiExchangeData() as api:
