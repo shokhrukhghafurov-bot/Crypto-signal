@@ -10124,7 +10124,72 @@ class Backend:
                                 logger.info("[mid][macro] alert: action=%s event=%s window=%s", mac_act, getattr(mac_ev, "name", None), mac_win)
                                 await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
 
-                        for sym in symbols:
+# --- MID candles load-balancing + smart cache ---
+# Goal: reduce "no_candles" by distributing REST load (50/50 Binance/Bybit) + fallback.
+# Cache key: (exchange,symbol,tf,limit) -> (ts, df). Returns stale cache on transient errors.
+if not hasattr(self, "_mid_candles_cache"):
+    self._mid_candles_cache = {}
+_mid_stale_sec = float(os.getenv("MID_CANDLES_CACHE_STALE_SEC", "900") or 900)
+_mid_ttl_5m = float(os.getenv("MID_CANDLES_CACHE_TTL_5M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "60")) or 60)
+_mid_ttl_30m = float(os.getenv("MID_CANDLES_CACHE_TTL_30M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "180")) or 180)
+_mid_ttl_1h = float(os.getenv("MID_CANDLES_CACHE_TTL_1H", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "300")) or 300)
+
+def _mid_ttl(tf: str) -> float:
+    s = (tf or "").strip().lower()
+    if s in ("5m", "3m", "1m"):
+        return _mid_ttl_5m
+    if s in ("30m", "20m"):
+        return _mid_ttl_30m
+    if s in ("1h", "60m", "2h", "4h"):
+        return _mid_ttl_1h
+    return _mid_ttl_30m
+
+async def _mid_klines_cached(exch: str, symbol: str, tf: str, limit: int) -> pd.DataFrame:
+    key = (exch, symbol, tf, int(limit))
+    now = time.time()
+    ent = self._mid_candles_cache.get(key)
+    ttl = _mid_ttl(tf)
+    if ent is not None:
+        try:
+            ts0, df0 = ent
+            if df0 is not None and (now - float(ts0)) <= ttl:
+                return df0
+        except Exception:
+            pass
+
+    async def _fetch() -> pd.DataFrame:
+        if exch == "BINANCE":
+            return await api.klines_binance(symbol, tf, limit)
+        if exch == "BYBIT":
+            return await api.klines_bybit(symbol, tf, limit)
+        if exch == "OKX":
+            return await api.klines_okx(symbol, tf, limit)
+        if exch == "GATEIO":
+            return await api.klines_gateio(symbol, tf, limit)
+        if exch == "MEXC":
+            return await api.klines_mexc(symbol, tf, limit)
+        return pd.DataFrame()
+
+    try:
+        df = await _fetch()
+        if df is None:
+            df = pd.DataFrame()
+        # cache even empty (short TTL) to avoid stampede on broken symbols
+        self._mid_candles_cache[key] = (now, df)
+        return df
+    except Exception:
+        # transient failure -> use stale cache if available
+        if ent is not None:
+            try:
+                ts0, df0 = ent
+                if df0 is not None and (now - float(ts0)) <= _mid_stale_sec:
+                    return df0
+            except Exception:
+                pass
+        return pd.DataFrame()
+
+                        half = max(1, (len(symbols) + 1)//2)
+                        for _mid_i, sym in enumerate(symbols):
                             if is_blocked_symbol(sym):
                                 _mid_skip_blocked += 1
                                 _rej_add(sym, "blocked_symbol")
@@ -10161,116 +10226,47 @@ class Backend:
                                     except Exception:
                                         pass
                                     continue
-
 supporters = []
-# --- Candle fetch strategy (MID) ---
-# Goal: reduce REST overload + timeouts that cause massive "no_candles".
-# We stop after N successful exchanges (default 1). Set MID_CANDLES_CONFIRM_MIN=2
-# if you want multi-exchange confirmation again.
-confirm_min = int(os.getenv("MID_CANDLES_CONFIRM_MIN", "1") or 1)
-retry_n = int(os.getenv("MID_CANDLES_RETRY", "2") or 2)
-retry_n = max(1, min(retry_n, 3))
-cache_ttl = int(os.getenv("MID_CANDLES_CACHE_TTL_SEC", os.getenv("CANDLES_CACHE_TTL", "180")) or 180)
-if not hasattr(self, "_mid_candles_cache"):
-    self._mid_candles_cache = {}
-_cc = self._mid_candles_cache
-_now_ts = time.time()
+had_candles = False
 
-def _cc_get(_ex: str, _sym: str, _tf: str):
+# 50/50 распределение нагрузки: первая половина символов — BINANCE, вторая — BYBIT.
+# Если биржа недоступна/нет данных — fallback на остальные из scan_exchanges.
+primary = "BINANCE" if _mid_i < half else "BYBIT"
+avail = [x for x in scan_exchanges if x in ("BINANCE","BYBIT","OKX","GATEIO","MEXC")]
+if not avail:
+    avail = list(scan_exchanges)
+if primary not in avail and avail:
+    primary = avail[0]
+
+ordered = [primary] + [x for x in ("OKX","GATEIO","MEXC","BINANCE","BYBIT") if x in avail and x != primary]
+# last resort: any remaining scan_exchanges not in ordered
+for x in avail:
+    if x not in ordered:
+        ordered.append(x)
+
+for name in ordered:
     try:
-        v = _cc.get((_ex, _sym, _tf))
-        if not v:
-            return None
-        ts0, df0 = v
-        if df0 is None:
-            return None
-        if getattr(df0, "empty", False):
-            return None
-        if _now_ts - float(ts0) > cache_ttl:
-            return None
-        return df0
-    except Exception:
-        return None
-
-def _cc_set(_ex: str, _sym: str, _tf: str, _df):
-    try:
-        if _df is None or getattr(_df, "empty", False):
-            return
-        _cc[(_ex, _sym, _tf)] = (_now_ts, _df)
-    except Exception:
-        return
-
-for name in scan_exchanges:
-    try:
-        # Try cache first (helps when REST blips but symbol repeats across ticks)
-        a = _cc_get(name, sym, tf_trigger)
-        b = _cc_get(name, sym, tf_mid)
-        c = _cc_get(name, sym, tf_trend)
-
-        if a is None or b is None or c is None:
-            last_exc = None
-            for _attempt in range(retry_n):
-                try:
-                    if name == "BINANCE":
-                        a = await api.klines_binance(sym, tf_trigger, 250)
-                        b = await api.klines_binance(sym, tf_mid, 250)
-                        c = await api.klines_binance(sym, tf_trend, 250)
-                    elif name == "BYBIT":
-                        a = await api.klines_bybit(sym, tf_trigger, 250)
-                        b = await api.klines_bybit(sym, tf_mid, 250)
-                        c = await api.klines_bybit(sym, tf_trend, 250)
-                    elif name == "OKX":
-                        a = await api.klines_okx(sym, tf_trigger, 250)
-                        b = await api.klines_okx(sym, tf_mid, 250)
-                        c = await api.klines_okx(sym, tf_trend, 250)
-                    elif name == "GATEIO":
-                        a = await api.klines_gateio(sym, tf_trigger, 250)
-                        b = await api.klines_gateio(sym, tf_mid, 250)
-                        c = await api.klines_gateio(sym, tf_trend, 250)
-                    elif name == "MEXC":
-                        a = await api.klines_mexc(sym, tf_trigger, 250)
-                        b = await api.klines_mexc(sym, tf_mid, 250)
-                        c = await api.klines_mexc(sym, tf_trend, 250)
-                    else:
-                        continue
-
-                    # Cache good frames
-                    _cc_set(name, sym, tf_trigger, a)
-                    _cc_set(name, sym, tf_mid, b)
-                    _cc_set(name, sym, tf_trend, c)
-                    break
-                except Exception as e:
-                    last_exc = e
-                    # tiny backoff helps on burst rate-limits
-                    try:
-                        await asyncio.sleep(0.08 * (_attempt + 1))
-                    except Exception:
-                        pass
-
-            # If REST failed, try cached fallback again
-            if a is None or getattr(a, "empty", False):
-                a = _cc_get(name, sym, tf_trigger)
-            if b is None or getattr(b, "empty", False):
-                b = _cc_get(name, sym, tf_mid)
-            if c is None or getattr(c, "empty", False):
-                c = _cc_get(name, sym, tf_trend)
-
-        if a is None or b is None or c is None or getattr(a, "empty", False) or getattr(b, "empty", False) or getattr(c, "empty", False):
-            no_data += 1
+        a = await _mid_klines_cached(name, sym, tf_trigger, 250)
+        b = await _mid_klines_cached(name, sym, tf_mid, 250)
+        c = await _mid_klines_cached(name, sym, tf_trend, 250)
+        if a is None or b is None or c is None or a.empty or b.empty or c.empty:
             continue
-
+        had_candles = True
         r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
         if r:
             supporters.append((name, r))
-            # Stop early once we have enough confirmations (default 1)
-            if len(supporters) >= confirm_min:
-                break
+        # если на основной бирже есть свечи, но сетап не проходит — не "подбирать" на другой бирже.
+        break
     except Exception:
         continue
 
 if not supporters:
-    _rej_add(sym, "no_candles")
-    continue                            best_name, best_r = max(supporters, key=lambda x: (float(x[1].get("confidence",0)), float(x[1].get("rr",0))))
+    _rej_add(sym, "no_candles" if not had_candles else "no_setup")
+    continue
+                                _rej_add(sym, "no_candles")
+                                continue
+
+                            best_name, best_r = max(supporters, key=lambda x: (float(x[1].get("confidence",0)), float(x[1].get("rr",0))))
                             binance_r = next((r for n, r in supporters if n == "BINANCE"), None)
                             base_r = binance_r or best_r
                             # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
