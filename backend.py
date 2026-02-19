@@ -9802,9 +9802,11 @@ class Backend:
                                 _fut_ok = await asyncio.gather(_pair_exists("BINANCE"), _pair_exists("BYBIT"), _pair_exists("OKX"))
                                 if not any(bool(x) for x in _fut_ok):
                                     logger.info("[scanner] skip %s FUTURES: no contract on BINANCE/BYBIT/OKX (best_source=%s)", sym, best_name)
+                                    _rej_add(sym, "no_futures_contract")
                                     continue
                             except Exception as _e:
                                 logger.info("[scanner] skip %s FUTURES: futures existence check failed: %s", sym, _e)
+                                _rej_add(sym, "futures_existence_check_failed")
                                 continue
 
 # Exchanges where the instrument exists for the given market.
@@ -10081,6 +10083,33 @@ class Backend:
                         _mid_f_futoff = 0
                         _mid_hard_block0 = _mid_hard_block_total()
                         _mid_hard_block = 0
+
+                        # --- MID reject digest (log-only): explains "scanned=N but counters don't add up" ---
+                        # Enable with MID_REJECT_DIGEST=1
+                        _rej_enabled = os.getenv("MID_REJECT_DIGEST", "0").strip().lower() in ("1","true","yes","on")
+                        _rej_max_reasons = int(os.getenv("MID_REJECT_DIGEST_MAX_REASONS", "12") or 12)
+                        _rej_examples = int(os.getenv("MID_REJECT_DIGEST_EXAMPLES", "3") or 3)
+                        _rej_seen = set()
+                        _rej_counts = {}
+                        _rej_examples_map = {}
+
+                        def _rej_add(_sym: str, _reason: str):
+                            """Record exactly one terminal reason per symbol per tick."""
+                            if not _rej_enabled:
+                                return
+                            try:
+                                if _sym in _rej_seen:
+                                    return
+                                _rej_seen.add(_sym)
+                                _rej_counts[_reason] = int(_rej_counts.get(_reason, 0) or 0) + 1
+                                lst = _rej_examples_map.get(_reason)
+                                if lst is None:
+                                    lst = []
+                                    _rej_examples_map[_reason] = lst
+                                if len(lst) < _rej_examples:
+                                    lst.append(_sym)
+                            except Exception:
+                                return
                         logger.info("[mid] tick start TOP_N=%s interval=%ss pool=%s scanned=%s (MID_TOP_N_SYMBOLS=%s)", top_n, interval, _mid_pool, _mid_scanned, top_n_symbols)
                         logger.info("[mid][scanner] symbols loaded: %s (pool=%s)", _mid_scanned, _mid_pool)
                         mac_act, mac_ev, mac_win = self.macro.current_action()
@@ -10094,6 +10123,7 @@ class Backend:
                         for sym in symbols:
                             if is_blocked_symbol(sym):
                                 _mid_skip_blocked += 1
+                                _rej_add(sym, "blocked_symbol")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "blocked_symbol")
                                 except Exception:
@@ -10101,6 +10131,7 @@ class Backend:
                                 continue
                             if not self.can_emit_mid(sym):
                                 _mid_skip_cooldown += 1
+                                _rej_add(sym, "cooldown")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "cooldown")
                                 except Exception:
@@ -10109,6 +10140,7 @@ class Backend:
 
                             if MACRO_FILTER and mac_act == "PAUSE_ALL":
                                 _mid_skip_macro += 1
+                                _rej_add(sym, "macro_pause_all")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "macro_pause_all")
                                 except Exception:
@@ -10119,6 +10151,7 @@ class Backend:
                                 news_act = await self.news.action_for_symbol(api.session, sym)
                                 if news_act == "PAUSE_ALL":
                                     _mid_skip_news += 1
+                                    _rej_add(sym, "news_pause_all")
                                     try:
                                         self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "news_pause_all")
                                     except Exception:
@@ -10159,6 +10192,7 @@ class Backend:
                                 except Exception:
                                     continue
                             if not supporters:
+                                _rej_add(sym, "no_candles")
                                 continue
 
                             best_name, best_r = max(supporters, key=lambda x: (float(x[1].get("confidence",0)), float(x[1].get("rr",0))))
@@ -10167,6 +10201,8 @@ class Backend:
                             # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
                             if base_r.get("trap_ok") is False or base_r.get("blocked") is True:
                                 _mid_skip_trap += 1
+
+                                _rej_add(sym, str(base_r.get("trap_reason") or base_r.get("block_reason") or "trap_block"))
 
                                 # collect digest stats (DO NOT forward to error-bot)
                                 _r = (base_r.get("trap_reason") or base_r.get("block_reason") or "")
@@ -10178,6 +10214,7 @@ class Backend:
                                 continue
                             if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
                                 _mid_f_align += 1
+                                _rej_add(sym, "align_mismatch")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), "align_mismatch")
                                 except Exception:
@@ -10192,6 +10229,7 @@ class Backend:
 
                             if min_adx_30m and adx30 < min_adx_30m:
                                 _mid_f_adx += 1
+                                _rej_add(sym, "adx_30m")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx30<{min_adx_30m:g} adx={adx30:g}")
                                 except Exception:
@@ -10199,6 +10237,7 @@ class Backend:
                                 continue
                             if min_adx_1h and adx1h < min_adx_1h:
                                 _mid_f_adx += 1
+                                _rej_add(sym, "adx_1h")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx1h<{min_adx_1h:g} adx={adx1h:g}")
                                 except Exception:
@@ -10206,6 +10245,7 @@ class Backend:
                                 continue
                             if min_atr_pct and atrp < min_atr_pct:
                                 _mid_f_atr += 1
+                                _rej_add(sym, "atr_pct")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"atr_pct<{min_atr_pct:g} atr%={atrp:g}")
                                 except Exception:
@@ -10222,6 +10262,7 @@ class Backend:
                             min_conf = min_score_fut if market == "FUTURES" else min_score_spot
                             if conf < float(min_conf):
                                 _mid_f_score += 1
+                                _rej_add(sym, "score")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"score<{float(min_conf):g} score={conf:g}")
                                 except Exception:
@@ -10229,6 +10270,7 @@ class Backend:
                                 continue
                             if rr < float(min_rr):
                                 _mid_f_rr += 1
+                                _rej_add(sym, "rr")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"rr<{float(min_rr):g} rr={rr:g}")
                                 except Exception:
@@ -10243,6 +10285,7 @@ class Backend:
                             volx = float(base_r.get("rel_vol", 0.0) or 0.0)
                             if mid_min_vol_x and volx < mid_min_vol_x:
                                 _mid_f_score += 1
+                                _rej_add(sym, "vol_x")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"vol_x<{mid_min_vol_x:g} vol_x={volx:g}")
                                 except Exception:
@@ -10256,6 +10299,7 @@ class Backend:
                                 if mid_require_vwap_bias:
                                     if direction == "SHORT" and not (entry < vwap_val_num):
                                         _mid_f_align += 1
+                                        _rej_add(sym, "vwap_bias")
                                         try:
                                             self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_short entry>=vwap vwap={vwap_val_num:g}")
                                         except Exception:
@@ -10263,6 +10307,7 @@ class Backend:
                                         continue
                                     if direction == "LONG" and not (entry > vwap_val_num):
                                         _mid_f_align += 1
+                                        _rej_add(sym, "vwap_bias")
                                         try:
                                             self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_long entry<=vwap vwap={vwap_val_num:g}")
                                         except Exception:
@@ -10271,6 +10316,7 @@ class Backend:
                                 if mid_min_vwap_dist_atr > 0:
                                     if abs(entry - vwap_val_num) < (atr30 * mid_min_vwap_dist_atr):
                                         _mid_f_atr += 1
+                                        _rej_add(sym, "vwap_too_close")
                                         try:
                                             dist = abs(entry - vwap_val_num) / atr30 if atr30 else 0.0
                                             self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_far {dist:.2g}atr")
@@ -10294,6 +10340,7 @@ class Backend:
                                 fut_forced_off = (not allow_futures) or (news_act == "FUTURES_OFF") or (mac_act == "FUTURES_OFF")
                                 if fut_forced_off:
                                     _mid_f_futoff += 1
+                                    _rej_add(sym, "futures_forced_off")
                                     continue
                                 market = "FUTURES"
                                 if risk_note:
@@ -10339,9 +10386,11 @@ class Backend:
                                     _fut_ok = await asyncio.gather(_pair_exists("BINANCE"), _pair_exists("BYBIT"), _pair_exists("OKX"))
                                     if not any(bool(x) for x in _fut_ok):
                                         logger.info("[scanner] skip %s FUTURES: no contract on BINANCE/BYBIT/OKX (best_source=%s)", sym, best_name)
+                                        _rej_add(sym, "no_futures_contract")
                                         continue
                                 except Exception as _e:
                                     logger.info("[scanner] skip %s FUTURES: futures existence check failed: %s", sym, _e)
+                                    _rej_add(sym, "futures_existence_check_failed")
                                     continue
 
     # Exchanges where the instrument exists for the given market.
@@ -10374,6 +10423,7 @@ class Backend:
                                 self.last_futures_signal = sig
                             await emit_signal_cb(sig)
                             await asyncio.sleep(2)
+                            _rej_add(sym, "emitted")
                 except Exception:
                     logger.exception("[mid] scanner_loop_mid error")
 
@@ -10391,6 +10441,23 @@ class Backend:
                     _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
                     summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} elapsed={float(elapsed):.1f}s"
                     logger.info("[mid] %s", summary)
+
+                    # Optional: per-tick breakdown of where scanned symbols went.
+                    if _rej_enabled:
+                        try:
+                            accounted = len(_rej_seen)
+                            missing = max(0, int(_mid_scanned) - int(accounted))
+                            if missing:
+                                _rej_counts["untracked"] = int(_rej_counts.get("untracked", 0) or 0) + int(missing)
+                            top = sorted([(k, int(v)) for k, v in _rej_counts.items()], key=lambda x: (-x[1], x[0]))[:max(1, _rej_max_reasons)]
+                            parts = []
+                            for k, v in top:
+                                ex = _rej_examples_map.get(k) or []
+                                exs = ",".join(ex) if ex else ""
+                                parts.append(f"{k}={v}" + (f" [{exs}]" if exs else ""))
+                            logger.info("[mid][reject] scanned=%s accounted=%s missing=%s :: %s", int(_mid_scanned), int(accounted), int(missing), " | ".join(parts))
+                        except Exception:
+                            pass
                     try:
                         _mid_set_last_summary(summary)
                     except Exception:
