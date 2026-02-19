@@ -9673,6 +9673,83 @@ class Backend:
                         if not scan_exchanges:
                             scan_exchanges = ['BINANCE','BYBIT','OKX','GATEIO','MEXC']
 
+
+                        # --- MID candles: balanced primary BINANCE/BYBIT + fallback + smart cache ---
+                        _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT") or "").strip()
+                        mid_primary_exchanges = [x.strip().upper() for x in _primary_ex.split(",") if x.strip()]
+                        if len(mid_primary_exchanges) < 2:
+                            mid_primary_exchanges = ["BINANCE", "BYBIT"]
+                        # keep only those available in scan_exchanges
+                        mid_primary_exchanges = [x for x in mid_primary_exchanges if x in scan_exchanges] or ["BINANCE", "BYBIT"]
+                        mid_fallback_exchanges = [x for x in scan_exchanges if x not in mid_primary_exchanges]
+
+                        mid_primary_mode = (os.getenv("MID_PRIMARY_MODE", "hash") or "hash").strip().lower()
+                        mid_candles_retry = int(os.getenv("MID_CANDLES_RETRY", "1") or "1")
+                        mid_cache_ttl_5m = int(os.getenv("MID_CANDLES_CACHE_TTL_5M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "60")) or "60")
+                        mid_cache_ttl_30m = int(os.getenv("MID_CANDLES_CACHE_TTL_30M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "180")) or "180")
+                        mid_cache_ttl_1h = int(os.getenv("MID_CANDLES_CACHE_TTL_1H", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "300")) or "300")
+                        mid_cache_stale_sec = int(os.getenv("MID_CANDLES_CACHE_STALE_SEC", "900") or "900")
+
+                        _mid_candles_cache: Dict[Tuple[str,str,str,int], Tuple[float, pd.DataFrame]] = {}
+
+                        def _mid_cache_ttl(tf: str) -> int:
+                            t = (tf or "").lower()
+                            if t in ("5m", "5min", "5"):
+                                return mid_cache_ttl_5m
+                            if t in ("30m", "30min", "30"):
+                                return mid_cache_ttl_30m
+                            return mid_cache_ttl_1h
+
+                        def _mid_primary_for_symbol(symb: str) -> str:
+                            # Stable routing: hash(symbol) -> BINANCE or BYBIT (or configured list)
+                            if mid_primary_mode == "round_robin":
+                                # fallback to hash if round_robin is selected (we avoid shared mutable state across async tasks)
+                                pass
+                            try:
+                                h = int.from_bytes(hashlib.sha1(symb.encode("utf-8")).digest()[:4], "big")
+                            except Exception:
+                                h = sum(ord(c) for c in symb)
+                            return mid_primary_exchanges[h % len(mid_primary_exchanges)]
+
+                        async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
+                            key = (ex_name, symb, tf, int(limit))
+                            now = time.time()
+                            ttl = _mid_cache_ttl(tf)
+                            cached = _mid_candles_cache.get(key)
+                            if cached:
+                                ts, df = cached
+                                if (now - ts) <= ttl and df is not None and not df.empty:
+                                    return df
+                            # try REST with retry
+                            last_err = None
+                            for attempt in range(max(0, mid_candles_retry) + 1):
+                                try:
+                                    if ex_name == "BINANCE":
+                                        df = await api.klines_binance(symb, tf, limit)
+                                    elif ex_name == "BYBIT":
+                                        df = await api.klines_bybit(symb, tf, limit)
+                                    elif ex_name == "OKX":
+                                        df = await api.klines_okx(symb, tf, limit)
+                                    elif ex_name == "GATEIO":
+                                        df = await api.klines_gateio(symb, tf, limit)
+                                    elif ex_name == "MEXC":
+                                        df = await api.klines_mexc(symb, tf, limit)
+                                    else:
+                                        return None
+                                    if df is not None and not df.empty:
+                                        _mid_candles_cache[key] = (now, df)
+                                        return df
+                                except Exception as e:
+                                    last_err = e
+                                    # tiny backoff
+                                    await asyncio.sleep(0.05 * (attempt + 1))
+                                    continue
+                            # fallback to stale cache if we have it and it's not too old
+                            if cached:
+                                ts, df = cached
+                                if (now - ts) <= mid_cache_stale_sec and df is not None and not df.empty:
+                                    return df
+                            return None
                         results = await asyncio.gather(*[fetch_exchange(ex) for ex in scan_exchanges])
                         good = [(name, r) for (name, r) in results if r is not None]
                         if not good:
@@ -10124,72 +10201,7 @@ class Backend:
                                 logger.info("[mid][macro] alert: action=%s event=%s window=%s", mac_act, getattr(mac_ev, "name", None), mac_win)
                                 await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
 
-# --- MID candles load-balancing + smart cache ---
-# Goal: reduce "no_candles" by distributing REST load (50/50 Binance/Bybit) + fallback.
-# Cache key: (exchange,symbol,tf,limit) -> (ts, df). Returns stale cache on transient errors.
-if not hasattr(self, "_mid_candles_cache"):
-    self._mid_candles_cache = {}
-_mid_stale_sec = float(os.getenv("MID_CANDLES_CACHE_STALE_SEC", "900") or 900)
-_mid_ttl_5m = float(os.getenv("MID_CANDLES_CACHE_TTL_5M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "60")) or 60)
-_mid_ttl_30m = float(os.getenv("MID_CANDLES_CACHE_TTL_30M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "180")) or 180)
-_mid_ttl_1h = float(os.getenv("MID_CANDLES_CACHE_TTL_1H", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "300")) or 300)
-
-def _mid_ttl(tf: str) -> float:
-    s = (tf or "").strip().lower()
-    if s in ("5m", "3m", "1m"):
-        return _mid_ttl_5m
-    if s in ("30m", "20m"):
-        return _mid_ttl_30m
-    if s in ("1h", "60m", "2h", "4h"):
-        return _mid_ttl_1h
-    return _mid_ttl_30m
-
-async def _mid_klines_cached(exch: str, symbol: str, tf: str, limit: int) -> pd.DataFrame:
-    key = (exch, symbol, tf, int(limit))
-    now = time.time()
-    ent = self._mid_candles_cache.get(key)
-    ttl = _mid_ttl(tf)
-    if ent is not None:
-        try:
-            ts0, df0 = ent
-            if df0 is not None and (now - float(ts0)) <= ttl:
-                return df0
-        except Exception:
-            pass
-
-    async def _fetch() -> pd.DataFrame:
-        if exch == "BINANCE":
-            return await api.klines_binance(symbol, tf, limit)
-        if exch == "BYBIT":
-            return await api.klines_bybit(symbol, tf, limit)
-        if exch == "OKX":
-            return await api.klines_okx(symbol, tf, limit)
-        if exch == "GATEIO":
-            return await api.klines_gateio(symbol, tf, limit)
-        if exch == "MEXC":
-            return await api.klines_mexc(symbol, tf, limit)
-        return pd.DataFrame()
-
-    try:
-        df = await _fetch()
-        if df is None:
-            df = pd.DataFrame()
-        # cache even empty (short TTL) to avoid stampede on broken symbols
-        self._mid_candles_cache[key] = (now, df)
-        return df
-    except Exception:
-        # transient failure -> use stale cache if available
-        if ent is not None:
-            try:
-                ts0, df0 = ent
-                if df0 is not None and (now - float(ts0)) <= _mid_stale_sec:
-                    return df0
-            except Exception:
-                pass
-        return pd.DataFrame()
-
-                        half = max(1, (len(symbols) + 1)//2)
-                        for _mid_i, sym in enumerate(symbols):
+                        for sym in symbols:
                             if is_blocked_symbol(sym):
                                 _mid_skip_blocked += 1
                                 _rej_add(sym, "blocked_symbol")
@@ -10226,49 +10238,37 @@ async def _mid_klines_cached(exch: str, symbol: str, tf: str, limit: int) -> pd.
                                     except Exception:
                                         pass
                                     continue
-supporters = []
-had_candles = False
 
-# 50/50 распределение нагрузки: первая половина символов — BINANCE, вторая — BYBIT.
-# Если биржа недоступна/нет данных — fallback на остальные из scan_exchanges.
-primary = "BINANCE" if _mid_i < half else "BYBIT"
-avail = [x for x in scan_exchanges if x in ("BINANCE","BYBIT","OKX","GATEIO","MEXC")]
-if not avail:
-    avail = list(scan_exchanges)
-if primary not in avail and avail:
-    primary = avail[0]
+                            supporters = []  # kept for compatibility with later counters (not used for multi-exchange scoring)
+                            chosen_name = None
+                            chosen_r: Optional[Dict[str, Any]] = None
 
-ordered = [primary] + [x for x in ("OKX","GATEIO","MEXC","BINANCE","BYBIT") if x in avail and x != primary]
-# last resort: any remaining scan_exchanges not in ordered
-for x in avail:
-    if x not in ordered:
-        ordered.append(x)
+                            primary = _mid_primary_for_symbol(sym)
+                            # try primary first, then the other primary (if any), then fallbacks
+                            try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
 
-for name in ordered:
-    try:
-        a = await _mid_klines_cached(name, sym, tf_trigger, 250)
-        b = await _mid_klines_cached(name, sym, tf_mid, 250)
-        c = await _mid_klines_cached(name, sym, tf_trend, 250)
-        if a is None or b is None or c is None or a.empty or b.empty or c.empty:
-            continue
-        had_candles = True
-        r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
-        if r:
-            supporters.append((name, r))
-        # если на основной бирже есть свечи, но сетап не проходит — не "подбирать" на другой бирже.
-        break
-    except Exception:
-        continue
+                            for name in try_order:
+                                try:
+                                    a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250)
+                                    b = await _mid_fetch_klines_cached(name, sym, tf_mid, 250)
+                                    c = await _mid_fetch_klines_cached(name, sym, tf_trend, 250)
+                                    if a is None or b is None or c is None or a.empty or b.empty or c.empty:
+                                        no_data += 1
+                                        continue
+                                    r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
+                                    if r:
+                                        chosen_name = name
+                                        chosen_r = r
+                                        break
+                                except Exception:
+                                    continue
 
-if not supporters:
-    _rej_add(sym, "no_candles" if not had_candles else "no_setup")
-    continue
+                            if not chosen_r:
                                 _rej_add(sym, "no_candles")
                                 continue
 
-                            best_name, best_r = max(supporters, key=lambda x: (float(x[1].get("confidence",0)), float(x[1].get("rr",0))))
-                            binance_r = next((r for n, r in supporters if n == "BINANCE"), None)
-                            base_r = binance_r or best_r
+                            best_name, best_r = chosen_name, chosen_r
+                            base_r = best_r
                             # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
                             if base_r.get("trap_ok") is False or base_r.get("blocked") is True:
                                 _mid_skip_trap += 1
