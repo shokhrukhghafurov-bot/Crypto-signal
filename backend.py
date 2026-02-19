@@ -10092,6 +10092,9 @@ class Backend:
                         _rej_seen = set()
                         _rej_counts = {}
                         _rej_examples_map = {}
+                        _rej_full = os.getenv("MID_REJECT_DIGEST_FULL", "0").strip().lower() in ("1","true","yes","on")
+                        _rej_full_max = int(os.getenv("MID_REJECT_DIGEST_FULL_MAX", str(_mid_scanned)) or _mid_scanned)
+                        _rej_reason_by_sym = {}  # sym -> reason
 
                         def _rej_add(_sym: str, _reason: str):
                             """Record exactly one terminal reason per symbol per tick."""
@@ -10101,6 +10104,7 @@ class Backend:
                                 if _sym in _rej_seen:
                                     return
                                 _rej_seen.add(_sym)
+                                _rej_reason_by_sym[_sym] = _reason
                                 _rej_counts[_reason] = int(_rej_counts.get(_reason, 0) or 0) + 1
                                 lst = _rej_examples_map.get(_reason)
                                 if lst is None:
@@ -10456,6 +10460,20 @@ class Backend:
                                 exs = ",".join(ex) if ex else ""
                                 parts.append(f"{k}={v}" + (f" [{exs}]" if exs else ""))
                             logger.info("[mid][reject] scanned=%s accounted=%s missing=%s :: %s", int(_mid_scanned), int(accounted), int(missing), " | ".join(parts))
+                            # Optional: full per-symbol dump (can be verbose). Shows one reason per scanned symbol.
+                            if _rej_full:
+                                try:
+                                    maxn = max(0, int(_rej_full_max))
+                                    pairs = []
+                                    for s in symbols[:maxn]:
+                                        r = _rej_reason_by_sym.get(s) or "untracked"
+                                        pairs.append(f"{s}:{r}")
+                                    # chunk to avoid extremely long single lines
+                                    chunk = 20
+                                    for i in range(0, len(pairs), chunk):
+                                        logger.info("[mid][reject_full] %s", " | ".join(pairs[i:i+chunk]))
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
                     try:
