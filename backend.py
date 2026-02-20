@@ -953,6 +953,19 @@ def _gate_pair(symbol: str) -> str:
         return f"{s[:-4]}_USDT"
     return s
 
+def _mexc_interval(interval: str) -> str:
+    """MEXC spot /api/v3/klines is Binance-like but some deployments reject '1h' and expect minutes (e.g. '60m').
+    Normalize hour-based intervals to minutes.
+    """
+    s = (interval or "").strip().lower()
+    try:
+        if s.endswith("h"):
+            mins = int(float(s[:-1]) * 60)
+            return f"{mins}m"
+    except Exception:
+        pass
+    return interval
+
 async def _okx_signed_request(
     session: aiohttp.ClientSession,
     *,
@@ -6139,7 +6152,7 @@ class MultiExchangeData:
         We normalize into the same OHLCV DataFrame shape used by Binance.
         """
         url = f"{self.MEXC}/api/v3/klines"
-        params = {"symbol": symbol.upper(), "interval": interval, "limit": str(limit)}
+        params = {"symbol": symbol.upper(), "interval": _mexc_interval(interval), "limit": str(limit)}
         raw = await self._get_json(url, params=params)
         rows = raw if isinstance(raw, list) else []
         norm: list[list] = []
@@ -10341,14 +10354,9 @@ class Backend:
                                 try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
                                 for name in try_order:
                                     try:
-                                        a, b, c = await asyncio.gather(
-                                            _mid_fetch_klines_cached(name, sym, tf_trigger, 250),
-                                            _mid_fetch_klines_cached(name, sym, tf_mid, 250),
-                                            _mid_fetch_klines_cached(name, sym, tf_trend, 250),
-                                            return_exceptions=True,
-                                        )
-                                        if isinstance(a, Exception) or isinstance(b, Exception) or isinstance(c, Exception):
-                                            continue
+                                        a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250)
+                                        b = await _mid_fetch_klines_cached(name, sym, tf_mid, 250)
+                                        c = await _mid_fetch_klines_cached(name, sym, tf_trend, 250)
                                         if a is None or b is None or c is None or a.empty or b.empty or c.empty:
                                             continue
                                         r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
