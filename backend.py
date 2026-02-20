@@ -6,6 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 import os
 import re
+import time
 
 
 
@@ -590,7 +591,7 @@ _BLOCK_STABLECOIN_PAIRS = (os.getenv("BLOCK_STABLECOIN_PAIRS", "1").strip().lowe
 
 _STABLECOINS = _env_csv_set(
     "STABLECOINS",
-    "USDT,USDC,DAI,BUSD,TUSD,FDUSD,USDP,PYUSD,FRAX,EURC,USD1,BFUSD,RLUSD,USDE,USDS,USDD,GUSD,LUSD,SUSD,EURT"
+    "USDT,USDC,DAI,BUSD,TUSD,FDUSD,USDP,PYUSD,FRAX,EURC,USD1"
 )
 
 _BLOCKED_SYMBOLS = _env_csv_set(
@@ -5965,19 +5966,21 @@ class MultiExchangeData:
     def __init__(self) -> None:
         self.session: Optional[aiohttp.ClientSession] = None
 
-        # Market availability caches (prevents 400 spam when a symbol doesn't exist on a specific exchange).
-        self._market_avail_check = (os.getenv("MID_MARKET_AVAIL_CHECK", "1").strip().lower() not in ("0","false","no","off"))
-        self._markets_cache_ttl_sec = int(os.getenv("MID_MARKETS_CACHE_TTL_SEC", "21600") or 21600)  # 6h
-        self._unsupported_ttl_sec = int(os.getenv("MID_UNSUPPORTED_SYMBOL_TTL_SEC", "21600") or 21600)  # 6h
+        # --- Candle/market caching (stability + less API spam) ---
+        self._candles_cache: dict[tuple, tuple[float, pd.DataFrame]] = {}  # key -> (expires_mono, df)
+        self._candles_inflight: dict[tuple, asyncio.Future] = {}  # key -> Future[df]
+        self._markets_cache: dict[str, tuple[float, set[str]]] = {}  # exchange -> (expires_mono, set(symbols))
+        self._unsupported_until: dict[tuple, float] = {}  # (exchange, market, symbol, interval) -> expires_mono
 
-        self._gate_pairs: Optional[set[str]] = None
-        self._gate_pairs_loaded_at: float = 0.0
-        self._mexc_symbols: Optional[set[str]] = None
-        self._mexc_symbols_loaded_at: float = 0.0
+        # Limits / timeouts
+        self._http_concurrency = int(os.getenv("HTTP_CONCURRENCY", "25") or "25")
+        self._http_req_timeout_sec = float(os.getenv("HTTP_REQ_TIMEOUT_SEC", "6") or "6")
+        self._http_sem = asyncio.Semaphore(max(1, self._http_concurrency))
 
-        # Negative cache: (EXCHANGE, SYMBOL_OR_PAIR) -> expiry_ts
-        self._unsupported_until: dict[tuple[str, str], float] = {}
-        self._markets_lock = asyncio.Lock()
+        # Feature flags
+        self._market_avail_check = (os.getenv("MID_MARKET_AVAIL_CHECK", "1") or "1").strip().lower() in ("1","true","yes","on")
+        self._markets_cache_ttl = int(os.getenv("MID_MARKETS_CACHE_TTL_SEC", "21600") or "21600")  # 6h
+        self._unsupported_ttl = int(os.getenv("MID_UNSUPPORTED_SYMBOL_TTL_SEC", "21600") or "21600")  # 6h
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
@@ -5998,84 +6001,6 @@ class MultiExchangeData:
         if any(x in sym for x in ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")):
             return False
         return True
-
-
-    def _is_unsupported(self, ex: str, key: str) -> bool:
-        try:
-            if not self._market_avail_check:
-                return False
-            now = time.time()
-            exp = self._unsupported_until.get((ex.upper(), key.upper()))
-            if exp and exp > now:
-                return True
-            if exp and exp <= now:
-                # cleanup
-                self._unsupported_until.pop((ex.upper(), key.upper()), None)
-        except Exception:
-            pass
-        return False
-
-    def _mark_unsupported(self, ex: str, key: str) -> None:
-        try:
-            if not self._market_avail_check:
-                return
-            self._unsupported_until[(ex.upper(), key.upper())] = time.time() + float(self._unsupported_ttl_sec)
-        except Exception:
-            pass
-
-    async def _ensure_gate_pairs(self) -> None:
-        if not self._market_avail_check:
-            return
-        if self._gate_pairs is not None and (time.time() - self._gate_pairs_loaded_at) < float(self._markets_cache_ttl_sec):
-            return
-        async with self._markets_lock:
-            if self._gate_pairs is not None and (time.time() - self._gate_pairs_loaded_at) < float(self._markets_cache_ttl_sec):
-                return
-            assert self.session is not None
-            url = f"{self.GATEIO}/spot/currency_pairs"
-            try:
-                data = await self._get_json(url)
-                pairs: set[str] = set()
-                if isinstance(data, list):
-                    for it in data:
-                        if isinstance(it, dict):
-                            pid = (it.get("id") or it.get("name") or "").strip()
-                            if pid:
-                                pairs.add(pid.upper())
-                self._gate_pairs = pairs
-                self._gate_pairs_loaded_at = time.time()
-            except Exception:
-                # keep old cache if any
-                if self._gate_pairs is None:
-                    self._gate_pairs = set()
-                    self._gate_pairs_loaded_at = time.time()
-
-    async def _ensure_mexc_symbols(self) -> None:
-        if not self._market_avail_check:
-            return
-        if self._mexc_symbols is not None and (time.time() - self._mexc_symbols_loaded_at) < float(self._markets_cache_ttl_sec):
-            return
-        async with self._markets_lock:
-            if self._mexc_symbols is not None and (time.time() - self._mexc_symbols_loaded_at) < float(self._markets_cache_ttl_sec):
-                return
-            assert self.session is not None
-            url = f"{self.MEXC}/api/v3/exchangeInfo"
-            try:
-                data = await self._get_json(url)
-                syms: set[str] = set()
-                if isinstance(data, dict):
-                    for it in (data.get("symbols") or []):
-                        if isinstance(it, dict):
-                            s = (it.get("symbol") or "").strip()
-                            if s:
-                                syms.add(s.upper())
-                self._mexc_symbols = syms
-                self._mexc_symbols_loaded_at = time.time()
-            except Exception:
-                if self._mexc_symbols is None:
-                    self._mexc_symbols = set()
-                    self._mexc_symbols_loaded_at = time.time()
-
 
     async def _top_from_binance(self) -> list[tuple[float, str]]:
         assert self.session is not None
@@ -6221,10 +6146,132 @@ class MultiExchangeData:
         return dedup[:n]
 
     async def _get_json(self, url: str, params: Optional[Dict[str, str]] = None) -> Any:
+        """HTTP GET JSON with concurrency limit + per-request timeout."""
         assert self.session is not None
-        async with self.session.get(url, params=params) as r:
-            r.raise_for_status()
-            return await r.json()
+        async with self._http_sem:
+            async def _do():
+                async with self.session.get(url, params=params) as r:
+                    r.raise_for_status()
+                    return await r.json()
+            return await asyncio.wait_for(_do(), timeout=self._http_req_timeout_sec)
+
+
+
+    def _interval_cache_ttl(self, interval: str) -> float:
+        """TTL for candle cache, seconds."""
+        s = (interval or "").strip().lower()
+        if s == "5m":
+            return float(os.getenv("CANDLE_CACHE_TTL_5M_SEC", "15") or "15")
+        if s == "15m":
+            return float(os.getenv("CANDLE_CACHE_TTL_15M_SEC", "30") or "30")
+        if s == "30m":
+            return float(os.getenv("CANDLE_CACHE_TTL_30M_SEC", "90") or "90")
+        if s in ("1h","60m"):
+            return float(os.getenv("CANDLE_CACHE_TTL_1H_SEC", "180") or "180")
+        if s in ("4h","240m"):
+            return float(os.getenv("CANDLE_CACHE_TTL_4H_SEC", "600") or "600")
+        return float(os.getenv("CANDLE_CACHE_TTL_DEFAULT_SEC", "30") or "30")
+
+    def _is_unsupported_cached(self, exchange: str, market: str, symbol: str, interval: str) -> bool:
+        key = (exchange.upper(), (market or "").upper(), symbol.upper(), (interval or "").lower())
+        until = self._unsupported_until.get(key)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            self._unsupported_until.pop(key, None)
+            return False
+        return True
+
+    def _mark_unsupported(self, exchange: str, market: str, symbol: str, interval: str) -> None:
+        key = (exchange.upper(), (market or "").upper(), symbol.upper(), (interval or "").lower())
+        self._unsupported_until[key] = time.monotonic() + float(self._unsupported_ttl)
+
+    async def _get_gateio_markets(self) -> set[str]:
+        now = time.monotonic()
+        cached = self._markets_cache.get("GATEIO")
+        if cached and now < cached[0]:
+            return cached[1]
+        url = f"{self.GATEIO}/spot/currency_pairs"
+        try:
+            raw = await self._get_json(url, params=None)
+            s: set[str] = set()
+            if isinstance(raw, list):
+                for r in raw:
+                    if isinstance(r, dict):
+                        pid = (r.get("id") or r.get("currency_pair") or "").strip()
+                        if pid:
+                            s.add(pid.upper())
+            self._markets_cache["GATEIO"] = (now + float(self._markets_cache_ttl), s)
+            return s
+        except Exception:
+            if cached:
+                return cached[1]
+            return set()
+
+    async def _get_mexc_markets(self) -> set[str]:
+        now = time.monotonic()
+        cached = self._markets_cache.get("MEXC")
+        if cached and now < cached[0]:
+            return cached[1]
+        url = f"{self.MEXC}/api/v3/exchangeInfo"
+        try:
+            raw = await self._get_json(url, params=None)
+            s: set[str] = set()
+            if isinstance(raw, dict):
+                for r in (raw.get("symbols") or []):
+                    if isinstance(r, dict):
+                        sym = (r.get("symbol") or "").strip()
+                        if sym:
+                            s.add(sym.upper())
+            self._markets_cache["MEXC"] = (now + float(self._markets_cache_ttl), s)
+            return s
+        except Exception:
+            if cached:
+                return cached[1]
+            return set()
+
+    async def _market_supported(self, exchange: str, symbol: str) -> bool:
+        if not self._market_avail_check:
+            return True
+        ex = (exchange or "").upper()
+        sym = symbol.upper()
+        if ex == "GATEIO":
+            pair = _gate_pair(sym).upper()
+            markets = await self._get_gateio_markets()
+            return pair in markets
+        if ex == "MEXC":
+            markets = await self._get_mexc_markets()
+            return sym in markets
+        return True
+
+    async def _klines_cached(self, *, cache_key: tuple, interval: str, fetch_coro):
+        now = time.monotonic()
+        cached = self._candles_cache.get(cache_key)
+        if cached and now < cached[0]:
+            return cached[1]
+
+        inflight = self._candles_inflight.get(cache_key)
+        if inflight is not None and not inflight.done():
+            return await inflight
+
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._candles_inflight[cache_key] = fut
+        try:
+            df = await fetch_coro()
+            ttl = self._interval_cache_ttl(interval)
+            self._candles_cache[cache_key] = (time.monotonic() + ttl, df)
+            if not fut.done():
+                fut.set_result(df)
+            return df
+        except Exception as e:
+            if not fut.done():
+                fut.set_exception(e)
+            raise
+        finally:
+            cur = self._candles_inflight.get(cache_key)
+            if cur is fut:
+                self._candles_inflight.pop(cache_key, None)
 
     def _df_from_ohlcv(self, rows: List[List[Any]], order: str) -> pd.DataFrame:
         if not rows:
@@ -6253,10 +6300,18 @@ class MultiExchangeData:
         return df
 
     async def klines_binance(self, symbol: str, interval: str, limit: int = 250) -> pd.DataFrame:
-        url = f"{self.BINANCE_SPOT}/api/v3/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": str(limit)}
-        raw = await self._get_json(url, params=params)
-        return self._df_from_ohlcv(raw, "binance")
+        sym = (symbol or "").upper().strip()
+        iv = (interval or "").strip().lower()
+        market = "SPOT"
+        cache_key = ("BINANCE", market, sym, iv, int(limit))
+
+        async def _fetch():
+            url = f"{self.BINANCE_SPOT}/api/v3/klines"
+            params = {"symbol": sym, "interval": iv, "limit": str(limit)}
+            raw = await self._get_json(url, params=params)
+            return self._df_from_ohlcv(raw, "binance")
+
+        return await self._klines_cached(cache_key=cache_key, interval=iv, fetch_coro=_fetch)
 
     
     async def depth_binance(self, symbol: str, limit: int = 20) -> Optional[dict]:
@@ -6271,14 +6326,22 @@ class MultiExchangeData:
         except Exception:
             return None
     async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        interval_map = {"5m":"5", "15m":"15", "30m":"30", "1h":"60", "4h":"240"}
-        itv = interval_map.get(interval, "15")
-        url = f"{self.BYBIT}/v5/market/kline"
-        params = {"category": "spot", "symbol": symbol, "interval": itv, "limit": str(limit)}
-        data = await self._get_json(url, params=params)
-        rows = (data or {}).get("result", {}).get("list", []) or []
-        rows = list(reversed(rows))
-        return self._df_from_ohlcv(rows, "bybit")
+        sym = (symbol or "").upper().strip()
+        iv = (interval or "").strip().lower()
+        market = "SPOT"
+        cache_key = ("BYBIT", market, sym, iv, int(limit))
+
+        async def _fetch():
+            interval_map = {"5m":"5", "15m":"15", "30m":"30", "1h":"60", "4h":"240"}
+            itv = interval_map.get(iv, "15")
+            url = f"{self.BYBIT}/v5/market/kline"
+            params = {"category": "spot", "symbol": sym, "interval": itv, "limit": str(limit)}
+            data = await self._get_json(url, params=params)
+            rows = (data or {}).get("result", {}).get("list", []) or []
+            rows = list(reversed(rows))
+            return self._df_from_ohlcv(rows, "bybit")
+
+        return await self._klines_cached(cache_key=cache_key, interval=iv, fetch_coro=_fetch)
 
     def okx_inst(self, symbol: str) -> str:
         if symbol.endswith("USDT"):
@@ -6287,139 +6350,138 @@ class MultiExchangeData:
         return symbol
 
     async def klines_okx(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        bar_map = {"5m":"5m", "15m":"15m", "30m":"30m", "1h":"1H", "4h":"4H"}
-        bar = bar_map.get(interval, "15m")
-        inst = self.okx_inst(symbol)
-        url = f"{self.OKX}/api/v5/market/candles"
-        params = {"instId": inst, "bar": bar, "limit": str(limit)}
-        data = await self._get_json(url, params=params)
-        rows = (data or {}).get("data", []) or []
-        rows = list(reversed(rows))
-        return self._df_from_ohlcv(rows, "okx")
+        sym = (symbol or "").upper().strip()
+        iv = (interval or "").strip().lower()
+        market = "SPOT"
+        cache_key = ("OKX", market, sym, iv, int(limit))
+
+        async def _fetch():
+            bar_map = {"5m":"5m", "15m":"15m", "30m":"30m", "1h":"1H", "4h":"4H"}
+            bar = bar_map.get(iv, "15m")
+            inst = self.okx_inst(sym)
+            url = f"{self.OKX}/api/v5/market/candles"
+            params = {"instId": inst, "bar": bar, "limit": str(limit)}
+            data = await self._get_json(url, params=params)
+            rows = (data or {}).get("data", []) or []
+            rows = list(reversed(rows))
+            return self._df_from_ohlcv(rows, "okx")
+
+        return await self._klines_cached(cache_key=cache_key, interval=iv, fetch_coro=_fetch)
 
 
     async def klines_mexc(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        """Fetch klines from MEXC Spot (Binance-compatible /api/v3/klines).
+        """Fetch klines from MEXC Spot (Binance-compatible /api/v3/klines)."""
+        sym = (symbol or "").upper().strip()
+        iv = (interval or "").strip().lower()
+        market = "SPOT"
 
-        MEXC returns rows with 8 fields:
-          [openTime, open, high, low, close, volume, closeTime, quoteVolume]
-        We normalize into the same OHLCV DataFrame shape used by Binance.
-        """
-        url = f"{self.MEXC}/api/v3/klines"
-
-        sym_u = (symbol or "").upper().strip()
-        if self._is_unsupported("MEXC", sym_u):
+        if self._is_unsupported_cached("MEXC", market, sym, iv):
             return pd.DataFrame()
-        if self._market_avail_check:
-            await self._ensure_mexc_symbols()
-            if self._mexc_symbols is not None and self._mexc_symbols and sym_u not in self._mexc_symbols:
-                self._mark_unsupported("MEXC", sym_u)
-                return pd.DataFrame()
 
-        def _mexc_interval(iv: str) -> str:
-            iv = (iv or "").strip()
-            # MEXC sometimes rejects "1h" style intervals; use minutes (e.g., 60m)
-            if iv.endswith("h"):
+        if not await self._market_supported("MEXC", sym):
+            self._mark_unsupported("MEXC", market, sym, iv)
+            return pd.DataFrame()
+
+        cache_key = ("MEXC", market, sym, iv, int(limit))
+
+        def _mexc_interval(x: str) -> str:
+            x = (x or "").strip().lower()
+            if x.endswith("h"):
                 try:
-                    return f"{int(iv[:-1]) * 60}m"
+                    return f"{int(x[:-1]) * 60}m"
                 except Exception:
-                    return iv
-            return iv
+                    return x
+            return x
 
-        params = {"symbol": sym_u, "interval": _mexc_interval(interval), "limit": str(limit)}
-        try:
-            raw = await self._get_json(url, params=params)
-        except aiohttp.ClientResponseError as cre:
-            if int(getattr(cre, "status", 0) or 0) in (400, 404):
-                # Symbol not supported on MEXC spot
-                self._mark_unsupported("MEXC", sym_u)
-                return pd.DataFrame()
-            raise
+        async def _fetch():
+            url = f"{self.MEXC}/api/v3/klines"
+            params = {"symbol": sym, "interval": _mexc_interval(iv), "limit": str(limit)}
+            try:
+                raw = await self._get_json(url, params=params)
+            except aiohttp.ClientResponseError as e:
+                if getattr(e, "status", None) in (400, 404):
+                    self._mark_unsupported("MEXC", market, sym, iv)
+                    return pd.DataFrame()
+                raise
 
-        rows = raw if isinstance(raw, list) else []
-        norm: list[list] = []
-        for r in rows:
-            if not isinstance(r, (list, tuple)) or len(r) < 6:
-                continue
-            # Pad to Binance 12-col layout
-            open_t = r[0]
-            o = r[1]
-            h = r[2] if len(r) > 2 else None
-            l = r[3] if len(r) > 3 else None
-            c = r[4] if len(r) > 4 else None
-            v = r[5] if len(r) > 5 else None
-            close_t = r[6] if len(r) > 6 else None
-            quote_v = r[7] if len(r) > 7 else None
-            norm.append([open_t, o, h, l, c, v, close_t, quote_v, 0, 0, 0, 0])
-        return self._df_from_ohlcv(norm, "binance")
+            rows = raw if isinstance(raw, list) else []
+            norm: list[list] = []
+            for r in rows:
+                if not isinstance(r, (list, tuple)) or len(r) < 6:
+                    continue
+                open_t = r[0]
+                o = r[1]
+                h = r[2] if len(r) > 2 else None
+                l = r[3] if len(r) > 3 else None
+                c = r[4] if len(r) > 4 else None
+                v = r[5] if len(r) > 5 else None
+                close_t = r[6] if len(r) > 6 else None
+                quote_v = r[7] if len(r) > 7 else None
+                norm.append([open_t, o, h, l, c, v, close_t, quote_v, 0, 0, 0, 0])
+            return self._df_from_ohlcv(norm, "binance")
 
+        return await self._klines_cached(cache_key=cache_key, interval=iv, fetch_coro=_fetch)
 
 
     async def klines_gateio(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        """Fetch klines from Gate.io Spot API v4 /spot/candlesticks.
+        """Fetch klines from Gate.io Spot API v4 /spot/candlesticks."""
+        sym = (symbol or "").upper().strip()
+        iv = (interval or "").strip().lower()
+        market = "SPOT"
 
-        Gate returns a list of arrays (most commonly 6 fields):
-          [t, v, c, h, l, o] where t is unix seconds.
-        We normalize to the same OHLCV DataFrame shape.
-        """
-        pair = _gate_pair(symbol)
-        pair_u = (pair or "").upper()
-        if self._is_unsupported("GATEIO", pair_u):
+        if self._is_unsupported_cached("GATEIO", market, sym, iv):
             return pd.DataFrame()
-        if self._market_avail_check:
-            await self._ensure_gate_pairs()
-            if self._gate_pairs is not None and self._gate_pairs and pair_u not in self._gate_pairs:
-                self._mark_unsupported("GATEIO", pair_u)
-                return pd.DataFrame()
 
-        url = f"{self.GATEIO}/spot/candlesticks"
-        params = {"currency_pair": pair, "interval": interval, "limit": str(limit)}
-        try:
-            raw = await self._get_json(url, params=params)
-        except aiohttp.ClientResponseError as cre:
-            if int(getattr(cre, "status", 0) or 0) in (400, 404):
-                # Pair not supported on Gate.io spot
-                self._mark_unsupported("GATEIO", pair_u)
-                return pd.DataFrame()
-            raise
-        rows = raw if isinstance(raw, list) else []
-        norm: list[list] = []
+        if not await self._market_supported("GATEIO", sym):
+            self._mark_unsupported("GATEIO", market, sym, iv)
+            return pd.DataFrame()
 
-        # Convert interval to ms for a synthetic close_time
-        def _interval_ms(iv: str) -> int:
-            s = (iv or "").strip().lower()
+        cache_key = ("GATEIO", market, sym, iv, int(limit))
+
+        async def _fetch():
+            pair = _gate_pair(sym)
+            url = f"{self.GATEIO}/spot/candlesticks"
+            params = {"currency_pair": pair, "interval": iv, "limit": str(limit)}
             try:
-                if s.endswith("m"):
-                    return int(float(s[:-1]) * 60_000)
-                if s.endswith("h"):
-                    return int(float(s[:-1]) * 3_600_000)
-                if s.endswith("d"):
-                    return int(float(s[:-1]) * 86_400_000)
-            except Exception:
+                raw = await self._get_json(url, params=params)
+            except aiohttp.ClientResponseError as e:
+                if getattr(e, "status", None) in (400, 404):
+                    self._mark_unsupported("GATEIO", market, sym, iv)
+                    return pd.DataFrame()
+                raise
+
+            rows = raw if isinstance(raw, list) else []
+            norm: list[list] = []
+
+            def _interval_ms(s: str) -> int:
+                s = (s or "").strip().lower()
+                try:
+                    if s.endswith("m"):
+                        return int(float(s[:-1]) * 60_000)
+                    if s.endswith("h"):
+                        return int(float(s[:-1]) * 3_600_000)
+                    if s.endswith("d"):
+                        return int(float(s[:-1]) * 86_400_000)
+                except Exception:
+                    return 0
                 return 0
-            return 0
 
-        step_ms = _interval_ms(interval)
+            step_ms = _interval_ms(iv)
 
-        for r in rows:
-            if not isinstance(r, (list, tuple)) or len(r) < 6:
-                continue
-            # Typical Gate: [t, v, c, h, l, o]
-            t_s = r[0]
-            v = r[1]
-            c = r[2]
-            h = r[3]
-            l = r[4]
-            o = r[5]
-            try:
-                t_ms = int(float(t_s) * 1000.0)
-            except Exception:
-                continue
-            close_ms = t_ms + step_ms if step_ms > 0 else t_ms
-            # Pad to Binance 12-col layout
-            norm.append([t_ms, o, h, l, c, v, close_ms, 0, 0, 0, 0, 0])
+            for r in rows:
+                if not isinstance(r, (list, tuple)) or len(r) < 6:
+                    continue
+                t_s, v, c, h, l, o = r[0], r[1], r[2], r[3], r[4], r[5]
+                try:
+                    t_ms = int(float(t_s) * 1000.0)
+                except Exception:
+                    continue
+                close_ms = t_ms + step_ms if step_ms > 0 else t_ms
+                norm.append([t_ms, o, h, l, c, v, close_ms, 0, 0, 0, 0, 0])
 
-        return self._df_from_ohlcv(norm, "binance")
+            return self._df_from_ohlcv(norm, "binance")
+
+        return await self._klines_cached(cache_key=cache_key, interval=iv, fetch_coro=_fetch)
 
 
 # ------------------ Indicators / engine ------------------
