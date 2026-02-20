@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import defaultdict
 from pathlib import Path
 import os
 
@@ -10159,6 +10160,12 @@ class Backend:
                     except Exception:
                         h = sum(ord(c) for c in symb)
                     return mid_primary_exchanges[h % len(mid_primary_exchanges)]
+                # --- MID candles diagnostics (optional) ---
+                _mid_candles_log_fail = int(os.getenv("MID_CANDLES_LOG_FAIL", "0") or "0")
+                _mid_candles_log_samples = int(os.getenv("MID_CANDLES_LOG_FAIL_SAMPLES", "3") or "3")
+                _mid_candles_fail = defaultdict(int)  # (exchange, tf) -> count
+                _mid_candles_fail_samples = defaultdict(list)  # (exchange, tf) -> [err...]
+
 
                 async def _mid_fetch_klines_rest(ex_name: str, symb: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
                     try:
@@ -10172,7 +10179,16 @@ class Backend:
                             return await api.klines_gateio(symb, tf, limit)
                         # default MEXC
                         return await api.klines_mexc(symb, tf, limit)
-                    except Exception:
+                    except Exception as e:
+                        # swallow but count (optional)
+                        try:
+                            if _mid_candles_log_fail:
+                                _mid_candles_fail[(ex_name, tf)] += 1
+                                lst = _mid_candles_fail_samples[(ex_name, tf)]
+                                if len(lst) < _mid_candles_log_samples:
+                                    lst.append(f"{type(e).__name__}: {e}")
+                        except Exception:
+                            pass
                         return None
 
                 async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
@@ -10616,6 +10632,19 @@ class Backend:
                                 exs = ",".join(ex) if ex else ""
                                 parts.append(f"{k}={v}" + (f" [{exs}]" if exs else ""))
                             logger.info("[mid][reject] scanned=%s accounted=%s missing=%s :: %s", int(_mid_scanned), int(accounted), int(missing), " | ".join(parts))
+
+                            if _mid_candles_log_fail and _mid_candles_fail:
+                                try:
+                                    # top offenders
+                                    items = sorted(_mid_candles_fail.items(), key=lambda kv: kv[1], reverse=True)[:6]
+                                    parts2 = []
+                                    for (ex, tf), cnt in items:
+                                        samp = _mid_candles_fail_samples.get((ex, tf)) or []
+                                        s = "; ".join(samp)
+                                        parts2.append(f"{ex}:{tf}={cnt}" + (f" ({s})" if s else ""))
+                                    logger.warning("[mid][candles_fail] %s", " | ".join(parts2))
+                                except Exception:
+                                    pass
                             # Optional: full per-symbol dump (can be verbose). Shows one reason per scanned symbol.
                             if _rej_full:
                                 try:
