@@ -1,7 +1,8 @@
-from __future__ import annotations
+\from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 import os
@@ -952,19 +953,6 @@ def _gate_pair(symbol: str) -> str:
     if s.endswith("USDT"):
         return f"{s[:-4]}_USDT"
     return s
-
-def _mexc_interval(interval: str) -> str:
-    """MEXC spot /api/v3/klines is Binance-like but some deployments reject '1h' and expect minutes (e.g. '60m').
-    Normalize hour-based intervals to minutes.
-    """
-    s = (interval or "").strip().lower()
-    try:
-        if s.endswith("h"):
-            mins = int(float(s[:-1]) * 60)
-            return f"{mins}m"
-    except Exception:
-        pass
-    return interval
 
 async def _okx_signed_request(
     session: aiohttp.ClientSession,
@@ -6152,7 +6140,7 @@ class MultiExchangeData:
         We normalize into the same OHLCV DataFrame shape used by Binance.
         """
         url = f"{self.MEXC}/api/v3/klines"
-        params = {"symbol": symbol.upper(), "interval": _mexc_interval(interval), "limit": str(limit)}
+        params = {"symbol": symbol.upper(), "interval": interval, "limit": str(limit)}
         raw = await self._get_json(url, params=params)
         rows = raw if isinstance(raw, list) else []
         norm: list[list] = []
@@ -10245,7 +10233,16 @@ class Backend:
                                 symbols_pool = list(self._mid_symbols_cache)
                             else:
                                 raise
-                        # Scan only first MID_TOP_N symbols from the loaded universe.
+                                        # Optional: sanitize symbols list (drop non-ASCII / malformed tickers)
+                        if os.getenv("MID_SYMBOL_SANITIZE", "1") == "1":
+                            _re = os.getenv("MID_SYMBOL_REGEX", r"^[A-Z0-9]{2,20}USDT$")
+                            try:
+                                symbols_pool = [s for s in symbols_pool if isinstance(s, str) and re.match(_re, s)]
+                            except re.error as _e:
+                                logger.warning("[mid] bad MID_SYMBOL_REGEX=%r (%s); using default", _re, _e)
+                                symbols_pool = [s for s in symbols_pool if isinstance(s, str) and re.match(r"^[A-Z0-9]{2,20}USDT$", s)]
+
+        # Scan only first MID_TOP_N symbols from the loaded universe.
                         symbols = list(symbols_pool[:max(0, int(top_n))])
                         # --- MID tick counters / diagnostics ---
                         _mid_scanned = len(symbols)
