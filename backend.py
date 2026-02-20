@@ -5982,6 +5982,11 @@ class MultiExchangeData:
         self._markets_cache_ttl = int(os.getenv("MID_MARKETS_CACHE_TTL_SEC", "21600") or "21600")  # 6h
         self._unsupported_ttl = int(os.getenv("MID_UNSUPPORTED_SYMBOL_TTL_SEC", "21600") or "21600")  # 6h
 
+        # Candle cache counters (for [mid][summary])
+        self._candle_cache_hit = 0
+        self._candle_cache_miss = 0
+        self._candle_inflight_wait = 0
+
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
         return self
@@ -5989,6 +5994,14 @@ class MultiExchangeData:
     async def __aexit__(self, exc_type, exc, tb):
         if self.session:
             await self.session.close()
+
+    def candle_counters_snapshot(self) -> tuple[int,int,int]:
+        """Return (hit, miss, inflight_wait) counters."""
+        try:
+            return (int(self._candle_cache_hit), int(self._candle_cache_miss), int(self._candle_inflight_wait))
+        except Exception:
+            return (0,0,0)
+
 
     def _norm_top_symbol(self, s: str) -> str:
         s = (s or "").upper().strip()
@@ -6258,11 +6271,24 @@ class MultiExchangeData:
         now = time.monotonic()
         cached = self._candles_cache.get(cache_key)
         if cached and now < cached[0]:
+            try:
+                self._candle_cache_hit += 1
+            except Exception:
+                pass
             return cached[1]
 
         inflight = self._candles_inflight.get(cache_key)
         if inflight is not None and not inflight.done():
+            try:
+                self._candle_inflight_wait += 1
+            except Exception:
+                pass
             return await inflight
+
+        try:
+            self._candle_cache_miss += 1
+        except Exception:
+            pass
 
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
@@ -9974,13 +10000,13 @@ class Backend:
 
 
                         # --- MID candles: balanced primary BINANCE/BYBIT + fallback + smart cache ---
-                        _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT") or "").strip()
+                        _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE") or "").strip()
                         mid_primary_exchanges = [x.strip().upper() for x in _primary_ex.split(",") if x.strip()]
                         if len(mid_primary_exchanges) < 2:
                             mid_primary_exchanges = ["BINANCE", "BYBIT"]
                         # keep only those available in scan_exchanges
-                        mid_primary_exchanges = [x for x in mid_primary_exchanges if x in scan_exchanges] or ["BINANCE", "BYBIT"]
-                        mid_fallback_exchanges = [x for x in scan_exchanges if x not in mid_primary_exchanges]
+                        mid_primary_exchanges = [x for x in mid_primary_exchanges if x in mid_candles_sources] or ['BINANCE']
+                        mid_fallback_exchanges = [x for x in mid_candles_sources if x not in mid_primary_exchanges]
 
                         mid_primary_mode = (os.getenv("MID_PRIMARY_MODE", "hash") or "hash").strip().lower()
                         mid_candles_retry = int(os.getenv("MID_CANDLES_RETRY", "1") or "1")
@@ -10360,7 +10386,8 @@ class Backend:
 
         # Soft timeout per symbol (skips symbols whose data fetch is too slow).
         # 0 = disabled.
-        mid_symbol_timeout_sec = _parse_seconds_env('MID_SYMBOL_TIMEOUT_SEC', 0.0)
+        mid_symbol_timeout_sec = _parse_seconds_env('MID_SYMBOL_TIMEOUT_SEC', 8.0)
+        mid_tick_budget_sec = _parse_seconds_env('MID_TICK_BUDGET_SEC', 35.0)
 
         while True:
             interval_sec = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45") or 45)
@@ -10416,10 +10443,25 @@ class Backend:
                 tp2_r = float(os.getenv("MID_TP2_R","2.8"))
 
                 # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
+                # NOTE: MID candles routing can restrict this universe further via MID_CANDLES_SOURCES / MID_ENABLE_SECONDARY_EXCHANGES
                 _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
                 scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
                 if not scan_exchanges:
                     scan_exchanges = ['BINANCE','BYBIT','OKX','GATEIO','MEXC']
+
+                # MID candle sources preference (default: BINANCE,BYBIT,OKX).
+                # Secondary exchanges (GATEIO/MEXC) are used only if explicitly enabled.
+                _mid_sources = (os.getenv('MID_CANDLES_SOURCES', 'BINANCE,BYBIT,OKX') or 'BINANCE,BYBIT,OKX').strip()
+                mid_candles_sources = [x.strip().upper() for x in _mid_sources.split(',') if x.strip()]
+                if not mid_candles_sources:
+                    mid_candles_sources = ['BINANCE','BYBIT','OKX']
+                enable_secondary = (os.getenv('MID_ENABLE_SECONDARY_EXCHANGES','0') or '0').strip().lower() in ('1','true','yes','on')
+                if not enable_secondary:
+                    # hard-disable secondary unless allowed
+                    mid_candles_sources = [x for x in mid_candles_sources if x in ('BINANCE','BYBIT','OKX')] or ['BINANCE','BYBIT','OKX']
+                # Ensure candle sources are within scan_exchanges
+                mid_candles_sources = [x for x in mid_candles_sources if x in scan_exchanges] or ['BINANCE','BYBIT','OKX']
+
                 # --- MID candles routing: stable primary (hash) BINANCE/BYBIT + fallback + smart cache ---
                 _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT") or "").strip()
                 mid_primary_exchanges = [x.strip().upper() for x in _primary_ex.split(",") if x.strip()]
@@ -10478,6 +10520,15 @@ class Backend:
                         # default MEXC
                         return await api.klines_mexc(symb, tf, limit)
                     except Exception as e:
+                        # classify candle failures
+                        try:
+                            msg = str(e)
+                            if isinstance(e, ExchangeAPIError) and ('HTTP 400' in msg or 'HTTP 404' in msg):
+                                _mid_candles_unsupported += 1
+                            else:
+                                _mid_candles_net_fail += 1
+                        except Exception:
+                            pass
                         # swallow but count (optional)
                         try:
                             if _mid_candles_log_fail:
@@ -10547,6 +10598,9 @@ class Backend:
                         _mid_f_adx = 0
                         _mid_f_atr = 0
                         _mid_f_futoff = 0
+                        _mid_candles_net_fail = 0
+                        _mid_candles_unsupported = 0
+                        _c0 = api.candle_counters_snapshot()
                         _mid_hard_block0 = _mid_hard_block_total()
                         _mid_hard_block = 0
 
@@ -10591,6 +10645,16 @@ class Backend:
                                 await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
 
                         for sym in symbols:
+                            # Hard budget per MID tick (prevents very long ticks during exchange issues)
+                            if mid_tick_budget_sec and mid_tick_budget_sec > 0:
+                                if (time.time() - start) > float(mid_tick_budget_sec):
+                                    # Mark remaining symbols as budget-exceeded (so [mid][reject] stays honest)
+                                    try:
+                                        for _s in symbols[symbols.index(sym):]:
+                                            _rej_add(_s, 'tick_budget')
+                                    except Exception:
+                                        pass
+                                    break
                             if is_blocked_symbol(sym):
                                 _mid_skip_blocked += 1
                                 _rej_add(sym, "blocked_symbol")
@@ -10877,7 +10941,7 @@ class Backend:
                                     continue
 
     # Exchanges where the instrument exists for the given market.
-                            _ex_order = ['BINANCE', 'BYBIT', 'OKX'] if market == 'FUTURES' else ['BINANCE', 'BYBIT', 'OKX', 'GATEIO', 'MEXC']
+                            _ex_order = ['BINANCE', 'BYBIT', 'OKX'] if (market == 'FUTURES' or not enable_secondary) else ['BINANCE', 'BYBIT', 'OKX', 'GATEIO', 'MEXC']
                             _oks = await asyncio.gather(*[_pair_exists(x) for x in _ex_order])
                             _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
                             if not _pair_exchanges:
@@ -10922,7 +10986,7 @@ class Backend:
                 elapsed = time.time() - start
                 try:
                     _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
-                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} elapsed={float(elapsed):.1f}s"
+                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} elapsed={float(elapsed):.1f}s"
                     logger.info("[mid] %s", summary)
 
                     # Optional: hardblock breakdown (top buckets)
