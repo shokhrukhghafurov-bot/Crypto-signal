@@ -10314,12 +10314,12 @@ class Backend:
                                         pass
                                     continue
 
-                                                        supporters = []  # kept for compatibility with later counters (not used for multi-exchange scoring)
+                            supporters = []  # kept for compatibility with later counters (not used for multi-exchange scoring)
                             chosen_name = None
                             chosen_r: Optional[Dict[str, Any]] = None
 
                             async def _choose_exchange_mid():
-                                nonlocal chosen_name, chosen_r, no_data
+                                nonlocal chosen_name, chosen_r
                                 primary = _mid_primary_for_symbol(sym)
                                 # try primary first, then the other primary (if any), then fallbacks
                                 try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
@@ -10329,7 +10329,6 @@ class Backend:
                                         b = await _mid_fetch_klines_cached(name, sym, tf_mid, 250)
                                         c = await _mid_fetch_klines_cached(name, sym, tf_trend, 250)
                                         if a is None or b is None or c is None or a.empty or b.empty or c.empty:
-                                            no_data += 1
                                             continue
                                         r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
                                         if r:
