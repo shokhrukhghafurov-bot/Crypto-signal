@@ -10616,6 +10616,7 @@ class Backend:
                         _mid_f_futoff = 0
                         _mid_candles_net_fail = 0
                         _mid_candles_unsupported = 0
+                        _mid_candles_partial = 0
                         _c0 = api.candle_counters_snapshot()
                         _mid_hard_block0 = _mid_hard_block_total()
                         _mid_hard_block = 0
@@ -10731,8 +10732,15 @@ class Backend:
                                             b = None
                                         if isinstance(c, Exception):
                                             c = None
-                                        if a is None or b is None or c is None or a.empty or b.empty or c.empty:
+                                        # Allow partial candles: if trigger timeframe exists, we can reuse it for missing mid/trend (reduces no_candles)
+                                        if a is None or a.empty:
                                             continue
+                                        if b is None or b.empty:
+                                            b = a
+                                            _mid_candles_partial += 1
+                                        if c is None or c.empty:
+                                            c = a
+                                            _mid_candles_partial += 1
                                         r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
                                         if r:
                                             chosen_name = name
@@ -11002,7 +11010,7 @@ class Backend:
                 elapsed = time.time() - start
                 try:
                     _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
-                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} elapsed={float(elapsed):.1f}s"
+                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} elapsed={float(elapsed):.1f}s"
                     logger.info("[mid] %s", summary)
 
                     # Optional: hardblock breakdown (top buckets)
