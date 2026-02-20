@@ -10341,9 +10341,14 @@ class Backend:
                                 try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
                                 for name in try_order:
                                     try:
-                                        a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250)
-                                        b = await _mid_fetch_klines_cached(name, sym, tf_mid, 250)
-                                        c = await _mid_fetch_klines_cached(name, sym, tf_trend, 250)
+                                        a, b, c = await asyncio.gather(
+                                            _mid_fetch_klines_cached(name, sym, tf_trigger, 250),
+                                            _mid_fetch_klines_cached(name, sym, tf_mid, 250),
+                                            _mid_fetch_klines_cached(name, sym, tf_trend, 250),
+                                            return_exceptions=True,
+                                        )
+                                        if isinstance(a, Exception) or isinstance(b, Exception) or isinstance(c, Exception):
+                                            continue
                                         if a is None or b is None or c is None or a.empty or b.empty or c.empty:
                                             continue
                                         r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
