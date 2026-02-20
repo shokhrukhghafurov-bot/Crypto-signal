@@ -372,6 +372,7 @@ async def _mid_autotune_update_on_close(*, market: str, orig_text: str, timefram
 import aiohttp
 import hmac
 import hashlib
+import uuid
 import base64
 import urllib.parse
 import numpy as np
@@ -433,6 +434,78 @@ def _mid_hard_block_total() -> int:
         return int(_MID_HARD_BLOCK_TOTAL)
     except Exception:
         return 0
+
+# --- MID hard-block breakdown (per-tick) ---
+# We keep counts of *which* _mid_block_reason(...) caused a hard block.
+# Reset each MID tick by setting _MID_HARD_BLOCK_TICK_TOKEN to a new value.
+_MID_HARD_BLOCK_TICK_TOKEN = None  # type: ignore
+_MID_HARD_BLOCK_BY_KEY = defaultdict(int)  # key -> count
+_MID_HARD_BLOCK_SAMPLES = defaultdict(list)  # key -> [sample strings]
+
+def _mid_hardblock_key(reason: str) -> str:
+    """Normalize a raw block reason into a compact bucket key."""
+    try:
+        r = (reason or "").strip()
+        if not r:
+            return "unknown"
+        head = r.split()[0]  # first token
+        # common forms: 'late_entry_atr=1.23', 'anti_bounce_short ...', 'rsi_short=..', 'below_ema20_5m ...'
+        key = head.split("=", 1)[0].strip()
+        if key.startswith("anti_bounce_"):
+            return "anti_bounce"
+        if key.startswith("rsi_"):
+            return "rsi"
+        if key in ("below_ema20_5m", "above_ema20_5m"):
+            return "ema20_5m"
+        if key.startswith("near_recent_"):
+            return "near_recent_extreme"
+        if key.startswith("mid_"):
+            return "mid_error"
+        return key
+    except Exception:
+        return "unknown"
+
+def _mid_hardblock_reset_tick() -> None:
+    global _MID_HARD_BLOCK_TICK_TOKEN, _MID_HARD_BLOCK_BY_KEY, _MID_HARD_BLOCK_SAMPLES
+    try:
+        _MID_HARD_BLOCK_TICK_TOKEN = str(uuid.uuid4())
+        _MID_HARD_BLOCK_BY_KEY = defaultdict(int)
+        _MID_HARD_BLOCK_SAMPLES = defaultdict(list)
+    except Exception:
+        _MID_HARD_BLOCK_TICK_TOKEN = "1"
+        _MID_HARD_BLOCK_BY_KEY = defaultdict(int)
+        _MID_HARD_BLOCK_SAMPLES = defaultdict(list)
+
+def _mid_hardblock_track(reason: str, symbol: str | None = None) -> None:
+    """Track per-tick hard-block buckets (safe to call from anywhere)."""
+    try:
+        if not _MID_HARD_BLOCK_TICK_TOKEN:
+            return
+        k = _mid_hardblock_key(str(reason))
+        _MID_HARD_BLOCK_BY_KEY[k] += 1
+        # keep few samples for log context
+        try:
+            maxs = int(os.getenv("MID_HARDBLOCK_SAMPLES", "2") or "2")
+        except Exception:
+            maxs = 2
+        if maxs > 0:
+            arr = _MID_HARD_BLOCK_SAMPLES[k]
+            if len(arr) < maxs:
+                if symbol:
+                    arr.append(f"{symbol}:{reason}")
+                else:
+                    arr.append(str(reason))
+    except Exception:
+        pass
+
+def _mid_hardblock_dump(max_keys: int = 6) -> str:
+    """Return compact breakdown string like: late_entry_atr=40, vwap_dist_atr=25, anti_bounce=18"""
+    try:
+        items = sorted([(k, int(v)) for k, v in _MID_HARD_BLOCK_BY_KEY.items()], key=lambda x: (-x[1], x[0]))
+        items = items[:max(1, int(max_keys))]
+        return ", ".join([f"{k}={v}" for k, v in items])
+    except Exception:
+        return ""
 
 # --- MID trap digest sink (aggregates "MID blocked (trap)" into a periodic digest) ---
 
@@ -7012,6 +7085,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         if reason:
             try:
                 _mid_inc_hard_block(1)
+                _mid_hardblock_track(str(reason), symbol)
                 _k = f"block|{symbol}|{dir_trend}|{_mid_trap_reason_key(str(reason))}"
                 if _mid_trap_should_log(_k):
                     logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, reason, float(entry))
@@ -9599,6 +9673,10 @@ class Backend:
     async def scanner_loop(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         while True:
             start = time.time()
+                try:
+                    _mid_hardblock_reset_tick()
+                except Exception:
+                    pass
             logger.info("SCAN tick start top_n=%s interval=%ss news_filter=%s macro_filter=%s", TOP_N, SCAN_INTERVAL_SECONDS, bool(NEWS_FILTER and CRYPTOPANIC_TOKEN), bool(MACRO_FILTER))
             logger.info("[scanner] tick start TOP_N=%s interval=%ss", TOP_N, SCAN_INTERVAL_SECONDS)
             self.last_scan_ts = start
@@ -10171,7 +10249,7 @@ class Backend:
                         h = sum(ord(c) for c in symb)
                     return mid_primary_exchanges[h % len(mid_primary_exchanges)]
                 # --- MID candles diagnostics (optional) ---
-                _mid_candles_log_fail = int(os.getenv("MID_CANDLES_LOG_FAIL", "0") or "0")
+                _mid_candles_log_fail = int(os.getenv("MID_CANDLES_LOG_FAIL", "1") or "1")
                 _mid_candles_log_samples = int(os.getenv("MID_CANDLES_LOG_FAIL_SAMPLES", "3") or "3")
                 _mid_candles_fail = defaultdict(int)  # (exchange, tf) -> count
                 _mid_candles_fail_samples = defaultdict(list)  # (exchange, tf) -> [err...]
@@ -10636,6 +10714,15 @@ class Backend:
                     _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
                     summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} elapsed={float(elapsed):.1f}s"
                     logger.info("[mid] %s", summary)
+
+                    # Optional: hardblock breakdown (top buckets)
+                    try:
+                        if int(os.getenv("MID_HARDBLOCK_LOG", "1") or "1"):
+                            hb = _mid_hardblock_dump(int(os.getenv("MID_HARDBLOCK_TOP", "6") or "6"))
+                            if hb:
+                                logger.info("[mid][hardblock] %s", hb)
+                    except Exception:
+                        pass
 
                     # Optional: per-tick breakdown of where scanned symbols went.
                     if _rej_enabled:
