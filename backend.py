@@ -10314,29 +10314,44 @@ class Backend:
                                         pass
                                     continue
 
-                            supporters = []  # kept for compatibility with later counters (not used for multi-exchange scoring)
+                                                        supporters = []  # kept for compatibility with later counters (not used for multi-exchange scoring)
                             chosen_name = None
                             chosen_r: Optional[Dict[str, Any]] = None
 
-                            primary = _mid_primary_for_symbol(sym)
-                            # try primary first, then the other primary (if any), then fallbacks
-                            try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
-
-                            for name in try_order:
-                                try:
-                                    a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250)
-                                    b = await _mid_fetch_klines_cached(name, sym, tf_mid, 250)
-                                    c = await _mid_fetch_klines_cached(name, sym, tf_trend, 250)
-                                    if a is None or b is None or c is None or a.empty or b.empty or c.empty:
-                                        no_data += 1
+                            async def _choose_exchange_mid():
+                                nonlocal chosen_name, chosen_r, no_data
+                                primary = _mid_primary_for_symbol(sym)
+                                # try primary first, then the other primary (if any), then fallbacks
+                                try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
+                                for name in try_order:
+                                    try:
+                                        a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250)
+                                        b = await _mid_fetch_klines_cached(name, sym, tf_mid, 250)
+                                        c = await _mid_fetch_klines_cached(name, sym, tf_trend, 250)
+                                        if a is None or b is None or c is None or a.empty or b.empty or c.empty:
+                                            no_data += 1
+                                            continue
+                                        r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
+                                        if r:
+                                            chosen_name = name
+                                            chosen_r = r
+                                            return
+                                    except Exception:
                                         continue
-                                    r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
-                                    if r:
-                                        chosen_name = name
-                                        chosen_r = r
-                                        break
-                                except Exception:
+
+                            # Soft timeout per symbol (prevents a single symbol/exchange from stalling the whole MID tick)
+                            if mid_symbol_timeout_sec and mid_symbol_timeout_sec > 0:
+                                try:
+                                    await asyncio.wait_for(_choose_exchange_mid(), timeout=float(mid_symbol_timeout_sec))
+                                except asyncio.TimeoutError:
+                                    _rej_add(sym, f"symbol_timeout_{float(mid_symbol_timeout_sec):.0f}s")
+                                    try:
+                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, '', None, 'symbol_timeout')
+                                    except Exception:
+                                        pass
                                     continue
+                            else:
+                                await _choose_exchange_mid()
 
                             if not chosen_r:
                                 _rej_add(sym, "no_candles")
