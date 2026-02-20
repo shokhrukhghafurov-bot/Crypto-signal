@@ -6150,10 +6150,20 @@ class MultiExchangeData:
         assert self.session is not None
         async with self._http_sem:
             async def _do():
-                async with self.session.get(url, params=params) as r:
-                    r.raise_for_status()
-                    return await r.json()
+                try:
+                    async with self.session.get(url, params=params) as r:
+                        r.raise_for_status()
+                        return await r.json()
+                except asyncio.TimeoutError as e:
+                    raise ExchangeAPIError(f"HTTP timeout url={url}") from e
+                except aiohttp.ClientResponseError as e:
+                    # Keep status for smarter handling upstream
+                    raise ExchangeAPIError(f"HTTP {e.status} url={url} msg={e.message}") from e
+                except (aiohttp.ClientError, OSError, ConnectionResetError) as e:
+                    raise ExchangeAPIError(f"HTTP error url={url} err={type(e).__name__}: {e}") from e
+
             return await asyncio.wait_for(_do(), timeout=self._http_req_timeout_sec)
+
 
 
 
@@ -6256,6 +6266,15 @@ class MultiExchangeData:
 
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
+        # Prevent "Future exception was never retrieved" warnings if a fetch fails
+        def _consume_exc(_fut: asyncio.Future):
+            try:
+                if not _fut.cancelled():
+                    _ = _fut.exception()
+            except Exception:
+                pass
+        fut.add_done_callback(_consume_exc)
+
         self._candles_inflight[cache_key] = fut
         try:
             df = await fetch_coro()
