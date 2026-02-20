@@ -9673,10 +9673,10 @@ class Backend:
     async def scanner_loop(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         while True:
             start = time.time()
-                try:
-                    _mid_hardblock_reset_tick()
-                except Exception:
-                    pass
+            try:
+                _mid_hardblock_reset_tick()
+            except Exception:
+                pass
             logger.info("SCAN tick start top_n=%s interval=%ss news_filter=%s macro_filter=%s", TOP_N, SCAN_INTERVAL_SECONDS, bool(NEWS_FILTER and CRYPTOPANIC_TOKEN), bool(MACRO_FILTER))
             logger.info("[scanner] tick start TOP_N=%s interval=%ss", TOP_N, SCAN_INTERVAL_SECONDS)
             self.last_scan_ts = start
