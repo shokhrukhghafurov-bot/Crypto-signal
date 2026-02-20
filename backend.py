@@ -9996,7 +9996,7 @@ class Backend:
                         _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
                         scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
                         if not scan_exchanges:
-                            scan_exchanges = ['BINANCE','BYBIT','OKX','GATEIO','MEXC']
+                            scan_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
 
                         # MID candles sources list (controls where we fetch candles from)
                         _mid_src_env = (os.getenv('MID_CANDLES_SOURCES','') or '').strip()
@@ -10463,7 +10463,7 @@ class Backend:
                 _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
                 scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
                 if not scan_exchanges:
-                    scan_exchanges = ['BINANCE','BYBIT','OKX','GATEIO','MEXC']
+                    scan_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
 
                 # MID candle sources preference (default: BINANCE,BYBIT,OKX).
                 # Secondary exchanges (GATEIO/MEXC) are used only if explicitly enabled.
