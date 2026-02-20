@@ -9998,6 +9998,22 @@ class Backend:
                         if not scan_exchanges:
                             scan_exchanges = ['BINANCE','BYBIT','OKX','GATEIO','MEXC']
 
+                        # MID candles sources list (controls where we fetch candles from)
+                        _mid_src_env = (os.getenv('MID_CANDLES_SOURCES','') or '').strip()
+                        if _mid_src_env:
+                            mid_candles_sources = [x.strip().upper() for x in _mid_src_env.split(',') if x.strip()]
+                        else:
+                            mid_candles_sources = list(scan_exchanges)
+                        # keep only exchanges that are enabled for scanner (defensive)
+                        mid_candles_sources = [x for x in mid_candles_sources if x in scan_exchanges]
+                        if not mid_candles_sources:
+                            mid_candles_sources = ['BINANCE']
+
+                        # optionally disable secondary exchanges (GATEIO/MEXC)
+                        _sec = (os.getenv('MID_ENABLE_SECONDARY_EXCHANGES','0') or '0').strip().lower()
+                        if _sec in ('0','false','no','off'):
+                            mid_candles_sources = [x for x in mid_candles_sources if x in ('BINANCE','BYBIT','OKX')] or ['BINANCE']
+
 
                         # --- MID candles: balanced primary BINANCE/BYBIT + fallback + smart cache ---
                         _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE") or "").strip()
