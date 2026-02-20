@@ -1,8 +1,8 @@
-\from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
-import json
 import re
+import json
 from collections import defaultdict
 from pathlib import Path
 import os
@@ -10065,6 +10065,14 @@ class Backend:
         # 0 = disabled.
         mid_symbol_timeout_sec = _parse_seconds_env('MID_SYMBOL_TIMEOUT_SEC', 0.0)
 
+        # Sanitize symbols pool (drops non-ASCII / weird tickers) before slicing to TOP_N.
+        mid_symbol_sanitize = os.getenv("MID_SYMBOL_SANITIZE", "1").strip().lower() not in ("0","false","no")
+        mid_symbol_regex = os.getenv("MID_SYMBOL_REGEX", r"^[A-Z0-9]{2,20}USDT$").strip() or r"^[A-Z0-9]{2,20}USDT$"
+        try:
+            _mid_symbol_rx = re.compile(mid_symbol_regex, flags=re.ASCII)
+        except Exception:
+            _mid_symbol_rx = re.compile(r"^[A-Z0-9]{2,20}USDT$", flags=re.ASCII)
+
         while True:
             interval_sec = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45") or 45)
             async def _mid_tick_body():
@@ -10233,16 +10241,14 @@ class Backend:
                                 symbols_pool = list(self._mid_symbols_cache)
                             else:
                                 raise
-                                        # Optional: sanitize symbols list (drop non-ASCII / malformed tickers)
-                        if os.getenv("MID_SYMBOL_SANITIZE", "1") == "1":
-                            _re = os.getenv("MID_SYMBOL_REGEX", r"^[A-Z0-9]{2,20}USDT$")
-                            try:
-                                symbols_pool = [s for s in symbols_pool if isinstance(s, str) and re.match(_re, s)]
-                            except re.error as _e:
-                                logger.warning("[mid] bad MID_SYMBOL_REGEX=%r (%s); using default", _re, _e)
-                                symbols_pool = [s for s in symbols_pool if isinstance(s, str) and re.match(r"^[A-Z0-9]{2,20}USDT$", s)]
+                        # Scan only first MID_TOP_N symbols from the loaded universe.
 
-        # Scan only first MID_TOP_N symbols from the loaded universe.
+                        if mid_symbol_sanitize and symbols_pool:
+                            before = len(symbols_pool)
+                            symbols_pool = [s for s in symbols_pool if isinstance(s, str) and _mid_symbol_rx.match(s)]
+                            dropped = before - len(symbols_pool)
+                            if dropped:
+                                logger.info("[mid] sanitized symbols_pool kept=%s dropped=%s regex=%s", len(symbols_pool), dropped, _mid_symbol_rx.pattern)
                         symbols = list(symbols_pool[:max(0, int(top_n))])
                         # --- MID tick counters / diagnostics ---
                         _mid_scanned = len(symbols)
