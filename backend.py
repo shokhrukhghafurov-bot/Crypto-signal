@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import re
 import json
 from collections import defaultdict
 from pathlib import Path
 import os
+import re
 
 
 
@@ -6140,7 +6140,16 @@ class MultiExchangeData:
         We normalize into the same OHLCV DataFrame shape used by Binance.
         """
         url = f"{self.MEXC}/api/v3/klines"
-        params = {"symbol": symbol.upper(), "interval": interval, "limit": str(limit)}
+        def _mexc_interval(iv: str) -> str:
+            iv = (iv or "").strip()
+            # MEXC sometimes rejects "1h" style intervals; use minutes (e.g., 60m)
+            if iv.endswith("h"):
+                try:
+                    return f"{int(iv[:-1]) * 60}m"
+                except Exception:
+                    return iv
+            return iv
+        params = {"symbol": symbol.upper(), "interval": _mexc_interval(interval), "limit": str(limit)}
         raw = await self._get_json(url, params=params)
         rows = raw if isinstance(raw, list) else []
         norm: list[list] = []
@@ -10065,14 +10074,6 @@ class Backend:
         # 0 = disabled.
         mid_symbol_timeout_sec = _parse_seconds_env('MID_SYMBOL_TIMEOUT_SEC', 0.0)
 
-        # Sanitize symbols pool (drops non-ASCII / weird tickers) before slicing to TOP_N.
-        mid_symbol_sanitize = os.getenv("MID_SYMBOL_SANITIZE", "1").strip().lower() not in ("0","false","no")
-        mid_symbol_regex = os.getenv("MID_SYMBOL_REGEX", r"^[A-Z0-9]{2,20}USDT$").strip() or r"^[A-Z0-9]{2,20}USDT$"
-        try:
-            _mid_symbol_rx = re.compile(mid_symbol_regex, flags=re.ASCII)
-        except Exception:
-            _mid_symbol_rx = re.compile(r"^[A-Z0-9]{2,20}USDT$", flags=re.ASCII)
-
         while True:
             interval_sec = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45") or 45)
             async def _mid_tick_body():
@@ -10242,13 +10243,6 @@ class Backend:
                             else:
                                 raise
                         # Scan only first MID_TOP_N symbols from the loaded universe.
-
-                        if mid_symbol_sanitize and symbols_pool:
-                            before = len(symbols_pool)
-                            symbols_pool = [s for s in symbols_pool if isinstance(s, str) and _mid_symbol_rx.match(s)]
-                            dropped = before - len(symbols_pool)
-                            if dropped:
-                                logger.info("[mid] sanitized symbols_pool kept=%s dropped=%s regex=%s", len(symbols_pool), dropped, _mid_symbol_rx.pattern)
                         symbols = list(symbols_pool[:max(0, int(top_n))])
                         # --- MID tick counters / diagnostics ---
                         _mid_scanned = len(symbols)
@@ -10357,9 +10351,18 @@ class Backend:
                                 try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
                                 for name in try_order:
                                     try:
-                                        a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250)
-                                        b = await _mid_fetch_klines_cached(name, sym, tf_mid, 250)
-                                        c = await _mid_fetch_klines_cached(name, sym, tf_trend, 250)
+                                        a, b, c = await asyncio.gather(
+                                            _mid_fetch_klines_cached(name, sym, tf_trigger, 250),
+                                            _mid_fetch_klines_cached(name, sym, tf_mid, 250),
+                                            _mid_fetch_klines_cached(name, sym, tf_trend, 250),
+                                            return_exceptions=True,
+                                        )
+                                        if isinstance(a, Exception):
+                                            a = None
+                                        if isinstance(b, Exception):
+                                            b = None
+                                        if isinstance(c, Exception):
+                                            c = None
                                         if a is None or b is None or c is None or a.empty or b.empty or c.empty:
                                             continue
                                         r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
