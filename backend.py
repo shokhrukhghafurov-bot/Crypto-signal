@@ -7,6 +7,7 @@ from pathlib import Path
 import os
 import re
 import time
+import contextvars
 
 
 
@@ -128,6 +129,7 @@ MID_HIGHER_LOWS_LOOKBACK = int(os.getenv("MID_HIGHER_LOWS_LOOKBACK", str(MID_LOW
 import random
 import re
 import time
+import contextvars
 import datetime as dt
 import math
 import statistics
@@ -512,6 +514,9 @@ def _mid_hardblock_dump(max_keys: int = 6) -> str:
 
 # Trap log dedup (avoid spamming the same message every second)
 _MID_TRAP_LAST_LOG: Dict[str, float] = {}
+
+# Per-tick log suppression (avoid repeating [mid][block]/[mid][trap] many times for same symbol)
+_MID_TICK_CTX = contextvars.ContextVar('MID_TICK_CTX', default=None)
 
 
 def _mid_trap_log_cooldown_sec() -> float:
@@ -7033,8 +7038,15 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         try:
             
             _trap_msg = f"{symbol}|{dir_trend}|{_mid_trap_reason_key(str(trap_reason))}"
-            if _mid_trap_should_log(_trap_msg):
-                logger.info("[mid][trap] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, trap_reason, float(entry))
+            _ctx = _MID_TICK_CTX.get()
+            _tick_key = f"{symbol}|{dir_trend}|trap"
+            if _ctx is not None and _tick_key in _ctx.get('trap', set()):
+                _ctx['suppress_trap'] = int(_ctx.get('suppress_trap', 0)) + 1
+            else:
+                if _ctx is not None:
+                    _ctx.setdefault('trap', set()).add(_tick_key)
+                if _mid_trap_should_log(_trap_msg):
+                    logger.info("[mid][trap] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, trap_reason, float(entry))
 
             _emit_mid_trap_event({"dir": str(dir_trend), "reason": str(trap_reason), "reason_key": _mid_trap_reason_key(str(trap_reason)), "entry": float(entry)})
         except Exception:
@@ -7323,8 +7335,15 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 _mid_inc_hard_block(1)
                 _mid_hardblock_track(str(reason), symbol)
                 _k = f"block|{symbol}|{dir_trend}|{_mid_trap_reason_key(str(reason))}"
-                if _mid_trap_should_log(_k):
-                    logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, reason, float(entry))
+                _ctx = _MID_TICK_CTX.get()
+                _tick_key = f"{symbol}|{dir_trend}|block"
+                if _ctx is not None and _tick_key in _ctx.get('block', set()):
+                    _ctx['suppress_block'] = int(_ctx.get('suppress_block', 0)) + 1
+                else:
+                    if _ctx is not None:
+                        _ctx.setdefault('block', set()).add(_tick_key)
+                    if _mid_trap_should_log(_k):
+                        logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, reason, float(entry))
                 # Reuse MID trap sink/digest to show why MID hard-filters blocked entries
                 _emit_mid_trap_event({
                     "dir": str(dir_trend),
@@ -10282,10 +10301,16 @@ class Backend:
         while True:
             interval_sec = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45") or 45)
             async def _mid_tick_body():
-                start = time.time()
+                start_total = time.time()
+                start = start_total
+                start_scan = start_total
+                prefetch_elapsed = 0.0
                 if os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() in ("0","false","no"):
                     await asyncio.sleep(10)
                     return
+
+                # Tick-local log guard
+                _MID_TICK_CTX.set({'block': set(), 'trap': set(), 'suppress_block': 0, 'suppress_trap': 0})
 
                 interval = interval_sec
                 top_n = int(os.getenv("MID_TOP_N", "50"))
@@ -10486,6 +10511,8 @@ class Backend:
                         try:
                             symbols_pool = await api.get_top_usdt_symbols(top_n_symbols)
                             if symbols_pool:
+                                # de-duplicate (some exchanges/pools can return duplicates)
+                                symbols_pool = list(dict.fromkeys(symbols_pool))
                                 self._mid_symbols_cache = list(symbols_pool)
                                 self._mid_symbols_cache_ts = time.time()
                         except Exception as e:
@@ -10496,6 +10523,9 @@ class Backend:
                                 raise
                         # Scan only first MID_TOP_N symbols from the loaded universe.
                         symbols = list(symbols_pool[:max(0, int(top_n))])
+                        # ensure unique symbols per tick (preserve order)
+                        if symbols:
+                            symbols = list(dict.fromkeys(symbols))
                         # --- MID tick counters / diagnostics ---
                         _mid_scanned = len(symbols)
                         _mid_pool = len(symbols_pool)
@@ -10519,8 +10549,8 @@ class Backend:
                         _mid_hard_block = 0
 
                         # --- MID reject digest (log-only): explains "scanned=N but counters don't add up" ---
-                        # Enable with MID_REJECT_DIGEST=1
-                        _rej_enabled = os.getenv("MID_REJECT_DIGEST", "0").strip().lower() in ("1","true","yes","on")
+                        # MID reject digest (enabled by default; set MID_REJECT_DIGEST=0 to disable)
+                        _rej_enabled = os.getenv("MID_REJECT_DIGEST", "1").strip().lower() in ("1","true","yes","on")
                         _rej_max_reasons = int(os.getenv("MID_REJECT_DIGEST_MAX_REASONS", "12") or 12)
                         _rej_examples = int(os.getenv("MID_REJECT_DIGEST_EXAMPLES", "3") or 3)
                         _rej_seen = set()
@@ -10583,10 +10613,14 @@ class Backend:
                                         await asyncio.gather(*tasks, return_exceptions=True)
                             except Exception as _e:
                                 logger.warning("[mid] candles prefetch failed: %s", _e)
+
+                        # Exclude prefetch time from per-symbol budget (budget applies to scan phase)
+                        start_scan = time.time()
+                        prefetch_elapsed = float(start_scan - start_total)
                         for sym in symbols:
                             # Hard budget per MID tick (prevents very long ticks during exchange issues)
                             if mid_tick_budget_sec and mid_tick_budget_sec > 0:
-                                if (time.time() - start) > float(mid_tick_budget_sec):
+                                if (time.time() - start_scan) > float(mid_tick_budget_sec):
                                     # Mark remaining symbols as budget-exceeded (so [mid][reject] stays honest)
                                     try:
                                         for _s in symbols[symbols.index(sym):]:
@@ -10931,8 +10965,8 @@ class Backend:
                 elapsed = time.time() - start
                 try:
                     _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
-                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} elapsed={float(elapsed):.1f}s"
-                    logger.info("[mid] %s", summary)
+                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
+                    logger.info("[mid][summary] %s", summary)
 
                     # Optional: hardblock breakdown (top buckets)
                     try:
@@ -10943,8 +10977,10 @@ class Backend:
                     except Exception:
                         pass
 
-                    # Optional: per-tick breakdown of where scanned symbols went.
-                    if _rej_enabled:
+                    # Per-tick breakdown of where scanned symbols went.
+                    if not _rej_enabled:
+                        logger.info("[mid][reject] disabled (set MID_REJECT_DIGEST=1 to enable)")
+                    else:
                         try:
                             accounted = len(_rej_seen)
                             missing = max(0, int(_mid_scanned) - int(accounted))
