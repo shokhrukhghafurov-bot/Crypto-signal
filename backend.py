@@ -10016,10 +10016,10 @@ class Backend:
 
 
                         # --- MID candles: balanced primary BINANCE/BYBIT + fallback + smart cache ---
-                        _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE") or "").strip()
+                        _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT,OKX") or "").strip()
                         mid_primary_exchanges = [x.strip().upper() for x in _primary_ex.split(",") if x.strip()]
-                        if len(mid_primary_exchanges) < 2:
-                            mid_primary_exchanges = ["BINANCE", "BYBIT"]
+                        if len(mid_primary_exchanges) < 3:
+                            mid_primary_exchanges = ["BINANCE", "BYBIT", "OKX"]
                         # keep only those available in scan_exchanges
                         mid_primary_exchanges = [x for x in mid_primary_exchanges if x in mid_candles_sources] or ['BINANCE']
                         mid_fallback_exchanges = [x for x in mid_candles_sources if x not in mid_primary_exchanges]
@@ -10031,7 +10031,21 @@ class Backend:
                         mid_cache_ttl_1h = int(os.getenv("MID_CANDLES_CACHE_TTL_1H", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "300")) or "300")
                         mid_cache_stale_sec = int(os.getenv("MID_CANDLES_CACHE_STALE_SEC", "900") or "900")
 
-                        _mid_candles_cache: Dict[Tuple[str,str,str,int], Tuple[float, pd.DataFrame]] = {}
+                        # persistent candles cache (shared across ticks)
+                        if not hasattr(self, "_mid_candles_cache"):
+                            self._mid_candles_cache = {}  # type: ignore[attr-defined]
+                        if not hasattr(self, "_mid_candles_inflight"):
+                            self._mid_candles_inflight = {}  # type: ignore[attr-defined]
+                        if not hasattr(self, "_mid_klines_sem"):
+                            try:
+                                self._mid_klines_sem = asyncio.Semaphore(int(os.getenv("MID_KLINES_CONCURRENCY", "15") or "15"))  # type: ignore[attr-defined]
+                            except Exception:
+                                self._mid_klines_sem = asyncio.Semaphore(15)  # type: ignore[attr-defined]
+
+                        _mid_candles_cache = self._mid_candles_cache  # type: ignore[attr-defined]
+                        _mid_candles_inflight = self._mid_candles_inflight  # type: ignore[attr-defined]
+                        _mid_klines_sem = self._mid_klines_sem  # type: ignore[attr-defined]
+
 
                         def _mid_cache_ttl(tf: str) -> int:
                             t = (tf or "").lower()
@@ -10052,134 +10066,89 @@ class Backend:
                                 h = sum(ord(c) for c in symb)
                             return mid_primary_exchanges[h % len(mid_primary_exchanges)]
 
+                        
                         async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
+                            # Cache key is exchange+symbol+tf+limit
                             key = (ex_name, symb, tf, int(limit))
-                            now = time.time()
-                            ttl = _mid_cache_ttl(tf)
+                            now = time.monotonic()
+                            ttl = float(_mid_cache_ttl(tf))
                             cached = _mid_candles_cache.get(key)
                             if cached:
-                                ts, df = cached
-                                if (now - ts) <= ttl and df is not None and not df.empty:
+                                exp_ts, df = cached
+                                if now < exp_ts and df is not None and not df.empty:
                                     return df
-                            # try REST with retry
-                            last_err = None
-                            for attempt in range(max(0, mid_candles_retry) + 1):
+
+                            inflight = _mid_candles_inflight.get(key)
+                            if inflight is not None and not inflight.done():
+                                return await inflight
+
+                            loop = asyncio.get_running_loop()
+                            fut = loop.create_future()
+                            # Prevent "Future exception was never retrieved"
+                            def _consume_exc(_fut: asyncio.Future):
                                 try:
-                                    if ex_name == "BINANCE":
-                                        df = await api.klines_binance(symb, tf, limit)
-                                    elif ex_name == "BYBIT":
-                                        df = await api.klines_bybit(symb, tf, limit)
-                                    elif ex_name == "OKX":
-                                        df = await api.klines_okx(symb, tf, limit)
-                                    elif ex_name == "GATEIO":
-                                        df = await api.klines_gateio(symb, tf, limit)
-                                    elif ex_name == "MEXC":
-                                        df = await api.klines_mexc(symb, tf, limit)
-                                    else:
-                                        return None
+                                    if not _fut.cancelled():
+                                        _ = _fut.exception()
+                                except Exception:
+                                    pass
+                            fut.add_done_callback(_consume_exc)
+                            _mid_candles_inflight[key] = fut
+
+                            async def _do_fetch() -> Optional[pd.DataFrame]:
+                                last_err = None
+                                for attempt in range(max(0, mid_candles_retry) + 1):
+                                    try:
+                                        async with _mid_klines_sem:
+                                            # Hard timeout per request
+                                            req_timeout = float(os.getenv("MID_KLINES_TIMEOUT_SEC", os.getenv("HTTP_REQ_TIMEOUT_SEC", "4")) or "4")
+                                            async def _call():
+                                                if ex_name == "BINANCE":
+                                                    return await api.klines_binance(symb, tf, limit)
+                                                if ex_name == "BYBIT":
+                                                    return await api.klines_bybit(symb, tf, limit)
+                                                if ex_name == "OKX":
+                                                    return await api.klines_okx(symb, tf, limit)
+                                                if ex_name == "MEXC":
+                                                    return await api.klines_mexc(symb, tf, limit)
+                                                if ex_name == "GATEIO":
+                                                    return await api.klines_gateio(symb, tf, limit)
+                                                return None
+                                            df = await asyncio.wait_for(_call(), timeout=req_timeout)
+                                        if df is not None and not df.empty:
+                                            _mid_candles_cache[key] = (time.monotonic() + ttl, df)
+                                            return df
+                                        # empty df -> treat as miss and try next attempt
+                                    except Exception as e:
+                                        last_err = e
+                                        await asyncio.sleep(0.05 * (attempt + 1))
+                                        continue
+
+                                # stale fallback (best-effort)
+                                if cached:
+                                    exp_ts, df = cached
+                                    # allow stale up to mid_cache_stale_sec
                                     if df is not None and not df.empty:
-                                        _mid_candles_cache[key] = (now, df)
-                                        return df
-                                except Exception as e:
-                                    last_err = e
-                                    # tiny backoff
-                                    await asyncio.sleep(0.05 * (attempt + 1))
-                                    continue
-                            # fallback to stale cache if we have it and it's not too old
-                            if cached:
-                                ts, df = cached
-                                if (now - ts) <= mid_cache_stale_sec and df is not None and not df.empty:
-                                    return df
-                            return None
-                        results = await asyncio.gather(*[fetch_exchange(ex) for ex in scan_exchanges])
-                        good = [(name, r) for (name, r) in results if r is not None]
-                        if not good:
-                            continue
+                                        age = max(0.0, (now - (exp_ts - ttl)))
+                                        if age <= float(mid_cache_stale_sec):
+                                            return df
+                                if last_err:
+                                    raise last_err
+                                return None
 
-                        # Signal can be produced from a single exchange result.
-                        best_name, best_r = max(
-                            good,
-                            key=lambda x: (int((x[1] or {}).get("confidence", 0) or 0), float((x[1] or {}).get("rr", 0.0) or 0.0)),
-                        )
-                        best_dir = best_r["direction"]
-                        supporters = [(best_name, best_r)]
+                            try:
+                                df = await _do_fetch()
+                                if not fut.done():
+                                    fut.set_result(df)
+                                return df
+                            except Exception as e:
+                                if not fut.done():
+                                    fut.set_exception(e)
+                                raise
+                            finally:
+                                cur = _mid_candles_inflight.get(key)
+                                if cur is fut:
+                                    _mid_candles_inflight.pop(key, None)
 
-                        entry = float(best_r["entry"])
-                        sl = float(best_r["sl"])
-                        tp1 = float(best_r["tp1"])
-                        tp2 = float(best_r["tp2"])
-                        rr = float(best_r["rr"])
-                        conf = int(best_r["confidence"])
-
-                        market = choose_market(float(best_r.get("adx1", 0.0) or 0.0),
-                                              float(best_r.get("atr_pct", 0.0) or 0.0))
-                        
-                        min_conf = TA_MIN_SCORE_FUTURES if market == "FUTURES" else TA_MIN_SCORE_SPOT
-
-# Orderbook confirmation (FUTURES only, enabled via ENV)
-                        if USE_ORDERBOOK and (not ORDERBOOK_FUTURES_ONLY or market == "FUTURES"):
-                            ob_allows: List[bool] = []
-                            ob_notes: List[str] = []
-                            for ex in [s[0] for s in supporters]:
-                                if ex.strip().lower() not in ORDERBOOK_EXCHANGES:
-                                    continue
-                                ok, note = await orderbook_filter(api, ex, sym, best_dir)
-                                ob_allows.append(bool(ok))
-                                ob_notes.append(note)
-                            # If we checked at least one exchange and none allowed -> block signal
-                            if ob_allows and not any(ob_allows):
-                                # keep a short reason in logs
-                                logger.info("[orderbook] block %s %s %s notes=%s", sym, market, best_dir, "; ".join(ob_notes)[:200])
-                                continue
-                        
-                        if conf < min_conf or rr < 2.0:
-                            continue
-                        
-                        risk_notes = []
-
-                        # Add TA summary (real indicators) to the signal card
-                        try:
-                            best_supporter = max(supporters, key=lambda s: int(s[1].get("confidence", 0)))
-                            ta_block = str(best_supporter[1].get("ta_block", "") or "").strip()
-                            if ta_block:
-                                risk_notes.append(ta_block)
-                        except Exception:
-                            pass
-
-
-                        if news_act == "FUTURES_OFF" and market == "FUTURES":
-                            market = "SPOT"
-                            risk_notes.append("⚠️ Futures paused due to news")
-                        if mac_act == "FUTURES_OFF" and market == "FUTURES":
-                            market = "SPOT"
-                            risk_notes.append("⚠️ Futures signals are temporarily disabled (macro)")
-
-                        # Policy: SPOT + SHORT is confusing for most users. Default behavior:
-                        # auto-convert SPOT SHORT -> FUTURES SHORT (keeps Entry/SL/TP intact).
-                        # Exception: if futures signals are currently forced OFF (news/macro), we cannot convert,
-                        # so we skip such signals to avoid sending a non-executable SPOT SHORT.
-                        if market == "SPOT" and str(best_dir).upper() == "SHORT":
-                            fut_forced_off = any(
-                                ("Futures paused" in n) or ("Futures signals are temporarily disabled" in n)
-                                for n in risk_notes
-                            )
-                            if fut_forced_off:
-                                logger.info(
-                                    "[signal] skip %s %s %s reason=spot_short_but_futures_forced_off",
-                                    sym,
-                                    market,
-                                    best_dir,
-                                )
-                                continue
-
-                            market = "FUTURES"
-                            risk_notes.append("ℹ️ Auto-converted: SPOT SHORT → FUTURES")
-                            logger.info(
-                                "[signal] convert %s SPOT/SHORT -> FUTURES/SHORT",
-                                sym,
-                            )
-
-# List exchanges where the symbol exists (public price available).
                         async def _pair_exists(ex: str) -> bool:
                             try:
                                 exu = (ex or "").upper().strip()
@@ -10494,7 +10463,21 @@ class Backend:
                 mid_cache_ttl_1h = int(os.getenv("MID_CANDLES_CACHE_TTL_1H", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "300")) or "300")
                 mid_cache_stale_sec = int(os.getenv("MID_CANDLES_CACHE_STALE_SEC", "900") or "900")
 
-                _mid_candles_cache: Dict[Tuple[str,str,str,int], Tuple[float, pd.DataFrame]] = {}
+                # persistent candles cache (shared across ticks)
+                if not hasattr(self, "_mid_candles_cache"):
+                    self._mid_candles_cache = {}  # type: ignore[attr-defined]
+                if not hasattr(self, "_mid_candles_inflight"):
+                    self._mid_candles_inflight = {}  # type: ignore[attr-defined]
+                if not hasattr(self, "_mid_klines_sem"):
+                    try:
+                        self._mid_klines_sem = asyncio.Semaphore(int(os.getenv("MID_KLINES_CONCURRENCY", "15") or "15"))  # type: ignore[attr-defined]
+                    except Exception:
+                        self._mid_klines_sem = asyncio.Semaphore(15)  # type: ignore[attr-defined]
+
+                _mid_candles_cache = self._mid_candles_cache  # type: ignore[attr-defined]
+                _mid_candles_inflight = self._mid_candles_inflight  # type: ignore[attr-defined]
+                _mid_klines_sem = self._mid_klines_sem  # type: ignore[attr-defined]
+
 
                 def _mid_cache_ttl(tf: str) -> int:
                     t = (tf or "").lower()
