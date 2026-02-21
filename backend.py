@@ -160,6 +160,19 @@ _MID_AUTOTUNE_PATH = Path(os.getenv("MID_AUTOTUNE_PATH", str(Path(__file__).with
 # Kept sync-friendly because scanner code uses it from non-async contexts.
 _MID_AUTOTUNE_CACHE: dict = {}
 
+
+def _parse_seconds_env(name: str, default: float) -> float:
+    """Parse seconds-like environment values (supports optional trailing 's')."""
+    raw = os.getenv(name, "").strip()
+    if raw == "":
+        return float(default)
+    if raw.lower().endswith("s"):
+        raw = raw[:-1].strip()
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
 def _clamp(v: float, lo: float, hi: float) -> float:
     try:
         return float(max(lo, min(hi, float(v))))
@@ -10367,33 +10380,18 @@ class Backend:
         # --- MID candles market selection ---
         # IMPORTANT (production hardening):
         # User requested: "свечи берем только из SPOT и эти свечи для FUTURES тоже используем".
-        # MID candles markets to try.
-# Historically this was forced to SPOT only, but many symbols exist only on FUTURES/SWAP on some exchanges.
-# Control via env:
-#   MID_CANDLES_MARKET_MODE=SPOT | FUTURES | AUTO   (default AUTO if MID_ALLOW_FUTURES=1 else SPOT)
-mode = (os.getenv("MID_CANDLES_MARKET_MODE","").strip().upper() or "")
-allow_fut = (os.getenv("MID_ALLOW_FUTURES","0").strip().lower() in ("1","true","yes","on"))
-if not mode:
-    mode = "AUTO" if allow_fut else "SPOT"
-if mode in ("FUTURES","SWAP","PERP","PERPETUAL"):
-    markets_try = ["FUTURES"]
-elif mode == "AUTO":
-    markets_try = ["FUTURES","SPOT"] if allow_fut else ["SPOT"]
-else:
-    markets_try = ["SPOT"]
-# default/primary market used for prefetch
-market_mid = markets_try[0] if markets_try else "SPOT"
-        def _parse_seconds_env(name: str, default: float) -> float:
-            raw = os.getenv(name, "").strip()
-            if raw == "":
-                return float(default)
-            if raw.lower().endswith("s"):
-                raw = raw[:-1].strip()
-            try:
-                return float(raw)
-            except Exception:
-                return float(default)
-
+        # We force MID candles to be fetched from SPOT only.
+        # (Signals can still be FUTURES — we just use SPOT klines for TA.)
+        market_mode = (os.getenv('MID_CANDLES_MARKET_MODE', 'AUTO') or 'AUTO').upper().strip()
+        allow_fut = str(os.getenv('MID_ALLOW_FUTURES', '0') or '0').strip().lower() not in ('0','false','no','off')
+        if market_mode == 'AUTO':
+            markets_try = ['FUTURES','SPOT'] if allow_fut else ['SPOT']
+        elif market_mode in ('FUTURES','SWAP','PERP','PERPS'):
+            markets_try = ['FUTURES']
+        else:
+            markets_try = ['SPOT']
+        # default/primary market used for prefetch
+        market_mid = markets_try[0] if markets_try else 'SPOT'
 
         # Hard timeout for a whole MID tick (prevents 200s+ overruns).
         # 0 = disabled.
@@ -10411,6 +10409,24 @@ market_mid = markets_try[0] if markets_try else "SPOT"
                 start = start_total
                 start_scan = start_total
                 prefetch_elapsed = 0.0
+                # --- Candles diagnostics (per tick) ---
+                _mid_diag_enabled = str(os.getenv('MID_CANDLES_LOG_DIAG', os.getenv('MID_CANDLES_LOG_FAIL', '1')) or '1').strip().lower() not in ('0','false','no','off')
+                _mid_diag_max = int(os.getenv('MID_CANDLES_DIAG_MAX', '200') or 200)
+                _mid_diag_lines = 0
+                _mid_candles_diag = defaultdict(list)  # (symbol, tf) -> ["EX:MARKET:STATUS(:reason)", ...]
+
+                def _mid_diag_add(symb: str, ex_name: str, market: str, tf: str, status: str, reason: str = '') -> None:
+                    nonlocal _mid_diag_lines
+                    try:
+                        key = (symb, tf)
+                        rec = f"{ex_name}:{(market or 'SPOT').upper().strip()}:{status}" + (f":{reason}" if reason else '')
+                        _mid_candles_diag[key].append(rec)
+                        if _mid_diag_enabled and _mid_diag_lines < _mid_diag_max and status != 'OK':
+                            _mid_diag_lines += 1
+                            logger.info(f"[mid][candles_missing] symbol={symb} exchange={ex_name} market={(market or 'SPOT').upper().strip()} tf={tf} status={status}" + (f" reason={reason}" if reason else ""))
+                    except Exception:
+                        pass
+
                 if os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() in ("0","false","no"):
                     await asyncio.sleep(10)
                     return
@@ -10591,6 +10607,7 @@ market_mid = markets_try[0] if markets_try else "SPOT"
                             # Fast-skip pairs we already know are unsupported on this exchange/market/TF
                             try:
                                 if api._is_unsupported_cached(ex_name, mkt, symb, tf):
+                                    _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_cached')
                                     return pd.DataFrame()
                             except Exception:
                                 pass
@@ -10600,6 +10617,7 @@ market_mid = markets_try[0] if markets_try else "SPOT"
                                     api._mark_unsupported(ex_name, mkt, symb, tf)
                                 except Exception:
                                     pass
+                                _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_market')
                                 return None
                             if ex_name == "BINANCE":
                                 # Avoid noisy HTTP 400 (Invalid symbol) on futures by checking exchangeInfo first.
@@ -10614,6 +10632,7 @@ market_mid = markets_try[0] if markets_try else "SPOT"
                                                     api._mark_unsupported(ex_name, mkt, symb, tf)
                                                 except Exception:
                                                     pass
+                                                _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_pair')
                                                 return pd.DataFrame()
                                 except Exception:
                                     # If exchangeInfo fails, fall back to request (old behavior)
@@ -10658,6 +10677,7 @@ market_mid = markets_try[0] if markets_try else "SPOT"
                                         pass
                                 else:
                                     _mid_candles_net_fail += 1
+                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'fail', f"{type(e).__name__}: {e}")
                         except Exception:
                             pass
                         # swallow but count (optional)
@@ -10672,9 +10692,6 @@ market_mid = markets_try[0] if markets_try else "SPOT"
                         return None
 
                 async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
-                    # Force SPOT candles even if caller requested FUTURES.
-                    # This is intentional: we use SPOT klines for both SPOT and FUTURES signals.
-                    market = 'SPOT'
                     key = (ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
                     now = time.time()
                     ttl = _mid_cache_ttl(tf)
@@ -10682,6 +10699,7 @@ market_mid = markets_try[0] if markets_try else "SPOT"
                     if cached:
                         ts, df = cached
                         if (now - ts) <= ttl and df is not None and not df.empty:
+                            _mid_diag_add(symb, ex_name, market, tf, 'OK', 'cache')
                             return df
                     
                     # Persistent candles cache (Postgres) to survive restarts.
@@ -10700,6 +10718,7 @@ market_mid = markets_try[0] if markets_try else "SPOT"
                                     dfp = db_store._cc_unpack_df(blob)
                                     if dfp is not None and not dfp.empty:
                                         _mid_candles_cache[key] = (now, dfp)
+                                        _mid_diag_add(symb, ex_name, market, tf, 'OK', 'persist')
                                         return dfp
                         except Exception:
                             pass
@@ -10739,6 +10758,7 @@ market_mid = markets_try[0] if markets_try else "SPOT"
                                     await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob)
                             except Exception:
                                 pass
+                            _mid_diag_add(symb, ex_name, market, tf, 'OK', 'rest')
                             return last
                         # tiny backoff reduces rate-limit bursts and improves success on flaky networks
                         if _i < max(0, mid_candles_retry):
