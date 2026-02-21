@@ -10662,24 +10662,38 @@ class Backend:
                                 # Pre-check listing on Bybit SPOT to avoid noisy retCode=10001 and allow clean fallback
                                 try:
                                     if (mkt == 'SPOT') and (not await _bybit_symbol_listed(category='spot', symbol=symb)):
-                                        try:
-                                            api._mark_unsupported(ex_name, mkt, symb, tf)
-                                        except Exception:
-                                            pass
-                                        return pd.DataFrame()
-                                except Exception:
+                                            # Bybit SPOT doesn't list this symbol. Prefer FUTURES candles when allowed (perpetuals).
+                                            if allow_futures:
+                                                try:
+                                                    api._mark_unsupported(ex_name, mkt, symb, tf)
+                                                except Exception:
+                                                    pass
+                                                return await api.klines_bybit(symb, tf, limit, market='FUTURES')
+                                            try:
+                                                api._mark_unsupported(ex_name, mkt, symb, tf)
+                                            except Exception:
+                                                pass
+                                            return pd.DataFrame()
+except Exception:
                                     pass
                                 return await api.klines_bybit(symb, tf, limit, market=market)
                             if ex_name == "OKX":
                                 # Pre-check listing on OKX SPOT to avoid 51001 spam and allow clean fallback
                                 try:
                                     if (mkt == 'SPOT') and (not await _okx_symbol_listed(inst_type='SPOT', symbol=symb)):
-                                        try:
-                                            api._mark_unsupported(ex_name, mkt, symb, tf)
-                                        except Exception:
-                                            pass
-                                        return pd.DataFrame()
-                                except Exception:
+                                            # OKX SPOT doesn't list this symbol. Prefer FUTURES(SWAP) candles when allowed.
+                                            if allow_futures:
+                                                try:
+                                                    api._mark_unsupported(ex_name, mkt, symb, tf)
+                                                except Exception:
+                                                    pass
+                                                return await api.klines_okx(symb, tf, limit, market='FUTURES')
+                                            try:
+                                                api._mark_unsupported(ex_name, mkt, symb, tf)
+                                            except Exception:
+                                                pass
+                                            return pd.DataFrame()
+except Exception:
                                     pass
                                 return await api.klines_okx(symb, tf, limit, market=market)
                             if ex_name == "GATEIO":
