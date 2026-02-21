@@ -9935,6 +9935,15 @@ class Backend:
                     self.scanned_symbols_last = len(symbols)
                     logger.info("[main][scanner] symbols loaded: %s (TOP_N=%s)", self.scanned_symbols_last, TOP_N)
 
+                    # reject stats (per tick) — used only for logging/debug; never crash if missing
+                    _rej_counts = defaultdict(int)
+
+                    def _rej_add(_sym: str, _reason: str) -> None:
+                        try:
+                            _rej_counts[str(_reason)] += 1
+                        except Exception:
+                            pass
+
                     mac_act, mac_ev, mac_win = self.macro.current_action()
                     self.last_macro_action = mac_act
                     if MACRO_FILTER:
@@ -10149,70 +10158,6 @@ class Backend:
                                 if cur is fut:
                                     _mid_candles_inflight.pop(key, None)
 
-                        # --- pick best exchange result for MAIN scanner (15m/1h/4h) ---
-                        best_name: Optional[str] = None
-                        best_r: Optional[Dict[str, Any]] = None
-                        try:
-                            _got = await asyncio.gather(*[fetch_exchange(n) for n in scan_exchanges], return_exceptions=True)
-                            _cand: List[Tuple[str, Dict[str, Any]]] = []
-                            for _it in _got:
-                                if isinstance(_it, Exception):
-                                    continue
-                                try:
-                                    _n, _r = _it
-                                except Exception:
-                                    continue
-                                if not _r:
-                                    continue
-                                _cand.append((_n, _r))
-                            if not _cand:
-                                _rej_add(sym, "no_candles")
-                                continue
-
-                            def _best_key(_t: Tuple[str, Dict[str, Any]]):
-                                _n, _r = _t
-                                try:
-                                    _c = float(_r.get("confidence", 0) or 0)
-                                except Exception:
-                                    _c = 0.0
-                                try:
-                                    _rr = float(_r.get("rr", 0) or 0)
-                                except Exception:
-                                    _rr = 0.0
-                                return (_c, _rr)
-
-                            best_name, best_r = max(_cand, key=_best_key)
-                        except Exception as _e:
-                            logger.info("[scanner] %s skip: exchange fetch failed: %s", sym, _e)
-                            _rej_add(sym, "candles_fetch_failed")
-                            continue
-
-                        base_r = best_r or {}
-                        best_dir = str(base_r.get("direction", "") or "").upper()
-                        entry = float(base_r.get("entry", 0.0) or 0.0)
-                        sl = float(base_r.get("sl", 0.0) or 0.0)
-                        tp1 = float(base_r.get("tp1", 0.0) or 0.0)
-                        tp2 = float(base_r.get("tp2", 0.0) or 0.0)
-                        rr = float(base_r.get("rr", 0.0) or 0.0)
-                        conf = int(base_r.get("confidence", 0) or 0)
-
-                        # Market selection for MAIN scanner
-                        try:
-                            adx1v = float(base_r.get("adx1", float("nan")))
-                        except Exception:
-                            adx1v = float("nan")
-                        try:
-                            atrpv = float(base_r.get("atr_pct", 0.0) or 0.0)
-                        except Exception:
-                            atrpv = 0.0
-                        try:
-                            market = choose_market(adx1v, atrpv)
-                        except Exception:
-                            market = "FUTURES"
-                        if market == "FUTURES" and (news_act == "FUTURES_OFF" or mac_act == "FUTURES_OFF"):
-                            market = "SPOT"
-
-                        risk_notes: List[str] = []
                         async def _pair_exists(ex: str) -> bool:
                             try:
                                 exu = (ex or "").upper().strip()
