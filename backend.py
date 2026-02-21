@@ -42,11 +42,11 @@ if _TEST_MODE and _TEST_MODE_SCOPE in ("MID","ALL"):
         "MID_MIN_CONFIDENCE": "0",
         "MID_MIN_VOL_X": "0",
         # --- MID regime / filters ---
-        "MID_NEWS_FILTER": "0",
-        "MID_MACRO_FILTER": "0",
+        "MID_NEWS_FILTER": "1",
+        "MID_MACRO_FILTER": "1",
         "MID_RANGE_POS_FILTER": "0",
         "MID_TOP_FILTERS": "0",
-        "MID_TRAP_FILTERS": "0",
+        "MID_TRAP_FILTERS": "1",
         "MID_ALLOW_RANGE": "1",
         "MID_ALLOW_COUNTERTREND_WITH_5M_REVERSAL": "1",
         # Optional: avoid "no repeat" during test
