@@ -10424,7 +10424,7 @@ class Backend:
                             if ex_name == "GATEIO":
                                 return await api.klines_gateio(symb, tf, limit)
                             # default MEXC
-                                return await api.klines_mexc(symb, tf, limit)
+                            return await api.klines_mexc(symb, tf, limit)
 
                     except Exception as e:
                         # classify candle failures
