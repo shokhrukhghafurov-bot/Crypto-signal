@@ -10365,25 +10365,13 @@ class Backend:
         tf_trigger, tf_mid, tf_trend = "5m", "30m", "1h"
 
         # --- MID candles market selection ---
-        # Modes:
-        #   FUTURES  -> fetch only futures/linear/swap candles
-        #   SPOT     -> fetch only spot candles
-        #   AUTO     -> try FUTURES first, then SPOT (or order from MID_CANDLES_MARKET_ORDER)
-        market_mode = (os.getenv('MID_CANDLES_MARKET_MODE', 'AUTO') or 'AUTO').upper().strip()
-        if market_mode not in ('AUTO','SPOT','FUTURES'):
-            market_mode = 'AUTO'
-
-        if market_mode == 'AUTO':
-            order = (os.getenv('MID_CANDLES_MARKET_ORDER', 'FUTURES,SPOT') or 'FUTURES,SPOT')
-            markets_try = [m.strip().upper() for m in order.split(',') if m.strip()]
-            markets_try = [m for m in markets_try if m in ('FUTURES','SPOT')]
-            if not markets_try:
-                markets_try = ['FUTURES','SPOT']
-        else:
-            markets_try = [market_mode]
-
+        # IMPORTANT (production hardening):
+        # User requested: "свечи берем только из SPOT и эти свечи для FUTURES тоже используем".
+        # We force MID candles to be fetched from SPOT only.
+        # (Signals can still be FUTURES — we just use SPOT klines for TA.)
+        markets_try = ['SPOT']
         # default/primary market used for prefetch
-        market_mid = markets_try[0]
+        market_mid = 'SPOT'
         def _parse_seconds_env(name: str, default: float) -> float:
             raw = os.getenv(name, "").strip()
             if raw == "":
@@ -10670,6 +10658,9 @@ class Backend:
                         return None
 
                 async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
+                    # Force SPOT candles even if caller requested FUTURES.
+                    # This is intentional: we use SPOT klines for both SPOT and FUTURES signals.
+                    market = 'SPOT'
                     key = (ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
                     now = time.time()
                     ttl = _mid_cache_ttl(tf)
@@ -10685,7 +10676,7 @@ class Backend:
                         if last is None or getattr(last, 'empty', False):
                             # If it was explicitly marked unsupported (e.g. market not implemented),
                             # don't count it as an "empty candles" sample.
-                            if api._is_unsupported(ex_name, (market or 'SPOT').upper().strip(), symb, tf):
+                            if api._is_unsupported_cached(ex_name, (market or 'SPOT').upper().strip(), symb, tf):
                                 _mid_candles_unsupported += 1
                                 return None
                             _mid_candles_empty += 1
