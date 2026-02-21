@@ -10110,12 +10110,7 @@ class Backend:
                         _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
                         scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
                         if not scan_exchanges:
-                    scan_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
-
-                # --- Force BINANCE to be available for MID candles even if SCANNER_EXCHANGES omits it ---
-                _mid_force_binance = (os.getenv("MID_FORCE_BINANCE_CANDLES", "1") or "1").strip().lower() in ("1","true","yes","on")
-                if _mid_force_binance and "BINANCE" not in scan_exchanges:
-                    scan_exchanges = ["BINANCE"] + [x for x in scan_exchanges if x != "BINANCE"]
+                            scan_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
 
                         # --- Choose best exchange candidate (MAIN scanner) ---
                         results = await asyncio.gather(*[fetch_exchange(x) for x in scan_exchanges])
@@ -10485,14 +10480,32 @@ class Backend:
                 mid_candles_sources = [x.strip().upper() for x in _mid_sources.split(',') if x.strip()]
                 if not mid_candles_sources:
                     mid_candles_sources = list(scan_exchanges)
-                enable_secondary = (os.getenv('MID_ENABLE_SECONDARY_EXCHANGES','0') or '0').strip().lower() in ('1','true','yes','on')
-                if not enable_secondary:
-                    # hard-disable secondary unless allowed
-                    mid_candles_sources = [x for x in mid_candles_sources if x in ('BINANCE','BYBIT','OKX')] or ['BINANCE','BYBIT','OKX']
-                # Ensure candle sources are within scan_exchanges
-                mid_candles_sources = [x for x in mid_candles_sources if x in scan_exchanges] or ['BINANCE','BYBIT','OKX']
-                if _mid_force_binance and "BINANCE" not in mid_candles_sources:
-                    mid_candles_sources = ["BINANCE"] + [x for x in mid_candles_sources if x != "BINANCE"]
+
+                # --- MID candles sources (Variant A: multi-exchange) ---
+                # We allow pulling candles from all supported adapters, and decide per-symbol dynamically.
+                # This is required for tokens that exist on GateIO/MEXC but not on Binance.
+                allowed_candle_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
+
+                mid_force_all = (os.getenv('MID_CANDLES_ALL_EXCHANGES', '1') or '1').strip().lower() in ('1','true','yes','on')
+                enable_secondary = (os.getenv('MID_ENABLE_SECONDARY_EXCHANGES','1') or '1').strip().lower() in ('1','true','yes','on')
+
+                if mid_force_all:
+                    # Don't require candles sources to be present in SCANNER_EXCHANGES:
+                    # SCANNER_EXCHANGES controls symbol universe; candles sources control where we fetch klines.
+                    mid_candles_sources = [x for x in mid_candles_sources if x in allowed_candle_exchanges]
+                    if not mid_candles_sources:
+                        mid_candles_sources = allowed_candle_exchanges[:]
+                else:
+                    if not enable_secondary:
+                        # hard-disable secondary unless allowed
+                        mid_candles_sources = [x for x in mid_candles_sources if x in ('BINANCE','BYBIT','OKX')] or ['BINANCE','BYBIT','OKX']
+                    # Ensure candle sources are within scan_exchanges (legacy behavior)
+                    mid_candles_sources = [x for x in mid_candles_sources if x in scan_exchanges] or ['BINANCE','BYBIT','OKX']
+
+                # Always keep BINANCE as a fallback candle source unless explicitly disabled.
+                if (os.getenv('MID_FORCE_BINANCE_CANDLES','1') or '1').strip().lower() in ('1','true','yes','on'):
+                    if 'BINANCE' not in mid_candles_sources:
+                        mid_candles_sources = ['BINANCE'] + [x for x in mid_candles_sources if x != 'BINANCE']
 
                 # --- MID candles routing: stable primary (hash) BINANCE/BYBIT + fallback + smart cache ---
                 _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT") or "").strip()
@@ -10546,9 +10559,6 @@ class Backend:
 
                 def _mid_primary_for_symbol(symb: str) -> str:
                     # Stable routing: hash(symbol) -> primary exchange from MID_PRIMARY_EXCHANGES
-                    # Safety mode: always use BINANCE as primary for candles (prevents mass no_candles when BYBIT/OKX miss symbols)
-                    if (os.getenv("MID_PRIMARY_SAFE_BINANCE", "1") or "1").strip().lower() in ("1","true","yes","on"):
-                        return "BINANCE"
                     if not mid_primary_exchanges:
                         return "BINANCE"
                     if mid_primary_mode not in ("hash", "round_robin"):
@@ -10633,17 +10643,7 @@ class Backend:
                             if is_pair_not_found:
                                 _mid_candles_unsupported += 1
                                 try:
-                                    api._mark_unsupported(ex_name, (market or 'SPOT').upper().strip(), symb, tf)
-                                except Exception:
-                                    pass
-                                # FUTURES -> SPOT fallback on BYBIT/OKX when the futures instrument doesn't exist.
-                                # This prevents mass no_candles when a coin has no perp contract on that exchange.
-                                try:
-                                    mkt_u = (market or 'SPOT').upper().strip()
-                                    if mkt_u == 'FUTURES' and ex_name in ('BYBIT','OKX'):
-                                        df_spot = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, 'SPOT')
-                                        if df_spot is not None and not getattr(df_spot, 'empty', True):
-                                            return df_spot
+                                    api._mark_unsupported(ex_name, (market or 'SPOT'), symb, tf)
                                 except Exception:
                                     pass
                             else:
@@ -10651,7 +10651,7 @@ class Backend:
                                 if isinstance(e, ExchangeAPIError) and ('HTTP 400' in msg or 'HTTP 404' in msg):
                                     _mid_candles_unsupported += 1
                                     try:
-                                        api._mark_unsupported(ex_name, (market or 'SPOT').upper().strip(), symb, tf)
+                                        api._mark_unsupported(ex_name, (market or 'SPOT'), symb, tf)
                                     except Exception:
                                         pass
                                 else:
