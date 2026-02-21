@@ -10437,12 +10437,15 @@ class Backend:
                 if not scan_exchanges:
                     scan_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
 
-                # MID candle sources preference (default: BINANCE,BYBIT,OKX).
-                # Secondary exchanges (GATEIO/MEXC) are used only if explicitly enabled.
-                _mid_sources = (os.getenv('MID_CANDLES_SOURCES', 'BINANCE,BYBIT,OKX') or 'BINANCE,BYBIT,OKX').strip()
+                # MID candle sources preference.
+                # If MID_CANDLES_SOURCES is not provided, we default to the same universe as SCANNER_EXCHANGES
+                # (so "сканер по все биржи" also means candles routing can use all those exchanges).
+                # Secondary exchanges (GATEIO/MEXC) are still gated by MID_ENABLE_SECONDARY_EXCHANGES.
+                _mid_sources_env = (os.getenv('MID_CANDLES_SOURCES', '') or '').strip()
+                _mid_sources = _mid_sources_env if _mid_sources_env else ','.join(scan_exchanges)
                 mid_candles_sources = [x.strip().upper() for x in _mid_sources.split(',') if x.strip()]
                 if not mid_candles_sources:
-                    mid_candles_sources = ['BINANCE','BYBIT','OKX']
+                    mid_candles_sources = list(scan_exchanges)
                 enable_secondary = (os.getenv('MID_ENABLE_SECONDARY_EXCHANGES','0') or '0').strip().lower() in ('1','true','yes','on')
                 if not enable_secondary:
                     # hard-disable secondary unless allowed
@@ -10536,8 +10539,28 @@ class Backend:
                             except Exception:
                                 pass
                             if ex_name in ('GATEIO','MEXC') and mkt == 'FUTURES':
-                                return pd.DataFrame()
+                                # Futures candles are not implemented for these adapters. Mark unsupported and skip.
+                                try:
+                                    api._mark_unsupported(ex_name, mkt, symb, tf)
+                                except Exception:
+                                    pass
+                                return None
                             if ex_name == "BINANCE":
+                                # Avoid noisy HTTP 400 (Invalid symbol) on futures by checking exchangeInfo first.
+                                try:
+                                    if mkt == 'FUTURES':
+                                        info = api._binance_exchange_info(futures=True)
+                                        if info and isinstance(info, dict):
+                                            syms = {s.get('symbol') for s in (info.get('symbols') or []) if isinstance(s, dict)}
+                                            if symb not in syms:
+                                                try:
+                                                    api._mark_unsupported(ex_name, mkt, symb, tf)
+                                                except Exception:
+                                                    pass
+                                                return pd.DataFrame()
+                                except Exception:
+                                    # If exchangeInfo fails, fall back to request (old behavior)
+                                    pass
                                 return await api.klines_binance(symb, tf, limit, market=market)
                             if ex_name == "BYBIT":
                                 return await api.klines_bybit(symb, tf, limit, market=market)
@@ -10605,6 +10628,11 @@ class Backend:
                         last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, market)
                         # If response is empty (no exception), count as EMPTY + optional adaptive limit
                         if last is None or getattr(last, 'empty', False):
+                            # If it was explicitly marked unsupported (e.g. market not implemented),
+                            # don't count it as an "empty candles" sample.
+                            if api._is_unsupported(ex_name, (market or 'SPOT').upper().strip(), symb, tf):
+                                _mid_candles_unsupported += 1
+                                return None
                             _mid_candles_empty += 1
                             reason = f"empty_{ex_name.lower()}_{(market or 'SPOT').lower()}_{tf}"
                             _mid_candles_empty_reasons[reason] += 1
