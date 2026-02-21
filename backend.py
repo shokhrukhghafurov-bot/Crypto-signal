@@ -10282,7 +10282,10 @@ class Backend:
         while True:
             interval_sec = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45") or 45)
             async def _mid_tick_body():
-                start = time.time()
+                start_total = time.time()
+                start = start_total
+                start_scan = start_total
+                prefetch_elapsed = 0.0
                 if os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() in ("0","false","no"):
                     await asyncio.sleep(10)
                     return
@@ -10583,10 +10586,14 @@ class Backend:
                                         await asyncio.gather(*tasks, return_exceptions=True)
                             except Exception as _e:
                                 logger.warning("[mid] candles prefetch failed: %s", _e)
+
+                        # Exclude prefetch time from per-symbol budget (budget applies to scan phase)
+                        start_scan = time.time()
+                        prefetch_elapsed = float(start_scan - start_total)
                         for sym in symbols:
                             # Hard budget per MID tick (prevents very long ticks during exchange issues)
                             if mid_tick_budget_sec and mid_tick_budget_sec > 0:
-                                if (time.time() - start) > float(mid_tick_budget_sec):
+                                if (time.time() - start_scan) > float(mid_tick_budget_sec):
                                     # Mark remaining symbols as budget-exceeded (so [mid][reject] stays honest)
                                     try:
                                         for _s in symbols[symbols.index(sym):]:
@@ -10931,7 +10938,7 @@ class Backend:
                 elapsed = time.time() - start
                 try:
                     _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
-                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} elapsed={float(elapsed):.1f}s"
+                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(elapsed_total):.1f}s"
                     logger.info("[mid] %s", summary)
 
                     # Optional: hardblock breakdown (top buckets)
