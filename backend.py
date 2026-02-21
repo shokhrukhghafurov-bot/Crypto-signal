@@ -10515,11 +10515,9 @@ class Backend:
 
 
                 async def _mid_fetch_klines_rest(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
-                    # NOTE: These counters live in the outer MID tick scope.
-                    # We MUST declare them nonlocal, otherwise `+= 1` makes them locals,
-                    # raises UnboundLocalError, and the broad exception handlers swallow it.
-                    # Result: summary shows candles_unsupported/net_fail as 0 even when failing.
-                    nonlocal _mid_candles_net_fail, _mid_candles_unsupported
+
+
+                    nonlocal _mid_candles_unsupported, _mid_candles_net_fail
                     try:
                         # Global MID kline concurrency guard (prevents HTTP overload -> timeouts -> no_candles)
                         async with _mid_klines_sem:
@@ -10587,7 +10585,8 @@ class Backend:
                         return None
 
                 async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
-                    nonlocal _mid_candles_empty
+
+                    nonlocal _mid_candles_empty, _mid_candles_empty_reasons, _mid_candles_empty_samples
                     key = (ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
                     now = time.time()
                     ttl = _mid_cache_ttl(tf)
@@ -10819,27 +10818,31 @@ class Backend:
                             chosen_r: Optional[Dict[str, Any]] = None
 
                             async def _choose_exchange_mid():
-                                nonlocal chosen_name, chosen_market, chosen_r, _mid_candles_partial
+                                nonlocal chosen_name, chosen_market, chosen_r
                                 primary = _mid_primary_for_symbol(sym)
-                                # Restrict to configured candle sources (by default BINANCE,BYBIT,OKX).
-                                # This prevents wasting time on secondary exchanges (e.g. MEXC/GATEIO) unless explicitly enabled.
-                                if primary not in mid_candles_sources:
-                                    primary = (mid_candles_sources[0] if mid_candles_sources else primary)
-                                # Try primary first, then remaining sources in configured order.
-                                try_order = [primary] + [x for x in mid_candles_sources if x != primary]
+                                # try primary first, then the other primary (if any), then fallbacks
+                                try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
 
                                 # Try markets in order (AUTO: FUTURES->SPOT, or configured order)
                                 for mkt in markets_try:
                                     for name in try_order:
                                         try:
-                                            # Fetch trigger TF first (cuts 3x HTTP load on misses -> fewer timeouts/no_candles)
+                                            # Fetch a base TF first (try 5m -> 30m -> 1h) to reduce no_candles on flaky/unsupported endpoints
                                             a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250, mkt)
+                                            base_tf = tf_trigger
+                                            if a is None or a.empty:
+                                                a = await _mid_fetch_klines_cached(name, sym, tf_mid, 250, mkt)
+                                                base_tf = tf_mid
+                                            if a is None or a.empty:
+                                                a = await _mid_fetch_klines_cached(name, sym, tf_trend, 250, mkt)
+                                                base_tf = tf_trend
                                             if a is None or a.empty:
                                                 continue
 
+                                            # Fetch other TFs (best-effort). If missing, reuse base candles and count partial.
                                             b, c = await asyncio.gather(
-                                                _mid_fetch_klines_cached(name, sym, tf_mid, 250, mkt),
-                                                _mid_fetch_klines_cached(name, sym, tf_trend, 250, mkt),
+                                                _mid_fetch_klines_cached(name, sym, tf_mid, 250, mkt) if base_tf != tf_mid else asyncio.sleep(0, result=a),
+                                                _mid_fetch_klines_cached(name, sym, tf_trend, 250, mkt) if base_tf != tf_trend else asyncio.sleep(0, result=a),
                                                 return_exceptions=True,
                                             )
                                             if isinstance(b, Exception):
