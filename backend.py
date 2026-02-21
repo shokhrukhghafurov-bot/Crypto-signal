@@ -10522,8 +10522,8 @@ class Backend:
                         _mid_hard_block = 0
 
                         # --- MID reject digest (log-only): explains "scanned=N but counters don't add up" ---
-                        # Enable with MID_REJECT_DIGEST=1
-                        _rej_enabled = os.getenv("MID_REJECT_DIGEST", "0").strip().lower() in ("1","true","yes","on")
+                        # MID reject digest (enabled by default; set MID_REJECT_DIGEST=0 to disable)
+                        _rej_enabled = os.getenv("MID_REJECT_DIGEST", "1").strip().lower() in ("1","true","yes","on")
                         _rej_max_reasons = int(os.getenv("MID_REJECT_DIGEST_MAX_REASONS", "12") or 12)
                         _rej_examples = int(os.getenv("MID_REJECT_DIGEST_EXAMPLES", "3") or 3)
                         _rej_seen = set()
