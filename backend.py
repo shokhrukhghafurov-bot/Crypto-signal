@@ -2295,33 +2295,52 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
         if exchange not in fut_allowed:
             exchange = "binance"
 
-        # If we have a confirmed list, enforce it
+        # Choose futures exchange by priority:
+        # - user must have active futures keys
+        # - futures contract must exist on that exchange (prevents 'Symbol Is Invalid')
+        # - if signal provides confirmations/available_exchanges, enforce that subset
+        async def _fut_contract_exists(ex: str, sym: str) -> bool:
+            ex = (ex or "").lower()
+            sym = (sym or "").upper().replace("/", "")
+            try:
+                if ex == "binance":
+                    info = await _binance_exchange_info(futures=True)
+                    for s in (info.get("symbols", []) or []):
+                        if str(s.get("symbol") or "").upper() == sym:
+                            stt = str(s.get("status") or "").upper()
+                            return (stt in ("TRADING", "1")) or (stt == "")
+                    return False
+                if ex == "bybit":
+                    data = await _http_json(
+                        "GET",
+                        "https://api.bybit.com/v5/market/instruments-info",
+                        params={"category": "linear", "symbol": sym},
+                        timeout_s=10,
+                    )
+                    lst = ((data.get("result") or {}).get("list") or [])
+                    return bool(lst)
+                if ex == "okx":
+                    await _okx_instrument_filters(inst_type="SWAP", symbol=sym)
+                    return True
+            except Exception:
+                return False
+            return False
+
+        candidates = [exchange] + [x for x in fut_allowed if x != exchange]
         if conf_set:
-            # Try user's selected exchange first
-            if (exchange in conf_set) and (await _has_fut_keys(exchange)):
-                pass
-            else:
-                chosen = None
-                for ex in fut_allowed:
-                    if ex not in conf_set:
-                        continue
-                    if await _has_fut_keys(ex):
-                        chosen = ex
-                        break
-                if not chosen:
-                    return _skip("no_exchange_available", market=market)
-                exchange = chosen
-        else:
-            # No confirmations in signal (old signals / compatibility): just require keys on selected exchange.
-            if not (await _has_fut_keys(exchange)):
-                chosen = None
-                for ex in fut_allowed:
-                    if await _has_fut_keys(ex):
-                        chosen = ex
-                        break
-                if not chosen:
-                    return _skip("no_exchange_available", market=market)
-                exchange = chosen
+            candidates = [x for x in candidates if x in conf_set]
+
+        chosen = None
+        for ex in candidates:
+            if not (await _has_fut_keys(ex)):
+                continue
+            if not (await _fut_contract_exists(ex, symbol)):
+                continue
+            chosen = ex
+            break
+        if not chosen:
+            return _skip("no_exchange_available", market=market)
+        exchange = chosen
 
     # amounts
     spot_amt = float(st.get("spot_amount_per_trade") or 0.0)
@@ -9311,19 +9330,25 @@ class Backend:
 
         # --- PHASE A: WS-only (priority order) ---
         if mode == "MEDIAN":
-            _pdbg("mode=MEDIAN; PHASE A WS-only: try BINANCE_WS and BYBIT_WS for median")
-            b, _bsrc = await _binance_ws_only()
-            y, _ysrc = await _bybit_ws_only()
-            if _is_reasonable(b) and _is_reasonable(y):
+            # MEDIAN over available WS sources (best-effort). Prefer major venues first.
+            _pdbg("mode=MEDIAN; PHASE A WS-only: try BINANCE_WS/BYBIT_WS/OKX_WS for median")
+            ws_prices: list[tuple[str, float]] = []
+            for _nm, _fn in (("BINANCE", _binance_ws_only), ("BYBIT", _bybit_ws_only), ("OKX", _okx_ws_only)):
                 try:
-                    med = float(statistics.median([float(b), float(y)]))
-                    return med, "MEDIAN(BINANCE_WS+BYBIT_WS)"
+                    p, _ = await _fn()
+                except Exception:
+                    p = None
+                if _is_reasonable(p):
+                    ws_prices.append((_nm, float(p)))
+            if len(ws_prices) >= 2:
+                try:
+                    med = float(statistics.median([p for _, p in ws_prices]))
+                    return med, "MEDIAN(" + "+".join([f"{nm}_WS" for nm, _ in ws_prices]) + ")"
                 except Exception:
                     pass
-            if _is_reasonable(b):
-                return float(b), "BINANCE_WS"
-            if _is_reasonable(y):
-                return float(y), "BYBIT_WS"
+            if ws_prices:
+                nm, p = ws_prices[0]
+                return float(p), f"{nm}_WS"
 
         _pdbg(f"PHASE A WS-only order={'+'.join(chain)} mode={mode}")
         for exname in chain:
@@ -10414,7 +10439,7 @@ class Backend:
 
                 # MID candle sources preference (default: BINANCE,BYBIT,OKX).
                 # Secondary exchanges (GATEIO/MEXC) are used only if explicitly enabled.
-                _mid_sources = (os.getenv('MID_CANDLES_SOURCES', 'BINANCE,BYBIT,OKX') or 'BINANCE,BYBIT,OKX').strip()
+                _mid_sources = (os.getenv('MID_CANDLES_SOURCES', 'BINANCE,BYBIT,OKX,MEXC,GATEIO') or 'BINANCE,BYBIT,OKX').strip()
                 mid_candles_sources = [x.strip().upper() for x in _mid_sources.split(',') if x.strip()]
                 if not mid_candles_sources:
                     mid_candles_sources = ['BINANCE','BYBIT','OKX']
@@ -10534,9 +10559,15 @@ class Backend:
                                 except Exception:
                                     pass
                             else:
-                                # Do NOT mark unsupported on generic HTTP errors (can be transient / rate-limit / proxy).
-                                # Only hard-mark unsupported when the exchange explicitly says the instrument/symbol does not exist.
-                                _mid_candles_net_fail += 1
+                                # HTTP 400/404 often means unsupported interval/symbol too
+                                if isinstance(e, ExchangeAPIError) and ('HTTP 400' in msg or 'HTTP 404' in msg):
+                                    _mid_candles_unsupported += 1
+                                    try:
+                                        api._mark_unsupported(ex_name, (market or 'SPOT'), symb, tf)
+                                    except Exception:
+                                        pass
+                                else:
+                                    _mid_candles_net_fail += 1
                         except Exception:
                             pass
                         # swallow but count (optional)
@@ -10563,10 +10594,7 @@ class Backend:
                     for _i in range(max(0, mid_candles_retry) + 1):
                         last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, market)
                         # If response is empty (no exception), count as EMPTY + optional adaptive limit
-                        if last is None:
-                            # Exception / network / rate-limit etc. (already counted in net_fail). Do not treat as "empty candles".
-                            pass
-                        elif getattr(last, 'empty', False):
+                        if last is None or getattr(last, 'empty', False):
                             _mid_candles_empty += 1
                             reason = f"empty_{ex_name.lower()}_{(market or 'SPOT').lower()}_{tf}"
                             _mid_candles_empty_reasons[reason] += 1
@@ -10574,7 +10602,7 @@ class Backend:
                                 lst = _mid_candles_empty_samples[reason]
                                 if len(lst) < _mid_candles_log_empty_samples:
                                     lst.append(f"{symb}@{ex_name}/{market}/{tf}/L{limit}")
-                            # adaptive limit step-down (some exchanges cap max bars)
+                            # adaptive limit step-down
                             if limit > 200:
                                 limit = 200
                                 continue
@@ -10707,32 +10735,24 @@ class Backend:
                             try:
                                 prefetch_limit = int(os.getenv("MID_PREFETCH_LIMIT", "250") or 250)
                                 prefetch_timeout = float(os.getenv("MID_PREFETCH_TIMEOUT_SEC", "25") or 25)
+                                groups = defaultdict(list)
+                                for _s in symbols:
+                                    if is_blocked_symbol(_s):
+                                        continue
+                                    groups[_mid_primary_for_symbol(_s)].append(_s)
 
-                                async def _prefetch_one(_sym: str):
-                                    if is_blocked_symbol(_sym):
-                                        return
-                                    primary = _mid_primary_for_symbol(_sym)
-                                    try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
+                                tasks = []
+                                for _ex, _syms in groups.items():
+                                    for _s in _syms:
+                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trigger, prefetch_limit, market_mid)))
+                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_mid, prefetch_limit, market_mid)))
+                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trend, prefetch_limit, market_mid)))
 
-                                    for _mkt in markets_try:
-                                        for _ex in try_order:
-                                            a = await _mid_fetch_klines_cached(_ex, _sym, tf_trigger, prefetch_limit, _mkt)
-                                            if a is None or a.empty:
-                                                continue
-                                            await asyncio.gather(
-                                                _mid_fetch_klines_cached(_ex, _sym, tf_mid, prefetch_limit, _mkt),
-                                                _mid_fetch_klines_cached(_ex, _sym, tf_trend, prefetch_limit, _mkt),
-                                                return_exceptions=True,
-                                            )
-                                            return
-
-                                tasks = [asyncio.create_task(_prefetch_one(_s)) for _s in symbols if _s]
                                 if tasks:
                                     if prefetch_timeout and prefetch_timeout > 0:
                                         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=prefetch_timeout)
                                     else:
                                         await asyncio.gather(*tasks, return_exceptions=True)
-
                             except Exception as _e:
                                 logger.warning("[mid] candles prefetch failed: %s", _e)
 
