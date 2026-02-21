@@ -10149,6 +10149,70 @@ class Backend:
                                 if cur is fut:
                                     _mid_candles_inflight.pop(key, None)
 
+                        # --- pick best exchange result for MAIN scanner (15m/1h/4h) ---
+                        best_name: Optional[str] = None
+                        best_r: Optional[Dict[str, Any]] = None
+                        try:
+                            _got = await asyncio.gather(*[fetch_exchange(n) for n in scan_exchanges], return_exceptions=True)
+                            _cand: List[Tuple[str, Dict[str, Any]]] = []
+                            for _it in _got:
+                                if isinstance(_it, Exception):
+                                    continue
+                                try:
+                                    _n, _r = _it
+                                except Exception:
+                                    continue
+                                if not _r:
+                                    continue
+                                _cand.append((_n, _r))
+                            if not _cand:
+                                _rej_add(sym, "no_candles")
+                                continue
+
+                            def _best_key(_t: Tuple[str, Dict[str, Any]]):
+                                _n, _r = _t
+                                try:
+                                    _c = float(_r.get("confidence", 0) or 0)
+                                except Exception:
+                                    _c = 0.0
+                                try:
+                                    _rr = float(_r.get("rr", 0) or 0)
+                                except Exception:
+                                    _rr = 0.0
+                                return (_c, _rr)
+
+                            best_name, best_r = max(_cand, key=_best_key)
+                        except Exception as _e:
+                            logger.info("[scanner] %s skip: exchange fetch failed: %s", sym, _e)
+                            _rej_add(sym, "candles_fetch_failed")
+                            continue
+
+                        base_r = best_r or {}
+                        best_dir = str(base_r.get("direction", "") or "").upper()
+                        entry = float(base_r.get("entry", 0.0) or 0.0)
+                        sl = float(base_r.get("sl", 0.0) or 0.0)
+                        tp1 = float(base_r.get("tp1", 0.0) or 0.0)
+                        tp2 = float(base_r.get("tp2", 0.0) or 0.0)
+                        rr = float(base_r.get("rr", 0.0) or 0.0)
+                        conf = int(base_r.get("confidence", 0) or 0)
+
+                        # Market selection for MAIN scanner
+                        try:
+                            adx1v = float(base_r.get("adx1", float("nan")))
+                        except Exception:
+                            adx1v = float("nan")
+                        try:
+                            atrpv = float(base_r.get("atr_pct", 0.0) or 0.0)
+                        except Exception:
+                            atrpv = 0.0
+                        try:
+                            market = choose_market(adx1v, atrpv)
+                        except Exception:
+                            market = "FUTURES"
+                        if market == "FUTURES" and (news_act == "FUTURES_OFF" or mac_act == "FUTURES_OFF"):
+                            market = "SPOT"
+
+                        risk_notes: List[str] = []
                         async def _pair_exists(ex: str) -> bool:
                             try:
                                 exu = (ex or "").upper().strip()
@@ -10447,14 +10511,13 @@ class Backend:
                 # Ensure candle sources are within scan_exchanges
                 mid_candles_sources = [x for x in mid_candles_sources if x in scan_exchanges] or ['BINANCE','BYBIT','OKX']
 
-                # --- MID candles routing: stable primary (hash) among primaries + fallback + smart cache ---
-                # Default primaries include OKX as well to shard load across 3 exchanges out-of-the-box.
-                _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT,OKX") or "").strip()
+                # --- MID candles routing: stable primary (hash) BINANCE/BYBIT + fallback + smart cache ---
+                _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT") or "").strip()
                 mid_primary_exchanges = [x.strip().upper() for x in _primary_ex.split(",") if x.strip()]
                 if len(mid_primary_exchanges) < 2:
-                    mid_primary_exchanges = ["BINANCE", "BYBIT", "OKX"]
+                    mid_primary_exchanges = ["BINANCE", "BYBIT"]
                 # keep only those available in scan_exchanges
-                mid_primary_exchanges = [x for x in mid_primary_exchanges if x in scan_exchanges] or ["BINANCE", "BYBIT", "OKX"]
+                mid_primary_exchanges = [x for x in mid_primary_exchanges if x in scan_exchanges] or ["BINANCE", "BYBIT"]
                 mid_fallback_exchanges = [x for x in scan_exchanges if x not in mid_primary_exchanges]
 
                 mid_primary_mode = (os.getenv("MID_PRIMARY_MODE", "hash") or "hash").strip().lower()
