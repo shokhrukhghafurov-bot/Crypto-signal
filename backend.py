@@ -10821,8 +10821,12 @@ class Backend:
                             async def _choose_exchange_mid():
                                 nonlocal chosen_name, chosen_market, chosen_r, _mid_candles_partial
                                 primary = _mid_primary_for_symbol(sym)
-                                # try primary first, then the other primary (if any), then fallbacks
-                                try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
+                                # Restrict to configured candle sources (by default BINANCE,BYBIT,OKX).
+                                # This prevents wasting time on secondary exchanges (e.g. MEXC/GATEIO) unless explicitly enabled.
+                                if primary not in mid_candles_sources:
+                                    primary = (mid_candles_sources[0] if mid_candles_sources else primary)
+                                # Try primary first, then remaining sources in configured order.
+                                try_order = [primary] + [x for x in mid_candles_sources if x != primary]
 
                                 # Try markets in order (AUTO: FUTURES->SPOT, or configured order)
                                 for mkt in markets_try:
