@@ -10494,6 +10494,12 @@ class Backend:
                         # Global MID kline concurrency guard (prevents HTTP overload -> timeouts -> no_candles)
                         async with _mid_klines_sem:
                             mkt = (market or 'SPOT').upper().strip()
+                            # Fast-skip pairs we already know are unsupported on this exchange/market/TF
+                            try:
+                                if api._is_unsupported_cached(ex_name, mkt, symb, tf):
+                                    return pd.DataFrame()
+                            except Exception:
+                                pass
                             if ex_name in ('GATEIO','MEXC') and mkt == 'FUTURES':
                                 return pd.DataFrame()
                             if ex_name == "BINANCE":
@@ -10509,12 +10515,34 @@ class Backend:
 
                     except Exception as e:
                         # classify candle failures
+                        is_pair_not_found = False
                         try:
                             msg = str(e)
-                            if isinstance(e, ExchangeAPIError) and ('HTTP 400' in msg or 'HTTP 404' in msg):
+                            umsg = msg.upper()
+                            # Pair/instrument does not exist on this exchange/market
+                            if isinstance(e, ExchangeAPIError):
+                                if ('INVALID SYMBOL' in umsg) or ('-1121' in umsg) or ('SYMBOL IS INVALID' in umsg) or ('NOT SUPPORTED SYMBOL' in umsg) or ('NOT SUPPORTED SYMBOLS' in umsg) or ('INSTRUMENT ID' in umsg and 'DOESN\'T EXIST' in umsg) or ('CODE=51001' in umsg):
+                                    is_pair_not_found = True
+                            # Some wrappers may not be ExchangeAPIError but still include these markers
+                            if (not is_pair_not_found) and (('SYMBOL IS INVALID' in umsg) or ('NOT SUPPORTED SYMBOL' in umsg) or ('NOT SUPPORTED SYMBOLS' in umsg) or ('INVALID SYMBOL' in umsg) or ('CODE=51001' in umsg) or ("DOESN'T EXIST" in umsg and 'INSTRUMENT' in umsg)):
+                                is_pair_not_found = True
+
+                            if is_pair_not_found:
                                 _mid_candles_unsupported += 1
+                                try:
+                                    api._mark_unsupported(ex_name, (market or 'SPOT'), symb, tf)
+                                except Exception:
+                                    pass
                             else:
-                                _mid_candles_net_fail += 1
+                                # HTTP 400/404 often means unsupported interval/symbol too
+                                if isinstance(e, ExchangeAPIError) and ('HTTP 400' in msg or 'HTTP 404' in msg):
+                                    _mid_candles_unsupported += 1
+                                    try:
+                                        api._mark_unsupported(ex_name, (market or 'SPOT'), symb, tf)
+                                    except Exception:
+                                        pass
+                                else:
+                                    _mid_candles_net_fail += 1
                         except Exception:
                             pass
                         # swallow but count (optional)
@@ -10684,6 +10712,8 @@ class Backend:
                                 prefetch_timeout = float(os.getenv("MID_PREFETCH_TIMEOUT_SEC", "25") or 25)
                                 groups = defaultdict(list)
                                 for _s in symbols:
+                                    if is_blocked_symbol(_s):
+                                        continue
                                     groups[_mid_primary_for_symbol(_s)].append(_s)
 
                                 tasks = []
