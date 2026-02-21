@@ -10435,8 +10435,14 @@ class Backend:
                 _mid_candles_fail = defaultdict(int)  # (exchange, tf) -> count
                 _mid_candles_fail_samples = defaultdict(list)  # (exchange, tf) -> [err...]
 
+                _mid_candles_log_empty = int(os.getenv("MID_CANDLES_LOG_EMPTY", "1") or "1")
+                _mid_candles_log_empty_samples = int(os.getenv("MID_CANDLES_LOG_EMPTY_SAMPLES", "10") or "10")
+                _mid_candles_empty = defaultdict(int)  # (exchange, tf) -> count (empty/None without exception)
+                _mid_candles_empty_samples = defaultdict(list)  # (exchange, tf) -> [sym...]
+
 
                 async def _mid_fetch_klines_rest(ex_name: str, symb: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
+                    nonlocal _mid_candles_net_fail, _mid_candles_unsupported
                     try:
                         # Global MID kline concurrency guard (prevents HTTP overload -> timeouts -> no_candles)
                         async with _mid_klines_sem:
@@ -10473,6 +10479,7 @@ class Backend:
                         return None
 
                 async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
+                    nonlocal _mid_candles_empty
                     key = (ex_name, symb, tf, int(limit))
                     now = time.time()
                     ttl = _mid_cache_ttl(tf)
@@ -10484,6 +10491,17 @@ class Backend:
                     last = None
                     for _i in range(max(0, mid_candles_retry) + 1):
                         last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit)
+                        # empty/None without raising -> track separately (common cause of no_candles with zero net_fail)
+                        try:
+                            if last is None or getattr(last, 'empty', True):
+                                _mid_candles_empty[(ex_name, tf)] += 1
+                                if _mid_candles_log_empty:
+                                    lst = _mid_candles_empty_samples[(ex_name, tf)]
+                                    if len(lst) < _mid_candles_log_empty_samples:
+                                        lst.append(symb)
+                        except Exception:
+                            pass
+
                         if last is not None and not last.empty:
                             _mid_candles_cache[key] = (now, last)
                             return last
@@ -10544,6 +10562,8 @@ class Backend:
                         _mid_candles_net_fail = 0
                         _mid_candles_unsupported = 0
                         _mid_candles_partial = 0
+                        _mid_candles_empty = defaultdict(int)
+                        _mid_candles_empty_samples = defaultdict(list)
                         _c0 = api.candle_counters_snapshot()
                         _mid_hard_block0 = _mid_hard_block_total()
                         _mid_hard_block = 0
@@ -10965,7 +10985,7 @@ class Backend:
                 elapsed = time.time() - start
                 try:
                     _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
-                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
+                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} candles_empty={sum(_mid_candles_empty.values()) if '_mid_candles_empty' in locals() else 0} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
                     logger.info("[mid][summary] %s", summary)
 
                     # Optional: hardblock breakdown (top buckets)
@@ -11064,3 +11084,4 @@ async def autotrade_stress_test(*, user_id: int, symbol: str, market_type: str =
     This build keeps production stable: stress-test is disabled here to avoid accidental trading.
     """
     return {"ok": False, "error": "stress_test_disabled_in_production"}
+
