@@ -377,7 +377,6 @@ import hmac
 import hashlib
 import uuid
 import base64
-import gzip
 import urllib.parse
 import numpy as np
 import pandas as pd
@@ -10522,20 +10521,6 @@ class Backend:
                 mid_cache_ttl_1h = int(os.getenv("MID_CANDLES_CACHE_TTL_1H", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "300")) or "300")
                 mid_cache_stale_sec = int(os.getenv("MID_CANDLES_CACHE_STALE_SEC", "900") or "900")
 
-                # Persistent candle cache in Postgres (kv_store). Survives restarts.
-                _mid_persist_candles = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip() not in ("0","false","False","no","NO")
-                _mid_persist_max_age = int(os.getenv("MID_PERSIST_CANDLES_MAX_AGE_SEC", str(mid_cache_stale_sec)) or str(mid_cache_stale_sec))
-                try:
-                    import db_store as _db_store
-                    try:
-                        _ = _db_store.get_pool()
-                        _mid_db_ready = True
-                    except Exception:
-                        _mid_db_ready = False
-                except Exception:
-                    _db_store = None
-                    _mid_db_ready = False
-
                 # persistent candles cache (shared across ticks)
                 if not hasattr(self, "_mid_candles_cache"):
                     self._mid_candles_cache = {}  # type: ignore[attr-defined]
@@ -10684,34 +10669,28 @@ class Backend:
                         ts, df = cached
                         if (now - ts) <= ttl and df is not None and not df.empty:
                             return df
+                    
+                    # Persistent candles cache (Postgres) to survive restarts.
+                    persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
+                    if persist_enabled and tf in ("5m","30m","1h"):
+                        try:
+                            max_age = int(os.getenv("MID_PERSIST_CANDLES_MAX_AGE_SEC", os.getenv("MID_CANDLES_CACHE_STALE_SEC", "1800")) or 1800)
+                            row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
+                            if row:
+                                blob, updated_at = row
+                                if updated_at is not None:
+                                    age = (dt.datetime.now(dt.timezone.utc) - updated_at).total_seconds()
+                                else:
+                                    age = 0.0
+                                if age <= max_age:
+                                    dfp = db_store._cc_unpack_df(blob)
+                                    if dfp is not None and not dfp.empty:
+                                        _mid_candles_cache[key] = (now, dfp)
+                                        return dfp
+                        except Exception:
+                            pass
 
-                    # Try persistent cache (Postgres kv_store) on memory miss (survives restarts).
-                    try:
-                        if _mid_persist_candles and _mid_db_ready and _db_store is not None:
-                            pkey = f"mid_candles_v1:{ex_name}:{symb}:{tf}:{int(limit)}"
-                            pv = await _db_store.kv_get_json(pkey)
-                            if isinstance(pv, dict) and pv.get("fmt") == "gz_b64_v1":
-                                pts = float(pv.get("ts") or 0)
-                                if pts > 0 and (now - pts) <= float(_mid_persist_max_age):
-                                    b64 = pv.get("data") or ""
-                                    if b64:
-                                        raw = gzip.decompress(base64.b64decode(b64.encode("ascii")))
-                                        obj = json.loads(raw.decode("utf-8"))
-                                        cols = obj.get("cols") or []
-                                        arrs = obj.get("arrs") or {}
-                                        if isinstance(cols, list) and isinstance(arrs, dict) and cols:
-                                            dfp = pd.DataFrame({c: arrs.get(c, []) for c in cols})
-                                            if not dfp.empty:
-                                                if "open_time" in dfp.columns:
-                                                    dfp["open_time"] = pd.to_datetime(dfp["open_time"], unit="ms", utc=True).dt.tz_convert(None)
-                                                for c in ("open","high","low","close","volume"):
-                                                    if c in dfp.columns:
-                                                        dfp[c] = pd.to_numeric(dfp[c], errors="coerce")
-                                                _mid_candles_cache[key] = (now, dfp)
-                                                return dfp
-                    except Exception:
-                        pass
-                    last = None
+last = None
                     for _i in range(max(0, mid_candles_retry) + 1):
                         last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, market)
                         # If response is empty (no exception), count as EMPTY + optional adaptive limit
@@ -10738,28 +10717,12 @@ class Backend:
 
                         if last is not None and not last.empty:
                             _mid_candles_cache[key] = (now, last)
-                            # Persist to Postgres kv_store (survives restarts)
+                            # write-through to persistent cache
                             try:
-                                if _mid_persist_candles and _mid_db_ready and _db_store is not None:
-                                    dfw = last
-                                    cols = [c for c in ("open_time","open","high","low","close","volume") if c in dfw.columns]
-                                    if cols:
-                                        dfx = dfw[cols].copy()
-                                        if "open_time" in dfx.columns:
-                                            # store ms since epoch
-                                            try:
-                                                ot = pd.to_datetime(dfx["open_time"], utc=True)
-                                            except Exception:
-                                                ot = pd.to_datetime(dfx["open_time"], errors="coerce", utc=True)
-                                            dfx["open_time"] = (ot.view("int64") // 1_000_000).astype("int64")
-                                        for c in ("open","high","low","close","volume"):
-                                            if c in dfx.columns:
-                                                dfx[c] = pd.to_numeric(dfx[c], errors="coerce")
-                                        obj = {"cols": cols, "arrs": {c: dfx[c].tolist() for c in cols}}
-                                        raw = json.dumps(obj, separators=(",",":")).encode("utf-8")
-                                        b64 = base64.b64encode(gzip.compress(raw, compresslevel=6)).decode("ascii")
-                                        pkey = f"mid_candles_v1:{ex_name}:{symb}:{tf}:{int(limit)}"
-                                        await _db_store.kv_set_json(pkey, {"fmt":"gz_b64_v1","ts": float(now), "data": b64})
+                                persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
+                                if persist_enabled and tf in ("5m","30m","1h"):
+                                    blob = db_store._cc_pack_df(last)
+                                    await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob)
                             except Exception:
                                 pass
                             return last
