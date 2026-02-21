@@ -10534,15 +10534,9 @@ class Backend:
                                 except Exception:
                                     pass
                             else:
-                                # HTTP 400/404 often means unsupported interval/symbol too
-                                if isinstance(e, ExchangeAPIError) and ('HTTP 400' in msg or 'HTTP 404' in msg):
-                                    _mid_candles_unsupported += 1
-                                    try:
-                                        api._mark_unsupported(ex_name, (market or 'SPOT'), symb, tf)
-                                    except Exception:
-                                        pass
-                                else:
-                                    _mid_candles_net_fail += 1
+                                # Do NOT mark unsupported on generic HTTP errors (can be transient / rate-limit / proxy).
+                                # Only hard-mark unsupported when the exchange explicitly says the instrument/symbol does not exist.
+                                _mid_candles_net_fail += 1
                         except Exception:
                             pass
                         # swallow but count (optional)
@@ -10569,7 +10563,10 @@ class Backend:
                     for _i in range(max(0, mid_candles_retry) + 1):
                         last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, market)
                         # If response is empty (no exception), count as EMPTY + optional adaptive limit
-                        if last is None or getattr(last, 'empty', False):
+                        if last is None:
+                            # Exception / network / rate-limit etc. (already counted in net_fail). Do not treat as "empty candles".
+                            pass
+                        elif getattr(last, 'empty', False):
                             _mid_candles_empty += 1
                             reason = f"empty_{ex_name.lower()}_{(market or 'SPOT').lower()}_{tf}"
                             _mid_candles_empty_reasons[reason] += 1
@@ -10577,7 +10574,7 @@ class Backend:
                                 lst = _mid_candles_empty_samples[reason]
                                 if len(lst) < _mid_candles_log_empty_samples:
                                     lst.append(f"{symb}@{ex_name}/{market}/{tf}/L{limit}")
-                            # adaptive limit step-down
+                            # adaptive limit step-down (some exchanges cap max bars)
                             if limit > 200:
                                 limit = 200
                                 continue
@@ -10710,24 +10707,32 @@ class Backend:
                             try:
                                 prefetch_limit = int(os.getenv("MID_PREFETCH_LIMIT", "250") or 250)
                                 prefetch_timeout = float(os.getenv("MID_PREFETCH_TIMEOUT_SEC", "25") or 25)
-                                groups = defaultdict(list)
-                                for _s in symbols:
-                                    if is_blocked_symbol(_s):
-                                        continue
-                                    groups[_mid_primary_for_symbol(_s)].append(_s)
 
-                                tasks = []
-                                for _ex, _syms in groups.items():
-                                    for _s in _syms:
-                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trigger, prefetch_limit, market_mid)))
-                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_mid, prefetch_limit, market_mid)))
-                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trend, prefetch_limit, market_mid)))
+                                async def _prefetch_one(_sym: str):
+                                    if is_blocked_symbol(_sym):
+                                        return
+                                    primary = _mid_primary_for_symbol(_sym)
+                                    try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
 
+                                    for _mkt in markets_try:
+                                        for _ex in try_order:
+                                            a = await _mid_fetch_klines_cached(_ex, _sym, tf_trigger, prefetch_limit, _mkt)
+                                            if a is None or a.empty:
+                                                continue
+                                            await asyncio.gather(
+                                                _mid_fetch_klines_cached(_ex, _sym, tf_mid, prefetch_limit, _mkt),
+                                                _mid_fetch_klines_cached(_ex, _sym, tf_trend, prefetch_limit, _mkt),
+                                                return_exceptions=True,
+                                            )
+                                            return
+
+                                tasks = [asyncio.create_task(_prefetch_one(_s)) for _s in symbols if _s]
                                 if tasks:
                                     if prefetch_timeout and prefetch_timeout > 0:
                                         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=prefetch_timeout)
                                     else:
                                         await asyncio.gather(*tasks, return_exceptions=True)
+
                             except Exception as _e:
                                 logger.warning("[mid] candles prefetch failed: %s", _e)
 
