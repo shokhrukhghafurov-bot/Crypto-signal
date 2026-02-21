@@ -10110,7 +10110,12 @@ class Backend:
                         _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
                         scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
                         if not scan_exchanges:
-                            scan_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
+                    scan_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
+
+                # --- Force BINANCE to be available for MID candles even if SCANNER_EXCHANGES omits it ---
+                _mid_force_binance = (os.getenv("MID_FORCE_BINANCE_CANDLES", "1") or "1").strip().lower() in ("1","true","yes","on")
+                if _mid_force_binance and "BINANCE" not in scan_exchanges:
+                    scan_exchanges = ["BINANCE"] + [x for x in scan_exchanges if x != "BINANCE"]
 
                         # --- Choose best exchange candidate (MAIN scanner) ---
                         results = await asyncio.gather(*[fetch_exchange(x) for x in scan_exchanges])
@@ -10486,6 +10491,8 @@ class Backend:
                     mid_candles_sources = [x for x in mid_candles_sources if x in ('BINANCE','BYBIT','OKX')] or ['BINANCE','BYBIT','OKX']
                 # Ensure candle sources are within scan_exchanges
                 mid_candles_sources = [x for x in mid_candles_sources if x in scan_exchanges] or ['BINANCE','BYBIT','OKX']
+                if _mid_force_binance and "BINANCE" not in mid_candles_sources:
+                    mid_candles_sources = ["BINANCE"] + [x for x in mid_candles_sources if x != "BINANCE"]
 
                 # --- MID candles routing: stable primary (hash) BINANCE/BYBIT + fallback + smart cache ---
                 _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT") or "").strip()
@@ -10496,13 +10503,6 @@ class Backend:
                 # NOT the full scan_exchanges list. This prevents wasting time on exchanges that are not intended
                 # to be used for candles (e.g., MEXC/GATEIO futures returning empty).
                 mid_universe = list(mid_candles_sources or ["BINANCE","BYBIT","OKX"])
-
-                # Force BINANCE as a candle source (even if SCANNER_EXCHANGES excludes it).
-                # This dramatically reduces 'no_candles' when BYBIT/OKX don't have the instrument.
-                mid_force_binance = (os.getenv('MID_FORCE_BINANCE_CANDLES','1') or '1').strip().lower() in ('1','true','yes','on')
-                if mid_force_binance and 'BINANCE' not in mid_universe:
-                    mid_universe = ['BINANCE'] + list(mid_universe)
-
 
                 # Ensure at least 2 primaries; fall back to first two in universe
                 if len(mid_primary_exchanges) < 2:
@@ -10546,6 +10546,9 @@ class Backend:
 
                 def _mid_primary_for_symbol(symb: str) -> str:
                     # Stable routing: hash(symbol) -> primary exchange from MID_PRIMARY_EXCHANGES
+                    # Safety mode: always use BINANCE as primary for candles (prevents mass no_candles when BYBIT/OKX miss symbols)
+                    if (os.getenv("MID_PRIMARY_SAFE_BINANCE", "1") or "1").strip().lower() in ("1","true","yes","on"):
+                        return "BINANCE"
                     if not mid_primary_exchanges:
                         return "BINANCE"
                     if mid_primary_mode not in ("hash", "round_robin"):
@@ -10630,7 +10633,17 @@ class Backend:
                             if is_pair_not_found:
                                 _mid_candles_unsupported += 1
                                 try:
-                                    api._mark_unsupported(ex_name, (market or 'SPOT'), symb, tf)
+                                    api._mark_unsupported(ex_name, (market or 'SPOT').upper().strip(), symb, tf)
+                                except Exception:
+                                    pass
+                                # FUTURES -> SPOT fallback on BYBIT/OKX when the futures instrument doesn't exist.
+                                # This prevents mass no_candles when a coin has no perp contract on that exchange.
+                                try:
+                                    mkt_u = (market or 'SPOT').upper().strip()
+                                    if mkt_u == 'FUTURES' and ex_name in ('BYBIT','OKX'):
+                                        df_spot = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, 'SPOT')
+                                        if df_spot is not None and not getattr(df_spot, 'empty', True):
+                                            return df_spot
                                 except Exception:
                                     pass
                             else:
@@ -10638,7 +10651,7 @@ class Backend:
                                 if isinstance(e, ExchangeAPIError) and ('HTTP 400' in msg or 'HTTP 404' in msg):
                                     _mid_candles_unsupported += 1
                                     try:
-                                        api._mark_unsupported(ex_name, (market or 'SPOT'), symb, tf)
+                                        api._mark_unsupported(ex_name, (market or 'SPOT').upper().strip(), symb, tf)
                                     except Exception:
                                         pass
                                 else:
@@ -10897,13 +10910,6 @@ class Backend:
                                 primary = _mid_primary_for_symbol(sym)
                                 # try primary first, then the other primary (if any), then fallbacks
                                 try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
-
-                                # Always try BINANCE as a reliable candles source
-                                if 'BINANCE' not in try_order:
-                                    try_order.append('BINANCE')
-                                # de-dup while preserving order
-                                try_order = list(dict.fromkeys([x for x in try_order if x]))
-
 
                                 # Try markets in order (AUTO: FUTURES->SPOT, or configured order)
                                 for mkt in markets_try:
