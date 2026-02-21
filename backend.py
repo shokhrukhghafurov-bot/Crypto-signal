@@ -10415,16 +10415,17 @@ class Backend:
                     try:
                         # Global MID kline concurrency guard (prevents HTTP overload -> timeouts -> no_candles)
                         async with _mid_klines_sem:
-                        if ex_name == "BINANCE":
-                            return await api.klines_binance(symb, tf, limit)
-                        if ex_name == "BYBIT":
-                            return await api.klines_bybit(symb, tf, limit)
-                        if ex_name == "OKX":
-                            return await api.klines_okx(symb, tf, limit)
-                        if ex_name == "GATEIO":
-                            return await api.klines_gateio(symb, tf, limit)
-                        # default MEXC
-                        return await api.klines_mexc(symb, tf, limit)
+                            if ex_name == "BINANCE":
+                                return await api.klines_binance(symb, tf, limit)
+                            if ex_name == "BYBIT":
+                                return await api.klines_bybit(symb, tf, limit)
+                            if ex_name == "OKX":
+                                return await api.klines_okx(symb, tf, limit)
+                            if ex_name == "GATEIO":
+                                return await api.klines_gateio(symb, tf, limit)
+                            # default MEXC
+                                return await api.klines_mexc(symb, tf, limit)
+
                     except Exception as e:
                         # classify candle failures
                         try:
