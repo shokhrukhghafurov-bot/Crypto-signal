@@ -10690,7 +10690,7 @@ class Backend:
                         except Exception:
                             pass
 
-last = None
+                    last = None
                     for _i in range(max(0, mid_candles_retry) + 1):
                         last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, market)
                         # If response is empty (no exception), count as EMPTY + optional adaptive limit
