@@ -10293,9 +10293,27 @@ class Backend:
 
     async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         tf_trigger, tf_mid, tf_trend = "5m", "30m", "1h"
-        market_mid = (os.getenv('MID_CANDLES_MARKET', 'FUTURES') or 'FUTURES').upper().strip()
-        if market_mid not in ('SPOT','FUTURES'):
-            market_mid = 'FUTURES'
+
+        # --- MID candles market selection ---
+        # Modes:
+        #   FUTURES  -> fetch only futures/linear/swap candles
+        #   SPOT     -> fetch only spot candles
+        #   AUTO     -> try FUTURES first, then SPOT (or order from MID_CANDLES_MARKET_ORDER)
+        market_mode = (os.getenv('MID_CANDLES_MARKET_MODE', 'AUTO') or 'AUTO').upper().strip()
+        if market_mode not in ('AUTO','SPOT','FUTURES'):
+            market_mode = 'AUTO'
+
+        if market_mode == 'AUTO':
+            order = (os.getenv('MID_CANDLES_MARKET_ORDER', 'FUTURES,SPOT') or 'FUTURES,SPOT')
+            markets_try = [m.strip().upper() for m in order.split(',') if m.strip()]
+            markets_try = [m for m in markets_try if m in ('FUTURES','SPOT')]
+            if not markets_try:
+                markets_try = ['FUTURES','SPOT']
+        else:
+            markets_try = [market_mode]
+
+        # default/primary market used for prefetch
+        market_mid = markets_try[0]
         def _parse_seconds_env(name: str, default: float) -> float:
             raw = os.getenv(name, "").strip()
             if raw == "":
@@ -10647,8 +10665,8 @@ class Backend:
                                 for _ex, _syms in groups.items():
                                     for _s in _syms:
                                         tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trigger, prefetch_limit, market_mid)))
-                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_mid, prefetch_limit)))
-                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trend, prefetch_limit)))
+                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_mid, prefetch_limit, market_mid)))
+                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trend, prefetch_limit, market_mid)))
 
                                 if tasks:
                                     if prefetch_timeout and prefetch_timeout > 0:
@@ -10711,44 +10729,52 @@ class Backend:
 
                             supporters = []  # kept for compatibility with later counters (not used for multi-exchange scoring)
                             chosen_name = None
+                            chosen_market = None
                             chosen_r: Optional[Dict[str, Any]] = None
 
                             async def _choose_exchange_mid():
-                                nonlocal chosen_name, chosen_r
+                                nonlocal chosen_name, chosen_market, chosen_r
                                 primary = _mid_primary_for_symbol(sym)
                                 # try primary first, then the other primary (if any), then fallbacks
                                 try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
-                                for name in try_order:
-                                    try:
-                                                                                # Fetch trigger TF first (cuts 3x HTTP load on misses -> fewer timeouts/no_candles)
-                                        a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250, market_mid)
-                                        if a is None or a.empty:
-                                            continue
-                                        b, c = await asyncio.gather(
-                                            _mid_fetch_klines_cached(name, sym, tf_mid, 250, market_mid),
-                                            _mid_fetch_klines_cached(name, sym, tf_trend, 250, market_mid),
-                                            return_exceptions=True,
-                                        )
-                                        if isinstance(b, Exception):
-                                            b = None
-                                        if isinstance(c, Exception):
-                                            c = None
-                                        # Allow partial candles: if trigger timeframe exists, we can reuse it for missing mid/trend
-                                        if b is None or getattr(b, 'empty', True):
-                                            b = a
-                                            _mid_candles_partial += 1
-                                        if c is None or getattr(c, 'empty', True):
-                                            c = a
-                                            _mid_candles_partial += 1
-                                        r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
-                                        if r:
-                                            chosen_name = name
-                                            chosen_r = r
-                                            return
-                                    except Exception:
-                                        continue
 
-                            # Soft timeout per symbol (prevents a single symbol/exchange from stalling the whole MID tick)
+                                # Try markets in order (AUTO: FUTURES->SPOT, or configured order)
+                                for mkt in markets_try:
+                                    for name in try_order:
+                                        try:
+                                            # Fetch trigger TF first (cuts 3x HTTP load on misses -> fewer timeouts/no_candles)
+                                            a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250, mkt)
+                                            if a is None or a.empty:
+                                                continue
+
+                                            b, c = await asyncio.gather(
+                                                _mid_fetch_klines_cached(name, sym, tf_mid, 250, mkt),
+                                                _mid_fetch_klines_cached(name, sym, tf_trend, 250, mkt),
+                                                return_exceptions=True,
+                                            )
+                                            if isinstance(b, Exception):
+                                                b = None
+                                            if isinstance(c, Exception):
+                                                c = None
+
+                                            # Allow partial candles: if trigger timeframe exists, we can reuse it for missing mid/trend
+                                            if b is None or getattr(b, 'empty', True):
+                                                b = a
+                                                _mid_candles_partial += 1
+                                            if c is None or getattr(c, 'empty', True):
+                                                c = a
+                                                _mid_candles_partial += 1
+
+                                            r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
+                                            if r:
+                                                chosen_name = name
+                                                chosen_market = mkt
+                                                chosen_r = r
+                                                return
+                                        except Exception:
+                                            continue
+
+# Soft timeout per symbol (prevents a single symbol/exchange from stalling the whole MID tick)
                             if mid_symbol_timeout_sec and mid_symbol_timeout_sec > 0:
                                 try:
                                     await asyncio.wait_for(_choose_exchange_mid(), timeout=float(mid_symbol_timeout_sec))
