@@ -10491,7 +10491,10 @@ class Backend:
                     mid_candles_sources = [x for x in mid_candles_sources if x in scan_exchanges] or ['BINANCE','BYBIT','OKX']
 
                 # Always keep BINANCE as a fallback candle source unless explicitly disabled.
-                if (os.getenv('MID_FORCE_BINANCE_CANDLES','1') or '1').strip().lower() in ('1','true','yes','on'):
+                # NOTE: Many symbols are missing on BYBIT/OKX SPOT; without BINANCE fallback MID may produce массовый no_candles/emitted=0.
+                disable_binance = (os.getenv('MID_DISABLE_BINANCE_CANDLES','0') or '0').strip().lower() in ('1','true','yes','on')
+                force_binance = (os.getenv('MID_FORCE_BINANCE_CANDLES','1') or '1').strip().lower() in ('1','true','yes','on')
+                if (not disable_binance) and force_binance:
                     if 'BINANCE' not in mid_candles_sources:
                         mid_candles_sources = ['BINANCE'] + [x for x in mid_candles_sources if x != 'BINANCE']
 
@@ -10570,7 +10573,6 @@ class Backend:
 
 
                 async def _mid_fetch_klines_rest(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
-                    nonlocal _mid_candles_net_fail, _mid_candles_unsupported
                     try:
                         # Global MID kline concurrency guard (prevents HTTP overload -> timeouts -> no_candles)
                         async with _mid_klines_sem:
@@ -10659,7 +10661,6 @@ class Backend:
                         return None
 
                 async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
-                    nonlocal _mid_candles_unsupported, _mid_candles_empty
                     # Force SPOT candles even if caller requested FUTURES.
                     # This is intentional: we use SPOT klines for both SPOT and FUTURES signals.
                     market = 'SPOT'
@@ -10928,7 +10929,7 @@ class Backend:
                             chosen_r: Optional[Dict[str, Any]] = None
 
                             async def _choose_exchange_mid():
-                                nonlocal chosen_name, chosen_market, chosen_r, _mid_candles_partial
+                                nonlocal chosen_name, chosen_market, chosen_r
                                 primary = _mid_primary_for_symbol(sym)
                                 # try primary first, then the other primary (if any), then fallbacks
                                 try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
