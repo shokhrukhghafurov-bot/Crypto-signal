@@ -128,7 +128,21 @@ async def ensure_schema() -> None:
         
 
 
-        # --- Auto-trade global settings (single row) ---
+        
+        # --- Persistent candles cache (binary, not JSON) ---
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS candles_cache (
+          key TEXT PRIMARY KEY,
+          payload BYTEA NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_candles_cache_updated ON candles_cache(updated_at);")
+        except Exception:
+            pass
+
+# --- Auto-trade global settings (single row) ---
         await conn.execute("""
 CREATE TABLE IF NOT EXISTS autotrade_bot_settings (
   id INT PRIMARY KEY CHECK (id = 1),
@@ -2763,3 +2777,65 @@ async def kv_set_json(key: str, value: dict) -> None:
             """,
             k, value
         )
+
+
+import zlib
+import pickle
+
+def _cc_key(ex_name: str, market: str, symbol: str, tf: str, limit: int) -> str:
+    return f"candles:{ex_name}:{market}:{symbol}:{tf}:{int(limit)}"
+
+def _cc_pack_df(df) -> bytes:
+    # Store binary (pickle+zlib) to avoid JSON and reduce size
+    payload = {
+        "columns": list(df.columns),
+        "values": df.values.tolist(),
+        "index": df.index.tolist() if hasattr(df.index, "tolist") else list(df.index),
+    }
+    raw = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+    return zlib.compress(raw, level=6)
+
+def _cc_unpack_df(blob: bytes):
+    raw = zlib.decompress(blob)
+    payload = pickle.loads(raw)
+    import pandas as pd
+    df = pd.DataFrame(payload["values"], columns=payload["columns"])
+    try:
+        df.index = payload.get("index", df.index)
+    except Exception:
+        pass
+    return df
+
+async def candles_cache_get(ex_name: str, market: str, symbol: str, tf: str, limit: int):
+    pool = get_pool()
+    key = _cc_key(ex_name, market, symbol, tf, limit)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT payload, updated_at FROM candles_cache WHERE key=$1", key)
+        return None if not row else (row["payload"], row["updated_at"])
+
+async def candles_cache_set(ex_name: str, market: str, symbol: str, tf: str, limit: int, payload: bytes) -> None:
+    pool = get_pool()
+    key = _cc_key(ex_name, market, symbol, tf, limit)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO candles_cache(key,payload,updated_at) VALUES ($1,$2,NOW()) "
+            "ON CONFLICT (key) DO UPDATE SET payload=EXCLUDED.payload, updated_at=NOW()",
+            key, payload
+        )
+
+async def candles_cache_purge(max_age_sec: int) -> int:
+    """Delete candles cache rows older than max_age_sec. Returns number of deleted rows."""
+    pool = get_pool()
+    max_age_sec = int(max_age_sec or 0)
+    if max_age_sec <= 0:
+        return 0
+    async with pool.acquire() as conn:
+        res = await conn.execute(
+            "DELETE FROM candles_cache WHERE updated_at < (NOW() - ($1::int * INTERVAL '1 second'))",
+            max_age_sec
+        )
+    # asyncpg returns like 'DELETE 12'
+    try:
+        return int(str(res).split()[-1])
+    except Exception:
+        return 0
