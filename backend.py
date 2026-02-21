@@ -10447,13 +10447,14 @@ class Backend:
                 # Ensure candle sources are within scan_exchanges
                 mid_candles_sources = [x for x in mid_candles_sources if x in scan_exchanges] or ['BINANCE','BYBIT','OKX']
 
-                # --- MID candles routing: stable primary (hash) BINANCE/BYBIT + fallback + smart cache ---
-                _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT") or "").strip()
+                # --- MID candles routing: stable primary (hash) among primaries + fallback + smart cache ---
+                # Default primaries include OKX as well to shard load across 3 exchanges out-of-the-box.
+                _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT,OKX") or "").strip()
                 mid_primary_exchanges = [x.strip().upper() for x in _primary_ex.split(",") if x.strip()]
                 if len(mid_primary_exchanges) < 2:
-                    mid_primary_exchanges = ["BINANCE", "BYBIT"]
+                    mid_primary_exchanges = ["BINANCE", "BYBIT", "OKX"]
                 # keep only those available in scan_exchanges
-                mid_primary_exchanges = [x for x in mid_primary_exchanges if x in scan_exchanges] or ["BINANCE", "BYBIT"]
+                mid_primary_exchanges = [x for x in mid_primary_exchanges if x in scan_exchanges] or ["BINANCE", "BYBIT", "OKX"]
                 mid_fallback_exchanges = [x for x in scan_exchanges if x not in mid_primary_exchanges]
 
                 mid_primary_mode = (os.getenv("MID_PRIMARY_MODE", "hash") or "hash").strip().lower()
