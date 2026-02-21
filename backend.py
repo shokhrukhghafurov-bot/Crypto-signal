@@ -10986,6 +10986,14 @@ class Backend:
                             missing = max(0, int(_mid_scanned) - int(accounted))
                             if missing:
                                 _rej_counts["untracked"] = int(_rej_counts.get("untracked", 0) or 0) + int(missing)
+                            # Include hard-blocks in reject digest (so [mid][reject] can show hardblock=...)
+                            try:
+                                hb_total = int(sum(int(v) for v in _MID_HARD_BLOCK_BY_KEY.values()))
+                                if hb_total:
+                                    _rej_counts["hardblock"] = int(_rej_counts.get("hardblock", 0) or 0) + hb_total
+                            except Exception:
+                                pass
+
                             top = sorted([(k, int(v)) for k, v in _rej_counts.items()], key=lambda x: (-x[1], x[0]))[:max(1, _rej_max_reasons)]
                             parts = []
                             for k, v in top:
@@ -10993,6 +11001,14 @@ class Backend:
                                 exs = ",".join(ex) if ex else ""
                                 parts.append(f"{k}={v}" + (f" [{exs}]" if exs else ""))
                             logger.info("[mid][reject] scanned=%s accounted=%s missing=%s :: %s", int(_mid_scanned), int(accounted), int(missing), " | ".join(parts))
+                            # Extra: show top hardblock reasons in reject digest for quick debugging
+                            try:
+                                hb_dump = _mid_hardblock_dump(int(os.getenv("MID_HARDBLOCK_TOP", "6") or "6"))
+                                if hb_dump:
+                                    logger.info("[mid][reject] hardblock_top: %s", hb_dump)
+                            except Exception:
+                                pass
+
 
                             if _mid_candles_log_fail and _mid_candles_fail:
                                 try:
