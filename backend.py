@@ -10967,7 +10967,12 @@ class Backend:
 
                                 # Try markets in order (AUTO: FUTURES->SPOT, or configured order)
                                 for mkt in markets_try:
-                                    for name in try_order:
+                                    mkt_u = (mkt or 'SPOT').upper().strip()
+                                    if mkt_u == 'FUTURES':
+                                        names = [x for x in try_order if x in ('BINANCE','BYBIT','OKX')]
+                                    else:
+                                        names = try_order
+                                    for name in names:
                                         try:
                                             # Fetch trigger TF first (cuts 3x HTTP load on misses -> fewer timeouts/no_candles)
                                             a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250, mkt)
