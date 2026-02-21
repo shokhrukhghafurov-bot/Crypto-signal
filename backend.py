@@ -10007,157 +10007,53 @@ class Backend:
                         if not scan_exchanges:
                             scan_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
 
-                        # MID candles sources list (controls where we fetch candles from)
-                        _mid_src_env = (os.getenv('MID_CANDLES_SOURCES','') or '').strip()
-                        if _mid_src_env:
-                            mid_candles_sources = [x.strip().upper() for x in _mid_src_env.split(',') if x.strip()]
-                        else:
-                            mid_candles_sources = list(scan_exchanges)
-                        # keep only exchanges that are enabled for scanner (defensive)
-                        mid_candles_sources = [x for x in mid_candles_sources if x in scan_exchanges]
-                        if not mid_candles_sources:
-                            mid_candles_sources = ['BINANCE']
-
-                        # optionally disable secondary exchanges (GATEIO/MEXC)
-                        _sec = (os.getenv('MID_ENABLE_SECONDARY_EXCHANGES','0') or '0').strip().lower()
-                        if _sec in ('0','false','no','off'):
-                            mid_candles_sources = [x for x in mid_candles_sources if x in ('BINANCE','BYBIT','OKX')] or ['BINANCE']
-
-
-                        # --- MID candles: balanced primary BINANCE/BYBIT + fallback + smart cache ---
-                        _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT,OKX") or "").strip()
-                        mid_primary_exchanges = [x.strip().upper() for x in _primary_ex.split(",") if x.strip()]
-                        if len(mid_primary_exchanges) < 3:
-                            mid_primary_exchanges = ["BINANCE", "BYBIT", "OKX"]
-                        # keep only those available in scan_exchanges
-                        mid_primary_exchanges = [x for x in mid_primary_exchanges if x in mid_candles_sources] or ['BINANCE']
-                        mid_fallback_exchanges = [x for x in mid_candles_sources if x not in mid_primary_exchanges]
-
-                        mid_primary_mode = (os.getenv("MID_PRIMARY_MODE", "hash") or "hash").strip().lower()
-                        mid_candles_retry = int(os.getenv("MID_CANDLES_RETRY", "1") or "1")
-                        mid_cache_ttl_5m = int(os.getenv("MID_CANDLES_CACHE_TTL_5M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "60")) or "60")
-                        mid_cache_ttl_30m = int(os.getenv("MID_CANDLES_CACHE_TTL_30M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "180")) or "180")
-                        mid_cache_ttl_1h = int(os.getenv("MID_CANDLES_CACHE_TTL_1H", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "300")) or "300")
-                        mid_cache_stale_sec = int(os.getenv("MID_CANDLES_CACHE_STALE_SEC", "900") or "900")
-
-                        # persistent candles cache (shared across ticks)
-                        if not hasattr(self, "_mid_candles_cache"):
-                            self._mid_candles_cache = {}  # type: ignore[attr-defined]
-                        if not hasattr(self, "_mid_candles_inflight"):
-                            self._mid_candles_inflight = {}  # type: ignore[attr-defined]
-                        if not hasattr(self, "_mid_klines_sem"):
+                        # --- Choose best exchange candidate (MAIN scanner) ---
+                        results = await asyncio.gather(*[fetch_exchange(x) for x in scan_exchanges])
+                        best_name = None
+                        best_r = None
+                        best_score = -1.0
+                        for _name, _res in results:
+                            if not _res:
+                                continue
                             try:
-                                self._mid_klines_sem = asyncio.Semaphore(int(os.getenv("MID_KLINES_CONCURRENCY", "15") or "15"))  # type: ignore[attr-defined]
+                                _c = float(_res.get("confidence", 0) or 0)
                             except Exception:
-                                self._mid_klines_sem = asyncio.Semaphore(15)  # type: ignore[attr-defined]
+                                _c = 0.0
+                            if _c > best_score:
+                                best_score = _c
+                                best_name = _name
+                                best_r = _res
 
-                        _mid_candles_cache = self._mid_candles_cache  # type: ignore[attr-defined]
-                        _mid_candles_inflight = self._mid_candles_inflight  # type: ignore[attr-defined]
-                        _mid_klines_sem = self._mid_klines_sem  # type: ignore[attr-defined]
+                        if not best_r or not best_name:
+                            _rej_add(sym, "no_candidate")
+                            continue
 
+                        best_dir = str(best_r.get("direction") or "").upper()
+                        entry = float(best_r.get("entry") or 0.0)
+                        sl = float(best_r.get("sl") or 0.0)
+                        tp1 = float(best_r.get("tp1") or 0.0)
+                        tp2 = float(best_r.get("tp2") or 0.0)
+                        rr = float(best_r.get("rr") or 0.0)
+                        conf = int(round(float(best_r.get("confidence", 0) or 0)))
 
-                        def _mid_cache_ttl(tf: str) -> int:
-                            t = (tf or "").lower()
-                            if t in ("5m", "5min", "5"):
-                                return mid_cache_ttl_5m
-                            if t in ("30m", "30min", "30"):
-                                return mid_cache_ttl_30m
-                            return mid_cache_ttl_1h
+                        # Market: choose FUTURES only for stronger trend+volatility, otherwise SPOT
+                        try:
+                            market = choose_market(float(best_r.get("adx1", 0) or 0), float(best_r.get("atr_pct", 0) or 0))
+                        except Exception:
+                            market = "SPOT"
 
-                        def _mid_primary_for_symbol(symb: str) -> str:
-                            # Stable routing: hash(symbol) -> BINANCE or BYBIT (or configured list)
-                            if mid_primary_mode == "round_robin":
-                                # fallback to hash if round_robin is selected (we avoid shared mutable state across async tasks)
-                                pass
-                            try:
-                                h = int.from_bytes(hashlib.sha1(symb.encode("utf-8")).digest()[:4], "big")
-                            except Exception:
-                                h = sum(ord(c) for c in symb)
-                            return mid_primary_exchanges[h % len(mid_primary_exchanges)]
+                        # Risk/TA notes (human-readable)
+                        risk_note = _fmt_ta_block(best_r)
 
-                        
-                        async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
-                            # Cache key is exchange+symbol+tf+limit
-                            key = (ex_name, symb, tf, int(limit))
-                            now = time.monotonic()
-                            ttl = float(_mid_cache_ttl(tf))
-                            cached = _mid_candles_cache.get(key)
-                            if cached:
-                                exp_ts, df = cached
-                                if now < exp_ts and df is not None and not df.empty:
-                                    return df
+                        # SPOT+SHORT is not executable -> convert to FUTURES unless Futures are forced off by news/macro
+                        if market == "SPOT" and best_dir == "SHORT":
+                            if news_act == "FUTURES_OFF" or mac_act == "FUTURES_OFF":
+                                _rej_add(sym, "futures_forced_off")
+                                continue
+                            market = "FUTURES"
+                            risk_note = (risk_note + "\n" if risk_note else "") + "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
 
-                            inflight = _mid_candles_inflight.get(key)
-                            if inflight is not None and not inflight.done():
-                                return await inflight
-
-                            loop = asyncio.get_running_loop()
-                            fut = loop.create_future()
-                            # Prevent "Future exception was never retrieved"
-                            def _consume_exc(_fut: asyncio.Future):
-                                try:
-                                    if not _fut.cancelled():
-                                        _ = _fut.exception()
-                                except Exception:
-                                    pass
-                            fut.add_done_callback(_consume_exc)
-                            _mid_candles_inflight[key] = fut
-
-                            async def _do_fetch() -> Optional[pd.DataFrame]:
-                                last_err = None
-                                for attempt in range(max(0, mid_candles_retry) + 1):
-                                    try:
-                                        async with _mid_klines_sem:
-                                            # Hard timeout per request
-                                            req_timeout = float(os.getenv("MID_KLINES_TIMEOUT_SEC", os.getenv("HTTP_REQ_TIMEOUT_SEC", "4")) or "4")
-                                            async def _call():
-                                                if ex_name == "BINANCE":
-                                                    return await api.klines_binance(symb, tf, limit)
-                                                if ex_name == "BYBIT":
-                                                    return await api.klines_bybit(symb, tf, limit)
-                                                if ex_name == "OKX":
-                                                    return await api.klines_okx(symb, tf, limit)
-                                                if ex_name == "MEXC":
-                                                    return await api.klines_mexc(symb, tf, limit)
-                                                if ex_name == "GATEIO":
-                                                    return await api.klines_gateio(symb, tf, limit)
-                                                return None
-                                            df = await asyncio.wait_for(_call(), timeout=req_timeout)
-                                        if df is not None and not df.empty:
-                                            _mid_candles_cache[key] = (time.monotonic() + ttl, df)
-                                            return df
-                                        # empty df -> treat as miss and try next attempt
-                                    except Exception as e:
-                                        last_err = e
-                                        await asyncio.sleep(0.05 * (attempt + 1))
-                                        continue
-
-                                # stale fallback (best-effort)
-                                if cached:
-                                    exp_ts, df = cached
-                                    # allow stale up to mid_cache_stale_sec
-                                    if df is not None and not df.empty:
-                                        age = max(0.0, (now - (exp_ts - ttl)))
-                                        if age <= float(mid_cache_stale_sec):
-                                            return df
-                                if last_err:
-                                    raise last_err
-                                return None
-
-                            try:
-                                df = await _do_fetch()
-                                if not fut.done():
-                                    fut.set_result(df)
-                                return df
-                            except Exception as e:
-                                if not fut.done():
-                                    fut.set_exception(e)
-                                raise
-                            finally:
-                                cur = _mid_candles_inflight.get(key)
-                                if cur is fut:
-                                    _mid_candles_inflight.pop(key, None)
-
+                        risk_notes = [risk_note] if risk_note else []
                         async def _pair_exists(ex: str) -> bool:
                             try:
                                 exu = (ex or "").upper().strip()
