@@ -6164,19 +6164,30 @@ class MultiExchangeData:
         return dedup[:n]
 
     async def _get_json(self, url: str, params: Optional[Dict[str, str]] = None) -> Any:
-        """HTTP GET JSON with concurrency limit + per-request timeout."""
+        """HTTP GET JSON with concurrency limit + per-request timeout.
+
+        Many exchanges (especially Binance) return HTTP 400 with a JSON error payload.
+        aiohttp's raise_for_status() would hide that payload, making `no_candles` impossible
+        to debug. We always read the body and include a short snippet in the exception.
+        """
         assert self.session is not None
         async with self._http_sem:
             async def _do():
                 try:
                     async with self.session.get(url, params=params) as r:
-                        r.raise_for_status()
-                        return await r.json()
+                        body_txt = await r.text()
+                        if r.status >= 400:
+                            snippet = (body_txt or "")[:300].replace("\n", " ").replace("\r", " ")
+                            raise ExchangeAPIError(f"HTTP {r.status} url={str(r.url)} body={snippet}")
+
+                        if not body_txt:
+                            return None
+                        try:
+                            return json.loads(body_txt)
+                        except Exception:
+                            return None
                 except asyncio.TimeoutError as e:
                     raise ExchangeAPIError(f"HTTP timeout url={url}") from e
-                except aiohttp.ClientResponseError as e:
-                    # Keep status for smarter handling upstream
-                    raise ExchangeAPIError(f"HTTP {e.status} url={url} msg={e.message}") from e
                 except (aiohttp.ClientError, OSError, ConnectionResetError) as e:
                     raise ExchangeAPIError(f"HTTP error url={url} err={type(e).__name__}: {e}") from e
 
@@ -10573,6 +10584,20 @@ class Backend:
                         try:
                             symbols_pool = await api.get_top_usdt_symbols(top_n_symbols)
                             if symbols_pool:
+                                # Normalize symbols across exchanges (OKX uses BTC-USDT / BTC-USDT-SWAP, Gate may use BTC_USDT).
+                                # Internally we use canonical BASEQUOTE like BTCUSDT.
+                                def _mid_norm_symbol(s: str) -> str:
+                                    u = (s or "").upper().strip()
+                                    # Remove common separators
+                                    u = u.replace("-", "").replace("_", "").replace(":", "")
+                                    # Strip derivative suffixes
+                                    for suf in ("SWAP", "PERP", "FUT", "FUTURES"):
+                                        if u.endswith(suf):
+                                            u = u[: -len(suf)]
+                                            break
+                                    return u
+
+                                symbols_pool = [_mid_norm_symbol(x) for x in symbols_pool if x]
                                 # de-duplicate (some exchanges/pools can return duplicates)
                                 symbols_pool = list(dict.fromkeys(symbols_pool))
                                 self._mid_symbols_cache = list(symbols_pool)
