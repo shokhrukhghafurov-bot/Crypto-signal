@@ -10469,7 +10469,7 @@ class Backend:
 
                 # Fallback exchanges are the rest of the MID universe
                 mid_fallback_exchanges = [x for x in mid_universe if x not in mid_primary_exchanges]
-mid_primary_mode = (os.getenv("MID_PRIMARY_MODE", "hash") or "hash").strip().lower()
+                mid_primary_mode = (os.getenv("MID_PRIMARY_MODE", "hash") or "hash").strip().lower()
                 mid_candles_retry = int(os.getenv("MID_CANDLES_RETRY", "1") or "1")
                 mid_cache_ttl_5m = int(os.getenv("MID_CANDLES_CACHE_TTL_5M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "60")) or "60")
                 mid_cache_ttl_30m = int(os.getenv("MID_CANDLES_CACHE_TTL_30M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "180")) or "180")
