@@ -10377,7 +10377,7 @@ class Backend:
                     try:
                         self._mid_klines_sem = asyncio.Semaphore(int(os.getenv("MID_KLINES_CONCURRENCY", "15") or "15"))  # type: ignore[attr-defined]
                     except Exception:
-                        self._mid_klines_sem = asyncio.Semaphore(15)  # type: ignore[attr-defined]
+                        self._mid_klines_sem = asyncio.Semaphore(int(os.getenv('MID_KLINES_CONCURRENCY', '45') or 45))  # type: ignore[attr-defined]
 
                 _mid_candles_cache = self._mid_candles_cache  # type: ignore[attr-defined]
                 _mid_candles_inflight = self._mid_candles_inflight  # type: ignore[attr-defined]
@@ -10558,6 +10558,31 @@ class Backend:
                                 logger.info("[mid][macro] alert: action=%s event=%s window=%s", mac_act, getattr(mac_ev, "name", None), mac_win)
                                 await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
 
+
+                        # --- Architecture C: prefetch candles for all symbols (primary exchange) ---
+                        mid_prefetch = os.getenv("MID_PREFETCH_CANDLES", "1").strip().lower() in ("1","true","yes","on")
+                        if mid_prefetch and symbols:
+                            try:
+                                prefetch_limit = int(os.getenv("MID_PREFETCH_LIMIT", "250") or 250)
+                                prefetch_timeout = float(os.getenv("MID_PREFETCH_TIMEOUT_SEC", "25") or 25)
+                                groups = defaultdict(list)
+                                for _s in symbols:
+                                    groups[_mid_primary_for_symbol(_s)].append(_s)
+
+                                tasks = []
+                                for _ex, _syms in groups.items():
+                                    for _s in _syms:
+                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trigger, prefetch_limit)))
+                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_mid, prefetch_limit)))
+                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trend, prefetch_limit)))
+
+                                if tasks:
+                                    if prefetch_timeout and prefetch_timeout > 0:
+                                        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=prefetch_timeout)
+                                    else:
+                                        await asyncio.gather(*tasks, return_exceptions=True)
+                            except Exception as _e:
+                                logger.warning("[mid] candles prefetch failed: %s", _e)
                         for sym in symbols:
                             # Hard budget per MID tick (prevents very long ticks during exchange issues)
                             if mid_tick_budget_sec and mid_tick_budget_sec > 0:
