@@ -6383,7 +6383,10 @@ class MultiExchangeData:
         sym = (symbol or '').upper().strip()
         iv = (interval or '').strip().lower()
         mkt = (market or 'SPOT').upper().strip()
-        cache_key = ('BINANCE', mkt, sym, iv, int(limit))
+        # Binance USDT-M futures has some contracts with a different symbol name
+        # than spot (e.g. PEPE futures is typically 1000PEPEUSDT).
+        sym_req = self._binance_futures_symbol_alias(sym) if mkt == 'FUTURES' else sym
+        cache_key = ('BINANCE', mkt, sym_req, iv, int(limit))
 
         async def _fetch():
             # Binance may return HTTP 200 with JSON error payload; validate type
@@ -6391,7 +6394,7 @@ class MultiExchangeData:
                 url = f"{self.BINANCE_FUTURES}/fapi/v1/klines"
             else:
                 url = f"{self.BINANCE_SPOT}/api/v3/klines"
-            params = {'symbol': sym, 'interval': iv, 'limit': str(limit)}
+            params = {'symbol': sym_req, 'interval': iv, 'limit': str(limit)}
             raw = await self._get_json(url, params=params)
             if isinstance(raw, dict) and 'code' in raw:
                 raise ExchangeAPIError(f"BINANCE {mkt} code={raw.get('code')} msg={raw.get('msg')}")
@@ -6400,6 +6403,37 @@ class MultiExchangeData:
             return self._df_from_ohlcv(raw, 'binance')
 
         return await self._klines_cached(cache_key=cache_key, interval=iv, fetch_coro=_fetch)
+
+    def _binance_futures_symbol_alias(self, sym: str) -> str:
+        """Map spot-like symbols to Binance USDT-M futures symbol when they differ.
+
+        Env override:
+          BINANCE_FUTURES_SYMBOL_MAP="PEPEUSDT=1000PEPEUSDT,FLOKIUSDT=1000FLOKIUSDT"
+
+        Defaults include only a few common cases to avoid surprising remaps.
+        """
+        try:
+            if not hasattr(self, '_binance_fut_sym_map_cache'):
+                m = {
+                    'PEPEUSDT': '1000PEPEUSDT',
+                    'FLOKIUSDT': '1000FLOKIUSDT',
+                    'SHIBUSDT': '1000SHIBUSDT',
+                }
+                raw = (os.getenv('BINANCE_FUTURES_SYMBOL_MAP', '') or '').strip()
+                if raw:
+                    for part in raw.split(','):
+                        part = part.strip()
+                        if not part or '=' not in part:
+                            continue
+                        k, v = part.split('=', 1)
+                        k = (k or '').upper().strip()
+                        v = (v or '').upper().strip()
+                        if k and v:
+                            m[k] = v
+                self._binance_fut_sym_map_cache = m
+            return self._binance_fut_sym_map_cache.get(sym, sym)
+        except Exception:
+            return sym
 
     
     async def depth_binance(self, symbol: str, limit: int = 20) -> Optional[dict]:
@@ -10552,7 +10586,8 @@ class Backend:
                                         info = api._binance_exchange_info(futures=True)
                                         if info and isinstance(info, dict):
                                             syms = {s.get('symbol') for s in (info.get('symbols') or []) if isinstance(s, dict)}
-                                            if symb not in syms:
+                                            symb_req = api._binance_futures_symbol_alias((symb or '').upper().strip())
+                                            if (symb not in syms) and (symb_req not in syms):
                                                 try:
                                                     api._mark_unsupported(ex_name, mkt, symb, tf)
                                                 except Exception:
