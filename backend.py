@@ -1679,56 +1679,6 @@ async def _bybit_instrument_filters(*, category: str, symbol: str) -> tuple[floa
     return qty_step, min_qty, tick
 
 
-# --- MID candles: fast symbol listing checks (avoid noisy "not supported symbol"/51001 and enable clean fallback) ---
-_BYBIT_LISTED_CACHE: dict[str, dict] = {}
-_OKX_LISTED_CACHE: dict[str, dict] = {}
-
-async def _bybit_symbol_listed(*, category: str, symbol: str) -> bool:
-    """Return True if Bybit V5 lists this symbol in given category (spot/linear/inverse). Cached ~1h."""
-    key = f"{category}:{symbol.upper()}"
-    c = _BYBIT_LISTED_CACHE.get(key)
-    if c and c.get("_ts", 0) > time.time() - 3600:
-        return bool(c.get("ok"))
-    ok = False
-    try:
-        data = await _http_json(
-            "GET",
-            "https://api.bybit.com/v5/market/instruments-info",
-            params={"category": category, "symbol": symbol.upper()},
-            timeout_s=10,
-        )
-        lst = ((data.get("result") or {}).get("list") or [])
-        ok = bool(lst)
-    except Exception:
-        ok = False
-    _BYBIT_LISTED_CACHE[key] = {"_ts": time.time(), "ok": ok}
-    return ok
-
-async def _okx_symbol_listed(*, inst_type: str, symbol: str) -> bool:
-    """Return True if OKX lists this symbol for instType (SPOT/SWAP). Cached ~1h."""
-    key = f"{inst_type}:{symbol.upper()}"
-    c = _OKX_LISTED_CACHE.get(key)
-    if c and c.get("_ts", 0) > time.time() - 3600:
-        return bool(c.get("ok"))
-    ok = False
-    try:
-        inst = _okx_inst(symbol)
-        data = await _http_json(
-            "GET",
-            "https://www.okx.com/api/v5/public/instruments",
-            params={"instType": inst_type, "instId": inst},
-            timeout_s=10,
-        )
-        lst = (data.get("data") or []) if isinstance(data, dict) else []
-        ok = bool(lst)
-    except Exception:
-        ok = False
-    _OKX_LISTED_CACHE[key] = {"_ts": time.time(), "ok": ok}
-    return ok
-
-
-
-
 async def _bybit_available_usdt(api_key: str, api_secret: str) -> float:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
@@ -10417,11 +10367,22 @@ class Backend:
         # --- MID candles market selection ---
         # IMPORTANT (production hardening):
         # User requested: "свечи берем только из SPOT и эти свечи для FUTURES тоже используем".
-        # We force MID candles to be fetched from SPOT only.
-        # (Signals can still be FUTURES — we just use SPOT klines for TA.)
-        markets_try = ['SPOT']
-        # default/primary market used for prefetch
-        market_mid = 'SPOT'
+        # MID candles markets to try.
+# Historically this was forced to SPOT only, but many symbols exist only on FUTURES/SWAP on some exchanges.
+# Control via env:
+#   MID_CANDLES_MARKET_MODE=SPOT | FUTURES | AUTO   (default AUTO if MID_ALLOW_FUTURES=1 else SPOT)
+mode = (os.getenv("MID_CANDLES_MARKET_MODE","").strip().upper() or "")
+allow_fut = (os.getenv("MID_ALLOW_FUTURES","0").strip().lower() in ("1","true","yes","on"))
+if not mode:
+    mode = "AUTO" if allow_fut else "SPOT"
+if mode in ("FUTURES","SWAP","PERP","PERPETUAL"):
+    markets_try = ["FUTURES"]
+elif mode == "AUTO":
+    markets_try = ["FUTURES","SPOT"] if allow_fut else ["SPOT"]
+else:
+    markets_try = ["SPOT"]
+# default/primary market used for prefetch
+market_mid = markets_try[0] if markets_try else "SPOT"
         def _parse_seconds_env(name: str, default: float) -> float:
             raw = os.getenv(name, "").strip()
             if raw == "":
@@ -10659,42 +10620,8 @@ class Backend:
                                     pass
                                 return await api.klines_binance(symb, tf, limit, market=market)
                             if ex_name == "BYBIT":
-                                # Pre-check listing on Bybit SPOT to avoid noisy retCode=10001 and allow clean fallback
-                                try:
-                                    if (mkt == 'SPOT') and (not await _bybit_symbol_listed(category='spot', symbol=symb)):
-                                            # Bybit SPOT doesn't list this symbol. Prefer FUTURES candles when allowed (perpetuals).
-                                            if allow_futures:
-                                                try:
-                                                    api._mark_unsupported(ex_name, mkt, symb, tf)
-                                                except Exception:
-                                                    pass
-                                                return await api.klines_bybit(symb, tf, limit, market='FUTURES')
-                                            try:
-                                                api._mark_unsupported(ex_name, mkt, symb, tf)
-                                            except Exception:
-                                                pass
-                                            return pd.DataFrame()
-except Exception:
-                                    pass
                                 return await api.klines_bybit(symb, tf, limit, market=market)
                             if ex_name == "OKX":
-                                # Pre-check listing on OKX SPOT to avoid 51001 spam and allow clean fallback
-                                try:
-                                    if (mkt == 'SPOT') and (not await _okx_symbol_listed(inst_type='SPOT', symbol=symb)):
-                                            # OKX SPOT doesn't list this symbol. Prefer FUTURES(SWAP) candles when allowed.
-                                            if allow_futures:
-                                                try:
-                                                    api._mark_unsupported(ex_name, mkt, symb, tf)
-                                                except Exception:
-                                                    pass
-                                                return await api.klines_okx(symb, tf, limit, market='FUTURES')
-                                            try:
-                                                api._mark_unsupported(ex_name, mkt, symb, tf)
-                                            except Exception:
-                                                pass
-                                            return pd.DataFrame()
-except Exception:
-                                    pass
                                 return await api.klines_okx(symb, tf, limit, market=market)
                             if ex_name == "GATEIO":
                                 return await api.klines_gateio(symb, tf, limit)
