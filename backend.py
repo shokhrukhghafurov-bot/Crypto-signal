@@ -7,6 +7,7 @@ from pathlib import Path
 import os
 import re
 import time
+import contextvars
 
 
 
@@ -128,6 +129,7 @@ MID_HIGHER_LOWS_LOOKBACK = int(os.getenv("MID_HIGHER_LOWS_LOOKBACK", str(MID_LOW
 import random
 import re
 import time
+import contextvars
 import datetime as dt
 import math
 import statistics
@@ -512,6 +514,9 @@ def _mid_hardblock_dump(max_keys: int = 6) -> str:
 
 # Trap log dedup (avoid spamming the same message every second)
 _MID_TRAP_LAST_LOG: Dict[str, float] = {}
+
+# Per-tick log suppression (avoid repeating [mid][block]/[mid][trap] many times for same symbol)
+_MID_TICK_CTX = contextvars.ContextVar('MID_TICK_CTX', default=None)
 
 
 def _mid_trap_log_cooldown_sec() -> float:
@@ -7033,8 +7038,15 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         try:
             
             _trap_msg = f"{symbol}|{dir_trend}|{_mid_trap_reason_key(str(trap_reason))}"
-            if _mid_trap_should_log(_trap_msg):
-                logger.info("[mid][trap] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, trap_reason, float(entry))
+            _ctx = _MID_TICK_CTX.get()
+            _tick_key = f"{symbol}|{dir_trend}|trap"
+            if _ctx is not None and _tick_key in _ctx.get('trap', set()):
+                _ctx['suppress_trap'] = int(_ctx.get('suppress_trap', 0)) + 1
+            else:
+                if _ctx is not None:
+                    _ctx.setdefault('trap', set()).add(_tick_key)
+                if _mid_trap_should_log(_trap_msg):
+                    logger.info("[mid][trap] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, trap_reason, float(entry))
 
             _emit_mid_trap_event({"dir": str(dir_trend), "reason": str(trap_reason), "reason_key": _mid_trap_reason_key(str(trap_reason)), "entry": float(entry)})
         except Exception:
@@ -7323,8 +7335,15 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 _mid_inc_hard_block(1)
                 _mid_hardblock_track(str(reason), symbol)
                 _k = f"block|{symbol}|{dir_trend}|{_mid_trap_reason_key(str(reason))}"
-                if _mid_trap_should_log(_k):
-                    logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, reason, float(entry))
+                _ctx = _MID_TICK_CTX.get()
+                _tick_key = f"{symbol}|{dir_trend}|block"
+                if _ctx is not None and _tick_key in _ctx.get('block', set()):
+                    _ctx['suppress_block'] = int(_ctx.get('suppress_block', 0)) + 1
+                else:
+                    if _ctx is not None:
+                        _ctx.setdefault('block', set()).add(_tick_key)
+                    if _mid_trap_should_log(_k):
+                        logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, reason, float(entry))
                 # Reuse MID trap sink/digest to show why MID hard-filters blocked entries
                 _emit_mid_trap_event({
                     "dir": str(dir_trend),
@@ -10289,6 +10308,9 @@ class Backend:
                 if os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() in ("0","false","no"):
                     await asyncio.sleep(10)
                     return
+
+                # Tick-local log guard
+                _MID_TICK_CTX.set({'block': set(), 'trap': set(), 'suppress_block': 0, 'suppress_trap': 0})
 
                 interval = interval_sec
                 top_n = int(os.getenv("MID_TOP_N", "50"))
