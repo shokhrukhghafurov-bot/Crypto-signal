@@ -10507,6 +10507,7 @@ class Backend:
                 # Fallback exchanges are the rest of the MID universe
                 mid_fallback_exchanges = [x for x in mid_universe if x not in mid_primary_exchanges]
                 mid_primary_mode = (os.getenv("MID_PRIMARY_MODE", "hash") or "hash").strip().lower()
+                _mid_primary_rr_idx = [-1]  # round-robin cursor
                 mid_candles_retry = int(os.getenv("MID_CANDLES_RETRY", "1") or "1")
                 mid_cache_ttl_5m = int(os.getenv("MID_CANDLES_CACHE_TTL_5M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "60")) or "60")
                 mid_cache_ttl_30m = int(os.getenv("MID_CANDLES_CACHE_TTL_30M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "180")) or "180")
@@ -10538,16 +10539,41 @@ class Backend:
                     return mid_cache_ttl_1h
 
                 def _mid_primary_for_symbol(symb: str) -> str:
-                    # Stable routing: hash(symbol) -> primary exchange from MID_PRIMARY_EXCHANGES
-                    if not mid_primary_exchanges:
+
+                    # Stable routing for candle prefetch.
+
+                    # Safety default: prefer BINANCE to avoid bursts of unsupported symbols on BYBIT/OKX futures.
+
+                    safe_binance = int(os.getenv("MID_PRIMARY_SAFE_BINANCE", "1") or "1")
+
+                    if safe_binance:
+
                         return "BINANCE"
-                    if mid_primary_mode not in ("hash", "round_robin"):
-                        # unknown mode -> hash
-                        pass
+
+                    if not mid_primary_exchanges:
+
+                        return "BINANCE"
+
+                    if mid_primary_mode == "round_robin":
+
+                        try:
+
+                            _mid_primary_rr_idx[0] = (_mid_primary_rr_idx[0] + 1) % len(mid_primary_exchanges)
+
+                            return mid_primary_exchanges[_mid_primary_rr_idx[0]]
+
+                        except Exception:
+
+                            pass
+
                     try:
-                        h = int.from_bytes(hashlib.sha1(symb.encode("utf-8")).digest()[:4], "big")
+
+                        h = int.from_bytes(hashlib.sha1((symb or "").encode("utf-8")).digest()[:4], "big")
+
                     except Exception:
-                        h = sum(ord(c) for c in symb)
+
+                        h = sum(ord(c) for c in (symb or ""))
+
                     return mid_primary_exchanges[h % len(mid_primary_exchanges)]
                 # --- MID candles diagnostics (optional) ---
                 _mid_candles_log_fail = int(os.getenv("MID_CANDLES_LOG_FAIL", "1") or "1")
@@ -10562,91 +10588,341 @@ class Backend:
 
 
                 async def _mid_fetch_klines_rest(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
-                    try:
-                        # Global MID kline concurrency guard (prevents HTTP overload -> timeouts -> no_candles)
-                        async with _mid_klines_sem:
-                            mkt = (market or 'SPOT').upper().strip()
-                            # Fast-skip pairs we already know are unsupported on this exchange/market/TF
+
+
+                    """Fetch candles with a safe FUTURES->SPOT fallback for BYBIT/OKX."""
+
+
+                    mkt = (market or 'SPOT').upper().strip()
+
+
+                
+
+
+                    def _is_pair_not_found_err(err: Exception) -> bool:
+
+
+                        try:
+
+
+                            msg = str(err)
+
+
+                            umsg = msg.upper()
+
+
+                            if isinstance(err, ExchangeAPIError):
+
+
+                                if ('INVALID SYMBOL' in umsg) or ('-1121' in umsg) or ('SYMBOL IS INVALID' in umsg) or ('NOT SUPPORTED SYMBOL' in umsg) or ('NOT SUPPORTED SYMBOLS' in umsg) or ('INSTRUMENT ID' in umsg and 'DOESN\'T EXIST' in umsg) or ('CODE=51001' in umsg):
+
+
+                                    return True
+
+
+                            if ('SYMBOL IS INVALID' in umsg) or ('NOT SUPPORTED SYMBOL' in umsg) or ('NOT SUPPORTED SYMBOLS' in umsg) or ('INVALID SYMBOL' in umsg) or ('CODE=51001' in umsg) or ("DOESN'T EXIST" in umsg and 'INSTRUMENT' in umsg):
+
+
+                                return True
+
+
+                        except Exception:
+
+
+                            pass
+
+
+                        return False
+
+
+                
+
+
+                    async def _dispatch(_mkt: str) -> Optional[pd.DataFrame]:
+
+
+                        try:
+
+
+                            if api._is_unsupported_cached(ex_name, _mkt, symb, tf):
+
+
+                                return pd.DataFrame()
+
+
+                        except Exception:
+
+
+                            pass
+
+
+                
+
+
+                        if ex_name in ('GATEIO', 'MEXC') and _mkt == 'FUTURES':
+
+
                             try:
-                                if api._is_unsupported_cached(ex_name, mkt, symb, tf):
-                                    return pd.DataFrame()
+
+
+                                api._mark_unsupported(ex_name, _mkt, symb, tf)
+
+
                             except Exception:
+
+
                                 pass
-                            if ex_name in ('GATEIO','MEXC') and mkt == 'FUTURES':
-                                # Futures candles are not implemented for these adapters. Mark unsupported and skip.
-                                try:
-                                    api._mark_unsupported(ex_name, mkt, symb, tf)
-                                except Exception:
-                                    pass
-                                return None
-                            if ex_name == "BINANCE":
-                                # Avoid noisy HTTP 400 (Invalid symbol) on futures by checking exchangeInfo first.
-                                try:
-                                    if mkt == 'FUTURES':
-                                        info = api._binance_exchange_info(futures=True)
-                                        if info and isinstance(info, dict):
-                                            syms = {s.get('symbol') for s in (info.get('symbols') or []) if isinstance(s, dict)}
-                                            symb_req = api._binance_futures_symbol_alias((symb or '').upper().strip())
-                                            if (symb not in syms) and (symb_req not in syms):
-                                                try:
-                                                    api._mark_unsupported(ex_name, mkt, symb, tf)
-                                                except Exception:
-                                                    pass
-                                                return pd.DataFrame()
-                                except Exception:
-                                    # If exchangeInfo fails, fall back to request (old behavior)
-                                    pass
-                                return await api.klines_binance(symb, tf, limit, market=market)
-                            if ex_name == "BYBIT":
-                                return await api.klines_bybit(symb, tf, limit, market=market)
-                            if ex_name == "OKX":
-                                return await api.klines_okx(symb, tf, limit, market=market)
-                            if ex_name == "GATEIO":
-                                return await api.klines_gateio(symb, tf, limit)
-                            # default MEXC
-                            return await api.klines_mexc(symb, tf, limit)
+
+
+                            return None
+
+
+                
+
+
+                        if ex_name == "BINANCE":
+
+
+                            try:
+
+
+                                if _mkt == 'FUTURES':
+
+
+                                    info = api._binance_exchange_info(futures=True)
+
+
+                                    if info and isinstance(info, dict):
+
+
+                                        syms = {s.get('symbol') for s in (info.get('symbols') or []) if isinstance(s, dict)}
+
+
+                                        symb_req = api._binance_futures_symbol_alias((symb or '').upper().strip())
+
+
+                                        if (symb not in syms) and (symb_req not in syms):
+
+
+                                            try:
+
+
+                                                api._mark_unsupported(ex_name, _mkt, symb, tf)
+
+
+                                            except Exception:
+
+
+                                                pass
+
+
+                                            return pd.DataFrame()
+
+
+                            except Exception:
+
+
+                                pass
+
+
+                            return await api.klines_binance(symb, tf, limit, market=_mkt)
+
+
+                
+
+
+                        if ex_name == "BYBIT":
+
+
+                            return await api.klines_bybit(symb, tf, limit, market=_mkt)
+
+
+                
+
+
+                        if ex_name == "OKX":
+
+
+                            return await api.klines_okx(symb, tf, limit, market=_mkt)
+
+
+                
+
+
+                        if ex_name == "GATEIO":
+
+
+                            return await api.klines_gateio(symb, tf, limit)
+
+
+                
+
+
+                        return await api.klines_mexc(symb, tf, limit)
+
+
+                
+
+
+                    try:
+
+
+                        async with _mid_klines_sem:
+
+
+                            try:
+
+
+                                return await _dispatch(mkt)
+
+
+                            except Exception as e1:
+
+
+                                if mkt == 'FUTURES' and ex_name in ('BYBIT', 'OKX') and _is_pair_not_found_err(e1):
+
+
+                                    # mark futures unsupported and retry SPOT candles on the same exchange
+
+
+                                    try:
+
+
+                                        api._mark_unsupported(ex_name, 'FUTURES', symb, tf)
+
+
+                                    except Exception:
+
+
+                                        pass
+
+
+                                    try:
+
+
+                                        return await _dispatch('SPOT')
+
+
+                                    except Exception as e2:
+
+
+                                        if _is_pair_not_found_err(e2):
+
+
+                                            try:
+
+
+                                                api._mark_unsupported(ex_name, 'SPOT', symb, tf)
+
+
+                                            except Exception:
+
+
+                                                pass
+
+
+                                        raise e2
+
+
+                                raise e1
+
+
+                
+
 
                     except Exception as e:
-                        # classify candle failures
-                        is_pair_not_found = False
-                        try:
-                            msg = str(e)
-                            umsg = msg.upper()
-                            # Pair/instrument does not exist on this exchange/market
-                            if isinstance(e, ExchangeAPIError):
-                                if ('INVALID SYMBOL' in umsg) or ('-1121' in umsg) or ('SYMBOL IS INVALID' in umsg) or ('NOT SUPPORTED SYMBOL' in umsg) or ('NOT SUPPORTED SYMBOLS' in umsg) or ('INSTRUMENT ID' in umsg and 'DOESN\'T EXIST' in umsg) or ('CODE=51001' in umsg):
-                                    is_pair_not_found = True
-                            # Some wrappers may not be ExchangeAPIError but still include these markers
-                            if (not is_pair_not_found) and (('SYMBOL IS INVALID' in umsg) or ('NOT SUPPORTED SYMBOL' in umsg) or ('NOT SUPPORTED SYMBOLS' in umsg) or ('INVALID SYMBOL' in umsg) or ('CODE=51001' in umsg) or ("DOESN'T EXIST" in umsg and 'INSTRUMENT' in umsg)):
-                                is_pair_not_found = True
 
-                            if is_pair_not_found:
-                                _mid_candles_unsupported += 1
-                                try:
-                                    api._mark_unsupported(ex_name, (market or 'SPOT'), symb, tf)
-                                except Exception:
-                                    pass
-                            else:
-                                # HTTP 400/404 often means unsupported interval/symbol too
-                                if isinstance(e, ExchangeAPIError) and ('HTTP 400' in msg or 'HTTP 404' in msg):
-                                    _mid_candles_unsupported += 1
-                                    try:
-                                        api._mark_unsupported(ex_name, (market or 'SPOT'), symb, tf)
-                                    except Exception:
-                                        pass
-                                else:
-                                    _mid_candles_net_fail += 1
-                        except Exception:
-                            pass
-                        # swallow but count (optional)
+
+                        # classify candle failures
+
+
                         try:
-                            if _mid_candles_log_fail:
-                                _mid_candles_fail[(ex_name, tf)] += 1
-                                lst = _mid_candles_fail_samples[(ex_name, tf)]
-                                if len(lst) < _mid_candles_log_samples:
-                                    lst.append(f"{type(e).__name__}: {e}")
+
+
+                            if _is_pair_not_found_err(e):
+
+
+                                _mid_candles_unsupported += 1
+
+
+                                try:
+
+
+                                    api._mark_unsupported(ex_name, mkt, symb, tf)
+
+
+                                except Exception:
+
+
+                                    pass
+
+
+                            else:
+
+
+                                msg = str(e)
+
+
+                                if isinstance(e, ExchangeAPIError) and ('HTTP 400' in msg or 'HTTP 404' in msg):
+
+
+                                    _mid_candles_unsupported += 1
+
+
+                                    try:
+
+
+                                        api._mark_unsupported(ex_name, mkt, symb, tf)
+
+
+                                    except Exception:
+
+
+                                        pass
+
+
+                                else:
+
+
+                                    _mid_candles_net_fail += 1
+
+
                         except Exception:
+
+
                             pass
+
+
+                
+
+
+                        # swallow but count (optional)
+
+
+                        try:
+
+
+                            if _mid_candles_log_fail:
+
+
+                                _mid_candles_fail[(ex_name, tf)] += 1
+
+
+                                lst = _mid_candles_fail_samples[(ex_name, tf)]
+
+
+                                if len(lst) < _mid_candles_log_samples:
+
+
+                                    lst.append(f"{type(e).__name__}: {e}")
+
+
+                        except Exception:
+
+
+                            pass
+
+
                         return None
 
                 async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
