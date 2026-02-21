@@ -10439,7 +10439,7 @@ class Backend:
 
                 # MID candle sources preference (default: BINANCE,BYBIT,OKX).
                 # Secondary exchanges (GATEIO/MEXC) are used only if explicitly enabled.
-                _mid_sources = (os.getenv('MID_CANDLES_SOURCES', 'BINANCE,BYBIT,OKX,MEXC,GATEIO') or 'BINANCE,BYBIT,OKX').strip()
+                _mid_sources = (os.getenv('MID_CANDLES_SOURCES', 'BINANCE,BYBIT,OKX') or 'BINANCE,BYBIT,OKX').strip()
                 mid_candles_sources = [x.strip().upper() for x in _mid_sources.split(',') if x.strip()]
                 if not mid_candles_sources:
                     mid_candles_sources = ['BINANCE','BYBIT','OKX']
@@ -10453,13 +10453,23 @@ class Backend:
                 # --- MID candles routing: stable primary (hash) BINANCE/BYBIT + fallback + smart cache ---
                 _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT") or "").strip()
                 mid_primary_exchanges = [x.strip().upper() for x in _primary_ex.split(",") if x.strip()]
-                if len(mid_primary_exchanges) < 2:
-                    mid_primary_exchanges = ["BINANCE", "BYBIT"]
-                # keep only those available in scan_exchanges
-                mid_primary_exchanges = [x for x in mid_primary_exchanges if x in scan_exchanges] or ["BINANCE", "BYBIT"]
-                mid_fallback_exchanges = [x for x in scan_exchanges if x not in mid_primary_exchanges]
 
-                mid_primary_mode = (os.getenv("MID_PRIMARY_MODE", "hash") or "hash").strip().lower()
+                # Universe for MID candles routing:
+                # Use MID_CANDLES_SOURCES (already filtered by MID_ENABLE_SECONDARY_EXCHANGES and SCANNER_EXCHANGES),
+                # NOT the full scan_exchanges list. This prevents wasting time on exchanges that are not intended
+                # to be used for candles (e.g., MEXC/GATEIO futures returning empty).
+                mid_universe = list(mid_candles_sources or ["BINANCE","BYBIT","OKX"])
+
+                # Ensure at least 2 primaries; fall back to first two in universe
+                if len(mid_primary_exchanges) < 2:
+                    mid_primary_exchanges = mid_universe[:2] if len(mid_universe) >= 2 else ["BINANCE", "BYBIT"]
+
+                # Keep only those available in mid_universe
+                mid_primary_exchanges = [x for x in mid_primary_exchanges if x in mid_universe] or (mid_universe[:2] if len(mid_universe) >= 2 else ["BINANCE","BYBIT"])
+
+                # Fallback exchanges are the rest of the MID universe
+                mid_fallback_exchanges = [x for x in mid_universe if x not in mid_primary_exchanges]
+mid_primary_mode = (os.getenv("MID_PRIMARY_MODE", "hash") or "hash").strip().lower()
                 mid_candles_retry = int(os.getenv("MID_CANDLES_RETRY", "1") or "1")
                 mid_cache_ttl_5m = int(os.getenv("MID_CANDLES_CACHE_TTL_5M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "60")) or "60")
                 mid_cache_ttl_30m = int(os.getenv("MID_CANDLES_CACHE_TTL_30M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "180")) or "180")
@@ -10515,9 +10525,6 @@ class Backend:
 
 
                 async def _mid_fetch_klines_rest(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
-
-
-                    nonlocal _mid_candles_unsupported, _mid_candles_net_fail
                     try:
                         # Global MID kline concurrency guard (prevents HTTP overload -> timeouts -> no_candles)
                         async with _mid_klines_sem:
@@ -10585,8 +10592,6 @@ class Backend:
                         return None
 
                 async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
-
-                    nonlocal _mid_candles_empty, _mid_candles_empty_reasons, _mid_candles_empty_samples
                     key = (ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
                     now = time.time()
                     ttl = _mid_cache_ttl(tf)
@@ -10827,22 +10832,14 @@ class Backend:
                                 for mkt in markets_try:
                                     for name in try_order:
                                         try:
-                                            # Fetch a base TF first (try 5m -> 30m -> 1h) to reduce no_candles on flaky/unsupported endpoints
+                                            # Fetch trigger TF first (cuts 3x HTTP load on misses -> fewer timeouts/no_candles)
                                             a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250, mkt)
-                                            base_tf = tf_trigger
-                                            if a is None or a.empty:
-                                                a = await _mid_fetch_klines_cached(name, sym, tf_mid, 250, mkt)
-                                                base_tf = tf_mid
-                                            if a is None or a.empty:
-                                                a = await _mid_fetch_klines_cached(name, sym, tf_trend, 250, mkt)
-                                                base_tf = tf_trend
                                             if a is None or a.empty:
                                                 continue
 
-                                            # Fetch other TFs (best-effort). If missing, reuse base candles and count partial.
                                             b, c = await asyncio.gather(
-                                                _mid_fetch_klines_cached(name, sym, tf_mid, 250, mkt) if base_tf != tf_mid else asyncio.sleep(0, result=a),
-                                                _mid_fetch_klines_cached(name, sym, tf_trend, 250, mkt) if base_tf != tf_trend else asyncio.sleep(0, result=a),
+                                                _mid_fetch_klines_cached(name, sym, tf_mid, 250, mkt),
+                                                _mid_fetch_klines_cached(name, sym, tf_trend, 250, mkt),
                                                 return_exceptions=True,
                                             )
                                             if isinstance(b, Exception):
