@@ -10489,6 +10489,8 @@ class Backend:
                         try:
                             symbols_pool = await api.get_top_usdt_symbols(top_n_symbols)
                             if symbols_pool:
+                                # de-duplicate (some exchanges/pools can return duplicates)
+                                symbols_pool = list(dict.fromkeys(symbols_pool))
                                 self._mid_symbols_cache = list(symbols_pool)
                                 self._mid_symbols_cache_ts = time.time()
                         except Exception as e:
@@ -10499,6 +10501,9 @@ class Backend:
                                 raise
                         # Scan only first MID_TOP_N symbols from the loaded universe.
                         symbols = list(symbols_pool[:max(0, int(top_n))])
+                        # ensure unique symbols per tick (preserve order)
+                        if symbols:
+                            symbols = list(dict.fromkeys(symbols))
                         # --- MID tick counters / diagnostics ---
                         _mid_scanned = len(symbols)
                         _mid_pool = len(symbols_pool)
@@ -10950,8 +10955,10 @@ class Backend:
                     except Exception:
                         pass
 
-                    # Optional: per-tick breakdown of where scanned symbols went.
-                    if _rej_enabled:
+                    # Per-tick breakdown of where scanned symbols went.
+                    if not _rej_enabled:
+                        logger.info("[mid][reject] disabled (set MID_REJECT_DIGEST=1 to enable)")
+                    else:
                         try:
                             accounted = len(_rej_seen)
                             missing = max(0, int(_mid_scanned) - int(accounted))
