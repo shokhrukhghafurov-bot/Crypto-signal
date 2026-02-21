@@ -1679,6 +1679,56 @@ async def _bybit_instrument_filters(*, category: str, symbol: str) -> tuple[floa
     return qty_step, min_qty, tick
 
 
+# --- MID candles: fast symbol listing checks (avoid noisy "not supported symbol"/51001 and enable clean fallback) ---
+_BYBIT_LISTED_CACHE: dict[str, dict] = {}
+_OKX_LISTED_CACHE: dict[str, dict] = {}
+
+async def _bybit_symbol_listed(*, category: str, symbol: str) -> bool:
+    """Return True if Bybit V5 lists this symbol in given category (spot/linear/inverse). Cached ~1h."""
+    key = f"{category}:{symbol.upper()}"
+    c = _BYBIT_LISTED_CACHE.get(key)
+    if c and c.get("_ts", 0) > time.time() - 3600:
+        return bool(c.get("ok"))
+    ok = False
+    try:
+        data = await _http_json(
+            "GET",
+            "https://api.bybit.com/v5/market/instruments-info",
+            params={"category": category, "symbol": symbol.upper()},
+            timeout_s=10,
+        )
+        lst = ((data.get("result") or {}).get("list") or [])
+        ok = bool(lst)
+    except Exception:
+        ok = False
+    _BYBIT_LISTED_CACHE[key] = {"_ts": time.time(), "ok": ok}
+    return ok
+
+async def _okx_symbol_listed(*, inst_type: str, symbol: str) -> bool:
+    """Return True if OKX lists this symbol for instType (SPOT/SWAP). Cached ~1h."""
+    key = f"{inst_type}:{symbol.upper()}"
+    c = _OKX_LISTED_CACHE.get(key)
+    if c and c.get("_ts", 0) > time.time() - 3600:
+        return bool(c.get("ok"))
+    ok = False
+    try:
+        inst = _okx_inst(symbol)
+        data = await _http_json(
+            "GET",
+            "https://www.okx.com/api/v5/public/instruments",
+            params={"instType": inst_type, "instId": inst},
+            timeout_s=10,
+        )
+        lst = (data.get("data") or []) if isinstance(data, dict) else []
+        ok = bool(lst)
+    except Exception:
+        ok = False
+    _OKX_LISTED_CACHE[key] = {"_ts": time.time(), "ok": ok}
+    return ok
+
+
+
+
 async def _bybit_available_usdt(api_key: str, api_secret: str) -> float:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
@@ -6434,91 +6484,6 @@ class MultiExchangeData:
             return self._binance_fut_sym_map_cache.get(sym, sym)
         except Exception:
             return sym
-    # ------------------ Universal symbol mapping (internal -> exchange) ------------------
-
-    def _canon_symbol(self, symbol: str) -> str:
-        return (symbol or "").upper().strip()
-
-    def _parse_symbol_map(self, raw: str) -> dict[str, str]:
-        """Parse 'A=B,C=D' into dict. Always uppercases keys/values."""
-        out: dict[str, str] = {}
-        raw = (raw or "").strip()
-        if not raw:
-            return out
-        for part in raw.split(","):
-            part = (part or "").strip()
-            if not part or "=" not in part:
-                continue
-            k, v = part.split("=", 1)
-            k = (k or "").upper().strip()
-            v = (v or "").upper().strip()
-            if k and v:
-                out[k] = v
-        return out
-
-    def _symbol_map_for(self, ex: str, market: str) -> dict[str, str]:
-        """Per-exchange mapping overrides.
-
-        Supported env vars:
-          SYMBOL_MAP_<EX>="PEPEUSDT=1000PEPEUSDT"
-          SYMBOL_MAP_<EX>_<MARKET>="..."   where MARKET is SPOT or FUTURES
-        Example:
-          SYMBOL_MAP_BYBIT="PEPEUSDT=1000PEPEUSDT"
-          SYMBOL_MAP_OKX_FUTURES="PEPEUSDT=1000PEPEUSDT"  (will become 1000PEPE-USDT-SWAP in OKX futures)
-        """
-        exu = (ex or "").upper().strip()
-        mkt = (market or "").upper().strip()
-        cache = getattr(self, "_symbol_map_cache", None)
-        if cache is None:
-            cache = {}
-            setattr(self, "_symbol_map_cache", cache)
-        key = f"{exu}:{mkt}"
-        cached = cache.get(key)
-        if isinstance(cached, dict):
-            return cached
-
-        m: dict[str, str] = {}
-        m.update(self._parse_symbol_map(os.getenv(f"SYMBOL_MAP_{exu}", "")))
-        if mkt:
-            m.update(self._parse_symbol_map(os.getenv(f"SYMBOL_MAP_{exu}_{mkt}", "")))
-        cache[key] = m
-        return m
-
-    def ex_symbol(self, ex: str, market: str, symbol: str) -> str:
-        """Convert internal universal symbol (BTCUSDT) to exchange-specific request symbol.
-
-        Notes:
-        - We keep INTERNAL symbols universal (e.g. BTCUSDT).
-        - Only at the HTTP/WS boundary we convert to each exchange's format.
-        """
-        exu = (ex or "").upper().strip()
-        mkt = (market or "").upper().strip()
-        sym = self._canon_symbol(symbol)
-
-        # 1) Market-specific known aliases (Binance futures: 1000PEPEUSDT etc.)
-        if exu == "BINANCE" and mkt == "FUTURES":
-            sym = self._binance_futures_symbol_alias(sym)
-
-        # 2) User overrides via env maps
-        try:
-            mp = self._symbol_map_for(exu, mkt)
-            sym = mp.get(sym, sym)
-        except Exception:
-            pass
-
-        # 3) Exchange formatting is mostly done inside each adapter method.
-        # Here we only normalize obvious cases.
-        if exu == "OKX":
-            # keep as base symbol here; klines_okx will build instId via okx_inst() + (-SWAP if futures)
-            return sym
-        if exu == "GATEIO":
-            return sym
-        if exu == "MEXC":
-            return sym
-        if exu == "BYBIT":
-            return sym
-        return sym
-
 
     
     async def depth_binance(self, symbol: str, limit: int = 20) -> Optional[dict]:
@@ -6534,7 +6499,6 @@ class MultiExchangeData:
             return None
     async def klines_bybit(self, symbol: str, interval: str, limit: int = 200, market: str = 'SPOT') -> pd.DataFrame:
         sym = (symbol or '').upper().strip()
-        sym = self.ex_symbol('BYBIT', mkt, sym)
         iv = (interval or '').strip().lower()
         mkt = (market or 'SPOT').upper().strip()
         cache_key = ('BYBIT', mkt, sym, iv, int(limit))
@@ -6555,23 +6519,13 @@ class MultiExchangeData:
         return await self._klines_cached(cache_key=cache_key, interval=iv, fetch_coro=_fetch)
 
     def okx_inst(self, symbol: str) -> str:
-        """Return OKX instId base symbol (without -SWAP).
-        Accepts either universal form (BTCUSDT) or already formatted (BTC-USDT).
-        """
-        s = (symbol or "").upper().strip()
-        if not s:
-            return s
-        if "-" in s:
-            return s
-        if s.endswith("USDT"):
-            return f"{s[:-4]}-USDT"
-        if s.endswith("USDC"):
-            return f"{s[:-4]}-USDC"
-        return s
+        if symbol.endswith("USDT"):
+            base = symbol[:-4]
+            return f"{base}-USDT"
+        return symbol
 
     async def klines_okx(self, symbol: str, interval: str, limit: int = 200, market: str = 'SPOT') -> pd.DataFrame:
         sym = (symbol or '').upper().strip()
-        sym = self.ex_symbol('OKX', mkt, sym)
         iv = (interval or '').strip().lower()
         mkt = (market or 'SPOT').upper().strip()
         cache_key = ('OKX', mkt, sym, iv, int(limit))
@@ -6600,7 +6554,6 @@ class MultiExchangeData:
         sym = (symbol or "").upper().strip()
         iv = (interval or "").strip().lower()
         market = "SPOT"
-        sym = self.ex_symbol('MEXC', market, sym)
 
         if self._is_unsupported_cached("MEXC", market, sym, iv):
             return pd.DataFrame()
@@ -6655,7 +6608,6 @@ class MultiExchangeData:
         sym = (symbol or "").upper().strip()
         iv = (interval or "").strip().lower()
         market = "SPOT"
-        sym = self.ex_symbol('GATEIO', market, sym)
 
         if self._is_unsupported_cached("GATEIO", market, sym, iv):
             return pd.DataFrame()
@@ -10707,8 +10659,28 @@ class Backend:
                                     pass
                                 return await api.klines_binance(symb, tf, limit, market=market)
                             if ex_name == "BYBIT":
+                                # Pre-check listing on Bybit SPOT to avoid noisy retCode=10001 and allow clean fallback
+                                try:
+                                    if (mkt == 'SPOT') and (not await _bybit_symbol_listed(category='spot', symbol=symb)):
+                                        try:
+                                            api._mark_unsupported(ex_name, mkt, symb, tf)
+                                        except Exception:
+                                            pass
+                                        return pd.DataFrame()
+                                except Exception:
+                                    pass
                                 return await api.klines_bybit(symb, tf, limit, market=market)
                             if ex_name == "OKX":
+                                # Pre-check listing on OKX SPOT to avoid 51001 spam and allow clean fallback
+                                try:
+                                    if (mkt == 'SPOT') and (not await _okx_symbol_listed(inst_type='SPOT', symbol=symb)):
+                                        try:
+                                            api._mark_unsupported(ex_name, mkt, symb, tf)
+                                        except Exception:
+                                            pass
+                                        return pd.DataFrame()
+                                except Exception:
+                                    pass
                                 return await api.klines_okx(symb, tf, limit, market=market)
                             if ex_name == "GATEIO":
                                 return await api.klines_gateio(symb, tf, limit)
