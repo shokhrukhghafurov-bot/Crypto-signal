@@ -164,6 +164,24 @@ def _attach_task_monitor(name: str, task: asyncio.Task) -> None:
 _UNFILLED_RE = re.compile(r'(?<!\{)\{[a-zA-Z0-9_]+\}(?!\})')
 
 
+
+async def _candles_cache_purge_loop() -> None:
+    """Periodically purge persistent candles cache to keep DB small."""
+    if not pool:
+        return
+    every = int(os.getenv("MID_PERSIST_CANDLES_PURGE_EVERY_SEC", "300") or 300)
+    max_age = int(os.getenv("MID_PERSIST_CANDLES_MAX_AGE_SEC", os.getenv("MID_CANDLES_CACHE_STALE_SEC", "1800")) or 1800)
+    # small delay on boot
+    await asyncio.sleep(10)
+    while True:
+        try:
+            deleted = await db_store.candles_cache_purge(max_age)
+            if deleted:
+                logger.info("[candles-cache] purged=%s max_age_sec=%s", deleted, max_age)
+        except Exception as e:
+            logger.warning("[candles-cache] purge failed: %s", e)
+        await asyncio.sleep(every)
+
 async def _task_heartbeat_loop(task_name: str, *, interval_sec: float = 5.0) -> None:
     """Keeps health 'last_ok' fresh while the task is alive (prevents false DEAD)."""
     while True:
@@ -4594,6 +4612,11 @@ async def main() -> None:
     logger.info("Bot starting; TZ=%s", TZ_NAME)
     await init_db()
     load_langs()
+
+    # Persistent candles cache maintenance (purge old rows)
+    TASKS["candles-cache-purge"] = asyncio.create_task(_candles_cache_purge_loop(), name="candles-cache-purge")
+    _attach_task_monitor("candles-cache-purge", TASKS["candles-cache-purge"])
+
 
     # Forward unhandled asyncio task exceptions to error-bot (so "Task exception was never retrieved" is not lost)
     def _loop_exc_handler(loop, context):
