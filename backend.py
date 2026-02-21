@@ -6434,6 +6434,91 @@ class MultiExchangeData:
             return self._binance_fut_sym_map_cache.get(sym, sym)
         except Exception:
             return sym
+    # ------------------ Universal symbol mapping (internal -> exchange) ------------------
+
+    def _canon_symbol(self, symbol: str) -> str:
+        return (symbol or "").upper().strip()
+
+    def _parse_symbol_map(self, raw: str) -> dict[str, str]:
+        """Parse 'A=B,C=D' into dict. Always uppercases keys/values."""
+        out: dict[str, str] = {}
+        raw = (raw or "").strip()
+        if not raw:
+            return out
+        for part in raw.split(","):
+            part = (part or "").strip()
+            if not part or "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            k = (k or "").upper().strip()
+            v = (v or "").upper().strip()
+            if k and v:
+                out[k] = v
+        return out
+
+    def _symbol_map_for(self, ex: str, market: str) -> dict[str, str]:
+        """Per-exchange mapping overrides.
+
+        Supported env vars:
+          SYMBOL_MAP_<EX>="PEPEUSDT=1000PEPEUSDT"
+          SYMBOL_MAP_<EX>_<MARKET>="..."   where MARKET is SPOT or FUTURES
+        Example:
+          SYMBOL_MAP_BYBIT="PEPEUSDT=1000PEPEUSDT"
+          SYMBOL_MAP_OKX_FUTURES="PEPEUSDT=1000PEPEUSDT"  (will become 1000PEPE-USDT-SWAP in OKX futures)
+        """
+        exu = (ex or "").upper().strip()
+        mkt = (market or "").upper().strip()
+        cache = getattr(self, "_symbol_map_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_symbol_map_cache", cache)
+        key = f"{exu}:{mkt}"
+        cached = cache.get(key)
+        if isinstance(cached, dict):
+            return cached
+
+        m: dict[str, str] = {}
+        m.update(self._parse_symbol_map(os.getenv(f"SYMBOL_MAP_{exu}", "")))
+        if mkt:
+            m.update(self._parse_symbol_map(os.getenv(f"SYMBOL_MAP_{exu}_{mkt}", "")))
+        cache[key] = m
+        return m
+
+    def ex_symbol(self, ex: str, market: str, symbol: str) -> str:
+        """Convert internal universal symbol (BTCUSDT) to exchange-specific request symbol.
+
+        Notes:
+        - We keep INTERNAL symbols universal (e.g. BTCUSDT).
+        - Only at the HTTP/WS boundary we convert to each exchange's format.
+        """
+        exu = (ex or "").upper().strip()
+        mkt = (market or "").upper().strip()
+        sym = self._canon_symbol(symbol)
+
+        # 1) Market-specific known aliases (Binance futures: 1000PEPEUSDT etc.)
+        if exu == "BINANCE" and mkt == "FUTURES":
+            sym = self._binance_futures_symbol_alias(sym)
+
+        # 2) User overrides via env maps
+        try:
+            mp = self._symbol_map_for(exu, mkt)
+            sym = mp.get(sym, sym)
+        except Exception:
+            pass
+
+        # 3) Exchange formatting is mostly done inside each adapter method.
+        # Here we only normalize obvious cases.
+        if exu == "OKX":
+            # keep as base symbol here; klines_okx will build instId via okx_inst() + (-SWAP if futures)
+            return sym
+        if exu == "GATEIO":
+            return sym
+        if exu == "MEXC":
+            return sym
+        if exu == "BYBIT":
+            return sym
+        return sym
+
 
     
     async def depth_binance(self, symbol: str, limit: int = 20) -> Optional[dict]:
@@ -6449,6 +6534,7 @@ class MultiExchangeData:
             return None
     async def klines_bybit(self, symbol: str, interval: str, limit: int = 200, market: str = 'SPOT') -> pd.DataFrame:
         sym = (symbol or '').upper().strip()
+        sym = self.ex_symbol('BYBIT', mkt, sym)
         iv = (interval or '').strip().lower()
         mkt = (market or 'SPOT').upper().strip()
         cache_key = ('BYBIT', mkt, sym, iv, int(limit))
@@ -6469,13 +6555,23 @@ class MultiExchangeData:
         return await self._klines_cached(cache_key=cache_key, interval=iv, fetch_coro=_fetch)
 
     def okx_inst(self, symbol: str) -> str:
-        if symbol.endswith("USDT"):
-            base = symbol[:-4]
-            return f"{base}-USDT"
-        return symbol
+        """Return OKX instId base symbol (without -SWAP).
+        Accepts either universal form (BTCUSDT) or already formatted (BTC-USDT).
+        """
+        s = (symbol or "").upper().strip()
+        if not s:
+            return s
+        if "-" in s:
+            return s
+        if s.endswith("USDT"):
+            return f"{s[:-4]}-USDT"
+        if s.endswith("USDC"):
+            return f"{s[:-4]}-USDC"
+        return s
 
     async def klines_okx(self, symbol: str, interval: str, limit: int = 200, market: str = 'SPOT') -> pd.DataFrame:
         sym = (symbol or '').upper().strip()
+        sym = self.ex_symbol('OKX', mkt, sym)
         iv = (interval or '').strip().lower()
         mkt = (market or 'SPOT').upper().strip()
         cache_key = ('OKX', mkt, sym, iv, int(limit))
@@ -6504,6 +6600,7 @@ class MultiExchangeData:
         sym = (symbol or "").upper().strip()
         iv = (interval or "").strip().lower()
         market = "SPOT"
+        sym = self.ex_symbol('MEXC', market, sym)
 
         if self._is_unsupported_cached("MEXC", market, sym, iv):
             return pd.DataFrame()
@@ -6558,6 +6655,7 @@ class MultiExchangeData:
         sym = (symbol or "").upper().strip()
         iv = (interval or "").strip().lower()
         market = "SPOT"
+        sym = self.ex_symbol('GATEIO', market, sym)
 
         if self._is_unsupported_cached("GATEIO", market, sym, iv):
             return pd.DataFrame()
