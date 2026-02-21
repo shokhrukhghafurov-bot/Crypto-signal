@@ -6349,17 +6349,25 @@ class MultiExchangeData:
         df = df.dropna(subset=["open","high","low","close"]).sort_values("open_time").reset_index(drop=True)
         return df
 
-    async def klines_binance(self, symbol: str, interval: str, limit: int = 250) -> pd.DataFrame:
-        sym = (symbol or "").upper().strip()
-        iv = (interval or "").strip().lower()
-        market = "SPOT"
-        cache_key = ("BINANCE", market, sym, iv, int(limit))
+    async def klines_binance(self, symbol: str, interval: str, limit: int = 250, market: str = 'SPOT') -> pd.DataFrame:
+        sym = (symbol or '').upper().strip()
+        iv = (interval or '').strip().lower()
+        mkt = (market or 'SPOT').upper().strip()
+        cache_key = ('BINANCE', mkt, sym, iv, int(limit))
 
         async def _fetch():
-            url = f"{self.BINANCE_SPOT}/api/v3/klines"
-            params = {"symbol": sym, "interval": iv, "limit": str(limit)}
+            # Binance may return HTTP 200 with JSON error payload; validate type
+            if mkt == 'FUTURES':
+                url = f"{self.BINANCE_FUTURES}/fapi/v1/klines"
+            else:
+                url = f"{self.BINANCE_SPOT}/api/v3/klines"
+            params = {'symbol': sym, 'interval': iv, 'limit': str(limit)}
             raw = await self._get_json(url, params=params)
-            return self._df_from_ohlcv(raw, "binance")
+            if isinstance(raw, dict) and 'code' in raw:
+                raise ExchangeAPIError(f"BINANCE {mkt} code={raw.get('code')} msg={raw.get('msg')}")
+            if not isinstance(raw, list):
+                raise ExchangeAPIError(f"BINANCE {mkt} bad_payload type={type(raw).__name__}")
+            return self._df_from_ohlcv(raw, 'binance')
 
         return await self._klines_cached(cache_key=cache_key, interval=iv, fetch_coro=_fetch)
 
@@ -6375,21 +6383,24 @@ class MultiExchangeData:
             return data if isinstance(data, dict) else None
         except Exception:
             return None
-    async def klines_bybit(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        sym = (symbol or "").upper().strip()
-        iv = (interval or "").strip().lower()
-        market = "SPOT"
-        cache_key = ("BYBIT", market, sym, iv, int(limit))
+    async def klines_bybit(self, symbol: str, interval: str, limit: int = 200, market: str = 'SPOT') -> pd.DataFrame:
+        sym = (symbol or '').upper().strip()
+        iv = (interval or '').strip().lower()
+        mkt = (market or 'SPOT').upper().strip()
+        cache_key = ('BYBIT', mkt, sym, iv, int(limit))
 
         async def _fetch():
-            interval_map = {"5m":"5", "15m":"15", "30m":"30", "1h":"60", "4h":"240"}
-            itv = interval_map.get(iv, "15")
+            interval_map = {'5m':'5', '15m':'15', '30m':'30', '1h':'60', '4h':'240'}
+            itv = interval_map.get(iv, '15')
             url = f"{self.BYBIT}/v5/market/kline"
-            params = {"category": "spot", "symbol": sym, "interval": itv, "limit": str(limit)}
+            category = 'linear' if mkt == 'FUTURES' else 'spot'
+            params = {'category': category, 'symbol': sym, 'interval': itv, 'limit': str(limit)}
             data = await self._get_json(url, params=params)
-            rows = (data or {}).get("result", {}).get("list", []) or []
+            if isinstance(data, dict) and str(data.get('retCode', '0')) not in ('0', ''):
+                raise ExchangeAPIError(f"BYBIT {mkt} retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
+            rows = (data or {}).get('result', {}).get('list', []) or []
             rows = list(reversed(rows))
-            return self._df_from_ohlcv(rows, "bybit")
+            return self._df_from_ohlcv(rows, 'bybit')
 
         return await self._klines_cached(cache_key=cache_key, interval=iv, fetch_coro=_fetch)
 
@@ -6399,22 +6410,27 @@ class MultiExchangeData:
             return f"{base}-USDT"
         return symbol
 
-    async def klines_okx(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
-        sym = (symbol or "").upper().strip()
-        iv = (interval or "").strip().lower()
-        market = "SPOT"
-        cache_key = ("OKX", market, sym, iv, int(limit))
+    async def klines_okx(self, symbol: str, interval: str, limit: int = 200, market: str = 'SPOT') -> pd.DataFrame:
+        sym = (symbol or '').upper().strip()
+        iv = (interval or '').strip().lower()
+        mkt = (market or 'SPOT').upper().strip()
+        cache_key = ('OKX', mkt, sym, iv, int(limit))
 
         async def _fetch():
-            bar_map = {"5m":"5m", "15m":"15m", "30m":"30m", "1h":"1H", "4h":"4H"}
-            bar = bar_map.get(iv, "15m")
-            inst = self.okx_inst(sym)
+            bar_map = {'5m':'5m', '15m':'15m', '30m':'30m', '1h':'1H', '4h':'4H'}
+            bar = bar_map.get(iv, '15m')
+            if mkt == 'FUTURES':
+                inst = self.okx_inst(sym) + '-SWAP'
+            else:
+                inst = self.okx_inst(sym)
             url = f"{self.OKX}/api/v5/market/candles"
-            params = {"instId": inst, "bar": bar, "limit": str(limit)}
+            params = {'instId': inst, 'bar': bar, 'limit': str(limit)}
             data = await self._get_json(url, params=params)
-            rows = (data or {}).get("data", []) or []
+            if isinstance(data, dict) and str(data.get('code', '0')) not in ('0', ''):
+                raise ExchangeAPIError(f"OKX {mkt} code={data.get('code')} msg={data.get('msg')}")
+            rows = (data or {}).get('data', []) or []
             rows = list(reversed(rows))
-            return self._df_from_ohlcv(rows, "okx")
+            return self._df_from_ohlcv(rows, 'okx')
 
         return await self._klines_cached(cache_key=cache_key, interval=iv, fetch_coro=_fetch)
 
@@ -10277,6 +10293,9 @@ class Backend:
 
     async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         tf_trigger, tf_mid, tf_trend = "5m", "30m", "1h"
+        market_mid = (os.getenv('MID_CANDLES_MARKET', 'FUTURES') or 'FUTURES').upper().strip()
+        if market_mid not in ('SPOT','FUTURES'):
+            market_mid = 'FUTURES'
         def _parse_seconds_env(name: str, default: float) -> float:
             raw = os.getenv(name, "").strip()
             if raw == "":
@@ -10434,24 +10453,26 @@ class Backend:
                 _mid_candles_log_samples = int(os.getenv("MID_CANDLES_LOG_FAIL_SAMPLES", "3") or "3")
                 _mid_candles_fail = defaultdict(int)  # (exchange, tf) -> count
                 _mid_candles_fail_samples = defaultdict(list)  # (exchange, tf) -> [err...]
+                _mid_candles_log_empty = int(os.getenv('MID_CANDLES_LOG_EMPTY', '1') or '1')
+                _mid_candles_log_empty_samples = int(os.getenv('MID_CANDLES_LOG_EMPTY_SAMPLES', '5') or '5')
+                _mid_candles_empty = 0
+                _mid_candles_empty_reasons = defaultdict(int)
+                _mid_candles_empty_samples = defaultdict(list)
 
-                _mid_candles_log_empty = int(os.getenv("MID_CANDLES_LOG_EMPTY", "1") or "1")
-                _mid_candles_log_empty_samples = int(os.getenv("MID_CANDLES_LOG_EMPTY_SAMPLES", "10") or "10")
-                _mid_candles_empty = defaultdict(int)  # (exchange, tf) -> count (empty/None without exception)
-                _mid_candles_empty_samples = defaultdict(list)  # (exchange, tf) -> [sym...]
 
-
-                async def _mid_fetch_klines_rest(ex_name: str, symb: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
-                    nonlocal _mid_candles_net_fail, _mid_candles_unsupported
+                async def _mid_fetch_klines_rest(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
                     try:
                         # Global MID kline concurrency guard (prevents HTTP overload -> timeouts -> no_candles)
                         async with _mid_klines_sem:
+                            mkt = (market or 'SPOT').upper().strip()
+                            if ex_name in ('GATEIO','MEXC') and mkt == 'FUTURES':
+                                return pd.DataFrame()
                             if ex_name == "BINANCE":
-                                return await api.klines_binance(symb, tf, limit)
+                                return await api.klines_binance(symb, tf, limit, market=market)
                             if ex_name == "BYBIT":
-                                return await api.klines_bybit(symb, tf, limit)
+                                return await api.klines_bybit(symb, tf, limit, market=market)
                             if ex_name == "OKX":
-                                return await api.klines_okx(symb, tf, limit)
+                                return await api.klines_okx(symb, tf, limit, market=market)
                             if ex_name == "GATEIO":
                                 return await api.klines_gateio(symb, tf, limit)
                             # default MEXC
@@ -10478,9 +10499,8 @@ class Backend:
                             pass
                         return None
 
-                async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
-                    nonlocal _mid_candles_empty
-                    key = (ex_name, symb, tf, int(limit))
+                async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
+                    key = (ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
                     now = time.time()
                     ttl = _mid_cache_ttl(tf)
                     cached = _mid_candles_cache.get(key)
@@ -10490,17 +10510,23 @@ class Backend:
                             return df
                     last = None
                     for _i in range(max(0, mid_candles_retry) + 1):
-                        last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit)
-                        # empty/None without raising -> track separately (common cause of no_candles with zero net_fail)
-                        try:
-                            if last is None or getattr(last, 'empty', True):
-                                _mid_candles_empty[(ex_name, tf)] += 1
-                                if _mid_candles_log_empty:
-                                    lst = _mid_candles_empty_samples[(ex_name, tf)]
-                                    if len(lst) < _mid_candles_log_empty_samples:
-                                        lst.append(symb)
-                        except Exception:
-                            pass
+                        last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, market)
+                        # If response is empty (no exception), count as EMPTY + optional adaptive limit
+                        if last is None or getattr(last, 'empty', False):
+                            _mid_candles_empty += 1
+                            reason = f"empty_{ex_name.lower()}_{(market or 'SPOT').lower()}_{tf}"
+                            _mid_candles_empty_reasons[reason] += 1
+                            if _mid_candles_log_empty:
+                                lst = _mid_candles_empty_samples[reason]
+                                if len(lst) < _mid_candles_log_empty_samples:
+                                    lst.append(f"{symb}@{ex_name}/{market}/{tf}/L{limit}")
+                            # adaptive limit step-down
+                            if limit > 200:
+                                limit = 200
+                                continue
+                            if limit > 120:
+                                limit = 120
+                                continue
 
                         if last is not None and not last.empty:
                             _mid_candles_cache[key] = (now, last)
@@ -10562,8 +10588,6 @@ class Backend:
                         _mid_candles_net_fail = 0
                         _mid_candles_unsupported = 0
                         _mid_candles_partial = 0
-                        _mid_candles_empty = defaultdict(int)
-                        _mid_candles_empty_samples = defaultdict(list)
                         _c0 = api.candle_counters_snapshot()
                         _mid_hard_block0 = _mid_hard_block_total()
                         _mid_hard_block = 0
@@ -10622,7 +10646,7 @@ class Backend:
                                 tasks = []
                                 for _ex, _syms in groups.items():
                                     for _s in _syms:
-                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trigger, prefetch_limit)))
+                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trigger, prefetch_limit, market_mid)))
                                         tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_mid, prefetch_limit)))
                                         tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trend, prefetch_limit)))
 
@@ -10697,12 +10721,12 @@ class Backend:
                                 for name in try_order:
                                     try:
                                                                                 # Fetch trigger TF first (cuts 3x HTTP load on misses -> fewer timeouts/no_candles)
-                                        a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250)
+                                        a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250, market_mid)
                                         if a is None or a.empty:
                                             continue
                                         b, c = await asyncio.gather(
-                                            _mid_fetch_klines_cached(name, sym, tf_mid, 250),
-                                            _mid_fetch_klines_cached(name, sym, tf_trend, 250),
+                                            _mid_fetch_klines_cached(name, sym, tf_mid, 250, market_mid),
+                                            _mid_fetch_klines_cached(name, sym, tf_trend, 250, market_mid),
                                             return_exceptions=True,
                                         )
                                         if isinstance(b, Exception):
@@ -10985,7 +11009,7 @@ class Backend:
                 elapsed = time.time() - start
                 try:
                     _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
-                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} candles_empty={sum(_mid_candles_empty.values()) if '_mid_candles_empty' in locals() else 0} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
+                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
                     logger.info("[mid][summary] %s", summary)
 
                     # Optional: hardblock breakdown (top buckets)
@@ -11012,6 +11036,20 @@ class Backend:
                                 ex = _rej_examples_map.get(k) or []
                                 exs = ",".join(ex) if ex else ""
                                 parts.append(f"{k}={v}" + (f" [{exs}]" if exs else ""))
+                            # candles empty breakdown (helps debug no_candles when HTTP doesn't error)
+                            try:
+                                if _mid_candles_empty_reasons:
+                                    top_empty = sorted(_mid_candles_empty_reasons.items(), key=lambda kv: -kv[1])[:6]
+                                    top_s = ', '.join([f'{k}={v}' for k,v in top_empty])
+                                    logger.info('[mid][candles_empty] total=%s top=%s', _mid_candles_empty, top_s)
+                                    if _mid_candles_log_empty:
+                                        for k, _v in top_empty:
+                                            samp = _mid_candles_empty_samples.get(k) or []
+                                            if samp:
+                                                logger.info('[mid][candles_empty_samples] %s :: %s', k, ','.join(samp[:_mid_candles_log_empty_samples]))
+                            except Exception:
+                                pass
+
                             logger.info("[mid][reject] scanned=%s accounted=%s missing=%s :: %s", int(_mid_scanned), int(accounted), int(missing), " | ".join(parts))
 
                             if _mid_candles_log_fail and _mid_candles_fail:
@@ -11084,4 +11122,3 @@ async def autotrade_stress_test(*, user_id: int, symbol: str, market_type: str =
     This build keeps production stable: stress-test is disabled here to avoid accidental trading.
     """
     return {"ok": False, "error": "stress_test_disabled_in_production"}
-
