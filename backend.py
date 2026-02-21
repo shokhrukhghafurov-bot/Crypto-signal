@@ -10413,6 +10413,8 @@ class Backend:
 
                 async def _mid_fetch_klines_rest(ex_name: str, symb: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
                     try:
+                        # Global MID kline concurrency guard (prevents HTTP overload -> timeouts -> no_candles)
+                        async with _mid_klines_sem:
                         if ex_name == "BINANCE":
                             return await api.klines_binance(symb, tf, limit)
                         if ex_name == "BYBIT":
@@ -10454,11 +10456,17 @@ class Backend:
                         if (now - ts) <= ttl and df is not None and not df.empty:
                             return df
                     last = None
-                    for _ in range(max(0, mid_candles_retry) + 1):
+                    for _i in range(max(0, mid_candles_retry) + 1):
                         last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit)
                         if last is not None and not last.empty:
                             _mid_candles_cache[key] = (now, last)
                             return last
+                        # tiny backoff reduces rate-limit bursts and improves success on flaky networks
+                        if _i < max(0, mid_candles_retry):
+                            try:
+                                await asyncio.sleep(0.15 * (_i + 1))
+                            except Exception:
+                                pass
                     # fallback to stale cache if available and not too old
                     if cached:
                         ts, df = cached
@@ -10608,25 +10616,24 @@ class Backend:
                                 try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
                                 for name in try_order:
                                     try:
-                                        a, b, c = await asyncio.gather(
-                                            _mid_fetch_klines_cached(name, sym, tf_trigger, 250),
+                                                                                # Fetch trigger TF first (cuts 3x HTTP load on misses -> fewer timeouts/no_candles)
+                                        a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250)
+                                        if a is None or a.empty:
+                                            continue
+                                        b, c = await asyncio.gather(
                                             _mid_fetch_klines_cached(name, sym, tf_mid, 250),
                                             _mid_fetch_klines_cached(name, sym, tf_trend, 250),
                                             return_exceptions=True,
                                         )
-                                        if isinstance(a, Exception):
-                                            a = None
                                         if isinstance(b, Exception):
                                             b = None
                                         if isinstance(c, Exception):
                                             c = None
-                                        # Allow partial candles: if trigger timeframe exists, we can reuse it for missing mid/trend (reduces no_candles)
-                                        if a is None or a.empty:
-                                            continue
-                                        if b is None or b.empty:
+                                        # Allow partial candles: if trigger timeframe exists, we can reuse it for missing mid/trend
+                                        if b is None or getattr(b, 'empty', True):
                                             b = a
                                             _mid_candles_partial += 1
-                                        if c is None or c.empty:
+                                        if c is None or getattr(c, 'empty', True):
                                             c = a
                                             _mid_candles_partial += 1
                                         r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
