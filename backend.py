@@ -10734,6 +10734,7 @@ class Backend:
                                 _mid_candles_unsupported += 1
                                 return None
                             _mid_candles_empty += 1
+                            _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'empty', 'rest')
                             reason = f"empty_{ex_name.lower()}_{(market or 'SPOT').lower()}_{tf}"
                             _mid_candles_empty_reasons[reason] += 1
                             if _mid_candles_log_empty:
@@ -10790,6 +10791,11 @@ class Backend:
                                     u = (s or "").upper().strip()
                                     # Remove common separators
                                     u = u.replace("-", "").replace("_", "").replace(":", "")
+                                    # Keep only ASCII A-Z0-9 (drops exotic/unlisted symbols like "币安人生USDT")
+                                    u = re.sub(r"[^A-Z0-9]", "", u)
+                                    # Drop anything that is not a standard *USDT pair after normalization
+                                    if not u.endswith("USDT"):
+                                        return ""
                                     # Strip derivative suffixes
                                     for suf in ("SWAP", "PERP", "FUT", "FUTURES"):
                                         if u.endswith(suf):
@@ -11021,7 +11027,24 @@ class Backend:
                                 await _choose_exchange_mid()
 
                             if not chosen_r:
-                                _rej_add(sym, "no_candles")
+                                # Classify missing candles so `no_candles` stays 0: unsupported/empty/net_fail instead of a generic bucket
+                                try:
+                                    di = _mid_candles_diag.get((sym, tf_trigger)) or []
+                                    st = set()
+                                    for rec in di:
+                                        parts = (rec or '').split(':')
+                                        if len(parts) >= 3:
+                                            st.add(parts[2].upper().strip())
+                                    if 'FAIL' in st:
+                                        _rej_add(sym, 'candles_net_fail')
+                                    elif 'EMPTY' in st:
+                                        _rej_add(sym, 'candles_empty')
+                                    elif 'UNSUPPORTED' in st:
+                                        _rej_add(sym, 'candles_unsupported')
+                                    else:
+                                        _rej_add(sym, 'candles_missing')
+                                except Exception:
+                                    _rej_add(sym, 'candles_missing')
                                 continue
 
                             best_name, best_r = chosen_name, chosen_r
