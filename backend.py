@@ -6257,16 +6257,6 @@ class MultiExchangeData:
         key = (exchange.upper(), (market or "").upper(), symbol.upper(), (interval or "").lower())
         self._unsupported_until[key] = time.monotonic() + float(self._unsupported_ttl)
 
-    def _mark_unsupported_ttl(self, exchange: str, market: str, symbol: str, interval: str, ttl_sec: float) -> None:
-        """Mark symbol/market/interval as temporarily unsupported for a custom TTL (seconds)."""
-        try:
-            ttl = float(ttl_sec)
-        except Exception:
-            ttl = float(self._unsupported_ttl)
-        ttl = max(1.0, ttl)
-        key = (exchange.upper(), (market or "").upper(), symbol.upper(), (interval or "").lower())
-        self._unsupported_until[key] = time.monotonic() + ttl
-
     async def _get_gateio_markets(self) -> set[str]:
         now = time.monotonic()
         cached = self._markets_cache.get("GATEIO")
@@ -6615,10 +6605,8 @@ class MultiExchangeData:
                 self._mark_unsupported("BYBIT", mkt, sym, iv)
                 return pd.DataFrame()
         except Exception:
-            # If availability check fails, DO NOT spam REST requests (they often return empty lists).
-            # Mark as temporarily unsupported and skip this tick.
-            self._mark_unsupported_ttl("BYBIT", mkt, sym, iv, float(os.getenv("CANDLES_AVAIL_FAIL_TTL_SEC", "90") or "90"))
-            return pd.DataFrame()
+            # If availability check fails, fall back to request (legacy behavior)
+            pass
 
         async def _fetch():
             interval_map = {'5m':'5', '15m':'15', '30m':'30', '1h':'60', '4h':'240'}
@@ -6632,11 +6620,6 @@ class MultiExchangeData:
             if isinstance(data, dict) and str(data.get('retCode', '0')) not in ('0', ''):
                 raise ExchangeAPIError(f"BYBIT {mkt} retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
             rows = (data or {}).get('result', {}).get('list', []) or []
-            if not rows:
-                # BYBIT sometimes returns HTTP 200 with empty list for unsupported/paused pairs.
-                # Cache as unsupported to prevent storms.
-                self._mark_unsupported("BYBIT", mkt, sym, iv)
-                return pd.DataFrame()
             rows = list(reversed(rows))
             return self._df_from_ohlcv(rows, 'bybit')
 
@@ -6661,8 +6644,7 @@ class MultiExchangeData:
                 self._mark_unsupported("OKX", mkt, sym, iv)
                 return pd.DataFrame()
         except Exception:
-            self._mark_unsupported_ttl("OKX", mkt, sym, iv, float(os.getenv("CANDLES_AVAIL_FAIL_TTL_SEC", "90") or "90"))
-            return pd.DataFrame()
+            pass
 
         async def _fetch():
             bar_map = {'5m':'5m', '15m':'15m', '30m':'30m', '1h':'1H', '4h':'4H'}
@@ -6679,10 +6661,6 @@ class MultiExchangeData:
             if isinstance(data, dict) and str(data.get('code', '0')) not in ('0', ''):
                 raise ExchangeAPIError(f"OKX {mkt} code={data.get('code')} msg={data.get('msg')}")
             rows = (data or {}).get('data', []) or []
-            if not rows:
-                # OKX may return empty data list for unsupported/paused instId.
-                self._mark_unsupported("OKX", mkt, sym, iv)
-                return pd.DataFrame()
             rows = list(reversed(rows))
             return self._df_from_ohlcv(rows, 'okx')
 
@@ -10591,7 +10569,6 @@ class Backend:
                 _mid_diag_max = int(os.getenv('MID_CANDLES_DIAG_MAX', '200') or 200)
                 _mid_diag_lines = 0
                 _mid_candles_diag = defaultdict(list)  # (symbol, tf) -> ["EX:MARKET:STATUS(:reason)", ...]
-                _mid_diag_seen = set()  # dedup log spam per tick
 
                 def _mid_diag_add(symb: str, ex_name: str, market: str, tf: str, status: str, reason: str = '') -> None:
                     nonlocal _mid_diag_lines
@@ -10600,12 +10577,8 @@ class Backend:
                         rec = f"{ex_name}:{(market or 'SPOT').upper().strip()}:{status}" + (f":{reason}" if reason else '')
                         _mid_candles_diag[key].append(rec)
                         if _mid_diag_enabled and _mid_diag_lines < _mid_diag_max and status != 'OK':
-                            # Deduplicate repeated unsupported_cached spam within the same tick
-                            dkey = (symb, ex_name, (market or 'SPOT').upper().strip(), tf, status, (reason or ''))
-                            if dkey not in _mid_diag_seen:
-                                _mid_diag_seen.add(dkey)
-                                _mid_diag_lines += 1
-                                logger.info(f"[mid][candles_missing] symbol={symb} exchange={ex_name} market={(market or 'SPOT').upper().strip()} tf={tf} status={status}" + (f" reason={reason}" if reason else ""))
+                            _mid_diag_lines += 1
+                            logger.info(f"[mid][candles_missing] symbol={symb} exchange={ex_name} market={(market or 'SPOT').upper().strip()} tf={tf} status={status}" + (f" reason={reason}" if reason else ""))
                     except Exception:
                         pass
 
@@ -10934,6 +10907,16 @@ class Backend:
                         try:
                             max_age = int(os.getenv("MID_PERSIST_CANDLES_MAX_AGE_SEC", os.getenv("MID_CANDLES_CACHE_STALE_SEC", "1800")) or 1800)
                             row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
+                            if (not row):
+                                # WS-candles service usually persists with a single fixed limit (default 250).
+                                # If MID asks for a different limit (e.g. 200/120), try the WS limit as fallback
+                                # to maximize cache hits and avoid REST storms.
+                                try:
+                                    ws_limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
+                                except Exception:
+                                    ws_limit = 250
+                                if int(limit) != int(ws_limit):
+                                    row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(ws_limit))
                             if row:
                                 blob, updated_at = row
                                 if updated_at is not None:
@@ -10942,6 +10925,11 @@ class Backend:
                                     age = 0.0
                                 if age <= max_age:
                                     dfp = db_store._cc_unpack_df(blob)
+                                    try:
+                                        if dfp is not None and not dfp.empty and int(limit) > 0 and len(dfp) > int(limit):
+                                            dfp = dfp.tail(int(limit)).copy()
+                                    except Exception:
+                                        pass
                                     if dfp is not None and not dfp.empty:
                                         _mid_db_hit += 1
                                         _mid_candles_cache[key] = (now, dfp)
