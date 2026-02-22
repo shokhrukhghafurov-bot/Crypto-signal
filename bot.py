@@ -5809,3 +5809,14 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+# --- WS candles service startup (PRO) ---
+try:
+    from backend import ws_candles_service_loop
+    if os.getenv("WORKER_ROLE", "").upper() == "WS_CANDLES":
+        logger.info("[ws-candles] WORKER_ROLE=WS_CANDLES → starting service")
+        asyncio.create_task(ws_candles_service_loop(backend))
+except Exception as e:
+    logger.error("[ws-candles] failed to start WS candles service: %s", e)
+
