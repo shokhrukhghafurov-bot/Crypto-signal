@@ -10382,22 +10382,14 @@ class Backend:
         # User requested: "свечи берем только из SPOT и эти свечи для FUTURES тоже используем".
         # We force MID candles to be fetched from SPOT only.
         # (Signals can still be FUTURES — we just use SPOT klines for TA.)
-                # --- MID candles market selection ---
-        # Production hardening:
-        # By default we ALWAYS use SPOT klines for TA, even for FUTURES signals.
-        # (This massively reduces "Invalid symbol" errors on futures endpoints and stabilizes candles availability.)
-        force_spot = str(os.getenv('MID_CANDLES_FORCE_SPOT', os.getenv('MID_CANDLES_SPOT_ONLY', '1')) or '1').strip().lower() in ('1','true','yes','on')
         market_mode = (os.getenv('MID_CANDLES_MARKET_MODE', 'AUTO') or 'AUTO').upper().strip()
         allow_fut = str(os.getenv('MID_ALLOW_FUTURES', '0') or '0').strip().lower() not in ('0','false','no','off')
-        if force_spot:
-            markets_try = ['SPOT']
+        if market_mode == 'AUTO':
+            markets_try = ['FUTURES','SPOT'] if allow_fut else ['SPOT']
+        elif market_mode in ('FUTURES','SWAP','PERP','PERPS'):
+            markets_try = ['FUTURES']
         else:
-            if market_mode == 'AUTO':
-                markets_try = ['FUTURES','SPOT'] if allow_fut else ['SPOT']
-            elif market_mode in ('FUTURES','SWAP','PERP','PERPS'):
-                markets_try = ['FUTURES']
-            else:
-                markets_try = ['SPOT']
+            markets_try = ['SPOT']
         # default/primary market used for prefetch
         market_mid = markets_try[0] if markets_try else 'SPOT'
 
@@ -10615,6 +10607,17 @@ class Backend:
                         # Global MID kline concurrency guard (prevents HTTP overload -> timeouts -> no_candles)
                         async with _mid_klines_sem:
                             mkt = (market or 'SPOT').upper().strip()
+                            # PRODUCTION: optionally force SPOT candles to avoid FUTURES-only instrument gaps
+                            if os.getenv('MID_CANDLES_FORCE_SPOT', '0').strip().lower() not in ('0','false','no','off'):
+                                mkt = 'SPOT'
+
+                            # PRODUCTION: drop obviously-bad symbols early (saves REST/WS limits and prevents no_candles storms)
+                            _sym = (symb or '').strip().upper()
+                            if (not _sym.isascii()) or (not _sym.endswith('USDT')) or (len(_sym) < 6) or (not re.match(r'^[A-Z0-9]{2,20}USDT$', _sym)):
+                                _mark_unsupported(ex_name, mkt, _sym, tf, reason='invalid_symbol_format')
+                                _mid_candles_unsupported += 1
+                                return None
+
                             # Fast-skip pairs we already know are unsupported on this exchange/market/TF
                             try:
                                 if api._is_unsupported_cached(ex_name, mkt, symb, tf):
@@ -10816,27 +10819,6 @@ class Backend:
                                 symbols_pool = [_mid_norm_symbol(x) for x in symbols_pool if x]
                                 # de-duplicate (some exchanges/pools can return duplicates)
                                 symbols_pool = list(dict.fromkeys(symbols_pool))
-
-                                # Filter obviously invalid / non-canonical symbols early.
-                                # This prevents wasting requests on junk like "UUSDT" or non-ASCII pairs,
-                                # and makes MID/WS much more stable.
-                                def _mid_valid_symbol(u: str) -> bool:
-                                    if not u:
-                                        return False
-                                    if not u.endswith("USDT"):
-                                        return False
-                                    if not re.fullmatch(r"[A-Z0-9]+", u):
-                                        return False
-                                    base = u[:-4]
-                                    if len(base) < 2 or len(base) > 20:
-                                        return False
-                                    return True
-
-                                before_cnt = len(symbols_pool)
-                                symbols_pool = [x for x in symbols_pool if _mid_valid_symbol(x)]
-                                if before_cnt and len(symbols_pool) != before_cnt:
-                                    logger.info("[mid] symbols filtered: %s -> %s", before_cnt, len(symbols_pool))
-
                                 self._mid_symbols_cache = list(symbols_pool)
                                 self._mid_symbols_cache_ts = time.time()
                         except Exception as e:
