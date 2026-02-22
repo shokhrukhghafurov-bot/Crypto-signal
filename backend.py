@@ -10577,6 +10577,18 @@ class Backend:
                         rec = f"{ex_name}:{(market or 'SPOT').upper().strip()}:{status}" + (f":{reason}" if reason else '')
                         _mid_candles_diag[key].append(rec)
                         if _mid_diag_enabled and _mid_diag_lines < _mid_diag_max and status != 'OK':
+                            # log once per tick to avoid spam (unsupported_cached, etc.)
+                            try:
+                                _ctx = _MID_TICK_CTX.get()
+                                if isinstance(_ctx, dict):
+                                    _cm = _ctx.get('candles_missing')
+                                    if isinstance(_cm, set):
+                                        _k = (str(symb), str(ex_name), str((market or 'SPOT').upper().strip()), str(tf), str(status))
+                                        if _k in _cm:
+                                            return
+                                        _cm.add(_k)
+                            except Exception:
+                                pass
                             _mid_diag_lines += 1
                             logger.info(f"[mid][candles_missing] symbol={symb} exchange={ex_name} market={(market or 'SPOT').upper().strip()} tf={tf} status={status}" + (f" reason={reason}" if reason else ""))
                     except Exception:
@@ -10587,7 +10599,7 @@ class Backend:
                     return
 
                 # Tick-local log guard
-                _MID_TICK_CTX.set({'block': set(), 'trap': set(), 'suppress_block': 0, 'suppress_trap': 0})
+                _MID_TICK_CTX.set({'block': set(), 'trap': set(), 'candles_missing': set(), 'suppress_block': 0, 'suppress_trap': 0})
 
                 interval = interval_sec
                 top_n = int(os.getenv("MID_TOP_N", "50"))
@@ -10938,6 +10950,86 @@ class Backend:
                         except Exception:
                             pass
 
+
+                    # If TF is 30m/1h and we have 5m candles (WS/DB), build higher TF from 5m to avoid REST.
+                    if tf in ("30m", "1h"):
+                        try:
+                            tf_minutes = 30 if tf == "30m" else 60
+                            # Get 5m candles (WS/DB-first; REST only if no cache)
+                            df5 = await _mid_fetch_klines_cached(ex_name, symb, "5m", int(max(limit, 120)), market)
+                            if df5 is not None and not getattr(df5, "empty", True):
+                                d5 = df5.copy()
+                                try:
+                                    if "open_time" in d5.columns and "open_time_ms" not in d5.columns:
+                                        d5["open_time_ms"] = d5["open_time"].astype("int64")
+                                    if "close_time" in d5.columns and "close_time_ms" not in d5.columns:
+                                        d5["close_time_ms"] = d5["close_time"].astype("int64")
+                                    d5["open_time_ms"] = d5["open_time_ms"].astype("int64")
+                                    if "close_time_ms" in d5.columns:
+                                        d5["close_time_ms"] = d5["close_time_ms"].astype("int64")
+                                except Exception:
+                                    pass
+
+                                bucket_ms = tf_minutes * 60_000
+                                ot = d5["open_time_ms"].astype("int64")
+                                b = (ot // bucket_ms) * bucket_ms
+                                d5 = d5.assign(_bucket=b)
+
+                                g = d5.groupby("_bucket", sort=True)
+
+                                out = g.agg(
+                                    open_time_ms=("open_time_ms", "min"),
+                                    open=("open", "first"),
+                                    high=("high", "max"),
+                                    low=("low", "min"),
+                                    close=("close", "last"),
+                                    volume=("volume", "sum"),
+                                ).reset_index(drop=True)
+
+                                try:
+                                    if "close_time_ms" in d5.columns:
+                                        out["close_time_ms"] = g["close_time_ms"].max().values
+                                    else:
+                                        out["close_time_ms"] = out["open_time_ms"].astype("int64") + bucket_ms
+                                except Exception:
+                                    out["close_time_ms"] = out["open_time_ms"].astype("int64") + bucket_ms
+
+                                # add extra cols for packed DF compatibility
+                                for _c, _v in (
+                                    ("quote_volume", 0.0),
+                                    ("trades", 0),
+                                    ("taker_base_volume", 0.0),
+                                    ("taker_quote_volume", 0.0),
+                                    ("ignore", 0),
+                                ):
+                                    if _c not in out.columns:
+                                        out[_c] = _v
+
+                                # freshness check
+                                try:
+                                    max_age = float(os.getenv("MID_AGG_FROM_5M_MAX_AGE_SEC", "1800") or 1800)
+                                    now_ms = int(time.time() * 1000)
+                                    last_close = int(out["close_time_ms"].iloc[-1])
+                                    allowed = max(max_age, float(tf_minutes) * 60.0 * 2.0)
+                                    if (now_ms - last_close) <= int(allowed * 1000):
+                                        if int(limit) > 0 and len(out) > int(limit):
+                                            out = out.tail(int(limit)).copy()
+                                        _mid_candles_cache[key] = (now, out)
+                                        _mid_diag_add(symb, ex_name, market, tf, "OK", "agg_from_5m")
+                                        try:
+                                            if persist_enabled and tf in ("30m", "1h"):
+                                                blob = db_store._cc_pack_df(out)
+                                                await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob)
+                                        except Exception:
+                                            pass
+                                        return out
+                                    else:
+                                        _mid_diag_add(symb, ex_name, market, tf, "stale_agg_from_5m")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
                     last = None
                     for _i in range(max(0, mid_candles_retry) + 1):
                         last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, market)
@@ -11010,6 +11102,24 @@ class Backend:
                                 continue
 
                         if last is not None and not last.empty:
+                            # Accept REST candles only if newest candle is reasonably fresh (prevents stale REST poisoning).
+                            try:
+                                rest_max_age = float(os.getenv("MID_REST_CANDLES_MAX_AGE_SEC", "1800") or 1800)
+                                tf_sec = 300.0 if tf == "5m" else (1800.0 if tf == "30m" else (3600.0 if tf == "1h" else 0.0))
+                                allowed = max(rest_max_age, tf_sec * 2.0) if tf_sec > 0 else rest_max_age
+                                now_ms = int(time.time() * 1000)
+                                if "close_time_ms" in last.columns:
+                                    _last_close = int(float(last["close_time_ms"].iloc[-1]))
+                                elif "close_time" in last.columns:
+                                    _last_close = int(float(last["close_time"].iloc[-1]))
+                                else:
+                                    _last_close = 0
+                                if _last_close > 0 and (now_ms - _last_close) > int(allowed * 1000):
+                                    _mid_diag_add(symb, ex_name, market, tf, "stale_rest")
+                                    last = pd.DataFrame()
+                            except Exception:
+                                pass
+
                             _mid_candles_cache[key] = (now, last)
                             # write-through to persistent cache
                             try:
