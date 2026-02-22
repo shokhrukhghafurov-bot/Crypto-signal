@@ -6169,6 +6169,10 @@ class MultiExchangeData:
             try:
                 items = await fn()
                 if items:
+                    try:
+                        self.last_top_provider = str(name)
+                    except Exception:
+                        pass
                     break
             except Exception as e:
                 last_err = e
@@ -10743,7 +10747,18 @@ class Backend:
                     return mid_cache_ttl_1h
 
                 def _mid_primary_for_symbol(symb: str) -> str:
-                    # Stable routing: hash(symbol) -> primary exchange from MID_PRIMARY_EXCHANGES
+                    # Prefer the exchange that produced the symbol universe (scanner), to avoid routing
+                    # a symbol to an exchange where it doesn't exist -> candles_unavailable storms.
+                    try:
+                        _pref_map = getattr(self, "_mid_symbol_pref_exchange", None)
+                        if isinstance(_pref_map, dict):
+                            _px = _pref_map.get(symb)
+                            if _px:
+                                return str(_px).upper()
+                    except Exception:
+                        pass
+
+                    # Fallback: stable routing hash(symbol) -> primary exchange from MID_PRIMARY_EXCHANGES
                     if not mid_primary_exchanges:
                         return "BINANCE"
                     if mid_primary_mode not in ("hash", "round_robin"):
@@ -11177,10 +11192,24 @@ class Backend:
                                 symbols_pool = list(dict.fromkeys(symbols_pool))
                                 self._mid_symbols_cache = list(symbols_pool)
                                 self._mid_symbols_cache_ts = time.time()
+                                # remember which exchange provided this universe (so MID prefers correct candles exchange)
+                                try:
+                                    _pref_ex = getattr(api, 'last_top_provider', None)
+                                    if _pref_ex:
+                                        self._mid_symbols_cache_provider = str(_pref_ex)
+                                        self._mid_symbol_pref_exchange = {s: str(_pref_ex) for s in symbols_pool}
+                                except Exception:
+                                    pass
                         except Exception as e:
                             if getattr(self, "_mid_symbols_cache", None):
                                 logger.warning("[mid] get_top_usdt_symbols failed (%s); using cached symbols (%s)", e, len(self._mid_symbols_cache))
                                 symbols_pool = list(self._mid_symbols_cache)
+                                try:
+                                    _pref_ex = getattr(self, '_mid_symbols_cache_provider', None)
+                                    if _pref_ex:
+                                        self._mid_symbol_pref_exchange = {s: str(_pref_ex) for s in symbols_pool}
+                                except Exception:
+                                    pass
                             else:
                                 raise
                         # Scan only first MID_TOP_N symbols from the loaded universe.
