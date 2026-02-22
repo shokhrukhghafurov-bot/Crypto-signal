@@ -6301,44 +6301,54 @@ class MultiExchangeData:
                 return cached[1]
             return set()
 
-    
-    async def _get_bybit_markets(self, market: str) -> set[str]:
-        """Return supported symbols set for Bybit market.
 
-        market: 'SPOT' or 'FUTURES' (linear USDT perpetuals).
-        Uses v5 instruments-info with caching.
-        """
+    async def _get_binance_markets(self, market: str) -> set[str]:
+        """Fetch tradable symbols for Binance SPOT or FUTURES and cache them."""
         now = time.monotonic()
-        mkt = (market or "SPOT").upper().strip()
+        mkt = (market or 'SPOT').upper().strip()
+        key = f"BINANCE:{mkt}"
+        cached = self._markets_cache.get(key)
+        if cached and now < cached[0]:
+            return cached[1]
+        try:
+            if mkt == 'FUTURES':
+                url = f"{self.BINANCE_FUTURES}/fapi/v1/exchangeInfo"
+            else:
+                url = f"{self.BINANCE_SPOT}/api/v3/exchangeInfo"
+            raw = await self._get_json(url, params=None)
+            s: set[str] = set()
+            if isinstance(raw, dict):
+                for r in (raw.get("symbols") or []):
+                    if isinstance(r, dict):
+                        sym = (r.get("symbol") or "").strip().upper()
+                        if sym:
+                            s.add(sym)
+            self._markets_cache[key] = (now + float(self._markets_cache_ttl), s)
+            return s
+        except Exception:
+            if cached:
+                return cached[1]
+            return set()
+
+    async def _get_bybit_markets(self, market: str) -> set[str]:
+        """Fetch tradable symbols for Bybit SPOT or linear FUTURES and cache them."""
+        now = time.monotonic()
+        mkt = (market or 'SPOT').upper().strip()
         key = f"BYBIT:{mkt}"
         cached = self._markets_cache.get(key)
         if cached and now < cached[0]:
             return cached[1]
+        category = 'linear' if mkt == 'FUTURES' else 'spot'
         url = f"{self.BYBIT}/v5/market/instruments-info"
-        category = "linear" if mkt == "FUTURES" else "spot"
-        s: set[str] = set()
-        cursor: Optional[str] = None
         try:
-            # Best-effort pagination (Bybit returns 'nextPageCursor')
-            for _ in range(12):
-                params = {"category": category, "limit": "1000"}
-                if cursor:
-                    params["cursor"] = cursor
-                raw = await self._get_json(url, params=params)
-                if isinstance(raw, dict) and str(raw.get("retCode", "0")) not in ("0", ""):
-                    raise ExchangeAPIError(f"BYBIT instruments retCode={raw.get('retCode')} retMsg={raw.get('retMsg')}")
-                result = (raw or {}).get("result") or {}
-                rows = (result.get("list") or []) if isinstance(result, dict) else []
-                if isinstance(rows, list):
-                    for r in rows:
-                        if isinstance(r, dict):
-                            sym = (r.get("symbol") or "").strip()
-                            if sym:
-                                s.add(sym.upper())
-                cursor = (result.get("nextPageCursor") or "").strip() if isinstance(result, dict) else ""
-                if not cursor:
-                    break
-            # Cache even if empty: prevents spamming on temporary failures
+            raw = await self._get_json(url, params={"category": category})
+            lst = (((raw or {}).get("result") or {}).get("list") or []) if isinstance(raw, dict) else []
+            s: set[str] = set()
+            for r in lst:
+                if isinstance(r, dict):
+                    sym = (r.get("symbol") or "").strip().upper()
+                    if sym:
+                        s.add(sym)
             self._markets_cache[key] = (now + float(self._markets_cache_ttl), s)
             return s
         except Exception:
@@ -6347,31 +6357,33 @@ class MultiExchangeData:
             return set()
 
     async def _get_okx_markets(self, market: str) -> set[str]:
-        """Return supported instIds set for OKX market.
+        """Fetch tradable symbols for OKX SPOT or SWAP (FUTURES) and cache them.
 
-        For SPOT: instId like 'BTC-USDT'
-        For FUTURES: instId like 'BTC-USDT-SWAP'
+        We normalize OKX instId like BTC-USDT or BTC-USDT-SWAP to Binance-style BTCUSDT.
         """
         now = time.monotonic()
-        mkt = (market or "SPOT").upper().strip()
+        mkt = (market or 'SPOT').upper().strip()
         key = f"OKX:{mkt}"
         cached = self._markets_cache.get(key)
         if cached and now < cached[0]:
             return cached[1]
-        inst_type = "SWAP" if mkt == "FUTURES" else "SPOT"
+        inst_type = 'SWAP' if mkt == 'FUTURES' else 'SPOT'
         url = f"{self.OKX}/api/v5/public/instruments"
-        s: set[str] = set()
         try:
             raw = await self._get_json(url, params={"instType": inst_type})
-            if isinstance(raw, dict) and str(raw.get("code", "0")) not in ("0", ""):
-                raise ExchangeAPIError(f"OKX instruments code={raw.get('code')} msg={raw.get('msg')}")
-            rows = (raw or {}).get("data", []) or []
-            if isinstance(rows, list):
-                for r in rows:
-                    if isinstance(r, dict):
-                        inst = (r.get("instId") or "").strip()
-                        if inst:
-                            s.add(inst.upper())
+            lst = (raw.get("data") or []) if isinstance(raw, dict) else []
+            s: set[str] = set()
+            for r in lst:
+                if not isinstance(r, dict):
+                    continue
+                inst = (r.get("instId") or "").strip().upper()
+                if not inst:
+                    continue
+                # SPOT: BTC-USDT ; SWAP: BTC-USDT-SWAP
+                parts = inst.split('-')
+                if len(parts) >= 2 and parts[1] in ("USDT","USDC"):
+                    sym = f"{parts[0]}{parts[1]}"
+                    s.add(sym)
             self._markets_cache[key] = (now + float(self._markets_cache_ttl), s)
             return s
         except Exception:
@@ -6379,59 +6391,37 @@ class MultiExchangeData:
                 return cached[1]
             return set()
 
-    async def _get_binance_markets(self, market: str) -> set[str]:
-        """Return supported symbols set for Binance market (SPOT or FUTURES)."""
-        now = time.monotonic()
-        mkt = (market or "SPOT").upper().strip()
-        key = f"BINANCE:{mkt}"
-        cached = self._markets_cache.get(key)
-        if cached and now < cached[0]:
-            return cached[1]
-        url = f"{self.BINANCE_FUTURES}/fapi/v1/exchangeInfo" if mkt == "FUTURES" else f"{self.BINANCE_SPOT}/api/v3/exchangeInfo"
-        s: set[str] = set()
-        try:
-            raw = await self._get_json(url, params=None)
-            if isinstance(raw, dict):
-                for r in (raw.get("symbols") or []) or []:
-                    if isinstance(r, dict):
-                        sym = (r.get("symbol") or "").strip()
-                        if sym:
-                            s.add(sym.upper())
-            self._markets_cache[key] = (now + float(self._markets_cache_ttl), s)
-            return s
-        except Exception:
-            if cached:
-                return cached[1]
-            return set()
+    async def _market_supported(self, exchange: str, market: str, symbol: str) -> bool:
+        """Return True if (exchange, market) supports symbol.
 
-    def _okx_inst_id(self, symbol: str, market: str) -> str:
-        sym = (symbol or "").upper().strip()
-        if sym.endswith("USDT"):
-            base = sym[:-4]
-            inst = f"{base}-USDT"
-        else:
-            inst = sym
-        if (market or "SPOT").upper().strip() == "FUTURES":
-            inst = inst + "-SWAP"
-        return inst
-
-
-    async def _market_supported(self, exchange: str, symbol: str, market: str = "SPOT", interval: str = "") -> bool:
-        """Check if (exchange, market, symbol) exists before calling klines.
-
-        Prevents massive 'Invalid symbol' / 'Instrument doesn't exist' spam and reduces candles_fail.
+        market is 'SPOT' or 'FUTURES'. Uses cached exchange instrument lists to prevent
+        wasting REST calls (and to speed up MID).
         """
         if not self._market_avail_check:
             return True
-
         ex = (exchange or "").upper().strip()
         mkt = (market or "SPOT").upper().strip()
         sym = (symbol or "").upper().strip()
 
-        # Basic sanity: avoid non-ASCII / weird symbols in MID pools
-        # Keep it permissive but block obvious garbage that will fail everywhere.
-        if not sym or any(ord(ch) > 127 for ch in sym) or not re.fullmatch(r"[A-Z0-9]{2,25}USDT", sym):
+        # Quick reject for clearly invalid symbols
+        if not sym or not re.fullmatch(r"[A-Z0-9]{2,20}USDT", sym):
             return False
+
+        if ex == "BINANCE":
+            markets = await self._get_binance_markets(mkt)
+            # Futures may have different request symbol (1000PEPEUSDT etc) — accept either.
+            if mkt == "FUTURES":
+                sym_req = self._binance_futures_symbol_alias(sym)
+                return (sym_req in markets) or (sym in markets)
+            return sym in markets
+
+        if ex == "BYBIT":
+            markets = await self._get_bybit_markets(mkt)
+            return sym in markets
+
+        if ex == "OKX":
+            markets = await self._get_okx_markets(mkt)
+            return sym in markets
 
         if ex == "GATEIO":
             pair = _gate_pair(sym).upper()
@@ -6442,23 +6432,7 @@ class MultiExchangeData:
             markets = await self._get_mexc_markets()
             return sym in markets
 
-        if ex == "BYBIT":
-            markets = await self._get_bybit_markets(mkt)
-            return sym in markets
-
-        if ex == "OKX":
-            inst = self._okx_inst_id(sym, mkt).upper()
-            markets = await self._get_okx_markets(mkt)
-            return inst in markets
-
-        if ex == "BINANCE":
-            # Binance futures sometimes uses an alias (1000PEPEUSDT, etc.)
-            sym_req = self._binance_futures_symbol_alias(sym) if mkt == "FUTURES" else sym
-            markets = await self._get_binance_markets(mkt)
-            return sym_req in markets
-
         return True
-
 
     async def _klines_cached(self, *, cache_key: tuple, interval: str, fetch_coro):
         now = time.monotonic()
@@ -6544,12 +6518,16 @@ class MultiExchangeData:
         # Binance USDT-M futures has some contracts with a different symbol name
         # than spot (e.g. PEPE futures is typically 1000PEPEUSDT).
         sym_req = self._binance_futures_symbol_alias(sym) if mkt == 'FUTURES' else sym
-        if self._is_unsupported_cached("BINANCE", mkt, sym_req, iv):
-            return pd.DataFrame()
-        if not await self._market_supported("BINANCE", sym, mkt, iv):
-            self._mark_unsupported("BINANCE", mkt, sym_req, iv)
-            return pd.DataFrame()
         cache_key = ('BINANCE', mkt, sym_req, iv, int(limit))
+        # PRO: market availability pre-check (prevents invalid-symbol spam and speeds up MID)
+        if self._market_avail_check:
+            try:
+                if not await self._market_supported("BINANCE", mkt, sym):
+                    self._mark_unsupported("BINANCE", mkt, sym, iv)
+                    return pd.DataFrame()
+            except Exception:
+                # fail-open if market list endpoint is temporarily unavailable
+                pass
 
         async def _fetch():
             # Binance may return HTTP 200 with JSON error payload; validate type
@@ -6615,12 +6593,15 @@ class MultiExchangeData:
         iv = (interval or '').strip().lower()
         mkt = (market or 'SPOT').upper().strip()
         cache_key = ('BYBIT', mkt, sym, iv, int(limit))
-
-        if self._is_unsupported_cached("BYBIT", mkt, sym, iv):
-            return pd.DataFrame()
-        if not await self._market_supported("BYBIT", sym, mkt, iv):
-            self._mark_unsupported("BYBIT", mkt, sym, iv)
-            return pd.DataFrame()
+        # PRO: market availability pre-check (prevents invalid-symbol spam and speeds up MID)
+        if self._market_avail_check:
+            try:
+                if not await self._market_supported("BYBIT", mkt, sym):
+                    self._mark_unsupported("BYBIT", mkt, sym, iv)
+                    return pd.DataFrame()
+            except Exception:
+                # fail-open if market list endpoint is temporarily unavailable
+                pass
 
         async def _fetch():
             interval_map = {'5m':'5', '15m':'15', '30m':'30', '1h':'60', '4h':'240'}
@@ -6648,12 +6629,15 @@ class MultiExchangeData:
         iv = (interval or '').strip().lower()
         mkt = (market or 'SPOT').upper().strip()
         cache_key = ('OKX', mkt, sym, iv, int(limit))
-
-        if self._is_unsupported_cached("OKX", mkt, sym, iv):
-            return pd.DataFrame()
-        if not await self._market_supported("OKX", sym, mkt, iv):
-            self._mark_unsupported("OKX", mkt, sym, iv)
-            return pd.DataFrame()
+        # PRO: market availability pre-check (prevents invalid-symbol spam and speeds up MID)
+        if self._market_avail_check:
+            try:
+                if not await self._market_supported("OKX", mkt, sym):
+                    self._mark_unsupported("OKX", mkt, sym, iv)
+                    return pd.DataFrame()
+            except Exception:
+                # fail-open if market list endpoint is temporarily unavailable
+                pass
 
         async def _fetch():
             bar_map = {'5m':'5m', '15m':'15m', '30m':'30m', '1h':'1H', '4h':'4H'}
@@ -6683,7 +6667,7 @@ class MultiExchangeData:
         if self._is_unsupported_cached("MEXC", market, sym, iv):
             return pd.DataFrame()
 
-        if not await self._market_supported("MEXC", sym, market, iv):
+        if not await self._market_supported("MEXC", "SPOT", sym):
             self._mark_unsupported("MEXC", market, sym, iv)
             return pd.DataFrame()
 
@@ -6737,7 +6721,7 @@ class MultiExchangeData:
         if self._is_unsupported_cached("GATEIO", market, sym, iv):
             return pd.DataFrame()
 
-        if not await self._market_supported("GATEIO", sym, market, iv):
+        if not await self._market_supported("GATEIO", "SPOT", sym):
             self._mark_unsupported("GATEIO", market, sym, iv)
             return pd.DataFrame()
 
@@ -11051,11 +11035,24 @@ class Backend:
                                     groups[_mid_primary_for_symbol(_s)].append(_s)
 
                                 tasks = []
+                                max_tasks = int(os.getenv("MID_PREFETCH_MAX_TASKS", "180") or 180)
+                                per_ex = int(os.getenv("MID_PREFETCH_SYMBOLS_PER_EX", "40") or 40)
                                 for _ex, _syms in groups.items():
+                                    # limit prefetch fanout to keep tick fast (PRO)
+                                    if per_ex > 0:
+                                        _syms = _syms[:per_ex]
                                     for _s in _syms:
+                                        if max_tasks and len(tasks) >= max_tasks:
+                                            break
                                         tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trigger, prefetch_limit, market_mid)))
+                                        if max_tasks and len(tasks) >= max_tasks:
+                                            break
                                         tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_mid, prefetch_limit, market_mid)))
+                                        if max_tasks and len(tasks) >= max_tasks:
+                                            break
                                         tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trend, prefetch_limit, market_mid)))
+                                    if max_tasks and len(tasks) >= max_tasks:
+                                        break
 
                                 if tasks:
                                     if prefetch_timeout and prefetch_timeout > 0:
