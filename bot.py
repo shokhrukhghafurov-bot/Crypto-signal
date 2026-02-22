@@ -5723,21 +5723,28 @@ async def main() -> None:
                 pass
 
             
-            # --- WS candles aggregator (runs ONLY on primary, optional) ---
-            ws_enabled = os.getenv("CANDLES_WS_ENABLED", "0").strip().lower() not in ("0","false","no","off")
-            if ws_enabled:
-                try:
-                    from backend import ws_candles_service_loop
-                    logger.info("[ws-candles] CANDLES_WS_ENABLED=1 → starting WS candles aggregator")
-                    TASKS["ws-candles"] = asyncio.create_task(ws_candles_service_loop(backend), name="ws-candles")
-                    _health_mark_ok("ws-candles")
-                    _attach_task_monitor("ws-candles", TASKS["ws-candles"])
-                    # heartbeat so health doesn't show DEAD when loop is idle
-                    TASKS["ws-candles-hb"] = asyncio.create_task(_task_heartbeat_loop("ws-candles", interval_sec=10.0), name="ws-candles-hb")
-                except Exception as e:
-                    logger.error("[ws-candles] failed to start WS candles aggregator: %s", e)
+            # --- WS candles aggregator (production) ---
+            ws_enabled = os.getenv('CANDLES_WS_ENABLED', '0').strip().lower() not in ('0','false','no','off')
+            ws_role = os.getenv('WORKER_ROLE', '').strip().upper()
+            ws_force = os.getenv('CANDLES_WS_RUN_ON_ANY', '0').strip().lower() not in ('0','false','no','off')
+            if not ws_enabled:
+                logger.info('[ws-candles] disabled (set CANDLES_WS_ENABLED=1 to enable)')
+            else:
+                can_run_ws = ws_force or (ws_role == 'WS_CANDLES') or is_primary
+                if not can_run_ws:
+                    logger.info('[ws-candles] enabled but not primary; skipping (set WORKER_ROLE=WS_CANDLES or CANDLES_WS_RUN_ON_ANY=1 to force)')
+                else:
+                    try:
+                        from backend import ws_candles_service_loop
+                        logger.info('[ws-candles] starting WS candles aggregator (role=%s primary=%s)', ws_role or 'MAIN', is_primary)
+                        TASKS['ws-candles'] = asyncio.create_task(ws_candles_service_loop(backend), name='ws-candles')
+                        _health_mark_ok('ws-candles')
+                        _attach_task_monitor('ws-candles', TASKS['ws-candles'])
+                        TASKS['ws-candles-hb'] = asyncio.create_task(_task_heartbeat_loop('ws-candles', interval_sec=10.0), name='ws-candles-hb')
+                    except Exception as e:
+                        logger.error('[ws-candles] failed to start WS candles aggregator: %s', e)
 
-            # --- Candles cache cleanup (optional, runs ONLY on primary) ---
+# --- Candles cache cleanup (optional, runs ONLY on primary) ---
             cleanup_enabled = os.getenv("CANDLES_CACHE_CLEANUP_ENABLED", "1").strip().lower() not in ("0","false","no","off")
             if cleanup_enabled:
                 try:
