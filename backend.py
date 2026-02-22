@@ -6301,19 +6301,164 @@ class MultiExchangeData:
                 return cached[1]
             return set()
 
-    async def _market_supported(self, exchange: str, symbol: str) -> bool:
+    
+    async def _get_bybit_markets(self, market: str) -> set[str]:
+        """Return supported symbols set for Bybit market.
+
+        market: 'SPOT' or 'FUTURES' (linear USDT perpetuals).
+        Uses v5 instruments-info with caching.
+        """
+        now = time.monotonic()
+        mkt = (market or "SPOT").upper().strip()
+        key = f"BYBIT:{mkt}"
+        cached = self._markets_cache.get(key)
+        if cached and now < cached[0]:
+            return cached[1]
+        url = f"{self.BYBIT}/v5/market/instruments-info"
+        category = "linear" if mkt == "FUTURES" else "spot"
+        s: set[str] = set()
+        cursor: Optional[str] = None
+        try:
+            # Best-effort pagination (Bybit returns 'nextPageCursor')
+            for _ in range(12):
+                params = {"category": category, "limit": "1000"}
+                if cursor:
+                    params["cursor"] = cursor
+                raw = await self._get_json(url, params=params)
+                if isinstance(raw, dict) and str(raw.get("retCode", "0")) not in ("0", ""):
+                    raise ExchangeAPIError(f"BYBIT instruments retCode={raw.get('retCode')} retMsg={raw.get('retMsg')}")
+                result = (raw or {}).get("result") or {}
+                rows = (result.get("list") or []) if isinstance(result, dict) else []
+                if isinstance(rows, list):
+                    for r in rows:
+                        if isinstance(r, dict):
+                            sym = (r.get("symbol") or "").strip()
+                            if sym:
+                                s.add(sym.upper())
+                cursor = (result.get("nextPageCursor") or "").strip() if isinstance(result, dict) else ""
+                if not cursor:
+                    break
+            # Cache even if empty: prevents spamming on temporary failures
+            self._markets_cache[key] = (now + float(self._markets_cache_ttl), s)
+            return s
+        except Exception:
+            if cached:
+                return cached[1]
+            return set()
+
+    async def _get_okx_markets(self, market: str) -> set[str]:
+        """Return supported instIds set for OKX market.
+
+        For SPOT: instId like 'BTC-USDT'
+        For FUTURES: instId like 'BTC-USDT-SWAP'
+        """
+        now = time.monotonic()
+        mkt = (market or "SPOT").upper().strip()
+        key = f"OKX:{mkt}"
+        cached = self._markets_cache.get(key)
+        if cached and now < cached[0]:
+            return cached[1]
+        inst_type = "SWAP" if mkt == "FUTURES" else "SPOT"
+        url = f"{self.OKX}/api/v5/public/instruments"
+        s: set[str] = set()
+        try:
+            raw = await self._get_json(url, params={"instType": inst_type})
+            if isinstance(raw, dict) and str(raw.get("code", "0")) not in ("0", ""):
+                raise ExchangeAPIError(f"OKX instruments code={raw.get('code')} msg={raw.get('msg')}")
+            rows = (raw or {}).get("data", []) or []
+            if isinstance(rows, list):
+                for r in rows:
+                    if isinstance(r, dict):
+                        inst = (r.get("instId") or "").strip()
+                        if inst:
+                            s.add(inst.upper())
+            self._markets_cache[key] = (now + float(self._markets_cache_ttl), s)
+            return s
+        except Exception:
+            if cached:
+                return cached[1]
+            return set()
+
+    async def _get_binance_markets(self, market: str) -> set[str]:
+        """Return supported symbols set for Binance market (SPOT or FUTURES)."""
+        now = time.monotonic()
+        mkt = (market or "SPOT").upper().strip()
+        key = f"BINANCE:{mkt}"
+        cached = self._markets_cache.get(key)
+        if cached and now < cached[0]:
+            return cached[1]
+        url = f"{self.BINANCE_FUTURES}/fapi/v1/exchangeInfo" if mkt == "FUTURES" else f"{self.BINANCE_SPOT}/api/v3/exchangeInfo"
+        s: set[str] = set()
+        try:
+            raw = await self._get_json(url, params=None)
+            if isinstance(raw, dict):
+                for r in (raw.get("symbols") or []) or []:
+                    if isinstance(r, dict):
+                        sym = (r.get("symbol") or "").strip()
+                        if sym:
+                            s.add(sym.upper())
+            self._markets_cache[key] = (now + float(self._markets_cache_ttl), s)
+            return s
+        except Exception:
+            if cached:
+                return cached[1]
+            return set()
+
+    def _okx_inst_id(self, symbol: str, market: str) -> str:
+        sym = (symbol or "").upper().strip()
+        if sym.endswith("USDT"):
+            base = sym[:-4]
+            inst = f"{base}-USDT"
+        else:
+            inst = sym
+        if (market or "SPOT").upper().strip() == "FUTURES":
+            inst = inst + "-SWAP"
+        return inst
+
+
+    async def _market_supported(self, exchange: str, symbol: str, market: str = "SPOT", interval: str = "") -> bool:
+        """Check if (exchange, market, symbol) exists before calling klines.
+
+        Prevents massive 'Invalid symbol' / 'Instrument doesn't exist' spam and reduces candles_fail.
+        """
         if not self._market_avail_check:
             return True
-        ex = (exchange or "").upper()
-        sym = symbol.upper()
+
+        ex = (exchange or "").upper().strip()
+        mkt = (market or "SPOT").upper().strip()
+        sym = (symbol or "").upper().strip()
+
+        # Basic sanity: avoid non-ASCII / weird symbols in MID pools
+        # Keep it permissive but block obvious garbage that will fail everywhere.
+        if not sym or any(ord(ch) > 127 for ch in sym) or not re.fullmatch(r"[A-Z0-9]{2,25}USDT", sym):
+            return False
+
         if ex == "GATEIO":
             pair = _gate_pair(sym).upper()
             markets = await self._get_gateio_markets()
             return pair in markets
+
         if ex == "MEXC":
             markets = await self._get_mexc_markets()
             return sym in markets
+
+        if ex == "BYBIT":
+            markets = await self._get_bybit_markets(mkt)
+            return sym in markets
+
+        if ex == "OKX":
+            inst = self._okx_inst_id(sym, mkt).upper()
+            markets = await self._get_okx_markets(mkt)
+            return inst in markets
+
+        if ex == "BINANCE":
+            # Binance futures sometimes uses an alias (1000PEPEUSDT, etc.)
+            sym_req = self._binance_futures_symbol_alias(sym) if mkt == "FUTURES" else sym
+            markets = await self._get_binance_markets(mkt)
+            return sym_req in markets
+
         return True
+
 
     async def _klines_cached(self, *, cache_key: tuple, interval: str, fetch_coro):
         now = time.monotonic()
@@ -6399,6 +6544,11 @@ class MultiExchangeData:
         # Binance USDT-M futures has some contracts with a different symbol name
         # than spot (e.g. PEPE futures is typically 1000PEPEUSDT).
         sym_req = self._binance_futures_symbol_alias(sym) if mkt == 'FUTURES' else sym
+        if self._is_unsupported_cached("BINANCE", mkt, sym_req, iv):
+            return pd.DataFrame()
+        if not await self._market_supported("BINANCE", sym, mkt, iv):
+            self._mark_unsupported("BINANCE", mkt, sym_req, iv)
+            return pd.DataFrame()
         cache_key = ('BINANCE', mkt, sym_req, iv, int(limit))
 
         async def _fetch():
@@ -6466,6 +6616,12 @@ class MultiExchangeData:
         mkt = (market or 'SPOT').upper().strip()
         cache_key = ('BYBIT', mkt, sym, iv, int(limit))
 
+        if self._is_unsupported_cached("BYBIT", mkt, sym, iv):
+            return pd.DataFrame()
+        if not await self._market_supported("BYBIT", sym, mkt, iv):
+            self._mark_unsupported("BYBIT", mkt, sym, iv)
+            return pd.DataFrame()
+
         async def _fetch():
             interval_map = {'5m':'5', '15m':'15', '30m':'30', '1h':'60', '4h':'240'}
             itv = interval_map.get(iv, '15')
@@ -6492,6 +6648,12 @@ class MultiExchangeData:
         iv = (interval or '').strip().lower()
         mkt = (market or 'SPOT').upper().strip()
         cache_key = ('OKX', mkt, sym, iv, int(limit))
+
+        if self._is_unsupported_cached("OKX", mkt, sym, iv):
+            return pd.DataFrame()
+        if not await self._market_supported("OKX", sym, mkt, iv):
+            self._mark_unsupported("OKX", mkt, sym, iv)
+            return pd.DataFrame()
 
         async def _fetch():
             bar_map = {'5m':'5m', '15m':'15m', '30m':'30m', '1h':'1H', '4h':'4H'}
@@ -6521,7 +6683,7 @@ class MultiExchangeData:
         if self._is_unsupported_cached("MEXC", market, sym, iv):
             return pd.DataFrame()
 
-        if not await self._market_supported("MEXC", sym):
+        if not await self._market_supported("MEXC", sym, market, iv):
             self._mark_unsupported("MEXC", market, sym, iv)
             return pd.DataFrame()
 
@@ -6575,7 +6737,7 @@ class MultiExchangeData:
         if self._is_unsupported_cached("GATEIO", market, sym, iv):
             return pd.DataFrame()
 
-        if not await self._market_supported("GATEIO", sym):
+        if not await self._market_supported("GATEIO", sym, market, iv):
             self._mark_unsupported("GATEIO", market, sym, iv)
             return pd.DataFrame()
 
@@ -10734,7 +10896,6 @@ class Backend:
                                 _mid_candles_unsupported += 1
                                 return None
                             _mid_candles_empty += 1
-                            _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'empty', 'rest')
                             reason = f"empty_{ex_name.lower()}_{(market or 'SPOT').lower()}_{tf}"
                             _mid_candles_empty_reasons[reason] += 1
                             if _mid_candles_log_empty:
@@ -10791,11 +10952,6 @@ class Backend:
                                     u = (s or "").upper().strip()
                                     # Remove common separators
                                     u = u.replace("-", "").replace("_", "").replace(":", "")
-                                    # Keep only ASCII A-Z0-9 (drops exotic/unlisted symbols like "币安人生USDT")
-                                    u = re.sub(r"[^A-Z0-9]", "", u)
-                                    # Drop anything that is not a standard *USDT pair after normalization
-                                    if not u.endswith("USDT"):
-                                        return ""
                                     # Strip derivative suffixes
                                     for suf in ("SWAP", "PERP", "FUT", "FUTURES"):
                                         if u.endswith(suf):
@@ -11027,24 +11183,7 @@ class Backend:
                                 await _choose_exchange_mid()
 
                             if not chosen_r:
-                                # Classify missing candles so `no_candles` stays 0: unsupported/empty/net_fail instead of a generic bucket
-                                try:
-                                    di = _mid_candles_diag.get((sym, tf_trigger)) or []
-                                    st = set()
-                                    for rec in di:
-                                        parts = (rec or '').split(':')
-                                        if len(parts) >= 3:
-                                            st.add(parts[2].upper().strip())
-                                    if 'FAIL' in st:
-                                        _rej_add(sym, 'candles_net_fail')
-                                    elif 'EMPTY' in st:
-                                        _rej_add(sym, 'candles_empty')
-                                    elif 'UNSUPPORTED' in st:
-                                        _rej_add(sym, 'candles_unsupported')
-                                    else:
-                                        _rej_add(sym, 'candles_missing')
-                                except Exception:
-                                    _rej_add(sym, 'candles_missing')
+                                _rej_add(sym, "no_candles")
                                 continue
 
                             best_name, best_r = chosen_name, chosen_r
