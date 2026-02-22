@@ -5732,6 +5732,19 @@ async def main() -> None:
                 except Exception as e:
                     logger.error("[ws-candles] failed to start WS candles aggregator: %s", e)
 
+# --- Candles cache cleanup (optional, runs ONLY on primary) ---
+cleanup_enabled = os.getenv("CANDLES_CACHE_CLEANUP_ENABLED", "1").strip().lower() not in ("0","false","no","off")
+if cleanup_enabled:
+    try:
+        from backend import candles_cache_cleanup_loop
+        logger.info("[candles-cleanup] starting candles_cache cleanup loop")
+        TASKS["candles-cleanup"] = asyncio.create_task(candles_cache_cleanup_loop(backend), name="candles-cleanup")
+        _health_mark_ok("candles-cleanup")
+        _attach_task_monitor("candles-cleanup", TASKS["candles-cleanup"])
+        TASKS["candles-cleanup-hb"] = asyncio.create_task(_task_heartbeat_loop("candles-cleanup", interval_sec=60.0), name="candles-cleanup-hb")
+    except Exception as e:
+        logger.error("[candles-cleanup] failed to start cleanup loop: %s", e)
+
             logger.info("Starting track_loop")
             if hasattr(backend, "track_loop"):
                 # Let backend report liveness for Smart Manager (once per cycle)
