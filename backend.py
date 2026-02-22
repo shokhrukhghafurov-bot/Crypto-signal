@@ -11385,3 +11385,375 @@ async def autotrade_stress_test(*, user_id: int, symbol: str, market_type: str =
     This build keeps production stable: stress-test is disabled here to avoid accidental trading.
     """
     return {"ok": False, "error": "stress_test_disabled_in_production"}
+
+
+
+# =========================
+# WS Candles Aggregator (SPOT + FUTURES) with DB store + REST fallback support
+# =========================
+#
+# Design:
+# - Dedicated service (1 replica) subscribes to 5m kline/candles via WS for BINANCE/BYBIT/OKX
+#   for both SPOT and FUTURES markets.
+# - Aggregates 30m and 1h candles locally from closed 5m candles to reduce WS subscriptions.
+# - Persists latest candle history to Postgres via db_store.candles_cache_set(), using the same
+#   packed DF format expected by MID persistent candles cache.
+#
+# Usage (recommended separate Railway service):
+#   WORKER_ROLE=WS_CANDLES
+#   CANDLES_WS_EXCHANGES=binance,bybit,okx
+#   CANDLES_WS_MARKETS=SPOT,FUTURES
+#   CANDLES_WS_SYMBOLS_SOURCE=TOP_N        # or STATIC
+#   CANDLES_WS_SYMBOLS_STATIC=BTCUSDT,ETHUSDT
+#   CANDLES_WS_LIMIT=250
+#   CANDLES_WS_DB_WRITE_EVERY_SEC=3
+#
+# In bot.py (or your main), start:
+#   if os.getenv("WORKER_ROLE") == "WS_CANDLES":
+#       await ws_candles_service_loop(backend)
+#
+# Notes:
+# - If WS misses or reconnects, MID will still REST-refill on cache-miss. This service just makes
+#   cache hits common and reduces REST load.
+#
+from collections import defaultdict, deque
+
+class _WSCandlesAggregator:
+    def __init__(self, *, exchanges: list[str], markets: list[str], symbols: list[str], limit: int = 250) -> None:
+        self.exchanges = [str(x).lower().strip() for x in (exchanges or []) if str(x).strip()]
+        self.markets = [str(x).upper().strip() for x in (markets or []) if str(x).strip()]
+        self.symbols = [str(s).upper().strip() for s in (symbols or []) if str(s).strip()]
+        self.limit = int(limit or 250)
+        # buffers: (ex, market, symbol, tf) -> deque[dict]
+        self._buf5 = defaultdict(lambda: deque(maxlen=self.limit))
+        self._agg30 = defaultdict(lambda: deque(maxlen=self.limit))
+        self._agg1h = defaultdict(lambda: deque(maxlen=self.limit))
+        # partial accumulators for 30m/1h: (ex,market,symbol,tf)-> list[dict]
+        self._acc30 = defaultdict(list)
+        self._acc1h = defaultdict(list)
+        # last write time per key to avoid excessive DB writes
+        self._last_write = defaultdict(float)
+
+    def _okx_inst(self, market: str, symbol: str) -> str:
+        sym = (symbol or "").upper()
+        if sym.endswith("USDT"):
+            base, quote = sym[:-4], "USDT"
+        elif sym.endswith("USDC"):
+            base, quote = sym[:-4], "USDC"
+        else:
+            base, quote = sym[:-3], sym[-3:]
+            if len(sym) >= 4 and sym[-4:] in ("USDT","USDC"):
+                base, quote = sym[:-4], sym[-4:]
+        inst = f"{base}-{quote}"
+        if (market or "SPOT").upper() != "SPOT":
+            inst = inst + "-SWAP"
+        return inst
+
+    def _tf_bucket_start(self, open_ms: int, tf_minutes: int) -> int:
+        # align to tf boundary in ms
+        tf_ms = tf_minutes * 60_000
+        return int((open_ms // tf_ms) * tf_ms)
+
+    def _append_5m(self, ex: str, market: str, symbol: str, c: dict) -> None:
+        key = (ex, market, symbol)
+        self._buf5[key].append(c)
+
+        # build 30m + 1h from closed 5m candles
+        try:
+            o_ms = int(c["open_time_ms"])
+        except Exception:
+            return
+
+        # 30m accumulator
+        b30 = self._tf_bucket_start(o_ms, 30)
+        acc30_key = (ex, market, symbol, b30)
+        self._acc30[acc30_key].append(c)
+        if len(self._acc30[acc30_key]) >= 6:
+            grp = self._acc30.pop(acc30_key)
+            self._agg30[key].append(self._agg_from_group(grp, tf="30m"))
+
+        # 1h accumulator
+        b1h = self._tf_bucket_start(o_ms, 60)
+        acc1h_key = (ex, market, symbol, b1h)
+        self._acc1h[acc1h_key].append(c)
+        if len(self._acc1h[acc1h_key]) >= 12:
+            grp = self._acc1h.pop(acc1h_key)
+            self._agg1h[key].append(self._agg_from_group(grp, tf="1h"))
+
+    def _agg_from_group(self, grp: list[dict], tf: str) -> dict:
+        # grp are 5m candles (dicts), assume sorted by open_time
+        grp = sorted(grp, key=lambda x: int(x.get("open_time_ms", 0)))
+        o = grp[0]
+        l = grp[-1]
+        high = max(float(x["high"]) for x in grp)
+        low = min(float(x["low"]) for x in grp)
+        vol = sum(float(x.get("volume", 0.0)) for x in grp)
+        return dict(
+            open_time_ms=int(o["open_time_ms"]),
+            close_time_ms=int(l.get("close_time_ms") or (int(l["open_time_ms"]) + 5*60_000)),
+            open=float(o["open"]),
+            high=float(high),
+            low=float(low),
+            close=float(l["close"]),
+            volume=float(vol),
+            tf=tf,
+        )
+
+    def _df_from_buf(self, buf: deque) -> 'pd.DataFrame':
+        if not buf:
+            return pd.DataFrame()
+        rows = []
+        for x in buf:
+            rows.append([
+                int(x["open_time_ms"]),
+                float(x["open"]),
+                float(x["high"]),
+                float(x["low"]),
+                float(x["close"]),
+                float(x.get("volume", 0.0)),
+                int(x.get("close_time_ms") or (int(x["open_time_ms"]) + 5*60_000)),
+                0.0, 0, 0.0, 0.0, 0
+            ])
+        # match binance-like columns; indicators need open_time/open/high/low/close/volume
+        df = pd.DataFrame(rows, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","quote_volume","n_trades","taker_base","taker_quote","ignore"
+        ])
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+        for col in ("open","high","low","close","volume"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+
+    async def _maybe_write_db(self, ex: str, market: str, symbol: str, tf: str, df: 'pd.DataFrame') -> None:
+        try:
+            import db_store  # local module
+        except Exception:
+            return
+        if df is None or df.empty:
+            return
+        write_every = float(os.getenv("CANDLES_WS_DB_WRITE_EVERY_SEC", "3") or 3)
+        key = (ex, market, symbol, tf)
+        now = time.time()
+        if (now - float(self._last_write.get(key, 0.0))) < write_every:
+            return
+        self._last_write[key] = now
+        try:
+            blob = db_store._cc_pack_df(df)
+            await db_store.candles_cache_set(ex.upper(), market.upper(), symbol.upper(), tf, int(self.limit), blob)
+        except Exception:
+            # do not crash on DB failures
+            return
+
+    async def _flush_symbol(self, ex: str, market: str, symbol: str) -> None:
+        key = (ex, market, symbol)
+        # 5m
+        df5 = self._df_from_buf(self._buf5.get(key) or deque())
+        await self._maybe_write_db(ex, market, symbol, "5m", df5)
+        # 30m
+        df30 = self._df_from_buf(self._agg30.get(key) or deque())
+        await self._maybe_write_db(ex, market, symbol, "30m", df30)
+        # 1h
+        df1h = self._df_from_buf(self._agg1h.get(key) or deque())
+        await self._maybe_write_db(ex, market, symbol, "1h", df1h)
+
+    async def _binance_loop(self, market: str) -> None:
+        # One connection per market, 5m streams for all symbols
+        import websockets
+        m = (market or "SPOT").upper()
+        base = "wss://stream.binance.com:9443" if m == "SPOT" else "wss://fstream.binance.com"
+        streams = "/stream?streams=" + "/".join([f"{s.lower()}@kline_5m" for s in self.symbols])
+        url = base + streams
+        backoff = 1
+        while True:
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_queue=2048) as ws:
+                    backoff = 1
+                    async for msg in ws:
+                        try:
+                            j = json.loads(msg)
+                            data = j.get("data") or {}
+                            k = data.get("k") or {}
+                            if not k:
+                                continue
+                            sym = (k.get("s") or "").upper()
+                            is_closed = bool(k.get("x"))
+                            if not is_closed:
+                                continue
+                            o_ms = int(k.get("t"))
+                            c_ms = int(k.get("T"))
+                            c = dict(
+                                open_time_ms=o_ms,
+                                close_time_ms=c_ms,
+                                open=float(k.get("o")),
+                                high=float(k.get("h")),
+                                low=float(k.get("l")),
+                                close=float(k.get("c")),
+                                volume=float(k.get("v") or 0.0),
+                                tf="5m",
+                            )
+                            self._append_5m("binance", m, sym, c)
+                            await self._flush_symbol("binance", m, sym)
+                        except Exception:
+                            continue
+            except Exception:
+                await asyncio.sleep(min(30, backoff))
+                backoff = min(30, backoff * 2)
+
+    async def _bybit_loop(self, market: str) -> None:
+        # Public v5 websockets; subscribe to 5m kline topics
+        import websockets
+        m = (market or "SPOT").upper()
+        url = "wss://stream.bybit.com/v5/public/spot" if m == "SPOT" else "wss://stream.bybit.com/v5/public/linear"
+        sub = {"op": "subscribe", "args": [f"kline.5.{s.upper()}" for s in self.symbols]}
+        backoff = 1
+        while True:
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_queue=4096) as ws:
+                    backoff = 1
+                    try:
+                        await ws.send(json.dumps(sub))
+                    except Exception:
+                        pass
+                    async for msg in ws:
+                        try:
+                            j = json.loads(msg)
+                            topic = str(j.get("topic") or "")
+                            if not topic.startswith("kline."):
+                                continue
+                            data = j.get("data")
+                            if not data:
+                                continue
+                            # data can be dict or list; normalize to list
+                            if isinstance(data, dict):
+                                data = [data]
+                            for k in data:
+                                # bybit kline fields: start/end/open/high/low/close/volume, confirm
+                                is_closed = bool(k.get("confirm") or k.get("is_confirm"))
+                                if not is_closed:
+                                    continue
+                                sym = (k.get("symbol") or "").upper()
+                                o_ms = int(k.get("start") or 0)
+                                c_ms = int(k.get("end") or (o_ms + 5*60_000))
+                                c = dict(
+                                    open_time_ms=o_ms,
+                                    close_time_ms=c_ms,
+                                    open=float(k.get("open")),
+                                    high=float(k.get("high")),
+                                    low=float(k.get("low")),
+                                    close=float(k.get("close")),
+                                    volume=float(k.get("volume") or 0.0),
+                                    tf="5m",
+                                )
+                                self._append_5m("bybit", m, sym, c)
+                                await self._flush_symbol("bybit", m, sym)
+                        except Exception:
+                            continue
+            except Exception:
+                await asyncio.sleep(min(30, backoff))
+                backoff = min(30, backoff * 2)
+
+    async def _okx_loop(self, market: str) -> None:
+        import websockets
+        m = (market or "SPOT").upper()
+        url = "wss://ws.okx.com:8443/ws/v5/public"
+        args = [{"channel":"candle5m","instId": self._okx_inst(m, s)} for s in self.symbols]
+        sub = {"op":"subscribe","args": args}
+        backoff = 1
+        while True:
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20, max_queue=4096) as ws:
+                    backoff = 1
+                    try:
+                        await ws.send(json.dumps(sub))
+                    except Exception:
+                        pass
+                    async for msg in ws:
+                        try:
+                            j = json.loads(msg)
+                            if j.get("event"):
+                                continue
+                            arg = j.get("arg") or {}
+                            ch = str(arg.get("channel") or "")
+                            if ch != "candle5m":
+                                continue
+                            inst = str(arg.get("instId") or "")
+                            data = j.get("data") or []
+                            if not data:
+                                continue
+                            # OKX candle array: [ts,o,h,l,c,vol,volCcy,volCcyQuote,confirm]
+                            row = data[0]
+                            if len(row) < 6:
+                                continue
+                            ts = int(row[0])
+                            o,h,l,c0,vol = row[1],row[2],row[3],row[4],row[5]
+                            # inst -> symbol
+                            sym = inst.replace("-SWAP","").replace("-","")
+                            cdict = dict(
+                                open_time_ms=ts,
+                                close_time_ms=ts + 5*60_000,
+                                open=float(o), high=float(h), low=float(l), close=float(c0),
+                                volume=float(vol or 0.0),
+                                tf="5m",
+                            )
+                            self._append_5m("okx", m, sym, cdict)
+                            await self._flush_symbol("okx", m, sym)
+                        except Exception:
+                            continue
+            except Exception:
+                await asyncio.sleep(min(30, backoff))
+                backoff = min(30, backoff * 2)
+
+    async def run(self) -> None:
+        tasks = []
+        for ex in self.exchanges:
+            for m in self.markets:
+                if ex == "binance":
+                    tasks.append(asyncio.create_task(self._binance_loop(m)))
+                elif ex == "bybit":
+                    tasks.append(asyncio.create_task(self._bybit_loop(m)))
+                elif ex == "okx":
+                    tasks.append(asyncio.create_task(self._okx_loop(m)))
+        if not tasks:
+            return
+        await asyncio.gather(*tasks)
+
+async def ws_candles_service_loop(backend: 'Backend') -> None:
+    """Run WS candles aggregator and persist candles to DB cache for SPOT and FUTURES."""
+    # symbols source
+    src = str(os.getenv("CANDLES_WS_SYMBOLS_SOURCE", "TOP_N") or "TOP_N").upper().strip()
+    symbols: list[str] = []
+    if src == "STATIC":
+        raw = str(os.getenv("CANDLES_WS_SYMBOLS_STATIC", "") or "")
+        symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    else:
+        # TOP_N: reuse scanner symbol pool if available
+        try:
+            top_n = int(os.getenv("MID_TOP_N_SYMBOLS", os.getenv("TOP_N", "100")) or 100)
+        except Exception:
+            top_n = 100
+        try:
+            # Backend usually has method to load symbols; fall back to Binance top list if not
+            symbols = await backend.load_top_symbols(top_n=top_n)  # type: ignore
+        except Exception:
+            # last resort: try from env
+            raw = str(os.getenv("CANDLES_WS_SYMBOLS_STATIC", "") or "")
+            symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    # sanitize: only A-Z0-9 and USDT/USDC endings
+    clean = []
+    for s in symbols:
+        s2 = re.sub(r"[^A-Z0-9]", "", (s or "").upper())
+        if not s2.endswith(("USDT","USDC")):
+            continue
+        if len(s2) < 6 or len(s2) > 20:
+            continue
+        clean.append(s2)
+    symbols = list(dict.fromkeys(clean))  # de-dupe keep order
+
+    exchanges = [x.strip().lower() for x in str(os.getenv("CANDLES_WS_EXCHANGES", "binance,bybit,okx") or "").split(",") if x.strip()]
+    markets = [x.strip().upper() for x in str(os.getenv("CANDLES_WS_MARKETS", "SPOT,FUTURES") or "").split(",") if x.strip()]
+    limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
+
+    logger = logging.getLogger("crypto-signal")
+    logger.info(f"[ws-candles] starting exchanges={exchanges} markets={markets} symbols={len(symbols)} limit={limit}")
+    agg = _WSCandlesAggregator(exchanges=exchanges, markets=markets, symbols=symbols, limit=limit)
+    await agg.run()
