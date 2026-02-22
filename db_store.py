@@ -1397,7 +1397,7 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
 
     bucket_by = (os.getenv("SIGNAL_STATS_BUCKET_BY", "closed") or "closed").strip().lower()
     if bucket_by not in ("opened", "closed"):
-        bucket_by = "opened"
+        bucket_by = "closed"
 
     # If DB not ready, be safe for dashboard.
     try:
