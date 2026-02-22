@@ -5717,15 +5717,18 @@ async def main() -> None:
             except Exception:
                 pass
 
+            
             # --- WS candles aggregator (runs ONLY on primary, optional) ---
             ws_enabled = os.getenv("CANDLES_WS_ENABLED", "0").strip().lower() not in ("0","false","no","off")
             if ws_enabled:
                 try:
                     from backend import ws_candles_service_loop
-                    logger.info("[ws-candles] CANDLES_WS_ENABLED=1 → starting WS candles aggregator (primary only)")
+                    logger.info("[ws-candles] CANDLES_WS_ENABLED=1 → starting WS candles aggregator")
                     TASKS["ws-candles"] = asyncio.create_task(ws_candles_service_loop(backend), name="ws-candles")
-                    _attach_task_monitor("ws-candles", TASKS["ws-candles"])
                     _health_mark_ok("ws-candles")
+                    _attach_task_monitor("ws-candles", TASKS["ws-candles"])
+                    # heartbeat so health doesn't show DEAD when loop is idle
+                    TASKS["ws-candles-hb"] = asyncio.create_task(_task_heartbeat_loop("ws-candles", interval_sec=10.0), name="ws-candles-hb")
                 except Exception as e:
                     logger.error("[ws-candles] failed to start WS candles aggregator: %s", e)
 
@@ -5753,13 +5756,14 @@ async def main() -> None:
                     asyncio.create_task(backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert))
                     # repeat last MID tick summary in logs so it doesn't get lost
                     asyncio.create_task(mid_summary_heartbeat_loop())
+
                 else:
                     logger.warning('MID_SCANNER_ENABLED=1 but Backend has no scanner_loop_mid; skipping')
 
             logger.info("Starting signal_outcome_loop")
             asyncio.create_task(signal_outcome_loop())
 
-# Auto-trade manager can run on all replicas (cluster-safe via DB lease/locks)
+        # Auto-trade manager can run on all replicas (cluster-safe via DB lease/locks)
         TASKS["autotrade-manager"] = asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error), name="autotrade-manager")
         _health_mark_ok("autotrade-manager")
         _attach_task_monitor("autotrade-manager", TASKS["autotrade-manager"])
