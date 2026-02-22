@@ -11758,3 +11758,51 @@ async def ws_candles_service_loop(backend: 'Backend') -> None:
     logger.info(f"[ws-candles] starting exchanges={exchanges} markets={markets} symbols={len(symbols)} limit={limit}")
     agg = _WSCandlesAggregator(exchanges=exchanges, markets=markets, symbols=symbols, limit=limit)
     await agg.run()
+
+
+# ============================================
+# Candles cache cleanup loop
+# ============================================
+
+async def candles_cache_cleanup_loop(backend: 'Backend') -> None:
+    """Periodically purge stale candles_cache rows (keys not updated recently).
+
+    candles_cache stores ONE row per key (ex/market/symbol/tf/limit). Over time, keys for delisted
+    symbols or disabled markets can remain. This loop deletes rows whose updated_at is older than
+    a configured threshold.
+
+    Env:
+      CANDLES_CACHE_CLEANUP_EVERY_SEC (default 14400 = 4h)
+      CANDLES_CACHE_PURGE_MAX_AGE_SEC (default 86400 = 24h)
+      CANDLES_CACHE_CLEANUP_ENABLED (default 1)
+    """
+    import asyncio
+    import logging
+    import os
+
+    log = logging.getLogger('crypto-signal')
+
+    enabled = str(os.getenv('CANDLES_CACHE_CLEANUP_ENABLED', '1') or '1').strip().lower() not in ('0','false','no','off')
+    if not enabled:
+        log.info('[candles-cleanup] disabled (CANDLES_CACHE_CLEANUP_ENABLED=0)')
+        return
+
+    every_sec = int(os.getenv('CANDLES_CACHE_CLEANUP_EVERY_SEC', '14400') or 14400)
+    max_age_sec = int(os.getenv('CANDLES_CACHE_PURGE_MAX_AGE_SEC', '86400') or 86400)
+
+    log.info('[candles-cleanup] started interval=%ss max_age=%ss', every_sec, max_age_sec)
+
+    while True:
+        try:
+            deleted = 0
+            try:
+                deleted = await db_store.candles_cache_purge(max_age_sec)
+            except Exception:
+                # db_store may not be ready yet; retry next cycle
+                log.exception('[candles-cleanup] purge failed')
+            else:
+                log.info('[candles-cleanup] deleted=%s stale keys (older than %ss)', deleted, max_age_sec)
+        except Exception:
+            log.exception('[candles-cleanup] unexpected error')
+
+        await asyncio.sleep(max(60, every_sec))
