@@ -6388,6 +6388,8 @@ class MultiExchangeData:
                 if not inst:
                     continue
                 # Spot: BTC-USDT  | Swap: BTC-USDT-SWAP
+                if it == 'SWAP' and not inst.endswith('-SWAP'):
+                    continue
                 if "-USDT" in inst:
                     base = inst.split("-USDT", 1)[0].replace("-", "").replace("_", "")
                     if base:
@@ -10925,6 +10927,19 @@ class Backend:
                         last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, market)
                         # If response is empty (no exception), count as EMPTY + optional adaptive limit
                         if last is None or getattr(last, 'empty', False):
+                            # If we got an empty dataframe, it often means the instrument doesn't exist for this market (esp. OKX SWAP).
+                            # Re-check market availability and convert empty->unsupported_pair to avoid repeated empty storms.
+                            try:
+                                mkt_now = (market or 'SPOT').upper().strip()
+                                if await api._market_supported_ex(ex_name, mkt_now, symb) is False:
+                                    try:
+                                        api._mark_unsupported(ex_name, mkt_now, symb, tf)
+                                    except Exception:
+                                        pass
+                                    _mid_diag_add(symb, ex_name, mkt_now, tf, 'unsupported_pair')
+                                    return pd.DataFrame()
+                            except Exception:
+                                pass
                             # If it was explicitly marked unsupported (e.g. market not implemented),
                             # don't count it as an "empty candles" sample.
                             if api._is_unsupported_cached(ex_name, (market or 'SPOT').upper().strip(), symb, tf):
