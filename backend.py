@@ -10752,6 +10752,7 @@ class Backend:
                 _mid_candles_empty = 0
                 _mid_candles_empty_reasons = defaultdict(int)
                 _mid_candles_empty_samples = defaultdict(list)
+                _mid_candles_fallback = 0
 
 
                 async def _mid_fetch_klines_rest(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
@@ -10878,9 +10879,9 @@ class Backend:
                             pass
                         return None
 
-                async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str, allow_fallback: bool = True) -> Optional[pd.DataFrame]:
+                async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
 
-                    nonlocal _mid_candles_net_fail, _mid_candles_unsupported, _mid_candles_partial, _mid_db_hit, _mid_rest_refill, _mid_candles_cache, _mid_candles_empty, _mid_candles_empty_reasons, _mid_candles_empty_samples
+                    nonlocal _mid_candles_net_fail, _mid_candles_unsupported, _mid_candles_partial, _mid_db_hit, _mid_rest_refill, _mid_candles_cache, _mid_candles_empty, _mid_candles_empty_reasons, _mid_candles_empty_samples, _mid_candles_fallback
                     # Normalize symbol consistently for cache + unsupported markers
                     _sn = (symb or '').strip().upper()
                     _sn = _sn.replace('-', '').replace('_', '').replace(':', '').replace('/', '')
@@ -10889,42 +10890,7 @@ class Backend:
                             _sn = _sn[: -len(_suf)]
                             break
                     symb = _sn
-
-                    # Auto-fallback FUTURES -> SPOT (same exchange) for candles.
-                    # Enabled by default via MID_CANDLES_FUTURES_FALLBACK_SPOT=1.
-                    _mkt_req = (market or 'SPOT').upper().strip()
-                    _orig_limit = int(limit)
-                    _fallback_enabled = str(os.getenv('MID_CANDLES_FUTURES_FALLBACK_SPOT', '1') or '1').strip().lower() not in ('0','false','no','off')
-
-                    async def _try_spot_fallback(tag: str) -> Optional[pd.DataFrame]:
-                        if not (_fallback_enabled and allow_fallback and _mkt_req == 'FUTURES'):
-                            return None
-                        try:
-                            df_spot = await _mid_fetch_klines_cached(ex_name, symb, tf, _orig_limit, 'SPOT', allow_fallback=False)
-                        except Exception:
-                            df_spot = None
-                        if df_spot is None or getattr(df_spot, 'empty', True):
-                            return None
-
-                        # Cache the SPOT candles under FUTURES key as well, so next FUTURES request hits cache.
-                        try:
-                            _now_f = time.time()
-                            fut_key = (ex_name, 'FUTURES', symb, tf, int(_orig_limit))
-                            _mid_candles_cache[fut_key] = (_now_f, df_spot)
-                            # write-through to persistent cache
-                            persist_enabled2 = str(os.getenv('MID_PERSIST_CANDLES', '1') or '1').strip().lower() not in ('0','false','no','off')
-                            if persist_enabled2 and tf in ('5m','30m','1h'):
-                                try:
-                                    blob2 = db_store._cc_pack_df(df_spot)
-                                    await db_store.candles_cache_set(ex_name, 'FUTURES', symb, tf, int(_orig_limit), blob2)
-                                except Exception:
-                                    pass
-                            _mid_diag_add(symb, ex_name, 'FUTURES', tf, 'OK', f"fallback_spot_{tag}")
-                        except Exception:
-                            pass
-                        return df_spot
-
-                    key = (ex_name, _mkt_req, symb, tf, int(limit))
+                    key = (ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
                     now = time.time()
                     ttl = _mid_cache_ttl(tf)
                     cached = _mid_candles_cache.get(key)
@@ -10957,31 +10923,49 @@ class Backend:
                         except Exception:
                             pass
 
-                    # If futures is already known-unsupported in cache, immediately try SPOT fallback.
-                    try:
-                        if _fallback_enabled and allow_fallback and _mkt_req == 'FUTURES':
-                            if api._is_unsupported_cached(ex_name, 'FUTURES', symb, tf):
-                                df_fb0 = await _try_spot_fallback('unsupported_cached')
-                                if df_fb0 is not None and not df_fb0.empty:
-                                    return df_fb0
-                    except Exception:
-                        pass
-
                     last = None
                     for _i in range(max(0, mid_candles_retry) + 1):
                         last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, market)
                         # If response is empty (no exception), count as EMPTY + optional adaptive limit
                         if last is None or getattr(last, 'empty', False):
+
+                            # Bidirectional market fallback (FUTURES <-> SPOT) when requested market yields empty/None/unsupported.
+                            try:
+                                mkt_req = (market or 'SPOT').upper().strip()
+                                fb_global = str(os.getenv("MID_CANDLES_MARKET_FALLBACK", "1") or "1").strip().lower() not in ("0","false","no","off")
+                                if fb_global and mkt_req in ("FUTURES", "SPOT"):
+                                    if mkt_req == "FUTURES":
+                                        fb_on = str(os.getenv("MID_CANDLES_FUTURES_FALLBACK_SPOT", "1") or "1").strip().lower() not in ("0","false","no","off")
+                                        alt = "SPOT" if fb_on else None
+                                    else:
+                                        fb_on = str(os.getenv("MID_CANDLES_SPOT_FALLBACK_FUTURES", "1") or "1").strip().lower() not in ("0","false","no","off")
+                                        alt = "FUTURES" if fb_on else None
+                                    if alt:
+                                        alt_df = await _mid_fetch_klines_rest(ex_name, symb, tf, int(limit), alt)
+                                        if alt_df is not None and not getattr(alt_df, "empty", True):
+                                            # Cache write-through under BOTH markets to suppress repeated empties.
+                                            key_alt = (ex_name, alt, symb, tf, int(limit))
+                                            _mid_candles_cache[key_alt] = (now, alt_df)
+                                            _mid_candles_cache[key] = (now, alt_df)
+                                            # write-through to persistent cache
+                                            try:
+                                                persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
+                                                if persist_enabled and tf in ("5m","30m","1h"):
+                                                    blob = db_store._cc_pack_df(alt_df)
+                                                    await db_store.candles_cache_set(ex_name, alt, symb, tf, int(limit), blob)
+                                                    await db_store.candles_cache_set(ex_name, mkt_req, symb, tf, int(limit), blob)
+                                            except Exception:
+                                                pass
+                                            _mid_candles_fallback += 1
+                                            _mid_diag_add(symb, ex_name, mkt_req, tf, "OK", f"fallback_{alt.lower()}")
+                                            return alt_df
+                            except Exception:
+                                pass
                             # If we got an empty dataframe, it often means the instrument doesn't exist for this market (esp. OKX SWAP).
                             # Re-check market availability and convert empty->unsupported_pair to avoid repeated empty storms.
                             try:
                                 mkt_now = (market or 'SPOT').upper().strip()
                                 if await api._market_supported_ex(ex_name, mkt_now, symb) is False:
-                                    # FUTURES missing -> try SPOT (same exchange) before marking unsupported.
-                                    if _fallback_enabled and allow_fallback and _mkt_req == 'FUTURES':
-                                        df_fb1 = await _try_spot_fallback('unsupported_pair')
-                                        if df_fb1 is not None and not df_fb1.empty:
-                                            return df_fb1
                                     try:
                                         api._mark_unsupported(ex_name, mkt_now, symb, tf)
                                     except Exception:
@@ -10994,9 +10978,6 @@ class Backend:
                             # don't count it as an "empty candles" sample.
                             if api._is_unsupported_cached(ex_name, (market or 'SPOT').upper().strip(), symb, tf):
                                 _mid_candles_unsupported += 1
-                                df_fb2 = await _try_spot_fallback('unsupported_after_empty')
-                                if df_fb2 is not None and not df_fb2.empty:
-                                    return df_fb2
                                 return None
                             _mid_candles_empty += 1
                             reason = f"empty_{ex_name.lower()}_{(market or 'SPOT').lower()}_{tf}"
@@ -11037,9 +11018,6 @@ class Backend:
                         ts, df = cached
                         if (now - ts) <= mid_cache_stale_sec and df is not None and not df.empty:
                             return df
-                    df_fb3 = await _try_spot_fallback('final')
-                    if df_fb3 is not None and not df_fb3.empty:
-                        return df_fb3
                     return None
 
                 try:
