@@ -11735,47 +11735,138 @@ class _WSCandlesAggregator:
         await asyncio.gather(*tasks)
 
 async def ws_candles_service_loop(backend: 'Backend') -> None:
-    """Run WS candles aggregator and persist candles to DB cache for SPOT and FUTURES."""
-    # symbols source
-    src = str(os.getenv("CANDLES_WS_SYMBOLS_SOURCE", "TOP_N") or "TOP_N").upper().strip()
-    symbols: list[str] = []
-    if src == "STATIC":
-        raw = str(os.getenv("CANDLES_WS_SYMBOLS_STATIC", "") or "")
-        symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
-    else:
-        # TOP_N: reuse scanner symbol pool if available
-        try:
-            top_n = int(os.getenv("MID_TOP_N_SYMBOLS", os.getenv("TOP_N", "100")) or 100)
-        except Exception:
-            top_n = 100
-        try:
-            # Backend usually has method to load symbols; fall back to Binance top list if not
-            symbols = await backend.load_top_symbols(top_n=top_n)  # type: ignore
-        except Exception:
-            # last resort: try from env
-            raw = str(os.getenv("CANDLES_WS_SYMBOLS_STATIC", "") or "")
-            symbols = [s.strip().upper() for s in raw.split(",") if s.strip()]
-    # sanitize: only A-Z0-9 and USDT/USDC endings
-    clean = []
-    for s in symbols:
-        s2 = re.sub(r"[^A-Z0-9]", "", (s or "").upper())
-        if not s2.endswith(("USDT","USDC")):
-            continue
-        if len(s2) < 6 or len(s2) > 20:
-            continue
-        clean.append(s2)
-    symbols = list(dict.fromkeys(clean))  # de-dupe keep order
+    """Run WS candles aggregator and persist candles to DB cache for SPOT and FUTURES.
+
+    Important: the scanner symbol list is often empty at process start (it is loaded by loops),
+    so this service waits until symbols become available, and then keeps them refreshed
+    (by restarting subscriptions when the symbol set changes).
+    """
+    import asyncio
+    import logging
+    import os
+    import re
+    import time
+
+    logger = logging.getLogger("crypto-signal")
 
     exchanges = [x.strip().lower() for x in str(os.getenv("CANDLES_WS_EXCHANGES", "binance,bybit,okx") or "").split(",") if x.strip()]
     _m_raw = os.getenv("CANDLES_WS_MARKET", os.getenv("CANDLES_WS_MARKETS", "SPOT,FUTURES") or "SPOT,FUTURES")
     markets = [x.strip().upper() for x in str(_m_raw or "").split(",") if x.strip()]
     limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
+    resub_sec = int(os.getenv("CANDLES_WS_RESUB_CHECK_SEC", os.getenv("CANDLES_WS_RESUB_CHECK", "30")) or 30)
 
-    logger = logging.getLogger("crypto-signal")
-    logger.info(f"[ws-candles] starting exchanges={exchanges} markets={markets} symbols={len(symbols)} limit={limit}")
-    agg = _WSCandlesAggregator(exchanges=exchanges, markets=markets, symbols=symbols, limit=limit)
-    await agg.run()
+    src = str(os.getenv("CANDLES_WS_SYMBOLS_SOURCE", "MID_POOL") or "MID_POOL").upper().strip()
+    # MID_POOL = prefer symbols that MID scanner uses; TOP_N = backend.load_top_symbols; STATIC = env list
+    if src not in ("MID_POOL", "TOP_N", "STATIC"):
+        src = "MID_POOL"
 
+    def _sanitize_symbols(symbols: list[str]) -> list[str]:
+        clean: list[str] = []
+        for s in symbols or []:
+            s2 = re.sub(r"[^A-Z0-9]", "", (s or "").upper())
+            if not s2.endswith(("USDT", "USDC")):
+                continue
+            if len(s2) < 6 or len(s2) > 30:
+                continue
+            clean.append(s2)
+        # de-dupe keep order
+        return list(dict.fromkeys(clean))
+
+    async def _get_symbols() -> list[str]:
+        # 1) STATIC
+        if src == "STATIC":
+            raw = str(os.getenv("CANDLES_WS_SYMBOLS_STATIC", "") or "")
+            return _sanitize_symbols([s.strip() for s in raw.split(",") if s.strip()])
+
+        # 2) Prefer MID symbols pool if available
+        if src == "MID_POOL":
+            for attr in ("_mid_symbols_cache", "_symbols_cache", "mid_symbols_cache", "symbols_cache"):
+                try:
+                    v = getattr(backend, attr, None)
+                    if not v:
+                        continue
+                    # common shapes: list[str] | tuple(ts, list[str]) | dict{...}
+                    if isinstance(v, (list, tuple)) and v and isinstance(v[-1], list):
+                        # tuple(ts, list) or [list]
+                        cand = v[-1]
+                    elif isinstance(v, (list, tuple)) and v and isinstance(v[0], str):
+                        cand = list(v)
+                    elif isinstance(v, dict):
+                        cand = v.get("symbols") or v.get("data") or v.get("value") or []
+                    else:
+                        cand = []
+                    if cand:
+                        return _sanitize_symbols(list(cand))
+                except Exception:
+                    continue
+
+        # 3) TOP_N via backend
+        try:
+            top_n = int(os.getenv("MID_TOP_N_SYMBOLS", os.getenv("CANDLES_WS_TOP_N", os.getenv("TOP_N", "100"))) or 100)
+        except Exception:
+            top_n = 100
+        try:
+            syms = await backend.load_top_symbols(top_n=top_n)  # type: ignore
+            return _sanitize_symbols(list(syms or []))
+        except Exception:
+            raw = str(os.getenv("CANDLES_WS_SYMBOLS_STATIC", "") or "")
+            return _sanitize_symbols([s.strip() for s in raw.split(",") if s.strip()])
+
+    logger.info("[ws-candles] service starting exchanges=%s markets=%s limit=%s src=%s resub=%ss",
+                exchanges, markets, limit, src, resub_sec)
+
+    current: list[str] = []
+    agg_task: asyncio.Task | None = None
+    last_wait_log = 0.0
+
+    while True:
+        try:
+            symbols = await _get_symbols()
+            if not symbols:
+                now = time.time()
+                if now - last_wait_log > 30:
+                    logger.info("[ws-candles] waiting for symbols... (scanner pools not ready yet)")
+                    last_wait_log = now
+                await asyncio.sleep(5)
+                continue
+
+            # Restart aggregator when symbol set changes or when task died
+            need_restart = (symbols != current) or (agg_task is None) or (agg_task.done())
+
+            if agg_task is not None and agg_task.done():
+                try:
+                    exc = agg_task.exception()
+                    if exc:
+                        logger.warning("[ws-candles] aggregator crashed: %s", exc)
+                except Exception:
+                    pass
+                agg_task = None
+                current = []
+
+            if need_restart:
+                # Stop previous (if running)
+                if agg_task is not None and (not agg_task.done()):
+                    try:
+                        agg_task.cancel()
+                        await asyncio.wait_for(agg_task, timeout=10)
+                    except Exception:
+                        pass
+                    agg_task = None
+
+                current = symbols
+                logger.info("[ws-candles] (re)starting exchanges=%s markets=%s symbols=%s limit=%s",
+                            exchanges, markets, len(current), limit)
+                agg = _WSCandlesAggregator(exchanges=exchanges, markets=markets, symbols=current, limit=limit)
+                agg_task = asyncio.create_task(agg.run(), name="ws-candles-aggregator")
+
+            await asyncio.sleep(max(10, resub_sec))
+        except asyncio.CancelledError:
+            if agg_task is not None:
+                agg_task.cancel()
+            raise
+        except Exception:
+            logger.exception("[ws-candles] service loop error")
+            await asyncio.sleep(5)
 
 # ============================================
 # Candles cache cleanup loop
