@@ -10614,7 +10614,12 @@ class Backend:
                             # PRODUCTION: drop obviously-bad symbols early (saves REST/WS limits and prevents no_candles storms)
                             _sym = (symb or '').strip().upper()
                             if (not _sym.isascii()) or (not _sym.endswith('USDT')) or (len(_sym) < 6) or (not re.match(r'^[A-Z0-9]{2,20}USDT$', _sym)):
-                                _mark_unsupported(ex_name, mkt, _sym, tf, reason='invalid_symbol_format')
+                                # Mark as unsupported to avoid repeated REST/WS attempts for clearly invalid symbols.
+                                try:
+                                    api._mark_unsupported(ex_name, mkt, _sym, tf)
+                                except Exception:
+                                    pass
+                                _mid_diag_add(_sym, ex_name, mkt, tf, 'invalid_symbol_format')
                                 _mid_candles_unsupported += 1
                                 return None
 
