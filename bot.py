@@ -4613,9 +4613,14 @@ async def main() -> None:
     await init_db()
     load_langs()
 
-    # Persistent candles cache maintenance (purge old rows)
-    TASKS["candles-cache-purge"] = asyncio.create_task(_candles_cache_purge_loop(), name="candles-cache-purge")
-    _attach_task_monitor("candles-cache-purge", TASKS["candles-cache-purge"])
+    # Persistent candles cache maintenance (optional).
+    # NOTE: Disabled by default. Prefer backend.candles_cache_cleanup_loop for DB-level cleanup.
+    purge_enabled = str(os.getenv("CANDLES_CACHE_PURGE_LOOP_ENABLED", "0") or "0").strip().lower() not in ("0","false","no","off")
+    cleanup_enabled = str(os.getenv("CANDLES_CACHE_CLEANUP_ENABLED", "1") or "1").strip().lower() not in ("0","false","no","off")
+    if purge_enabled and (not cleanup_enabled):
+        TASKS["candles-cache-purge"] = asyncio.create_task(_candles_cache_purge_loop(), name="candles-cache-purge")
+        _attach_task_monitor("candles-cache-purge", TASKS["candles-cache-purge"])
+
 
 
     # Forward unhandled asyncio task exceptions to error-bot (so "Task exception was never retrieved" is not lost)
