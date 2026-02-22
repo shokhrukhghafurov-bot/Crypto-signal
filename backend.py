@@ -11755,10 +11755,10 @@ async def ws_candles_service_loop(backend: 'Backend') -> None:
     limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
     resub_sec = int(os.getenv("CANDLES_WS_RESUB_CHECK_SEC", os.getenv("CANDLES_WS_RESUB_CHECK", "30")) or 30)
 
-    src = str(os.getenv("CANDLES_WS_SYMBOLS_SOURCE", "MID_POOL") or "MID_POOL").upper().strip()
-    # MID_POOL = prefer symbols that MID scanner uses; TOP_N = backend.load_top_symbols; STATIC = env list
-    if src not in ("MID_POOL", "TOP_N", "STATIC"):
-        src = "MID_POOL"
+    src = str(os.getenv("CANDLES_WS_SYMBOLS_SOURCE", "BOTH_POOLS") or "BOTH_POOLS").upper().strip()
+    # BOTH_POOLS = MID pool + main scanner pool; MID_POOL = MID scanner pool; TOP_N = backend.load_top_symbols; STATIC = env list
+    if src not in ("BOTH_POOLS", "MID_POOL", "TOP_N", "STATIC"):
+        src = "BOTH_POOLS"
 
     def _sanitize_symbols(symbols: list[str]) -> list[str]:
         clean: list[str] = []
@@ -11772,37 +11772,73 @@ async def ws_candles_service_loop(backend: 'Backend') -> None:
         # de-dupe keep order
         return list(dict.fromkeys(clean))
 
+    def _extract_cache_symbols(v) -> list[str]:
+        """Extract symbols list from various cache shapes used in Backend."""
+        try:
+            if not v:
+                return []
+            if isinstance(v, (list, tuple)):
+                if v and isinstance(v[-1], list):
+                    return list(v[-1])
+                if v and isinstance(v[0], str):
+                    return list(v)
+            if isinstance(v, dict):
+                cand = v.get("symbols") or v.get("data") or v.get("value") or []
+                if isinstance(cand, (list, tuple)):
+                    return list(cand)
+            return []
+        except Exception:
+            return []
+
+
     async def _get_symbols() -> list[str]:
         # 1) STATIC
         if src == "STATIC":
             raw = str(os.getenv("CANDLES_WS_SYMBOLS_STATIC", "") or "")
             return _sanitize_symbols([s.strip() for s in raw.split(",") if s.strip()])
 
-        # 2) Prefer MID symbols pool if available
-        if src == "MID_POOL":
-            for attr in ("_mid_symbols_cache", "_symbols_cache", "mid_symbols_cache", "symbols_cache"):
-                try:
-                    v = getattr(backend, attr, None)
-                    if not v:
-                        continue
-                    # common shapes: list[str] | tuple(ts, list[str]) | dict{...}
-                    if isinstance(v, (list, tuple)) and v and isinstance(v[-1], list):
-                        # tuple(ts, list) or [list]
-                        cand = v[-1]
-                    elif isinstance(v, (list, tuple)) and v and isinstance(v[0], str):
-                        cand = list(v)
-                    elif isinstance(v, dict):
-                        cand = v.get("symbols") or v.get("data") or v.get("value") or []
-                    else:
-                        cand = []
-                    if cand:
-                        return _sanitize_symbols(list(cand))
-                except Exception:
-                    continue
+        # 2) Pools from running scanners (best: no extra REST)
+        if src in ("BOTH_POOLS", "MID_POOL"):
+            try:
+                mid_max = int(os.getenv("CANDLES_WS_TOP_N_MID", os.getenv("MID_TOP_N_SYMBOLS", "150")) or 150)
+            except Exception:
+                mid_max = 150
+            try:
+                main_max = int(os.getenv("CANDLES_WS_TOP_N_MAIN", os.getenv("TOP_N", "10")) or 10)
+            except Exception:
+                main_max = 10
 
-        # 3) TOP_N via backend
+            mid_syms: list[str] = []
+            main_syms: list[str] = []
+
+            # MID pool (scanner_loop_mid)
+            for attr in ("_mid_symbols_cache", "mid_symbols_cache"):
+                mid_syms = _extract_cache_symbols(getattr(backend, attr, None))
+                if mid_syms:
+                    break
+
+            # MAIN pool (scanner_loop)
+            if src == "BOTH_POOLS":
+                for attr in ("_symbols_cache", "symbols_cache"):
+                    main_syms = _extract_cache_symbols(getattr(backend, attr, None))
+                    if main_syms:
+                        break
+
+            mid_syms = _sanitize_symbols(list(mid_syms)[: max(0, mid_max)])
+            main_syms = _sanitize_symbols(list(main_syms)[: max(0, main_max)])
+
+            if mid_syms or main_syms:
+                out: list[str] = []
+                seen: set[str] = set()
+                for s in (mid_syms + main_syms):
+                    if s not in seen:
+                        out.append(s)
+                        seen.add(s)
+                return out
+
+        # 3) TOP_N via backend (fallback)
         try:
-            top_n = int(os.getenv("MID_TOP_N_SYMBOLS", os.getenv("CANDLES_WS_TOP_N", os.getenv("TOP_N", "100"))) or 100)
+            top_n = int(os.getenv("CANDLES_WS_TOP_N", os.getenv("MID_TOP_N_SYMBOLS", os.getenv("TOP_N", "100"))) or 100)
         except Exception:
             top_n = 100
         try:
