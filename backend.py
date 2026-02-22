@@ -6257,6 +6257,16 @@ class MultiExchangeData:
         key = (exchange.upper(), (market or "").upper(), symbol.upper(), (interval or "").lower())
         self._unsupported_until[key] = time.monotonic() + float(self._unsupported_ttl)
 
+    def _mark_unsupported_ttl(self, exchange: str, market: str, symbol: str, interval: str, ttl_sec: float) -> None:
+        """Mark symbol/market/interval as temporarily unsupported for a custom TTL (seconds)."""
+        try:
+            ttl = float(ttl_sec)
+        except Exception:
+            ttl = float(self._unsupported_ttl)
+        ttl = max(1.0, ttl)
+        key = (exchange.upper(), (market or "").upper(), symbol.upper(), (interval or "").lower())
+        self._unsupported_until[key] = time.monotonic() + ttl
+
     async def _get_gateio_markets(self) -> set[str]:
         now = time.monotonic()
         cached = self._markets_cache.get("GATEIO")
@@ -6605,8 +6615,10 @@ class MultiExchangeData:
                 self._mark_unsupported("BYBIT", mkt, sym, iv)
                 return pd.DataFrame()
         except Exception:
-            # If availability check fails, fall back to request (legacy behavior)
-            pass
+            # If availability check fails, DO NOT spam REST requests (they often return empty lists).
+            # Mark as temporarily unsupported and skip this tick.
+            self._mark_unsupported_ttl("BYBIT", mkt, sym, iv, float(os.getenv("CANDLES_AVAIL_FAIL_TTL_SEC", "90") or "90"))
+            return pd.DataFrame()
 
         async def _fetch():
             interval_map = {'5m':'5', '15m':'15', '30m':'30', '1h':'60', '4h':'240'}
@@ -6620,6 +6632,11 @@ class MultiExchangeData:
             if isinstance(data, dict) and str(data.get('retCode', '0')) not in ('0', ''):
                 raise ExchangeAPIError(f"BYBIT {mkt} retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
             rows = (data or {}).get('result', {}).get('list', []) or []
+            if not rows:
+                # BYBIT sometimes returns HTTP 200 with empty list for unsupported/paused pairs.
+                # Cache as unsupported to prevent storms.
+                self._mark_unsupported("BYBIT", mkt, sym, iv)
+                return pd.DataFrame()
             rows = list(reversed(rows))
             return self._df_from_ohlcv(rows, 'bybit')
 
@@ -6644,7 +6661,8 @@ class MultiExchangeData:
                 self._mark_unsupported("OKX", mkt, sym, iv)
                 return pd.DataFrame()
         except Exception:
-            pass
+            self._mark_unsupported_ttl("OKX", mkt, sym, iv, float(os.getenv("CANDLES_AVAIL_FAIL_TTL_SEC", "90") or "90"))
+            return pd.DataFrame()
 
         async def _fetch():
             bar_map = {'5m':'5m', '15m':'15m', '30m':'30m', '1h':'1H', '4h':'4H'}
@@ -6661,6 +6679,10 @@ class MultiExchangeData:
             if isinstance(data, dict) and str(data.get('code', '0')) not in ('0', ''):
                 raise ExchangeAPIError(f"OKX {mkt} code={data.get('code')} msg={data.get('msg')}")
             rows = (data or {}).get('data', []) or []
+            if not rows:
+                # OKX may return empty data list for unsupported/paused instId.
+                self._mark_unsupported("OKX", mkt, sym, iv)
+                return pd.DataFrame()
             rows = list(reversed(rows))
             return self._df_from_ohlcv(rows, 'okx')
 
@@ -10569,6 +10591,7 @@ class Backend:
                 _mid_diag_max = int(os.getenv('MID_CANDLES_DIAG_MAX', '200') or 200)
                 _mid_diag_lines = 0
                 _mid_candles_diag = defaultdict(list)  # (symbol, tf) -> ["EX:MARKET:STATUS(:reason)", ...]
+                _mid_diag_seen = set()  # dedup log spam per tick
 
                 def _mid_diag_add(symb: str, ex_name: str, market: str, tf: str, status: str, reason: str = '') -> None:
                     nonlocal _mid_diag_lines
@@ -10577,8 +10600,12 @@ class Backend:
                         rec = f"{ex_name}:{(market or 'SPOT').upper().strip()}:{status}" + (f":{reason}" if reason else '')
                         _mid_candles_diag[key].append(rec)
                         if _mid_diag_enabled and _mid_diag_lines < _mid_diag_max and status != 'OK':
-                            _mid_diag_lines += 1
-                            logger.info(f"[mid][candles_missing] symbol={symb} exchange={ex_name} market={(market or 'SPOT').upper().strip()} tf={tf} status={status}" + (f" reason={reason}" if reason else ""))
+                            # Deduplicate repeated unsupported_cached spam within the same tick
+                            dkey = (symb, ex_name, (market or 'SPOT').upper().strip(), tf, status, (reason or ''))
+                            if dkey not in _mid_diag_seen:
+                                _mid_diag_seen.add(dkey)
+                                _mid_diag_lines += 1
+                                logger.info(f"[mid][candles_missing] symbol={symb} exchange={ex_name} market={(market or 'SPOT').upper().strip()} tf={tf} status={status}" + (f" reason={reason}" if reason else ""))
                     except Exception:
                         pass
 
