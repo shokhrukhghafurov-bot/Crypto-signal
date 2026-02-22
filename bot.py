@@ -5717,7 +5717,18 @@ async def main() -> None:
             except Exception:
                 pass
 
-            logger.info("Starting track_loop")
+            
+# --- WS candles aggregator (runs ONLY on primary, optional) ---
+ws_enabled = os.getenv("CANDLES_WS_ENABLED", "0").strip().lower() not in ("0","false","no","off")
+if ws_enabled:
+    try:
+        from backend import ws_candles_service_loop
+        logger.info("[ws-candles] CANDLES_WS_ENABLED=1 → starting WS candles aggregator (primary only)")
+        asyncio.create_task(ws_candles_service_loop(backend), name="ws-candles")
+    except Exception as e:
+        logger.error("[ws-candles] failed to start WS candles aggregator: %s", e)
+
+logger.info("Starting track_loop")
             if hasattr(backend, "track_loop"):
                 # Let backend report liveness for Smart Manager (once per cycle)
                 try:
@@ -5809,14 +5820,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-# --- WS candles service startup (PRO) ---
-try:
-    from backend import ws_candles_service_loop
-    if os.getenv("WORKER_ROLE", "").upper() == "WS_CANDLES":
-        logger.info("[ws-candles] WORKER_ROLE=WS_CANDLES → starting service")
-        asyncio.create_task(ws_candles_service_loop(backend))
-except Exception as e:
-    logger.error("[ws-candles] failed to start WS candles service: %s", e)
-
