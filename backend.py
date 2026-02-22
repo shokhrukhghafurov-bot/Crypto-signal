@@ -6301,6 +6301,135 @@ class MultiExchangeData:
                 return cached[1]
             return set()
 
+
+    async def _get_binance_futures_markets(self) -> set[str]:
+        """Cached set of BINANCE USDT-M futures symbols (canonical like BTCUSDT)."""
+        now = time.monotonic()
+        cached = self._markets_cache.get("BINANCE_FUTURES")
+        if cached and now < cached[0]:
+            return cached[1]
+        url = f"{self.BINANCE_FUTURES}/fapi/v1/exchangeInfo"
+        try:
+            raw = await self._get_json(url, params=None)
+            s: set[str] = set()
+            if isinstance(raw, dict):
+                for r in (raw.get("symbols") or []):
+                    if isinstance(r, dict):
+                        sym = (r.get("symbol") or "").strip()
+                        if not sym:
+                            continue
+                        stt = str(r.get("status") or "").upper()
+                        if stt and stt not in ("TRADING", "1"):
+                            continue
+                        s.add(sym.upper())
+            self._markets_cache["BINANCE_FUTURES"] = (now + float(self._markets_cache_ttl), s)
+            return s
+        except Exception:
+            if cached:
+                return cached[1]
+            return set()
+
+    async def _get_bybit_markets(self, *, category: str) -> set[str]:
+        """Cached set of BYBIT symbols for category 'linear' (futures) or 'spot'."""
+        cat = (category or "spot").strip().lower()
+        key_name = f"BYBIT_{cat.upper()}"
+        now = time.monotonic()
+        cached = self._markets_cache.get(key_name)
+        if cached and now < cached[0]:
+            return cached[1]
+        url = f"{self.BYBIT}/v5/market/instruments-info"
+        s: set[str] = set()
+        try:
+            cursor = None
+            # Safety cap: avoid infinite pagination loops if API misbehaves
+            for _ in range(0, 8):
+                params = {"category": cat, "limit": "1000"}
+                if cursor:
+                    params["cursor"] = cursor
+                raw = await self._get_json(url, params=params)
+                if isinstance(raw, dict) and str(raw.get("retCode", "0")) not in ("0", ""):
+                    raise ExchangeAPIError(f"BYBIT instruments-info retCode={raw.get('retCode')} retMsg={raw.get('retMsg')}")
+                lst = ((raw.get("result") or {}).get("list") or []) if isinstance(raw, dict) else []
+                for r in lst:
+                    if isinstance(r, dict):
+                        sym = (r.get("symbol") or "").strip()
+                        if sym:
+                            s.add(sym.upper())
+                nxt = ((raw.get("result") or {}).get("nextPageCursor") or "") if isinstance(raw, dict) else ""
+                if not nxt or nxt == cursor:
+                    break
+                cursor = nxt
+            self._markets_cache[key_name] = (now + float(self._markets_cache_ttl), s)
+            return s
+        except Exception:
+            if cached:
+                return cached[1]
+            return set()
+
+    async def _get_okx_markets(self, *, inst_type: str) -> set[str]:
+        """Cached set of OKX instIds normalized to canonical BASEQUOTE (BTCUSDT)."""
+        it = (inst_type or "SPOT").strip().upper()
+        key_name = f"OKX_{it}"
+        now = time.monotonic()
+        cached = self._markets_cache.get(key_name)
+        if cached and now < cached[0]:
+            return cached[1]
+        url = f"{self.OKX}/api/v5/public/instruments"
+        s: set[str] = set()
+        try:
+            raw = await self._get_json(url, params={"instType": it})
+            if isinstance(raw, dict) and str(raw.get("code", "0")) not in ("0", ""):
+                raise ExchangeAPIError(f"OKX instruments code={raw.get('code')} msg={raw.get('msg')}")
+            lst = (raw.get("data") or []) if isinstance(raw, dict) else []
+            for r in lst:
+                if not isinstance(r, dict):
+                    continue
+                inst = (r.get("instId") or "").strip().upper()
+                if not inst:
+                    continue
+                # Spot: BTC-USDT  | Swap: BTC-USDT-SWAP
+                if "-USDT" in inst:
+                    base = inst.split("-USDT", 1)[0].replace("-", "").replace("_", "")
+                    if base:
+                        s.add(f"{base}USDT")
+            self._markets_cache[key_name] = (now + float(self._markets_cache_ttl), s)
+            return s
+        except Exception:
+            if cached:
+                return cached[1]
+            return set()
+
+    async def _market_supported_ex(self, exchange: str, market: str, symbol: str) -> bool:
+        """True if symbol exists on the exchange for the given market (SPOT/FUTURES)."""
+        if not self._market_avail_check:
+            return True
+        ex = (exchange or "").upper().strip()
+        mkt = (market or "SPOT").upper().strip()
+        sym = (symbol or "").upper().strip()
+        if not sym:
+            return False
+
+        # Gate/MEXC: already supported via old helper (spot-only)
+        if ex in ("GATEIO", "MEXC") and mkt == "SPOT":
+            return await self._market_supported(ex, sym)
+
+        if ex == "BINANCE" and mkt == "FUTURES":
+            markets = await self._get_binance_futures_markets()
+            sym_req = self._binance_futures_symbol_alias(sym)
+            return (sym in markets) or (sym_req in markets)
+
+        if ex == "BYBIT":
+            cat = "linear" if mkt == "FUTURES" else "spot"
+            markets = await self._get_bybit_markets(category=cat)
+            return sym in markets
+
+        if ex == "OKX":
+            it = "SWAP" if mkt == "FUTURES" else "SPOT"
+            markets = await self._get_okx_markets(inst_type=it)
+            return sym in markets
+
+        return True
+
     async def _market_supported(self, exchange: str, symbol: str) -> bool:
         if not self._market_avail_check:
             return True
@@ -6466,6 +6595,17 @@ class MultiExchangeData:
         mkt = (market or 'SPOT').upper().strip()
         cache_key = ('BYBIT', mkt, sym, iv, int(limit))
 
+        # Fast-skip unsupported symbols/markets (prevents BYBIT empty/no_candles storms)
+        if self._is_unsupported_cached("BYBIT", mkt, sym, iv):
+            return pd.DataFrame()
+        try:
+            if not await self._market_supported_ex("BYBIT", mkt, sym):
+                self._mark_unsupported("BYBIT", mkt, sym, iv)
+                return pd.DataFrame()
+        except Exception:
+            # If availability check fails, fall back to request (legacy behavior)
+            pass
+
         async def _fetch():
             interval_map = {'5m':'5', '15m':'15', '30m':'30', '1h':'60', '4h':'240'}
             itv = interval_map.get(iv, '15')
@@ -6473,6 +6613,8 @@ class MultiExchangeData:
             category = 'linear' if mkt == 'FUTURES' else 'spot'
             params = {'category': category, 'symbol': sym, 'interval': itv, 'limit': str(limit)}
             data = await self._get_json(url, params=params)
+            if not isinstance(data, dict):
+                raise ExchangeAPIError(f"BYBIT {mkt} bad_payload type={type(data).__name__}")
             if isinstance(data, dict) and str(data.get('retCode', '0')) not in ('0', ''):
                 raise ExchangeAPIError(f"BYBIT {mkt} retCode={data.get('retCode')} retMsg={data.get('retMsg')}")
             rows = (data or {}).get('result', {}).get('list', []) or []
@@ -6493,6 +6635,15 @@ class MultiExchangeData:
         mkt = (market or 'SPOT').upper().strip()
         cache_key = ('OKX', mkt, sym, iv, int(limit))
 
+        if self._is_unsupported_cached("OKX", mkt, sym, iv):
+            return pd.DataFrame()
+        try:
+            if not await self._market_supported_ex("OKX", mkt, sym):
+                self._mark_unsupported("OKX", mkt, sym, iv)
+                return pd.DataFrame()
+        except Exception:
+            pass
+
         async def _fetch():
             bar_map = {'5m':'5m', '15m':'15m', '30m':'30m', '1h':'1H', '4h':'4H'}
             bar = bar_map.get(iv, '15m')
@@ -6503,6 +6654,8 @@ class MultiExchangeData:
             url = f"{self.OKX}/api/v5/market/candles"
             params = {'instId': inst, 'bar': bar, 'limit': str(limit)}
             data = await self._get_json(url, params=params)
+            if not isinstance(data, dict):
+                raise ExchangeAPIError(f"OKX {mkt} bad_payload type={type(data).__name__}")
             if isinstance(data, dict) and str(data.get('code', '0')) not in ('0', ''):
                 raise ExchangeAPIError(f"OKX {mkt} code={data.get('code')} msg={data.get('msg')}")
             rows = (data or {}).get('data', []) or []
@@ -10625,7 +10778,7 @@ class Backend:
 
                             # Fast-skip pairs we already know are unsupported on this exchange/market/TF
                             try:
-                                if api._is_unsupported_cached(ex_name, mkt, symb, tf):
+                                if api._is_unsupported_cached(ex_name, mkt, _sym, tf):
                                     _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_cached')
                                     return pd.DataFrame()
                             except Exception:
@@ -10638,6 +10791,19 @@ class Backend:
                                     pass
                                 _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_market')
                                 return None
+                            # Availability check (cached): skip symbols that don't exist on this exchange/market
+                            try:
+                                if not await api._market_supported_ex(ex_name, mkt, _sym):
+                                    try:
+                                        api._mark_unsupported(ex_name, mkt, _sym, tf)
+                                    except Exception:
+                                        pass
+                                    _mid_diag_add(_sym, ex_name, mkt, tf, 'unsupported_pair')
+                                    return pd.DataFrame()
+                            except Exception:
+                                # If availability check fails, fall back to request
+                                pass
+
                             if ex_name == "BINANCE":
                                 # Avoid noisy HTTP 400 (Invalid symbol) on futures by checking exchangeInfo first.
                                 try:
@@ -10713,6 +10879,14 @@ class Backend:
                 async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
 
                     nonlocal _mid_candles_net_fail, _mid_candles_unsupported, _mid_candles_partial, _mid_db_hit, _mid_rest_refill, _mid_candles_cache, _mid_candles_empty, _mid_candles_empty_reasons, _mid_candles_empty_samples
+                    # Normalize symbol consistently for cache + unsupported markers
+                    _sn = (symb or '').strip().upper()
+                    _sn = _sn.replace('-', '').replace('_', '').replace(':', '').replace('/', '')
+                    for _suf in ('SWAP','PERP','PERPETUAL','FUT','FUTURES'):
+                        if _sn.endswith(_suf):
+                            _sn = _sn[: -len(_suf)]
+                            break
+                    symb = _sn
                     key = (ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
                     now = time.time()
                     ttl = _mid_cache_ttl(tf)
@@ -10822,6 +10996,9 @@ class Backend:
                                     return u
 
                                 symbols_pool = [_mid_norm_symbol(x) for x in symbols_pool if x]
+                                # Production hardening: drop obviously invalid symbols early (prevents invalid_symbol_format/no_candles storms)
+                                _sym_ok = re.compile(r'^[A-Z0-9]{2,20}USDT$')
+                                symbols_pool = [x for x in symbols_pool if x and x.isascii() and x.endswith('USDT') and _sym_ok.match(x)]
                                 # de-duplicate (some exchanges/pools can return duplicates)
                                 symbols_pool = list(dict.fromkeys(symbols_pool))
                                 self._mid_symbols_cache = list(symbols_pool)
