@@ -10696,7 +10696,7 @@ class Backend:
 
                 async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
 
-                    nonlocal _mid_candles_net_fail, _mid_candles_unsupported, _mid_candles_partial, _mid_candles_cache, _mid_candles_empty, _mid_candles_empty_reasons, _mid_candles_empty_samples
+                    nonlocal _mid_candles_net_fail, _mid_candles_unsupported, _mid_candles_partial, _mid_db_hit, _mid_rest_refill, _mid_candles_cache, _mid_candles_empty, _mid_candles_empty_reasons, _mid_candles_empty_samples
                     key = (ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
                     now = time.time()
                     ttl = _mid_cache_ttl(tf)
@@ -10704,6 +10704,7 @@ class Backend:
                     if cached:
                         ts, df = cached
                         if (now - ts) <= ttl and df is not None and not df.empty:
+                            _mid_db_hit += 1
                             _mid_diag_add(symb, ex_name, market, tf, 'OK', 'cache')
                             return df
                     
@@ -10722,6 +10723,7 @@ class Backend:
                                 if age <= max_age:
                                     dfp = db_store._cc_unpack_df(blob)
                                     if dfp is not None and not dfp.empty:
+                                        _mid_db_hit += 1
                                         _mid_candles_cache[key] = (now, dfp)
                                         _mid_diag_add(symb, ex_name, market, tf, 'OK', 'persist')
                                         return dfp
@@ -10763,6 +10765,7 @@ class Backend:
                                     await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob)
                             except Exception:
                                 pass
+                            _mid_rest_refill += 1
                             _mid_diag_add(symb, ex_name, market, tf, 'OK', 'rest')
                             return last
                         # tiny backoff reduces rate-limit bursts and improves success on flaky networks
@@ -10836,6 +10839,8 @@ class Backend:
                         _mid_candles_net_fail = 0
                         _mid_candles_unsupported = 0
                         _mid_candles_partial = 0
+                        _mid_db_hit = 0
+                        _mid_rest_refill = 0
                         _c0 = api.candle_counters_snapshot()
                         _mid_hard_block0 = _mid_hard_block_total()
                         _mid_hard_block = 0
@@ -11274,6 +11279,18 @@ class Backend:
                     _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
                     summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
                     logger.info("[mid][summary] %s", summary)
+                    try:
+                        _tot = int(_mid_db_hit) + int(_mid_rest_refill)
+                        if _tot > 0:
+                            _hit_pct = int(round(100.0 * float(_mid_db_hit) / float(_tot)))
+                            _miss_pct = max(0, 100 - _hit_pct)
+                        else:
+                            _hit_pct = 100
+                            _miss_pct = 0
+                        logger.info("[mid] cache_hit=%s%% cache_miss=%s%% (db_hit=%s rest_refill=%s)", _hit_pct, _miss_pct, _mid_db_hit, _mid_rest_refill)
+                    except Exception:
+                        pass
+
 
                     # Optional: hardblock breakdown (top buckets)
                     try:
