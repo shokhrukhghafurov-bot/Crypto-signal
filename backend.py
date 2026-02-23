@@ -10573,12 +10573,17 @@ class Backend:
                 _mid_diag_max = int(os.getenv('MID_CANDLES_DIAG_MAX', '200') or 200)
                 _mid_diag_lines = 0
                 _mid_candles_diag = defaultdict(list)  # (symbol, tf) -> ["EX:MARKET:STATUS(:reason)", ...]
+                _mid_candles_diag_seen = defaultdict(set)  # (symbol, tf) -> {rec,...} (dedupe per tick)
 
                 def _mid_diag_add(symb: str, ex_name: str, market: str, tf: str, status: str, reason: str = '') -> None:
                     nonlocal _mid_diag_lines
                     try:
                         key = (symb, tf)
                         rec = f"{ex_name}:{(market or 'SPOT').upper().strip()}:{status}" + (f":{reason}" if reason else '')
+                        # Dedupe per tick: prevents storms like unsupported_cached repeated many times in diag.
+                        if rec in _mid_candles_diag_seen[key]:
+                            return
+                        _mid_candles_diag_seen[key].add(rec)
                         _mid_candles_diag[key].append(rec)
                         if _mid_diag_enabled and _mid_diag_lines < _mid_diag_max and status != 'OK':
                             # Collect diagnostics; actual logging happens once per symbol when candles are finally unavailable.
@@ -10794,6 +10799,29 @@ class Backend:
                                 _mid_candles_unsupported += 1
                                 return None
 
+                            def _mid_rest_is_fresh(df: Optional[pd.DataFrame]) -> bool:
+                                """Validate REST candles freshness. Reject stale REST to avoid using old data."""
+                                try:
+                                    if df is None or getattr(df, 'empty', True):
+                                        return False
+                                    max_age = float(os.getenv("MID_REST_CANDLES_MAX_AGE_SEC", os.getenv("MID_CANDLES_CACHE_STALE_SEC", "900")) or 900)
+                                    now_ms = int(time.time() * 1000)
+                                    if "close_time_ms" in df.columns:
+                                        last_ms = int(df["close_time_ms"].iloc[-1])
+                                    elif "close_time" in df.columns:
+                                        last_ms = int(df["close_time"].iloc[-1])
+                                    elif "open_time_ms" in df.columns:
+                                        # approximate close from open + tf
+                                        last_ms = int(df["open_time_ms"].iloc[-1])
+                                    elif "open_time" in df.columns:
+                                        last_ms = int(df["open_time"].iloc[-1])
+                                    else:
+                                        return True  # cannot verify -> don't block
+                                    return (now_ms - last_ms) <= int(max_age * 1000)
+                                except Exception:
+                                    return True
+
+
                             # Fast-skip pairs we already know are unsupported on this exchange/market/TF
                             try:
                                 if api._is_unsupported_cached(ex_name, mkt, _sym, tf):
@@ -10840,15 +10868,35 @@ class Backend:
                                 except Exception:
                                     # If exchangeInfo fails, fall back to request (old behavior)
                                     pass
-                                return await api.klines_binance(symb, tf, limit, market=market)
+                                df = await api.klines_binance(symb, tf, limit, market=market)
+                                if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
+                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
+                                    return pd.DataFrame()
+                                return df
                             if ex_name == "BYBIT":
-                                return await api.klines_bybit(symb, tf, limit, market=market)
+                                df = await api.klines_bybit(symb, tf, limit, market=market)
+                                if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
+                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
+                                    return pd.DataFrame()
+                                return df
                             if ex_name == "OKX":
-                                return await api.klines_okx(symb, tf, limit, market=market)
+                                df = await api.klines_okx(symb, tf, limit, market=market)
+                                if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
+                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
+                                    return pd.DataFrame()
+                                return df
                             if ex_name == "GATEIO":
-                                return await api.klines_gateio(symb, tf, limit)
+                                df = await api.klines_gateio(symb, tf, limit)
+                                if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
+                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
+                                    return pd.DataFrame()
+                                return df
                             # default MEXC
-                            return await api.klines_mexc(symb, tf, limit)
+                            df = await api.klines_mexc(symb, tf, limit)
+                            if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
+                                _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
+                                return pd.DataFrame()
+                            return df
 
                     except Exception as e:
                         # classify candle failures
@@ -10893,6 +10941,69 @@ class Backend:
                         except Exception:
                             pass
                         return None
+
+                
+                async def _mid_fetch_klines_wsdb_only(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
+                    """Return candles using only in-memory cache + persistent DB cache.
+                    NO REST, NO retries. Used to build higher TF from WS/DB 5m without accidentally triggering REST storms.
+                    """
+                    nonlocal _mid_db_hit, _mid_candles_cache
+                    try:
+                        _sn = (symb or '').strip().upper()
+                        _sn = _sn.replace('-', '').replace('_', '').replace(':', '').replace('/', '')
+                        for _suf in ('SWAP','PERP','PERPETUAL','FUT','FUTURES'):
+                            if _sn.endswith(_suf):
+                                _sn = _sn[: -len(_suf)]
+                                break
+                        symb_n = _sn
+                        key = (ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(limit))
+                        now = time.time()
+                        ttl = _mid_cache_ttl(tf)
+                        cached = _mid_candles_cache.get(key)
+                        if cached:
+                            ts, df = cached
+                            if (now - ts) <= ttl and df is not None and not getattr(df, 'empty', True):
+                                _mid_db_hit += 1
+                                _mid_diag_add(symb_n, ex_name, market, tf, 'OK', 'cache')
+                                return df
+
+                        persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
+                        if persist_enabled and tf in ("5m","30m","1h"):
+                            try:
+                                max_age = int(os.getenv("MID_PERSIST_CANDLES_MAX_AGE_SEC", os.getenv("MID_CANDLES_CACHE_STALE_SEC", "1800")) or 1800)
+                                row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(limit))
+                                if (not row):
+                                    try:
+                                        ws_limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
+                                    except Exception:
+                                        ws_limit = 250
+                                    if int(limit) != int(ws_limit):
+                                        row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(ws_limit))
+                                if row:
+                                    blob, updated_at = row
+                                    if updated_at is not None:
+                                        age = (dt.datetime.now(dt.timezone.utc) - updated_at).total_seconds()
+                                    else:
+                                        age = 0.0
+                                    if age <= max_age:
+                                        dfp = db_store._cc_unpack_df(blob)
+                                        try:
+                                            if dfp is not None and not dfp.empty and int(limit) > 0 and len(dfp) > int(limit):
+                                                dfp = dfp.tail(int(limit)).copy()
+                                        except Exception:
+                                            pass
+                                        if dfp is not None and not dfp.empty:
+                                            _mid_db_hit += 1
+                                            _mid_candles_cache[key] = (now, dfp)
+                                            _mid_diag_add(symb_n, ex_name, market, tf, 'OK', 'persist')
+                                            return dfp
+                                    else:
+                                        _mid_diag_add(symb_n, ex_name, market, tf, 'stale_persist')
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    return None
 
                 async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
 
@@ -10959,7 +11070,7 @@ class Backend:
                         try:
                             tf_minutes = 30 if tf == "30m" else 60
                             # Get 5m candles (WS/DB-first; REST only if no cache)
-                            df5 = await _mid_fetch_klines_cached(ex_name, symb, "5m", int(max(limit, 120)), market)
+                            df5 = await _mid_fetch_klines_wsdb_only(ex_name, symb, "5m", int(max(limit, 120)), market)
                             if df5 is not None and not getattr(df5, "empty", True):
                                 d5 = df5.copy()
                                 try:
@@ -11383,22 +11494,13 @@ class Backend:
                                             if isinstance(c, Exception):
                                                 c = None
 
-                                            # Require mid/trend candles. Do NOT silently reuse trigger TF,
-                                            # because that can break TA (wrong timeframe) and cause false
-                                            # candles_unavailable even when another exchange has proper data.
-                                            # Exception: if requested TF equals trigger TF, reuse is fine.
+                                            # Allow partial candles: if trigger timeframe exists, we can reuse it for missing mid/trend
                                             if b is None or getattr(b, 'empty', True):
-                                                if str(tf_mid) == str(tf_trigger):
-                                                    b = a
-                                                    _mid_candles_partial += 1
-                                                else:
-                                                    continue
+                                                b = a
+                                                _mid_candles_partial += 1
                                             if c is None or getattr(c, 'empty', True):
-                                                if str(tf_trend) == str(tf_trigger):
-                                                    c = a
-                                                    _mid_candles_partial += 1
-                                                else:
-                                                    continue
+                                                c = a
+                                                _mid_candles_partial += 1
 
                                             r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
                                             if r:
