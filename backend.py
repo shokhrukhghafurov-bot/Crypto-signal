@@ -6406,6 +6406,33 @@ class MultiExchangeData:
                 return cached[1]
             return set()
 
+    async def _get_binance_spot_markets(self) -> set[str]:
+        """Cached set of BINANCE spot symbols (canonical like BTCUSDT)."""
+        now = time.monotonic()
+        cached = self._markets_cache.get("BINANCE_SPOT")
+        if cached and now < cached[0]:
+            return cached[1]
+        url = f"{self.BINANCE_SPOT}/api/v3/exchangeInfo"
+        try:
+            raw = await self._get_json(url, params=None)
+            s: set[str] = set()
+            if isinstance(raw, dict):
+                for r in (raw.get("symbols") or []):
+                    if isinstance(r, dict):
+                        sym = (r.get("symbol") or "").strip()
+                        if not sym:
+                            continue
+                        stt = str(r.get("status") or "").upper()
+                        if stt and stt not in ("TRADING", "1"):
+                            continue
+                        s.add(sym.upper())
+            self._markets_cache["BINANCE_SPOT"] = (now + float(self._markets_cache_ttl), s)
+            return s
+        except Exception:
+            if cached:
+                return cached[1]
+            return set()
+
     async def _get_bybit_markets(self, *, category: str) -> set[str]:
         """Cached set of BYBIT symbols for category 'linear' (futures) or 'spot'."""
         cat = (category or "spot").strip().lower()
@@ -6496,6 +6523,10 @@ class MultiExchangeData:
             markets = await self._get_binance_futures_markets()
             sym_req = self._binance_futures_symbol_alias(sym)
             return (sym in markets) or (sym_req in markets)
+
+        if ex == "BINANCE" and mkt == "SPOT":
+            markets = await self._get_binance_spot_markets()
+            return sym in markets
 
         if ex == "BYBIT":
             cat = "linear" if mkt == "FUTURES" else "spot"
@@ -6612,6 +6643,21 @@ class MultiExchangeData:
         # than spot (e.g. PEPE futures is typically 1000PEPEUSDT).
         sym_req = self._binance_futures_symbol_alias(sym) if mkt == 'FUTURES' else sym
         cache_key = ('BINANCE', mkt, sym_req, iv, int(limit))
+        # Fast-skip unsupported symbols/markets (prevents BINANCE invalid symbol storms)
+        symbol_key = sym_req
+        if self._is_unsupported_cached("BINANCE", mkt, symbol_key, iv):
+            return pd.DataFrame()
+        try:
+            if not await self._market_supported_ex("BINANCE", mkt, sym):
+                # Mark unsupported for this market and optionally fall back (futures -> spot)
+                self._mark_unsupported("BINANCE", mkt, symbol_key, iv)
+                if mkt == 'FUTURES' and (os.getenv('BINANCE_FUTURES_FALLBACK_SPOT', '1') or '1').strip().lower() in ('1','true','yes','on'):
+                    return await self.klines_binance(sym, interval, limit=limit, market='SPOT')
+                return pd.DataFrame()
+        except Exception:
+            # If availability check fails, fall back to request (legacy behavior)
+            pass
+
 
         async def _fetch():
             # Binance may return HTTP 200 with JSON error payload; validate type
