@@ -11326,6 +11326,16 @@ class Backend:
                             _pl = self._mid_prefill_last  # type: ignore[attr-defined]
                             _pkey = (ex_name, (market or "SPOT").upper().strip(), symb, tf)
                             last_ts = float(_pl.get(_pkey, 0.0) or 0.0)
+                            # If we have a recent successful prefill for this (market,symbol,tf),
+                            # don't hit REST again even if we rotate exchanges.
+                            if not hasattr(self, "_mid_prefill_last_ok"):
+                                self._mid_prefill_last_ok = {}  # type: ignore[attr-defined]
+                            _pl_ok = self._mid_prefill_last_ok  # type: ignore[attr-defined]
+                            _okey = ((market or "SPOT").upper().strip(), symb, tf)
+                            last_ok = float(_pl_ok.get(_okey, 0.0) or 0.0)
+                            if (time.time() - last_ok) < float(prefill_cooldown):
+                                last_ts = time.time()
+
                             if (time.time() - last_ts) >= float(prefill_cooldown):
                                 _pl[_pkey] = float(time.time())
                                 pf_limit = _prefill_limit_for_tf(tf)
@@ -11377,6 +11387,11 @@ class Backend:
                                             df_ret = df_pf_n
                                         _mid_rest_refill += 1
                                         _mid_diag_ok(symb, ex_name, market, tf, "rest_prefill", df_pf_n)
+                                        try:
+                                            if hasattr(self, "_mid_prefill_last_ok"):
+                                                self._mid_prefill_last_ok[((market or "SPOT").upper().strip(), symb, tf)] = float(time.time())  # type: ignore[attr-defined]
+                                        except Exception:
+                                            pass
                                         return df_ret
                         except Exception:
                             pass
@@ -11573,7 +11588,7 @@ class Backend:
                     # fallback to stale cache if available and not too old
                     if cached:
                         ts, df = cached
-                        if (now - ts) <= mid_cache_stale_sec and df is not None and not df.empty:
+                        if (now - ts) <= float(_mid_tf_stale_sec(tf, kind="cache")) and df is not None and not df.empty:
                             return df
                     return None
 
@@ -11825,7 +11840,7 @@ class Backend:
                             found_ok_candles: bool = False  # candles were present and had enough bars on at least one venue
 
                             async def _choose_exchange_mid():
-                                nonlocal chosen_name, chosen_market, chosen_r, found_ok_candles
+                                nonlocal chosen_name, chosen_market, chosen_r
                                 primary = _mid_primary_for_symbol(sym)
                                 # try primary first, then the other primary (if any), then fallbacks
                                 if MID_CANDLES_LIGHT_MODE or MID_CANDLES_BINANCE_FIRST:
