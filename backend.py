@@ -416,11 +416,8 @@ def _mid_norm_ohlcv(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
         if not hasattr(df, "empty"):
             return None
         if df.empty:
-                dfn = _mid_norm_ohlcv(df)
-                if dfn is None:
-                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
-                    return pd.DataFrame()
-                return dfn
+            # Empty frame is not a schema error; just return it.
+            return df.copy()
         d = df.copy()
         # normalize column names
         cols = list(d.columns)
