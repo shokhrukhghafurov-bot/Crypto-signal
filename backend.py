@@ -11383,13 +11383,22 @@ class Backend:
                                             if isinstance(c, Exception):
                                                 c = None
 
-                                            # Allow partial candles: if trigger timeframe exists, we can reuse it for missing mid/trend
+                                            # Require mid/trend candles. Do NOT silently reuse trigger TF,
+                                            # because that can break TA (wrong timeframe) and cause false
+                                            # candles_unavailable even when another exchange has proper data.
+                                            # Exception: if requested TF equals trigger TF, reuse is fine.
                                             if b is None or getattr(b, 'empty', True):
-                                                b = a
-                                                _mid_candles_partial += 1
+                                                if str(tf_mid) == str(tf_trigger):
+                                                    b = a
+                                                    _mid_candles_partial += 1
+                                                else:
+                                                    continue
                                             if c is None or getattr(c, 'empty', True):
-                                                c = a
-                                                _mid_candles_partial += 1
+                                                if str(tf_trend) == str(tf_trigger):
+                                                    c = a
+                                                    _mid_candles_partial += 1
+                                                else:
+                                                    continue
 
                                             r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
                                             if r:
