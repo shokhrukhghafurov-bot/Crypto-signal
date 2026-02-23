@@ -39,7 +39,7 @@ if _TEST_MODE and _TEST_MODE_SCOPE in ("MID","ALL"):
         "MID_RR_DISCOUNT": "1.0",
         "MID_MIN_SCORE_FUTURES": "90",
         "MID_MIN_SCORE_SPOT": "90",
-        "MID_MIN_CONFIDENCE": "90",
+        "MID_MIN_CONFIDENCE": "0",
         "MID_MIN_VOL_X": "0",
         # --- MID regime / filters ---
         "MID_NEWS_FILTER": "1",
@@ -11517,93 +11517,126 @@ class Backend:
                         except Exception:
                             pass
 
-                    last = None
-                    for _i in range(max(0, mid_candles_retry) + 1):
-                        last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, market)
-                        # If response is empty (no exception), count as EMPTY + optional adaptive limit
-                        if last is None or getattr(last, 'empty', False):
+# --- REST fetch with adaptive limit (250 -> 200 -> 120) that works even when mid_candles_retry=0 ---
+last = None
+base_limit = int(limit)
+limits_to_try = []
+try:
+    if base_limit > 0:
+        limits_to_try.append(base_limit)
+    if base_limit > 200:
+        limits_to_try.append(200)
+    if base_limit > 120:
+        limits_to_try.append(120)
+    _seen = set()
+    limits_to_try = [x for x in limits_to_try if (x not in _seen and not _seen.add(x))]
+except Exception:
+    limits_to_try = [int(limit)]
 
-                            # Bidirectional market fallback (FUTURES <-> SPOT) when requested market yields empty/None/unsupported.
-                            try:
-                                mkt_req = (market or 'SPOT').upper().strip()
-                                fb_global = str(os.getenv("MID_CANDLES_MARKET_FALLBACK", "1") or "1").strip().lower() not in ("0","false","no","off")
-                                if fb_global and mkt_req in ("FUTURES", "SPOT"):
-                                    if mkt_req == "FUTURES":
-                                        fb_on = str(os.getenv("MID_CANDLES_FUTURES_FALLBACK_SPOT", "1") or "1").strip().lower() not in ("0","false","no","off")
-                                        alt = "SPOT" if fb_on else None
-                                    else:
-                                        fb_on = str(os.getenv("MID_CANDLES_SPOT_FALLBACK_FUTURES", "1") or "1").strip().lower() not in ("0","false","no","off")
-                                        alt = "FUTURES" if fb_on else None
-                                    if alt:
-                                        alt_df = await _mid_fetch_klines_rest(ex_name, symb, tf, int(limit), alt)
-                                        if alt_df is not None and not getattr(alt_df, "empty", True):
-                                            # Cache write-through under BOTH markets to suppress repeated empties.
-                                            key_alt = (ex_name, alt, symb, tf, int(limit))
-                                            _mid_candles_cache[key_alt] = (now, alt_df)
-                                            _mid_candles_cache[key] = (now, alt_df)
-                                            # write-through to persistent cache
-                                            try:
-                                                persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
-                                                if persist_enabled and tf in ("5m","30m","1h"):
-                                                    blob = db_store._cc_pack_df(alt_df)
-                                                    await db_store.candles_cache_set(ex_name, alt, symb, tf, int(limit), blob)
-                                                    await db_store.candles_cache_set(ex_name, mkt_req, symb, tf, int(limit), blob)
-                                            except Exception:
-                                                pass
-                                            _mid_candles_fallback += 1
-                                            _mid_diag_add(symb, ex_name, mkt_req, tf, "OK", f"fallback_{alt.lower()}")
-                                            return alt_df
-                            except Exception:
-                                pass
-                            # If we got an empty dataframe, it often means the instrument doesn't exist for this market (esp. OKX SWAP).
-                            # Re-check market availability and convert empty->unsupported_pair to avoid repeated empty storms.
-                            try:
-                                mkt_now = (market or 'SPOT').upper().strip()
-                                if await api._market_supported_ex(ex_name, mkt_now, symb) is False:
-                                    try:
-                                        api._mark_unsupported(ex_name, mkt_now, symb, tf)
-                                    except Exception:
-                                        pass
-                                    _mid_diag_add(symb, ex_name, mkt_now, tf, 'unsupported_pair')
-                                    return pd.DataFrame()
-                            except Exception:
-                                pass
-                            # If REST returned empty multiple times, treat certain FUTURES empties as unsupported to stop storms.
-                            try:
-                                mkt_now2 = (market or 'SPOT').upper().strip()
-                                empty_as_unsup = str(os.getenv("MID_EMPTY_FUTURES_AS_UNSUPPORTED", "1") or "1").strip().lower() not in ("0","false","no","off")
-                                if empty_as_unsup and mkt_now2 == "FUTURES" and ex_name in ("BYBIT","OKX"):
-                                    last_attempt = (_i >= max(0, mid_candles_retry)) and (int(limit) <= 120)
-                                    if last_attempt:
-                                        try:
-                                            api._mark_unsupported(ex_name, mkt_now2, symb, tf)
-                                        except Exception:
-                                            pass
-                                        _mid_diag_add(symb, ex_name, mkt_now2, tf, "unsupported_pair", "empty_futures")
-                                        _mid_candles_unsupported += 1
-                                        return None
-                            except Exception:
-                                pass
+for _i in range(max(0, mid_candles_retry) + 1):
+    for _lim in limits_to_try:
+        limit = int(_lim)
+        last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, market)
 
-                            # If it was explicitly marked unsupported (e.g. market not implemented),
-                            # don't count it as an "empty candles" sample.
-                            if api._is_unsupported_cached(ex_name, (market or 'SPOT').upper().strip(), symb, tf):
-                                _mid_candles_unsupported += 1
-                                return None
-                            _mid_candles_empty += 1
-                            reason = f"empty_{ex_name.lower()}_{(market or 'SPOT').lower()}_{tf}"
-                            _mid_candles_empty_reasons[reason] += 1
-                            if _mid_candles_log_empty:
-                                lst = _mid_candles_empty_samples[reason]
-                                if len(lst) < _mid_candles_log_empty_samples:
-                                    lst.append(f"{symb}@{ex_name}/{market}/{tf}/L{limit}")
-                            # adaptive limit step-down
-                            if limit > 200:
-                                limit = 200
-                                continue
-                            if limit > 120:
-                                limit = 120
-                                continue
+        # If response is empty (no exception), count as EMPTY + optional adaptive behaviors
+        if last is None or getattr(last, 'empty', False):
+
+            # Bidirectional market fallback (FUTURES <-> SPOT) when requested market yields empty/None/unsupported.
+            try:
+                mkt_req = (market or 'SPOT').upper().strip()
+                fb_global = str(os.getenv("MID_CANDLES_MARKET_FALLBACK", "1") or "1").strip().lower() not in ("0","false","no","off")
+                if fb_global and mkt_req in ("FUTURES", "SPOT"):
+                    if mkt_req == "FUTURES":
+                        fb_on = str(os.getenv("MID_CANDLES_FUTURES_FALLBACK_SPOT", "1") or "1").strip().lower() not in ("0","false","no","off")
+                        alt = "SPOT" if fb_on else None
+                    else:
+                        fb_on = str(os.getenv("MID_CANDLES_SPOT_FALLBACK_FUTURES", "1") or "1").strip().lower() not in ("0","false","no","off")
+                        alt = "FUTURES" if fb_on else None
+                    if alt:
+                        alt_df = await _mid_fetch_klines_rest(ex_name, symb, tf, int(limit), alt)
+                        if alt_df is not None and not getattr(alt_df, "empty", True):
+                            # Cache write-through under BOTH markets to suppress repeated empties.
+                            key_alt = (ex_name, alt, symb, tf, int(limit))
+                            _mid_candles_cache[key_alt] = (now, alt_df)
+                            _mid_candles_cache[key] = (now, alt_df)
+                            # write-through to persistent cache
+                            try:
+                                persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
+                                if persist_enabled and tf in ("5m","30m","1h"):
+                                    blob = db_store._cc_pack_df(alt_df)
+                                    await db_store.candles_cache_set(ex_name, alt, symb, tf, int(limit), blob)
+                                    await db_store.candles_cache_set(ex_name, mkt_req, symb, tf, int(limit), blob)
+                            except Exception:
+                                pass
+                            _mid_candles_fallback += 1
+                            _mid_diag_add(symb, ex_name, mkt_req, tf, "OK", f"fallback_{alt.lower()}")
+                            return alt_df
+            except Exception:
+                pass
+
+            # If we got an empty dataframe, it often means the instrument doesn't exist for this market (esp. OKX SWAP).
+            # Re-check market availability and convert empty->unsupported_pair to avoid repeated empty storms.
+            try:
+                mkt_now = (market or 'SPOT').upper().strip()
+                if await api._market_supported_ex(ex_name, mkt_now, symb) is False:
+                    try:
+                        api._mark_unsupported(ex_name, mkt_now, symb, tf)
+                    except Exception:
+                        pass
+                    _mid_diag_add(symb, ex_name, mkt_now, tf, 'unsupported_pair')
+                    _mid_candles_unsupported += 1
+                    return None
+            except Exception:
+                pass
+
+            # If REST returned empty on the *smallest* limit for BYBIT/OKX FUTURES, treat as unsupported to stop storms.
+            try:
+                mkt_now2 = (market or 'SPOT').upper().strip()
+                empty_as_unsup = str(os.getenv("MID_EMPTY_FUTURES_AS_UNSUPPORTED", "1") or "1").strip().lower() not in ("0","false","no","off")
+                is_last_lim = (int(limit) <= 120) or (limit == limits_to_try[-1])
+                is_last_try = (_i >= max(0, mid_candles_retry))
+                if empty_as_unsup and mkt_now2 == "FUTURES" and ex_name in ("BYBIT","OKX") and is_last_lim and is_last_try:
+                    try:
+                        api._mark_unsupported(ex_name, mkt_now2, symb, tf)
+                    except Exception:
+                        pass
+                    _mid_diag_add(symb, ex_name, mkt_now2, tf, "unsupported_pair", "empty_futures")
+                    _mid_candles_unsupported += 1
+                    return None
+            except Exception:
+                pass
+
+            # If it was explicitly marked unsupported (e.g. market not implemented),
+            # don't count it as an "empty candles" sample.
+            if api._is_unsupported_cached(ex_name, (market or 'SPOT').upper().strip(), symb, tf):
+                _mid_candles_unsupported += 1
+                return None
+
+            _mid_candles_empty += 1
+            reason = f"empty_{ex_name.lower()}_{(market or 'SPOT').lower()}_{tf}"
+            _mid_candles_empty_reasons[reason] += 1
+            if _mid_candles_log_empty:
+                lst = _mid_candles_empty_samples[reason]
+                if len(lst) < _mid_candles_log_empty_samples:
+                    lst.append(f"{symb}@{ex_name}/{market}/{tf}/L{limit}")
+
+            continue  # try next limit / retry
+
+        # got non-empty candles
+        break
+    else:
+        # all limits empty for this retry iteration
+        last = pd.DataFrame()
+
+    if last is not None and not getattr(last, "empty", True):
+        break
+
+    # tiny backoff reduces rate-limit bursts and improves success on flaky networks
+    if _i < max(0, mid_candles_retry):
+        try:
+            await asyncio.sleep(0.15 * (_i + 1))
+        except Exception:
+            pass
 
                         if last is not None and not last.empty:
                             # Accept REST candles only if newest candle is reasonably fresh (prevents stale REST poisoning).
