@@ -6492,10 +6492,10 @@ class MultiExchangeData:
             if not fut.done():
                 fut.set_result(df)
             dfn = _mid_norm_ohlcv(df)
-                            if dfn is None:
-                                _mid_diag_add(symb, ex_name, market, tf, 'bad_schema', 'cache')
-                                return pd.DataFrame()
-                            return dfn
+            if dfn is None:
+                _mid_diag_add(symb, ex_name, market, tf, 'bad_schema', 'cache')
+                return pd.DataFrame()
+            return dfn
         except Exception as e:
             if not fut.done():
                 fut.set_exception(e)
@@ -11023,75 +11023,75 @@ class Backend:
                         return None
 
 
-async def _mid_fetch_klines_wsdb_only(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
-                    """Return candles using only in-memory cache + persistent DB cache.
-                    NO REST, NO retries. Used to build higher TF from WS/DB 5m without accidentally triggering REST storms.
-                    """
-                    nonlocal _mid_db_hit, _mid_candles_cache
-                    try:
-                        _sn = (symb or '').strip().upper()
-                        _sn = _sn.replace('-', '').replace('_', '').replace(':', '').replace('/', '')
-                        for _suf in ('SWAP','PERP','PERPETUAL','FUT','FUTURES'):
-                            if _sn.endswith(_suf):
-                                _sn = _sn[: -len(_suf)]
-                                break
-                        symb_n = _sn
-                        key = (ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(limit))
-                        now = time.time()
-                        ttl = _mid_cache_ttl(tf)
-                        cached = _mid_candles_cache.get(key)
-                        if cached:
-                            ts, df = cached
-                            if (now - ts) <= ttl and df is not None and not getattr(df, 'empty', True):
-                                _mid_db_hit += 1
-                                _mid_diag_add(symb_n, ex_name, market, tf, 'OK', 'cache')
-                                dfn = _mid_norm_ohlcv(df)
-                                if dfn is None:
-                                    _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'cache')
-                                    return pd.DataFrame()
-                                return dfn
-
-                        persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
-                        if persist_enabled and tf in ("5m","30m","1h"):
-                            try:
-                                max_age = int(os.getenv("MID_PERSIST_CANDLES_MAX_AGE_SEC", os.getenv("MID_CANDLES_CACHE_STALE_SEC", "1800")) or 1800)
-                                row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(limit))
-                                if (not row):
+                async def _mid_fetch_klines_wsdb_only(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
+                                    """Return candles using only in-memory cache + persistent DB cache.
+                                    NO REST, NO retries. Used to build higher TF from WS/DB 5m without accidentally triggering REST storms.
+                                    """
+                                    nonlocal _mid_db_hit, _mid_candles_cache
                                     try:
-                                        ws_limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
+                                        _sn = (symb or '').strip().upper()
+                                        _sn = _sn.replace('-', '').replace('_', '').replace(':', '').replace('/', '')
+                                        for _suf in ('SWAP','PERP','PERPETUAL','FUT','FUTURES'):
+                                            if _sn.endswith(_suf):
+                                                _sn = _sn[: -len(_suf)]
+                                                break
+                                        symb_n = _sn
+                                        key = (ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(limit))
+                                        now = time.time()
+                                        ttl = _mid_cache_ttl(tf)
+                                        cached = _mid_candles_cache.get(key)
+                                        if cached:
+                                            ts, df = cached
+                                            if (now - ts) <= ttl and df is not None and not getattr(df, 'empty', True):
+                                                _mid_db_hit += 1
+                                                _mid_diag_add(symb_n, ex_name, market, tf, 'OK', 'cache')
+                                                dfn = _mid_norm_ohlcv(df)
+                                                if dfn is None:
+                                                    _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'cache')
+                                                    return pd.DataFrame()
+                                                return dfn
+
+                                        persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
+                                        if persist_enabled and tf in ("5m","30m","1h"):
+                                            try:
+                                                max_age = int(os.getenv("MID_PERSIST_CANDLES_MAX_AGE_SEC", os.getenv("MID_CANDLES_CACHE_STALE_SEC", "1800")) or 1800)
+                                                row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(limit))
+                                                if (not row):
+                                                    try:
+                                                        ws_limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
+                                                    except Exception:
+                                                        ws_limit = 250
+                                                    if int(limit) != int(ws_limit):
+                                                        row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(ws_limit))
+                                                if row:
+                                                    blob, updated_at = row
+                                                    if updated_at is not None:
+                                                        age = (dt.datetime.now(dt.timezone.utc) - updated_at).total_seconds()
+                                                    else:
+                                                        age = 0.0
+                                                    if age <= max_age:
+                                                        dfp = db_store._cc_unpack_df(blob)
+                                                        try:
+                                                            if dfp is not None and not dfp.empty and int(limit) > 0 and len(dfp) > int(limit):
+                                                                dfp = dfp.tail(int(limit)).copy()
+                                                        except Exception:
+                                                            pass
+                                                        if dfp is not None and not dfp.empty:
+                                                            _mid_db_hit += 1
+                                                            _mid_candles_cache[key] = (now, dfp)
+                                                            _mid_diag_add(symb_n, ex_name, market, tf, 'OK', 'persist')
+                                                            dfp_n = _mid_norm_ohlcv(dfp)
+                                                            if dfp_n is None:
+                                                                _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'persist')
+                                                                return pd.DataFrame()
+                                                            return dfp_n
+                                                    else:
+                                                        _mid_diag_add(symb_n, ex_name, market, tf, 'stale_persist')
+                                            except Exception:
+                                                pass
                                     except Exception:
-                                        ws_limit = 250
-                                    if int(limit) != int(ws_limit):
-                                        row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(ws_limit))
-                                if row:
-                                    blob, updated_at = row
-                                    if updated_at is not None:
-                                        age = (dt.datetime.now(dt.timezone.utc) - updated_at).total_seconds()
-                                    else:
-                                        age = 0.0
-                                    if age <= max_age:
-                                        dfp = db_store._cc_unpack_df(blob)
-                                        try:
-                                            if dfp is not None and not dfp.empty and int(limit) > 0 and len(dfp) > int(limit):
-                                                dfp = dfp.tail(int(limit)).copy()
-                                        except Exception:
-                                            pass
-                                        if dfp is not None and not dfp.empty:
-                                            _mid_db_hit += 1
-                                            _mid_candles_cache[key] = (now, dfp)
-                                            _mid_diag_add(symb_n, ex_name, market, tf, 'OK', 'persist')
-                                            dfp_n = _mid_norm_ohlcv(dfp)
-                                            if dfp_n is None:
-                                                _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'persist')
-                                                return pd.DataFrame()
-                                            return dfp_n
-                                    else:
-                                        _mid_diag_add(symb_n, ex_name, market, tf, 'stale_persist')
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    return None
+                                        pass
+                                    return None
 
                 async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
 
