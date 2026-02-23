@@ -11840,7 +11840,7 @@ class Backend:
                             found_ok_candles: bool = False  # candles were present and had enough bars on at least one venue
 
                             async def _choose_exchange_mid():
-                                nonlocal chosen_name, chosen_market, chosen_r
+                                nonlocal chosen_name, chosen_market, chosen_r, found_ok_candles
                                 primary = _mid_primary_for_symbol(sym)
                                 # try primary first, then the other primary (if any), then fallbacks
                                 if MID_CANDLES_LIGHT_MODE or MID_CANDLES_BINANCE_FIRST:
