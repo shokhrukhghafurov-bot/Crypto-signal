@@ -11620,6 +11620,27 @@ class Backend:
                             supporters = []  # kept for compatibility with later counters (not used for multi-exchange scoring)
                             chosen_name = None
                             chosen_market = None
+                            # --- MID candles length requirements (diagnostics) ---
+                            # If candles are present but too short for indicators, MID will behave like "no_candles".
+                            # Log explicit need/got per TF to distinguish "didn't have time to collect" vs "bad data".
+                            def _mid_need_bars(tf: str) -> int:
+                                t = (tf or "").strip().lower()
+                                try:
+                                    if t in ("5m", "5min", "5"):
+                                        return int(os.getenv("MID_NEED_5M_BARS", os.getenv("MID_NEED_BARS_5M", "60")) or 60)
+                                    if t in ("30m", "30min", "30"):
+                                        return int(os.getenv("MID_NEED_30M_BARS", os.getenv("MID_NEED_BARS_30M", "200")) or 200)
+                                    # default: 1h+
+                                    return int(os.getenv("MID_NEED_1H_BARS", os.getenv("MID_NEED_BARS_1H", "200")) or 200)
+                                except Exception:
+                                    return 0
+
+                            def _mid_len(df: Optional[pd.DataFrame]) -> int:
+                                try:
+                                    return int(len(df)) if df is not None else 0
+                                except Exception:
+                                    return 0
+
                             chosen_r: Optional[Dict[str, Any]] = None
 
                             async def _choose_exchange_mid():
@@ -11670,6 +11691,26 @@ class Backend:
                                             if b is None or getattr(b, 'empty', True):
                                                 continue
                                             if c is None or getattr(c, 'empty', True):
+                                                continue
+
+                                            # Length sanity: distinguish "empty" vs "too few bars".
+                                            n5_need = _mid_need_bars(tf_trigger)
+                                            n30_need = _mid_need_bars(tf_mid)
+                                            n1h_need = _mid_need_bars(tf_trend)
+                                            n5_got = _mid_len(a)
+                                            n30_got = _mid_len(b)
+                                            n1h_got = _mid_len(c)
+                                            if n5_need and n5_got < n5_need:
+                                                _mid_diag_add(sym, name, mkt_u, tf_trigger, "partial", f"need_{tf_trigger}_bars={n5_need} got={n5_got}")
+                                                _mid_candles_partial += 1
+                                                continue
+                                            if n30_need and n30_got < n30_need:
+                                                _mid_diag_add(sym, name, mkt_u, tf_mid, "partial", f"need_{tf_mid}_bars={n30_need} got={n30_got}")
+                                                _mid_candles_partial += 1
+                                                continue
+                                            if n1h_need and n1h_got < n1h_need:
+                                                _mid_diag_add(sym, name, mkt_u, tf_trend, "partial", f"need_{tf_trend}_bars={n1h_need} got={n1h_got}")
+                                                _mid_candles_partial += 1
                                                 continue
 
                                             r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
