@@ -11258,6 +11258,101 @@ class Backend:
                         except Exception:
                             pass
 
+                    # --- REST prefill for cold start (fills history after restart) ---
+                    # WS is great for live updates but after restart may have got=1.
+                    # When enabled, if we don't have enough bars in cache/DB, we do a one-time REST prefill
+                    # (with per-symbol/TF cooldown) and persist the result to Postgres candles_cache.
+                    prefill_enabled = str(os.getenv("MID_PREFILL_FROM_REST", "0") or "0").strip().lower() not in ("0","false","no","off")
+                    prefill_only_if_missing = str(os.getenv("MID_PREFILL_ONLY_IF_MISSING", "1") or "1").strip().lower() not in ("0","false","no","off")
+                    try:
+                        prefill_cooldown = float(os.getenv("MID_PREFILL_COOLDOWN_SEC", "900") or 900)
+                    except Exception:
+                        prefill_cooldown = 900.0
+                    try:
+                        prefill_timeout = float(os.getenv("MID_PREFILL_TIMEOUT_SEC", "3.5") or 3.5)
+                    except Exception:
+                        prefill_timeout = 3.5
+
+                    def _prefill_limit_for_tf(tf_: str) -> int:
+                        ttf = (tf_ or "").strip().lower()
+                        try:
+                            if ttf in ("5m","5min","5"):
+                                return int(os.getenv("MID_PREFILL_LIMIT_5M", "300") or 300)
+                            if ttf in ("30m","30min","30"):
+                                return int(os.getenv("MID_PREFILL_LIMIT_30M", "200") or 200)
+                            return int(os.getenv("MID_PREFILL_LIMIT_1H", "150") or 150)
+                        except Exception:
+                            return 300 if ttf.startswith("5") else (200 if ttf.startswith("30") else 150)
+
+                    # prefill guard state
+                    if prefill_enabled and tf in ("5m","30m","1h"):
+                        try:
+                            # If we already have enough bars in WS/DB cache -> skip prefill.
+                            need = _mid_need_bars(tf) if prefill_only_if_missing else 0
+                            if need and int(limit) > 0 and int(limit) >= need:
+                                # We don't know got here because cache lookup already failed, so treat as missing.
+                                pass
+                            if not hasattr(self, "_mid_prefill_last"):
+                                self._mid_prefill_last = {}  # type: ignore[attr-defined]
+                            _pl = self._mid_prefill_last  # type: ignore[attr-defined]
+                            _pkey = (ex_name, (market or "SPOT").upper().strip(), symb, tf)
+                            last_ts = float(_pl.get(_pkey, 0.0) or 0.0)
+                            if (time.time() - last_ts) >= float(prefill_cooldown):
+                                _pl[_pkey] = float(time.time())
+                                pf_limit = _prefill_limit_for_tf(tf)
+                                # ensure prefill limit at least what caller asked
+                                try:
+                                    pf_limit = int(max(int(pf_limit), int(limit)))
+                                except Exception:
+                                    pf_limit = int(pf_limit)
+                                # Do REST prefill (single venue) with a short timeout.
+                                try:
+                                    df_pf = await asyncio.wait_for(_mid_fetch_klines_rest(ex_name, symb, tf, int(pf_limit), market), timeout=float(prefill_timeout))
+                                except Exception:
+                                    df_pf = None
+                                if df_pf is not None and not getattr(df_pf, "empty", True):
+                                    # normalize once, then persist
+                                    df_pf_n = _mid_norm_ohlcv(df_pf)
+                                    if df_pf_n is not None and not getattr(df_pf_n, "empty", True):
+                                        got_pf = 0
+                                        try:
+                                            got_pf = int(len(df_pf_n))
+                                        except Exception:
+                                            got_pf = 0
+                                        # Persist under multiple common limits to maximize reuse (prefill_limit + WS limit + requested limit).
+                                        try:
+                                            if persist_enabled:
+                                                blob_full = db_store._cc_pack_df(df_pf_n)
+                                                await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(pf_limit), blob_full)
+                                                try:
+                                                    ws_limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
+                                                except Exception:
+                                                    ws_limit = 250
+                                                if int(ws_limit) != int(pf_limit) and got_pf:
+                                                    df_ws = df_pf_n.tail(int(ws_limit)).copy() if got_pf > int(ws_limit) else df_pf_n
+                                                    blob_ws = db_store._cc_pack_df(df_ws)
+                                                    await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(ws_limit), blob_ws)
+                                                if int(limit) != int(pf_limit) and int(limit) > 0 and got_pf:
+                                                    df_req = df_pf_n.tail(int(limit)).copy() if got_pf > int(limit) else df_pf_n
+                                                    blob_req = db_store._cc_pack_df(df_req)
+                                                    await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob_req)
+                                        except Exception:
+                                            pass
+                                        # Cache in memory for this request
+                                        try:
+                                            df_ret = df_pf_n
+                                            if int(limit) > 0 and got_pf and got_pf > int(limit):
+                                                df_ret = df_pf_n.tail(int(limit)).copy()
+                                            _mid_candles_cache[key] = (now, df_ret)
+                                        except Exception:
+                                            df_ret = df_pf_n
+                                        _mid_rest_refill += 1
+                                        _mid_diag_ok(symb, ex_name, market, tf, "rest_prefill", df_pf_n)
+                                        return df_ret
+                        except Exception:
+                            pass
+
+
 
                     # If TF is 30m/1h and we have 5m candles (WS/DB), build higher TF from 5m to avoid REST.
                     if tf in ("30m", "1h"):
