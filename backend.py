@@ -10652,6 +10652,10 @@ class Backend:
                 _mid_candles_diag = defaultdict(list)  # (symbol, tf) -> ["EX:MARKET:STATUS(:reason)", ...]
                 _mid_candles_diag_seen = defaultdict(set)  # (symbol, tf) -> {rec,...} (dedupe per tick)
 
+                _mid_log_candles_short = os.getenv("MID_LOG_CANDLES_SHORT", "1").strip().lower() in ("1","true","yes","on")
+                _mid_candles_short_seen = set()  # {(symbol, tf)} per tick
+                _mid_log_prefill = os.getenv("MID_LOG_PREFILL", "1").strip().lower() in ("1","true","yes","on")
+
                 def _mid_diag_add(symb: str, ex_name: str, market: str, tf: str, status: str, reason: str = '') -> None:
                     nonlocal _mid_diag_lines
                     try:
@@ -10662,6 +10666,15 @@ class Backend:
                             return
                         _mid_candles_diag_seen[key].add(rec)
                         _mid_candles_diag[key].append(rec)
+                        # Optional: log once per symbol/tf when candles are present but too short for indicators.
+                        try:
+                            if status == "partial" and _mid_log_candles_short:
+                                k2 = (symb, tf)
+                                if k2 not in _mid_candles_short_seen:
+                                    _mid_candles_short_seen.add(k2)
+                                    logger.info("[mid][candles_short] symbol=%s tf=%s ex=%s market=%s %s", symb, tf, ex_name, (market or "SPOT"), reason)
+                        except Exception:
+                            pass
                         if _mid_diag_enabled and _mid_diag_lines < _mid_diag_max and status != 'OK':
                             # Collect diagnostics; actual logging happens once per symbol when candles are finally unavailable.
                             _mid_diag_lines += 1
@@ -11335,6 +11348,12 @@ class Backend:
                             last_ok = float(_pl_ok.get(_okey, 0.0) or 0.0)
                             if (time.time() - last_ok) < float(prefill_cooldown):
                                 last_ts = time.time()
+                                try:
+                                    if _mid_log_prefill:
+                                        _left = float(prefill_cooldown) - (time.time() - last_ok)
+                                        logger.info("[mid][prefill_skip] symbol=%s tf=%s market=%s reason=cooldown left=%.1fs", symb, tf, (market or "SPOT"), max(0.0, _left))
+                                except Exception:
+                                    pass
 
                             if (time.time() - last_ts) >= float(prefill_cooldown):
                                 _pl[_pkey] = float(time.time())
@@ -11346,6 +11365,11 @@ class Backend:
                                     pf_limit = int(pf_limit)
                                 # Do REST prefill (single venue) with a short timeout.
                                 try:
+                                    try:
+                                        if _mid_log_prefill:
+                                            logger.info("[mid][prefill_try] symbol=%s tf=%s market=%s ex=%s limit=%s pf_limit=%s timeout=%ss", symb, tf, (market or "SPOT"), ex_name, limit, pf_limit, prefill_timeout)
+                                    except Exception:
+                                        pass
                                     df_pf = await asyncio.wait_for(_mid_fetch_klines_rest(ex_name, symb, tf, int(pf_limit), market), timeout=float(prefill_timeout))
                                 except Exception:
                                     df_pf = None
@@ -11386,6 +11410,11 @@ class Backend:
                                         except Exception:
                                             df_ret = df_pf_n
                                         _mid_rest_refill += 1
+                                        try:
+                                            if _mid_log_prefill:
+                                                logger.info("[mid][prefill] symbol=%s tf=%s market=%s ex=%s got=%s limit=%s pf_limit=%s", symb, tf, (market or "SPOT"), ex_name, got_pf, limit, pf_limit)
+                                        except Exception:
+                                            pass
                                         _mid_diag_ok(symb, ex_name, market, tf, "rest_prefill", df_pf_n)
                                         try:
                                             if hasattr(self, "_mid_prefill_last_ok"):
