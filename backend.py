@@ -10743,6 +10743,49 @@ class Backend:
                         return mid_cache_ttl_30m
                     return mid_cache_ttl_1h
 
+
+                def _mid_tf_stale_sec(tf: str, *, kind: str = "generic") -> float:
+                    """Return max allowed candle age (seconds) for a timeframe.
+
+                    Priority (highest -> lowest):
+                      - MID_REST_CANDLES_MAX_AGE_SEC / MID_PERSIST_CANDLES_MAX_AGE_SEC (explicit per-source override)
+                      - MID_CANDLES_CACHE_STALE_SEC (legacy global override)
+                      - TF-aware defaults (env-overridable):
+                          5m  -> MID_TF_STALE_5M_SEC  (default 1200)
+                          30m -> MID_TF_STALE_30M_SEC (default 5400)
+                          1h  -> MID_TF_STALE_1H_SEC  (default 7200)
+                    """
+                    try:
+                        t = (tf or "").strip().lower()
+                        # Explicit per-source override (keeps backward compatibility)
+                        if kind == "rest":
+                            v = (os.getenv("MID_REST_CANDLES_MAX_AGE_SEC") or "").strip()
+                            if v:
+                                return float(v)
+                        if kind == "persist":
+                            v = (os.getenv("MID_PERSIST_CANDLES_MAX_AGE_SEC") or "").strip()
+                            if v:
+                                return float(v)
+
+                        # Legacy global override
+                        v = (os.getenv("MID_CANDLES_CACHE_STALE_SEC") or "").strip()
+                        if v:
+                            return float(v)
+
+                        # TF-aware defaults (can be overridden)
+                        if t in ("5m", "5min", "5"):
+                            v = (os.getenv("MID_TF_STALE_5M_SEC") or os.getenv("MID_STALE_5M_SEC") or "").strip()
+                            return float(v) if v else 1200.0
+                        if t in ("30m", "30min", "30"):
+                            v = (os.getenv("MID_TF_STALE_30M_SEC") or os.getenv("MID_STALE_30M_SEC") or "").strip()
+                            return float(v) if v else 5400.0
+                        # default: 1h+
+                        v = (os.getenv("MID_TF_STALE_1H_SEC") or os.getenv("MID_STALE_1H_SEC") or "").strip()
+                        return float(v) if v else 7200.0
+                    except Exception:
+                        # safest fallback
+                        return 1800.0
+
                 def _mid_primary_for_symbol(symb: str) -> str:
                     # Prefer the exchange that produced the symbol universe (scanner), to avoid routing
                     # a symbol to an exchange where it doesn't exist -> candles_unavailable storms.
@@ -10808,7 +10851,7 @@ class Backend:
                                 try:
                                     if df is None or getattr(df, 'empty', True):
                                         return False
-                                    max_age = float(os.getenv("MID_REST_CANDLES_MAX_AGE_SEC", os.getenv("MID_CANDLES_CACHE_STALE_SEC", "900")) or 900)
+                                    max_age = float(_mid_tf_stale_sec(tf, kind="rest"))
                                     now_ms = int(time.time() * 1000)
                                     if "close_time_ms" in df.columns:
                                         last_ms = int(df["close_time_ms"].iloc[-1])
@@ -11054,7 +11097,7 @@ class Backend:
                                         persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
                                         if persist_enabled and tf in ("5m","30m","1h"):
                                             try:
-                                                max_age = int(os.getenv("MID_PERSIST_CANDLES_MAX_AGE_SEC", os.getenv("MID_CANDLES_CACHE_STALE_SEC", "1800")) or 1800)
+                                                max_age = int(float(_mid_tf_stale_sec(tf, kind="persist")))
                                                 row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(limit))
                                                 if (not row):
                                                     try:
@@ -11119,7 +11162,7 @@ class Backend:
                     persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
                     if persist_enabled and tf in ("5m","30m","1h"):
                         try:
-                            max_age = int(os.getenv("MID_PERSIST_CANDLES_MAX_AGE_SEC", os.getenv("MID_CANDLES_CACHE_STALE_SEC", "1800")) or 1800)
+                            max_age = int(float(_mid_tf_stale_sec(tf, kind="persist")))
                             row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
                             if (not row):
                                 # WS-candles service usually persists with a single fixed limit (default 250).
