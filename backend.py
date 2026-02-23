@@ -10900,6 +10900,42 @@ class Backend:
                 _mid_candles_fallback = 0
 
 
+                def _mid_fmt_missing_wait(tf: str, need: int, got: int) -> str:
+                    """Return ' missing=X (~Y needed)' for partial candle history diagnostics."""
+                    try:
+                        if not need:
+                            return ''
+                        missing = int(need) - int(got or 0)
+                        if missing <= 0:
+                            return ''
+                        tf_l = (tf or '').lower().strip()
+                        sec_per = 0
+                        # supports like 5m, 30m, 1h, 4h, 1d
+                        if tf_l.endswith('m') and tf_l[:-1].isdigit():
+                            sec_per = int(tf_l[:-1]) * 60
+                        elif tf_l.endswith('h') and tf_l[:-1].isdigit():
+                            sec_per = int(tf_l[:-1]) * 3600
+                        elif tf_l.endswith('d') and tf_l[:-1].isdigit():
+                            sec_per = int(tf_l[:-1]) * 86400
+                        if sec_per <= 0:
+                            return f" missing={missing}"
+                        total = missing * sec_per
+                        days = total // 86400
+                        rem = total % 86400
+                        hours = rem // 3600
+                        rem = rem % 3600
+                        mins = rem // 60
+                        if days > 0:
+                            approx = f"{days}d{hours:02d}h"
+                        elif hours > 0:
+                            approx = f"{hours}h{mins:02d}m"
+                        else:
+                            approx = f"{mins}m"
+                        return f" missing={missing} (~{approx} needed)"
+                    except Exception:
+                        return ''
+
+
                 async def _mid_fetch_klines_rest(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
 
 
@@ -11701,15 +11737,15 @@ class Backend:
                                             n30_got = _mid_len(b)
                                             n1h_got = _mid_len(c)
                                             if n5_need and n5_got < n5_need:
-                                                _mid_diag_add(sym, name, mkt_u, tf_trigger, "partial", f"need_{tf_trigger}_bars={n5_need} got={n5_got}")
+                                                _mid_diag_add(sym, name, mkt_u, tf_trigger, "partial", f"need_{tf_trigger}_bars={n5_need} got={n5_got}" + _mid_fmt_missing_wait(tf_trigger, n5_need, n5_got))
                                                 _mid_candles_partial += 1
                                                 continue
                                             if n30_need and n30_got < n30_need:
-                                                _mid_diag_add(sym, name, mkt_u, tf_mid, "partial", f"need_{tf_mid}_bars={n30_need} got={n30_got}")
+                                                _mid_diag_add(sym, name, mkt_u, tf_mid, "partial", f"need_{tf_mid}_bars={n30_need} got={n30_got}" + _mid_fmt_missing_wait(tf_mid, n30_need, n30_got))
                                                 _mid_candles_partial += 1
                                                 continue
                                             if n1h_need and n1h_got < n1h_need:
-                                                _mid_diag_add(sym, name, mkt_u, tf_trend, "partial", f"need_{tf_trend}_bars={n1h_need} got={n1h_got}")
+                                                _mid_diag_add(sym, name, mkt_u, tf_trend, "partial", f"need_{tf_trend}_bars={n1h_need} got={n1h_got}" + _mid_fmt_missing_wait(tf_trend, n1h_need, n1h_got))
                                                 _mid_candles_partial += 1
                                                 continue
 
