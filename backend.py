@@ -11262,6 +11262,10 @@ class Backend:
                     # WS is great for live updates but after restart may have got=1.
                     # When enabled, if we don't have enough bars in cache/DB, we do a one-time REST prefill
                     # (with per-symbol/TF cooldown) and persist the result to Postgres candles_cache.
+                    #
+                    # Smart mode:
+                    # - Prefer a remembered "best exchange" per (market,symbol) to avoid redundant probes.
+                    # - Otherwise probe up to MID_PREFILL_MAX_EXCHANGES venues in parallel and pick the fastest valid / most-complete.
                     prefill_enabled = str(os.getenv("MID_PREFILL_FROM_REST", "0") or "0").strip().lower() not in ("0","false","no","off")
                     prefill_only_if_missing = str(os.getenv("MID_PREFILL_ONLY_IF_MISSING", "1") or "1").strip().lower() not in ("0","false","no","off")
                     try:
@@ -11272,6 +11276,11 @@ class Backend:
                         prefill_timeout = float(os.getenv("MID_PREFILL_TIMEOUT_SEC", "3.5") or 3.5)
                     except Exception:
                         prefill_timeout = 3.5
+                    try:
+                        prefill_max_ex = int(os.getenv("MID_PREFILL_MAX_EXCHANGES", "2") or 2)
+                    except Exception:
+                        prefill_max_ex = 2
+                    prefill_max_ex = max(1, min(5, int(prefill_max_ex)))
 
                     def _prefill_limit_for_tf(tf_: str) -> int:
                         ttf = (tf_ or "").strip().lower()
@@ -11284,46 +11293,120 @@ class Backend:
                         except Exception:
                             return 300 if ttf.startswith("5") else (200 if ttf.startswith("30") else 150)
 
+                    def _prefill_candidates(mkt: str) -> list[str]:
+                        # Optional explicit order:
+                        raw = (os.getenv("MID_PREFILL_EXCHANGES") or "").strip()
+                        if raw:
+                            arr = [x.strip().upper() for x in raw.split(",") if x and x.strip()]
+                        else:
+                            # Defaults cover most symbols. Futures usually only on big 3.
+                            if (mkt or "SPOT").upper().strip() == "FUTURES":
+                                arr = ["BINANCE", "BYBIT", "OKX"]
+                            else:
+                                arr = ["BINANCE", "BYBIT", "OKX", "MEXC", "GATEIO"]
+                        # Ensure current ex is always considered first if it is in list.
+                        if ex_name and ex_name.upper() in arr:
+                            arr = [ex_name.upper()] + [x for x in arr if x != ex_name.upper()]
+                        # Dedup keep order
+                        out: list[str] = []
+                        for x in arr:
+                            if x and x not in out:
+                                out.append(x)
+                        return out
+
+                    async def _prefill_one(name: str, *, mkt: str, tf_: str, pf_limit: int) -> tuple[str, Optional[pd.DataFrame], float, int]:
+                        t0 = time.time()
+                        try:
+                            df0 = await asyncio.wait_for(_mid_fetch_klines_rest(name, symb, tf_, int(pf_limit), mkt), timeout=float(prefill_timeout))
+                        except Exception:
+                            df0 = None
+                        took = max(0.0, time.time() - t0)
+                        if df0 is None or getattr(df0, "empty", True):
+                            return (name, None, took, 0)
+                        dfn = _mid_norm_ohlcv(df0)
+                        if dfn is None or getattr(dfn, "empty", True):
+                            return (name, None, took, 0)
+                        try:
+                            n = int(len(dfn))
+                        except Exception:
+                            n = 0
+                        return (name, dfn, took, n)
+
                     # prefill guard state
                     if prefill_enabled and tf in ("5m","30m","1h"):
                         try:
-                            # If we already have enough bars in WS/DB cache -> skip prefill.
                             need = _mid_need_bars(tf) if prefill_only_if_missing else 0
-                            if need and int(limit) > 0 and int(limit) >= need:
-                                # We don't know got here because cache lookup already failed, so treat as missing.
-                                pass
                             if not hasattr(self, "_mid_prefill_last"):
                                 self._mid_prefill_last = {}  # type: ignore[attr-defined]
+                            if not hasattr(self, "_mid_prefill_best"):
+                                self._mid_prefill_best = {}  # type: ignore[attr-defined]  # (market,symbol)->exchange
                             _pl = self._mid_prefill_last  # type: ignore[attr-defined]
-                            _pkey = (ex_name, (market or "SPOT").upper().strip(), symb, tf)
+                            _best = self._mid_prefill_best  # type: ignore[attr-defined]
+
+                            mkt_u = (market or "SPOT").upper().strip()
+                            # cooldown key for the *target symbol/tf* (not per exchange), to avoid blasting REST on cold-start.
+                            _pkey = (mkt_u, symb, tf)
                             last_ts = float(_pl.get(_pkey, 0.0) or 0.0)
                             if (time.time() - last_ts) >= float(prefill_cooldown):
                                 _pl[_pkey] = float(time.time())
+
                                 pf_limit = _prefill_limit_for_tf(tf)
-                                # ensure prefill limit at least what caller asked
                                 try:
                                     pf_limit = int(max(int(pf_limit), int(limit)))
                                 except Exception:
                                     pf_limit = int(pf_limit)
-                                # Do REST prefill (single venue) with a short timeout.
+
+                                # Choose candidates: remember best per symbol to reduce extra calls.
+                                cand = _prefill_candidates(mkt_u)
+                                best_hint = None
                                 try:
-                                    df_pf = await asyncio.wait_for(_mid_fetch_klines_rest(ex_name, symb, tf, int(pf_limit), market), timeout=float(prefill_timeout))
+                                    best_hint = _best.get((mkt_u, symb))
                                 except Exception:
-                                    df_pf = None
-                                if df_pf is not None and not getattr(df_pf, "empty", True):
-                                    # normalize once, then persist
-                                    df_pf_n = _mid_norm_ohlcv(df_pf)
-                                    if df_pf_n is not None and not getattr(df_pf_n, "empty", True):
-                                        got_pf = 0
+                                    best_hint = None
+                                if best_hint and str(best_hint).upper() in cand:
+                                    cand = [str(best_hint).upper()] + [x for x in cand if x != str(best_hint).upper()]
+
+                                # Probe up to N venues in parallel.
+                                cand = cand[:max(1, int(prefill_max_ex))]
+                                tasks = [asyncio.create_task(_prefill_one(nm, mkt=mkt_u, tf_=tf, pf_limit=pf_limit)) for nm in cand]
+                                results = []
+                                for t in tasks:
+                                    try:
+                                        results.append(await t)
+                                    except Exception:
+                                        pass
+
+                                # Pick best: first prefer those meeting 'need', then by bars desc, then by speed.
+                                chosen_pf = None
+                                if results:
+                                    ok = [r for r in results if r[1] is not None and (not need or r[3] >= int(need))]
+                                    pool = ok if ok else [r for r in results if r[1] is not None]
+                                    if pool:
+                                        pool.sort(key=lambda r: (-int(r[3]), float(r[2])))
+                                        chosen_pf = pool[0]
+
+                                if chosen_pf:
+                                    pf_ex, df_pf_n, took, got_pf = chosen_pf
+                                    if df_pf_n is not None and got_pf:
+                                        # Remember the best venue for this (market,symbol) for future cold-starts.
                                         try:
-                                            got_pf = int(len(df_pf_n))
+                                            _best[(mkt_u, symb)] = str(pf_ex).upper()
                                         except Exception:
-                                            got_pf = 0
-                                        # Persist under multiple common limits to maximize reuse (prefill_limit + WS limit + requested limit).
+                                            pass
+
+                                        # Persist under winner + also write-through under current ex_name (if different),
+                                        # so future reads on either path hit DB.
                                         try:
                                             if persist_enabled:
+                                                def _persist_under(exn: str, dfn: pd.DataFrame) -> None:
+                                                    pass
+                                                # full
                                                 blob_full = db_store._cc_pack_df(df_pf_n)
-                                                await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(pf_limit), blob_full)
+                                                await db_store.candles_cache_set(pf_ex, mkt_u, symb, tf, int(pf_limit), blob_full)
+                                                if str(ex_name).upper() != str(pf_ex).upper():
+                                                    await db_store.candles_cache_set(ex_name, mkt_u, symb, tf, int(pf_limit), blob_full)
+
+                                                # ws limit tail
                                                 try:
                                                     ws_limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
                                                 except Exception:
@@ -11331,13 +11414,20 @@ class Backend:
                                                 if int(ws_limit) != int(pf_limit) and got_pf:
                                                     df_ws = df_pf_n.tail(int(ws_limit)).copy() if got_pf > int(ws_limit) else df_pf_n
                                                     blob_ws = db_store._cc_pack_df(df_ws)
-                                                    await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(ws_limit), blob_ws)
+                                                    await db_store.candles_cache_set(pf_ex, mkt_u, symb, tf, int(ws_limit), blob_ws)
+                                                    if str(ex_name).upper() != str(pf_ex).upper():
+                                                        await db_store.candles_cache_set(ex_name, mkt_u, symb, tf, int(ws_limit), blob_ws)
+
+                                                # requested limit tail
                                                 if int(limit) != int(pf_limit) and int(limit) > 0 and got_pf:
                                                     df_req = df_pf_n.tail(int(limit)).copy() if got_pf > int(limit) else df_pf_n
                                                     blob_req = db_store._cc_pack_df(df_req)
-                                                    await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob_req)
+                                                    await db_store.candles_cache_set(pf_ex, mkt_u, symb, tf, int(limit), blob_req)
+                                                    if str(ex_name).upper() != str(pf_ex).upper():
+                                                        await db_store.candles_cache_set(ex_name, mkt_u, symb, tf, int(limit), blob_req)
                                         except Exception:
                                             pass
+
                                         # Cache in memory for this request
                                         try:
                                             df_ret = df_pf_n
@@ -11346,15 +11436,18 @@ class Backend:
                                             _mid_candles_cache[key] = (now, df_ret)
                                         except Exception:
                                             df_ret = df_pf_n
+
                                         _mid_rest_refill += 1
-                                        _mid_diag_ok(symb, ex_name, market, tf, "rest_prefill", df_pf_n)
+                                        # Log winner venue + time
+                                        try:
+                                            _mid_diag_ok(symb, str(pf_ex).upper(), mkt_u, tf, "rest_prefill", df_pf_n)
+                                        except Exception:
+                                            _mid_diag_ok(symb, ex_name, market, tf, "rest_prefill", df_pf_n)
                                         return df_ret
                         except Exception:
                             pass
 
-
-
-                    # If TF is 30m/1h and we have 5m candles (WS/DB), build higher TF from 5m to avoid REST.
+# If TF is 30m/1h and we have 5m candles (WS/DB), build higher TF from 5m to avoid REST.
                     if tf in ("30m", "1h"):
                         try:
                             tf_minutes = 30 if tf == "30m" else 60
