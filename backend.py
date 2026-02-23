@@ -393,6 +393,65 @@ import base64
 import urllib.parse
 import numpy as np
 import pandas as pd
+
+
+def _mid_norm_ohlcv(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Normalize OHLCV columns to lower-case open/high/low/close/(volume).
+    Returns cleaned df or None if schema is unusable.
+    """
+    try:
+        if df is None:
+            return None
+        if not hasattr(df, "empty"):
+            return None
+        if df.empty:
+                dfn = _mid_norm_ohlcv(df)
+                if dfn is None:
+                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
+                    return pd.DataFrame()
+                return dfn
+        d = df.copy()
+        # normalize column names
+        cols = list(d.columns)
+        lower_map = {c: str(c).strip().lower() for c in cols}
+        d.rename(columns=lower_map, inplace=True)
+        # common aliases
+        alias = {
+            "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume",
+            "vol": "volume", "qty": "volume", "quote_volume": "volume",
+            "openprice": "open", "highprice": "high", "lowprice": "low", "closeprice": "close",
+        }
+        for k, v in alias.items():
+            if k in d.columns and v not in d.columns:
+                d.rename(columns={k: v}, inplace=True)
+        # some feeds use 'timestamp'/'time' for open_time_ms (optional)
+        if "open_time_ms" not in d.columns:
+            for k in ("open_time", "timestamp", "time", "t"):
+                if k in d.columns:
+                    try:
+                        d["open_time_ms"] = d[k].astype("int64")
+                        break
+                    except Exception:
+                        pass
+        # validate required columns
+        for req in ("open","high","low","close"):
+            if req not in d.columns:
+                return None
+        # cast numeric
+        for req in ("open","high","low","close"):
+            d[req] = d[req].astype(float)
+        if "volume" in d.columns:
+            try:
+                d["volume"] = d["volume"].astype(float)
+            except Exception:
+                pass
+        return d
+    except Exception:
+        return None
+
+
+
+
 import websockets
 from ta.trend import EMAIndicator, MACD, ADXIndicator
 from ta.momentum import RSIIndicator
@@ -10959,11 +11018,11 @@ class Backend:
                             if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                 _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                 return pd.DataFrame()
-                                dfn = _mid_norm_ohlcv(df)
-                                if dfn is None:
-                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
-                                    return pd.DataFrame()
-                                return dfn
+                            dfn = _mid_norm_ohlcv(df)
+                            if dfn is None:
+                                _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
+                                return pd.DataFrame()
+                            return dfn
 
                     except Exception as e:
                         # classify candle failures
@@ -11011,61 +11070,6 @@ class Backend:
 
                 
                 
-                def _mid_norm_ohlcv(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
-                    """Normalize OHLCV columns to lower-case open/high/low/close/(volume).
-                    Returns cleaned df or None if schema is unusable.
-                    """
-                    try:
-                        if df is None:
-                            return None
-                        if not hasattr(df, "empty"):
-                            return None
-                        if df.empty:
-                                dfn = _mid_norm_ohlcv(df)
-                                if dfn is None:
-                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
-                                    return pd.DataFrame()
-                                return dfn
-                        d = df.copy()
-                        # normalize column names
-                        cols = list(d.columns)
-                        lower_map = {c: str(c).strip().lower() for c in cols}
-                        d.rename(columns=lower_map, inplace=True)
-                        # common aliases
-                        alias = {
-                            "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume",
-                            "vol": "volume", "qty": "volume", "quote_volume": "volume",
-                            "openprice": "open", "highprice": "high", "lowprice": "low", "closeprice": "close",
-                        }
-                        for k, v in alias.items():
-                            if k in d.columns and v not in d.columns:
-                                d.rename(columns={k: v}, inplace=True)
-                        # some feeds use 'timestamp'/'time' for open_time_ms (optional)
-                        if "open_time_ms" not in d.columns:
-                            for k in ("open_time", "timestamp", "time", "t"):
-                                if k in d.columns:
-                                    try:
-                                        d["open_time_ms"] = d[k].astype("int64")
-                                        break
-                                    except Exception:
-                                        pass
-                        # validate required columns
-                        for req in ("open","high","low","close"):
-                            if req not in d.columns:
-                                return None
-                        # cast numeric
-                        for req in ("open","high","low","close"):
-                            d[req] = d[req].astype(float)
-                        if "volume" in d.columns:
-                            try:
-                                d["volume"] = d["volume"].astype(float)
-                            except Exception:
-                                pass
-                        return d
-                    except Exception:
-                        return None
-
-
                 async def _mid_fetch_klines_wsdb_only(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
                                     """Return candles using only in-memory cache + persistent DB cache.
                                     NO REST, NO retries. Used to build higher TF from WS/DB 5m without accidentally triggering REST storms.
