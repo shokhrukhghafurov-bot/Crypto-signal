@@ -10537,12 +10537,16 @@ class Backend:
         tf_trigger, tf_mid, tf_trend = "5m", "30m", "1h"
 
         # --- MID candles market selection ---
-        # IMPORTANT (production hardening):
-        # User requested: "свечи берем только из SPOT и эти свечи для FUTURES тоже используем".
-        # We force MID candles to be fetched from SPOT only.
-        # (Signals can still be FUTURES — we just use SPOT klines for TA.)
+        # PRO behavior:
+        #   - Prefer FUTURES candles when available (often better liquidity/continuity)
+        #   - Fallback to SPOT if FUTURES are unavailable
+        # This matches: "свечи должен берет из фючерси и спот на все биржи, бинанс основи".
+        #
+        # Controls:
+        #   MID_CANDLES_MARKET_MODE=AUTO|FUTURES|SPOT
+        #   MID_ALLOW_FUTURES=1 (default)
         market_mode = (os.getenv('MID_CANDLES_MARKET_MODE', 'AUTO') or 'AUTO').upper().strip()
-        allow_fut = str(os.getenv('MID_ALLOW_FUTURES', '0') or '0').strip().lower() not in ('0','false','no','off')
+        allow_fut = str(os.getenv('MID_ALLOW_FUTURES', '1') or '1').strip().lower() not in ('0','false','no','off')
         if market_mode == 'AUTO':
             markets_try = ['FUTURES','SPOT'] if allow_fut else ['SPOT']
         elif market_mode in ('FUTURES','SWAP','PERP','PERPS'):
@@ -11368,8 +11372,19 @@ class Backend:
                             async def _choose_exchange_mid():
                                 nonlocal chosen_name, chosen_market, chosen_r
                                 primary = _mid_primary_for_symbol(sym)
-                                # try primary first, then the other primary (if any), then fallbacks
-                                try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
+                                # "BINANCE основи": always try BINANCE first (unless explicitly disabled),
+                                # then try the symbol's primary exchange, then other primaries, then fallbacks.
+                                try_order = []
+                                if (not disable_binance):
+                                    try_order.append('BINANCE')
+                                if primary and primary not in try_order:
+                                    try_order.append(primary)
+                                for x in mid_primary_exchanges:
+                                    if x and x not in try_order:
+                                        try_order.append(x)
+                                for x in mid_fallback_exchanges:
+                                    if x and x not in try_order:
+                                        try_order.append(x)
 
                                 # Try markets in order (AUTO: FUTURES->SPOT, or configured order)
                                 for mkt in markets_try:
