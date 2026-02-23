@@ -11146,7 +11146,7 @@ class Backend:
                                             ts, df = cached
                                             if (now - ts) <= ttl and df is not None and not getattr(df, 'empty', True):
                                                 _mid_db_hit += 1
-                                                _mid_diag_add(symb_n, ex_name, market, tf, 'OK', 'cache')
+                                                _mid_diag_ok(symb_n, ex_name, market, tf, 'cache', df)
                                                 dfn = _mid_norm_ohlcv(df)
                                                 if dfn is None:
                                                     _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'cache')
@@ -11181,7 +11181,7 @@ class Backend:
                                                         if dfp is not None and not dfp.empty:
                                                             _mid_db_hit += 1
                                                             _mid_candles_cache[key] = (now, dfp)
-                                                            _mid_diag_add(symb_n, ex_name, market, tf, 'OK', 'persist')
+                                                            _mid_diag_ok(symb_n, ex_name, market, tf, 'persist', dfp)
                                                             dfp_n = _mid_norm_ohlcv(dfp)
                                                             if dfp_n is None:
                                                                 _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'persist')
@@ -11214,7 +11214,7 @@ class Backend:
                         ts, df = cached
                         if (now - ts) <= ttl and df is not None and not df.empty:
                             _mid_db_hit += 1
-                            _mid_diag_add(symb, ex_name, market, tf, 'OK', 'cache')
+                            _mid_diag_ok(symb, ex_name, market, tf, 'cache', df)
                             return df
                     
                     # Persistent candles cache (Postgres) to survive restarts.
@@ -11249,7 +11249,7 @@ class Backend:
                                     if dfp is not None and not dfp.empty:
                                         _mid_db_hit += 1
                                         _mid_candles_cache[key] = (now, dfp)
-                                        _mid_diag_add(symb, ex_name, market, tf, 'OK', 'persist')
+                                        _mid_diag_ok(symb, ex_name, market, tf, 'persist', dfp)
                                         dfp_n = _mid_norm_ohlcv(dfp)
                                         if dfp_n is None:
                                             _mid_diag_add(symb, ex_name, market, tf, 'bad_schema', 'persist')
@@ -11438,7 +11438,7 @@ class Backend:
                             except Exception:
                                 pass
                             _mid_rest_refill += 1
-                            _mid_diag_add(symb, ex_name, market, tf, 'OK', 'rest')
+                            _mid_diag_ok(symb, ex_name, market, tf, 'rest', last)
                             return last
                         # tiny backoff reduces rate-limit bursts and improves success on flaky networks
                         if _i < max(0, mid_candles_retry):
@@ -11671,13 +11671,33 @@ class Backend:
                                 except Exception:
                                     return 0
 
-                            def _mid_len(df: Optional[pd.DataFrame]) -> int:
+                            
+def _mid_diag_ok(symb: str, ex_name: str, market: str, tf: str, source: str, df: Optional[pd.DataFrame]) -> None:
+    """Add an OK/partial diag record including got/need bars.
+    If got < need -> mark as partial with need/got/missing (~time needed).
+    """
+    try:
+        need = _mid_need_bars(tf)
+        got = int(len(df)) if df is not None else 0
+        if need and got < need:
+            _mid_diag_add(symb, ex_name, market, tf, "partial",
+                         f"need_{tf}_bars={need} got={got}" + _mid_fmt_missing_wait(tf, need, got))
+        else:
+            # Keep the existing OK semantics but enrich with bars count for clarity.
+            if got:
+                _mid_diag_add(symb, ex_name, market, tf, "OK", f"{source}(got={got})")
+            else:
+                _mid_diag_add(symb, ex_name, market, tf, "OK", source)
+    except Exception:
+        _mid_diag_add(symb, ex_name, market, tf, "OK", source)
+def _mid_len(df: Optional[pd.DataFrame]) -> int:
                                 try:
                                     return int(len(df)) if df is not None else 0
                                 except Exception:
                                     return 0
 
                             chosen_r: Optional[Dict[str, Any]] = None
+                            found_ok_candles: bool = False  # candles were present and had enough bars on at least one venue
 
                             async def _choose_exchange_mid():
                                 nonlocal chosen_name, chosen_market, chosen_r
@@ -11749,6 +11769,8 @@ class Backend:
                                                 _mid_candles_partial += 1
                                                 continue
 
+                                            # Candles are available (non-empty + enough bars) on this venue.
+                                            found_ok_candles = True
                                             r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
                                             if r:
                                                 chosen_name = name
@@ -11773,6 +11795,9 @@ class Backend:
                                 await _choose_exchange_mid()
 
                             if not chosen_r:
+                                if found_ok_candles:
+                                    # Candles were OK but no signal on any venue; don't mislabel as candles_unavailable.
+                                    continue
                                 _rej_add(sym, "candles_unavailable")
 
                                 # Log once per symbol per tick when candles are finally unavailable (prevents spam).
