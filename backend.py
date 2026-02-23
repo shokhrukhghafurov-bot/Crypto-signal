@@ -11672,25 +11672,26 @@ class Backend:
                                     return 0
 
                             
-def _mid_diag_ok(symb: str, ex_name: str, market: str, tf: str, source: str, df: Optional[pd.DataFrame]) -> None:
-    """Add an OK/partial diag record including got/need bars.
-    If got < need -> mark as partial with need/got/missing (~time needed).
-    """
-    try:
-        need = _mid_need_bars(tf)
-        got = int(len(df)) if df is not None else 0
-        if need and got < need:
-            _mid_diag_add(symb, ex_name, market, tf, "partial",
-                         f"need_{tf}_bars={need} got={got}" + _mid_fmt_missing_wait(tf, need, got))
-        else:
-            # Keep the existing OK semantics but enrich with bars count for clarity.
-            if got:
-                _mid_diag_add(symb, ex_name, market, tf, "OK", f"{source}(got={got})")
-            else:
-                _mid_diag_add(symb, ex_name, market, tf, "OK", source)
-    except Exception:
-        _mid_diag_add(symb, ex_name, market, tf, "OK", source)
-def _mid_len(df: Optional[pd.DataFrame]) -> int:
+                            def _mid_diag_ok(symb: str, ex_name: str, market: str, tf: str, source: str, df: Optional[pd.DataFrame]) -> None:
+                                """Add an OK/partial diag record including got/need bars.
+                                If got < need -> mark as partial with need/got/missing (~time needed).
+                                """
+                                try:
+                                    need = _mid_need_bars(tf)
+                                    got = int(len(df)) if df is not None else 0
+                                    if need and got < need:
+                                        _mid_diag_add(symb, ex_name, market, tf, "partial",
+                                                     f"need_{tf}_bars={need} got={got}" + _mid_fmt_missing_wait(tf, need, got))
+                                    else:
+                                        # Keep the existing OK semantics but enrich with bars count for clarity.
+                                        if got:
+                                            _mid_diag_add(symb, ex_name, market, tf, "OK", f"{source}(got={got})")
+                                        else:
+                                            _mid_diag_add(symb, ex_name, market, tf, "OK", source)
+                                except Exception:
+                                    _mid_diag_add(symb, ex_name, market, tf, "OK", source)
+
+                            def _mid_len(df: Optional[pd.DataFrame]) -> int:
                                 try:
                                     return int(len(df)) if df is not None else 0
                                 except Exception:
@@ -11702,7 +11703,7 @@ def _mid_len(df: Optional[pd.DataFrame]) -> int:
                             async def _choose_exchange_mid():
                                 nonlocal chosen_name, chosen_market, chosen_r
                                 primary = _mid_primary_for_symbol(sym)
-# try primary first, then the other primary (if any), then fallbacks
+                                # try primary first, then the other primary (if any), then fallbacks
                                 if MID_CANDLES_LIGHT_MODE or MID_CANDLES_BINANCE_FIRST:
                                     # "binance-first" fast path: try BINANCE first, then BYBIT/OKX, then SPOT fallbacks
                                     _light_primary = ["BINANCE", "BYBIT", "OKX"]
