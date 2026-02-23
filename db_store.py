@@ -2808,6 +2808,8 @@ def _cc_unpack_df(blob: bytes):
 
 async def candles_cache_get(ex_name: str, market: str, symbol: str, tf: str, limit: int):
     pool = get_pool()
+    if not pool:
+        return None, None
     key = _cc_key(ex_name, market, symbol, tf, limit)
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT payload, updated_at FROM candles_cache WHERE key=$1", key)
@@ -2815,6 +2817,8 @@ async def candles_cache_get(ex_name: str, market: str, symbol: str, tf: str, lim
 
 async def candles_cache_set(ex_name: str, market: str, symbol: str, tf: str, limit: int, payload: bytes) -> None:
     pool = get_pool()
+    if not pool:
+        return
     key = _cc_key(ex_name, market, symbol, tf, limit)
     async with pool.acquire() as conn:
         await conn.execute(
@@ -2826,6 +2830,8 @@ async def candles_cache_set(ex_name: str, market: str, symbol: str, tf: str, lim
 async def candles_cache_purge(max_age_sec: int) -> int:
     """Delete candles cache rows older than max_age_sec. Returns number of deleted rows."""
     pool = get_pool()
+    if not pool:
+        return 0
     max_age_sec = int(max_age_sec or 0)
     if max_age_sec <= 0:
         return 0
