@@ -10686,7 +10686,7 @@ class Backend:
                     return
 
                 # Tick-local log guard
-                _MID_TICK_CTX.set({'block': set(), 'trap': set(), 'candles_missing': set(), 'candles_missing_sym': set(), 'suppress_block': 0, 'suppress_trap': 0})
+                _MID_TICK_CTX.set({'block': set(), 'trap': set(), 'candles_missing': set(), 'candles_missing_sym': set(), 'prefill_skip': set(), 'suppress_block': 0, 'suppress_trap': 0})
 
                 interval = interval_sec
                 top_n = int(os.getenv("MID_TOP_N", "50"))
@@ -11351,7 +11351,18 @@ class Backend:
                                 try:
                                     if _mid_log_prefill:
                                         _left = float(prefill_cooldown) - (time.time() - last_ok)
-                                        logger.info("[mid][prefill_skip] symbol=%s tf=%s market=%s reason=cooldown left=%.1fs", symb, tf, (market or "SPOT"), max(0.0, _left))
+                                        try:
+                                            _ctx = _MID_TICK_CTX.get()
+                                            _ps = _ctx.get('prefill_skip') if isinstance(_ctx, dict) else None
+                                            _k = (symb, tf, (market or "SPOT").upper().strip())
+                                            if isinstance(_ps, set) and _k in _ps:
+                                                pass
+                                            else:
+                                                if isinstance(_ps, set):
+                                                    _ps.add(_k)
+                                                logger.info("[mid][prefill_skip] symbol=%s tf=%s market=%s reason=cooldown left=%.1fs", symb, tf, (market or "SPOT"), max(0.0, _left))
+                                        except Exception:
+                                            logger.info("[mid][prefill_skip] symbol=%s tf=%s market=%s reason=cooldown left=%.1fs", symb, tf, (market or "SPOT"), max(0.0, _left))
                                 except Exception:
                                     pass
 
@@ -11557,6 +11568,23 @@ class Backend:
                                     return pd.DataFrame()
                             except Exception:
                                 pass
+                            # If REST returned empty multiple times, treat certain FUTURES empties as unsupported to stop storms.
+                            try:
+                                mkt_now2 = (market or 'SPOT').upper().strip()
+                                empty_as_unsup = str(os.getenv("MID_EMPTY_FUTURES_AS_UNSUPPORTED", "1") or "1").strip().lower() not in ("0","false","no","off")
+                                if empty_as_unsup and mkt_now2 == "FUTURES" and ex_name in ("BYBIT","OKX"):
+                                    last_attempt = (_i >= max(0, mid_candles_retry)) and (int(limit) <= 120)
+                                    if last_attempt:
+                                        try:
+                                            api._mark_unsupported(ex_name, mkt_now2, symb, tf)
+                                        except Exception:
+                                            pass
+                                        _mid_diag_add(symb, ex_name, mkt_now2, tf, "unsupported_pair", "empty_futures")
+                                        _mid_candles_unsupported += 1
+                                        return None
+                            except Exception:
+                                pass
+
                             # If it was explicitly marked unsupported (e.g. market not implemented),
                             # don't count it as an "empty candles" sample.
                             if api._is_unsupported_cached(ex_name, (market or 'SPOT').upper().strip(), symb, tf):
@@ -11965,7 +11993,8 @@ class Backend:
 
                             if not chosen_r:
                                 if found_ok_candles:
-                                    # Candles were OK but no signal on any venue; don't mislabel as candles_unavailable.
+                                    # Candles were OK but no signal on any venue.
+                                    _rej_add(sym, "no_signal")
                                     continue
                                 _rej_add(sym, "candles_unavailable")
 
