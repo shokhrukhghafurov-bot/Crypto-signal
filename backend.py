@@ -12338,22 +12338,7 @@ class Backend:
                                 ex = _rej_examples_map.get(k) or []
                                 exs = ",".join(ex) if ex else ""
                                 parts.append(f"{k}={v}" + (f" [{exs}]" if exs else ""))
-	                            # candles empty breakdown (helps debug real "no candles" cases when HTTP doesn't error)
-	                            # IMPORTANT: do NOT spam this when candles were eventually fetched from another venue.
-	                            # Log it only when at least one symbol ended up with candles_unavailable in this tick.
-	                            try:
-	                                if int(_rej_counts.get('candles_unavailable', 0) or 0) > 0 and _mid_candles_empty_reasons:
-	                                    top_empty = sorted(_mid_candles_empty_reasons.items(), key=lambda kv: -kv[1])[:6]
-	                                    top_s = ', '.join([f'{k}={v}' for k,v in top_empty])
-	                                    logger.info('[mid][candles_empty] total=%s top=%s', _mid_candles_empty, top_s)
-	                                    if _mid_candles_log_empty:
-	                                        for k, _v in top_empty:
-	                                            samp = _mid_candles_empty_samples.get(k) or []
-	                                            if samp:
-	                                                logger.info('[mid][candles_empty_samples] %s :: %s', k, ','.join(samp[:_mid_candles_log_empty_samples]))
-	                            except Exception:
-	                                pass
-
+                                # candles empty breakdown (helps debug real "no candles" cases when HTTP doesn't error)                                # IMPORTANT: do NOT spam this when candles were eventually fetched from another venue.                                # Log it only when at least one symbol ended up with candles_unavailable in this tick.                                try:                                    if int(_rej_counts.get('candles_unavailable', 0) or 0) > 0 and _mid_candles_empty_reasons:                                        top_empty = sorted(_mid_candles_empty_reasons.items(), key=lambda kv: -kv[1])[:6]                                        top_s = ', '.join([f'{k}={v}' for k,v in top_empty])                                        logger.info('[mid][candles_empty] total=%s top=%s', _mid_candles_empty, top_s)                                        if _mid_candles_log_empty:                                            for k, _v in top_empty:                                                samp = _mid_candles_empty_samples.get(k) or []                                                if samp:                                                    logger.info('[mid][candles_empty_samples] %s :: %s', k, ','.join(samp[:_mid_candles_log_empty_samples]))                                except Exception:                                    pass
                             logger.info("[mid][reject] scanned=%s accounted=%s missing=%s :: %s", int(_mid_scanned), int(accounted), int(missing), " | ".join(parts))
 
                             if _mid_candles_log_fail and _mid_candles_fail:
