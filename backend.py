@@ -39,7 +39,7 @@ if _TEST_MODE and _TEST_MODE_SCOPE in ("MID","ALL"):
         "MID_RR_DISCOUNT": "1.0",
         "MID_MIN_SCORE_FUTURES": "90",
         "MID_MIN_SCORE_SPOT": "90",
-        "MID_MIN_CONFIDENCE": "0",
+        "MID_MIN_CONFIDENCE": "90",
         "MID_MIN_VOL_X": "0",
         # --- MID regime / filters ---
         "MID_NEWS_FILTER": "1",
