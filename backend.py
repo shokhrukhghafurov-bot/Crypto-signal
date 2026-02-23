@@ -6491,7 +6491,11 @@ class MultiExchangeData:
             self._candles_cache[cache_key] = (time.monotonic() + ttl, df)
             if not fut.done():
                 fut.set_result(df)
-            return df
+            dfn = _mid_norm_ohlcv(df)
+                            if dfn is None:
+                                _mid_diag_add(symb, ex_name, market, tf, 'bad_schema', 'cache')
+                                return pd.DataFrame()
+                            return dfn
         except Exception as e:
             if not fut.done():
                 fut.set_exception(e)
@@ -10872,31 +10876,51 @@ class Backend:
                                 if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                     return pd.DataFrame()
-                                return df
+                                dfn = _mid_norm_ohlcv(df)
+                                if dfn is None:
+                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
+                                    return pd.DataFrame()
+                                return dfn
                             if ex_name == "BYBIT":
                                 df = await api.klines_bybit(symb, tf, limit, market=market)
                                 if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                     return pd.DataFrame()
-                                return df
+                                dfn = _mid_norm_ohlcv(df)
+                                if dfn is None:
+                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
+                                    return pd.DataFrame()
+                                return dfn
                             if ex_name == "OKX":
                                 df = await api.klines_okx(symb, tf, limit, market=market)
                                 if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                     return pd.DataFrame()
-                                return df
+                                dfn = _mid_norm_ohlcv(df)
+                                if dfn is None:
+                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
+                                    return pd.DataFrame()
+                                return dfn
                             if ex_name == "GATEIO":
                                 df = await api.klines_gateio(symb, tf, limit)
                                 if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                     return pd.DataFrame()
-                                return df
+                                dfn = _mid_norm_ohlcv(df)
+                                if dfn is None:
+                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
+                                    return pd.DataFrame()
+                                return dfn
                             # default MEXC
                             df = await api.klines_mexc(symb, tf, limit)
                             if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                 _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                 return pd.DataFrame()
-                            return df
+                                dfn = _mid_norm_ohlcv(df)
+                                if dfn is None:
+                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
+                                    return pd.DataFrame()
+                                return dfn
 
                     except Exception as e:
                         # classify candle failures
@@ -10943,7 +10967,63 @@ class Backend:
                         return None
 
                 
-                async def _mid_fetch_klines_wsdb_only(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
+                
+                def _mid_norm_ohlcv(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+                    """Normalize OHLCV columns to lower-case open/high/low/close/(volume).
+                    Returns cleaned df or None if schema is unusable.
+                    """
+                    try:
+                        if df is None:
+                            return None
+                        if not hasattr(df, "empty"):
+                            return None
+                        if df.empty:
+                                dfn = _mid_norm_ohlcv(df)
+                                if dfn is None:
+                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
+                                    return pd.DataFrame()
+                                return dfn
+                        d = df.copy()
+                        # normalize column names
+                        cols = list(d.columns)
+                        lower_map = {c: str(c).strip().lower() for c in cols}
+                        d.rename(columns=lower_map, inplace=True)
+                        # common aliases
+                        alias = {
+                            "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume",
+                            "vol": "volume", "qty": "volume", "quote_volume": "volume",
+                            "openprice": "open", "highprice": "high", "lowprice": "low", "closeprice": "close",
+                        }
+                        for k, v in alias.items():
+                            if k in d.columns and v not in d.columns:
+                                d.rename(columns={k: v}, inplace=True)
+                        # some feeds use 'timestamp'/'time' for open_time_ms (optional)
+                        if "open_time_ms" not in d.columns:
+                            for k in ("open_time", "timestamp", "time", "t"):
+                                if k in d.columns:
+                                    try:
+                                        d["open_time_ms"] = d[k].astype("int64")
+                                        break
+                                    except Exception:
+                                        pass
+                        # validate required columns
+                        for req in ("open","high","low","close"):
+                            if req not in d.columns:
+                                return None
+                        # cast numeric
+                        for req in ("open","high","low","close"):
+                            d[req] = d[req].astype(float)
+                        if "volume" in d.columns:
+                            try:
+                                d["volume"] = d["volume"].astype(float)
+                            except Exception:
+                                pass
+                        return d
+                    except Exception:
+                        return None
+
+
+async def _mid_fetch_klines_wsdb_only(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
                     """Return candles using only in-memory cache + persistent DB cache.
                     NO REST, NO retries. Used to build higher TF from WS/DB 5m without accidentally triggering REST storms.
                     """
@@ -10965,7 +11045,11 @@ class Backend:
                             if (now - ts) <= ttl and df is not None and not getattr(df, 'empty', True):
                                 _mid_db_hit += 1
                                 _mid_diag_add(symb_n, ex_name, market, tf, 'OK', 'cache')
-                                return df
+                                dfn = _mid_norm_ohlcv(df)
+                                if dfn is None:
+                                    _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'cache')
+                                    return pd.DataFrame()
+                                return dfn
 
                         persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
                         if persist_enabled and tf in ("5m","30m","1h"):
@@ -10996,7 +11080,11 @@ class Backend:
                                             _mid_db_hit += 1
                                             _mid_candles_cache[key] = (now, dfp)
                                             _mid_diag_add(symb_n, ex_name, market, tf, 'OK', 'persist')
-                                            return dfp
+                                            dfp_n = _mid_norm_ohlcv(dfp)
+                                            if dfp_n is None:
+                                                _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'persist')
+                                                return pd.DataFrame()
+                                            return dfp_n
                                     else:
                                         _mid_diag_add(symb_n, ex_name, market, tf, 'stale_persist')
                             except Exception:
@@ -11060,7 +11148,11 @@ class Backend:
                                         _mid_db_hit += 1
                                         _mid_candles_cache[key] = (now, dfp)
                                         _mid_diag_add(symb, ex_name, market, tf, 'OK', 'persist')
-                                        return dfp
+                                        dfp_n = _mid_norm_ohlcv(dfp)
+                                        if dfp_n is None:
+                                            _mid_diag_add(symb, ex_name, market, tf, 'bad_schema', 'persist')
+                                            return pd.DataFrame()
+                                        return dfp_n
                         except Exception:
                             pass
 
@@ -11494,20 +11586,11 @@ class Backend:
                                             if isinstance(c, Exception):
                                                 c = None
 
-                                            # IMPORTANT: never silently substitute the wrong timeframe.
-                                            # Reuse trigger candles ONLY when the requested TF is the same.
+                                            # Require true TFs for MID (no silent TF substitution).
                                             if b is None or getattr(b, 'empty', True):
-                                                if str(tf_mid) == str(tf_trigger):
-                                                    b = a
-                                                    _mid_candles_partial += 1
-                                                else:
-                                                    continue
+                                                continue
                                             if c is None or getattr(c, 'empty', True):
-                                                if str(tf_trend) == str(tf_trigger):
-                                                    c = a
-                                                    _mid_candles_partial += 1
-                                                else:
-                                                    continue
+                                                continue
 
                                             r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
                                             if r:
@@ -12075,9 +12158,6 @@ class _WSCandlesAggregator:
         try:
             import db_store  # local module
         except Exception:
-            return
-        # Allow disabling WS->DB persistence without turning off the WS service.
-        if str(os.getenv("CANDLES_WS_PERSIST_DB", os.getenv("CANDLES_WS_PERSIST", "1")) or "1").strip().lower() in ("0","false","no","off"):
             return
         if df is None or df.empty:
             return
