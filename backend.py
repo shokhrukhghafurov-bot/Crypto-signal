@@ -11417,33 +11417,33 @@ class Backend:
                             if not chosen_r:
                                 _rej_add(sym, "candles_unavailable")
 
-# Log once per symbol per tick when candles are finally unavailable (prevents spam).
-try:
-    _ctx = _MID_TICK_CTX.get()
-    if isinstance(_ctx, dict):
-        _cms = _ctx.get('candles_missing_sym')
-        if isinstance(_cms, set) and sym in _cms:
-            pass
-        else:
-            if isinstance(_cms, set):
-                _cms.add(sym)
-            # build condensed diagnostic summary for this symbol
-            parts = []
-            try:
-                for (s_key, tf_key), recs in _mid_candles_diag.items():
-                    if s_key == sym and recs:
-                        # keep only last few records per TF to cap size
-                        tail = recs[-6:]
-                        parts.append(f"{tf_key}=" + ",".join(tail))
-            except Exception:
-                pass
-            diag = " | ".join(parts)
-            if len(diag) > 700:
-                diag = diag[:700] + "…"
-            if diag:
-                logger.info(f"[mid][candles_unavailable] symbol={sym} diag={diag}")
-except Exception:
-    pass
+                                # Log once per symbol per tick when candles are finally unavailable (prevents spam).
+                                try:
+                                    _ctx = _MID_TICK_CTX.get()
+                                    if isinstance(_ctx, dict):
+                                        _cms = _ctx.get('candles_missing_sym')
+                                        if isinstance(_cms, set) and sym in _cms:
+                                            pass
+                                        else:
+                                            if isinstance(_cms, set):
+                                                _cms.add(sym)
+                                            # build condensed diagnostic summary for this symbol
+                                            parts = []
+                                            try:
+                                                for (s_key, tf_key), recs in _mid_candles_diag.items():
+                                                    if s_key == sym and recs:
+                                                        # keep only last few records per TF to cap size
+                                                        tail = recs[-6:]
+                                                        parts.append(f"{tf_key}=" + ",".join(tail))
+                                            except Exception:
+                                                pass
+                                            diag = " | ".join(parts)
+                                            if len(diag) > 700:
+                                                diag = diag[:700] + "…"
+                                            if diag:
+                                                logger.info(f"[mid][candles_unavailable] symbol={sym} diag={diag}")
+                                except Exception:
+                                    pass
                                 continue
 
                             best_name, best_r = chosen_name, chosen_r
