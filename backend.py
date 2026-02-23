@@ -11494,13 +11494,20 @@ class Backend:
                                             if isinstance(c, Exception):
                                                 c = None
 
-                                            # Allow partial candles: if trigger timeframe exists, we can reuse it for missing mid/trend
+                                            # IMPORTANT: never silently substitute the wrong timeframe.
+                                            # Reuse trigger candles ONLY when the requested TF is the same.
                                             if b is None or getattr(b, 'empty', True):
-                                                b = a
-                                                _mid_candles_partial += 1
+                                                if str(tf_mid) == str(tf_trigger):
+                                                    b = a
+                                                    _mid_candles_partial += 1
+                                                else:
+                                                    continue
                                             if c is None or getattr(c, 'empty', True):
-                                                c = a
-                                                _mid_candles_partial += 1
+                                                if str(tf_trend) == str(tf_trigger):
+                                                    c = a
+                                                    _mid_candles_partial += 1
+                                                else:
+                                                    continue
 
                                             r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
                                             if r:
@@ -12068,6 +12075,9 @@ class _WSCandlesAggregator:
         try:
             import db_store  # local module
         except Exception:
+            return
+        # Allow disabling WS->DB persistence without turning off the WS service.
+        if str(os.getenv("CANDLES_WS_PERSIST_DB", os.getenv("CANDLES_WS_PERSIST", "1")) or "1").strip().lower() in ("0","false","no","off"):
             return
         if df is None or df.empty:
             return
