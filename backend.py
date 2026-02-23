@@ -10537,16 +10537,12 @@ class Backend:
         tf_trigger, tf_mid, tf_trend = "5m", "30m", "1h"
 
         # --- MID candles market selection ---
-        # PRO behavior:
-        #   - Prefer FUTURES candles when available (often better liquidity/continuity)
-        #   - Fallback to SPOT if FUTURES are unavailable
-        # This matches: "свечи должен берет из фючерси и спот на все биржи, бинанс основи".
-        #
-        # Controls:
-        #   MID_CANDLES_MARKET_MODE=AUTO|FUTURES|SPOT
-        #   MID_ALLOW_FUTURES=1 (default)
+        # IMPORTANT (production hardening):
+        # User requested: "свечи берем только из SPOT и эти свечи для FUTURES тоже используем".
+        # We force MID candles to be fetched from SPOT only.
+        # (Signals can still be FUTURES — we just use SPOT klines for TA.)
         market_mode = (os.getenv('MID_CANDLES_MARKET_MODE', 'AUTO') or 'AUTO').upper().strip()
-        allow_fut = str(os.getenv('MID_ALLOW_FUTURES', '1') or '1').strip().lower() not in ('0','false','no','off')
+        allow_fut = str(os.getenv('MID_ALLOW_FUTURES', '0') or '0').strip().lower() not in ('0','false','no','off')
         if market_mode == 'AUTO':
             markets_try = ['FUTURES','SPOT'] if allow_fut else ['SPOT']
         elif market_mode in ('FUTURES','SWAP','PERP','PERPS'):
@@ -10585,20 +10581,8 @@ class Backend:
                         rec = f"{ex_name}:{(market or 'SPOT').upper().strip()}:{status}" + (f":{reason}" if reason else '')
                         _mid_candles_diag[key].append(rec)
                         if _mid_diag_enabled and _mid_diag_lines < _mid_diag_max and status != 'OK':
-                            # log once per tick to avoid spam (unsupported_cached, etc.)
-                            try:
-                                _ctx = _MID_TICK_CTX.get()
-                                if isinstance(_ctx, dict):
-                                    _cm = _ctx.get('candles_missing')
-                                    if isinstance(_cm, set):
-                                        _k = (str(symb), str(ex_name), str((market or 'SPOT').upper().strip()), str(tf), str(status))
-                                        if _k in _cm:
-                                            return
-                                        _cm.add(_k)
-                            except Exception:
-                                pass
+                            # Collect diagnostics; actual logging happens once per symbol when candles are finally unavailable.
                             _mid_diag_lines += 1
-                            logger.info(f"[mid][candles_missing] symbol={symb} exchange={ex_name} market={(market or 'SPOT').upper().strip()} tf={tf} status={status}" + (f" reason={reason}" if reason else ""))
                     except Exception:
                         pass
 
@@ -10607,7 +10591,7 @@ class Backend:
                     return
 
                 # Tick-local log guard
-                _MID_TICK_CTX.set({'block': set(), 'trap': set(), 'candles_missing': set(), 'suppress_block': 0, 'suppress_trap': 0})
+                _MID_TICK_CTX.set({'block': set(), 'trap': set(), 'candles_missing': set(), 'candles_missing_sym': set(), 'suppress_block': 0, 'suppress_trap': 0})
 
                 interval = interval_sec
                 top_n = int(os.getenv("MID_TOP_N", "50"))
@@ -11372,19 +11356,8 @@ class Backend:
                             async def _choose_exchange_mid():
                                 nonlocal chosen_name, chosen_market, chosen_r
                                 primary = _mid_primary_for_symbol(sym)
-                                # "BINANCE основи": always try BINANCE first (unless explicitly disabled),
-                                # then try the symbol's primary exchange, then other primaries, then fallbacks.
-                                try_order = []
-                                if (not disable_binance):
-                                    try_order.append('BINANCE')
-                                if primary and primary not in try_order:
-                                    try_order.append(primary)
-                                for x in mid_primary_exchanges:
-                                    if x and x not in try_order:
-                                        try_order.append(x)
-                                for x in mid_fallback_exchanges:
-                                    if x and x not in try_order:
-                                        try_order.append(x)
+                                # try primary first, then the other primary (if any), then fallbacks
+                                try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
 
                                 # Try markets in order (AUTO: FUTURES->SPOT, or configured order)
                                 for mkt in markets_try:
@@ -11443,6 +11416,34 @@ class Backend:
 
                             if not chosen_r:
                                 _rej_add(sym, "candles_unavailable")
+
+# Log once per symbol per tick when candles are finally unavailable (prevents spam).
+try:
+    _ctx = _MID_TICK_CTX.get()
+    if isinstance(_ctx, dict):
+        _cms = _ctx.get('candles_missing_sym')
+        if isinstance(_cms, set) and sym in _cms:
+            pass
+        else:
+            if isinstance(_cms, set):
+                _cms.add(sym)
+            # build condensed diagnostic summary for this symbol
+            parts = []
+            try:
+                for (s_key, tf_key), recs in _mid_candles_diag.items():
+                    if s_key == sym and recs:
+                        # keep only last few records per TF to cap size
+                        tail = recs[-6:]
+                        parts.append(f"{tf_key}=" + ",".join(tail))
+            except Exception:
+                pass
+            diag = " | ".join(parts)
+            if len(diag) > 700:
+                diag = diag[:700] + "…"
+            if diag:
+                logger.info(f"[mid][candles_unavailable] symbol={sym} diag={diag}")
+except Exception:
+    pass
                                 continue
 
                             best_name, best_r = chosen_name, chosen_r
