@@ -58,6 +58,17 @@ if _TEST_MODE and _TEST_MODE_SCOPE in ("MID","ALL"):
 # Enable verbose price source / fallback logging
 PRICE_DEBUG = os.getenv('PRICE_DEBUG', '0').strip().lower() in ('1','true','yes','on')
 
+# =======================
+# MID CANDLES "LIGHT MODE"
+# =======================
+# Enable with: MID_CANDLES_LIGHT_MODE=1
+# - Binace-first routing for candles
+# - Faster REST timeout to avoid long stalls, with immediate fallback to BYBIT/OKX (and MEXC/GATEIO for SPOT)
+MID_CANDLES_LIGHT_MODE = (os.getenv("MID_CANDLES_LIGHT_MODE", "0") or "").strip().lower() in ("1","true","yes","on")
+MID_CANDLES_BINANCE_FIRST = (os.getenv("MID_CANDLES_BINANCE_FIRST", "0") or "").strip().lower() in ("1","true","yes","on")
+MID_LIGHT_HTTP_TIMEOUT_SEC = float(os.getenv("MID_LIGHT_HTTP_TIMEOUT_SEC", "2.5") or "2.5")
+
+
 # --- MID extra entry filters (anti-late-entry / RSI / VWAP distance / climax) ---
 MID_LATE_ENTRY_ATR_MAX = float(os.getenv("MID_LATE_ENTRY_ATR_MAX", "2.2"))   # (close - recent_low)/ATR_30m
 MID_RSI_LONG_MAX = float(os.getenv("MID_RSI_LONG_MAX", "62"))               # RSI(5m) for LONG must be <
@@ -6071,6 +6082,12 @@ class MultiExchangeData:
         # Limits / timeouts
         self._http_concurrency = int(os.getenv("HTTP_CONCURRENCY", "25") or "25")
         self._http_req_timeout_sec = float(os.getenv("HTTP_REQ_TIMEOUT_SEC", "6") or "6")
+        if MID_CANDLES_LIGHT_MODE:
+            # keep REST fast in light mode; fallback to other exchanges instead of waiting long
+            try:
+                self._http_req_timeout_sec = float(min(self._http_req_timeout_sec, MID_LIGHT_HTTP_TIMEOUT_SEC))
+            except Exception:
+                self._http_req_timeout_sec = self._http_req_timeout_sec
         self._http_sem = asyncio.Semaphore(max(1, self._http_concurrency))
 
         # Feature flags
@@ -10846,6 +10863,8 @@ class Backend:
                         return 1800.0
 
                 def _mid_primary_for_symbol(symb: str) -> str:
+                    if MID_CANDLES_LIGHT_MODE or MID_CANDLES_BINANCE_FIRST:
+                        return "BINANCE"
                     # Prefer the exchange that produced the symbol universe (scanner), to avoid routing
                     # a symbol to an exchange where it doesn't exist -> candles_unavailable storms.
                     try:
@@ -11606,8 +11625,22 @@ class Backend:
                             async def _choose_exchange_mid():
                                 nonlocal chosen_name, chosen_market, chosen_r
                                 primary = _mid_primary_for_symbol(sym)
-                                # try primary first, then the other primary (if any), then fallbacks
-                                try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
+# try primary first, then the other primary (if any), then fallbacks
+                                if MID_CANDLES_LIGHT_MODE or MID_CANDLES_BINANCE_FIRST:
+                                    # "binance-first" fast path: try BINANCE first, then BYBIT/OKX, then SPOT fallbacks
+                                    _light_primary = ["BINANCE", "BYBIT", "OKX"]
+                                    try_order = []
+                                    for _x in _light_primary:
+                                        if _x not in try_order:
+                                            try_order.append(_x)
+                                    for _x in (mid_primary_exchanges or []):
+                                        if _x not in try_order:
+                                            try_order.append(_x)
+                                    for _x in (mid_fallback_exchanges or []):
+                                        if _x not in try_order:
+                                            try_order.append(_x)
+                                else:
+                                    try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
 
                                 # Try markets in order (AUTO: FUTURES->SPOT, or configured order)
                                 for mkt in markets_try:
