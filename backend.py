@@ -10479,7 +10479,10 @@ class Backend:
                     await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
 
                     try:
-                        symbols = await api.get_top_usdt_symbols(TOP_N * 3)  # FIX: fetch extra to allow stable filtering
+                        symbols = await api.get_top_usdt_symbols(TOP_N * 3)  # FIX: fetch extra for pre-filter
+                        # FIX: remove blocked/stable symbols BEFORE TOP_N slicing
+                        symbols = [s for s in symbols if not is_blocked_symbol(s)]
+                        symbols = symbols[:TOP_N]
                         if symbols:
                             self._symbols_cache = list(symbols)
                             self._symbols_cache_ts = time.time()
@@ -12052,7 +12055,9 @@ class Backend:
                             else:
                                 raise
                         # Scan only first MID_TOP_N symbols from the loaded universe.
-                        symbols = list(symbols_pool[:max(0, int(top_n))])
+                        # FIX: remove blocked/stable symbols BEFORE slicing to TOP_N
+                        _filtered_pool = [s for s in symbols_pool if not is_blocked_symbol(s)]
+                        symbols = list(_filtered_pool[:max(0, int(top_n))])
                         # ensure unique symbols per tick (preserve order)
                         if symbols:
                             symbols = list(dict.fromkeys(symbols))
