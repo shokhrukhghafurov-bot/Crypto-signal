@@ -10479,7 +10479,7 @@ class Backend:
                     await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
 
                     try:
-                        symbols = await api.get_top_usdt_symbols(TOP_N)
+                        symbols = await api.get_top_usdt_symbols(TOP_N * 3)  # FIX: fetch extra to allow stable filtering
                         if symbols:
                             self._symbols_cache = list(symbols)
                             self._symbols_cache_ts = time.time()
@@ -12067,8 +12067,8 @@ class Backend:
                                 _kept = []
                                 for _s in symbols:
                                     if is_blocked_symbol(_s):
-                                        _kept.append(_s)
-                                        continue
+            _rej_add(_s, "blocked_symbol")
+            continue
                                     _ok = False
                                     # Try both markets because later we may fall back FUTURES->SPOT
                                     for _mkt in ("FUTURES","SPOT"):
