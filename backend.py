@@ -12101,6 +12101,9 @@ class Backend:
                         _rej_full = os.getenv("MID_REJECT_DIGEST_FULL", "0").strip().lower() in ("1","true","yes","on")
                         _rej_full_max = int(os.getenv("MID_REJECT_DIGEST_FULL_MAX", str(_mid_scanned)) or _mid_scanned)
                         _rej_reason_by_sym = {}  # sym -> reason
+                        # Keep a list of normalized reasons too, so 'other={...}' in [mid][summary]
+                        # can show a breakdown like: other=43{score_low=6,rr_low=3,...}
+                        _rej_reasons_by_sym = defaultdict(list)  # sym -> [base_reason...]
 
                         def _rej_add(_sym: str, _reason: str):
                             """Record exactly one terminal reason per symbol per tick."""
@@ -12111,6 +12114,21 @@ class Backend:
                                     return
                                 _rej_seen.add(_sym)
                                 _rej_reason_by_sym[_sym] = _reason
+                                # Also collect normalized base reason for per-symbol aggregation.
+                                try:
+                                    _r = str(_reason or '').strip() or 'unknown'
+                                    _base = _r.split()[0] if _r else 'unknown'
+                                    for _sep in ('=', ':'):
+                                        if _sep in _base:
+                                            _base = _base.split(_sep, 1)[0]
+                                    _base = _base.strip() or 'unknown'
+                                    _map = {'score': 'score_low', 'rr': 'rr_low', 'confidence': 'confidence_low'}
+                                    _base = _map.get(_base, _base)
+                                    if len(_base) > 64:
+                                        _base = _base[:64]
+                                    _rej_reasons_by_sym[str(_sym)].append(_base)
+                                except Exception:
+                                    pass
                                 _rej_counts[_reason] = int(_rej_counts.get(_reason, 0) or 0) + 1
                                 lst = _rej_examples_map.get(_reason)
                                 if lst is None:
