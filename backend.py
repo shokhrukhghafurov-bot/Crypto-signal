@@ -12060,6 +12060,7 @@ class Backend:
                         _mid_no_signal_stage_by_sym = {}
                         _mid_no_signal_stages_by_sym = {}
                         _mid_no_signal_detail_reasons = {}  # fail_reason -> count
+                        _mid_no_signal_detail_reasons_other = {}  # fail_reason -> count (only when stage==other)
                         _mid_no_signal_reasons_by_sym = {}      # sym -> [fail_reason...] per venue
   # sym -> [stage per venue with OK candles]
                         _mid_no_signal_stage_mode = str(os.getenv("MID_NO_SIGNAL_STAGE_MODE","best")).strip().lower()
@@ -12402,6 +12403,11 @@ class Backend:
                                                 _rbest = str(_st or 'other')
                                             if _rbest:
                                                 _mid_no_signal_detail_reasons[_rbest] = int(_mid_no_signal_detail_reasons.get(_rbest,0) or 0) + 1
+                                                try:
+                                                    if str(_st) == 'other':
+                                                        _mid_no_signal_detail_reasons_other[_rbest] = int(_mid_no_signal_detail_reasons_other.get(_rbest,0) or 0) + 1
+                                                except Exception:
+                                                    pass
                                         except Exception:
                                             pass
 
@@ -12708,7 +12714,7 @@ class Backend:
                     _ns_other_details = ''
                     try:
                         _other_n = int(_mid_no_signal_reasons.get('other', 0) or 0)
-                        if _other_n > 0 and isinstance(_mid_no_signal_detail_reasons, dict) and _mid_no_signal_detail_reasons:
+                        if _other_n > 0 and isinstance(_mid_no_signal_detail_reasons_other, dict) and _mid_no_signal_detail_reasons_other:
                             # MID_NO_SIGNAL_DETAIL_TOPN:
                             #   0 or negative => show ALL aggregated reasons
                             #   >0            => show top-N aggregated reasons
@@ -12718,7 +12724,7 @@ class Backend:
                                 topn = 0
 
                             agg = {}
-                            for _k, _v in _mid_no_signal_detail_reasons.items():
+                            for _k, _v in _mid_no_signal_detail_reasons_other.items():
                                 if not _v:
                                     continue
                                 k = str(_k).strip()
@@ -12729,6 +12735,8 @@ class Backend:
                                 base = re.split(r'[=:]', token, maxsplit=1)[0].strip()
                                 if not base:
                                     base = token
+                                if base == 'other':
+                                    continue
                                 agg[base] = agg.get(base, 0) + int(_v or 0)
 
                             items = sorted(agg.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
