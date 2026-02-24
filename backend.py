@@ -6290,7 +6290,7 @@ class MultiExchangeData:
             except Exception:
                 pass
 
-                providers_all = {
+        providers_all = {
             "BINANCE": self._top_from_binance,
             "BYBIT": self._top_from_bybit,
             "OKX": self._top_from_okx,
