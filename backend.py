@@ -10896,6 +10896,8 @@ class Backend:
                 mid_min_vwap_dist_atr = float(os.getenv("MID_MIN_VWAP_DIST_ATR", "0") or "0")
 
                 require_align = os.getenv("MID_REQUIRE_30M_TREND","1").strip().lower() not in ("0","false","no")
+                structure_align_soft = os.getenv("MID_STRUCTURE_ALIGN_SOFT","0").strip().lower() not in ("0","false","no")
+                structure_align_penalty = float(os.getenv("MID_STRUCTURE_ALIGN_PENALTY","8") or 8)
                 allow_futures = os.getenv("MID_ALLOW_FUTURES","1").strip().lower() not in ("0","false","no")
 
                 tp_policy = (os.getenv("MID_TP_POLICY","R") or "R").strip().upper()
@@ -12307,14 +12309,27 @@ class Backend:
                                 continue
                             if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
                                 _mid_f_align += 1
-                                _rej_add(sym, "align_mismatch")
-                                try:
-                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), "align_mismatch")
-                                except Exception:
-                                    pass
-                                continue
+                                if not structure_align_soft:
+                                    _rej_add(sym, "align_mismatch")
+                                    try:
+                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), "align_mismatch")
+                                    except Exception:
+                                        pass
+                                    continue
+                                else:
+                                    # Soft alignment: don't reject, but apply confidence penalty so only strong setups pass.
+                                    try:
+                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"),
+                                                           f"align_soft_penalty={structure_align_penalty:g}")
+                                    except Exception:
+                                        pass
+                                    # Mark penalty to be applied after we read conf
+                                    base_r["__align_soft_penalty"] = float(structure_align_penalty)
 
                             conf = float(base_r.get("confidence",0) or 0)
+                            align_pen = float(base_r.get("__align_soft_penalty", 0) or 0)
+                            if align_pen:
+                                conf = max(0.0, conf - align_pen)
                             rr = float(base_r.get("rr",0) or 0)
                             adx30 = float(base_r.get("adx1",0) or 0)
                             adx1h = float(base_r.get("adx4",0) or 0)
@@ -12534,20 +12549,6 @@ class Backend:
                     _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
                     summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} no_signal={int(_mid_no_signal)} [trap={int(_mid_no_signal_reasons.get('trap',0) or 0)},structure={int(_mid_no_signal_reasons.get('structure',0) or 0)},trend={int(_mid_no_signal_reasons.get('trend',0) or 0)},extreme={int(_mid_no_signal_reasons.get('extreme',0) or 0)},impulse={int(_mid_no_signal_reasons.get('impulse',0) or 0)},other={int(_mid_no_signal_reasons.get('other',0) or 0)}] cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} no_candles={(int(_mid_candles_net_fail)+int(_mid_candles_unsupported)+int(_mid_candles_partial)+int(_mid_candles_empty))} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} candles_empty={_mid_candles_empty} candles_fallback={_mid_candles_fallback} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
                     logger.info("[mid][summary] %s", summary)
-                    # Separate top reasons for candles_empty right after summary (easier to spot in logs)
-                    try:
-                        topn = int(os.getenv("MID_CANDLES_EMPTY_TOP_N", "5") or "5")
-                        if int(_mid_candles_empty) > 0 and isinstance(_mid_candles_empty_reasons, dict) and _mid_candles_empty_reasons:
-                            items = sorted(_mid_candles_empty_reasons.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))[:max(1, topn)]
-                            parts = []
-                            for k, v in items:
-                                try:
-                                    parts.append(f"{k}={int(v)}")
-                                except Exception:
-                                    parts.append(f"{k}={v}")
-                            logger.info("[mid][candles_empty_top] total=%d top=%s", int(_mid_candles_empty), ",".join(parts))
-                    except Exception:
-                        pass
                     try:
                         _tot = int(_mid_db_hit) + int(_mid_rest_refill)
                         if _tot > 0:
