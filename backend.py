@@ -12067,8 +12067,8 @@ class Backend:
                                 _kept = []
                                 for _s in symbols:
                                     if is_blocked_symbol(_s):
-            _rej_add(_s, "blocked_symbol")
-            continue
+                                        _rej_add(_s, "blocked_symbol")
+                                        continue
                                     _ok = False
                                     # Try both markets because later we may fall back FUTURES->SPOT
                                     for _mkt in ("FUTURES","SPOT"):
