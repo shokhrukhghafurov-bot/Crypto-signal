@@ -7405,9 +7405,30 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     Produces a result dict compatible with scanner_loop_mid and a rich TA block (like MAIN),
     but tuned for MID timeframes.
     """
+    # Ensure diagnostics always have something meaningful (prevents other{unknown=...}).
+    # We'll overwrite these defaults as we learn better stage/reason.
+    try:
+        if diag is not None:
+            diag.setdefault("fail_stage", "other")
+            diag.setdefault("fail_reason", "unknown")
+    except Exception:
+        pass
+
     if df5 is None or df30 is None or df1h is None:
+        try:
+            if diag is not None:
+                diag["fail_stage"] = "other"
+                diag["fail_reason"] = "missing_df"
+        except Exception:
+            pass
         return None
     if df5.empty or df30.empty or df1h.empty:
+        try:
+            if diag is not None:
+                diag["fail_stage"] = "other"
+                diag["fail_reason"] = "empty_df"
+        except Exception:
+            pass
         return None
 
     def _fail(stage: str, reason: str = "") -> None:
@@ -7415,8 +7436,11 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             if diag is None:
                 return
             diag["fail_stage"] = str(stage)
-            if reason:
-                diag["fail_reason"] = str(reason)
+            # Always write a reason so summary never falls back to unknown unless we truly have nothing.
+            r = (str(reason).strip() if reason is not None else "")
+            if not r:
+                r = "unknown" if str(stage) == "other" else str(stage)
+            diag["fail_reason"] = r
         except Exception:
             return
 
@@ -7425,6 +7449,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         df30i = _add_indicators(df30)
         df1hi = _add_indicators(df1h)
     except Exception:
+        _fail("other", "indicators_error")
         return None
 
     # Directions (trend=1h, mid=30m)
@@ -7437,6 +7462,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
     entry = float(last5.get("close", np.nan))
     if np.isnan(entry) or entry <= 0:
+        _fail("other", "bad_entry")
         return None
 
     # ATR from 30m (prefer indicator, fallback to true-range)
@@ -7450,8 +7476,10 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             tr = np.maximum(hi - lo, np.maximum((hi - prev).abs(), (lo - prev).abs()))
             atr30 = float(tr.rolling(14).mean().iloc[-1])
         except Exception:
+            _fail("other", "atr30_calc_error")
             return None
     if np.isnan(atr30) or atr30 <= 0:
+        _fail("other", "bad_atr30")
         return None
 
     # Trend strength
@@ -7494,6 +7522,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         pass
 
     if dir_trend is None:
+        _fail("other", "no_trend_dir")
         return None
     if dir_mid is None:
         dir_mid = dir_trend
