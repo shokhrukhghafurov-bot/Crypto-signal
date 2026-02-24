@@ -12060,8 +12060,7 @@ class Backend:
                         _mid_no_signal_stage_by_sym = {}
                         _mid_no_signal_stages_by_sym = {}
                         _mid_no_signal_detail_reasons = {}  # fail_reason -> count
-                        _mid_no_signal_other_detail_reasons = {}  # other-only base_reason -> count
-
+                        _mid_no_signal_detail_reasons_other = {}  # base_reason (OTHER stage only) -> count
                         _mid_no_signal_reasons_by_sym = {}      # sym -> [fail_reason...] per venue
   # sym -> [stage per venue with OK candles]
                         _mid_no_signal_stage_mode = str(os.getenv("MID_NO_SIGNAL_STAGE_MODE","best")).strip().lower()
@@ -12402,20 +12401,16 @@ class Backend:
                                                     _rbest = _rs[0]
                                             else:
                                                 _rbest = str(_st or 'other')
-                                            if _rbest:
-                                                _mid_no_signal_detail_reasons[_rbest] = int(_mid_no_signal_detail_reasons.get(_rbest,0) or 0) + 1
-                                                # For summary "other{...}" we want only reasons that ended in stage==other,
-                                                # aggregated by base reason name (strip params like "rsi_long=37.7" or "near_1h_low dist=...").
+                                            # Track detailed reasons ONLY for the final 'other' stage (summary wants other=...{...})
+                                            if str(_st or '').strip().lower() == 'other' and _rbest:
                                                 try:
-                                                    if str(_st or '') == 'other':
-                                                        _k = str(_rbest)
-                                                        # base token: first segment before space, then before '=' or ':'
-                                                        _k = _k.split(' ', 1)[0]
-                                                        _k = _k.split('=', 1)[0]
-                                                        _k = _k.split(':', 1)[0]
-                                                        _k = _k.strip()
-                                                        if _k and _k != 'other':
-                                                            _mid_no_signal_other_detail_reasons[_k] = int(_mid_no_signal_other_detail_reasons.get(_k,0) or 0) + 1
+                                                    _k = str(_rbest).strip()
+                                                    # Normalize: take base token before whitespace, then cut params like rsi_long=37.7 -> rsi_long
+                                                    _k = (_k.split()[0] if _k else '').strip()
+                                                    _k = (_k.split('=')[0] if '=' in _k else _k)
+                                                    _k = (_k.split(':')[0] if ':' in _k else _k)
+                                                    if _k and _k != 'other':
+                                                        _mid_no_signal_detail_reasons_other[_k] = int(_mid_no_signal_detail_reasons_other.get(_k,0) or 0) + 1
                                                 except Exception:
                                                     pass
                                         except Exception:
@@ -12722,22 +12717,25 @@ class Backend:
                     _ns_other_details = ''
                     try:
                         _other_n = int(_mid_no_signal_reasons.get('other',0) or 0)
-                        # Build "other{...}" from OTHER-only reasons (base reason name -> count)
-                        _src = _mid_no_signal_other_detail_reasons if isinstance(_mid_no_signal_other_detail_reasons, dict) else {}
-                        if _other_n > 0 and _src:
-                            # MID_NO_SIGNAL_DETAIL_TOPN:
-                            #   0  => show ALL (default)
-                            #   >0 => show top-N
-                            topn = 0
+                        if _other_n > 0 and isinstance(_mid_no_signal_detail_reasons_other, dict) and _mid_no_signal_detail_reasons_other:
+                            topn = 8
                             try:
                                 topn = int(float(os.getenv('MID_NO_SIGNAL_DETAIL_TOPN','0') or 0))
                             except Exception:
-                                topn = 0
-                            items = sorted(_src.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
+                                topn = 8
+                            items = sorted(_mid_no_signal_detail_reasons_other.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
                             items = [(str(k), int(v or 0)) for k,v in items if v]
                             if items:
-                                shown = items if topn <= 0 else items[:max(1, topn)]
-                                _ns_other_details = '{' + ','.join([f'{k}={v}' for k,v in shown]) + '}'
+                                if topn and topn > 0:
+                                    shown = items[:topn]
+                                    rest = sum(v for _, v in items[topn:])
+                                else:
+                                    shown = items
+                                    rest = 0
+                                _ns_other_details = '{' + ','.join([f'{k}={v}' for k, v in shown])
+                                if rest > 0:
+                                    _ns_other_details += f',+{rest}'
+                                _ns_other_details += '}'
                     except Exception:
                         _ns_other_details = ''
 
