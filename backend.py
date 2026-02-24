@@ -12773,6 +12773,7 @@ class Backend:
                             else:
                                 self.last_futures_signal = sig
                             await emit_signal_cb(sig)
+                            _mid_emitted += 1
                             await asyncio.sleep(2)
                             _rej_add(sym, "emitted")
                 except Exception:
