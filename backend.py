@@ -10823,7 +10823,11 @@ class Backend:
 
                 _mid_log_candles_short = os.getenv("MID_LOG_CANDLES_SHORT", "1").strip().lower() in ("1","true","yes","on")
                 _mid_candles_short_seen = set()  # {(symbol, tf)} per tick
-                _mid_log_prefill = os.getenv("MID_LOG_PREFILL", "1").strip().lower() in ("1","true","yes","on")
+                # Prefill logs are very noisy in production. Default OFF.
+                # Enable explicitly via MID_LOG_PREFILL=1 when debugging.
+                _mid_log_prefill = os.getenv("MID_LOG_PREFILL", "0").strip().lower() in ("1","true","yes","on")
+                # If you still want to see successful prefill lines, enable MID_LOG_PREFILL_OK=1.
+                _mid_log_prefill_ok = os.getenv("MID_LOG_PREFILL_OK", "0").strip().lower() in ("1","true","yes","on")
 
                 def _mid_diag_add(symb: str, ex_name: str, market: str, tf: str, status: str, reason: str = '') -> None:
                     nonlocal _mid_diag_lines
@@ -10855,7 +10859,17 @@ class Backend:
                     return
 
                 # Tick-local log guard
-                _MID_TICK_CTX.set({'block': set(), 'trap': set(), 'candles_missing': set(), 'candles_missing_sym': set(), 'prefill_skip': set(), 'suppress_block': 0, 'suppress_trap': 0})
+                _MID_TICK_CTX.set({
+                    'block': set(),
+                    'trap': set(),
+                    'candles_missing': set(),
+                    'candles_missing_sym': set(),
+                    'prefill_skip': set(),
+                    'prefill_err': set(),
+                    'prefill_empty': set(),
+                    'suppress_block': 0,
+                    'suppress_trap': 0,
+                })
 
                 interval = interval_sec
                 top_n = int(os.getenv("MID_TOP_N", "50"))
@@ -11554,9 +11568,10 @@ class Backend:
                                             else:
                                                 if isinstance(_ps, set):
                                                     _ps.add(_k)
-                                                logger.info("[mid][prefill_skip] symbol=%s tf=%s market=%s reason=cooldown left=%.1fs", symb, tf, (market or "SPOT"), max(0.0, _left))
+                                                # Skip logs are noisy; keep them on DEBUG when explicitly enabled.
+                                                logger.debug("[mid][prefill_skip] symbol=%s tf=%s market=%s reason=cooldown left=%.1fs", symb, tf, (market or "SPOT"), max(0.0, _left))
                                         except Exception:
-                                            logger.info("[mid][prefill_skip] symbol=%s tf=%s market=%s reason=cooldown left=%.1fs", symb, tf, (market or "SPOT"), max(0.0, _left))
+                                            logger.debug("[mid][prefill_skip] symbol=%s tf=%s market=%s reason=cooldown left=%.1fs", symb, tf, (market or "SPOT"), max(0.0, _left))
                                 except Exception:
                                     pass
 
@@ -11572,12 +11587,35 @@ class Backend:
                                 try:
                                     try:
                                         if _mid_log_prefill:
-                                            logger.info("[mid][prefill_try] symbol=%s tf=%s market=%s ex=%s limit=%s pf_limit=%s timeout=%ss", symb, tf, (market or "SPOT"), ex_name, limit, pf_limit, prefill_timeout)
+                                            logger.debug("[mid][prefill_try] symbol=%s tf=%s market=%s ex=%s limit=%s pf_limit=%s timeout=%ss", symb, tf, (market or "SPOT"), ex_name, limit, pf_limit, prefill_timeout)
                                     except Exception:
                                         pass
-                                    df_pf = await asyncio.wait_for(_mid_fetch_klines_rest(ex_name, symb, tf, int(pf_limit), market), timeout=float(prefill_timeout))
-                                except Exception:
+                                    df_pf = await asyncio.wait_for(
+                                        _mid_fetch_klines_rest(ex_name, symb, tf, int(pf_limit), market),
+                                        timeout=float(prefill_timeout),
+                                    )
+                                except Exception as _e_pf:
+                                    # If REST prefill fails, this is important: candles may be unavailable.
+                                    # Log once per (market,symbol,tf) per tick.
                                     df_pf = None
+                                    try:
+                                        _ctx = _MID_TICK_CTX.get()
+                                        _pe = _ctx.get('prefill_err') if isinstance(_ctx, dict) else None
+                                        _k = ((market or "SPOT").upper().strip(), symb, tf, ex_name)
+                                        if isinstance(_pe, set) and _k in _pe:
+                                            pass
+                                        else:
+                                            if isinstance(_pe, set):
+                                                _pe.add(_k)
+                                            logger.warning(
+                                                "[mid][prefill_error] symbol=%s tf=%s market=%s ex=%s err=%s",
+                                                symb, tf, (market or "SPOT"), ex_name, str(_e_pf),
+                                            )
+                                    except Exception:
+                                        logger.warning(
+                                            "[mid][prefill_error] symbol=%s tf=%s market=%s ex=%s",
+                                            symb, tf, (market or "SPOT"), ex_name,
+                                        )
                                 if df_pf is not None and not getattr(df_pf, "empty", True):
                                     # normalize once, then persist
                                     df_pf_n = _mid_norm_ohlcv(df_pf)
@@ -11614,11 +11652,15 @@ class Backend:
                                         except Exception:
                                             df_ret = df_pf_n
                                         _mid_rest_refill += 1
-                                        try:
-                                            if _mid_log_prefill:
-                                                logger.info("[mid][prefill] symbol=%s tf=%s market=%s ex=%s got=%s limit=%s pf_limit=%s", symb, tf, (market or "SPOT"), ex_name, got_pf, limit, pf_limit)
-                                        except Exception:
-                                            pass
+                                        # Successful prefill is normal; keep it silent by default.
+                                        if _mid_log_prefill and _mid_log_prefill_ok:
+                                            try:
+                                                logger.debug(
+                                                    "[mid][prefill_ok] symbol=%s tf=%s market=%s ex=%s got=%s limit=%s pf_limit=%s",
+                                                    symb, tf, (market or "SPOT"), ex_name, got_pf, limit, pf_limit,
+                                                )
+                                            except Exception:
+                                                pass
                                         _mid_diag_ok(symb, ex_name, market, tf, "rest_prefill", df_pf_n)
                                         try:
                                             if hasattr(self, "_mid_prefill_last_ok"):
@@ -11626,6 +11668,23 @@ class Backend:
                                         except Exception:
                                             pass
                                         return df_ret
+                                else:
+                                    # REST returned empty/no data -> that's a real problem; log once per tick.
+                                    try:
+                                        _ctx = _MID_TICK_CTX.get()
+                                        _pe0 = _ctx.get('prefill_empty') if isinstance(_ctx, dict) else None
+                                        _k0 = ((market or "SPOT").upper().strip(), symb, tf, ex_name)
+                                        if isinstance(_pe0, set) and _k0 in _pe0:
+                                            pass
+                                        else:
+                                            if isinstance(_pe0, set):
+                                                _pe0.add(_k0)
+                                            logger.warning(
+                                                "[mid][prefill_empty] symbol=%s tf=%s market=%s ex=%s pf_limit=%s",
+                                                symb, tf, (market or "SPOT"), ex_name, pf_limit,
+                                            )
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
 
@@ -12603,7 +12662,14 @@ class Backend:
                 elapsed = time.time() - start
                 try:
                     _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
-                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} no_signal={int(_mid_no_signal)} [trap={int(_mid_no_signal_reasons.get('trap',0) or 0)},structure={int(_mid_no_signal_reasons.get('structure',0) or 0)},trend={int(_mid_no_signal_reasons.get('trend',0) or 0)},extreme={int(_mid_no_signal_reasons.get('extreme',0) or 0)},impulse={int(_mid_no_signal_reasons.get('impulse',0) or 0)},other={int(_mid_no_signal_reasons.get('other',0) or 0)}] cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} no_candles={(int(_mid_candles_net_fail)+int(_mid_candles_unsupported)+int(_mid_candles_partial)+int(_mid_candles_empty))} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} candles_empty={_mid_candles_empty} candles_fallback={_mid_candles_fallback} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
+                    # no_candles should reflect final outcome (candles_unavailable), not intermediate misses during fallback.
+                    # Otherwise a symbol that eventually succeeds still inflates no_candles.
+                    _no_candles_final = 0
+                    try:
+                        _no_candles_final = int(_rej_counts.get('candles_unavailable', 0) or 0)
+                    except Exception:
+                        _no_candles_final = 0
+                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} no_signal={int(_mid_no_signal)} [trap={int(_mid_no_signal_reasons.get('trap',0) or 0)},structure={int(_mid_no_signal_reasons.get('structure',0) or 0)},trend={int(_mid_no_signal_reasons.get('trend',0) or 0)},extreme={int(_mid_no_signal_reasons.get('extreme',0) or 0)},impulse={int(_mid_no_signal_reasons.get('impulse',0) or 0)},other={int(_mid_no_signal_reasons.get('other',0) or 0)}] cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} no_candles={_no_candles_final} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} candles_empty={_mid_candles_empty} candles_fallback={_mid_candles_fallback} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
                     logger.info("[mid][summary] %s", summary)
                     try:
                         _tot = int(_mid_db_hit) + int(_mid_rest_refill)
