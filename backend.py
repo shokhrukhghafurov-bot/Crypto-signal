@@ -11774,7 +11774,26 @@ class Backend:
                                 except Exception:
                                     pass
                     
-                                # If it was explicitly marked unsupported (e.g. market not implemented),
+                                
+                                # If REST returned empty repeatedly (any exchange/market), optionally treat it as unsupported
+                                # to avoid repeated empty storms and let other venues win quickly.
+                                try:
+                                    mkt_now2 = (market or 'SPOT').upper().strip()
+                                    empty_as_unsup_all = str(os.getenv('MID_EMPTY_AS_UNSUPPORTED', '1') or '1').strip().lower() not in ('0','false','no','off')
+                                    min_lim = int(os.getenv('MID_EMPTY_AS_UNSUPPORTED_MIN_LIMIT', '120') or 120)
+                                    is_small_lim = (int(limit) <= min_lim) or (limit == limits_to_try[0])
+                                    is_last_try = (_i >= max(0, mid_candles_retry))
+                                    if empty_as_unsup_all and is_small_lim and is_last_try:
+                                        try:
+                                            api._mark_unsupported(ex_name, mkt_now2, symb, tf)
+                                        except Exception:
+                                            pass
+                                        _mid_diag_add(symb, ex_name, mkt_now2, tf, 'unsupported_pair', 'empty')
+                                        _mid_candles_unsupported += 1
+                                        return None
+                                except Exception:
+                                    pass
+# If it was explicitly marked unsupported (e.g. market not implemented),
                                 # don't count it as an "empty candles" sample.
                                 if api._is_unsupported_cached(ex_name, (market or 'SPOT').upper().strip(), symb, tf):
                                     _mid_candles_unsupported += 1
