@@ -12323,7 +12323,7 @@ class Backend:
                                                     _mid_no_signal_stage_by_sym[sym] = _st  # last (debug)
                                                     _mid_no_signal_stages_by_sym.setdefault(sym, []).append(_st)
                                                     # Collect detailed fail reason (best-effort).
-                                                    _rr = str(_diag.get("fail_reason") or _st or "other")
+                                                    _rr = str(_diag.get("fail_reason") or ("unknown" if str(_st or '')=='other' else _st) or "other")
                                                     _rr = _rr.strip() or "other"
                                                     if len(_rr) > 64:
                                                         _rr = _rr[:64]
@@ -12399,7 +12399,7 @@ class Backend:
                                                 else:
                                                     _rbest = _rs[0]
                                             else:
-                                                _rbest = str(_st or 'other')
+                                                _rbest = ("unknown" if str(_st or '')=='other' else str(_st or 'other'))
                                             # Count detailed no-signal reasons only for the 'other' bucket,
                                             # and normalize to a base reason name (e.g. "rsi_long=37.7" -> "rsi_long",
                                             # "near_1h_low dist=..." -> "near_1h_low").
