@@ -12728,11 +12728,9 @@ class Backend:
                             if items:
                                 if other_cnt > 0:
                                     try:
-                                        cap = int(float(os.getenv("MID_NO_SIGNAL_OTHER_CAP","0") or 0))
+                                        cap = int(float(os.getenv("MID_NO_SIGNAL_OTHER_CAP","50") or 50))
                                     except Exception:
-                                        cap = 0
-                                    if int(cap) <= 0:
-                                        cap = len(items)
+                                        cap = 50
                                     shown = items[:max(1, min(len(items), cap))]
                                     rest = sum(v for _,v in items[len(shown):])
                                 else:
@@ -12818,76 +12816,10 @@ class Backend:
                                     pass
                         except Exception:
                             pass
-
-# --- MID tick done summary (always log) ---
-try:
-    # blocked = symbols that were skipped before evaluation (cooldown/news/macro/trap/blocked_symbol)
-    blocked_total = int(_mid_skip_blocked or 0) + int(_mid_skip_cooldown or 0) + int(_mid_skip_macro or 0) + int(_mid_skip_news or 0) + int(_mid_skip_trap or 0)
-except Exception:
-    blocked_total = 0
-
-# no_signal stage breakdown line, e.g. [trap=0,structure=4,...]
-stage_line = ""
-try:
-    if int(_mid_no_signal or 0) > 0 and isinstance(_mid_no_signal_reasons, dict) and _mid_no_signal_reasons:
-        _keys = ["trap","structure","trend","extreme","impulse","other"]
-        stage_line = "[" + ",".join([f"{k}={int(_mid_no_signal_reasons.get(k, 0) or 0)}" for k in _keys]) + "]"
-except Exception:
-    stage_line = ""
-
-# detailed reasons line, e.g. reasons={unknown=18,weak_trend=7,...}
-reasons_line = ""
-try:
-    if int(_mid_no_signal or 0) > 0 and isinstance(_mid_no_signal_detail_reasons, dict) and _mid_no_signal_detail_reasons:
-        items = sorted(_mid_no_signal_detail_reasons.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
-        items = [(str(k), int(v or 0)) for k, v in items if v]
-        if items:
-            # If 'other' exists -> show ALL reasons by default (cap can be set with MID_NO_SIGNAL_OTHER_CAP; 0=unlimited)
-            other_cnt = 0
-            try:
-                if isinstance(_mid_no_signal_reasons, dict):
-                    other_cnt = int(_mid_no_signal_reasons.get("other", 0) or 0)
-            except Exception:
-                other_cnt = 0
-
-            if other_cnt > 0:
-                try:
-                    cap = int(float(os.getenv("MID_NO_SIGNAL_OTHER_CAP", "0") or 0))
-                except Exception:
-                    cap = 0
-                if cap <= 0:
-                    cap = len(items)
-                shown = items[:max(1, min(len(items), cap))]
-                rest = sum(v for _, v in items[len(shown):])
-            else:
-                try:
-                    topn = int(float(os.getenv("MID_NO_SIGNAL_DETAIL_TOPN", "8") or 8))
-                except Exception:
-                    topn = 8
-                shown = items[:max(1, topn)]
-                rest = sum(v for _, v in items[max(1, topn):])
-
-            reasons_line = "reasons={" + ",".join([f"{k}={v}" for k, v in shown])
-            if rest > 0:
-                reasons_line += f",+{rest}"
-            reasons_line += "}"
-except Exception:
-    reasons_line = ""
-
-summary = (
-    f"tick done scanned={int(_mid_scanned)} emitted={int(_mid_emitted)} blocked={int(blocked_total)} "
-    f"hardblock={int(_mid_hard_block)} no_signal={int(_mid_no_signal)}"
-)
-if stage_line:
-    summary += "\n" + stage_line
-if reasons_line:
-    summary += "\n" + reasons_line
-
-logger.info("[mid][summary] %s", summary)
-try:
-    _mid_set_last_summary(summary)
-except Exception:
-    pass
+                    try:
+                        _mid_set_last_summary(summary)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 return elapsed
@@ -13495,3 +13427,64 @@ try:
 except Exception:
     pass
 # ================= END FORCE MID SUMMARY HEARTBEAT FIX =================
+
+
+# =======================
+# MID SUMMARY FIX (SAFE APPEND)
+# This helper prints full MID summary including structure and reasons.
+# Call mid_log_summary(...) from scanner_loop after MID tick completes.
+# =======================
+def mid_log_summary_safe(
+    scanned,
+    emitted,
+    blocked,
+    hardblock,
+    no_signal,
+    struct_reasons=None,
+    detail_reasons=None,
+):
+    try:
+        struct_reasons = struct_reasons or {}
+        detail_reasons = detail_reasons or {}
+
+        struct_txt = "[trap={trap},structure={structure},trend={trend},extreme={extreme},impulse={impulse},other={other}]".format(
+            trap=int(struct_reasons.get("trap", 0)),
+            structure=int(struct_reasons.get("structure", 0)),
+            trend=int(struct_reasons.get("trend", 0)),
+            extreme=int(struct_reasons.get("extreme", 0)),
+            impulse=int(struct_reasons.get("impulse", 0)),
+            other=int(struct_reasons.get("other", 0)),
+        )
+
+        # show all reasons
+        items = sorted(
+            [(str(k), int(v or 0)) for k, v in detail_reasons.items()],
+            key=lambda kv: (-kv[1], kv[0])
+        )
+
+        reasons_txt = ""
+        if items:
+            reasons_txt = " reasons={" + ",".join(f"{k}={v}" for k, v in items) + "}"
+
+        summary = (
+            f"tick done scanned={scanned} "
+            f"emitted={emitted} "
+            f"blocked={blocked} "
+            f"hardblock={hardblock} "
+            f"no_signal={no_signal}"
+        )
+
+        logger.info("[mid][summary] %s", summary)
+        logger.info("[mid][summary] %s", struct_txt)
+
+        if reasons_txt:
+            logger.info("[mid][summary]%s", reasons_txt)
+
+        try:
+            _mid_set_last_summary(summary)
+        except Exception:
+            pass
+
+    except Exception:
+        logger.exception("mid_log_summary_safe failed")
+
