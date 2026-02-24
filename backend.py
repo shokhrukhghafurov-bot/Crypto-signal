@@ -12707,20 +12707,26 @@ class Backend:
                     try:
                         _other_n = int(_mid_no_signal_reasons.get('other',0) or 0)
                         if _other_n > 0 and isinstance(_mid_no_signal_detail_reasons, dict) and _mid_no_signal_detail_reasons:
-                            topn = 8
+                            # MID_NO_SIGNAL_DETAIL_TOPN:
+                            #   - if <= 0  => show ALL reasons (default)
+                            #   - if  > 0  => show at most N reasons (top-N)
                             try:
-                                topn = int(float(os.getenv('MID_NO_SIGNAL_DETAIL_TOPN','8') or 8))
+                                topn = int(float(os.getenv('MID_NO_SIGNAL_DETAIL_TOPN','0') or 0))
                             except Exception:
-                                topn = 8
-                            items = sorted(_mid_no_signal_detail_reasons.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
-                            items = [(str(k), int(v or 0)) for k,v in items if v]
+                                topn = 0
+
+                            items = sorted(
+                                _mid_no_signal_detail_reasons.items(),
+                                key=lambda kv: (-int(kv[1] or 0), str(kv[0]))
+                            )
+                            items = [(str(k), int(v or 0)) for k, v in items if v]
+
                             if items:
-                                shown = items[:max(1, topn)]
-                                rest = sum(v for _,v in items[max(1, topn):])
-                                _ns_other_details = '{' + ','.join([f'{k}={v}' for k,v in shown])
-                                if rest>0:
-                                    _ns_other_details += f',+{rest}'
-                                _ns_other_details += '}'
+                                if topn <= 0 or topn >= len(items):
+                                    shown = items
+                                else:
+                                    shown = items[:max(1, topn)]
+                                _ns_other_details = '{' + ','.join([f'{k}={v}' for k, v in shown]) + '}'
                     except Exception:
                         _ns_other_details = ''
 
