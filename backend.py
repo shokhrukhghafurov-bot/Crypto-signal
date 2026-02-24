@@ -6227,18 +6227,91 @@ class MultiExchangeData:
         IMPORTANT: Binance may be unreachable (DNS/ban/region). We fall back to other exchanges.
         """
         assert self.session is not None
+        # --- Top symbols cache (prevents REST storms / bans) ---
+        try:
+            _ttl = float(os.getenv("TOP_SYMBOLS_CACHE_TTL_SEC", os.getenv("MID_SYMBOLS_REFRESH_SEC", "900")) or 900.0)
+        except Exception:
+            _ttl = 900.0
+        if _ttl < 0:
+            _ttl = 0.0
+        now_ts = time.time()
+        if not hasattr(self, "_top_symbols_cache"):
+            self._top_symbols_cache = []  # type: ignore[attr-defined]
+            self._top_symbols_cache_ts = 0.0  # type: ignore[attr-defined]
+        try:
+            _cache = list(getattr(self, "_top_symbols_cache", []) or [])
+            _age = float(now_ts - float(getattr(self, "_top_symbols_cache_ts", 0.0) or 0.0))
+            if _cache and _ttl > 0 and _age <= _ttl:
+                if n <= 0 or len(_cache) >= int(n):
+                    return _cache if n <= 0 else _cache[: int(n)]
+        except Exception:
+            pass
 
-        providers = [
-            ("BINANCE", self._top_from_binance),
-            ("BYBIT", self._top_from_bybit),
-            ("OKX", self._top_from_okx),
-            ("MEXC", self._top_from_mexc),
-            ("GATEIO", self._top_from_gateio),
-        ]
+        # --- Provider cooldowns (skip exchanges temporarily after rate-limit/ban) ---
+        if not hasattr(self, "_top_provider_cd_until"):
+            self._top_provider_cd_until = {}  # type: ignore[attr-defined]
+
+        def _cd_sec(provider: str) -> float:
+            pu = (provider or "").upper().strip()
+            base = 60.0
+            if pu == "BINANCE":
+                base = 3600.0
+            elif pu == "BYBIT":
+                base = 45.0
+            elif pu == "OKX":
+                base = 30.0
+            elif pu == "MEXC":
+                base = 30.0
+            elif pu == "GATEIO":
+                base = 30.0
+            try:
+                return float(os.getenv(f"TOP_PROVIDER_COOLDOWN_SEC_{pu}", str(base)) or base)
+            except Exception:
+                return base
+
+        def _is_cd(provider: str) -> bool:
+            pu = (provider or "").upper().strip()
+            try:
+                until = float(getattr(self, "_top_provider_cd_until", {}).get(pu, 0.0) or 0.0)
+                return until > time.time()
+            except Exception:
+                return False
+
+        def _set_cd(provider: str, err: Exception | str) -> None:
+            pu = (provider or "").upper().strip()
+            msg = str(err)
+            secs = _cd_sec(pu)
+            if "HTTP 418" in msg or "IP banned" in msg or "Way too much request weight" in msg or '"code":-1003' in msg:
+                secs = max(secs, 3600.0 if pu == "BINANCE" else secs)
+            if "retCode=10006" in msg or "Too many visits" in msg:
+                secs = max(15.0, min(secs, 120.0))
+            try:
+                getattr(self, "_top_provider_cd_until", {})[pu] = time.time() + float(secs)
+            except Exception:
+                pass
+
+                providers_all = {
+            "BINANCE": self._top_from_binance,
+            "BYBIT": self._top_from_bybit,
+            "OKX": self._top_from_okx,
+            "MEXC": self._top_from_mexc,
+            "GATEIO": self._top_from_gateio,
+        }
+
+        # Order can be overridden to reduce bans (e.g. "BYBIT,OKX,BINANCE")
+        _order = (os.getenv("TOP_SYMBOLS_PROVIDER_ORDER", "") or "").upper().strip()
+        if _order:
+            _names = [x.strip() for x in _order.split(",") if x.strip()]
+        else:
+            _names = ["BINANCE","BYBIT","OKX","MEXC","GATEIO"]
+
+        providers = [(nm, providers_all[nm]) for nm in _names if nm in providers_all]
 
         last_err: Exception | None = None
         items: list[tuple[float, str]] = []
         for name, fn in providers:
+            if _is_cd(name):
+                continue
             try:
                 items = await fn()
                 if items:
@@ -6249,6 +6322,10 @@ class MultiExchangeData:
                     break
             except Exception as e:
                 last_err = e
+                try:
+                    _set_cd(name, e)
+                except Exception:
+                    pass
                 logger.warning("get_top_usdt_symbols: %s failed: %s", name, e)
                 continue
 
@@ -6267,6 +6344,12 @@ class MultiExchangeData:
                 continue
             seen.add(s)
             dedup.append(s)
+
+        try:
+            self._top_symbols_cache = list(dedup)
+            self._top_symbols_cache_ts = time.time()
+        except Exception:
+            pass
 
         if n <= 0:
             return dedup
@@ -11085,7 +11168,25 @@ class Backend:
                                 except Exception:
                                     # If exchangeInfo fails, fall back to request (old behavior)
                                     pass
-                                df = await api.klines_binance(symb, tf, limit, market=market)
+                                async def _rest_call():
+
+                                    return await api.klines_binance(symb, tf, limit, market=market)
+
+                                try:
+
+                                    _rl = getattr(self, '_rest_limiter', None)
+
+                                    if _rl is not None:
+
+                                        df = await _rl.run(ex_name, _rest_call)
+
+                                    else:
+
+                                        df = await _rest_call()
+
+                                except Exception:
+
+                                    df = await _rest_call()
                                 if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                     return pd.DataFrame()
@@ -11095,7 +11196,25 @@ class Backend:
                                     return pd.DataFrame()
                                 return dfn
                             if ex_name == "BYBIT":
-                                df = await api.klines_bybit(symb, tf, limit, market=market)
+                                async def _rest_call():
+
+                                    return await api.klines_bybit(symb, tf, limit, market=market)
+
+                                try:
+
+                                    _rl = getattr(self, '_rest_limiter', None)
+
+                                    if _rl is not None:
+
+                                        df = await _rl.run(ex_name, _rest_call)
+
+                                    else:
+
+                                        df = await _rest_call()
+
+                                except Exception:
+
+                                    df = await _rest_call()
                                 if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                     return pd.DataFrame()
@@ -11105,7 +11224,25 @@ class Backend:
                                     return pd.DataFrame()
                                 return dfn
                             if ex_name == "OKX":
-                                df = await api.klines_okx(symb, tf, limit, market=market)
+                                async def _rest_call():
+
+                                    return await api.klines_okx(symb, tf, limit, market=market)
+
+                                try:
+
+                                    _rl = getattr(self, '_rest_limiter', None)
+
+                                    if _rl is not None:
+
+                                        df = await _rl.run(ex_name, _rest_call)
+
+                                    else:
+
+                                        df = await _rest_call()
+
+                                except Exception:
+
+                                    df = await _rest_call()
                                 if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                     return pd.DataFrame()
@@ -11115,7 +11252,25 @@ class Backend:
                                     return pd.DataFrame()
                                 return dfn
                             if ex_name == "GATEIO":
-                                df = await api.klines_gateio(symb, tf, limit)
+                                async def _rest_call():
+
+                                    return await api.klines_gateio(symb, tf, limit)
+
+                                try:
+
+                                    _rl = getattr(self, '_rest_limiter', None)
+
+                                    if _rl is not None:
+
+                                        df = await _rl.run(ex_name, _rest_call)
+
+                                    else:
+
+                                        df = await _rest_call()
+
+                                except Exception:
+
+                                    df = await _rest_call()
                                 if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                     return pd.DataFrame()
@@ -11125,7 +11280,25 @@ class Backend:
                                     return pd.DataFrame()
                                 return dfn
                             # default MEXC
-                            df = await api.klines_mexc(symb, tf, limit)
+                            async def _rest_call():
+
+                                return await api.klines_mexc(symb, tf, limit)
+
+                            try:
+
+                                _rl = getattr(self, '_rest_limiter', None)
+
+                                if _rl is not None:
+
+                                    df = await _rl.run(ex_name, _rest_call)
+
+                                else:
+
+                                    df = await _rest_call()
+
+                            except Exception:
+
+                                df = await _rest_call()
                             if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                 _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                 return pd.DataFrame()
@@ -11732,51 +11905,72 @@ class Backend:
                         if not hasattr(self, "_mid_symbols_cache"):
                             self._mid_symbols_cache = []
                             self._mid_symbols_cache_ts = 0.0
+                        # If we recently loaded the universe, reuse it instead of hitting REST every tick.
                         try:
-                            symbols_pool = await api.get_top_usdt_symbols(top_n_symbols)
-                            if symbols_pool:
-                                # Normalize symbols across exchanges (OKX uses BTC-USDT / BTC-USDT-SWAP, Gate may use BTC_USDT).
-                                # Internally we use canonical BASEQUOTE like BTCUSDT.
-                                def _mid_norm_symbol(s: str) -> str:
-                                    u = (s or "").upper().strip()
-                                    # Remove common separators
-                                    u = u.replace("-", "").replace("_", "").replace(":", "")
-                                    # Strip derivative suffixes
-                                    for suf in ("SWAP", "PERP", "FUT", "FUTURES"):
-                                        if u.endswith(suf):
-                                            u = u[: -len(suf)]
-                                            break
-                                    return u
+                            _refresh_sec = float(os.getenv("MID_SYMBOLS_REFRESH_SEC", os.getenv("TOP_SYMBOLS_CACHE_TTL_SEC", "900")) or 900.0)
+                        except Exception:
+                            _refresh_sec = 900.0
+                        if _refresh_sec < 0:
+                            _refresh_sec = 0.0
+                        try:
+                            _age = float(time.time() - float(self._mid_symbols_cache_ts or 0.0))
+                        except Exception:
+                            _age = 1e18
+                        if getattr(self, "_mid_symbols_cache", None) and _refresh_sec > 0 and _age <= _refresh_sec:
+                            symbols_pool = list(self._mid_symbols_cache)
+                            try:
+                                _pref_ex = getattr(self, '_mid_symbols_cache_provider', None)
+                                if _pref_ex:
+                                    self._mid_symbol_pref_exchange = {s: str(_pref_ex) for s in symbols_pool}
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                symbols_pool = await api.get_top_usdt_symbols(top_n_symbols)
+                                if symbols_pool:
+                                    # Normalize symbols across exchanges (OKX uses BTC-USDT / BTC-USDT-SWAP, Gate may use BTC_USDT).
+                                    # Internally we use canonical BASEQUOTE like BTCUSDT.
+                                    def _mid_norm_symbol(s: str) -> str:
+                                        u = (s or "").upper().strip()
+                                        # Remove common separators
+                                        u = u.replace("-", "").replace("_", "").replace(":", "")
+                                        # Strip derivative suffixes
+                                        for suf in ("SWAP", "PERP", "FUT", "FUTURES"):
+                                            if u.endswith(suf):
+                                                u = u[: -len(suf)]
+                                                break
+                                        return u
 
-                                symbols_pool = [_mid_norm_symbol(x) for x in symbols_pool if x]
-                                # Production hardening: drop obviously invalid symbols early (prevents invalid_symbol_format/no_candles storms)
-                                _sym_ok = re.compile(r'^[A-Z0-9]{2,20}USDT$')
-                                symbols_pool = [x for x in symbols_pool if x and x.isascii() and x.endswith('USDT') and _sym_ok.match(x)]
-                                # de-duplicate (some exchanges/pools can return duplicates)
-                                symbols_pool = list(dict.fromkeys(symbols_pool))
-                                self._mid_symbols_cache = list(symbols_pool)
-                                self._mid_symbols_cache_ts = time.time()
-                                # remember which exchange provided this universe (so MID prefers correct candles exchange)
-                                try:
-                                    _pref_ex = getattr(api, 'last_top_provider', None)
-                                    if _pref_ex:
-                                        self._mid_symbols_cache_provider = str(_pref_ex)
-                                        self._mid_symbol_pref_exchange = {s: str(_pref_ex) for s in symbols_pool}
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            if getattr(self, "_mid_symbols_cache", None):
-                                logger.warning("[mid] get_top_usdt_symbols failed (%s); using cached symbols (%s)", e, len(self._mid_symbols_cache))
-                                symbols_pool = list(self._mid_symbols_cache)
-                                try:
-                                    _pref_ex = getattr(self, '_mid_symbols_cache_provider', None)
-                                    if _pref_ex:
-                                        self._mid_symbol_pref_exchange = {s: str(_pref_ex) for s in symbols_pool}
-                                except Exception:
-                                    pass
-                            else:
-                                raise
-                        # Scan only first MID_TOP_N symbols from the loaded universe.
+                                    symbols_pool = [_mid_norm_symbol(x) for x in symbols_pool if x]
+                                    # Production hardening: drop obviously invalid symbols early (prevents invalid_symbol_format/no_candles storms)
+                                    _sym_ok = re.compile(r'^[A-Z0-9]{2,20}USDT$')
+                                    symbols_pool = [x for x in symbols_pool if x and x.isascii() and x.endswith('USDT') and _sym_ok.match(x)]
+                                    # de-duplicate (some exchanges/pools can return duplicates)
+                                    symbols_pool = list(dict.fromkeys(symbols_pool))
+                                    self._mid_symbols_cache = list(symbols_pool)
+                                    self._mid_symbols_cache_ts = time.time()
+                                    # remember which exchange provided this universe (so MID prefers correct candles exchange)
+                                    try:
+                                        _pref_ex = getattr(api, 'last_top_provider', None)
+                                        if _pref_ex:
+                                            self._mid_symbols_cache_provider = str(_pref_ex)
+                                            self._mid_symbol_pref_exchange = {s: str(_pref_ex) for s in symbols_pool}
+                                    except Exception:
+                                        pass
+                            except Exception as e:
+                                if getattr(self, "_mid_symbols_cache", None):
+                                    logger.warning("[mid] get_top_usdt_symbols failed (%s); using cached symbols (%s)", e, len(self._mid_symbols_cache))
+                                    symbols_pool = list(self._mid_symbols_cache)
+                                    try:
+                                        _pref_ex = getattr(self, '_mid_symbols_cache_provider', None)
+                                        if _pref_ex:
+                                            self._mid_symbol_pref_exchange = {s: str(_pref_ex) for s in symbols_pool}
+                                    except Exception:
+                                        pass
+                                else:
+                                    raise
+                        
+# Scan only first MID_TOP_N symbols from the loaded universe.
                         symbols = list(symbols_pool[:max(0, int(top_n))])
                         # ensure unique symbols per tick (preserve order)
                         if symbols:
@@ -11846,25 +12040,54 @@ class Backend:
                                 await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
 
 
-                        # --- Architecture C: prefetch candles for all symbols (primary exchange) ---
+                        # --- Architecture C: prefetch candles (rate-limit safe) ---
                         mid_prefetch = os.getenv("MID_PREFETCH_CANDLES", "1").strip().lower() in ("1","true","yes","on")
                         if mid_prefetch and symbols:
                             try:
+                                # NOTE: MID_PREFETCH_LIMIT is the candle LIMIT (bars), not task count.
                                 prefetch_limit = int(os.getenv("MID_PREFETCH_LIMIT", "250") or 250)
                                 prefetch_timeout = float(os.getenv("MID_PREFETCH_TIMEOUT_SEC", "25") or 25)
+                                # Hard caps to prevent REST storms (defaults are safe; tune via ENV).
+                                prefetch_symbols_max = int(os.getenv("MID_PREFETCH_SYMBOLS_MAX", "30") or 30)
+                                prefetch_tasks_max = int(os.getenv("MID_PREFETCH_MAX_TASKS", "120") or 120)
+                                if prefetch_symbols_max < 0:
+                                    prefetch_symbols_max = 0
+                                if prefetch_tasks_max < 0:
+                                    prefetch_tasks_max = 0
+                                # Which TFs to prefetch (default: only trigger TF to reduce load).
+                                _tfs_cfg = (os.getenv("MID_PREFETCH_TFS", "trigger") or "trigger").lower()
+                                _want_trigger = ("trigger" in _tfs_cfg) or ("5m" in _tfs_cfg)
+                                _want_mid = ("mid" in _tfs_cfg) or ("30m" in _tfs_cfg)
+                                _want_trend = ("trend" in _tfs_cfg) or ("1h" in _tfs_cfg) or ("60m" in _tfs_cfg)
+                                _tfs_to_prefetch = []
+                                if _want_trigger:
+                                    _tfs_to_prefetch.append(tf_trigger)
+                                if _want_mid:
+                                    _tfs_to_prefetch.append(tf_mid)
+                                if _want_trend:
+                                    _tfs_to_prefetch.append(tf_trend)
+                                if not _tfs_to_prefetch:
+                                    _tfs_to_prefetch = [tf_trigger]
+                        
+                                # Group symbols by their chosen primary exchange.
                                 groups = defaultdict(list)
-                                for _s in symbols:
+                                for _s in symbols[: max(0, prefetch_symbols_max) ]:
                                     if is_blocked_symbol(_s):
                                         continue
                                     groups[_mid_primary_for_symbol(_s)].append(_s)
-
+                        
                                 tasks = []
                                 for _ex, _syms in groups.items():
                                     for _s in _syms:
-                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trigger, prefetch_limit, market_mid)))
-                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_mid, prefetch_limit, market_mid)))
-                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trend, prefetch_limit, market_mid)))
-
+                                        for _tf in _tfs_to_prefetch:
+                                            if prefetch_tasks_max and len(tasks) >= prefetch_tasks_max:
+                                                break
+                                            tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, _tf, prefetch_limit, market_mid)))
+                                        if prefetch_tasks_max and len(tasks) >= prefetch_tasks_max:
+                                            break
+                                    if prefetch_tasks_max and len(tasks) >= prefetch_tasks_max:
+                                        break
+                        
                                 if tasks:
                                     if prefetch_timeout and prefetch_timeout > 0:
                                         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=prefetch_timeout)
@@ -11872,8 +12095,7 @@ class Backend:
                                         await asyncio.gather(*tasks, return_exceptions=True)
                             except Exception as _e:
                                 logger.warning("[mid] candles prefetch failed: %s", _e)
-
-                        # Exclude prefetch time from per-symbol budget (budget applies to scan phase)
+# Exclude prefetch time from per-symbol budget (budget applies to scan phase)
                         start_scan = time.time()
                         prefetch_elapsed = float(start_scan - start_total)
                         for sym in symbols:
