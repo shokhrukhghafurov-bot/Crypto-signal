@@ -12707,18 +12707,38 @@ class Backend:
                     try:
                         _ns_total = int(_mid_no_signal or 0)
                         if _ns_total > 0 and isinstance(_mid_no_signal_detail_reasons, dict) and _mid_no_signal_detail_reasons:
-                            topn = 8
+                            # default topn
                             try:
                                 topn = int(float(os.getenv('MID_NO_SIGNAL_DETAIL_TOPN','8') or 8))
                             except Exception:
                                 topn = 8
-                            items = sorted(_mid_no_signal_detail_reasons.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
+
+                            items = sorted(_mid_no_signal_detail_reasons.items(),
+                                           key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
                             items = [(str(k), int(v or 0)) for k,v in items if v]
+
+                            # If "other" bucket exists -> show more (or all) reasons to avoid hiding the real causes
+                            other_cnt = 0
+                            try:
+                                if isinstance(_mid_no_signal_reasons, dict):
+                                    other_cnt = int(_mid_no_signal_reasons.get("other", 0) or 0)
+                            except Exception:
+                                other_cnt = 0
+
                             if items:
-                                shown = items[:max(1, topn)]
-                                rest = sum(v for _,v in items[max(1, topn):])
+                                if other_cnt > 0:
+                                    try:
+                                        cap = int(float(os.getenv("MID_NO_SIGNAL_OTHER_CAP","50") or 50))
+                                    except Exception:
+                                        cap = 50
+                                    shown = items[:max(1, min(len(items), cap))]
+                                    rest = sum(v for _,v in items[len(shown):])
+                                else:
+                                    shown = items[:max(1, topn)]
+                                    rest = sum(v for _,v in items[max(1, topn):])
+
                                 _ns_reason_details = ' reasons={' + ','.join([f'{k}={v}' for k,v in shown])
-                                if rest>0:
+                                if rest > 0:
                                     _ns_reason_details += f',+{rest}'
                                 _ns_reason_details += '}'
                     except Exception:
