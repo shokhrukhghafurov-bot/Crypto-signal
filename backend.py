@@ -6294,84 +6294,84 @@ class MultiExchangeData:
             out.append((qv, sym))
         return out
 
-async def get_top_usdt_symbols(self, n: int) -> List[str]:
-    """Return Binance-style symbols (e.g. BTCUSDT) sorted by quote turnover.
-
-    IMPORTANT: Binance may be unreachable (DNS/ban/region). We fall back to other exchanges.
-    This method also uses a short TTL cache + provider cooldown to prevent REST storms.
-    """
-    assert self.session is not None
-
-    # Fast path: return cached list (shared module-level cache) to avoid hitting REST every tick
-    cached = _top_cache_get(n)
-    if cached:
-        try:
-            self.last_top_provider = str(_TOP_SYMBOLS_CACHE.get("provider") or "CACHE")
-        except Exception:
-            pass
-        return cached
-
-    providers = [
-        ("BINANCE", self._top_from_binance),
-        ("BYBIT", self._top_from_bybit),
-        ("OKX", self._top_from_okx),
-        ("MEXC", self._top_from_mexc),
-        ("GATEIO", self._top_from_gateio),
-    ]
-
-    last_err: Exception | None = None
-    items: list[tuple[float, str]] = []
-
-    for name, fn in providers:
-        # Skip provider during cooldown (ban/rate limit backoff)
-        if _top_provider_is_cooled(name):
-            continue
-        try:
-            items = await fn()
-            if items:
-                try:
-                    self.last_top_provider = str(name)
-                except Exception:
-                    pass
-                break
-        except Exception as e:
-            last_err = e
-            # Set cooldown so we don't hammer the same provider again next tick
+    async def get_top_usdt_symbols(self, n: int) -> List[str]:
+        """Return Binance-style symbols (e.g. BTCUSDT) sorted by quote turnover.
+    
+        IMPORTANT: Binance may be unreachable (DNS/ban/region). We fall back to other exchanges.
+        This method also uses a short TTL cache + provider cooldown to prevent REST storms.
+        """
+        assert self.session is not None
+    
+        # Fast path: return cached list (shared module-level cache) to avoid hitting REST every tick
+        cached = _top_cache_get(n)
+        if cached:
             try:
-                cd = int(_top_cooldown_for_error(name, e))
-                _top_set_provider_cooldown(name, cd)
+                self.last_top_provider = str(_TOP_SYMBOLS_CACHE.get("provider") or "CACHE")
             except Exception:
                 pass
-            logger.warning("get_top_usdt_symbols: %s failed: %s", name, e)
-            continue
-
-    if not items:
-        if last_err is not None:
-            raise last_err
-        return []
-
-    items.sort(reverse=True, key=lambda x: float(x[0] or 0.0))
-    syms = [sym for _, sym in items if sym]
-
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    dedup: list[str] = []
-    for s in syms:
-        if s in seen:
-            continue
-        seen.add(s)
-        dedup.append(s)
-
-    # Save to TTL cache (shared across scanner ticks)
-    try:
-        _top_cache_set(dedup, getattr(self, "last_top_provider", ""))
-    except Exception:
-        pass
-
-    if n <= 0:
-        return dedup
-    return dedup[:n]
-
+            return cached
+    
+        providers = [
+            ("BINANCE", self._top_from_binance),
+            ("BYBIT", self._top_from_bybit),
+            ("OKX", self._top_from_okx),
+            ("MEXC", self._top_from_mexc),
+            ("GATEIO", self._top_from_gateio),
+        ]
+    
+        last_err: Exception | None = None
+        items: list[tuple[float, str]] = []
+    
+        for name, fn in providers:
+            # Skip provider during cooldown (ban/rate limit backoff)
+            if _top_provider_is_cooled(name):
+                continue
+            try:
+                items = await fn()
+                if items:
+                    try:
+                        self.last_top_provider = str(name)
+                    except Exception:
+                        pass
+                    break
+            except Exception as e:
+                last_err = e
+                # Set cooldown so we don't hammer the same provider again next tick
+                try:
+                    cd = int(_top_cooldown_for_error(name, e))
+                    _top_set_provider_cooldown(name, cd)
+                except Exception:
+                    pass
+                logger.warning("get_top_usdt_symbols: %s failed: %s", name, e)
+                continue
+    
+        if not items:
+            if last_err is not None:
+                raise last_err
+            return []
+    
+        items.sort(reverse=True, key=lambda x: float(x[0] or 0.0))
+        syms = [sym for _, sym in items if sym]
+    
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        dedup: list[str] = []
+        for s in syms:
+            if s in seen:
+                continue
+            seen.add(s)
+            dedup.append(s)
+    
+        # Save to TTL cache (shared across scanner ticks)
+        try:
+            _top_cache_set(dedup, getattr(self, "last_top_provider", ""))
+        except Exception:
+            pass
+    
+        if n <= 0:
+            return dedup
+        return dedup[:n]
+    
     async def _get_json(self, url: str, params: Optional[Dict[str, str]] = None) -> Any:
         """HTTP GET JSON with concurrency limit + per-request timeout.
 
