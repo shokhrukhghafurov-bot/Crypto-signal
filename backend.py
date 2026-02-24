@@ -11388,6 +11388,29 @@ class Backend:
                             break
                     symb = _sn
                     key = (ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
+                    mkt0 = (market or 'SPOT').upper().strip()
+                    # Fast skip: known unsupported (avoid repeated empty/unsupported storms)
+                    try:
+                        if api._is_unsupported_cached(ex_name, mkt0, symb, tf):
+                            _mid_candles_unsupported += 1
+                            _mid_diag_add(symb, ex_name, mkt0, tf, 'unsupported_cached', 'pre')
+                            return None
+                    except Exception:
+                        pass
+                    # Fast skip: market/symbol not supported according to cached instruments
+                    # (prevents FUTURES empty responses when the contract doesn't exist)
+                    try:
+                        if getattr(api, "_market_avail_check", False):
+                            if not _market_supported_ex(ex_name, mkt0, symb):
+                                try:
+                                    api._mark_unsupported(ex_name, mkt0, symb, tf)
+                                except Exception:
+                                    pass
+                                _mid_diag_add(symb, ex_name, mkt0, tf, 'unsupported_pair', 'pre')
+                                _mid_candles_unsupported += 1
+                                return None
+                    except Exception:
+                        pass
                     now = time.time()
                     ttl = _mid_cache_ttl(tf)
                     cached = _mid_candles_cache.get(key)
@@ -11800,16 +11823,16 @@ class Backend:
                                 if api._is_unsupported_cached(ex_name, (market or 'SPOT').upper().strip(), symb, tf):
                                     _mid_candles_unsupported += 1
                                     return None
-                    
-                                _mid_candles_empty += 1
-                                reason = f"empty_{ex_name.lower()}_{(market or 'SPOT').lower()}_{tf}"
-                                _mid_candles_empty_reasons[reason] += 1
-                                if _mid_candles_log_empty:
-                                    lst = _mid_candles_empty_samples[reason]
-                                    if len(lst) < _mid_candles_log_empty_samples:
-                                        lst.append(f"{symb}@{ex_name}/{market}/{tf}/L{limit}")
-                    
-                                continue  # try next limit / retry
+
+                                # Treat persistent "empty" as unsupported_pair (most often: contract doesn't exist).
+                                # This makes MID immediately try other markets/exchanges instead of accumulating empty storms.
+                                try:
+                                    api._mark_unsupported(ex_name, (market or 'SPOT').upper().strip(), symb, tf)
+                                except Exception:
+                                    pass
+                                _mid_diag_add(symb, ex_name, (market or 'SPOT').upper().strip(), tf, 'unsupported_pair', 'empty')
+                                _mid_candles_unsupported += 1
+                                return None
                     
                             # got non-empty candles
                             break
@@ -11924,6 +11947,39 @@ class Backend:
                         # ensure unique symbols per tick (preserve order)
                         if symbols:
                             symbols = list(dict.fromkeys(symbols))
+                        # Prefilter symbols that are not available on ANY configured MID candle source.
+                        # This removes candles_unavailable storms like FXSUSDT and reduces wasted HTTP calls.
+                        try:
+                            prefilter = (os.getenv("MID_PREFILTER_UNSUPPORTED_SYMBOLS", "1") or "1").strip().lower() in ("1","true","yes","on")
+                        except Exception:
+                            prefilter = True
+                        if prefilter and symbols:
+                            try:
+                                _kept = []
+                                for _s in symbols:
+                                    if is_blocked_symbol(_s):
+                                        _kept.append(_s)
+                                        continue
+                                    _ok = False
+                                    # Try both markets because later we may fall back FUTURES->SPOT
+                                    for _mkt in ("FUTURES","SPOT"):
+                                        for _ex in (mid_universe or ["BINANCE","BYBIT","OKX"]):
+                                            try:
+                                                if _market_supported_ex(_ex, _mkt, _s):
+                                                    _ok = True
+                                                    break
+                                            except Exception:
+                                                continue
+                                        if _ok:
+                                            break
+                                    if _ok:
+                                        _kept.append(_s)
+                                    else:
+                                        # remember for routing diagnostics
+                                        _rej_add(_s, "no_market_any")
+                                symbols = _kept
+                            except Exception:
+                                pass
                         # --- MID tick counters / diagnostics ---
                         _mid_scanned = len(symbols)
                         _mid_pool = len(symbols_pool)
