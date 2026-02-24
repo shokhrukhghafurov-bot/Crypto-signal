@@ -12059,8 +12059,7 @@ class Backend:
                         _mid_no_signal_reasons = {"trap":0,"structure":0,"trend":0,"extreme":0,"impulse":0,"other":0}
                         _mid_no_signal_stage_by_sym = {}
                         _mid_no_signal_stages_by_sym = {}
-                        _mid_no_signal_detail_reasons = {}  # fail_reason -> count
-                        _mid_no_signal_detail_reasons_other = {}  # base_reason (OTHER stage only) -> count
+                        _mid_no_signal_detail_reasons_other = {}  # base_reason -> count (stage==other only)
                         _mid_no_signal_reasons_by_sym = {}      # sym -> [fail_reason...] per venue
   # sym -> [stage per venue with OK candles]
                         _mid_no_signal_stage_mode = str(os.getenv("MID_NO_SIGNAL_STAGE_MODE","best")).strip().lower()
@@ -12401,18 +12400,20 @@ class Backend:
                                                     _rbest = _rs[0]
                                             else:
                                                 _rbest = str(_st or 'other')
-                                            # Track detailed reasons ONLY for the final 'other' stage (summary wants other=...{...})
-                                            if str(_st or '').strip().lower() == 'other' and _rbest:
-                                                try:
-                                                    _k = str(_rbest).strip()
-                                                    # Normalize: take base token before whitespace, then cut params like rsi_long=37.7 -> rsi_long
-                                                    _k = (_k.split()[0] if _k else '').strip()
-                                                    _k = (_k.split('=')[0] if '=' in _k else _k)
-                                                    _k = (_k.split(':')[0] if ':' in _k else _k)
-                                                    if _k and _k != 'other':
-                                                        _mid_no_signal_detail_reasons_other[_k] = int(_mid_no_signal_detail_reasons_other.get(_k,0) or 0) + 1
-                                                except Exception:
-                                                    pass
+                                            # Count detailed no-signal reasons only for the 'other' bucket,
+                                            # and normalize to a base reason name (e.g. "rsi_long=37.7" -> "rsi_long",
+                                            # "near_1h_low dist=..." -> "near_1h_low").
+                                            if str(_st or '') == 'other' and _rbest:
+                                                _key = str(_rbest).strip()
+                                                # base token (first word)
+                                                _key = _key.split()[0] if _key else _key
+                                                # strip value parts
+                                                for _sep in ('=', ':'):
+                                                    if _sep in _key:
+                                                        _key = _key.split(_sep, 1)[0]
+                                                _key = _key.strip()
+                                                if _key and _key != 'other':
+                                                    _mid_no_signal_detail_reasons_other[_key] = int(_mid_no_signal_detail_reasons_other.get(_key, 0) or 0) + 1
                                         except Exception:
                                             pass
 
@@ -12713,33 +12714,41 @@ class Backend:
                         _no_candles_final = int(_rej_counts.get('candles_unavailable', 0) or 0)
                     except Exception:
                         _no_candles_final = 0
-                    # Expand no_signal 'other' into concrete fail reasons (best-effort)
+                    # Expand no_signal 'other' into aggregated fail reasons (best-effort)
                     _ns_other_details = ''
                     try:
-                        _other_n = int(_mid_no_signal_reasons.get('other',0) or 0)
-                        if _other_n > 0 and isinstance(_mid_no_signal_detail_reasons_other, dict) and _mid_no_signal_detail_reasons_other:
-                            topn = 8
+                        _other_n = int(_mid_no_signal_reasons.get('other', 0) or 0)
+                        if _other_n > 0:
+                            # 0 => show all (default). >0 => show top-N + +rest.
                             try:
-                                topn = int(float(os.getenv('MID_NO_SIGNAL_DETAIL_TOPN','0') or 0))
+                                topn = int(float(os.getenv('MID_NO_SIGNAL_DETAIL_TOPN', '0') or 0))
                             except Exception:
-                                topn = 8
-                            items = sorted(_mid_no_signal_detail_reasons_other.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
-                            items = [(str(k), int(v or 0)) for k,v in items if v]
-                            if items:
-                                if topn and topn > 0:
-                                    shown = items[:topn]
-                                    rest = sum(v for _, v in items[topn:])
-                                else:
-                                    shown = items
-                                    rest = 0
-                                _ns_other_details = '{' + ','.join([f'{k}={v}' for k, v in shown])
-                                if rest > 0:
-                                    _ns_other_details += f',+{rest}'
-                                _ns_other_details += '}'
+                                topn = 0
+
+                            items = []
+                            if isinstance(_mid_no_signal_detail_reasons_other, dict) and _mid_no_signal_detail_reasons_other:
+                                items = sorted(_mid_no_signal_detail_reasons_other.items(),
+                                               key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
+
+                            # If we couldn't capture granular reasons, still show that "other" happened.
+                            if not items:
+                                _ns_other_details = '{untracked=%s}' % int(_other_n)
+                            else:
+                                items = [(str(k), int(v or 0)) for k, v in items if v and str(k).strip()]
+                                if items:
+                                    if topn and topn > 0:
+                                        shown = items[:topn]
+                                        rest = sum(v for _, v in items[topn:])
+                                    else:
+                                        shown = items
+                                        rest = 0
+                                    _ns_other_details = '{' + ','.join([f'{k}={v}' for k, v in shown])
+                                    if rest > 0:
+                                        _ns_other_details += f',+{rest}'
+                                    _ns_other_details += '}'
                     except Exception:
                         _ns_other_details = ''
-
-                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} no_signal={int(_mid_no_signal)} [trap={int(_mid_no_signal_reasons.get('trap',0) or 0)},structure={int(_mid_no_signal_reasons.get('structure',0) or 0)},trend={int(_mid_no_signal_reasons.get('trend',0) or 0)},extreme={int(_mid_no_signal_reasons.get('extreme',0) or 0)},impulse={int(_mid_no_signal_reasons.get('impulse',0) or 0)},other={int(_mid_no_signal_reasons.get('other',0) or 0)}{_ns_other_details}] cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} no_candles={_no_candles_final} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} candles_empty={_mid_candles_empty} candles_fallback={_mid_candles_fallback} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
+summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} no_signal={int(_mid_no_signal)} [trap={int(_mid_no_signal_reasons.get('trap',0) or 0)},structure={int(_mid_no_signal_reasons.get('structure',0) or 0)},trend={int(_mid_no_signal_reasons.get('trend',0) or 0)},extreme={int(_mid_no_signal_reasons.get('extreme',0) or 0)},impulse={int(_mid_no_signal_reasons.get('impulse',0) or 0)},other={int(_mid_no_signal_reasons.get('other',0) or 0)}{_ns_other_details}] cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} no_candles={_no_candles_final} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} candles_empty={_mid_candles_empty} candles_fallback={_mid_candles_fallback} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
                     logger.info("[mid][summary] %s", summary)
                     try:
                         _tot = int(_mid_db_hit) + int(_mid_rest_refill)
