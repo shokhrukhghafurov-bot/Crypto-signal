@@ -12714,7 +12714,7 @@ class Backend:
                         _no_candles_final = int(_rej_counts.get('candles_unavailable', 0) or 0)
                     except Exception:
                         _no_candles_final = 0
-                    # Expand no_signal 'other' into aggregated fail reasons (best-effort)
+                    # Expand no_signal 'other' into aggregated fail reasons (best-effort, safe)
                     _ns_other_details = ''
                     try:
                         _other_n = int(_mid_no_signal_reasons.get('other', 0) or 0)
@@ -12724,17 +12724,16 @@ class Backend:
                                 topn = int(float(os.getenv('MID_NO_SIGNAL_DETAIL_TOPN', '0') or 0))
                             except Exception:
                                 topn = 0
-
+                    
                             items = []
                             if isinstance(_mid_no_signal_detail_reasons_other, dict) and _mid_no_signal_detail_reasons_other:
                                 items = sorted(_mid_no_signal_detail_reasons_other.items(),
                                                key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
-
-                            # If we couldn't capture granular reasons, still show that "other" happened.
+                    
                             if not items:
                                 _ns_other_details = '{untracked=%s}' % int(_other_n)
                             else:
-                                items = [(str(k), int(v or 0)) for k, v in items if v and str(k).strip()]
+                                items = [(str(k), int(v or 0)) for k, v in items if v and str(k).strip() and str(k).strip() != 'other']
                                 if items:
                                     if topn and topn > 0:
                                         shown = items[:topn]
@@ -12746,10 +12745,35 @@ class Backend:
                                     if rest > 0:
                                         _ns_other_details += f',+{rest}'
                                     _ns_other_details += '}'
-                    except Exception:
+                    except Exception as e:
+                        # Never break the tick due to summary formatting.
                         _ns_other_details = ''
-summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} no_signal={int(_mid_no_signal)} [trap={int(_mid_no_signal_reasons.get('trap',0) or 0)},structure={int(_mid_no_signal_reasons.get('structure',0) or 0)},trend={int(_mid_no_signal_reasons.get('trend',0) or 0)},extreme={int(_mid_no_signal_reasons.get('extreme',0) or 0)},impulse={int(_mid_no_signal_reasons.get('impulse',0) or 0)},other={int(_mid_no_signal_reasons.get('other',0) or 0)}{_ns_other_details}] cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} no_candles={_no_candles_final} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} candles_empty={_mid_candles_empty} candles_fallback={_mid_candles_fallback} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
-                    logger.info("[mid][summary] %s", summary)
+                    
+                    # Build and log summary safely (avoid syntax/formatting issues)
+                    try:
+                        summary = (
+                            f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} "
+                            f"hardblock={_mid_hard_block} no_signal={int(_mid_no_signal)} "
+                            f"[trap={int(_mid_no_signal_reasons.get('trap',0) or 0)},"
+                            f"structure={int(_mid_no_signal_reasons.get('structure',0) or 0)},"
+                            f"trend={int(_mid_no_signal_reasons.get('trend',0) or 0)},"
+                            f"extreme={int(_mid_no_signal_reasons.get('extreme',0) or 0)},"
+                            f"impulse={int(_mid_no_signal_reasons.get('impulse',0) or 0)},"
+                            f"other={int(_mid_no_signal_reasons.get('other',0) or 0)}{_ns_other_details}] "
+                            f"cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} "
+                            f"align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} "
+                            f"no_candles={_no_candles_final} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} "
+                            f"candles_partial={_mid_candles_partial} candles_empty={_mid_candles_empty} candles_fallback={_mid_candles_fallback} "
+                            f"cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} "
+                            f"cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} "
+                            f"inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} "
+                            f"prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
+                        )
+                        logger.info("[mid][summary] %s", summary)
+                    except Exception as e:
+                        summary = f"tick done (summary_error={type(e).__name__}) scanned={_mid_scanned}"
+                        logger.warning("[mid][summary_error] %s", e)
+                        logger.info("[mid][summary] %s", summary)
                     try:
                         _tot = int(_mid_db_hit) + int(_mid_rest_refill)
                         if _tot > 0:
