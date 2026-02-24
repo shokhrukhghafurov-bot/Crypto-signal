@@ -7399,7 +7399,7 @@ def _mid_structure_trap_ok(*, direction: str, entry: float, df1hi: pd.DataFrame)
     return (True, "")
 
 
-def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame, symbol: str = "") -> Optional[Dict[str, Any]]:
+def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame, symbol: str = "", diag: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
     Produces a result dict compatible with scanner_loop_mid and a rich TA block (like MAIN),
@@ -7409,6 +7409,16 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         return None
     if df5.empty or df30.empty or df1h.empty:
         return None
+
+    def _fail(stage: str, reason: str = "") -> None:
+        try:
+            if diag is None:
+                return
+            diag["fail_stage"] = str(stage)
+            if reason:
+                diag["fail_reason"] = str(reason)
+        except Exception:
+            return
 
     try:
         df5i = _add_indicators(df5)
@@ -7526,6 +7536,16 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             _emit_mid_trap_event({"dir": str(dir_trend), "reason": str(trap_reason), "reason_key": _mid_trap_reason_key(str(trap_reason)), "entry": float(entry)})
         except Exception:
             pass
+        _stage = "trap"
+        try:
+            _tr = str(trap_reason)
+            if "post_impulse" in _tr:
+                _stage = "impulse"
+            elif ("weak_extreme" in _tr) or ("near_" in _tr) or ("extreme" in _tr):
+                _stage = "extreme"
+        except Exception:
+            pass
+        _fail(_stage, str(trap_reason))
         return None
 
 
@@ -7536,6 +7556,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         min_adx_1h = float(_mid_autotune_get_param("MID_MIN_ADX_1H", float(os.getenv("MID_MIN_ADX_1H", "0") or 0), market))
         if not allow_range and min_adx_30m > 0 and min_adx_1h > 0:
             if (not np.isnan(adx30)) and (not np.isnan(adx1h)) and (adx30 < min_adx_30m) and (adx1h < min_adx_1h):
+                _fail("trend", "adx_choppy")
                 return None
     except Exception:
         pass
@@ -7877,8 +7898,10 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         short_min = float(os.getenv("MID_RANGE_POS_SHORT_MIN", "0.25") or 0.25)
         if range_pos_filter and (mstruct == "RANGE") and (range_pos is not None):
             if (dir_trend == "LONG") and (range_pos > long_max):
+                _fail("structure", "range_pos_long")
                 return None
             if (dir_trend == "SHORT") and (range_pos < short_min):
+                _fail("structure", "range_pos_short")
                 return None
     except Exception:
         pass
@@ -11896,6 +11919,10 @@ class Backend:
                         _mid_f_atr = 0
                         _mid_f_futoff = 0
                         _mid_candles_net_fail = 0
+                        _mid_no_signal = 0
+                        _mid_no_signal_reasons = {"trap":0,"structure":0,"trend":0,"extreme":0,"impulse":0,"other":0}
+                        _mid_no_signal_stage_by_sym = {}
+
                         _mid_candles_unsupported = 0
                         _mid_candles_partial = 0
                         _mid_db_hit = 0
@@ -12142,7 +12169,16 @@ class Backend:
 
                                             # Candles are available (non-empty + enough bars) on this venue.
                                             found_ok_candles = True
-                                            r = evaluate_on_exchange_mid(a, b, c, symbol=sym)
+                                            _diag = {}
+                                            r = evaluate_on_exchange_mid(a, b, c, symbol=sym, diag=_diag)
+                                            if not r:
+                                                try:
+                                                    _st = str(_diag.get("fail_stage") or "other")
+                                                    if _st not in _mid_no_signal_reasons:
+                                                        _st = "other"
+                                                    _mid_no_signal_stage_by_sym[sym] = _st
+                                                except Exception:
+                                                    pass
                                             if r:
                                                 chosen_name = name
                                                 chosen_market = mkt
@@ -12169,6 +12205,14 @@ class Backend:
                                 if found_ok_candles:
                                     # Candles were OK but no signal on any venue.
                                     _rej_add(sym, "no_signal")
+                                    try:
+                                        _mid_no_signal += 1
+                                        _st = str(_mid_no_signal_stage_by_sym.get(sym) or "other")
+                                        if _st not in _mid_no_signal_reasons:
+                                            _st = "other"
+                                        _mid_no_signal_reasons[_st] = int(_mid_no_signal_reasons.get(_st,0) or 0) + 1
+                                    except Exception:
+                                        pass
                                     continue
                                 _rej_add(sym, "candles_unavailable")
 
@@ -12444,7 +12488,7 @@ class Backend:
                 elapsed = time.time() - start
                 try:
                     _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
-                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} no_candles={(int(_mid_candles_net_fail)+int(_mid_candles_unsupported)+int(_mid_candles_partial)+int(_mid_candles_empty))} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} candles_empty={_mid_candles_empty} candles_fallback={_mid_candles_fallback} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
+                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} no_signal={int(_mid_no_signal)} [trap={int(_mid_no_signal_reasons.get('trap',0) or 0)},structure={int(_mid_no_signal_reasons.get('structure',0) or 0)},trend={int(_mid_no_signal_reasons.get('trend',0) or 0)},extreme={int(_mid_no_signal_reasons.get('extreme',0) or 0)},impulse={int(_mid_no_signal_reasons.get('impulse',0) or 0)},other={int(_mid_no_signal_reasons.get('other',0) or 0)}] cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} no_candles={(int(_mid_candles_net_fail)+int(_mid_candles_unsupported)+int(_mid_candles_partial)+int(_mid_candles_empty))} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} candles_empty={_mid_candles_empty} candles_fallback={_mid_candles_fallback} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
                     logger.info("[mid][summary] %s", summary)
                     try:
                         _tot = int(_mid_db_hit) + int(_mid_rest_refill)
