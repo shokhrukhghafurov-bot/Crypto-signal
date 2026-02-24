@@ -12058,7 +12058,10 @@ class Backend:
                         _mid_no_signal = 0
                         _mid_no_signal_reasons = {"trap":0,"structure":0,"trend":0,"extreme":0,"impulse":0,"other":0}
                         _mid_no_signal_stage_by_sym = {}
-                        _mid_no_signal_stages_by_sym = {}  # sym -> [stage per venue with OK candles]
+                        _mid_no_signal_stages_by_sym = {}
+                        _mid_no_signal_detail_reasons = {}  # fail_reason -> count
+                        _mid_no_signal_reasons_by_sym = {}      # sym -> [fail_reason...] per venue
+  # sym -> [stage per venue with OK candles]
                         _mid_no_signal_stage_mode = str(os.getenv("MID_NO_SIGNAL_STAGE_MODE","best")).strip().lower()
                         if _mid_no_signal_stage_mode not in ("best","majority"):
                             _mid_no_signal_stage_mode = "best"
@@ -12319,6 +12322,12 @@ class Backend:
                                                     # Collect stage per venue; we'll decide final stage when rejecting as no_signal.
                                                     _mid_no_signal_stage_by_sym[sym] = _st  # last (debug)
                                                     _mid_no_signal_stages_by_sym.setdefault(sym, []).append(_st)
+                                                    # Collect detailed fail reason (best-effort).
+                                                    _rr = str(_diag.get("fail_reason") or _st or "other")
+                                                    _rr = _rr.strip() or "other"
+                                                    if len(_rr) > 64:
+                                                        _rr = _rr[:64]
+                                                    _mid_no_signal_reasons_by_sym.setdefault(sym, []).append(_rr)
                                                 except Exception:
                                                     pass
                                             if r:
@@ -12372,6 +12381,30 @@ class Backend:
                                         if _st not in _mid_no_signal_reasons:
                                             _st = "other"
                                         _mid_no_signal_reasons[_st] = int(_mid_no_signal_reasons.get(_st,0) or 0) + 1
+                                        try:
+                                            _rs = list(_mid_no_signal_reasons_by_sym.get(sym) or [])
+                                            if _rs:
+                                                if _mid_no_signal_stage_mode == 'majority':
+                                                    counts2 = {}
+                                                    for r0 in _rs:
+                                                        counts2[r0] = counts2.get(r0, 0) + 1
+                                                    best_r = None
+                                                    best_n2 = -1
+                                                    for r0 in _rs:
+                                                        n2 = counts2.get(r0, 0)
+                                                        if n2 > best_n2:
+                                                            best_n2 = n2
+                                                            best_r = r0
+                                                    _rbest = best_r or _rs[0]
+                                                else:
+                                                    _rbest = _rs[0]
+                                            else:
+                                                _rbest = str(_st or 'other')
+                                            if _rbest:
+                                                _mid_no_signal_detail_reasons[_rbest] = int(_mid_no_signal_detail_reasons.get(_rbest,0) or 0) + 1
+                                        except Exception:
+                                            pass
+
                                     except Exception:
                                         pass
                                     continue
@@ -12669,7 +12702,29 @@ class Backend:
                         _no_candles_final = int(_rej_counts.get('candles_unavailable', 0) or 0)
                     except Exception:
                         _no_candles_final = 0
-                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} no_signal={int(_mid_no_signal)} [trap={int(_mid_no_signal_reasons.get('trap',0) or 0)},structure={int(_mid_no_signal_reasons.get('structure',0) or 0)},trend={int(_mid_no_signal_reasons.get('trend',0) or 0)},extreme={int(_mid_no_signal_reasons.get('extreme',0) or 0)},impulse={int(_mid_no_signal_reasons.get('impulse',0) or 0)},other={int(_mid_no_signal_reasons.get('other',0) or 0)}] cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} no_candles={_no_candles_final} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} candles_empty={_mid_candles_empty} candles_fallback={_mid_candles_fallback} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
+                    # Expand no_signal 'other' into concrete fail reasons (best-effort)
+                    _ns_other_details = ''
+                    try:
+                        _other_n = int(_mid_no_signal_reasons.get('other',0) or 0)
+                        if _other_n > 0 and isinstance(_mid_no_signal_detail_reasons, dict) and _mid_no_signal_detail_reasons:
+                            topn = 8
+                            try:
+                                topn = int(float(os.getenv('MID_NO_SIGNAL_DETAIL_TOPN','8') or 8))
+                            except Exception:
+                                topn = 8
+                            items = sorted(_mid_no_signal_detail_reasons.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
+                            items = [(str(k), int(v or 0)) for k,v in items if v]
+                            if items:
+                                shown = items[:max(1, topn)]
+                                rest = sum(v for _,v in items[max(1, topn):])
+                                _ns_other_details = '{' + ','.join([f'{k}={v}' for k,v in shown])
+                                if rest>0:
+                                    _ns_other_details += f',+{rest}'
+                                _ns_other_details += '}'
+                    except Exception:
+                        _ns_other_details = ''
+
+                    summary = f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} hardblock={_mid_hard_block} no_signal={int(_mid_no_signal)} [trap={int(_mid_no_signal_reasons.get('trap',0) or 0)},structure={int(_mid_no_signal_reasons.get('structure',0) or 0)},trend={int(_mid_no_signal_reasons.get('trend',0) or 0)},extreme={int(_mid_no_signal_reasons.get('extreme',0) or 0)},impulse={int(_mid_no_signal_reasons.get('impulse',0) or 0)},other={int(_mid_no_signal_reasons.get('other',0) or 0)}{_ns_other_details}] cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} no_candles={_no_candles_final} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} candles_partial={_mid_candles_partial} candles_empty={_mid_candles_empty} candles_fallback={_mid_candles_fallback} cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
                     logger.info("[mid][summary] %s", summary)
                     try:
                         _tot = int(_mid_db_hit) + int(_mid_rest_refill)
