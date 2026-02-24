@@ -12707,38 +12707,18 @@ class Backend:
                     try:
                         _ns_total = int(_mid_no_signal or 0)
                         if _ns_total > 0 and isinstance(_mid_no_signal_detail_reasons, dict) and _mid_no_signal_detail_reasons:
-                            # default topn
+                            topn = 8
                             try:
                                 topn = int(float(os.getenv('MID_NO_SIGNAL_DETAIL_TOPN','8') or 8))
                             except Exception:
                                 topn = 8
-
-                            items = sorted(_mid_no_signal_detail_reasons.items(),
-                                           key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
+                            items = sorted(_mid_no_signal_detail_reasons.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
                             items = [(str(k), int(v or 0)) for k,v in items if v]
-
-                            # If "other" bucket exists -> show more (or all) reasons to avoid hiding the real causes
-                            other_cnt = 0
-                            try:
-                                if isinstance(_mid_no_signal_reasons, dict):
-                                    other_cnt = int(_mid_no_signal_reasons.get("other", 0) or 0)
-                            except Exception:
-                                other_cnt = 0
-
                             if items:
-                                if other_cnt > 0:
-                                    try:
-                                        cap = int(float(os.getenv("MID_NO_SIGNAL_OTHER_CAP","50") or 50))
-                                    except Exception:
-                                        cap = 50
-                                    shown = items[:max(1, min(len(items), cap))]
-                                    rest = sum(v for _,v in items[len(shown):])
-                                else:
-                                    shown = items[:max(1, topn)]
-                                    rest = sum(v for _,v in items[max(1, topn):])
-
+                                shown = items[:max(1, topn)]
+                                rest = sum(v for _,v in items[max(1, topn):])
                                 _ns_reason_details = ' reasons={' + ','.join([f'{k}={v}' for k,v in shown])
-                                if rest > 0:
+                                if rest>0:
                                     _ns_reason_details += f',+{rest}'
                                 _ns_reason_details += '}'
                     except Exception:
@@ -13406,85 +13386,3 @@ async def candles_cache_cleanup_loop(backend: 'Backend') -> None:
             log.exception('[candles-cleanup] unexpected error')
 
         await asyncio.sleep(max(60, every_sec))
-
-
-# ================= FORCE MID SUMMARY HEARTBEAT FIX =================
-# This ensures [mid][summary] always appears in logs even if main tick fails
-try:
-    import threading, time, logging, os
-    def _force_mid_summary_heartbeat():
-        log = logging.getLogger("crypto-signal")
-        sec = int(float(os.getenv("MID_SUMMARY_FORCE_SEC","60") or 60))
-        if sec < 5:
-            sec = 5
-        while True:
-            try:
-                log.info("[mid][summary] heartbeat alive (force enabled)")
-            except Exception:
-                pass
-            time.sleep(sec)
-    threading.Thread(target=_force_mid_summary_heartbeat, daemon=True).start()
-except Exception:
-    pass
-# ================= END FORCE MID SUMMARY HEARTBEAT FIX =================
-
-
-# =======================
-# MID SUMMARY FIX (SAFE APPEND)
-# This helper prints full MID summary including structure and reasons.
-# Call mid_log_summary(...) from scanner_loop after MID tick completes.
-# =======================
-def mid_log_summary_safe(
-    scanned,
-    emitted,
-    blocked,
-    hardblock,
-    no_signal,
-    struct_reasons=None,
-    detail_reasons=None,
-):
-    try:
-        struct_reasons = struct_reasons or {}
-        detail_reasons = detail_reasons or {}
-
-        struct_txt = "[trap={trap},structure={structure},trend={trend},extreme={extreme},impulse={impulse},other={other}]".format(
-            trap=int(struct_reasons.get("trap", 0)),
-            structure=int(struct_reasons.get("structure", 0)),
-            trend=int(struct_reasons.get("trend", 0)),
-            extreme=int(struct_reasons.get("extreme", 0)),
-            impulse=int(struct_reasons.get("impulse", 0)),
-            other=int(struct_reasons.get("other", 0)),
-        )
-
-        # show all reasons
-        items = sorted(
-            [(str(k), int(v or 0)) for k, v in detail_reasons.items()],
-            key=lambda kv: (-kv[1], kv[0])
-        )
-
-        reasons_txt = ""
-        if items:
-            reasons_txt = " reasons={" + ",".join(f"{k}={v}" for k, v in items) + "}"
-
-        summary = (
-            f"tick done scanned={scanned} "
-            f"emitted={emitted} "
-            f"blocked={blocked} "
-            f"hardblock={hardblock} "
-            f"no_signal={no_signal}"
-        )
-
-        logger.info("[mid][summary] %s", summary)
-        logger.info("[mid][summary] %s", struct_txt)
-
-        if reasons_txt:
-            logger.info("[mid][summary]%s", reasons_txt)
-
-        try:
-            _mid_set_last_summary(summary)
-        except Exception:
-            pass
-
-    except Exception:
-        logger.exception("mid_log_summary_safe failed")
-
