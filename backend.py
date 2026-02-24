@@ -6076,6 +6076,16 @@ class MultiExchangeData:
         self._markets_cache: dict[str, tuple[float, set[str]]] = {}  # exchange -> (expires_mono, set(symbols))
         self._unsupported_until: dict[tuple, float] = {}  # (exchange, market, symbol, interval) -> expires_mono
 
+# --- Top symbols caching + provider cooldown (avoid REST bans/rate limits) ---
+self._top_symbols_cache: tuple[float, list[str]] | None = None  # (expires_mono, symbols)
+self._top_provider_cooldown_until: dict[str, float] = {}  # provider -> mono timestamp
+
+# Tunables (env)
+self._top_symbols_ttl_sec = float(os.getenv("TOP_SYMBOLS_TTL_SEC", "300") or "300")
+self._top_provider_cooldown_sec = float(os.getenv("TOP_PROVIDER_COOLDOWN_SEC", "90") or "90")
+self._binance_ban_cooldown_sec = float(os.getenv("BINANCE_BAN_COOLDOWN_SEC", "900") or "900")
+self._bybit_rl_cooldown_sec = float(os.getenv("BYBIT_RATE_LIMIT_COOLDOWN_SEC", "120") or "120")
+
         # Limits / timeouts
         self._http_concurrency = int(os.getenv("HTTP_CONCURRENCY", "25") or "25")
         self._http_req_timeout_sec = float(os.getenv("HTTP_REQ_TIMEOUT_SEC", "6") or "6")
@@ -6221,56 +6231,108 @@ class MultiExchangeData:
             out.append((qv, sym))
         return out
 
-    async def get_top_usdt_symbols(self, n: int) -> List[str]:
-        """Return Binance-style symbols (e.g. BTCUSDT) sorted by quote turnover.
 
-        IMPORTANT: Binance may be unreachable (DNS/ban/region). We fall back to other exchanges.
-        """
-        assert self.session is not None
+async def get_top_usdt_symbols(self, n: int) -> List[str]:
+    """Return Binance-style symbols (e.g. BTCUSDT) sorted by quote turnover.
 
-        providers = [
-            ("BINANCE", self._top_from_binance),
-            ("BYBIT", self._top_from_bybit),
-            ("OKX", self._top_from_okx),
-            ("MEXC", self._top_from_mexc),
-            ("GATEIO", self._top_from_gateio),
-        ]
+    IMPORTANT: Binance may be unreachable (DNS/ban/region). We fall back to other exchanges.
 
-        last_err: Exception | None = None
-        items: list[tuple[float, str]] = []
-        for name, fn in providers:
-            try:
-                items = await fn()
-                if items:
+    Rate-limit protection:
+    - Cache the result for TOP_SYMBOLS_TTL_SEC (default 300s)
+    - Per-provider cooldown when a provider fails (especially Binance 418/-1003 ban and Bybit 10006)
+    """
+    assert self.session is not None
+
+    # Cache hit
+    now_mono = time.monotonic()
+    if self._top_symbols_cache is not None:
+        exp_mono, cached = self._top_symbols_cache
+        if exp_mono > now_mono and cached:
+            return cached[: max(0, int(n))] if n > 0 else cached
+
+    providers = [
+        ("BINANCE", self._top_from_binance),
+        ("BYBIT", self._top_from_bybit),
+        ("OKX", self._top_from_okx),
+        ("MEXC", self._top_from_mexc),
+        ("GATEIO", self._top_from_gateio),
+    ]
+
+    def _cooldown(name: str, sec: float) -> None:
+        try:
+            self._top_provider_cooldown_until[name] = max(self._top_provider_cooldown_until.get(name, 0.0), time.monotonic() + float(sec))
+        except Exception:
+            self._top_provider_cooldown_until[name] = time.monotonic() + float(sec)
+
+    last_err: Exception | None = None
+    items: list[tuple[float, str]] = []
+
+    for name, fn in providers:
+        cd_until = float(self._top_provider_cooldown_until.get(name, 0.0) or 0.0)
+        if cd_until > time.monotonic():
+            continue
+
+        try:
+            items = await fn()
+            if items:
+                try:
+                    self.last_top_provider = str(name)
+                except Exception:
+                    pass
+                break
+        except Exception as e:
+            last_err = e
+
+            # Provider-specific cooldowns
+            msg = str(e)
+
+            # Binance ban / 418 with -1003 payload: set longer cooldown (or until ban timestamp if present)
+            if name == "BINANCE" and ("HTTP 418" in msg or '"code":-1003' in msg or "IP banned until" in msg):
+                sec = float(self._binance_ban_cooldown_sec or 900.0)
+                m = re.search(r"IP banned until\s+(\d+)", msg)
+                if m:
                     try:
-                        self.last_top_provider = str(name)
+                        ban_until_ms = int(m.group(1))
+                        ban_until_sec = ban_until_ms / 1000.0
+                        # Convert to remaining seconds from now (best effort; monotonic drift ignored)
+                        # If remaining is tiny/negative, still cool down for a short period to avoid hammering.
+                        remaining = max(30.0, ban_until_sec - time.time())
+                        sec = min(max(sec, remaining), 3600.0 * 6)
                     except Exception:
-                        pass
-                    break
-            except Exception as e:
-                last_err = e
-                logger.warning("get_top_usdt_symbols: %s failed: %s", name, e)
-                continue
+                        sec = float(self._binance_ban_cooldown_sec or 900.0)
+                _cooldown(name, sec)
+            elif name == "BYBIT" and ("retCode=10006" in msg or "Too many visits" in msg):
+                _cooldown(name, float(self._bybit_rl_cooldown_sec or 120.0))
+            else:
+                _cooldown(name, float(self._top_provider_cooldown_sec or 90.0))
 
-        if not items:
-            if last_err is not None:
-                raise last_err
-            return []
+            logger.warning("get_top_usdt_symbols: %s failed: %s", name, e)
+            continue
 
-        items.sort(reverse=True, key=lambda x: float(x[0] or 0.0))
-        syms = [sym for _, sym in items if sym]
-        # Deduplicate while preserving order
-        seen: set[str] = set()
-        dedup: list[str] = []
-        for s in syms:
-            if s in seen:
-                continue
-            seen.add(s)
-            dedup.append(s)
+    if not items:
+        if last_err is not None:
+            raise last_err
+        return []
 
-        if n <= 0:
-            return dedup
-        return dedup[:n]
+    items.sort(reverse=True, key=lambda x: float(x[0] or 0.0))
+    syms = [sym for _, sym in items if sym]
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    dedup: list[str] = []
+    for s in syms:
+        if s in seen:
+            continue
+        seen.add(s)
+        dedup.append(s)
+
+    # Save cache (even if n smaller)
+    ttl = float(self._top_symbols_ttl_sec or 300.0)
+    self._top_symbols_cache = (time.monotonic() + max(1.0, ttl), dedup)
+
+    if n <= 0:
+        return dedup
+    return dedup[:n]
 
     async def _get_json(self, url: str, params: Optional[Dict[str, str]] = None) -> Any:
         """HTTP GET JSON with concurrency limit + per-request timeout.
