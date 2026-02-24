@@ -11922,6 +11922,10 @@ class Backend:
                         _mid_no_signal = 0
                         _mid_no_signal_reasons = {"trap":0,"structure":0,"trend":0,"extreme":0,"impulse":0,"other":0}
                         _mid_no_signal_stage_by_sym = {}
+                        _mid_no_signal_stages_by_sym = {}  # sym -> [stage per venue with OK candles]
+                        _mid_no_signal_stage_mode = str(os.getenv("MID_NO_SIGNAL_STAGE_MODE","best")).strip().lower()
+                        if _mid_no_signal_stage_mode not in ("best","majority"):
+                            _mid_no_signal_stage_mode = "best"
 
                         _mid_candles_unsupported = 0
                         _mid_candles_partial = 0
@@ -12176,7 +12180,9 @@ class Backend:
                                                     _st = str(_diag.get("fail_stage") or "other")
                                                     if _st not in _mid_no_signal_reasons:
                                                         _st = "other"
-                                                    _mid_no_signal_stage_by_sym[sym] = _st
+                                                    # Collect stage per venue; we'll decide final stage when rejecting as no_signal.
+                                                    _mid_no_signal_stage_by_sym[sym] = _st  # last (debug)
+                                                    _mid_no_signal_stages_by_sym.setdefault(sym, []).append(_st)
                                                 except Exception:
                                                     pass
                                             if r:
@@ -12207,11 +12213,30 @@ class Backend:
                                     _rej_add(sym, "no_signal")
                                     try:
                                         _mid_no_signal += 1
-                                        _st = str(_mid_no_signal_stage_by_sym.get(sym) or "other")
+                                        stages = list(_mid_no_signal_stages_by_sym.get(sym) or [])
+                                        if stages:
+                                            if _mid_no_signal_stage_mode == "majority":
+                                                # pick most frequent stage; tie -> earliest (keeps primary-order preference)
+                                                counts = {}
+                                                for s in stages:
+                                                    counts[s] = counts.get(s, 0) + 1
+                                                best_s = None
+                                                best_n = -1
+                                                for s in stages:
+                                                    n = counts.get(s, 0)
+                                                    if n > best_n:
+                                                        best_n = n
+                                                        best_s = s
+                                                _st = best_s or stages[0]
+                                            else:
+                                                # "best": first venue in priority order that had OK candles
+                                                _st = stages[0]
+                                        else:
+                                            _st = str(_mid_no_signal_stage_by_sym.get(sym) or "other")
                                         if _st not in _mid_no_signal_reasons:
                                             _st = "other"
                                         _mid_no_signal_reasons[_st] = int(_mid_no_signal_reasons.get(_st,0) or 0) + 1
-                                    except Exception:
+except Exception:
                                         pass
                                     continue
                                 _rej_add(sym, "candles_unavailable")
