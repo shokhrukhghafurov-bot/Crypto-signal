@@ -12236,7 +12236,7 @@ class Backend:
                                         if _st not in _mid_no_signal_reasons:
                                             _st = "other"
                                         _mid_no_signal_reasons[_st] = int(_mid_no_signal_reasons.get(_st,0) or 0) + 1
-except Exception:
+                                    except Exception:
                                         pass
                                     continue
                                 _rej_add(sym, "candles_unavailable")
