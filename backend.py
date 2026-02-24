@@ -475,6 +475,79 @@ from cryptography.fernet import Fernet
 
 logger = logging.getLogger("crypto-signal")
 
+# --- Top symbols cache & provider cooldown (prevents REST storms / bans) ---
+TOP_SYMBOLS_TTL_SEC = int(os.getenv("TOP_SYMBOLS_TTL_SEC", "300") or "300")  # cache top list for N seconds
+TOP_PROVIDER_COOLDOWN_SEC = int(os.getenv("TOP_PROVIDER_COOLDOWN_SEC", "90") or "90")
+BINANCE_BAN_COOLDOWN_SEC = int(os.getenv("BINANCE_BAN_COOLDOWN_SEC", "900") or "900")
+BYBIT_RATE_LIMIT_COOLDOWN_SEC = int(os.getenv("BYBIT_RATE_LIMIT_COOLDOWN_SEC", "120") or "120")
+
+_TOP_SYMBOLS_CACHE: dict[str, Any] = {"expires_mono": 0.0, "symbols": [], "provider": ""}
+_TOP_PROVIDER_COOLDOWN_UNTIL: dict[str, float] = {}  # provider -> monotonic timestamp
+
+def _top_cache_get(n: int) -> list[str]:
+    try:
+        if TOP_SYMBOLS_TTL_SEC <= 0:
+            return []
+        if float(_TOP_SYMBOLS_CACHE.get("expires_mono") or 0.0) > time.monotonic():
+            syms = list(_TOP_SYMBOLS_CACHE.get("symbols") or [])
+            if n <= 0:
+                return syms
+            return syms[:n]
+    except Exception:
+        pass
+    return []
+
+def _top_cache_set(symbols: list[str], provider: str) -> None:
+    try:
+        if TOP_SYMBOLS_TTL_SEC <= 0:
+            return
+        _TOP_SYMBOLS_CACHE["symbols"] = list(symbols or [])
+        _TOP_SYMBOLS_CACHE["provider"] = str(provider or "")
+        _TOP_SYMBOLS_CACHE["expires_mono"] = time.monotonic() + float(TOP_SYMBOLS_TTL_SEC)
+    except Exception:
+        pass
+
+def _top_set_provider_cooldown(provider: str, seconds: int) -> None:
+    try:
+        if seconds <= 0:
+            return
+        _TOP_PROVIDER_COOLDOWN_UNTIL[str(provider)] = time.monotonic() + float(seconds)
+    except Exception:
+        pass
+
+def _top_provider_is_cooled(provider: str) -> bool:
+    try:
+        return float(_TOP_PROVIDER_COOLDOWN_UNTIL.get(str(provider)) or 0.0) > time.monotonic()
+    except Exception:
+        return False
+
+def _top_cooldown_for_error(provider: str, err: Exception) -> int:
+    """Decide cooldown based on error string (handles Binance IP ban & Bybit rate limit)."""
+    try:
+        s = str(err)
+    except Exception:
+        s = ""
+    p = str(provider or "").upper()
+
+    # Binance IP ban / request-weight ban: HTTP 418 and JSON code -1003 are typical
+    if p == "BINANCE":
+        if ("HTTP 418" in s) or ("-1003" in s) or ("IP banned" in s) or ("Way too much request weight" in s):
+            return BINANCE_BAN_COOLDOWN_SEC
+        # Too many requests / rate limit
+        if ("HTTP 429" in s) or ("too many requests" in s.lower()):
+            return max(60, TOP_PROVIDER_COOLDOWN_SEC)
+
+    # Bybit rate limit
+    if p == "BYBIT":
+        if ("retCode=10006" in s) or ("Too many visits" in s):
+            return BYBIT_RATE_LIMIT_COOLDOWN_SEC
+        if ("HTTP 429" in s) or ("too many" in s.lower()):
+            return max(30, TOP_PROVIDER_COOLDOWN_SEC)
+
+    # Generic provider cooldown
+    return TOP_PROVIDER_COOLDOWN_SEC
+
+
 # --- MID summary heartbeat (repeat last MID tick summary so it doesn't get lost in Railway logs) ---
 MID_LAST_SUMMARY = None
 MID_LAST_SUMMARY_TS = 0.0
@@ -6076,16 +6149,6 @@ class MultiExchangeData:
         self._markets_cache: dict[str, tuple[float, set[str]]] = {}  # exchange -> (expires_mono, set(symbols))
         self._unsupported_until: dict[tuple, float] = {}  # (exchange, market, symbol, interval) -> expires_mono
 
-# --- Top symbols caching + provider cooldown (avoid REST bans/rate limits) ---
-self._top_symbols_cache: tuple[float, list[str]] | None = None  # (expires_mono, symbols)
-self._top_provider_cooldown_until: dict[str, float] = {}  # provider -> mono timestamp
-
-# Tunables (env)
-self._top_symbols_ttl_sec = float(os.getenv("TOP_SYMBOLS_TTL_SEC", "300") or "300")
-self._top_provider_cooldown_sec = float(os.getenv("TOP_PROVIDER_COOLDOWN_SEC", "90") or "90")
-self._binance_ban_cooldown_sec = float(os.getenv("BINANCE_BAN_COOLDOWN_SEC", "900") or "900")
-self._bybit_rl_cooldown_sec = float(os.getenv("BYBIT_RATE_LIMIT_COOLDOWN_SEC", "120") or "120")
-
         # Limits / timeouts
         self._http_concurrency = int(os.getenv("HTTP_CONCURRENCY", "25") or "25")
         self._http_req_timeout_sec = float(os.getenv("HTTP_REQ_TIMEOUT_SEC", "6") or "6")
@@ -6231,24 +6294,22 @@ self._bybit_rl_cooldown_sec = float(os.getenv("BYBIT_RATE_LIMIT_COOLDOWN_SEC", "
             out.append((qv, sym))
         return out
 
-
 async def get_top_usdt_symbols(self, n: int) -> List[str]:
     """Return Binance-style symbols (e.g. BTCUSDT) sorted by quote turnover.
 
     IMPORTANT: Binance may be unreachable (DNS/ban/region). We fall back to other exchanges.
-
-    Rate-limit protection:
-    - Cache the result for TOP_SYMBOLS_TTL_SEC (default 300s)
-    - Per-provider cooldown when a provider fails (especially Binance 418/-1003 ban and Bybit 10006)
+    This method also uses a short TTL cache + provider cooldown to prevent REST storms.
     """
     assert self.session is not None
 
-    # Cache hit
-    now_mono = time.monotonic()
-    if self._top_symbols_cache is not None:
-        exp_mono, cached = self._top_symbols_cache
-        if exp_mono > now_mono and cached:
-            return cached[: max(0, int(n))] if n > 0 else cached
+    # Fast path: return cached list (shared module-level cache) to avoid hitting REST every tick
+    cached = _top_cache_get(n)
+    if cached:
+        try:
+            self.last_top_provider = str(_TOP_SYMBOLS_CACHE.get("provider") or "CACHE")
+        except Exception:
+            pass
+        return cached
 
     providers = [
         ("BINANCE", self._top_from_binance),
@@ -6258,20 +6319,13 @@ async def get_top_usdt_symbols(self, n: int) -> List[str]:
         ("GATEIO", self._top_from_gateio),
     ]
 
-    def _cooldown(name: str, sec: float) -> None:
-        try:
-            self._top_provider_cooldown_until[name] = max(self._top_provider_cooldown_until.get(name, 0.0), time.monotonic() + float(sec))
-        except Exception:
-            self._top_provider_cooldown_until[name] = time.monotonic() + float(sec)
-
     last_err: Exception | None = None
     items: list[tuple[float, str]] = []
 
     for name, fn in providers:
-        cd_until = float(self._top_provider_cooldown_until.get(name, 0.0) or 0.0)
-        if cd_until > time.monotonic():
+        # Skip provider during cooldown (ban/rate limit backoff)
+        if _top_provider_is_cooled(name):
             continue
-
         try:
             items = await fn()
             if items:
@@ -6282,30 +6336,12 @@ async def get_top_usdt_symbols(self, n: int) -> List[str]:
                 break
         except Exception as e:
             last_err = e
-
-            # Provider-specific cooldowns
-            msg = str(e)
-
-            # Binance ban / 418 with -1003 payload: set longer cooldown (or until ban timestamp if present)
-            if name == "BINANCE" and ("HTTP 418" in msg or '"code":-1003' in msg or "IP banned until" in msg):
-                sec = float(self._binance_ban_cooldown_sec or 900.0)
-                m = re.search(r"IP banned until\s+(\d+)", msg)
-                if m:
-                    try:
-                        ban_until_ms = int(m.group(1))
-                        ban_until_sec = ban_until_ms / 1000.0
-                        # Convert to remaining seconds from now (best effort; monotonic drift ignored)
-                        # If remaining is tiny/negative, still cool down for a short period to avoid hammering.
-                        remaining = max(30.0, ban_until_sec - time.time())
-                        sec = min(max(sec, remaining), 3600.0 * 6)
-                    except Exception:
-                        sec = float(self._binance_ban_cooldown_sec or 900.0)
-                _cooldown(name, sec)
-            elif name == "BYBIT" and ("retCode=10006" in msg or "Too many visits" in msg):
-                _cooldown(name, float(self._bybit_rl_cooldown_sec or 120.0))
-            else:
-                _cooldown(name, float(self._top_provider_cooldown_sec or 90.0))
-
+            # Set cooldown so we don't hammer the same provider again next tick
+            try:
+                cd = int(_top_cooldown_for_error(name, e))
+                _top_set_provider_cooldown(name, cd)
+            except Exception:
+                pass
             logger.warning("get_top_usdt_symbols: %s failed: %s", name, e)
             continue
 
@@ -6326,9 +6362,11 @@ async def get_top_usdt_symbols(self, n: int) -> List[str]:
         seen.add(s)
         dedup.append(s)
 
-    # Save cache (even if n smaller)
-    ttl = float(self._top_symbols_ttl_sec or 300.0)
-    self._top_symbols_cache = (time.monotonic() + max(1.0, ttl), dedup)
+    # Save to TTL cache (shared across scanner ticks)
+    try:
+        _top_cache_set(dedup, getattr(self, "last_top_provider", ""))
+    except Exception:
+        pass
 
     if n <= 0:
         return dedup
