@@ -10460,10 +10460,25 @@ class Backend:
 
                     # reject stats (per tick) — used only for logging/debug; never crash if missing
                     _rej_counts = defaultdict(int)
+                    _rej_reasons_by_sym = defaultdict(list)  # sym -> [base_reason...]
 
                     def _rej_add(_sym: str, _reason: str) -> None:
+                        """Collect reject reason (for later summary breakdown)."""
                         try:
-                            _rej_counts[str(_reason)] += 1
+                            _r = str(_reason or "").strip() or "unknown"
+                            _rej_counts[_r] += 1
+
+                            # Normalize to base reason names expected in summary
+                            _map = {
+                                "score": "score_low",
+                                "rr": "rr_low",
+                                "confidence": "confidence_low",
+                            }
+                            _base = _map.get(_r, _r)
+                            # Keep it short/clean
+                            if len(_base) > 64:
+                                _base = _base[:64]
+                            _rej_reasons_by_sym[str(_sym)].append(_base)
                         except Exception:
                             pass
 
@@ -12061,6 +12076,7 @@ class Backend:
                         _mid_no_signal_stages_by_sym = {}
                         _mid_no_signal_detail_reasons_other = {}  # base_reason -> count (stage==other only)
                         _mid_no_signal_reasons_by_sym = {}      # sym -> [fail_reason...] per venue
+                        _rej_reasons_added = set()  # ensure _rej_reasons_by_sym merged once per sym
   # sym -> [stage per venue with OK candles]
                         _mid_no_signal_stage_mode = str(os.getenv("MID_NO_SIGNAL_STAGE_MODE","best")).strip().lower()
                         if _mid_no_signal_stage_mode not in ("best","majority"):
@@ -12328,6 +12344,15 @@ class Backend:
                                                     if len(_rr) > 64:
                                                         _rr = _rr[:64]
                                                     _mid_no_signal_reasons_by_sym.setdefault(sym, []).append(_rr)
+                                                    # Merge per-symbol reject reasons collected by _rej_add (score_low/rr_low/etc)
+                                                    try:
+                                                        if sym not in _rej_reasons_added and '_rej_reasons_by_sym' in locals():
+                                                            for _r0 in list(_rej_reasons_by_sym.get(sym) or []):
+                                                                if _r0:
+                                                                    _mid_no_signal_reasons_by_sym.setdefault(sym, []).append(str(_r0))
+                                                            _rej_reasons_added.add(sym)
+                                                    except Exception:
+                                                        pass
                                                 except Exception:
                                                     pass
                                             if r:
