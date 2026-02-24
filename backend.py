@@ -10814,7 +10814,7 @@ class Backend:
                         _mid_candles_diag[key].append(rec)
                         # Optional: log once per symbol/tf when candles are present but too short for indicators.
                         try:
-                            if status == "partial" and _mid_log_candles_short:
+                            if status == "partial" and _mid_log_candles_short and os.getenv("MID_LOG_CANDLES_SHORT_EARLY", "0").strip().lower() in ("1","true","yes","on"):
                                 k2 = (symb, tf)
                                 if k2 not in _mid_candles_short_seen:
                                     _mid_candles_short_seen.add(k2)
@@ -11542,11 +11542,10 @@ class Backend:
                                         # Persist under multiple common limits to maximize reuse (prefill_limit + WS limit + requested limit).
                                         try:
                                             if persist_enabled:
-                                                blob_full = db_store._cc_pack_df(df_pf_n)
-                                                await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(pf_limit), blob_full)
                                                 try:
                                                     ws_limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
                                                 except Exception:
+                                                    ws_limit = 250
                                                     ws_limit = 250
                                                 if int(ws_limit) != int(pf_limit) and got_pf:
                                                     df_ws = df_pf_n.tail(int(ws_limit)).copy() if got_pf > int(ws_limit) else df_pf_n
