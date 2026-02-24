@@ -7880,6 +7880,12 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 })
             except Exception:
                 pass
+            # IMPORTANT: surface the concrete block reason in MID no-signal summary.
+            # Without this, the caller sees stage==other but reason missing -> other{unknown=...}.
+            try:
+                _fail("other", str(reason))
+            except Exception:
+                pass
             return None
     except Exception:
         # If filters fail, do not block signal.
