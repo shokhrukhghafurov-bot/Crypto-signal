@@ -672,6 +672,55 @@ _MID_TRAP_LAST_LOG: Dict[str, float] = {}
 _MID_TICK_CTX = contextvars.ContextVar('MID_TICK_CTX', default=None)
 
 
+_MID_ADAPT_CTX = contextvars.ContextVar('MID_ADAPT_CTX', default=None)
+
+def _mid_adapt_reset_tick() -> None:
+    """Reset adaptive regime stats for the current MID tick."""
+    try:
+        _MID_ADAPT_CTX.set({'n': 0, 'sum_atrp': 0.0, 'sum_t': 0.0})
+    except Exception:
+        pass
+
+def _mid_adapt_track(atrp: float, t: float) -> None:
+    """Track per-symbol ATR% + normalized regime parameter (t in [0..1])."""
+    try:
+        ctx = _MID_ADAPT_CTX.get()
+        if not isinstance(ctx, dict):
+            return
+        ctx['n'] = int(ctx.get('n') or 0) + 1
+        ctx['sum_atrp'] = float(ctx.get('sum_atrp') or 0.0) + float(atrp or 0.0)
+        ctx['sum_t'] = float(ctx.get('sum_t') or 0.0) + float(t or 0.0)
+    except Exception:
+        return
+
+def _mid_adapt_regime_from_t(t: float) -> str:
+    try:
+        tt = float(t)
+    except Exception:
+        tt = 0.5
+    if tt <= 0.33:
+        return "LOW"
+    if tt >= 0.66:
+        return "HIGH"
+    return "MID"
+
+def _mid_adapt_snapshot() -> Optional[Tuple[str, float, float, int]]:
+    """Return (regime, avg_atrp, avg_t, n) for current tick, or None."""
+    try:
+        ctx = _MID_ADAPT_CTX.get()
+        if not isinstance(ctx, dict):
+            return None
+        n = int(ctx.get('n') or 0)
+        if n <= 0:
+            return None
+        avg_atrp = float(ctx.get('sum_atrp') or 0.0) / float(n)
+        avg_t = float(ctx.get('sum_t') or 0.0) / float(n)
+        regime = _mid_adapt_regime_from_t(avg_t)
+        return (regime, float(avg_atrp), float(avg_t), n)
+    except Exception:
+        return None
+
+
 def _mid_trap_log_cooldown_sec() -> float:
     """Cooldown (seconds) for MID log de-duplication.
 
@@ -5119,6 +5168,11 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                     t = 0.0
                 if t > 1.0:
                     t = 1.0
+
+                try:
+                    _mid_adapt_track(float(atrp or 0.0), float(t or 0.0))
+                except Exception:
+                    pass
 
                 # When ATR% is LOW (t≈0) -> loosen filters a bit (more emitted in quiet markets).
                 # When ATR% is HIGH (t≈1) -> tighten filters (avoid late/dirty entries in volatile markets).
@@ -11046,6 +11100,11 @@ class Backend:
                     'suppress_block': 0,
                     'suppress_trap': 0,
                 })
+                try:
+                    _mid_adapt_reset_tick()
+                except Exception:
+                    pass
+
 
                 interval = interval_sec
                 top_n = int(os.getenv("MID_TOP_N", "50"))
@@ -12977,6 +13036,15 @@ class Backend:
                             f"prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
                         )
                         logger.info("[mid][summary] %s", summary)
+
+# Adaptive regime snapshot (avg across evaluated symbols for this tick)
+try:
+    _snap = _mid_adapt_snapshot()
+    if _snap:
+        _reg, _atrp_avg, _t_avg, _n = _snap
+        logger.info("[mid][adaptive] regime=%s atrp=%.1f%% t=%.2f n=%s", _reg, float(_atrp_avg), float(_t_avg), int(_n))
+except Exception:
+    pass
                     except Exception as e:
                         summary = f"tick done (summary_error={type(e).__name__}) scanned={_mid_scanned}"
                         logger.warning("[mid][summary_error] %s", e)
