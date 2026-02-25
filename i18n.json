@@ -578,6 +578,7 @@
     "tp1_reason": "Достигли TP1 → частичное закрытие {closed_pct}% и защита SL→BE",
     "msg_trade_open": "{emoji} {symbol} | {market} | {side}\n\n📌 Статус: {status}\n📊 Нереализ. PnL: {pnl_unreal}\n📊 Risk/Reward: 1 : {rr}\n{live_block}{checks_block}━━━━━━━━━━━━━━━━\n\n💰 Вход: {entry}\n🛑 SL: {sl}\n🎯 TP1: {tp1}\n🚀 TP2: {tp2}\n{be_line}\n🕒 Открыта: {opened_time} (MSK)",
     "msg_trade_open_tp1": "🟣 {symbol} | {market} | {side}\n\n📌 Статус: TP1 🟡\n📊 Итог PnL (зафиксировано): {pnl_total}\n📊 Risk/Reward: 1 : {rr}\n{live_block}{checks_block}━━━━━━━━━━━━━━━━\n\n💰 Вход: {entry}\n🛑 SL: {sl}\n🎯 TP1: {tp1}\n🚀 TP2: {tp2}\n🛡 BE: {be_price}\n\n🕒 Открыта: {opened_time} (MSK)\n🕒 TP1: {event_time} (MSK)",
-    "lbl_unrealized_pnl": "Нереализ. PnL"
+    "lbl_unrealized_pnl": "Нереализ. PnL",
+    "msg_manual_close": "Закрыть вручную"
   }
 }
