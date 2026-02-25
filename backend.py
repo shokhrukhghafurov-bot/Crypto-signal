@@ -5105,6 +5105,63 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         rsi_short_max = MID_ULTRA_RSI_SHORT_MAX if MID_ULTRA_SAFE else MID_RSI_SHORT_MAX
         confirm_body_min = MID_ULTRA_CONFIRM_CANDLE_BODY_ATR_MIN if MID_ULTRA_SAFE else MID_CONFIRM_CANDLE_BODY_ATR_MIN
 
+        # --- Adaptive MID filter thresholds by ATR% regime (optional) ---
+        try:
+            if os.getenv("MID_ADAPTIVE_FILTERS", "0").strip().lower() in ("1","true","yes","on"):
+                atrp = (float(atr_30m) / float(close) * 100.0) if (atr_30m and close) else 0.0
+                low = float(os.getenv("MID_ADAPT_ATR_PCT_LOW", "2.0") or 2.0)
+                high = float(os.getenv("MID_ADAPT_ATR_PCT_HIGH", "6.0") or 6.0)
+                if high <= low:
+                    t = 0.5
+                else:
+                    t = (atrp - low) / (high - low)
+                if t < 0.0:
+                    t = 0.0
+                if t > 1.0:
+                    t = 1.0
+
+                # When ATR% is LOW (t≈0) -> tighten filters (less SL).
+                # When ATR% is HIGH (t≈1) -> loosen some filters slightly (avoid emitted=0).
+                late_tight = float(os.getenv("MID_ADAPT_LATE_TIGHTEN_MIN", "0.90") or 0.90)
+                late_wide  = float(os.getenv("MID_ADAPT_LATE_WIDEN_MAX", "1.15") or 1.15)
+                vwap_tight = float(os.getenv("MID_ADAPT_VWAP_TIGHTEN_MIN", "0.90") or 0.90)
+                vwap_wide  = float(os.getenv("MID_ADAPT_VWAP_WIDEN_MAX", "1.20") or 1.20)
+                bounce_tight = float(os.getenv("MID_ADAPT_BOUNCE_TIGHTEN_MIN", "0.90") or 0.90)
+                bounce_wide  = float(os.getenv("MID_ADAPT_BOUNCE_WIDEN_MAX", "1.30") or 1.30)
+
+                near_strict = float(os.getenv("MID_ADAPT_NEAR_STRICT_MAX", "1.15") or 1.15)  # low ATR% => stricter (bigger)
+                near_loose  = float(os.getenv("MID_ADAPT_NEAR_LOOSE_MIN", "0.70") or 0.70)    # high ATR% => looser (smaller)
+                vol_strict  = float(os.getenv("MID_ADAPT_VOL_STRICT_MAX", "1.10") or 1.10)   # low ATR% => stricter (bigger)
+                vol_loose   = float(os.getenv("MID_ADAPT_VOL_LOOSE_MIN", "0.95") or 0.95)    # high ATR% => looser (smaller)
+
+                late_scale = late_tight + t * (late_wide - late_tight)
+                vwap_scale = vwap_tight + t * (vwap_wide - vwap_tight)
+                bounce_scale = bounce_tight + t * (bounce_wide - bounce_tight)
+
+                # Apply to thresholds
+                late_entry_max *= late_scale
+                vwap_dist_max *= vwap_scale
+
+                # Near-extreme threshold: smaller => less blocking (looser) when ATR% high
+                # Interpolate multiplier from near_strict (t=0) to near_loose (t=1)
+                near_mult = near_strict + t * (near_loose - near_strict)
+
+                # Min volume threshold: slightly looser when ATR% high
+                vol_mult = vol_strict + t * (vol_loose - vol_strict)
+
+                # Save for later usage in this function (locals)
+                _mid_adapt_near_mult = near_mult
+                _mid_adapt_vol_mult = vol_mult
+                _mid_adapt_bounce_scale = bounce_scale
+            else:
+                _mid_adapt_near_mult = 1.0
+                _mid_adapt_vol_mult = 1.0
+                _mid_adapt_bounce_scale = 1.0
+        except Exception:
+            _mid_adapt_near_mult = 1.0
+            _mid_adapt_vol_mult = 1.0
+            _mid_adapt_bounce_scale = 1.0
+
         if atr_30m and atr_30m > 0:
             if side.upper() == "LONG":
                 move_from_low = (close - recent_low) / atr_30m
@@ -5119,7 +5176,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
             # --- Near-extremes: avoid LONG right under resistance / SHORT right above support ---
             try:
                 if MID_BLOCK_NEAR_EXTREMES and atr_30m and atr_30m > 0:
-                    thr = MID_ULTRA_NEAR_EXTREME_ATR_MIN if MID_ULTRA_SAFE else MID_NEAR_EXTREME_ATR_MIN
+                    thr = (MID_ULTRA_NEAR_EXTREME_ATR_MIN if MID_ULTRA_SAFE else MID_NEAR_EXTREME_ATR_MIN) * (_mid_adapt_near_mult if '_mid_adapt_near_mult' in locals() else 1.0)
                     if side.upper() == "LONG":
                         dist_to_high = (recent_high - close) / atr_30m
                         if dist_to_high >= 0 and dist_to_high < thr:
@@ -5134,14 +5191,22 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                 pass
             # --- Anti-bounce: block SHORT after sharp rebound from recent low (and vice versa for LONG) ---
             if MID_ANTI_BOUNCE_ENABLED and atr_30m and atr_30m > 0:
+                # Prefer side-specific MAX if set; fall back to MID_ANTI_BOUNCE_ATR_MAX
+                bounce_short_max = float(MID_ANTI_BOUNCE_SHORT_MAX) if (MID_ANTI_BOUNCE_SHORT_MAX and float(MID_ANTI_BOUNCE_SHORT_MAX) > 0) else float(MID_ANTI_BOUNCE_ATR_MAX)
+                bounce_long_max  = float(MID_ANTI_BOUNCE_LONG_MAX) if (MID_ANTI_BOUNCE_LONG_MAX and float(MID_ANTI_BOUNCE_LONG_MAX) > 0) else float(MID_ANTI_BOUNCE_ATR_MAX)
+                bounce_scale = _mid_adapt_bounce_scale if '_mid_adapt_bounce_scale' in locals() else 1.0
+                bounce_short_max *= bounce_scale
+                bounce_long_max *= bounce_scale
+
                 if side.upper() == "SHORT":
                     dist_low_atr = (close - recent_low) / atr_30m
-                    if dist_low_atr > MID_ANTI_BOUNCE_ATR_MAX:
-                        return f"anti_bounce_short dist_low_atr={dist_low_atr:.2f} > {MID_ANTI_BOUNCE_ATR_MAX:g}"
+                    if dist_low_atr > bounce_short_max:
+                        return f"anti_bounce_short dist_low_atr={dist_low_atr:.2f} > {bounce_short_max:g}"
                 else:  # LONG
                     dist_high_atr = (recent_high - close) / atr_30m
-                    if dist_high_atr > MID_ANTI_BOUNCE_ATR_MAX:
-                        return f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {MID_ANTI_BOUNCE_ATR_MAX:g}"
+                    if dist_high_atr > bounce_long_max:
+                        return f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {bounce_long_max:g}"
+
 
 
             # --- HTF alignment guard (ULTRA SAFE): block countertrend entries in strong trends ---
@@ -5197,6 +5262,13 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                 vol_x = last_vol / avg_vol
             else:
                 vol_x = 0.0
+
+            try:
+                min_vol = float(MID_MIN_VOL_X) * (_mid_adapt_vol_mult if '_mid_adapt_vol_mult' in locals() else 1.0)
+                if min_vol and vol_x < min_vol:
+                    return f"vol_x={vol_x:.2f} < {min_vol:g}"
+            except Exception:
+                pass
             # "climax": big vol + big body; block next N bars
             if climax_recent_bars > 0 or (vol_x > MID_CLIMAX_VOL_X and body_atr > MID_CLIMAX_BODY_ATR):
                 return f"climax vol_x={vol_x:.2f} > {MID_CLIMAX_VOL_X:g} and body_atr={body_atr:.2f} > {MID_CLIMAX_BODY_ATR:g}"
