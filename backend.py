@@ -7,7 +7,6 @@ from pathlib import Path
 import os
 import re
 import time
-import math
 import contextvars
 
 
@@ -5158,28 +5157,6 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                       htf_dir_1h: str | None = None, htf_dir_30m: str | None = None, adx_30m: float | None = None) -> str | None:
     """Return human-readable MID BLOCKED reason (for logging + error-bot), or None if allowed."""
     try:
-        # Guard against bad numeric inputs (avoid mid_filter_error storms)
-        try:
-            _close = float(close)
-            _atr = float(atr_30m) if atr_30m is not None else 0.0
-        except Exception:
-            return "mid_bad_inputs" if MID_FAIL_CLOSED else None
-        if (not math.isfinite(_close)) or (not math.isfinite(_atr)) or _atr <= 0.0:
-            return "mid_bad_atr" if MID_FAIL_CLOSED else None
-        # recent extremes are required for many filters; validate early
-        if recent_low is None or recent_high is None:
-            return "mid_bad_extremes" if MID_FAIL_CLOSED else None
-        try:
-            _rl = float(recent_low); _rh = float(recent_high)
-        except Exception:
-            return "mid_bad_extremes" if MID_FAIL_CLOSED else None
-        if (not math.isfinite(_rl)) or (not math.isfinite(_rh)):
-            return "mid_bad_extremes" if MID_FAIL_CLOSED else None
-        # use sanitized vars below
-        close = _close
-        atr_30m = _atr
-        recent_low = _rl
-        recent_high = _rh
         # ULTRA SAFE: tighten filters dynamically for near-zero SL preference
         late_entry_max = MID_ULTRA_LATE_ENTRY_ATR_MAX if MID_ULTRA_SAFE else MID_LATE_ENTRY_ATR_MAX
         vwap_dist_max = MID_ULTRA_VWAP_DIST_ATR_MAX if MID_ULTRA_SAFE else MID_VWAP_DIST_ATR_MAX
@@ -5281,8 +5258,11 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
             # --- Anti-bounce: block SHORT after sharp rebound from recent low (and vice versa for LONG) ---
             if MID_ANTI_BOUNCE_ENABLED and atr_30m and atr_30m > 0:
                 # Prefer side-specific MAX if set; fall back to MID_ANTI_BOUNCE_ATR_MAX
-                bounce_short_max = float(MID_ANTI_BOUNCE_SHORT_MAX) if (MID_ANTI_BOUNCE_SHORT_MAX and float(MID_ANTI_BOUNCE_SHORT_MAX) > 0) else float(MID_ANTI_BOUNCE_ATR_MAX)
-                bounce_long_max  = float(MID_ANTI_BOUNCE_LONG_MAX) if (MID_ANTI_BOUNCE_LONG_MAX and float(MID_ANTI_BOUNCE_LONG_MAX) > 0) else float(MID_ANTI_BOUNCE_ATR_MAX)
+                bounce_atr_max = float(globals().get("MID_ANTI_BOUNCE_ATR_MAX", _env_float("MID_ANTI_BOUNCE_ATR_MAX", 1.8)))
+                _ab_short = _env_float("MID_ANTI_BOUNCE_SHORT_MAX", 0.0)
+                _ab_long  = _env_float("MID_ANTI_BOUNCE_LONG_MAX", 0.0)
+                bounce_short_max = float(_ab_short) if _ab_short and _ab_short > 0 else bounce_atr_max
+                bounce_long_max  = float(_ab_long)  if _ab_long  and _ab_long  > 0 else bounce_atr_max
                 bounce_scale = _mid_adapt_bounce_scale if '_mid_adapt_bounce_scale' in locals() else 1.0
                 bounce_short_max *= bounce_scale
                 bounce_long_max *= bounce_scale
@@ -5466,9 +5446,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
 
 
     except Exception:
-        # if filter computation fails, respect fail-closed flag (and log traceback if enabled)
-        if (os.getenv("MID_LOG_FILTER_ERRORS", "1") or "").strip().lower() in ("1","true","yes","on"):
-            logger.exception("[mid][filter_error] symbol=%s side=%s close=%s atr_30m=%s", symbol, side, close, atr_30m)
+        # if filter computation fails, respect fail-closed flag
         return "mid_filter_error" if MID_FAIL_CLOSED else None
     return None
 @dataclass(frozen=True)
@@ -5493,6 +5471,7 @@ class Signal:
     available_exchanges: str = ""
     risk_note: str = ""
     ts: float = 0.0
+
 @dataclass
 
 class UserTrade:
