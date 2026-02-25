@@ -1,4 +1,4 @@
-from __future__ import annotations
+фfrom __future__ import annotations
 
 import asyncio
 import json
@@ -117,6 +117,16 @@ MID_CONFIRM_CANDLE_REQUIRE_DIRECTION = os.getenv("MID_CONFIRM_CANDLE_REQUIRE_DIR
 MID_CONFIRM_CANDLE_BODY_ATR_MIN = float(os.getenv("MID_CONFIRM_CANDLE_BODY_ATR_MIN", "0.10"))  # abs(close-open)/ATR_30m
 # Require price to be on the correct side of VWAP(30m) (LONG above, SHORT below)
 MID_REQUIRE_VWAP_SIDE = os.getenv("MID_REQUIRE_VWAP_SIDE", "1").strip().lower() not in ("0","false","no","off")
+# --- MID adaptive tightening based on ATR% (30m) ---
+MID_ADAPTIVE_FILTERS = os.getenv("MID_ADAPTIVE_FILTERS", "0").strip().lower() in ("1","true","yes","on")
+MID_ADAPT_ATR_PCT_LOW = float(os.getenv("MID_ADAPT_ATR_PCT_LOW", "2.0") or 2.0)   # below = loose
+MID_ADAPT_ATR_PCT_HIGH = float(os.getenv("MID_ADAPT_ATR_PCT_HIGH", "6.0") or 6.0)  # above = tight
+# Tightening strengths (0..1). Higher = stricter when ATR% is high.
+MID_ADAPT_TIGHTEN_LATE_ENTRY = float(os.getenv("MID_ADAPT_TIGHTEN_LATE_ENTRY", "0.25") or 0.25)
+MID_ADAPT_TIGHTEN_VWAP_DIST = float(os.getenv("MID_ADAPT_TIGHTEN_VWAP_DIST", "0.30") or 0.30)
+MID_ADAPT_TIGHTEN_ANTI_BOUNCE = float(os.getenv("MID_ADAPT_TIGHTEN_ANTI_BOUNCE", "0.25") or 0.25)
+MID_ADAPT_TIGHTEN_NEAR_EXTREME = float(os.getenv("MID_ADAPT_TIGHTEN_NEAR_EXTREME", "0.30") or 0.30)
+MID_ADAPT_TIGHTEN_MIN_VOL_X = float(os.getenv("MID_ADAPT_TIGHTEN_MIN_VOL_X", "0.25") or 0.25)
 # --- MID trend/structure guards (anti-countertrend) ---
 # Block LONG when micro structure is bearish (reduces "bounce then SL" cases)
 MID_BLOCK_LONG_BOS_DOWN = os.getenv("MID_BLOCK_LONG_BOS_DOWN", "1").strip().lower() not in ("0","false","no","off")
@@ -5116,10 +5126,39 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                     return f"late_entry_atr={move_from_high:.2f} > {late_entry_max:g}"
 
 
+            # --- Confirmation candle guard (cuts a lot of fast SL in chop) ---
+            try:
+                if MID_CONFIRM_CANDLE_ENABLED and o is not None:
+                    body_atr_confirm = abs(float(close) - float(o)) / float(atr_30m)
+                    if body_atr_confirm < float(confirm_body_min):
+                        return f"confirm_body_atr={body_atr_confirm:.2f} < {float(confirm_body_min):g}"
+                    if MID_CONFIRM_CANDLE_REQUIRE_DIRECTION:
+                        if side.upper() == "LONG" and float(close) <= float(o):
+                            return "confirm_dir_long close<=open"
+                        if side.upper() == "SHORT" and float(close) >= float(o):
+                            return "confirm_dir_short close>=open"
+            except Exception:
+                if MID_FAIL_CLOSED:
+                    return "mid_confirm_candle_error"
+                pass
+
+            # --- VWAP side guard (LONG above VWAP, SHORT below) ---
+            try:
+                if MID_REQUIRE_VWAP_SIDE and (vwap is not None):
+                    if side.upper() == "LONG" and float(close) <= float(vwap):
+                        return f"vwap_side_long close<={float(vwap):g}"
+                    if side.upper() == "SHORT" and float(close) >= float(vwap):
+                        return f"vwap_side_short close>={float(vwap):g}"
+            except Exception:
+                if MID_FAIL_CLOSED:
+                    return "mid_vwap_side_error"
+                pass
+
+
             # --- Near-extremes: avoid LONG right under resistance / SHORT right above support ---
             try:
                 if MID_BLOCK_NEAR_EXTREMES and atr_30m and atr_30m > 0:
-                    thr = MID_ULTRA_NEAR_EXTREME_ATR_MIN if MID_ULTRA_SAFE else MID_NEAR_EXTREME_ATR_MIN
+                    thr = float(near_extreme_thr)
                     if side.upper() == "LONG":
                         dist_to_high = (recent_high - close) / atr_30m
                         if dist_to_high >= 0 and dist_to_high < thr:
@@ -5136,12 +5175,12 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
             if MID_ANTI_BOUNCE_ENABLED and atr_30m and atr_30m > 0:
                 if side.upper() == "SHORT":
                     dist_low_atr = (close - recent_low) / atr_30m
-                    if dist_low_atr > MID_ANTI_BOUNCE_ATR_MAX:
-                        return f"anti_bounce_short dist_low_atr={dist_low_atr:.2f} > {MID_ANTI_BOUNCE_ATR_MAX:g}"
+                    if dist_low_atr > float(anti_bounce_max):
+                        return f"anti_bounce_short dist_low_atr={dist_low_atr:.2f} > {float(anti_bounce_max):g}"
                 else:  # LONG
                     dist_high_atr = (recent_high - close) / atr_30m
-                    if dist_high_atr > MID_ANTI_BOUNCE_ATR_MAX:
-                        return f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {MID_ANTI_BOUNCE_ATR_MAX:g}"
+                    if dist_high_atr > float(anti_bounce_max):
+                        return f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {float(anti_bounce_max):g}"
 
 
             # --- HTF alignment guard (ULTRA SAFE): block countertrend entries in strong trends ---
@@ -5197,6 +5236,15 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                 vol_x = last_vol / avg_vol
             else:
                 vol_x = 0.0
+            # --- Minimum volume filter (avoid low-liquidity chop entries) ---
+            try:
+                if float(min_vol_x_thr) > 0 and float(vol_x) < float(min_vol_x_thr):
+                    return f"vol_x={float(vol_x):.2f} < {float(min_vol_x_thr):g}"
+            except Exception:
+                if MID_FAIL_CLOSED:
+                    return "mid_min_vol_error"
+                pass
+
             # "climax": big vol + big body; block next N bars
             if climax_recent_bars > 0 or (vol_x > MID_CLIMAX_VOL_X and body_atr > MID_CLIMAX_BODY_ATR):
                 return f"climax vol_x={vol_x:.2f} > {MID_CLIMAX_VOL_X:g} and body_atr={body_atr:.2f} > {MID_CLIMAX_BODY_ATR:g}"
