@@ -9344,6 +9344,15 @@ class Backend:
         after_tp1 = _trf(int(user_id), "after_tp1_suffix") if tp1_hit else ""
         close_agent = _trf(int(user_id), "close_agent_manual")
 
+        # BUGFIX: tp2_disp must be defined for the i18n template.
+        # Some signals/trades don't have TP2 (or it's 0), so we use "-".
+        tp2_disp = "-"
+        try:
+            _tp2v = float(getattr(s, "tp2", 0.0) or 0.0)
+            tp2_disp = (f"{_tp2v:.6f}" if _tp2v > 0 else "-")
+        except Exception:
+            tp2_disp = "-"
+
         # Status string should explicitly mention manual close
         status_txt = _trf(int(user_id), "status_closed_manual")
 
