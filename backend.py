@@ -13037,14 +13037,14 @@ class Backend:
                         )
                         logger.info("[mid][summary] %s", summary)
 
-# Adaptive regime snapshot (avg across evaluated symbols for this tick)
-try:
-    _snap = _mid_adapt_snapshot()
-    if _snap:
-        _reg, _atrp_avg, _t_avg, _n = _snap
-        logger.info("[mid][adaptive] regime=%s atrp=%.1f%% t=%.2f n=%s", _reg, float(_atrp_avg), float(_t_avg), int(_n))
-except Exception:
-    pass
+                        # Adaptive regime snapshot (avg across evaluated symbols for this tick)
+                        try:
+                            _snap = _mid_adapt_snapshot()
+                            if _snap:
+                                _reg, _atrp_avg, _t_avg, _n = _snap
+                                logger.info("[mid][adaptive] regime=%s atrp=%.1f%% t=%.2f n=%s", _reg, float(_atrp_avg), float(_t_avg), int(_n))
+                        except Exception:
+                            pass
                     except Exception as e:
                         summary = f"tick done (summary_error={type(e).__name__}) scanned={_mid_scanned}"
                         logger.warning("[mid][summary_error] %s", e)
