@@ -5120,8 +5120,8 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                 if t > 1.0:
                     t = 1.0
 
-                # When ATR% is LOW (t≈0) -> tighten filters (less SL).
-                # When ATR% is HIGH (t≈1) -> loosen some filters slightly (avoid emitted=0).
+                # When ATR% is LOW (t≈0) -> loosen filters a bit (more emitted in quiet markets).
+                # When ATR% is HIGH (t≈1) -> tighten filters (avoid late/dirty entries in volatile markets).
                 late_tight = float(os.getenv("MID_ADAPT_LATE_TIGHTEN_MIN", "0.90") or 0.90)
                 late_wide  = float(os.getenv("MID_ADAPT_LATE_WIDEN_MAX", "1.15") or 1.15)
                 vwap_tight = float(os.getenv("MID_ADAPT_VWAP_TIGHTEN_MIN", "0.90") or 0.90)
@@ -5134,20 +5134,20 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                 vol_strict  = float(os.getenv("MID_ADAPT_VOL_STRICT_MAX", "1.10") or 1.10)   # low ATR% => stricter (bigger)
                 vol_loose   = float(os.getenv("MID_ADAPT_VOL_LOOSE_MIN", "0.95") or 0.95)    # high ATR% => looser (smaller)
 
-                late_scale = late_tight + t * (late_wide - late_tight)
-                vwap_scale = vwap_tight + t * (vwap_wide - vwap_tight)
-                bounce_scale = bounce_tight + t * (bounce_wide - bounce_tight)
+                late_scale = late_wide + t * (late_tight - late_wide)
+                vwap_scale = vwap_wide + t * (vwap_tight - vwap_wide)
+                bounce_scale = bounce_wide + t * (bounce_tight - bounce_wide)
 
                 # Apply to thresholds
                 late_entry_max *= late_scale
                 vwap_dist_max *= vwap_scale
 
-                # Near-extreme threshold: smaller => less blocking (looser) when ATR% high
-                # Interpolate multiplier from near_strict (t=0) to near_loose (t=1)
-                near_mult = near_strict + t * (near_loose - near_strict)
+                # Near-extreme threshold: bigger => more blocking (stricter) when ATR% high
+                # Interpolate multiplier from near_loose (t=0) to near_strict (t=1)
+                near_mult = near_loose + t * (near_strict - near_loose)
 
-                # Min volume threshold: slightly looser when ATR% high
-                vol_mult = vol_strict + t * (vol_loose - vol_strict)
+                # Min volume threshold: slightly stricter when ATR% high
+                vol_mult = vol_loose + t * (vol_strict - vol_loose)
 
                 # Save for later usage in this function (locals)
                 _mid_adapt_near_mult = near_mult
