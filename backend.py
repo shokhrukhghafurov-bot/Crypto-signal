@@ -132,6 +132,10 @@ MID_BLOCK_SHORT_HIGHER_LOWS = os.getenv("MID_BLOCK_SHORT_HIGHER_LOWS", "1").stri
 MID_BOS_RECENT_BARS = int(os.getenv("MID_BOS_RECENT_BARS", "6") or 6)  # consider BOS within last N bars
 MID_HL_TOL_PCT = float(os.getenv("MID_HL_TOL_PCT", "0.001") or 0.001)  # allow equal-ish highs/lows (0.1%)
 MID_REQUIRE_5M_CONFIRM = os.getenv("MID_REQUIRE_5M_CONFIRM", "1").strip().lower() not in ("0","false","no","off")
+
+# Optional: log full tracebacks for unexpected MID filter errors.
+# Helps diagnose frequent `mid_filter_error` blocks in `[mid][summary]`.
+MID_LOG_FILTER_ERRORS = os.getenv("MID_LOG_FILTER_ERRORS", "1").strip().lower() in ("1","true","yes","on")
 MID_FAIL_CLOSED = os.getenv("MID_FAIL_CLOSED", "1").strip().lower() not in ("0","false","no","off")
 MID_HIGHER_LOWS_LOOKBACK = int(os.getenv("MID_HIGHER_LOWS_LOOKBACK", str(MID_LOWER_HIGHS_LOOKBACK)) or MID_LOWER_HIGHS_LOOKBACK)
 
@@ -5256,22 +5260,34 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                     return "mid_near_extreme_error"
                 pass
             # --- Anti-bounce: block SHORT after sharp rebound from recent low (and vice versa for LONG) ---
+            # NOTE: this block previously could raise ValueError if env vars were non-numeric
+            # (e.g. "false"), which then cascaded into `mid_filter_error` and killed signals.
             if MID_ANTI_BOUNCE_ENABLED and atr_30m and atr_30m > 0:
-                # Prefer side-specific MAX if set; fall back to MID_ANTI_BOUNCE_ATR_MAX
-                bounce_short_max = float(MID_ANTI_BOUNCE_SHORT_MAX) if (MID_ANTI_BOUNCE_SHORT_MAX and float(MID_ANTI_BOUNCE_SHORT_MAX) > 0) else float(MID_ANTI_BOUNCE_ATR_MAX)
-                bounce_long_max  = float(MID_ANTI_BOUNCE_LONG_MAX) if (MID_ANTI_BOUNCE_LONG_MAX and float(MID_ANTI_BOUNCE_LONG_MAX) > 0) else float(MID_ANTI_BOUNCE_ATR_MAX)
-                bounce_scale = _mid_adapt_bounce_scale if '_mid_adapt_bounce_scale' in locals() else 1.0
-                bounce_short_max *= bounce_scale
-                bounce_long_max *= bounce_scale
+                try:
+                    # Prefer side-specific MAX if set; fall back to MID_ANTI_BOUNCE_ATR_MAX
+                    bs = float(MID_ANTI_BOUNCE_SHORT_MAX) if MID_ANTI_BOUNCE_SHORT_MAX not in (None, "") else 0.0
+                    bl = float(MID_ANTI_BOUNCE_LONG_MAX) if MID_ANTI_BOUNCE_LONG_MAX not in (None, "") else 0.0
+                    base = float(MID_ANTI_BOUNCE_ATR_MAX)
 
-                if side.upper() == "SHORT":
-                    dist_low_atr = (close - recent_low) / atr_30m
-                    if dist_low_atr > bounce_short_max:
-                        return f"anti_bounce_short dist_low_atr={dist_low_atr:.2f} > {bounce_short_max:g}"
-                else:  # LONG
-                    dist_high_atr = (recent_high - close) / atr_30m
-                    if dist_high_atr > bounce_long_max:
-                        return f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {bounce_long_max:g}"
+                    bounce_short_max = bs if bs > 0 else base
+                    bounce_long_max = bl if bl > 0 else base
+
+                    bounce_scale = _mid_adapt_bounce_scale if '_mid_adapt_bounce_scale' in locals() else 1.0
+                    bounce_short_max *= bounce_scale
+                    bounce_long_max *= bounce_scale
+
+                    if side.upper() == "SHORT":
+                        dist_low_atr = (close - recent_low) / atr_30m
+                        if dist_low_atr > bounce_short_max:
+                            return f"anti_bounce_short dist_low_atr={dist_low_atr:.2f} > {bounce_short_max:g}"
+                    else:  # LONG
+                        dist_high_atr = (recent_high - close) / atr_30m
+                        if dist_high_atr > bounce_long_max:
+                            return f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {bounce_long_max:g}"
+                except Exception:
+                    if MID_FAIL_CLOSED:
+                        return "mid_anti_bounce_error"
+                    pass
 
 
 
@@ -5443,7 +5459,13 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
 
 
     except Exception:
-        # if filter computation fails, respect fail-closed flag
+        # If filter computation fails, optionally log traceback so we can fix the real root cause.
+        try:
+            if MID_LOG_FILTER_ERRORS:
+                logger.exception("[mid][filter_error] symbol=%s side=%s", symbol, side)
+        except Exception:
+            pass
+        # respect fail-closed flag
         return "mid_filter_error" if MID_FAIL_CLOSED else None
     return None
 @dataclass(frozen=True)
