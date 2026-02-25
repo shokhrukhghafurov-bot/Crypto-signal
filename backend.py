@@ -475,6 +475,27 @@ from cryptography.fernet import Fernet
 
 logger = logging.getLogger("crypto-signal")
 
+# --- MID filter error logging (fail-closed visibility) ---
+_MID_FILTER_ERR_LAST_TS = 0.0
+_MID_FILTER_ERR_LAST_KEY = ""
+def _mid_filter_err_log(symbol: str, side: str, where: str = "") -> None:
+    """Rate-limited exception logger for MID filter failures."""
+    global _MID_FILTER_ERR_LAST_TS, _MID_FILTER_ERR_LAST_KEY
+    try:
+        cool = float(os.getenv("MID_FILTER_ERR_LOG_SEC", "60") or 60)
+    except Exception:
+        cool = 60.0
+    try:
+        now = time.time()
+        key = f"{symbol}:{side}:{where}"
+        if (now - float(_MID_FILTER_ERR_LAST_TS or 0.0)) >= cool or key != _MID_FILTER_ERR_LAST_KEY:
+            _MID_FILTER_ERR_LAST_TS = now
+            _MID_FILTER_ERR_LAST_KEY = key
+            logger.exception("[mid][filter_error] %s side=%s where=%s", symbol, side, where)
+    except Exception:
+        pass
+
+
 # --- Top symbols cache & provider cooldown (prevents REST storms / bans) ---
 TOP_SYMBOLS_TTL_SEC = int(os.getenv("TOP_SYMBOLS_TTL_SEC", "300") or "300")  # cache top list for N seconds
 TOP_PROVIDER_COOLDOWN_SEC = int(os.getenv("TOP_PROVIDER_COOLDOWN_SEC", "90") or "90")
@@ -677,33 +698,21 @@ _MID_ADAPT_CTX = contextvars.ContextVar('MID_ADAPT_CTX', default=None)
 def _mid_adapt_reset_tick() -> None:
     """Reset adaptive regime stats for the current MID tick."""
     try:
-        _MID_ADAPT_CTX.set({'n': 0, 'sum_atrp': 0.0, 'sum_t': 0.0, 'seen': set()})
+        _MID_ADAPT_CTX.set({'n': 0, 'sum_atrp': 0.0, 'sum_t': 0.0})
     except Exception:
         pass
 
-def _mid_adapt_track(atrp: float, t: float, symbol: str | None = None) -> None:
-    """Track per-symbol ATR% + normalized regime parameter (t in [0..1]).
-    If symbol is provided, counts each symbol only once per tick (even if evaluated on many venues).
-    """
+def _mid_adapt_track(atrp: float, t: float) -> None:
+    """Track per-symbol ATR% + normalized regime parameter (t in [0..1])."""
     try:
         ctx = _MID_ADAPT_CTX.get()
         if not isinstance(ctx, dict):
             return
-        sym = (str(symbol or '').strip().upper()) if symbol is not None else ''
-        if sym:
-            seen = ctx.get('seen')
-            if not isinstance(seen, set):
-                seen = set()
-                ctx['seen'] = seen
-            if sym in seen:
-                return
-            seen.add(sym)
         ctx['n'] = int(ctx.get('n') or 0) + 1
         ctx['sum_atrp'] = float(ctx.get('sum_atrp') or 0.0) + float(atrp or 0.0)
         ctx['sum_t'] = float(ctx.get('sum_t') or 0.0) + float(t or 0.0)
     except Exception:
         return
-
 
 def _mid_adapt_regime_from_t(t: float) -> str:
     try:
@@ -5182,7 +5191,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                     t = 1.0
 
                 try:
-                    _mid_adapt_track(float(atrp or 0.0), float(t or 0.0), symbol)
+                    _mid_adapt_track(float(atrp or 0.0), float(t or 0.0))
                 except Exception:
                     pass
 
@@ -5444,6 +5453,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
 
     except Exception:
         # if filter computation fails, respect fail-closed flag
+        _mid_filter_err_log(symbol, side, where="_mid_block_reason")
         return "mid_filter_error" if MID_FAIL_CLOSED else None
     return None
 @dataclass(frozen=True)
@@ -12322,10 +12332,6 @@ class Backend:
                         _mid_rest_refill = 0
                         _c0 = api.candle_counters_snapshot()
                         _mid_hard_block0 = _mid_hard_block_total()
-                        try:
-                            _mid_adapt_reset_tick()
-                        except Exception:
-                            pass
                         _mid_hard_block = 0
 
                         # --- MID reject digest (log-only): explains "scanned=N but counters don't add up" ---
@@ -13053,14 +13059,14 @@ class Backend:
                         )
                         logger.info("[mid][summary] %s", summary)
 
-                        # Adaptive regime snapshot (avg across evaluated symbols for this tick)
-                        try:
-                            _snap = _mid_adapt_snapshot()
-                            if _snap:
-                                _reg, _atrp_avg, _t_avg, _n = _snap
-                                logger.info("[mid][adaptive] regime=%s atrp=%.1f%% t=%.2f n=%s", _reg, float(_atrp_avg), float(_t_avg), int(_n))
-                        except Exception:
-                            pass
+# Adaptive regime snapshot (avg across evaluated symbols for this tick)
+try:
+    _snap = _mid_adapt_snapshot()
+    if _snap:
+        _reg, _atrp_avg, _t_avg, _n = _snap
+        logger.info("[mid][adaptive] regime=%s atrp=%.1f%% t=%.2f n=%s", _reg, float(_atrp_avg), float(_t_avg), int(_n))
+except Exception:
+    pass
                     except Exception as e:
                         summary = f"tick done (summary_error={type(e).__name__}) scanned={_mid_scanned}"
                         logger.warning("[mid][summary_error] %s", e)
@@ -13537,6 +13543,27 @@ async def ws_candles_service_loop(backend: 'Backend') -> None:
     import time
 
     logger = logging.getLogger("crypto-signal")
+
+# --- MID filter error logging (fail-closed visibility) ---
+_MID_FILTER_ERR_LAST_TS = 0.0
+_MID_FILTER_ERR_LAST_KEY = ""
+def _mid_filter_err_log(symbol: str, side: str, where: str = "") -> None:
+    """Rate-limited exception logger for MID filter failures."""
+    global _MID_FILTER_ERR_LAST_TS, _MID_FILTER_ERR_LAST_KEY
+    try:
+        cool = float(os.getenv("MID_FILTER_ERR_LOG_SEC", "60") or 60)
+    except Exception:
+        cool = 60.0
+    try:
+        now = time.time()
+        key = f"{symbol}:{side}:{where}"
+        if (now - float(_MID_FILTER_ERR_LAST_TS or 0.0)) >= cool or key != _MID_FILTER_ERR_LAST_KEY:
+            _MID_FILTER_ERR_LAST_TS = now
+            _MID_FILTER_ERR_LAST_KEY = key
+            logger.exception("[mid][filter_error] %s side=%s where=%s", symbol, side, where)
+    except Exception:
+        pass
+
 
     exchanges = [x.strip().lower() for x in str(os.getenv("CANDLES_WS_EXCHANGES", "binance,bybit,okx") or "").split(",") if x.strip()]
     _m_raw = os.getenv("CANDLES_WS_MARKET", os.getenv("CANDLES_WS_MARKETS", "SPOT,FUTURES") or "SPOT,FUTURES")
