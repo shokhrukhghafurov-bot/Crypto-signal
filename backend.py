@@ -677,21 +677,33 @@ _MID_ADAPT_CTX = contextvars.ContextVar('MID_ADAPT_CTX', default=None)
 def _mid_adapt_reset_tick() -> None:
     """Reset adaptive regime stats for the current MID tick."""
     try:
-        _MID_ADAPT_CTX.set({'n': 0, 'sum_atrp': 0.0, 'sum_t': 0.0})
+        _MID_ADAPT_CTX.set({'n': 0, 'sum_atrp': 0.0, 'sum_t': 0.0, 'seen': set()})
     except Exception:
         pass
 
-def _mid_adapt_track(atrp: float, t: float) -> None:
-    """Track per-symbol ATR% + normalized regime parameter (t in [0..1])."""
+def _mid_adapt_track(atrp: float, t: float, symbol: str | None = None) -> None:
+    """Track per-symbol ATR% + normalized regime parameter (t in [0..1]).
+    If symbol is provided, counts each symbol only once per tick (even if evaluated on many venues).
+    """
     try:
         ctx = _MID_ADAPT_CTX.get()
         if not isinstance(ctx, dict):
             return
+        sym = (str(symbol or '').strip().upper()) if symbol is not None else ''
+        if sym:
+            seen = ctx.get('seen')
+            if not isinstance(seen, set):
+                seen = set()
+                ctx['seen'] = seen
+            if sym in seen:
+                return
+            seen.add(sym)
         ctx['n'] = int(ctx.get('n') or 0) + 1
         ctx['sum_atrp'] = float(ctx.get('sum_atrp') or 0.0) + float(atrp or 0.0)
         ctx['sum_t'] = float(ctx.get('sum_t') or 0.0) + float(t or 0.0)
     except Exception:
         return
+
 
 def _mid_adapt_regime_from_t(t: float) -> str:
     try:
@@ -5170,7 +5182,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                     t = 1.0
 
                 try:
-                    _mid_adapt_track(float(atrp or 0.0), float(t or 0.0))
+                    _mid_adapt_track(float(atrp or 0.0), float(t or 0.0), symbol)
                 except Exception:
                     pass
 
@@ -12310,6 +12322,10 @@ class Backend:
                         _mid_rest_refill = 0
                         _c0 = api.candle_counters_snapshot()
                         _mid_hard_block0 = _mid_hard_block_total()
+                        try:
+                            _mid_adapt_reset_tick()
+                        except Exception:
+                            pass
                         _mid_hard_block = 0
 
                         # --- MID reject digest (log-only): explains "scanned=N but counters don't add up" ---
