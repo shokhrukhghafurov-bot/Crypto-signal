@@ -2160,6 +2160,8 @@ async def broadcast_signal(sig: Signal) -> None:
             ORIGINAL_SIGNAL_TEXT[(uid, sig.signal_id)] = _signal_text(uid, sig, autotrade_hint=at_hint)
             kb_u = InlineKeyboardBuilder()
             kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+            kb_u.button(text=tr(uid, "sig_btn_analyze"), callback_data=f"analyze:{sig.signal_id}")
+            kb_u.adjust(2)
             await safe_send(uid, _signal_text(uid, sig, autotrade_hint=at_hint), reply_markup=kb_u.as_markup())
 
             # Auto-trade: execute real orders asynchronously, without affecting broadcast.
@@ -5849,3 +5851,76 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+# ===============================
+# AUTO SYMBOL ANALYSIS HANDLER
+# ===============================
+
+
+
+@dp.callback_query(lambda c: (c.data or "").startswith("analyze:"))
+async def on_analyze_token(call: types.CallbackQuery) -> None:
+    await call.answer()
+    uid = call.from_user.id if call.from_user else 0
+    if not uid:
+        return
+
+    try:
+        sid = int((call.data or "").split(":", 1)[1])
+    except Exception:
+        return
+
+    sig = SIGNALS.get(sid)
+    if not sig:
+        await safe_send(uid, "⚠️ Сигнал не найден (возможно, бот перезапускался).")
+        return
+
+    symbol = str(getattr(sig, "symbol", "") or "").upper().strip()
+    market = str(getattr(sig, "market", "FUTURES") or "FUTURES").upper().strip()
+    if not symbol:
+        await safe_send(uid, "⚠️ Не удалось определить символ по сигналу.")
+        return
+
+    # show "working…" quickly
+    try:
+        await call.message.edit_text(f"⏳ Анализирую **{symbol} ({market})** …", parse_mode="Markdown")
+    except Exception:
+        pass
+
+    try:
+        lang = get_lang(uid)
+        txt = await backend.analyze_symbol_institutional(symbol, market=market, lang=lang)
+        await safe_send(uid, txt, parse_mode="Markdown")
+    except Exception:
+        await safe_send(uid, f"⚠️ Ошибка анализа для {symbol}.")
+
+@dp.message()
+async def auto_symbol_analysis_handler(message: types.Message):
+    # Auto TA: user can type BTC / ETH / BTCUSDT
+    text_raw = (message.text or "").strip()
+    if not text_raw:
+        return
+
+    text = text_raw.strip().upper()
+
+    # do not react to commands or phrases
+    if text.startswith("/"):
+        return
+
+    # only pure tickers (A-Z0-9, no spaces)
+    if not re.fullmatch(r"[A-Z0-9]{2,15}", text):
+        return
+
+    uid = message.from_user.id if message.from_user else 0
+    lang = get_lang(uid) if uid else "ru"
+
+    symbol = text if text.endswith("USDT") else text + "USDT"
+
+    try:
+        report = await backend.analyze_symbol_institutional(symbol, market="FUTURES", lang=lang)
+        await message.answer(report, parse_mode="Markdown")
+    except Exception:
+        # keep silent to avoid spamming on random issues
+        return
+
