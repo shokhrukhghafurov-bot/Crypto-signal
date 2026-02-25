@@ -7661,6 +7661,45 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
     tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct)
     sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
+    # --- Adaptive MID SL/TP scaling by ATR%% (optional) ---
+    try:
+        if os.getenv("MID_ADAPTIVE_SLTP", "0").strip().lower() in ("1","true","yes","on"):
+            # Use ATR% on 30m as market volatility regime
+            atrp = float(atr_pct) if not np.isnan(atr_pct) else 0.0
+            low = float(os.getenv("MID_ADAPT_ATR_PCT_LOW", "2.0") or 2.0)
+            high = float(os.getenv("MID_ADAPT_ATR_PCT_HIGH", "6.0") or 6.0)
+            sl_tight = float(os.getenv("MID_ADAPT_SL_TIGHTEN_MIN", "0.95") or 0.95)
+            sl_wide = float(os.getenv("MID_ADAPT_SL_WIDEN_MAX", "1.35") or 1.35)
+            tp_tight = float(os.getenv("MID_ADAPT_TP_TIGHTEN_MIN", "0.98") or 0.98)
+            tp_wide = float(os.getenv("MID_ADAPT_TP_WIDEN_MAX", "1.25") or 1.25)
+    
+            if high <= low:
+                t = 0.5
+            else:
+                t = (atrp - low) / (high - low)
+            if t < 0.0:
+                t = 0.0
+            if t > 1.0:
+                t = 1.0
+    
+            sl_scale = sl_tight + t * (sl_wide - sl_tight)
+            tp_scale = tp_tight + t * (tp_wide - tp_tight)
+    
+            # Scale distances from entry while preserving direction
+            r_sl = abs(entry - sl) * sl_scale
+            r_tp1 = abs(tp1 - entry) * tp_scale
+            r_tp2 = abs(tp2 - entry) * tp_scale
+            if str(dir_trend).upper() == "LONG":
+                sl = entry - r_sl
+                tp1 = entry + r_tp1
+                tp2 = entry + r_tp2
+            else:
+                sl = entry + r_sl
+                tp1 = entry - r_tp1
+                tp2 = entry - r_tp2
+            rr = abs(tp2 - entry) / max(1e-12, abs(entry - sl))
+    except Exception:
+        pass
     # Hard cap: keep TP2 within MID_MAX_TP2_ATR * ATR to improve hit-rate
     try:
         max_tp2_atr = float(_mid_autotune_get_param("MID_MAX_TP2_ATR", float(os.getenv("MID_MAX_TP2_ATR", "2.2") or 2.2), market))
@@ -12643,59 +12682,6 @@ class Backend:
                             direction = str(base_r.get("direction","")).upper()
                             entry = float(base_r["entry"]); sl = float(base_r["sl"])
                             tp1 = float(base_r["tp1"]); tp2 = float(base_r["tp2"])
-
-# --- Adaptive MID SL/TP scaling by ATR% (optional) ---
-# Goal: keep outcome stable across volatility regimes:
-#   - Low ATR%: slightly tighter (avoid overstaying in chop)
-#   - High ATR%: wider SL/TP (avoid random wicks -> SL)
-try:
-    adaptive_sltp = os.getenv("MID_ADAPTIVE_SLTP","0").strip().lower() not in ("0","false","no","off")
-    if adaptive_sltp:
-        atr_low = float(os.getenv("MID_ADAPT_ATR_PCT_LOW","2.0") or 2.0)
-        atr_high = float(os.getenv("MID_ADAPT_ATR_PCT_HIGH","6.0") or 6.0)
-        atrp_now = float(base_r.get("atr_pct", 0.0) or 0.0)
-
-        # Multipliers for distances (entry->SL, entry->TPs)
-        sl_tight = float(os.getenv("MID_ADAPT_SL_TIGHTEN_MIN","0.95") or 0.95)
-        sl_wide  = float(os.getenv("MID_ADAPT_SL_WIDEN_MAX","1.35") or 1.35)
-        tp_tight = float(os.getenv("MID_ADAPT_TP_TIGHTEN_MIN","0.98") or 0.98)
-        tp_wide  = float(os.getenv("MID_ADAPT_TP_WIDEN_MAX","1.25") or 1.25)
-
-        if atr_high <= atr_low:
-            t = 0.5
-        else:
-            t = (atrp_now - atr_low) / (atr_high - atr_low)
-        if t < 0.0: t = 0.0
-        if t > 1.0: t = 1.0
-
-        sl_mul = sl_tight + (sl_wide - sl_tight) * t
-        tp_mul = tp_tight + (tp_wide - tp_tight) * t
-
-        if direction == "LONG":
-            d_sl = max(0.0, entry - sl)
-            d1 = max(0.0, tp1 - entry)
-            d2 = max(0.0, tp2 - entry)
-            if d_sl > 0 and d2 > 0:
-                sl = entry - d_sl * sl_mul
-                tp1 = entry + d1 * tp_mul
-                tp2 = entry + d2 * tp_mul
-        else:
-            d_sl = max(0.0, sl - entry)
-            d1 = max(0.0, entry - tp1)
-            d2 = max(0.0, entry - tp2)
-            if d_sl > 0 and d2 > 0:
-                sl = entry + d_sl * sl_mul
-                tp1 = entry - d1 * tp_mul
-                tp2 = entry - d2 * tp_mul
-
-        # Persist back so logs / digest reflect final prices
-        base_r["sl"] = sl
-        base_r["tp1"] = tp1
-        base_r["tp2"] = tp2
-        base_r["__adaptive_sltp"] = {"atr_pct": atrp_now, "t": t, "sl_mul": sl_mul, "tp_mul": tp_mul}
-except Exception:
-    pass
-
                             # --- HARD MID filters (TP2-first) ---
                             # 1) Volume must be real, иначе TP2 часто не добивает
                             volx = float(base_r.get("rel_vol", 0.0) or 0.0)
