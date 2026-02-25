@@ -4835,7 +4835,10 @@ def _get_lang(uid: int) -> str:
 def _tr(uid: int, key: str) -> str:
     lang = _get_lang(uid)
     i18n = _load_i18n()
-    return i18n.get(lang, i18n.get("en", {})).get(key, key)
+    d = i18n.get(lang, {})
+    if key in d:
+        return d.get(key, key)
+    return i18n.get("en", {}).get(key, key)
 
 class _SafeDict(dict):
     def __missing__(self, key):
