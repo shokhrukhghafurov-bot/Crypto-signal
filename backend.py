@@ -13742,3 +13742,349 @@ async def candles_cache_cleanup_loop(backend: 'Backend') -> None:
             log.exception('[candles-cleanup] unexpected error')
 
         await asyncio.sleep(max(60, every_sec))
+
+
+# ===============================
+# INSTITUTIONAL TA ENGINE (AUTO)
+# ===============================
+
+# --- Institutional token analysis (multi-timeframe) ---
+_I18N_CACHE = {"data": None, "mtime": 0.0}
+
+def _load_i18n_dict() -> dict:
+    """Loads i18n.json next to this file. Cached by mtime."""
+    import os, json, time
+    try:
+        p = os.path.join(os.path.dirname(__file__), "i18n.json")
+        st = os.stat(p)
+        if _I18N_CACHE["data"] is None or float(st.st_mtime) != float(_I18N_CACHE["mtime"]):
+            _I18N_CACHE["data"] = json.loads(open(p, "r", encoding="utf-8").read())
+            _I18N_CACHE["mtime"] = float(st.st_mtime)
+        return _I18N_CACHE["data"] or {}
+    except Exception:
+        return {}
+
+def _tr_i18n(lang: str, key: str, **kwargs) -> str:
+    d = _load_i18n_dict()
+    lang = (lang or "ru").lower()
+    if lang not in d:
+        lang = "ru"
+    s = None
+    try:
+        s = d.get(lang, {}).get(key)
+        if s is None:
+            # fallback to EN, then key
+            s = d.get("en", {}).get(key, key)
+        if kwargs:
+            return str(s).format(**kwargs)
+        return str(s)
+    except Exception:
+        try:
+            return str(s) if s is not None else key
+        except Exception:
+            return key
+
+def _fmt_int_space(x) -> str:
+    try:
+        return f"{float(x):,.0f}".replace(",", " ")
+    except Exception:
+        return "—"
+
+def _fmt_float(x, nd=2) -> str:
+    try:
+        return f"{float(x):.{nd}f}"
+    except Exception:
+        return "—"
+
+
+async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES", lang: str = "ru") -> str:
+    """
+    Institutional-style TA analysis.
+    Output format is strict (Telegram Markdown) and matches the required template.
+    Uses 5m/1h/4h candles + indicators from self._add_indicators().
+    """
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        return "⚠️ empty symbol"
+    if not sym.endswith("USDT") and sym.isalnum() and len(sym) <= 10:
+        sym = sym + "USDT"
+    mkt = (market or "FUTURES").strip().upper()
+    lang = (lang or "ru").lower()
+
+    # load candles
+    df5 = await self.load_candles(sym, "5m", mkt)
+    df1 = await self.load_candles(sym, "1h", mkt)
+    df4 = await self.load_candles(sym, "4h", mkt)
+
+    if df5 is None or getattr(df5, "empty", True):
+        return f"⚠️ no candles for {sym}"
+
+    # indicators
+    df5 = self._add_indicators(df5)
+    if df1 is not None and not getattr(df1, "empty", True):
+        df1 = self._add_indicators(df1)
+    if df4 is not None and not getattr(df4, "empty", True):
+        df4 = self._add_indicators(df4)
+
+    price = float(df5.close.iloc[-1])
+
+    def _trend_label(df):
+        try:
+            ema50 = float(df.ema50.iloc[-1])
+            ema200 = float(df.ema200.iloc[-1])
+            adx = float(df.adx.iloc[-1])
+        except Exception:
+            return _tr_i18n(lang, "analysis_trend_pullback")
+        if ema50 > ema200 and adx >= 25:
+            return _tr_i18n(lang, "analysis_trend_strong_up")
+        if ema50 > ema200:
+            return _tr_i18n(lang, "analysis_trend_up")
+        if ema50 < ema200 and adx >= 25:
+            return _tr_i18n(lang, "analysis_trend_strong_down")
+        return _tr_i18n(lang, "analysis_trend_pullback")
+
+    trend4 = _trend_label(df4) if (df4 is not None and not getattr(df4, "empty", True)) else "—"
+    trend1 = _trend_label(df1) if (df1 is not None and not getattr(df1, "empty", True)) else "—"
+    trend5 = _trend_label(df5)
+
+    # Levels from 1h window
+    try:
+        d1w = df1.tail(120) if (df1 is not None and not getattr(df1, "empty", True)) else df5.tail(240)
+        support1 = float(d1w.low.astype(float).min())
+        resistance1 = float(d1w.high.astype(float).max())
+    except Exception:
+        support1 = float(df5.low.astype(float).tail(240).min())
+        resistance1 = float(df5.high.astype(float).tail(240).max())
+
+    rng = max(1e-9, (resistance1 - support1))
+    support2 = support1 - rng * 0.5
+    resistance2 = resistance1 + rng * 0.5
+    pivot = (support1 + resistance1) / 2.0
+
+    # Indicators (5m)
+    rsi = float(getattr(df5.iloc[-1], "rsi", df5["rsi"].iloc[-1] if "rsi" in df5.columns else 50))
+    macd = float(getattr(df5.iloc[-1], "macd_hist", df5["macd_hist"].iloc[-1] if "macd_hist" in df5.columns else 0))
+    adx = float(getattr(df5.iloc[-1], "adx", df5["adx"].iloc[-1] if "adx" in df5.columns else 0))
+    atr = float(getattr(df5.iloc[-1], "atr_pct", df5["atr_pct"].iloc[-1] if "atr_pct" in df5.columns else 0))
+
+    # volume relative
+    vol_rel = None
+    try:
+        if "volume" in df5.columns:
+            v = df5["volume"].astype(float)
+            base = float(v.tail(41).head(40).mean())  # avg of previous 40 (closed)
+            cur = float(v.iloc[-1])
+            if base > 0:
+                vol_rel = cur / base
+    except Exception:
+        vol_rel = None
+    if vol_rel is None:
+        vol_rel = 1.0
+
+    # probability
+    long_score = 0.0
+    short_score = 0.0
+    try:
+        if float(df5.ema50.iloc[-1]) > float(df5.ema200.iloc[-1]):
+            long_score += 3
+        else:
+            short_score += 3
+    except Exception:
+        pass
+    if rsi > 55:
+        long_score += 2
+    elif rsi < 45:
+        short_score += 2
+    if macd > 0:
+        long_score += 1
+    else:
+        short_score += 1
+    if adx >= 25:
+        long_score += 1
+        short_score += 1
+
+    total = long_score + short_score
+    long_p = int(round(100.0 * long_score / total)) if total > 0 else 50
+    long_p = max(0, min(100, long_p))
+    short_p = 100 - long_p
+
+    bias = "LONG" if long_p > short_p else "SHORT"
+    confidence = "ВЫСОКАЯ" if (lang.startswith("ru") and abs(long_p - short_p) >= 30) else ("HIGH" if abs(long_p - short_p) >= 30 else ("СРЕДНЯЯ" if lang.startswith("ru") else "MEDIUM"))
+
+    entry = price
+    sl = support1
+    tp1 = resistance1
+    tp2 = resistance2
+    rr = 0.0
+    try:
+        if abs(entry - sl) > 1e-9:
+            rr = (tp2 - entry) / (entry - sl)
+    except Exception:
+        rr = 0.0
+
+    macd_label = "🟢 bullish" if macd > 0 else "🔴 bearish"
+    vol_status = _tr_i18n(lang, "analysis_volume_status_acc") if float(vol_rel) >= 1.2 else _tr_i18n(lang, "analysis_volume_status_neu")
+
+    # format numbers with spaces
+    price_s = _fmt_int_space(price)
+    s1_s = _fmt_int_space(support1)
+    s2_s = _fmt_int_space(support2)
+    r1_s = _fmt_int_space(resistance1)
+    r2_s = _fmt_int_space(resistance2)
+    piv_s = _fmt_int_space(pivot)
+    entry_s = _fmt_int_space(entry)
+    sl_s = _fmt_int_space(sl)
+    tp1_s = _fmt_int_space(tp1)
+    tp2_s = _fmt_int_space(tp2)
+
+    rsi_i = int(round(rsi)) if rsi == rsi else 0
+    adx_i = int(round(adx)) if adx == adx else 0
+    atr_s = _fmt_float(atr, 1)
+    vol_s = _fmt_float(vol_rel, 2)
+
+    line = "━━━━━━━━━━━━━━━━━━━"
+
+    report = (
+        f"📊 **{sym} ({mkt})**
+"
+        f"{_tr_i18n(lang, 'analysis_price_label', price=price_s)}
+
+"
+        f"{line}
+
+"
+        f"{_tr_i18n(lang, 'analysis_market_structure_title')}
+
+"
+        f"{_tr_i18n(lang, 'analysis_global_trend', t=trend4)}
+"
+        f"{_tr_i18n(lang, 'analysis_mid_trend', t=trend1)}
+"
+        f"{_tr_i18n(lang, 'analysis_local_trend', t=trend5)}
+
+"
+        f"{_tr_i18n(lang, 'analysis_in_channel')}
+
+"
+        f"{line}
+
+"
+        f"{_tr_i18n(lang, 'analysis_channel_title')}
+
+"
+        f"{_tr_i18n(lang, 'analysis_channel_type')}
+
+"
+        f"{_tr_i18n(lang, 'analysis_channel_support', v=s1_s)}
+"
+        f"{_tr_i18n(lang, 'analysis_channel_resistance', v=r1_s)}
+
+"
+        f"{_tr_i18n(lang, 'analysis_channel_status')}
+
+"
+        f"{line}
+
+"
+        f"{_tr_i18n(lang, 'analysis_levels_title')}
+
+"
+        f"{_tr_i18n(lang, 'analysis_resistance_lbl')}
+"
+        f"• {r1_s}
+"
+        f"• {r2_s}
+
+"
+        f"{_tr_i18n(lang, 'analysis_support_lbl')}
+"
+        f"• {s1_s}
+"
+        f"• {s2_s}
+
+"
+        f"{_tr_i18n(lang, 'analysis_pivot_lbl', v=piv_s)}
+
+"
+        f"{line}
+
+"
+        f"{_tr_i18n(lang, 'analysis_momentum_title')}
+
+"
+        f"{_tr_i18n(lang, 'analysis_rsi_line', rsi=rsi_i)}
+"
+        f"{_tr_i18n(lang, 'analysis_macd_line', macd=macd_label)}
+"
+        f"{_tr_i18n(lang, 'analysis_adx_line', adx=adx_i)}
+
+"
+        f"{_tr_i18n(lang, 'analysis_atr_line', atr=atr_s)}
+
+"
+        f"{_tr_i18n(lang, 'analysis_vol_line', vol=vol_s, status=vol_status)}
+
+"
+        f"{line}
+
+"
+        f"{_tr_i18n(lang, 'analysis_scenarios_title')}
+
+"
+        f"{_tr_i18n(lang, 'analysis_bullish_title')}
+"
+        f"{_tr_i18n(lang, 'analysis_bullish_lines', s1=s1_s, r1=r1_s, r2=r2_s)}
+
+"
+        f"{_tr_i18n(lang, 'analysis_bearish_title')}
+"
+        f"{_tr_i18n(lang, 'analysis_bearish_lines', s1=s1_s, s2=s2_s)}
+
+"
+        f"{line}
+
+"
+        f"{_tr_i18n(lang, 'analysis_prob_title')}
+
+"
+        f"LONG: **{long_p}%** 🟢
+"
+        f"SHORT: **{short_p}%** 🔴
+
+"
+        f"{_tr_i18n(lang, 'analysis_bias_line', b=bias)}
+"
+        f"{_tr_i18n(lang, 'analysis_conf_line', c=confidence)}
+
+"
+        f"{line}
+
+"
+        f"{_tr_i18n(lang, 'analysis_plan_title')}
+
+"
+        f"{_tr_i18n(lang, 'analysis_plan_side', side=('🟢 LONG' if bias=='LONG' else '🔴 SHORT'))}
+"
+        f"{_tr_i18n(lang, 'analysis_plan_entry', v=entry_s)}
+"
+        f"{_tr_i18n(lang, 'analysis_plan_sl', v=sl_s)}
+"
+        f"{_tr_i18n(lang, 'analysis_plan_tp1', v=tp1_s)}
+"
+        f"{_tr_i18n(lang, 'analysis_plan_tp2', v=tp2_s)}
+
+"
+        f"{_tr_i18n(lang, 'analysis_plan_rr', v=_fmt_float(rr,1))}
+
+"
+        f"{line}
+"
+        f"{_tr_i18n(lang, 'analysis_based_on')}
+"
+        f"{_tr_i18n(lang, 'analysis_based_on_list')}
+
+"
+        f"{_tr_i18n(lang, 'analysis_disclaimer')}"
+    )
+
+    return report
