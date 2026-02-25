@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 from collections import defaultdict
 from pathlib import Path
 import os
 import re
 import time
+import math
 import contextvars
 
 
@@ -5158,6 +5158,28 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                       htf_dir_1h: str | None = None, htf_dir_30m: str | None = None, adx_30m: float | None = None) -> str | None:
     """Return human-readable MID BLOCKED reason (for logging + error-bot), or None if allowed."""
     try:
+        # Guard against bad numeric inputs (avoid mid_filter_error storms)
+        try:
+            _close = float(close)
+            _atr = float(atr_30m) if atr_30m is not None else 0.0
+        except Exception:
+            return "mid_bad_inputs" if MID_FAIL_CLOSED else None
+        if (not math.isfinite(_close)) or (not math.isfinite(_atr)) or _atr <= 0.0:
+            return "mid_bad_atr" if MID_FAIL_CLOSED else None
+        # recent extremes are required for many filters; validate early
+        if recent_low is None or recent_high is None:
+            return "mid_bad_extremes" if MID_FAIL_CLOSED else None
+        try:
+            _rl = float(recent_low); _rh = float(recent_high)
+        except Exception:
+            return "mid_bad_extremes" if MID_FAIL_CLOSED else None
+        if (not math.isfinite(_rl)) or (not math.isfinite(_rh)):
+            return "mid_bad_extremes" if MID_FAIL_CLOSED else None
+        # use sanitized vars below
+        close = _close
+        atr_30m = _atr
+        recent_low = _rl
+        recent_high = _rh
         # ULTRA SAFE: tighten filters dynamically for near-zero SL preference
         late_entry_max = MID_ULTRA_LATE_ENTRY_ATR_MAX if MID_ULTRA_SAFE else MID_LATE_ENTRY_ATR_MAX
         vwap_dist_max = MID_ULTRA_VWAP_DIST_ATR_MAX if MID_ULTRA_SAFE else MID_VWAP_DIST_ATR_MAX
@@ -5259,60 +5281,20 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
             # --- Anti-bounce: block SHORT after sharp rebound from recent low (and vice versa for LONG) ---
             if MID_ANTI_BOUNCE_ENABLED and atr_30m and atr_30m > 0:
                 # Prefer side-specific MAX if set; fall back to MID_ANTI_BOUNCE_ATR_MAX
-                try:
-                    _ab_default = float(MID_ANTI_BOUNCE_ATR_MAX)
-                except Exception:
-                    _ab_default = 0.0
-
-                def _ab_parse(v: str | None, default: float) -> float:
-                    try:
-                        if v is None:
-                            return default
-                        s = str(v).strip()
-                        if not s:
-                            return default
-                        x = float(s)
-                        return x if x > 0 else default
-                    except Exception:
-                        return default
-
-                bounce_short_max = _ab_parse(MID_ANTI_BOUNCE_SHORT_MAX, _ab_default)
-                bounce_long_max  = _ab_parse(MID_ANTI_BOUNCE_LONG_MAX, _ab_default)
-
+                bounce_short_max = float(MID_ANTI_BOUNCE_SHORT_MAX) if (MID_ANTI_BOUNCE_SHORT_MAX and float(MID_ANTI_BOUNCE_SHORT_MAX) > 0) else float(MID_ANTI_BOUNCE_ATR_MAX)
+                bounce_long_max  = float(MID_ANTI_BOUNCE_LONG_MAX) if (MID_ANTI_BOUNCE_LONG_MAX and float(MID_ANTI_BOUNCE_LONG_MAX) > 0) else float(MID_ANTI_BOUNCE_ATR_MAX)
                 bounce_scale = _mid_adapt_bounce_scale if '_mid_adapt_bounce_scale' in locals() else 1.0
-                try:
-                    bounce_short_max *= float(bounce_scale or 1.0)
-                    bounce_long_max  *= float(bounce_scale or 1.0)
-                except Exception:
-                    pass
+                bounce_short_max *= bounce_scale
+                bounce_long_max *= bounce_scale
 
-                try:
-                    # Validate inputs to avoid TypeError/NaN cascades
-                    if recent_low is None or recent_high is None or close is None:
-                        raise ValueError("missing recent_low/high/close")
-                    if not (isinstance(close, (int, float)) and isinstance(recent_low, (int, float)) and isinstance(recent_high, (int, float))):
-                        raise ValueError("non-numeric recent_low/high/close")
-                    if not (math.isfinite(float(close)) and math.isfinite(float(recent_low)) and math.isfinite(float(recent_high)) and math.isfinite(float(atr_30m))):
-                        raise ValueError("non-finite inputs")
-
-                    if side.upper() == "SHORT":
-                        dist_low_atr = (close - recent_low) / atr_30m
-                        if dist_low_atr > bounce_short_max:
-                            return f"anti_bounce_short dist_low_atr={dist_low_atr:.2f} > {bounce_short_max:g}"
-                    else:  # LONG
-                        dist_high_atr = (recent_high - close) / atr_30m
-                        if dist_high_atr > bounce_long_max:
-                            return f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {bounce_long_max:g}"
-                except Exception:
-                    # If anti-bounce computation fails, respect fail-closed flag, but also log the stack for debugging
-                    try:
-                        if (os.getenv("MID_LOG_FILTER_ERRORS", "1") or "").strip().lower() in ("1","true","yes","on"):
-                            logger.exception("[mid][filter_error] anti_bounce symbol=%s side=%s", symbol, side)
-                    except Exception:
-                        pass
-                    if MID_FAIL_CLOSED:
-                        return "mid_anti_bounce_error"
-                    pass
+                if side.upper() == "SHORT":
+                    dist_low_atr = (close - recent_low) / atr_30m
+                    if dist_low_atr > bounce_short_max:
+                        return f"anti_bounce_short dist_low_atr={dist_low_atr:.2f} > {bounce_short_max:g}"
+                else:  # LONG
+                    dist_high_atr = (recent_high - close) / atr_30m
+                    if dist_high_atr > bounce_long_max:
+                        return f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {bounce_long_max:g}"
 
 
 
@@ -5484,7 +5466,9 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
 
 
     except Exception:
-        # if filter computation fails, respect fail-closed flag
+        # if filter computation fails, respect fail-closed flag (and log traceback if enabled)
+        if (os.getenv("MID_LOG_FILTER_ERRORS", "1") or "").strip().lower() in ("1","true","yes","on"):
+            logger.exception("[mid][filter_error] symbol=%s side=%s close=%s atr_30m=%s", symbol, side, close, atr_30m)
         return "mid_filter_error" if MID_FAIL_CLOSED else None
     return None
 @dataclass(frozen=True)
@@ -5509,7 +5493,6 @@ class Signal:
     available_exchanges: str = ""
     risk_note: str = ""
     ts: float = 0.0
-
 @dataclass
 
 class UserTrade:
