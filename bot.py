@@ -629,14 +629,21 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
         except Exception:
             logger.info("[mid] backend class=%s file=?", getattr(backend.__class__, "__name__", "Backend"))
 
-        logger.info(
-            "[mid] starting MID scanner (5m/30m/1h) interval=%ss top_n=%s has_method=%s",
-            interval, top_n, hasattr(backend, 'scanner_loop_mid')
+        # Be defensive: older builds sometimes used different method names.
+        mid_loop = (
+            getattr(backend, 'scanner_loop_mid', None)
+            or getattr(backend, 'mid_scanner_loop', None)
+            or getattr(backend, 'scanner_mid_loop', None)
         )
 
-        if hasattr(backend, 'scanner_loop_mid'):
+        logger.info(
+            "[mid] starting MID scanner (5m/30m/1h) interval=%ss top_n=%s has_method=%s",
+            interval, top_n, callable(mid_loop)
+        )
+
+        if callable(mid_loop):
             TASKS["mid-scanner"] = asyncio.create_task(
-                backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert),
+                mid_loop(broadcast_signal, broadcast_macro_alert),
                 name="mid-scanner",
             )
             # repeat last MID tick summary in logs so it doesn't get lost
@@ -648,6 +655,14 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
                 "This usually means Railway deployed an old build or imported a different backend.py. "
                 "Check the '[mid] backend class=... file=...' line above."
             )
+
+            # Extra diagnostics: list potential candidates so the reason is obvious from logs.
+            try:
+                mids = [n for n in dir(backend) if 'mid' in n.lower() and 'scan' in n.lower()]
+                if mids:
+                    logger.error("[mid] available methods containing 'mid'+'scan': %s", ", ".join(sorted(mids)[:40]))
+            except Exception:
+                pass
             return
 
         # MID pending-entry trigger loop (emit only when price reaches entry + TA reconfirmed)
