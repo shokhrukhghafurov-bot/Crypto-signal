@@ -176,6 +176,8 @@ MID_BLOCK_SHORT_HIGHER_LOWS = os.getenv("MID_BLOCK_SHORT_HIGHER_LOWS", "1").stri
 MID_BOS_RECENT_BARS = int(os.getenv("MID_BOS_RECENT_BARS", "6") or 6)  # consider BOS within last N bars
 MID_HL_TOL_PCT = float(os.getenv("MID_HL_TOL_PCT", "0.001") or 0.001)  # allow equal-ish highs/lows (0.1%)
 MID_REQUIRE_5M_CONFIRM = os.getenv("MID_REQUIRE_5M_CONFIRM", "1").strip().lower() not in ("0","false","no","off")
+MID_REQUIRE_LIQ_SWEEP = os.getenv("MID_REQUIRE_LIQ_SWEEP", "0").strip().lower() not in ("0","false","no","off")
+MID_LIQ_SWEEP_BONUS = float(os.getenv("MID_LIQ_SWEEP_BONUS", "4") or 4.0)
 MID_FAIL_CLOSED = os.getenv("MID_FAIL_CLOSED", "1").strip().lower() not in ("0","false","no","off")
 MID_HIGHER_LOWS_LOOKBACK = int(os.getenv("MID_HIGHER_LOWS_LOOKBACK", str(MID_LOWER_HIGHS_LOOKBACK)) or MID_LOWER_HIGHS_LOOKBACK)
 
@@ -8147,6 +8149,76 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
     support, resistance = _nearest_levels(df1hi)
 
+    # Breakout / Retest detection (simple but robust)
+    # We use 1h swing S/R and confirm on recent 5m candles.
+    breakout_retest = "—"
+    try:
+        sup_lvl = float(support) if support is not None else float("nan")
+        res_lvl = float(resistance) if resistance is not None else float("nan")
+        try:
+            tol = max(float(atr5) * 0.25, float(entry) * 0.0015)  # ~0.15% or 0.25 ATR(5m)
+        except Exception:
+            tol = float(entry) * 0.0015
+
+        d5 = df5i.tail(36).copy()  # last ~3h
+        if (not d5.empty) and len(d5) >= 10:
+            highs5 = d5["high"].astype(float).values
+            lows5 = d5["low"].astype(float).values
+            closes5 = d5["close"].astype(float).values
+
+            # Breakout up: close above resistance after being below/at it
+            bo_up_idx = None
+            if (not np.isnan(res_lvl)) and res_lvl > 0:
+                for i in range(1, len(closes5)):
+                    if closes5[i - 1] <= res_lvl and closes5[i] > res_lvl:
+                        bo_up_idx = i
+                        break
+
+            # Breakout down: close below support after being above/at it
+            bo_dn_idx = None
+            if (not np.isnan(sup_lvl)) and sup_lvl > 0:
+                for i in range(1, len(closes5)):
+                    if closes5[i - 1] >= sup_lvl and closes5[i] < sup_lvl:
+                        bo_dn_idx = i
+                        break
+
+            # Retest logic (after breakout)
+            ret_up = False
+            if bo_up_idx is not None:
+                for j in range(bo_up_idx + 1, len(closes5)):
+                    if (lows5[j] <= res_lvl + tol) and (closes5[j] > res_lvl):
+                        ret_up = True
+                        break
+
+            ret_dn = False
+            if bo_dn_idx is not None:
+                for j in range(bo_dn_idx + 1, len(closes5)):
+                    if (highs5[j] >= sup_lvl - tol) and (closes5[j] < sup_lvl):
+                        ret_dn = True
+                        break
+
+            # Prefer breakout in the same direction as the MID signal
+            if str(dir_trend).upper() == "LONG":
+                if bo_up_idx is not None and ret_up:
+                    breakout_retest = "BO↑ + Retest"
+                elif bo_up_idx is not None:
+                    breakout_retest = "BO↑"
+                elif bo_dn_idx is not None and ret_dn:
+                    breakout_retest = "BO↓ + Retest"
+                elif bo_dn_idx is not None:
+                    breakout_retest = "BO↓"
+            else:
+                if bo_dn_idx is not None and ret_dn:
+                    breakout_retest = "BO↓ + Retest"
+                elif bo_dn_idx is not None:
+                    breakout_retest = "BO↓"
+                elif bo_up_idx is not None and ret_up:
+                    breakout_retest = "BO↑ + Retest"
+                elif bo_up_idx is not None:
+                    breakout_retest = "BO↑"
+    except Exception:
+        breakout_retest = "—"
+
     # Range position filter (only when market structure is RANGE)
     range_pos = None
     range_pos_txt = "—"
@@ -8225,6 +8297,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "pattern": pattern,
         "support": support,
         "resistance": resistance,
+        "breakout_retest": breakout_retest,
         "channel": channel,
         "mstruct": mstruct,
         "range_pos": range_pos_txt,
@@ -8724,16 +8797,22 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
         volx = float(ta.get("rel_vol", 0.0) or 0.0)
         vwap = ta.get("vwap", "—")
         ch = ta.get("channel", "—")
-        pa = ta.get("structure", "—")
+        pa = ta.get("mstruct", ta.get("structure", "—"))
         pattern = ta.get("pattern", "—")
         sup = ta.get("support", "—")
         res = ta.get("resistance", "—")
+        br = ta.get("breakout_retest", "—")
+        eq_hi = ta.get("eq_hi", None)
+        eq_lo = ta.get("eq_lo", None)
+        sweep = ta.get("sweep", "")
         lines = [
             f"📊 TA score: {int(round(float(score))):d}/100 | Mode: {mode_txt}",
             f"RSI(5m): {rsi:.1f} | MACD hist(5m): {macd_hist:.4f}",
             f"ADX 30m/1h: {adx_30m:.1f}/{adx_1h:.1f} | ATR% (30m): {atr_pct:.2f}",
             f"BB: {bb} | Vol xAvg: {volx:.2f} | VWAP: {vwap}",
             f"Ch: {ch} | PA: {pa}",
+            f"Liquidity: EQH: {(_fmt_int_space(eq_hi) if eq_hi is not None else '—')} | EQL: {(_fmt_int_space(eq_lo) if eq_lo is not None else '—')} | Sweep(5m): {sweep or '—'}",
+            f"Breakout/Retest: {br}",
             f"Pattern: {pattern} | Support: {sup} | Resistance: {res}",
         ]
         trap_ok = bool(ta.get("trap_ok", True))
@@ -9057,6 +9136,61 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
 
     support, resistance = _nearest_levels(df1hi)
 
+    # ---------- Liquidity zones + sweep (SMC-lite) ----------
+    eq_hi = None
+    eq_lo = None
+    sweep_long = False
+    sweep_short = False
+    sweep_txt = "—"
+    try:
+        # Tolerance based on 30m ATR% (fallback to 0.2%)
+        atr_abs_30m = abs(float(entry)) * (abs(float(atr_pct)) / 100.0) if (entry and atr_pct == atr_pct) else (abs(float(entry)) * 0.002)
+        tol_liq = max(atr_abs_30m * 0.4, abs(float(entry)) * 0.001)
+
+        # Swing points on 1h (for stable EQ levels)
+        def _swing_points(_df: pd.DataFrame, left: int = 3, right: int = 3):
+            try:
+                if _df is None or getattr(_df, "empty", True) or len(_df) < (left + right + 20):
+                    return [], []
+                highs = _df["high"].astype(float).values
+                lows = _df["low"].astype(float).values
+                sh, sl = [], []
+                for i in range(left, len(_df) - right):
+                    h = highs[i]
+                    l = lows[i]
+                    if h == max(highs[i-left:i+right+1]):
+                        sh.append((i, float(h)))
+                    if l == min(lows[i-left:i+right+1]):
+                        sl.append((i, float(l)))
+                return sh, sl
+            except Exception:
+                return [], []
+
+        sh, sl = _swing_points(df1hi, left=3, right=3)
+        if len(sh) >= 2 and abs(sh[-1][1] - sh[-2][1]) <= tol_liq:
+            eq_hi = (sh[-1][1] + sh[-2][1]) / 2.0
+        if len(sl) >= 2 and abs(sl[-1][1] - sl[-2][1]) <= tol_liq:
+            eq_lo = (sl[-1][1] + sl[-2][1]) / 2.0
+
+        # Sweep detection on last ~30 candles 5m: wick through EQ + close back inside
+        recent5 = df5i.tail(30) if (df5i is not None and not getattr(df5i, "empty", True)) else None
+        if recent5 is not None and len(recent5) >= 5:
+            close_last = float(recent5["close"].astype(float).iloc[-1])
+            if eq_lo is not None:
+                low_min = float(recent5["low"].astype(float).min())
+                sweep_long = (low_min < float(eq_lo) - tol_liq * 0.15) and (close_last > float(eq_lo) + tol_liq * 0.05)
+            if eq_hi is not None:
+                high_max = float(recent5["high"].astype(float).max())
+                sweep_short = (high_max > float(eq_hi) + tol_liq * 0.15) and (close_last < float(eq_hi) - tol_liq * 0.05)
+
+        if dir_trend == "LONG":
+            sweep_txt = "SWEEP↑" if sweep_long else "—"
+        else:
+            sweep_txt = "SWEEP↓" if sweep_short else "—"
+    except Exception:
+        pass
+
+
     # Score / confidence: use unified TA score to avoid constant 100s
     ta_score = _ta_score(
         direction=dir_trend,
@@ -9072,6 +9206,14 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         pat_bias=pat_bias,
         atr_pct=atr_pct,
     )
+
+    # Liquidity sweep bonus (aligns with direction) — boosts quality, doesn't force entry by default
+    try:
+        if (dir_trend == "LONG" and sweep_long) or (dir_trend == "SHORT" and sweep_short):
+            ta_score = min(100, float(ta_score) + float(MID_LIQ_SWEEP_BONUS))
+    except Exception:
+        pass
+
     confidence = ta_score
 
     ta: Dict[str, Any] = {
@@ -9105,6 +9247,11 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "resistance": resistance,
         "channel": channel,
         "mstruct": mstruct,
+        "eq_hi": eq_hi,
+        "eq_lo": eq_lo,
+        "sweep_long": bool(sweep_long),
+        "sweep_short": bool(sweep_short),
+        "sweep": sweep_txt,
         "rsi_div": rsi_div,
         "ta_score": ta_score,
     }
@@ -12982,6 +13129,29 @@ class Backend:
                                             pass
                                         continue
 
+
+
+                            # 2b) Optional: require liquidity sweep in direction (SMC confirmation)
+                            if MID_REQUIRE_LIQ_SWEEP:
+                                try:
+                                    if direction == "LONG" and not bool(base_r.get("sweep_long", False)):
+                                        _mid_f_score += 1
+                                        _rej_add(sym, "liq_sweep_missing")
+                                        try:
+                                            self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, "liq_sweep_missing_long")
+                                        except Exception:
+                                            pass
+                                        continue
+                                    if direction == "SHORT" and not bool(base_r.get("sweep_short", False)):
+                                        _mid_f_score += 1
+                                        _rej_add(sym, "liq_sweep_missing")
+                                        try:
+                                            self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, "liq_sweep_missing_short")
+                                        except Exception:
+                                            pass
+                                        continue
+                                except Exception:
+                                    pass
                             if tp_policy == "R":
                                 risk = abs(entry-sl)
                                 if risk <= 0:
