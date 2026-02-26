@@ -14633,57 +14633,212 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             pass
 
         # Trading plan extras
-        # Entry zone should be built from key support/resistance + channel (instead of ATR band around price).
-        # LONG  -> buy the pullback near channel/support.
-        # SHORT -> sell the pullback near channel/resistance.
+        # Entry Zone (идеально для институционального входа) строим НЕ от ATR вокруг цены,
+        # а от зон спроса/предложения: Order Block + FVG + liquidity sweep + channel/support.
+        # После зоны обязательно показываем Trigger (подтверждение) и Invalidation (отмена).
         try:
             entry_lo = None
             entry_hi = None
+            entry_kind = "—"
+            entry_confluence = 0
+            entry_notes = []
 
             cs = float(chan_support) if chan_support is not None else None
             cm = float(chan_mid) if chan_mid is not None else None
             cr = float(chan_resist) if chan_resist is not None else None
             s1n = float(support1) if support1 is not None else None
+            s2n = float(support2) if support2 is not None else None
             r1n = float(resistance1) if resistance1 is not None else None
+            r2n = float(resistance2) if resistance2 is not None else None
 
-            # Fallback width in case channel range is tiny
+            # базовые допуски "рядом" (для confluence)
+            tol = max(atr_abs * 0.6, price * 0.002)
+
+            # fallback ширина зоны, чтобы отчёт никогда не ломался
             w_fallback = max(atr_abs * 0.25, price * 0.001)
 
-            if bias == "LONG" and cs is not None and cm is not None:
-                base = cs
-                if s1n is not None:
-                    base = max(base, s1n)
+            def _overlap(a_lo, a_hi, b_lo, b_hi):
+                lo = max(a_lo, b_lo)
+                hi = min(a_hi, b_hi)
+                return (lo, hi) if hi > lo else (None, None)
 
-                # zone width: a fraction of channel half-range, but not smaller than fallback
-                w = max(w_fallback, (cm - base) * 0.35)
-                entry_lo = max(0.0, base)
-                entry_hi = max(entry_lo, base + w)
-                # if price is below our hi (already deep), keep hi at least near price
-                if price == price:
-                    entry_hi = max(entry_hi, min(price, cm))
+            def _near(x, lo, hi, tol_):
+                if x is None:
+                    return False
+                return (lo - tol_) <= x <= (hi + tol_)
 
-            elif bias == "SHORT" and cr is not None and cm is not None:
-                top = cr
-                if r1n is not None:
-                    top = min(top, r1n)
+            def _clamp_zone(zlo, zhi):
+                zlo = max(0.0, float(zlo))
+                zhi = max(zlo, float(zhi))
+                return zlo, zhi
 
-                w = max(w_fallback, (top - cm) * 0.35)
-                entry_hi = max(0.0, top)
-                entry_lo = max(0.0, top - w)
+            # --- LONG: Demand zones ---
+            if bias == "LONG":
+                ob_ok = (ob_lo is not None and ob_hi is not None and ("спрос" in str(ob_side).lower()))
+                fvg_ok = (fvg_lo is not None and fvg_hi is not None and fvg_active is True and (str(fvg_side).lower().startswith("быч")))
+                ch_ok = (cs is not None and cm is not None and cm > cs)
 
-                # If current price is already above entry_lo, keep zone above/around price.
-                if price == price:
-                    entry_lo = max(entry_lo, min(price, entry_hi))
+                # 1) лучший вариант: OB + FVG overlap (узкая зона)
+                if ob_ok and fvg_ok:
+                    o_lo, o_hi = _overlap(float(ob_lo), float(ob_hi), float(fvg_lo), float(fvg_hi))
+                    if o_lo is not None:
+                        entry_lo, entry_hi = _clamp_zone(o_lo, o_hi)
+                        entry_kind = "OB+FVG"
+                        entry_notes.append("Order Block + FVG")
+                    else:
+                        # если не пересекаются — берём OB как базу (он сильнее)
+                        entry_lo, entry_hi = _clamp_zone(float(ob_lo), float(ob_hi))
+                        entry_kind = "OB"
+                        entry_notes.append("Order Block")
 
-            # Final fallback to ATR band if we could not build zone from levels/channel
-            if entry_lo is None or entry_hi is None or not (entry_hi > entry_lo):
-                entry_lo = max(0.0, price - atr_abs * 0.8)
-                entry_hi = max(0.0, price - atr_abs * 0.1)
+                elif ob_ok:
+                    entry_lo, entry_hi = _clamp_zone(float(ob_lo), float(ob_hi))
+                    entry_kind = "OB"
+                    entry_notes.append("Order Block")
+
+                elif fvg_ok:
+                    entry_lo, entry_hi = _clamp_zone(float(fvg_lo), float(fvg_hi))
+                    entry_kind = "FVG"
+                    entry_notes.append("FVG")
+
+                elif ch_ok:
+                    # зона от поддержки канала к середине (консервативно)
+                    base = cs
+                    # если Support1 выше поддержки канала — используем его (лучше)
+                    if s1n is not None:
+                        base = max(base, s1n)
+                    w = max(w_fallback, (cm - base) * 0.35)
+                    entry_lo, entry_hi = _clamp_zone(base, base + w)
+                    entry_kind = "CHANNEL"
+                    entry_notes.append("Support/Channel")
+
+                # fallback: ATR band (если ничего нет)
+                if entry_lo is None or entry_hi is None or not (entry_hi > entry_lo):
+                    entry_lo, entry_hi = _clamp_zone(price - atr_abs * 0.8, price - atr_abs * 0.1)
+                    entry_kind = "ATR"
+                    entry_notes.append("Fallback ATR")
+
+                # --- confluence scoring (0..5) ---
+                # OB присутствует (сильнейший фактор)
+                if ob_ok and _near((float(ob_lo)+float(ob_hi))/2.0, entry_lo, entry_hi, tol):
+                    entry_confluence += 2
+                # FVG рядом/внутри
+                if fvg_ok and _near((float(fvg_lo)+float(fvg_hi))/2.0, entry_lo, entry_hi, tol):
+                    entry_confluence += 1
+                # Support канала рядом с низом зоны
+                if cs is not None and abs(cs - entry_lo) <= tol:
+                    entry_confluence += 1
+                # Liquidity (Equal Lows) рядом
+                if _near(eq_lo, entry_lo, entry_hi, tol):
+                    entry_confluence += 1
+                # Pivot/S1 внутри/рядом
+                try:
+                    if _near(float(S1), entry_lo, entry_hi, tol) or _near(float(pivot), entry_lo, entry_hi, tol):
+                        entry_confluence += 1
+                except Exception:
+                    pass
+                entry_confluence = min(5, max(0, int(entry_confluence)))
+
+                # --- Trigger & Invalidation for LONG ---
+                trig_parts = []
+                trig_parts.append("BOS 5м вверх (закрытие выше локального swing-high)")
+                trig_parts.append(f"или reclaim зоны (закрытие 5м выше {_fmt_int_space(entry_hi)})")
+                trig_parts.append("и объём > 1.2x")
+                entry_trigger_txt = "Триггер входа: " + " + ".join(trig_parts)
+
+                inv_lvl = max(0.0, entry_lo - max(atr_abs * 0.15, price * 0.0008))
+                entry_inval_txt = f"Инвалидация: закрепление 5м ниже {_fmt_int_space(inv_lvl)}"
+
+                # Подгоняем SL под инвалидацию (SL должен быть ниже инвалидации)
+                try:
+                    sl = min(float(sl), inv_lvl)
+                except Exception:
+                    pass
+
+            # --- SHORT: Supply zones ---
+            else:
+                ob_ok = (ob_lo is not None and ob_hi is not None and ("предлож" in str(ob_side).lower()))
+                fvg_ok = (fvg_lo is not None and fvg_hi is not None and fvg_active is True and (str(fvg_side).lower().startswith("медв")))
+                ch_ok = (cr is not None and cm is not None and cr > cm)
+
+                if ob_ok and fvg_ok:
+                    o_lo, o_hi = _overlap(float(ob_lo), float(ob_hi), float(fvg_lo), float(fvg_hi))
+                    if o_lo is not None:
+                        entry_lo, entry_hi = _clamp_zone(o_lo, o_hi)
+                        entry_kind = "OB+FVG"
+                        entry_notes.append("Order Block + FVG")
+                    else:
+                        entry_lo, entry_hi = _clamp_zone(float(ob_lo), float(ob_hi))
+                        entry_kind = "OB"
+                        entry_notes.append("Order Block")
+
+                elif ob_ok:
+                    entry_lo, entry_hi = _clamp_zone(float(ob_lo), float(ob_hi))
+                    entry_kind = "OB"
+                    entry_notes.append("Order Block")
+
+                elif fvg_ok:
+                    entry_lo, entry_hi = _clamp_zone(float(fvg_lo), float(fvg_hi))
+                    entry_kind = "FVG"
+                    entry_notes.append("FVG")
+
+                elif ch_ok:
+                    top = cr
+                    if r1n is not None:
+                        top = min(top, r1n)
+                    w = max(w_fallback, (top - cm) * 0.35)
+                    entry_lo, entry_hi = _clamp_zone(top - w, top)
+                    entry_kind = "CHANNEL"
+                    entry_notes.append("Resistance/Channel")
+
+                if entry_lo is None or entry_hi is None or not (entry_hi > entry_lo):
+                    entry_lo, entry_hi = _clamp_zone(price + atr_abs * 0.1, price + atr_abs * 0.8)
+                    entry_kind = "ATR"
+                    entry_notes.append("Fallback ATR")
+
+                # confluence scoring
+                if ob_ok and _near((float(ob_lo)+float(ob_hi))/2.0, entry_lo, entry_hi, tol):
+                    entry_confluence += 2
+                if fvg_ok and _near((float(fvg_lo)+float(fvg_hi))/2.0, entry_lo, entry_hi, tol):
+                    entry_confluence += 1
+                if cr is not None and abs(cr - entry_hi) <= tol:
+                    entry_confluence += 1
+                if _near(eq_hi, entry_lo, entry_hi, tol):
+                    entry_confluence += 1
+                try:
+                    if _near(float(R1), entry_lo, entry_hi, tol) or _near(float(pivot), entry_lo, entry_hi, tol):
+                        entry_confluence += 1
+                except Exception:
+                    pass
+                entry_confluence = min(5, max(0, int(entry_confluence)))
+
+                trig_parts = []
+                trig_parts.append("BOS 5м вниз (закрытие ниже локального swing-low)")
+                trig_parts.append(f"или reject зоны (закрытие 5м ниже {_fmt_int_space(entry_lo)})")
+                trig_parts.append("и объём > 1.2x")
+                entry_trigger_txt = "Триггер входа: " + " + ".join(trig_parts)
+
+                inv_lvl = entry_hi + max(atr_abs * 0.15, price * 0.0008)
+                entry_inval_txt = f"Инвалидация: закрепление 5м выше {_fmt_int_space(inv_lvl)}"
+
+                try:
+                    sl = max(float(sl), inv_lvl)
+                except Exception:
+                    pass
+
         except Exception:
             entry_lo, entry_hi = price, price
-        entry_zone_txt = f"{_fmt_int_space(entry_lo)} – {_fmt_int_space(entry_hi)}"
+            entry_kind = "—"
+            entry_confluence = 0
+            entry_notes = []
+            entry_trigger_txt = "Триггер входа: —"
+            entry_inval_txt = "Инвалидация: —"
 
-        # RR to TP1/TP2
+        entry_zone_txt = f"{_fmt_int_space(entry_lo)} – {_fmt_int_space(entry_hi)}"
+        entry_quality_txt = f"Качество зоны (confluence): {entry_confluence}/5"
+        entry_kind_txt = f"Тип зоны: {entry_kind}" if entry_kind and entry_kind != "—" else "Тип зоны: —"
+        entry_notes_txt = ("Основание: " + ", ".join(entry_notes)) if entry_notes else "Основание: —"
+# RR to TP1/TP2
         rr1 = None
         rr2 = None
         try:
@@ -14830,6 +14985,11 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             "📍 Торговый план (Institutional)",
             "",
             f"Зона входа: {entry_zone_txt}",
+            f"{entry_kind_txt}",
+            f"{entry_quality_txt}",
+            f"{entry_notes_txt}",
+            f"{entry_trigger_txt}",
+            f"{entry_inval_txt}",
             "",
             "Stop Loss (на основе ATR + структуры):",
             f"SL: {sl_s}",
