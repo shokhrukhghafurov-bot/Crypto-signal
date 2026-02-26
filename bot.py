@@ -2781,7 +2781,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         await safe_edit(
             call.message,
             tr(uid, "analysis_prompt"),
-            menu_kb(uid),
+            None,  # no menu while waiting for ticker input
         )
         return
 
