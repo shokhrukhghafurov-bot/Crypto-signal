@@ -648,6 +648,12 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
             )
             # repeat last MID tick summary in logs so it doesn't get lost
             TASKS["mid-summary-hb"] = asyncio.create_task(mid_summary_heartbeat_loop(), name="mid-summary-hb")
+            # log once per minute: pending/expired/triggered + last tick age (explains 'why no signals')
+            try:
+                if hasattr(backend, "mid_status_summary_loop"):
+                    TASKS["mid-status"] = asyncio.create_task(backend.mid_status_summary_loop(), name="mid-status")
+            except Exception:
+                pass
         else:
             # Don't silently skip. This is exactly the bug user saw in logs.
             logger.error(
@@ -4983,7 +4989,13 @@ async def main() -> None:
         app.middlewares.append(cors_mw)
 
         async def health(_: web.Request) -> web.Response:
-            return web.json_response({"ok": True, "service": "crypto-signal"})
+            payload = {"ok": True, "service": "crypto-signal"}
+            try:
+                if hasattr(backend, "mid_status_snapshot"):
+                    payload["mid"] = await backend.mid_status_snapshot()
+            except Exception:
+                pass
+            return web.json_response(payload)
 
         # ---------------- AUTO-TRADE GLOBAL SETTINGS (pause/maintenance) ----------------
 
