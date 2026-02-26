@@ -11986,16 +11986,56 @@ async def mid_status_snapshot(self) -> dict:
 
         last_tick_ts = float(_iget("last_tick_ts", 0.0) or 0.0)
         last_tick_done_ts = float(_iget("last_tick_done_ts", 0.0) or 0.0)
+        started_ts = float(_iget("started_ts", 0.0) or 0.0)
+        try:
+            interval_sec = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45") or 45)
+        except Exception:
+            interval_sec = 45
+
+        # Task diagnostics (set in bot.py via backend._mid_scanner_task)
+        task_state = None
+        task_error = None
+        try:
+            t = getattr(self, "_mid_scanner_task", None)
+            if t is not None:
+                if t.cancelled():
+                    task_state = "CANCELLED"
+                elif t.done():
+                    task_state = "DONE"
+                    try:
+                        ex = t.exception()
+                        if ex is not None:
+                            task_error = f"{type(ex).__name__}: {ex}"
+                    except Exception:
+                        task_error = "exception_unavailable"
+                else:
+                    task_state = "RUNNING"
+        except Exception:
+            task_state = None
+
+        # Next tick estimate: if last tick never happened, base it on started_ts.
+        next_in = None
+        try:
+            if last_tick_ts:
+                next_in = max(0.0, float(interval_sec) - (now - float(last_tick_ts)))
+            elif started_ts:
+                next_in = max(0.0, float(interval_sec) - (now - float(started_ts)))
+        except Exception:
+            next_in = None
 
         return {
             "pending": pending_count,
+            "interval_sec": int(interval_sec),
             "setup_found_total": int(_iget("setup_found_total", 0) or 0),
             "pending_created_total": int(_iget("pending_created_total", 0) or 0),
             "pending_triggered_total": int(_iget("pending_triggered_total", 0) or 0),
             "pending_expired_total": int(_iget("pending_expired_total", 0) or 0),
+            "task_state": task_state,
+            "task_error": (str(task_error) if task_error else ""),
             "last_tick_ts": last_tick_ts,
             "last_tick_done_ts": last_tick_done_ts,
             "last_tick_age_sec": (now - last_tick_ts) if last_tick_ts else None,
+            "next_tick_in_sec": (None if next_in is None else float(next_in)),
             "last_tick_summary": str(_iget("last_tick_summary", "") or ""),
             "last_tick_setups": int(_iget("last_tick_setups", 0) or 0),
             "last_tick_pending_created": int(_iget("last_tick_pending_created", 0) or 0),
@@ -12018,13 +12058,16 @@ async def mid_status_summary_loop(self) -> None:
         try:
             snap = await self.mid_status_snapshot()
             logger.info(
-                "[mid][status] pending=%s setup_found=%s created=%s triggered=%s expired=%s last_tick_age=%s",
+                "[mid][status] task=%s pending=%s setup_found=%s created=%s triggered=%s expired=%s last_tick_age=%s next_tick_in=%s%s",
+                snap.get("task_state"),
                 snap.get("pending"),
                 snap.get("setup_found_total"),
                 snap.get("pending_created_total"),
                 snap.get("pending_triggered_total"),
                 snap.get("pending_expired_total"),
                 (None if snap.get("last_tick_age_sec") is None else int(float(snap.get("last_tick_age_sec") or 0))),
+                (None if snap.get("next_tick_in_sec") is None else int(float(snap.get("next_tick_in_sec") or 0))),
+                ("" if not (snap.get("task_error") or "").strip() else f" err={snap.get('task_error')}")
             )
         except Exception:
             logger.exception("[mid][status] summary loop error")
@@ -12292,6 +12335,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
     async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         tf_trigger, tf_mid, tf_trend = "5m", "30m", "1h"
 
+        # Initialize MID status dict early so /health and status logs can
+        # distinguish "not started yet" vs "crashed".
+        try:
+            st = getattr(self, "_mid_status", None)
+            if not isinstance(st, dict):
+                st = {}
+                setattr(self, "_mid_status", st)
+            st.setdefault("started_ts", time.time())
+        except Exception:
+            pass
+
         # --- MID candles market selection ---
         # IMPORTANT (production hardening):
         # User requested: "свечи берем только из SPOT и эти свечи для FUTURES тоже используем".
@@ -12333,6 +12387,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 st["last_tick_pending_created"] = 0
                 st["last_tick_emitted"] = 0
                 st["last_tick_summary"] = ""
+                try:
+                    logger.info("[mid] tick start interval=%ss", int(interval_sec))
+                except Exception:
+                    pass
                 start_scan = start_total
                 prefetch_elapsed = 0.0
                 # --- Candles diagnostics (per tick) ---
