@@ -596,6 +596,74 @@ async def _mid_trap_digest_loop() -> None:
         except Exception:
             pass
 
+
+def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_alert) -> None:
+    """Start MID scanner + optional MID digests in BOTH webhook and polling modes.
+
+    Fixes a production issue where MID_SCANNER_ENABLED=1 but MID loop is skipped,
+    and ensures trap digest is also enabled in webhook mode.
+    """
+    mid_enabled = os.getenv('MID_SCANNER_ENABLED', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+    if not mid_enabled:
+        return
+
+    # MID trap digest (optional)
+    try:
+        if hasattr(backend, 'set_mid_trap_sink'):
+            backend.set_mid_trap_sink(_mid_trap_note)
+        if (_error_bot and ERROR_BOT_ENABLED) and _MID_TRAP_DIGEST_ENABLED and _MID_TRAP_DIGEST_WINDOW_SEC > 0:
+            TASKS["mid-trap-digest"] = asyncio.create_task(_mid_trap_digest_loop(), name="mid-trap-digest")
+    except Exception as e:
+        logger.error("[mid][trap] failed to init trap digest: %s", e)
+
+    # MID scanner loop
+    try:
+        interval = int((os.getenv("MID_SCAN_INTERVAL_SECONDS", "").strip() or os.getenv("MID_SCAN_INTERVAL_SEC", "45").strip()) or 45)
+        top_n = int(os.getenv("MID_TOP_N", "70") or 70)
+
+        # Diagnostics: catch "imported wrong backend" cases
+        try:
+            import backend as _backend_mod
+            logger.info("[mid] backend module file=%s", getattr(_backend_mod, "__file__", "?"))
+        except Exception:
+            pass
+
+        logger.info(
+            "[mid] starting MID scanner (5m/30m/1h) interval=%ss top_n=%s has_method=%s",
+            interval, top_n, hasattr(backend, 'scanner_loop_mid')
+        )
+
+        if hasattr(backend, 'scanner_loop_mid'):
+            TASKS["mid-scanner"] = asyncio.create_task(
+                backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert),
+                name="mid-scanner",
+            )
+            # repeat last MID tick summary in logs so it doesn't get lost
+            TASKS["mid-summary-hb"] = asyncio.create_task(mid_summary_heartbeat_loop(), name="mid-summary-hb")
+        else:
+            # Don't silently skip. This is exactly the bug user saw in logs.
+            logger.error(
+                "MID_SCANNER_ENABLED=1 but Backend has no scanner_loop_mid. "
+                "Check deploy/import: backend.py not updated?"
+            )
+            return
+
+        # MID pending-entry trigger loop (emit only when price reaches entry + TA reconfirmed)
+        try:
+            if os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off"):
+                if hasattr(backend, "mid_pending_trigger_loop"):
+                    TASKS["mid-pending"] = asyncio.create_task(
+                        backend.mid_pending_trigger_loop(broadcast_signal),
+                        name="mid-pending",
+                    )
+                    _health_mark_ok("mid-pending")
+                    _attach_task_monitor("mid-pending", TASKS["mid-pending"])
+        except Exception as e:
+            logger.error("[mid][pending] failed to start trigger loop: %s", e)
+
+    except Exception as e:
+        logger.error("[mid] failed to start MID components: %s", e)
+
 class ErrorBotLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
@@ -5919,15 +5987,7 @@ async def main() -> None:
         if not is_primary:
             logger.warning("Webhook WORKER replica started: skipping background loops (scanner/track/outcomes).")
         else:
-            # --- MID trap digest ---
-            try:
-                backend.set_mid_trap_sink(_mid_trap_note)
-                if (_error_bot and ERROR_BOT_ENABLED) and _MID_TRAP_DIGEST_ENABLED and _MID_TRAP_DIGEST_WINDOW_SEC > 0:
-                    asyncio.create_task(_mid_trap_digest_loop())
-            except Exception:
-                pass
-
-            
+			# (MID trap digest is started inside _start_mid_components)
             # --- WS candles aggregator (production) ---
             ws_enabled = os.getenv('CANDLES_WS_ENABLED', '0').strip().lower() not in ('0','false','no','off')
             ws_role = os.getenv('WORKER_ROLE', '').strip().upper()
@@ -5978,27 +6038,8 @@ async def main() -> None:
             logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
             asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
 
-            # ⚡ MID TREND scanner
-            mid_enabled = os.getenv('MID_SCANNER_ENABLED', '1').strip().lower() not in ('0','false','no','off')
-            if mid_enabled:
-                if hasattr(backend, 'scanner_loop_mid'):
-                    logger.info("Starting MID scanner_loop (5m/30m/1h) interval=%ss top_n=%s", int((os.getenv("MID_SCAN_INTERVAL_SECONDS","").strip() or os.getenv("MID_SCAN_INTERVAL_SEC","45").strip()) or 45), int(os.getenv("MID_TOP_N","70")))
-                    asyncio.create_task(backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert))
-                    # MID pending-entry trigger loop (emit only when price reaches entry + TA reconfirmed)
-                    try:
-                        if os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0","false","no","off"):
-                            if hasattr(backend, "mid_pending_trigger_loop"):
-                                TASKS["mid-pending"] = asyncio.create_task(backend.mid_pending_trigger_loop(broadcast_signal), name="mid-pending")
-                                _health_mark_ok("mid-pending")
-                                _attach_task_monitor("mid-pending", TASKS["mid-pending"])
-                    except Exception as e:
-                        logger.error("[mid][pending] failed to start trigger loop: %s", e)
-
-                    # repeat last MID tick summary in logs so it doesn't get lost
-                    asyncio.create_task(mid_summary_heartbeat_loop())
-
-                else:
-                    logger.warning('MID_SCANNER_ENABLED=1 but Backend has no scanner_loop_mid; skipping')
+            # ⚡ MID TREND scanner + MID trap digest (works in webhook mode too)
+            _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
 
             logger.info("Starting signal_outcome_loop")
             asyncio.create_task(signal_outcome_loop())
@@ -6030,14 +6071,6 @@ async def main() -> None:
             pass
         await asyncio.Event().wait()
 
-    # --- MID trap digest ---
-    try:
-        backend.set_mid_trap_sink(_mid_trap_note)
-        if (_error_bot and ERROR_BOT_ENABLED) and _MID_TRAP_DIGEST_ENABLED and _MID_TRAP_DIGEST_WINDOW_SEC > 0:
-            asyncio.create_task(_mid_trap_digest_loop())
-    except Exception:
-        pass
-
     logger.info("Starting track_loop")
     if hasattr(backend, "track_loop"):
         asyncio.create_task(backend.track_loop(bot))
@@ -6045,19 +6078,9 @@ async def main() -> None:
         logger.warning("Backend has no track_loop; skipping")
     logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
-    # ⚡ MID TREND scanner (5m/30m/1h) - optional, does not affect the main scanner
-    mid_enabled = os.getenv('MID_SCANNER_ENABLED', '1').strip().lower() not in ('0','false','no','off')
-    if mid_enabled:
-        if hasattr(backend, 'scanner_loop_mid'):
-            logger.info("Starting MID scanner_loop (5m/30m/1h) interval=%ss top_n=%s", int(os.getenv('MID_SCAN_INTERVAL_SECONDS','45')), int(os.getenv('MID_TOP_N','70')))
-            asyncio.create_task(backend.scanner_loop_mid(broadcast_signal, broadcast_macro_alert))
-            # MID pending-entry trigger loop (emit only when price reaches entry + TA reconfirmed)
-            try:
-                if os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0","false","no","off"):
-                    if hasattr(backend, "mid_pending_trigger_loop"):
-                        asyncio.create_task(backend.mid_pending_trigger_loop(broadcast_signal))
-            except Exception as e:
-                logger.error("[mid][pending] failed to start trigger loop: %s", e)
+
+    # ⚡ MID TREND scanner + MID trap digest
+    _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
 
     logger.info("Starting signal_outcome_loop")
     asyncio.create_task(signal_outcome_loop())
