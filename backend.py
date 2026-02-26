@@ -13891,8 +13891,30 @@ def _tr_i18n(lang: str, key: str, **kwargs) -> str:
             return key
 
 def _fmt_int_space(x) -> str:
+    """Human-friendly price/level formatter.
+
+    Previously this formatted everything as an integer, which made low-priced
+    assets (e.g., PEPE at 0.0000...) display as 0. We keep the function name for
+    compatibility but format adaptively.
+    """
     try:
-        return f"{float(x):,.0f}".replace(",", " ")
+        v = float(x)
+        if not (v == v) or v in (float("inf"), float("-inf")):
+            return "—"
+
+        av = abs(v)
+        if av >= 1000:
+            s = f"{v:,.0f}"
+        elif av >= 1:
+            s = f"{v:,.2f}"
+        elif av >= 0.01:
+            s = f"{v:.4f}"
+        elif av >= 0.0001:
+            s = f"{v:.6f}"
+        else:
+            s = f"{v:.8f}"
+
+        return s.replace(",", " ")
     except Exception:
         return "—"
 
