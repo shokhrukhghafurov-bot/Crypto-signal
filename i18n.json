@@ -334,7 +334,8 @@
     "analysis_trend_strong_up": "🟢 Strong uptrend",
     "analysis_trend_up": "🟢 Uptrend",
     "analysis_trend_strong_down": "🔴 Strong downtrend",
-    "analysis_trend_pullback": "🟡 Pullback within uptrend"
+    "analysis_trend_pullback": "🟡 Pullback within uptrend",
+    "analysis_prompt": "🔍 Send a ticker to analyze (e.g., BTC, ETH, SOLUSDT)."
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -671,6 +672,7 @@
     "analysis_trend_strong_up": "🟢 Сильный восходящий",
     "analysis_trend_up": "🟢 Восходящий",
     "analysis_trend_strong_down": "🔴 Сильный нисходящий",
-    "analysis_trend_pullback": "🟡 Коррекция внутри восходящего тренда"
+    "analysis_trend_pullback": "🟡 Коррекция внутри восходящего тренда",
+    "analysis_prompt": "🔍 Напиши тикер для анализа (пример: BTC, ETH, SOLUSDT)."
   }
 }
