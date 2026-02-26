@@ -11712,6 +11712,396 @@ class Backend:
         m[symbol] = time.time()
 
 
+# ---------------- MID pending entry (wait for price to reach entry + re-confirm TA) ----------------
+
+def can_add_mid_pending(self, symbol: str, direction: str = "", market: str = "") -> bool:
+    """Cooldown for adding the same pending setup (prevents KV spam).
+
+    Keyed by symbol+direction+market so LONG and SHORT can coexist without blocking each other.
+    """
+    cooldown_min = int(os.getenv("MID_PENDING_COOLDOWN_MIN", "30") or 30)
+    m = getattr(self, "_last_pending_mid", None)
+    if m is None:
+        self._last_pending_mid = {}
+        m = self._last_pending_mid
+    k = f"{(market or '').upper()}:{(symbol or '').upper()}:{(direction or '').upper()}".strip(":")
+    if not k:
+        k = (symbol or "").upper()
+    ts = m.get(k)
+    return ts is None or (time.time() - float(ts)) >= cooldown_min * 60
+
+def mark_mid_pending(self, symbol: str, direction: str = "", market: str = "") -> None:
+    m = getattr(self, "_last_pending_mid", None)
+    if m is None:
+        self._last_pending_mid = {}
+        m = self._last_pending_mid
+    k = f"{(market or '').upper()}:{(symbol or '').upper()}:{(direction or '').upper()}".strip(":")
+    if not k:
+        k = (symbol or "").upper()
+    m[k] = time.time()
+
+def _mid_last_fvg_zone(df30i: pd.DataFrame) -> Optional[Tuple[str, float, float]]:
+    """Return last detected FVG zone on 30m: (kind 'BULL'/'BEAR', low, high)."""
+    try:
+        if df30i is None or df30i.empty:
+            return None
+        d = df30i.tail(220).reset_index(drop=True)
+        if len(d) < 20:
+            return None
+        h = d["high"].astype(float).values
+        l = d["low"].astype(float).values
+        last_zone = None
+        for i in range(2, len(d)):
+            # Bullish imbalance: current low above high two candles back
+            if l[i] > h[i - 2]:
+                last_zone = ("BULL", float(h[i - 2]), float(l[i]))
+            # Bearish imbalance: current high below low two candles back
+            elif h[i] < l[i - 2]:
+                last_zone = ("BEAR", float(h[i]), float(l[i - 2]))
+        return last_zone
+    except Exception:
+        return None
+
+def _linreg_channel_bounds(df: pd.DataFrame, *, window: int = 120, k: float = 2.0) -> Tuple[float, float]:
+    """Linear regression channel bounds at the last bar (lower, upper)."""
+    try:
+        if df is None or df.empty or len(df) < max(60, window // 2):
+            return (float("nan"), float("nan"))
+        d = df.tail(window).copy()
+        y = d["close"].astype(float).values
+        x = np.arange(len(y), dtype=float)
+        a, b = np.polyfit(x, y, 1)
+        y_hat = a * x + b
+        resid = y - y_hat
+        sd = float(np.std(resid))
+        mid = float(y_hat[-1])
+        lower = mid - float(k) * sd
+        upper = mid + float(k) * sd
+        return (float(lower), float(upper))
+    except Exception:
+        return (float("nan"), float("nan"))
+
+def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame, *, direction: str, entry: float) -> Tuple[Optional[Tuple[float, float]], str]:
+    """Build an 'entry zone' using OB/FVG/channel and guard against zones that are too wide.
+
+    Returns (zone(low,high) or None, source_label).
+    """
+    try:
+        diru = str(direction or "").upper()
+        if diru not in ("LONG", "SHORT"):
+            return (None, "none")
+
+        # indicators for ATR
+        df30i = _add_indicators(df30) if df30 is not None and not df30.empty else None
+        df1hi = _add_indicators(df1h) if df1h is not None and not df1h.empty else None
+
+        atr = None
+        try:
+            if df30i is not None and "atr" in df30i.columns:
+                atr = float(df30i["atr"].astype(float).iloc[-1])
+        except Exception:
+            atr = None
+        if atr is None or not math.isfinite(atr) or atr <= 0:
+            atr = float(entry) * 0.001  # small fallback
+
+        # Config: width caps
+        max_w_atr = float(os.getenv("MID_PENDING_ZONE_MAX_ATR", "0.60") or 0.60)
+        min_w_atr = float(os.getenv("MID_PENDING_ZONE_MIN_ATR", "0.06") or 0.06)
+        pad_atr = float(os.getenv("MID_PENDING_ZONE_PAD_ATR", "0.05") or 0.05)
+
+        max_w = max_w_atr * atr
+        min_w = min_w_atr * atr
+        pad = pad_atr * atr
+
+        candidates: list[tuple[Tuple[float,float], str]] = []
+
+        # 1) Order Block zone on 30m
+        try:
+            if df30i is not None:
+                ob_zone, ok = _mid_order_block(df30i, direction=diru, atr30=atr)
+                if ok and ob_zone:
+                    candidates.append(((float(ob_zone[0]), float(ob_zone[1])), "OB30"))
+        except Exception:
+            pass
+
+        # 2) FVG zone on 30m (directional)
+        try:
+            if df30i is not None:
+                z = _mid_last_fvg_zone(df30i)
+                if z:
+                    kind, lo, hi = z
+                    if (diru == "LONG" and kind == "BULL") or (diru == "SHORT" and kind == "BEAR"):
+                        candidates.append(((float(lo), float(hi)), f"FVG30:{kind}"))
+        except Exception:
+            pass
+
+        # 3) Channel band on 1h (use lower band for LONG, upper for SHORT)
+        try:
+            if df1hi is not None:
+                ch_k = float(os.getenv("MID_PENDING_CHANNEL_K", "2.0") or 2.0)
+                lo_b, hi_b = _linreg_channel_bounds(df1hi, window=int(os.getenv("MID_PENDING_CHANNEL_WIN","120") or 120), k=ch_k)
+                if math.isfinite(lo_b) and math.isfinite(hi_b) and lo_b > 0 and hi_b > 0:
+                    if diru == "LONG":
+                        candidates.append(((float(lo_b - pad), float(lo_b + max(min_w, pad))), "CH1H:LOW"))
+                    else:
+                        candidates.append(((float(hi_b - max(min_w, pad)), float(hi_b + pad)), "CH1H:HIGH"))
+        except Exception:
+            pass
+
+        if not candidates:
+            return (None, "none")
+
+        # Choose best candidate: closest to entry, then narrowest
+        def _score(c):
+            (lo, hi), src = c
+            mid = (lo + hi) / 2.0
+            dist = abs(mid - float(entry))
+            width = abs(hi - lo)
+            return (dist, width)
+
+        candidates = sorted(candidates, key=_score)
+        (lo, hi), src = candidates[0]
+        lo, hi = (float(min(lo, hi)), float(max(lo, hi)))
+        # pad
+        lo -= pad
+        hi += pad
+
+        width = hi - lo
+        if width > max_w:
+            return (None, "too_wide")
+        if width < min_w:
+            mid = (lo + hi) / 2.0
+            lo = mid - min_w / 2.0
+            hi = mid + min_w / 2.0
+
+        # Ensure entry is not far away from zone (avoid random far zone)
+        if abs(((lo + hi) / 2.0) - float(entry)) > max(2.5 * atr, float(entry) * 0.01):
+            return (None, "far")
+
+        return ((lo, hi), src)
+    except Exception:
+        return (None, "error")
+
+async def _mid_pending_load(self) -> list[dict]:
+    try:
+        st = await db_store.kv_get_json("mid_pending") or {}
+        items = st.get("items", [])
+        return items if isinstance(items, list) else []
+    except Exception:
+        return []
+
+async def _mid_pending_save(self, items: list[dict]) -> None:
+    try:
+        await db_store.kv_set_json("mid_pending", {"items": items})
+    except Exception:
+        pass
+
+async def add_mid_pending(self, rec: dict) -> None:
+    """Upsert pending record by key."""
+    try:
+        items = await self._mid_pending_load()
+        key = str(rec.get("key") or "").strip()
+        if not key:
+            return
+        out = []
+        replaced = False
+        for it in items:
+            try:
+                if str(it.get("key") or "") == key:
+                    out.append(rec)
+                    replaced = True
+                else:
+                    out.append(it)
+            except Exception:
+                continue
+        if not replaced:
+            out.append(rec)
+        # trim
+        max_items = int(os.getenv("MID_PENDING_MAX", "120") or 120)
+        if max_items > 0 and len(out) > max_items:
+            out = out[-max_items:]
+        await self._mid_pending_save(out)
+    except Exception:
+        pass
+
+async def remove_mid_pending(self, key: str) -> None:
+    try:
+        k = str(key or "").strip()
+        if not k:
+            return
+        items = await self._mid_pending_load()
+        out = [it for it in items if str(it.get("key") or "") != k]
+        await self._mid_pending_save(out)
+    except Exception:
+        pass
+
+async def mid_pending_trigger_loop(self, emit_signal_cb):
+    """Background loop: checks pending setups and emits a signal only when price reaches entry and TA is still confirmed."""
+    enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+    if not enabled:
+        return
+    poll = float(os.getenv("MID_PENDING_POLL_SEC", "5") or 5.0)
+    ttl_min = float(os.getenv("MID_PENDING_TTL_MIN", "60") or 60.0)
+    tol_atr = float(os.getenv("MID_PENDING_ENTRY_TOL_ATR", "0.15") or 0.15)
+    tol_pct = float(os.getenv("MID_PENDING_ENTRY_TOL_PCT", "0.0018") or 0.0018)
+
+    logger.info("[mid][pending] trigger loop started poll=%.2fs ttl=%.1fmin tol_atr=%.3f tol_pct=%.4f",
+                poll, ttl_min, tol_atr, tol_pct)
+
+    while True:
+        try:
+            items = await self._mid_pending_load()
+            now = time.time()
+            keep: list[dict] = []
+            for it in items:
+                try:
+                    sym = str(it.get("symbol") or "")
+                    market = str(it.get("market") or "SPOT").upper()
+                    direction = str(it.get("direction") or "").upper()
+                    entry0 = float(it.get("entry") or 0.0)
+                    src_ex = str(it.get("source_exchange") or "BINANCE").upper()
+                    created = float(it.get("created_ts") or 0.0) or now
+                    if not sym or entry0 <= 0:
+                        continue
+                    # expire
+                    if (now - created) > ttl_min * 60:
+                        continue
+
+                    # load candles (also gives fallback price)
+                    df5 = await self.load_candles(sym, "5m", market)
+                    df30 = await self.load_candles(sym, "30m", market)
+                    df1h = await self.load_candles(sym, "1h", market)
+                    if df5 is None or getattr(df5, "empty", True) or df30 is None or getattr(df30, "empty", True) or df1h is None or getattr(df1h, "empty", True):
+                        keep.append(it)
+                        continue
+
+                    # price (prefer same source exchange; fallback to df close)
+                    price = None
+                    try:
+                        if src_ex == "BINANCE":
+                            price = await self._fetch_binance_price("FUTURES" if market == "FUTURES" else "SPOT", sym)
+                        elif src_ex == "BYBIT":
+                            price = await self._fetch_bybit_price("FUTURES" if market == "FUTURES" else "SPOT", sym)
+                        elif src_ex == "OKX":
+                            price = await self._fetch_okx_price("FUTURES" if market == "FUTURES" else "SPOT", sym)
+                        elif src_ex == "MEXC":
+                            price = await _mexc_public_price(sym)
+                        elif src_ex == "GATEIO":
+                            price = await _gateio_public_price(sym)
+                    except Exception:
+                        price = None
+
+                    try:
+                        px_close = float(df5["close"].astype(float).iloc[-1])
+                        if price is None or not (float(price) > 0):
+                            price = px_close
+                    except Exception:
+                        keep.append(it)
+                        continue
+
+                    try:
+                        atr_abs = None
+                        if "atr" in df5.columns:
+                            atr_abs = float(df5["atr"].astype(float).iloc[-1])
+                        if (atr_abs is None or atr_abs <= 0) and ("atr" in df30.columns):
+                            atr_abs = float(df30["atr"].astype(float).iloc[-1])
+                        if atr_abs is None or atr_abs <= 0:
+                            atr_abs = float(price) * 0.001
+                    except Exception:
+                        atr_abs = float(price) * 0.001
+
+                    tol = max(float(atr_abs) * tol_atr, float(price) * tol_pct)
+
+                    # trigger when price is close enough to planned entry / entry zone
+                    entry_low = it.get("entry_low")
+                    entry_high = it.get("entry_high")
+                    use_zone = False
+                    try:
+                        if entry_low is not None and entry_high is not None:
+                            lo = float(entry_low)
+                            hi = float(entry_high)
+                            if lo > 0 and hi > 0 and hi >= lo:
+                                use_zone = True
+                    except Exception:
+                        use_zone = False
+
+                    if use_zone:
+                        if not (float(price) >= (lo - tol) and float(price) <= (hi + tol)):
+                            keep.append(it)
+                            continue
+                    else:
+                        if abs(float(price) - entry0) > tol:
+                            keep.append(it)
+                            continue
+
+                    # re-confirm TA at trigger moment
+                    ta = evaluate_on_exchange_mid_v2(df5, df30, df1h)
+                    if not ta:
+                        keep.append(it)
+                        continue
+                    if str(ta.get("direction") or "").upper() != direction:
+                        keep.append(it)
+                        continue
+                    if not bool(ta.get("trap_ok", True)):
+                        keep.append(it)
+                        continue
+
+                    min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
+                    if int(float(ta.get("confidence") or 0)) < int(min_conf):
+                        keep.append(it)
+                        continue
+
+                    # Emit final signal
+                    entry = float(ta.get("entry") or entry0)
+                    sl = float(ta.get("sl") or it.get("sl") or 0.0)
+                    tp1 = float(ta.get("tp1") or it.get("tp1") or 0.0)
+                    tp2 = float(ta.get("tp2") or it.get("tp2") or 0.0)
+                    rr = float(ta.get("rr") or it.get("rr") or 0.0)
+                    conf = int(float(ta.get("confidence") or it.get("confidence") or 0))
+
+                    conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "")
+                    if not conf_names:
+                        conf_names = str(src_ex)
+
+                    sig = Signal(
+                        signal_id=self.next_signal_id(),
+                        market=market,
+                        symbol=sym,
+                        direction=direction,
+                        timeframe=str(it.get("timeframe") or "5m/30m/1h"),
+                        entry=entry,
+                        sl=sl,
+                        tp1=tp1,
+                        tp2=tp2,
+                        rr=rr,
+                        confidence=conf,
+                        confirmations=conf_names,
+                        source_exchange=src_ex,
+                        available_exchanges=conf_names,
+                        risk_note=str(it.get("risk_note") or "ENTRY CONFIRMED"),
+                        ts=time.time(),
+                    )
+
+                    self.mark_emitted_mid(sym)
+                    self.last_signal = sig
+                    if sig.market == "SPOT":
+                        self.last_spot_signal = sig
+                    else:
+                        self.last_futures_signal = sig
+
+                    await emit_signal_cb(sig)
+                    logger.info("[mid][pending] EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, entry, float(price), tol)
+                    # emitted: do not keep
+                except Exception:
+                    keep.append(it)
+
+            await self._mid_pending_save(keep)
+        except Exception:
+            logger.exception("[mid][pending] loop error")
+
+        await asyncio.sleep(max(1.0, poll))
+
+
     # ---------------- MID trap/blocked digest (anti-spam analytics) ----------------
     def _mid_reason_key(self, reason: str) -> str:
         r = (reason or "").strip()
@@ -13905,16 +14295,59 @@ class Backend:
                             risk_note=risk_note,
                             ts=time.time(),
                             )
-                            self.mark_emitted_mid(sym)
-                            self.last_signal = sig
-                            if sig.market == "SPOT":
-                                self.last_spot_signal = sig
+                            # If MID_PENDING_ENABLED=1: save setup and emit ONLY when price reaches entry + TA reconfirmed.
+                            pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0","false","no","off")
+                            if pending_enabled:
+                                try:
+                                    if self.can_add_mid_pending(sym, direction=direction, market=market):
+                                        key = f"{market}:{sym}:{direction}"
+
+                                        # Build smarter entry zone from OB/FVG/Channel (optional)
+                                        z, z_src = _mid_build_entry_zone(df5, df30, df1h, direction=direction, entry=float(entry))
+                                        entry_low = float(z[0]) if z else None
+                                        entry_high = float(z[1]) if z else None
+
+                                        rec = {
+                                            "key": key,
+                                            "market": market,
+                                            "symbol": sym,
+                                            "direction": direction,
+                                            "timeframe": f"{tf_trigger}/{tf_mid}/{tf_trend}",
+                                            "entry": float(entry),
+                                            "entry_low": entry_low,
+                                            "entry_high": entry_high,
+                                            "entry_zone_src": str(z_src),
+                                            "sl": float(sl),
+                                            "tp1": float(tp1),
+                                            "tp2": float(tp2),
+                                            "rr": float(tp2_r if tp_policy=="R" else rr),
+                                            "confidence": int(round(conf)),
+                                            "confirmations": conf_names,
+                                            "source_exchange": best_name,
+                                            "available_exchanges": conf_names,
+                                            "risk_note": risk_note,
+                                            "created_ts": time.time(),
+                                            "min_confidence": int(os.getenv("MID_MIN_CONFIDENCE", "0") or 0),
+                                        }
+                                        await self.add_mid_pending(rec)
+                                        self.mark_mid_pending(sym, direction=direction, market=market)
+                                        _rej_add(sym, "pending_saved")
+                                    else:
+                                        _rej_add(sym, "pending_cooldown")
+                                except Exception:
+                                    _rej_add(sym, "pending_error")
+                                # do NOT emit now
                             else:
-                                self.last_futures_signal = sig
-                            await emit_signal_cb(sig)
-                            _mid_emitted += 1
-                            await asyncio.sleep(2)
-                            _rej_add(sym, "emitted")
+                                self.mark_emitted_mid(sym)
+                                self.last_signal = sig
+                                if sig.market == "SPOT":
+                                    self.last_spot_signal = sig
+                                else:
+                                    self.last_futures_signal = sig
+                                await emit_signal_cb(sig)
+                                _mid_emitted += 1
+                                await asyncio.sleep(2)
+                                _rej_add(sym, "emitted")
                 except Exception:
                     logger.exception("[mid] scanner_loop_mid error")
 
