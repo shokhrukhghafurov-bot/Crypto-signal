@@ -5202,6 +5202,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                       ema20_5m: float | None, bos_down_5m: bool, two_red_5m: bool, lower_highs_5m: bool,
                       bos_up_5m: bool, two_green_5m: bool, higher_lows_5m: bool,
                       last_vol: float, avg_vol: float, last_body: float, climax_recent_bars: int,
+                      market: str = "SPOT",
                       htf_dir_1h: str | None = None, htf_dir_30m: str | None = None, adx_30m: float | None = None) -> str | None:
     """Return human-readable MID BLOCKED reason (for logging + error-bot), or None if allowed."""
     try:
@@ -5213,6 +5214,48 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         rsi_short_min = MID_ULTRA_RSI_SHORT_MIN if MID_ULTRA_SAFE else MID_RSI_SHORT_MIN
         rsi_short_max = MID_ULTRA_RSI_SHORT_MAX if MID_ULTRA_SAFE else MID_RSI_SHORT_MAX
         confirm_body_min = MID_ULTRA_CONFIRM_CANDLE_BODY_ATR_MIN if MID_ULTRA_SAFE else MID_CONFIRM_CANDLE_BODY_ATR_MIN
+
+        # --- FUTURES-specific adaptive thresholds (optional) ---
+        mkt_u = (market or "SPOT").upper().strip()
+        fut_late_mult = 1.0
+        fut_vwap_mult = 1.0
+        fut_bounce_mult = 1.0
+        try:
+            if mkt_u == "FUTURES" and os.getenv("MID_FUT_ADAPT_FILTERS", "1").strip().lower() in ("1","true","yes","on"):
+                # Optional hard overrides (set >0 to take effect)
+                _le_fut = _env_float("MID_LATE_ENTRY_ATR_MAX_FUT", 0.0)
+                _vw_fut = _env_float("MID_VWAP_DIST_ATR_MAX_FUT", 0.0)
+                if _le_fut and _le_fut > 0:
+                    late_entry_max = min(late_entry_max, float(_le_fut)) if MID_ULTRA_SAFE else float(_le_fut)
+                if _vw_fut and _vw_fut > 0:
+                    vwap_dist_max = min(vwap_dist_max, float(_vw_fut)) if MID_ULTRA_SAFE else float(_vw_fut)
+
+                # Adaptive scaling by ADX (expansion/trending -> allow a bit more distance without blocking)
+                if adx_30m is not None and os.getenv("MID_FUT_ADAPT_BY_ADX", "1").strip().lower() in ("1","true","yes","on"):
+                    adx = float(adx_30m)
+                    adx_strong = _env_float("MID_FUT_ADX_STRONG", 30.0)
+                    adx_med = _env_float("MID_FUT_ADX_MED", 25.0)
+
+                    if adx >= adx_strong:
+                        fut_late_mult = _env_float("MID_FUT_LATE_MULT_STRONG", 1.15)
+                        fut_vwap_mult = _env_float("MID_FUT_VWAP_MULT_STRONG", 1.10)
+                        fut_bounce_mult = _env_float("MID_FUT_BOUNCE_MULT_STRONG", 1.10)
+                    elif adx >= adx_med:
+                        fut_late_mult = _env_float("MID_FUT_LATE_MULT_MED", 1.08)
+                        fut_vwap_mult = _env_float("MID_FUT_VWAP_MULT_MED", 1.06)
+                        fut_bounce_mult = _env_float("MID_FUT_BOUNCE_MULT_MED", 1.06)
+                    else:
+                        # In weak/choppy conditions keep it tighter to avoid noise.
+                        fut_late_mult = _env_float("MID_FUT_LATE_MULT_WEAK", 0.98)
+                        fut_vwap_mult = _env_float("MID_FUT_VWAP_MULT_WEAK", 0.98)
+                        fut_bounce_mult = _env_float("MID_FUT_BOUNCE_MULT_WEAK", 0.98)
+
+                late_entry_max *= float(fut_late_mult)
+                vwap_dist_max *= float(fut_vwap_mult)
+        except Exception:
+            mkt_u = (market or "SPOT").upper().strip()
+            fut_late_mult = fut_vwap_mult = fut_bounce_mult = 1.0
+
 
         # --- Adaptive MID filter thresholds by ATR% regime (optional) ---
         try:
@@ -5307,13 +5350,19 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
             if MID_ANTI_BOUNCE_ENABLED and atr_30m and atr_30m > 0:
                 # Prefer side-specific MAX if set; fall back to MID_ANTI_BOUNCE_ATR_MAX
                 bounce_atr_max = float(globals().get("MID_ANTI_BOUNCE_ATR_MAX", _env_float("MID_ANTI_BOUNCE_ATR_MAX", 1.8)))
+                # FUTURES-specific override (optional)
+                if mkt_u == "FUTURES":
+                    _fut_b = _env_float("MID_ANTI_BOUNCE_ATR_MAX_FUT", 0.0)
+                    if _fut_b and _fut_b > 0:
+                        bounce_atr_max = float(_fut_b)
+
                 _ab_short = _env_float("MID_ANTI_BOUNCE_SHORT_MAX", 0.0)
                 _ab_long  = _env_float("MID_ANTI_BOUNCE_LONG_MAX", 0.0)
                 bounce_short_max = float(_ab_short) if _ab_short and _ab_short > 0 else bounce_atr_max
                 bounce_long_max  = float(_ab_long)  if _ab_long  and _ab_long  > 0 else bounce_atr_max
                 bounce_scale = _mid_adapt_bounce_scale if '_mid_adapt_bounce_scale' in locals() else 1.0
-                bounce_short_max *= bounce_scale
-                bounce_long_max *= bounce_scale
+                bounce_short_max *= (bounce_scale * (fut_bounce_mult if 'fut_bounce_mult' in locals() else 1.0))
+                bounce_long_max *= (bounce_scale * (fut_bounce_mult if 'fut_bounce_mult' in locals() else 1.0))
 
                 if side.upper() == "SHORT":
                     dist_low_atr = (close - recent_low) / atr_30m
@@ -7834,7 +7883,7 @@ def _mid_order_block(df30i: pd.DataFrame, *, direction: str, atr30: float) -> Tu
         return (None, False)
 
 # ================== END MID institutional TA engines ==================
-def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame, symbol: str = "", diag: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame, symbol: str = "", diag: Optional[Dict[str, Any]] = None, market: str = "SPOT") -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
     Produces a result dict compatible with scanner_loop_mid and a rich TA block (like MAIN),
@@ -8413,6 +8462,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             avg_vol=avg_vol if not np.isnan(avg_vol) else 0.0,
             last_body=float(last_body),
             climax_recent_bars=int(climax_recent_bars),
+            market=market,
             htf_dir_1h=str(dir_trend),
             htf_dir_30m=str(dir_mid),
             adx_30m=float(adx30) if not np.isnan(adx30) else None,
@@ -13306,7 +13356,7 @@ class Backend:
                                             # Candles are available (non-empty + enough bars) on this venue.
                                             found_ok_candles = True
                                             _diag = {}
-                                            r = evaluate_on_exchange_mid(a, b, c, symbol=sym, diag=_diag)
+                                            r = evaluate_on_exchange_mid(a, b, c, symbol=sym, diag=_diag, market=mkt_u)
                                             if not r:
                                                 try:
                                                     _st = str(_diag.get("fail_stage") or "other")
