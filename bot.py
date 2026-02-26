@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import os
 import logging
@@ -1167,12 +1168,13 @@ def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     kb.button(text=tr(uid, "m_stats"), callback_data="menu:stats")
     kb.button(text=tr(uid, "m_spot"), callback_data="menu:spot")
     kb.button(text=tr(uid, "m_fut"), callback_data="menu:futures")
+    kb.button(text=tr(uid, "sig_btn_analyze"), callback_data="menu:analysis")
     # Hide Auto-trade button globally when auto-trade is paused (admin)
     if not bool(AUTOTRADE_BOT_GLOBAL.get("pause_autotrade")):
         kb.button(text=tr(uid, "m_autotrade"), callback_data="menu:autotrade")
     kb.button(text=tr(uid, "m_trades"), callback_data="trades:page:0")
     kb.button(text=tr(uid, "m_notify"), callback_data="menu:notify")
-    kb.adjust(2, 2, 2, 1)
+    kb.adjust(2, 2, 2, 2)
     return kb.as_markup()
 
 
@@ -1194,6 +1196,83 @@ def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
 from cryptography.fernet import Fernet, InvalidToken
 
 AUTOTRADE_INPUT: Dict[int, Dict[str, str]] = {}
+
+# One-shot TA analyze mode (enabled via menu button)
+ANALYZE_INPUT: Dict[int, bool] = {}
+
+
+def _normalize_symbol_input(user_text: str, known_symbols: Optional[List[str]] = None) -> Tuple[Optional[str], List[str], Optional[str]]:
+    """Normalize user ticker input for the Analyze button.
+
+    Returns: (symbol_or_none, suggestions, note)
+
+    Accepts:
+      - btc, BTC, BTCUSDT
+      - btc/usdt, btc-usdt, btc usdt
+
+    If known_symbols is provided, will validate and suggest closest matches.
+    """
+    if not user_text:
+        return None, [], None
+
+    raw0 = (user_text or "").strip()
+    raw = raw0.upper().strip()
+
+    # remove common separators then keep only alnum
+    raw = raw.replace("/", "").replace("-", "").replace(" ", "")
+    raw = re.sub(r"[^A-Z0-9]", "", raw)
+    raw = raw.replace("USDTUSDT", "USDT").replace("USDCUSDC", "USDC")
+
+    if not raw:
+        return None, [], None
+
+    # If user typed only base coin (BTC/ETH/SOL) -> assume USDT
+    if raw.endswith("USDT") or raw.endswith("USDC"):
+        symbol = raw
+    else:
+        symbol = raw + "USDT"
+
+    if not known_symbols:
+        note = None if symbol == raw else f"Нормализовано: {raw0} → {symbol}"
+        return symbol, [], note
+
+    known_set = set(known_symbols)
+    if symbol in known_set:
+        note = None if symbol == raw else f"Нормализовано: {raw0} → {symbol}"
+        return symbol, [], note
+
+    # Suggestions by prefix (fast)
+    base = symbol
+    if base.endswith("USDT"):
+        base = base[:-4]
+    elif base.endswith("USDC"):
+        base = base[:-4]
+
+    suggestions: List[str] = []
+    if len(base) >= 2:
+        suggestions = [s for s in known_symbols if s.startswith(base)][:5]
+
+    # Fuzzy fallback (handles typos like "bt" -> "BTCUSDT")
+    if not suggestions and len(base) >= 2:
+        base_map: Dict[str, str] = {}
+        for s in known_symbols:
+            b = s
+            if b.endswith("USDT"):
+                b = b[:-4]
+            elif b.endswith("USDC"):
+                b = b[:-4]
+            if b and b not in base_map:
+                base_map[b] = s
+
+        close = difflib.get_close_matches(base, list(base_map.keys()), n=5, cutoff=0.6)
+        suggestions = [base_map[c] for c in close if c in base_map][:5]
+
+    # If exactly one suggestion -> auto-pick
+    if len(suggestions) == 1:
+        picked = suggestions[0]
+        return picked, [], f"Использую ближайший тикер: {picked} (вместо {raw0})"
+
+    return None, suggestions, None
 
 # Per-user locks to prevent race conditions on rapid button presses / concurrent inputs
 _USER_LOCKS: Dict[int, asyncio.Lock] = {}
@@ -2160,6 +2239,7 @@ async def broadcast_signal(sig: Signal) -> None:
             ORIGINAL_SIGNAL_TEXT[(uid, sig.signal_id)] = _signal_text(uid, sig, autotrade_hint=at_hint)
             kb_u = InlineKeyboardBuilder()
             kb_u.button(text=tr(uid, "btn_opened"), callback_data=f"open:{sig.signal_id}")
+            kb_u.adjust(1)
             await safe_send(uid, _signal_text(uid, sig, autotrade_hint=at_hint), reply_markup=kb_u.as_markup())
 
             # Auto-trade: execute real orders asynchronously, without affecting broadcast.
@@ -2693,7 +2773,19 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         await safe_edit(call.message, txt, menu_kb(uid))
         return
 
-    # ---- LIVE SIGNALS ----
+    
+    # ---- ANALYZE TOKEN (TA) ----
+    if action == "analysis":
+        # Enable one-shot analyze mode: next text message will be treated as ticker to analyze
+        ANALYZE_INPUT[uid] = True
+        await safe_edit(
+            call.message,
+            tr(uid, "analysis_prompt"),
+            menu_kb(uid),
+        )
+        return
+
+# ---- LIVE SIGNALS ----
     if action in ("spot", "futures"):
         market = "SPOT" if action == "spot" else "FUTURES"
 
@@ -3265,6 +3357,81 @@ async def autotrade_input_handler(message: types.Message) -> None:
     if not uid:
         return
     async with _user_lock(uid):
+        # ---- one-shot TA analyze input ----
+        if ANALYZE_INPUT.pop(uid, False):
+            # Access check
+            access = await get_access_status(uid)
+            if access != "ok":
+                await message.answer(tr(uid, f"access_{access}"), reply_markup=menu_kb(uid))
+                return
+
+            text = (message.text or "").strip()
+            if not text:
+                await message.answer(tr(uid, "analysis_prompt"), reply_markup=menu_kb(uid))
+                return
+
+            # Get known symbols from running scanners (best-effort, no extra REST).
+            try:
+                known = backend.get_known_symbols(limit=5000)
+            except Exception:
+                known = []
+
+            # Cold-start fallback: if scanner caches are empty, fetch a larger USDT universe once.
+            # This is cached / rate-limited inside backend and only happens on user-triggered analysis.
+            if not known:
+                try:
+                    known = await backend.get_top_usdt_symbols(1500)
+                except Exception:
+                    known = []
+
+            symbol, suggestions, note = _normalize_symbol_input(text, known_symbols=known)
+
+            if not symbol:
+                # Ask again without forcing the user to press the Analyze button
+                ANALYZE_INPUT[uid] = True
+                if suggestions:
+                    sug_txt = "\n".join(f"• {s}" for s in suggestions)
+                    await message.answer(
+                        f"❌ Тикер не найден: {text}\n\nВозможно ты имел в виду:\n{sug_txt}\n\nНапиши тикер ещё раз (например BTC или BTCUSDT).",
+                        reply_markup=menu_kb(uid),
+                    )
+                else:
+                    await message.answer(
+                        f"❌ Тикер не найден: {text}\n\nНапиши тикер ещё раз (например BTC или BTCUSDT).",
+                        reply_markup=menu_kb(uid),
+                    )
+                return
+
+            # Send an immediate progress message so the user understands the bot is working.
+            # (Analysis still works only via the "Analyze" button; this message is shown after symbol is resolved.)
+            try:
+                await message.answer(f"⏳ Анализирую {symbol} ...")
+            except Exception:
+                # If Telegram rejects the send (rare), continue with analysis anyway.
+                pass
+
+            try:
+                report = await backend.analyze_symbol_institutional(symbol, market="FUTURES", lang=get_lang(uid))
+            except Exception as e:
+                logger.exception("analysis failed for %s", symbol)
+                msg = tr(uid, "analysis_error") if ("analysis_error" in I18N.get(get_lang(uid), {})) else "Ошибка анализа. Попробуй позже."
+                if _is_admin(uid):
+                    msg += f"\n\nERR: {type(e).__name__}: {e}"
+                await message.answer(msg, reply_markup=menu_kb(uid))
+                return
+
+            # If we auto-normalized/auto-picked, prepend a small hint
+            if note:
+                report = f"_{note}_\n\n" + str(report)
+
+            # Telegram Markdown (classic)
+            try:
+                await message.answer(report, parse_mode="Markdown", reply_markup=menu_kb(uid))
+            except Exception:
+                # Fallback without parse_mode if Telegram rejects formatting
+                await message.answer(report.replace("**", ""), reply_markup=menu_kb(uid))
+            return
+
         state = AUTOTRADE_INPUT.get(uid)
         if not state:
             return
@@ -5849,3 +6016,11 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+# ===============================
+# AUTO SYMBOL ANALYSIS HANDLER
+# ===============================
+
+
+
