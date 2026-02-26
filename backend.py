@@ -15169,7 +15169,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         spike_txt = "Да" if (isinstance(vol_spike, str) and ("spike" in vol_spike.lower() or "всплеск" in vol_spike.lower() or "⚡" in vol_spike)) else "Нет"
 
         # Breakout/retest status for the header line
-        status_txt = ("Нет" if str(lang).startswith("ru") else "None")
+        status_txt = "—"
         try:
             b = (brk or "").lower()
             if "ретест" in b or "retest" in b:
@@ -15331,6 +15331,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             entry_kind = "—"
             entry_confluence = 0
             entry_notes = []
+            inv_lvl_out = None  # for entry status
 
             cs = float(chan_support) if chan_support is not None else None
             cm = float(chan_mid) if chan_mid is not None else None
@@ -15459,6 +15460,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
                     entry_trigger_txt = "Триггер входа: " + " + ".join(trig_parts)
 
                 inv_lvl = max(0.0, entry_lo - max(atr_abs * 0.15, price * 0.0008))
+                inv_lvl_out = float(inv_lvl)
                 entry_inval_txt = f"Инвалидация: закрепление 5м ниже {_fmt_int_space(inv_lvl)}"
 
                 # Подгоняем SL под инвалидацию (SL должен быть ниже инвалидации)
@@ -15536,6 +15538,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
                     entry_trigger_txt = "Триггер входа: " + " + ".join(trig_parts)
 
                 inv_lvl = entry_hi + max(atr_abs * 0.15, price * 0.0008)
+                inv_lvl_out = float(inv_lvl)
                 entry_inval_txt = f"Инвалидация: закрепление 5м выше {_fmt_int_space(inv_lvl)}"
 
                 try:
@@ -15544,6 +15547,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
                     pass
 
         except Exception:
+            inv_lvl_out = None
             entry_lo, entry_hi = price, price
             entry_kind = "—"
             entry_confluence = 0
@@ -15552,106 +15556,53 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             entry_trigger_txt = "Триггер входа: —"
             entry_inval_txt = "Инвалидация: —"
 
+        # ---- Entry status (READY / WAIT / CONFIRMED / INVALID) ----
+        entry_status = "WAIT"
+        try:
+            p_now = float(price)
+            zlo = float(entry_lo)
+            zhi = float(entry_hi)
+            inv = inv_lvl_out if (inv_lvl_out is not None) else None
+
+            # invalidation check first
+            if inv is not None:
+                if bias == "LONG" and p_now <= float(inv):
+                    entry_status = "INVALID"
+                elif bias == "SHORT" and p_now >= float(inv):
+                    entry_status = "INVALID"
+
+            if entry_status != "INVALID":
+                in_zone = (min(zlo, zhi) <= p_now <= max(zlo, zhi))
+                entry_status = "READY" if in_zone else "WAIT"
+
+                # "CONFIRMED" only when we're in zone AND confirmations are present
+                try:
+                    sweep_ok = bool(sweep_long) if bias == "LONG" else bool(sweep_short)
+                except Exception:
+                    sweep_ok = False
+                try:
+                    vol_ok = float(vol_rel) >= 1.2
+                except Exception:
+                    vol_ok = False
+                try:
+                    dir_ok = (("↑" in str(brk)) if bias == "LONG" else ("↓" in str(brk)))
+                except Exception:
+                    dir_ok = False
+
+                if entry_status == "READY" and sweep_ok and vol_ok and dir_ok:
+                    entry_status = "CONFIRMED"
+        except Exception:
+            entry_status = "WAIT"
+
+        # Human text via i18n (ru/en)
+        entry_status_label = _tr_i18n(lang, "lbl_entry_status")
+        entry_status_txt = _tr_i18n(lang, f"entry_status_{str(entry_status).lower()}")
+        entry_status_line = f"{entry_status_label}: {entry_status_txt}"
 
         entry_zone_txt = f"{_fmt_int_space(entry_lo)} – {_fmt_int_space(entry_hi)}"
         entry_quality_txt = f"Качество зоны (confluence): {entry_confluence}/5"
         entry_kind_txt = f"Тип зоны: {entry_kind}" if entry_kind and entry_kind != "—" else "Тип зоны: —"
         entry_notes_txt = ("Основание: " + ", ".join(entry_notes)) if entry_notes else "Основание: —"
-        # ---------- ENTRY STATUS (WAIT / READY / CONFIRMED / INVALID) ----------
-        # Meaning:
-        #   WAIT      -> price is not in entry zone yet (monitor only)
-        #   READY     -> price is inside entry zone (watch for confirmation)
-        #   CONFIRMED -> sweep + BOS + reclaim + volume confirmation present
-        #   INVALID   -> invalidation level breached (setup is broken)
-        entry_status = "WAIT"
-        try:
-            p_now = float(price)
-            lo = float(entry_lo)
-            hi = float(entry_hi)
-            inv = float(inv_lvl) if inv_lvl is not None else None
-
-            last5_close = None
-            try:
-                if df5 is not None and (not getattr(df5, "empty", True)) and "close" in df5.columns:
-                    last5_close = float(df5["close"].astype(float).iloc[-1])
-            except Exception:
-                last5_close = None
-
-            # Setup invalid?
-            if inv is not None:
-                if str(bias).upper() == "LONG" and p_now <= inv:
-                    entry_status = "INVALID"
-                elif str(bias).upper() == "SHORT" and p_now >= inv:
-                    entry_status = "INVALID"
-
-            if entry_status != "INVALID":
-                in_zone = (p_now >= min(lo, hi) and p_now <= max(lo, hi))
-                if in_zone:
-                    entry_status = "READY"
-                else:
-                    entry_status = "WAIT"
-
-                # Confirmation check (only meaningful when not invalid)
-                bos_up = False
-                bos_dn = False
-                try:
-                    se = (smc_event or "")
-                    se_l = str(se).lower()
-                    if "bos" in se_l:
-                        bos_up = ("↑" in str(se)) or ("вверх" in se_l) or ("up" in se_l)
-                        bos_dn = ("↓" in str(se)) or ("вниз" in se_l) or ("down" in se_l)
-                except Exception:
-                    pass
-
-                reclaim_ok = False
-                try:
-                    if last5_close is not None:
-                        if str(bias).upper() == "LONG":
-                            reclaim_ok = last5_close >= hi
-                        else:
-                            reclaim_ok = last5_close <= lo
-                except Exception:
-                    pass
-
-                vol_ok = False
-                try:
-                    vol_ok = float(vol_rel) >= 1.2
-                except Exception:
-                    vol_ok = False
-
-                sweep_ok = False
-                try:
-                    if str(bias).upper() == "LONG":
-                        sweep_ok = bool(sweep_long)
-                    else:
-                        sweep_ok = bool(sweep_short)
-                except Exception:
-                    sweep_ok = False
-
-                bos_ok = bos_up if str(bias).upper() == "LONG" else bos_dn
-
-                if sweep_ok and bos_ok and reclaim_ok and vol_ok:
-                    entry_status = "CONFIRMED"
-        except Exception:
-            entry_status = "WAIT"
-
-        def _entry_status_word(lang: str, st: str) -> str:
-            st = (st or "WAIT").upper()
-            # Prefer i18n keys (so RU/EN are consistent)
-            key = {
-                "WAIT": "entry_status_wait",
-                "READY": "entry_status_ready",
-                "CONFIRMED": "entry_status_confirmed",
-                "INVALID": "entry_status_invalid",
-            }.get(st, "entry_status_wait")
-            try:
-                return _tr_i18n(lang, key)
-            except Exception:
-                if str(lang).startswith("ru"):
-                    return {"WAIT":"WAIT (ждать)","READY":"READY (в зоне)","CONFIRMED":"CONFIRMED (вход)","INVALID":"INVALID (сломано)"}.get(st, "WAIT")
-                return st
-
-        entry_status_txt = f"{_tr_i18n(lang, 'entry_status_label')}: {_entry_status_word(lang, entry_status)}"
 # RR to TP1/TP2
         rr1 = None
         rr2 = None
@@ -15799,7 +15750,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             line,
             "📍 Торговый план (Institutional)",
             "",
-            entry_status_txt,
+            f"{entry_status_line}",
             f"Зона входа: {entry_zone_txt}",
             f"{entry_kind_txt}",
             f"{entry_quality_txt}",
@@ -15892,6 +15843,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             "",
             "## 🧾 Trading Plan",
             "",
+            f"{entry_status_line}",
             f"Side: {bias}",
             f"Entry: {entry_s}",
             f"SL: {sl_s}",
