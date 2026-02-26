@@ -991,12 +991,15 @@ async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: 
 async def init_db() -> None:
     """Init Postgres pool and ensure required columns exist."""
     global pool
+    # Pool sizing must be defined regardless of DATABASE_URL presence.
+    # (Previously min_size was accidentally placed after a `return`, causing
+    # UnboundLocalError when DATABASE_URL is set.)
+    min_size = int(os.getenv("DB_POOL_MIN", "1"))
+    max_size = int(os.getenv("DB_POOL_MAX", "10"))
     if not DATABASE_URL:
         # Allow running without Postgres locally, but notifications will be disabled.
         pool = None
         return
-        min_size = int(os.getenv("DB_POOL_MIN", "1"))
-    max_size = int(os.getenv("DB_POOL_MAX", "10"))
     acquire_timeout = float(os.getenv("DB_POOL_ACQUIRE_TIMEOUT_SEC", "25"))
     command_timeout = float(os.getenv("DB_COMMAND_TIMEOUT_SEC", "30"))
     init_retries = int(os.getenv("DB_INIT_RETRIES", "8"))
