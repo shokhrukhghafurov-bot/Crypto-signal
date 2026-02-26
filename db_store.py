@@ -24,6 +24,15 @@ def get_pool() -> asyncpg.Pool:
     return _pool
 
 
+
+def _db_acquire_timeout() -> float:
+    """Pool acquire timeout (seconds). Railway Postgres can have transient stalls."""
+    try:
+        v = float(os.getenv("DB_ACQUIRE_TIMEOUT_SEC", os.getenv("DB_POOL_ACQUIRE_TIMEOUT_SEC", "25")) or 25)
+    except Exception:
+        v = 25.0
+    return max(5.0, min(180.0, float(v)))
+
 async def ensure_users_table() -> None:
     """Create users table for fresh installations (new Postgres).
 
@@ -858,7 +867,7 @@ async def get_trade_by_id(user_id: int, trade_id: int) -> Optional[Dict[str, Any
 
 async def list_active_trades(limit: int = 500) -> List[Dict[str, Any]]:
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         rows = await conn.fetch(
             """
             SELECT t.id, t.user_id, t.signal_id, t.market, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
@@ -1602,7 +1611,7 @@ async def set_signal_bot_settings(*, pause_signals: bool, maintenance_mode: bool
 async def get_autotrade_bot_settings() -> Dict[str, Any]:
     """Get auto-trade global settings."""
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         try:
             row = await conn.fetchrow(
                 "SELECT pause_autotrade, maintenance_mode, updated_at FROM autotrade_bot_settings WHERE id=1"
@@ -2315,7 +2324,7 @@ async def claim_open_autotrade_positions(*, owner: str, limit: int = 200, lease_
     if not own:
         own = "worker"
 
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         # One statement, protected by row locks.
         rows = await conn.fetch(
             """
