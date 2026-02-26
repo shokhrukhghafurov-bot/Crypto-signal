@@ -636,6 +636,14 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
             or getattr(backend, 'scanner_mid_loop', None)
         )
 
+        # If a compatibility stub is present, treat as missing implementation.
+        try:
+            _mid_name = getattr(mid_loop, '__name__', '')
+            if _mid_name == '_missing_scanner_loop_mid':
+                mid_loop = None
+        except Exception:
+            pass
+
         logger.info(
             "[mid] starting MID scanner (5m/30m/1h) interval=%ss top_n=%s has_method=%s",
             interval, top_n, callable(mid_loop)
