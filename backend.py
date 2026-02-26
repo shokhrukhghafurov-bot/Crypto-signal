@@ -14657,6 +14657,23 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             # fallback ширина зоны, чтобы отчёт никогда не ломался
             w_fallback = max(atr_abs * 0.25, price * 0.001)
 
+            # liquidity sweep detection (последние ~30 свечей 5м)
+            sweep_long = False
+            sweep_short = False
+            try:
+                recent = df5.tail(30)
+                if eq_lo is not None and "low" in recent.columns and "close" in recent.columns:
+                    low_min = float(recent["low"].astype(float).min())
+                    close_last = float(recent["close"].astype(float).iloc[-1])
+                    sweep_long = (low_min < float(eq_lo) - tol * 0.15) and (close_last > float(eq_lo) + tol * 0.05)
+                if eq_hi is not None and "high" in recent.columns and "close" in recent.columns:
+                    high_max = float(recent["high"].astype(float).max())
+                    close_last = float(recent["close"].astype(float).iloc[-1])
+                    sweep_short = (high_max > float(eq_hi) + tol * 0.15) and (close_last < float(eq_hi) - tol * 0.05)
+            except Exception:
+                pass
+
+
             def _overlap(a_lo, a_hi, b_lo, b_hi):
                 lo = max(a_lo, b_lo)
                 hi = min(a_hi, b_hi)
@@ -14740,11 +14757,17 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
                 entry_confluence = min(5, max(0, int(entry_confluence)))
 
                 # --- Trigger & Invalidation for LONG ---
+                # Обязательное подтверждение: Liquidity sweep снизу (Equal Lows) + возврат выше уровня
+                entry_sweep_txt = "Liquidity sweep (5м): " + ("Да" if sweep_long else "Нет")
                 trig_parts = []
+                trig_parts.append("Liquidity sweep снизу (Equal Lows) + reclaim")
                 trig_parts.append("BOS 5м вверх (закрытие выше локального swing-high)")
-                trig_parts.append(f"или reclaim зоны (закрытие 5м выше {_fmt_int_space(entry_hi)})")
-                trig_parts.append("и объём > 1.2x")
-                entry_trigger_txt = "Триггер входа: " + " + ".join(trig_parts)
+                trig_parts.append(f"reclaim зоны (закрытие 5м выше {_fmt_int_space(entry_hi)})")
+                trig_parts.append("объём > 1.2x")
+                if not sweep_long:
+                    entry_trigger_txt = "Триггер входа: СНАЧАЛА " + trig_parts[0] + " (сейчас: Нет), затем " + " + ".join(trig_parts[1:])
+                else:
+                    entry_trigger_txt = "Триггер входа: " + " + ".join(trig_parts)
 
                 inv_lvl = max(0.0, entry_lo - max(atr_abs * 0.15, price * 0.0008))
                 entry_inval_txt = f"Инвалидация: закрепление 5м ниже {_fmt_int_space(inv_lvl)}"
@@ -14812,11 +14835,16 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
                     pass
                 entry_confluence = min(5, max(0, int(entry_confluence)))
 
+                entry_sweep_txt = "Liquidity sweep (5м): " + ("Да" if sweep_short else "Нет")
                 trig_parts = []
+                trig_parts.append("Liquidity sweep сверху (Equal Highs) + reject")
                 trig_parts.append("BOS 5м вниз (закрытие ниже локального swing-low)")
-                trig_parts.append(f"или reject зоны (закрытие 5м ниже {_fmt_int_space(entry_lo)})")
-                trig_parts.append("и объём > 1.2x")
-                entry_trigger_txt = "Триггер входа: " + " + ".join(trig_parts)
+                trig_parts.append(f"reject зоны (закрытие 5м ниже {_fmt_int_space(entry_lo)})")
+                trig_parts.append("объём > 1.2x")
+                if not sweep_short:
+                    entry_trigger_txt = "Триггер входа: СНАЧАЛА " + trig_parts[0] + " (сейчас: Нет), затем " + " + ".join(trig_parts[1:])
+                else:
+                    entry_trigger_txt = "Триггер входа: " + " + ".join(trig_parts)
 
                 inv_lvl = entry_hi + max(atr_abs * 0.15, price * 0.0008)
                 entry_inval_txt = f"Инвалидация: закрепление 5м выше {_fmt_int_space(inv_lvl)}"
@@ -14831,8 +14859,10 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             entry_kind = "—"
             entry_confluence = 0
             entry_notes = []
+            entry_sweep_txt = "Liquidity sweep (5м): —"
             entry_trigger_txt = "Триггер входа: —"
             entry_inval_txt = "Инвалидация: —"
+
 
         entry_zone_txt = f"{_fmt_int_space(entry_lo)} – {_fmt_int_space(entry_hi)}"
         entry_quality_txt = f"Качество зоны (confluence): {entry_confluence}/5"
@@ -14948,6 +14978,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             "💧 Зоны ликвидности:",
             f"Equal Highs (ликвидность сверху): {_fmt_int_space(eq_hi)}" if eq_hi is not None else "Equal Highs (ликвидность сверху): —",
             f"Equal Lows (ликвидность снизу): {_fmt_int_space(eq_lo)}" if eq_lo is not None else "Equal Lows (ликвидность снизу): —",
+            entry_sweep_txt,
             "",
             line,
             "🏦 Smart Money анализ (SMC)",
