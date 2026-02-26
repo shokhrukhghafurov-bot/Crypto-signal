@@ -3633,7 +3633,17 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
     # Best-effort; never crash.
     while True:
         try:
-            rows = await db_store.claim_open_autotrade_positions(owner=manager_worker_id, limit=manager_batch, lease_sec=manager_lease_sec)
+            try:
+                rows = await db_store.claim_open_autotrade_positions(owner=manager_worker_id, limit=manager_batch, lease_sec=manager_lease_sec)
+            except (TimeoutError, asyncio.TimeoutError) as e:
+                logger.warning("[autotrade] DB timeout while claiming positions (%s). Backing off.", e)
+                await asyncio.sleep(float(os.getenv("DB_BACKOFF_SEC", "5") or 5))
+                continue
+            except Exception as e:
+                logger.warning("[autotrade] DB error while claiming positions (%s). Backing off.", e)
+                await asyncio.sleep(float(os.getenv("DB_BACKOFF_SEC", "5") or 5))
+                continue
+
             for r in rows:
                 rid = int((r or {}).get('id') or 0)
                 # Refresh lease so other replicas won't steal it mid-processing.
@@ -10898,9 +10908,15 @@ class Backend:
                 pass
             try:
                 rows = await db_store.list_active_trades(limit=500)
+            except (TimeoutError, asyncio.TimeoutError) as e:
+                # DB transient stall: don't spam stacktraces, just back off.
+                logger.warning("track_loop: DB timeout (%s). Backing off.", e)
+                rows = []
+                await asyncio.sleep(float(os.getenv("DB_BACKOFF_SEC", "5") or 5))
             except Exception:
                 logger.exception("track_loop: failed to load active trades from DB")
                 rows = []
+                await asyncio.sleep(float(os.getenv("DB_BACKOFF_SEC", "5") or 5))
 
             for row in rows:
                 try:
