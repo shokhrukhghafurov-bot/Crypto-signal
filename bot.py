@@ -989,61 +989,20 @@ async def _status_autorefresh(uid: int, chat_id: int, message_id: int, seconds: 
 # ---------------- DB helpers ----------------
 
 async def init_db() -> None:
-    """Init Postgres pool and ensure required columns exist.
-
-    Fix: make DB connection resilient on Railway (transient timeouts / cold-start / network hiccups).
-    Tunable via env:
-      DB_POOL_MIN (default 1)
-      DB_POOL_MAX (default 10)
-      DB_POOL_ACQUIRE_TIMEOUT_SEC (default 25)
-      DB_COMMAND_TIMEOUT_SEC (default 30)
-      DB_INIT_RETRIES (default 8)
-      DB_INIT_RETRY_BASE_SEC (default 0.8)
-    """
+    """Init Postgres pool and ensure required columns exist."""
     global pool
     if not DATABASE_URL:
         # Allow running without Postgres locally, but notifications will be disabled.
         pool = None
         return
-
-    # Pool sizing
-    try:
-        min_size = int(os.getenv("DB_POOL_MIN", "1") or 1)
-    except Exception:
-        min_size = 1
-    try:
-        max_size = int(os.getenv("DB_POOL_MAX", "10") or 10)
-    except Exception:
-        max_size = 10
-    min_size = max(1, min(10, min_size))
-    max_size = max(min_size, min(30, max_size))
-
-    # Timeouts
-    try:
-        acquire_timeout = float(os.getenv("DB_POOL_ACQUIRE_TIMEOUT_SEC", "25") or 25)
-    except Exception:
-        acquire_timeout = 25.0
-    try:
-        command_timeout = float(os.getenv("DB_COMMAND_TIMEOUT_SEC", "30") or 30)
-    except Exception:
-        command_timeout = 30.0
-    acquire_timeout = max(5.0, min(120.0, acquire_timeout))
-    command_timeout = max(5.0, min(180.0, command_timeout))
-
-    # Retry init (DB may be sleeping / provisioning)
-    try:
-        retries = int(os.getenv("DB_INIT_RETRIES", "8") or 8)
-    except Exception:
-        retries = 8
-    retries = max(1, min(30, retries))
-    try:
-        base = float(os.getenv("DB_INIT_RETRY_BASE_SEC", "0.8") or 0.8)
-    except Exception:
-        base = 0.8
-    base = max(0.2, min(5.0, base))
-
-    last_err: Exception | None = None
-    for attempt in range(1, retries + 1):
+        min_size = int(os.getenv("DB_POOL_MIN", "1"))
+    max_size = int(os.getenv("DB_POOL_MAX", "10"))
+    acquire_timeout = float(os.getenv("DB_POOL_ACQUIRE_TIMEOUT_SEC", "25"))
+    command_timeout = float(os.getenv("DB_COMMAND_TIMEOUT_SEC", "30"))
+    init_retries = int(os.getenv("DB_INIT_RETRIES", "8"))
+    base_sleep = float(os.getenv("DB_INIT_RETRY_BASE_SEC", "0.8"))
+    last_err = None
+    for attempt in range(1, init_retries + 1):
         try:
             pool = await asyncpg.create_pool(
                 DATABASE_URL,
@@ -1051,35 +1010,20 @@ async def init_db() -> None:
                 max_size=max_size,
                 timeout=acquire_timeout,
                 command_timeout=command_timeout,
-                max_inactive_connection_lifetime=90.0,
             )
-            # Share the same pool with trade storage
-            db_store.set_pool(pool)
-            await db_store.ensure_schema()
-            # Users table migrations (signal access columns) live in db_store
-            await db_store.ensure_users_columns()
-            logger.info("DB pool ready (min=%s max=%s acquire_timeout=%ss cmd_timeout=%ss)", min_size, max_size, acquire_timeout, command_timeout)
-            return
+            break
         except Exception as e:
             last_err = e
-            # exponential backoff + jitter
-            delay = base * (2 ** (attempt - 1))
-            delay = min(15.0, delay)
-            try:
-                jitter = delay * (0.2 * (0.5 + (time.time() % 1.0)))
-            except Exception:
-                jitter = 0.0
-            logger.warning("DB init attempt %s/%s failed: %s (retry in %.1fs)", attempt, retries, e, delay + jitter)
-            await asyncio.sleep(delay + jitter)
-
-    # If we got here, DB is unavailable.
-    # Keep the bot alive (no crash), but DB-backed features (autotrade/tracking) will be degraded.
-    logger.error("DB init failed after %s attempts: %s", retries, last_err)
-    pool = None
-    return
+            await asyncio.sleep(base_sleep * attempt)
+    else:
+        raise last_err
+    # Share the same pool with trade storage
+    db_store.set_pool(pool)
+    await db_store.ensure_schema()
+    # Users table migrations (signal access columns) live in db_store
+    await db_store.ensure_users_columns()
 
 async def ensure_user(user_id: int) -> None:
-(user_id: int) -> None:
     if not pool or not user_id:
         return
     # Create user row if missing and grant 24h Signal trial ONCE.
@@ -5883,11 +5827,9 @@ async def main() -> None:
 
             async def _heartbeat_loop() -> None:
                 nonlocal conn2
-                fail_streak = 0
-                max_fail = int(os.getenv("PRIMARY_HEARTBEAT_MAX_FAILS", "5") or 5)
-                max_fail = max(1, min(30, max_fail))
                 while True:
                     try:
+                        # Keep the lease alive. If we fail to update, we should drop out of PRIMARY.
                         res = await conn2.execute(
                             '''
                             UPDATE infra_primary_leases
@@ -5899,32 +5841,11 @@ async def main() -> None:
                         )
                         # asyncpg returns "UPDATE <n>"
                         if not res.endswith(" 1"):
-                            # Lease definitively lost -> allow re-election (restart).
-                            logger.error("Primary election: LOST lease (name=%s). Exiting to allow re-election.", PRIMARY_LEASE_NAME)
+                            logger.error("Primary election: LOST lease (name=%s). Stopping process to allow re-election.", PRIMARY_LEASE_NAME)
                             os._exit(0)
-
-                        fail_streak = 0
-                    except asyncio.CancelledError:
-                        raise
                     except Exception as e:
-                        fail_streak += 1
-                        logger.error("Primary election: heartbeat error (%s) fail_streak=%s/%s", e, fail_streak, max_fail)
-
-                        # Try to re-acquire a fresh connection (old one may be broken).
-                        try:
-                            try:
-                                await pool.release(conn2)
-                            except Exception:
-                                pass
-                            conn2 = await pool.acquire()
-                        except Exception:
-                            pass
-
-                        # If DB/network is down for too long, step down (restart) to avoid split-brain.
-                        if fail_streak >= max_fail:
-                            logger.error("Primary election: heartbeat failed %s times. Exiting to allow re-election.", fail_streak)
-                            os._exit(0)
-
+                        logger.error("Primary election: heartbeat error (%s). Stopping process to allow re-election.", e)
+                        os._exit(0)
                     await asyncio.sleep(PRIMARY_HEARTBEAT_SEC)
 
             # Start heartbeat task and keep the lease connection open too.
