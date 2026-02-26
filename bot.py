@@ -3412,7 +3412,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
                 processing_msg = None
 
             try:
-                report = await backend.analyze_symbol_institutional(symbol, market="FUTURES", lang=get_lang(uid))
+                report = await backend.analyze_symbol_institutional(symbol, market="AUTO", lang=get_lang(uid))
             except Exception as e:
                 logger.exception("analysis failed for %s", symbol)
                 msg = tr(uid, "analysis_error") if ("analysis_error" in I18N.get(get_lang(uid), {})) else "Ошибка анализа. Попробуй позже."
