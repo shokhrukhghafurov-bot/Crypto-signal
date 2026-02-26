@@ -13203,6 +13203,9 @@ class Backend:
                         _mid_skip_trap = 0
                         _mid_f_align = 0
                         _mid_f_score = 0
+                        _mid_ta_score_low = 0
+                        _mid_ta_score_missing_sum = 0.0
+                        _mid_ta_score_missing_max = 0.0
                         _mid_f_rr = 0
                         _mid_f_adx = 0
                         _mid_f_atr = 0
@@ -13717,6 +13720,15 @@ class Backend:
                                 _mid_f_score += 1
                                 _rej_add(sym, "score")
                                 try:
+                                    _mid_ta_score_low += 1
+                                    _missing = float(min_conf) - float(conf)
+                                    if _missing > 0:
+                                        _mid_ta_score_missing_sum += _missing
+                                        if _missing > float(_mid_ta_score_missing_max):
+                                            _mid_ta_score_missing_max = _missing
+                                except Exception:
+                                    pass
+                                try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"score<{float(min_conf):g} score={conf:g}")
                                 except Exception:
                                     pass
@@ -13970,7 +13982,7 @@ class Backend:
                             f"impulse={int(_mid_no_signal_reasons.get('impulse',0) or 0)},"
                             f"other={int(_mid_no_signal_reasons.get('other',0) or 0)}{_ns_other_details}] "
                             f"cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} "
-                            f"align={_mid_f_align} score={_mid_f_score} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} "
+                            f"align={_mid_f_align} score={_mid_f_score} ta_score_low={_mid_ta_score_low} ta_miss_avg={(_mid_ta_score_missing_sum/_mid_ta_score_low) if _mid_ta_score_low else 0.0:.1f} ta_miss_max={_mid_ta_score_missing_max:.1f} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} "
                             f"no_candles={_no_candles_final} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} "
                             f"candles_partial={_mid_candles_partial} candles_empty={_mid_candles_empty} candles_fallback={_mid_candles_fallback} "
                             f"cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} "
