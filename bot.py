@@ -3403,12 +3403,13 @@ async def autotrade_input_handler(message: types.Message) -> None:
                 return
 
             # Send an immediate progress message so the user understands the bot is working.
-            # (Analysis still works only via the "Analyze" button; this message is shown after symbol is resolved.)
+            # Then delete it once the report is ready (clean UX).
+            processing_msg = None
             try:
-                await message.answer(f"⏳ Анализирую {symbol} ...")
+                processing_msg = await message.answer(f"⏳ Анализирую {symbol} ...")
             except Exception:
                 # If Telegram rejects the send (rare), continue with analysis anyway.
-                pass
+                processing_msg = None
 
             try:
                 report = await backend.analyze_symbol_institutional(symbol, market="FUTURES", lang=get_lang(uid))
@@ -3417,12 +3418,25 @@ async def autotrade_input_handler(message: types.Message) -> None:
                 msg = tr(uid, "analysis_error") if ("analysis_error" in I18N.get(get_lang(uid), {})) else "Ошибка анализа. Попробуй позже."
                 if _is_admin(uid):
                     msg += f"\n\nERR: {type(e).__name__}: {e}"
+                # Remove the progress message if it exists
+                if processing_msg is not None:
+                    try:
+                        await processing_msg.delete()
+                    except Exception:
+                        pass
                 await message.answer(msg, reply_markup=menu_kb(uid))
                 return
 
             # If we auto-normalized/auto-picked, prepend a small hint
             if note:
                 report = f"_{note}_\n\n" + str(report)
+
+            # Remove the progress message if it exists
+            if processing_msg is not None:
+                try:
+                    await processing_msg.delete()
+                except Exception:
+                    pass
 
             # Telegram Markdown (classic)
             try:
