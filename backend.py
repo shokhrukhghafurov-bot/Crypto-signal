@@ -15185,18 +15185,110 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             pass
 
         # Liquidity zones: try to output both Equal Highs and Equal Lows
+
+        # Liquidity zones: detect Equal Highs/Lows as clusters of swing points (not only last 2)
         eq_hi = None
         eq_lo = None
+        eq_hi_touches = 0
+        eq_lo_touches = 0
+        eq_hi_strength = 0
+        eq_lo_strength = 0
+        eq_hi_dist_pct = None
+        eq_lo_dist_pct = None
+        eq_hi_dist_atr = None
+        eq_lo_dist_atr = None
         try:
             atr_abs_s = float(df_struct_w["atr"].iloc[-1]) if "atr" in df_struct_w.columns and df_struct_w["atr"].iloc[-1] == df_struct_w["atr"].iloc[-1] else atr_abs
-            tol2 = max(atr_abs_s * 0.4, price * 0.001)
-            if len(sh) >= 2 and abs(sh[-1][1] - sh[-2][1]) <= tol2:
-                eq_hi = (sh[-1][1] + sh[-2][1]) / 2.0
-            if len(sl) >= 2 and abs(sl[-1][1] - sl[-2][1]) <= tol2:
-                eq_lo = (sl[-1][1] + sl[-2][1]) / 2.0
+            tol_atr = float(os.getenv("LIQ_EQ_TOL_ATR_MULT", "0.35") or 0.35)
+            tol_pct = float(os.getenv("LIQ_EQ_TOL_PCT", "0.0010") or 0.0010)  # 0.10%
+            tol2 = max(atr_abs_s * tol_atr, price * tol_pct)
+
+            max_swings = int(os.getenv("LIQ_EQ_MAX_SWINGS", "12") or 12)
+            min_sep_pct = float(os.getenv("LIQ_EQ_MIN_SEP_PCT", "0.0002") or 0.0002)  # avoid classifying "near price" as liquidity
+
+            def _median(vals: list[float]) -> float:
+                s = sorted(vals)
+                return float(s[len(s)//2])
+
+            def _best_eq(swings: list[tuple[int, float]] | None, side: str):
+                # side: "high" (liquidity above) or "low" (liquidity below)
+                if not swings:
+                    return None
+                pts = swings[-max_swings:]
+                clusters: list[dict] = []
+                for ix, v in pts:
+                    v = float(v)
+                    placed = False
+                    for c in clusters:
+                        if abs(v - float(c["level"])) <= tol2:
+                            c["vals"].append(v)
+                            c["idxs"].append(int(ix))
+                            c["level"] = _median(c["vals"])
+                            placed = True
+                            break
+                    if not placed:
+                        clusters.append({"vals": [v], "idxs": [int(ix)], "level": v})
+
+                # filter by side relative to current price (we care about resting liquidity away from price)
+                if side == "high":
+                    cand = [c for c in clusters if float(c["level"]) >= price * (1.0 + min_sep_pct)]
+                else:
+                    cand = [c for c in clusters if float(c["level"]) <= price * (1.0 - min_sep_pct)]
+
+                if not cand:
+                    return None
+
+                # best = most touches, then most recent touch
+                cand.sort(key=lambda c: (len(c["vals"]), max(c["idxs"])), reverse=True)
+                c = cand[0]
+                level = float(c["level"])
+                touches = int(len(c["vals"]))
+                last_touch = int(max(c["idxs"]))
+                spread = float(max(c["vals"]) - min(c["vals"])) if touches >= 2 else 0.0
+
+                # strength (1..5): touches + recency - dispersion
+                strength = min(5, max(1, touches))
+                try:
+                    age = (len(df_struct_w) - 1) - last_touch
+                    if age <= int(os.getenv("LIQ_EQ_RECENT_BONUS_BARS", "60") or 60):
+                        strength = min(5, strength + 1)
+                except Exception:
+                    pass
+                if spread > tol2 * float(os.getenv("LIQ_EQ_SPREAD_PENALTY", "0.8") or 0.8):
+                    strength = max(1, strength - 1)
+
+                dist = abs(level - price)
+                dist_pct = (dist / price * 100.0) if price > 0 else None
+                dist_atr = (dist / atr_abs_s) if atr_abs_s and atr_abs_s > 0 else None
+                return (level, touches, strength, dist_pct, dist_atr)
+
+            hi = _best_eq(sh, "high")
+            if hi:
+                eq_hi, eq_hi_touches, eq_hi_strength, eq_hi_dist_pct, eq_hi_dist_atr = hi
+
+            lo = _best_eq(sl, "low")
+            if lo:
+                eq_lo, eq_lo_touches, eq_lo_strength, eq_lo_dist_pct, eq_lo_dist_atr = lo
+
         except Exception:
             pass
 
+        def _liq_line(prefix: str, level: float | None, dist_pct: float | None, dist_atr: float | None, strength: int, touches: int, side: str) -> str:
+            if level is None:
+                return f"{prefix}: Не обнаружены"
+            try:
+                dp = f"{dist_pct:.2f}%" if dist_pct is not None and dist_pct == dist_pct else "n/a"
+            except Exception:
+                dp = "n/a"
+            try:
+                da = f"{dist_atr:.2f} ATR" if dist_atr is not None and dist_atr == dist_atr else "n/a"
+            except Exception:
+                da = "n/a"
+            arrow = "↑" if side == "high" else "↓"
+            return f"{prefix}: {_fmt_int_space(level)} {arrow} | dist: {dp} ({da}) | strength: {int(strength)}/5 | touches: {int(touches)}"
+
+        eq_hi_line = _liq_line("Equal Highs (ликвидность сверху)", eq_hi, eq_hi_dist_pct, eq_hi_dist_atr, eq_hi_strength, eq_hi_touches, "high")
+        eq_lo_line = _liq_line("Equal Lows (ликвидность снизу)", eq_lo, eq_lo_dist_pct, eq_lo_dist_atr, eq_lo_strength, eq_lo_touches, "low")
         # Order block parsing: "OB Спрос [lo–hi]" -> lo/hi
         ob_side = "—"
         ob_lo = None
@@ -15573,8 +15665,8 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             f"Статус: {status_txt}",
             "",
             "💧 Зоны ликвидности:",
-            f"Equal Highs (ликвидность сверху): {_fmt_int_space(eq_hi)}" if eq_hi is not None else "Equal Highs (ликвидность сверху): —",
-            f"Equal Lows (ликвидность снизу): {_fmt_int_space(eq_lo)}" if eq_lo is not None else "Equal Lows (ликвидность снизу): —",
+                        eq_hi_line,
+                        eq_lo_line,
             entry_sweep_txt,
             "",
             line,
