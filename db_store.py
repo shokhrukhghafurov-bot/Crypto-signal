@@ -23,15 +23,12 @@ def get_pool() -> asyncpg.Pool:
         raise RuntimeError("DB pool is not initialized. Call set_pool() first.")
     return _pool
 
-
-
 def _db_acquire_timeout() -> float:
-    """Pool acquire timeout (seconds). Railway Postgres can have transient stalls."""
     try:
-        v = float(os.getenv("DB_ACQUIRE_TIMEOUT_SEC", os.getenv("DB_POOL_ACQUIRE_TIMEOUT_SEC", "25")) or 25)
+        return float(os.getenv("DB_POOL_ACQUIRE_TIMEOUT_SEC", "25"))
     except Exception:
-        v = 25.0
-    return max(5.0, min(180.0, float(v)))
+        return 25.0
+
 
 async def ensure_users_table() -> None:
     """Create users table for fresh installations (new Postgres).
@@ -40,7 +37,7 @@ async def ensure_users_table() -> None:
     When we move to a dedicated Postgres for this bot, we must create it here.
     """
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
           telegram_id BIGINT PRIMARY KEY,
@@ -76,7 +73,7 @@ async def ensure_schema() -> None:
     """
     pool = get_pool()
     await ensure_users_table()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
 
         # Persistent sequence for bot callback signal_id (survives restarts)
         await conn.execute("""
@@ -501,7 +498,7 @@ async def ensure_users_columns() -> None:
     live in one place.
     """
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         # users table is created/managed elsewhere (backend). We only add missing columns.
         try:
             await conn.execute(
@@ -588,7 +585,7 @@ async def get_autotrade_access(user_id: int) -> Dict[str, Any]:
     """
     pool = get_pool()
     uid = int(user_id)
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         r = await conn.fetchrow(
             """
             SELECT
@@ -615,7 +612,7 @@ async def count_open_autotrade_positions(user_id: int) -> int:
     """Count OPEN autotrade positions for the user."""
     pool = get_pool()
     uid = int(user_id)
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         n = await conn.fetchval(
             """
             SELECT COUNT(1)
@@ -634,7 +631,7 @@ async def finalize_autotrade_disable(user_id: int) -> None:
     """Finalize STOP -> OFF when all positions are closed."""
     pool = get_pool()
     uid = int(user_id)
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             UPDATE users
@@ -654,7 +651,7 @@ async def ensure_user_signal_trial(user_id: int) -> None:
     if not user_id:
         return
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             INSERT INTO users (
@@ -681,7 +678,7 @@ async def ensure_user_signal_trial(user_id: int) -> None:
 async def next_signal_id() -> int:
     """Return a globally unique signal_id for bot callbacks (Postgres sequence)."""
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         v = await conn.fetchval("SELECT nextval('signal_seq');")
         return int(v) if v is not None else int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
 
@@ -703,7 +700,7 @@ async def open_trade_once(
     Returns (inserted, trade_db_id).
     """
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         try:
             # Prevent duplicate open trades per symbol+market for the same user.
             # If an ACTIVE/TP1 trade exists for this symbol, do not open a new one.
@@ -797,7 +794,7 @@ async def list_user_trades(user_id: int, *, include_closed: bool = True, limit: 
     where = "user_id=$1"
     if not include_closed:
         where += " AND status IN ('ACTIVE','TP1')"
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         rows = await conn.fetch(
             f"""
             SELECT t.id, t.user_id, t.signal_id, t.market, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
@@ -821,7 +818,7 @@ async def list_user_trades(user_id: int, *, include_closed: bool = True, limit: 
 
 async def get_trade_by_user_signal(user_id: int, signal_id: int) -> Optional[Dict[str, Any]]:
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         row = await conn.fetchrow(
             """
             SELECT t.id, t.user_id, t.signal_id, t.market, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
@@ -845,7 +842,7 @@ async def get_trade_by_user_signal(user_id: int, signal_id: int) -> Optional[Dic
 async def get_trade_by_id(user_id: int, trade_id: int) -> Optional[Dict[str, Any]]:
     """Fetch a trade by its DB id, ensuring it belongs to the user."""
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         row = await conn.fetchrow(
             """
             SELECT t.id, t.user_id, t.signal_id, t.market, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
@@ -891,7 +888,7 @@ async def list_active_trades(limit: int = 500) -> List[Dict[str, Any]]:
 
 async def set_tp1(trade_id: int, *, be_price: float, price: float | None = None, pnl_pct: float | None = None) -> None:
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             UPDATE trades
@@ -912,7 +909,7 @@ async def set_tp1(trade_id: int, *, be_price: float, price: float | None = None,
 async def set_trade_be_price(trade_id: int, *, be_price: float) -> None:
     """Update BE price for an ACTIVE/TP1 trade (no status change)."""
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             UPDATE trades
@@ -937,7 +934,7 @@ async def close_trade(trade_id: int, *, status: str, price: float | None = None,
         st = "LOSS"
 
     ev = "CLOSE" if st == "CLOSED" else st
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             UPDATE trades
@@ -963,7 +960,7 @@ async def perf_bucket(user_id: int, market: str, *, since: dt.datetime, until: d
     and close results are best represented by the final close event.
     """
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         # IMPORTANT:
         # We must count outcomes per *trade*, not per *event row*.
         # Some setups can emit multiple CLOSE events for the same trade_id.
@@ -1025,7 +1022,7 @@ async def perf_bucket_global(market: str, *, since: dt.datetime, until: dt.datet
     This mirrors perf_bucket(), but without filtering by user_id.
     """
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         # IMPORTANT:
         # Count outcomes per trade_id (last outcome within the period), not per event row.
         row = await conn.fetchrow(
@@ -1085,7 +1082,7 @@ async def daily_report(user_id: int, market: str, *, days: int, tz: str = "UTC")
     Day boundaries are computed in the given timezone.
     """
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         rows = await conn.fetch(
             """
             SELECT
@@ -1117,7 +1114,7 @@ async def weekly_report(user_id: int, market: str, *, weeks: int, tz: str = "UTC
     Each item: {"week":"2026-W03","trades":..,"wins":..,"losses":..,"be":..,"tp1_hits":..,"sum_pnl_pct":..}
     """
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         rows = await conn.fetch(
             """
             SELECT
@@ -1156,7 +1153,7 @@ async def record_signal_sent(*, sig_key: str, market: str, signal_id: int | None
     if market not in ('SPOT','FUTURES'):
         return False
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         try:
             r = await conn.fetchrow(
                 """
@@ -1180,7 +1177,7 @@ async def count_signal_sent_by_market(*, since: dt.datetime, until: dt.datetime)
     """
     pool = get_pool()
     out: Dict[str, int] = {'SPOT': 0, 'FUTURES': 0}
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         try:
             rows = await conn.fetch(
                 """
@@ -1215,7 +1212,7 @@ async def count_signal_tracks_opened_by_market(*, since: dt.datetime, until: dt.
         return {'SPOT': 0, 'FUTURES': 0}
 
     out: Dict[str, int] = {'SPOT': 0, 'FUTURES': 0}
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         try:
             rows = await conn.fetch(
                 """
@@ -1266,7 +1263,7 @@ async def upsert_signal_track(
     if side not in ("LONG", "SHORT"):
         side = "LONG"
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             INSERT INTO signal_tracks (signal_id, sig_key, market, symbol, side, entry, tp1, tp2, sl, status, opened_at, updated_at)
@@ -1298,7 +1295,7 @@ async def upsert_signal_track(
 async def list_open_signal_tracks(*, limit: int = 500) -> List[dict]:
     """Return ACTIVE/TP1 bot-level signal tracks."""
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         rows = await conn.fetch(
             """
             SELECT *
@@ -1314,7 +1311,7 @@ async def list_open_signal_tracks(*, limit: int = 500) -> List[dict]:
 
 async def mark_signal_tp1(*, signal_id: int, be_price: float | None = None, tp1_pnl_pct: float | None = None) -> None:
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             UPDATE signal_tracks
@@ -1335,7 +1332,7 @@ async def mark_signal_tp1(*, signal_id: int, be_price: float | None = None, tp1_
 
 async def mark_signal_be_crossed(*, signal_id: int) -> None:
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             UPDATE signal_tracks
@@ -1349,7 +1346,7 @@ async def mark_signal_be_crossed(*, signal_id: int) -> None:
 
 async def clear_signal_be_crossed(*, signal_id: int) -> None:
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             UPDATE signal_tracks
@@ -1367,7 +1364,7 @@ async def close_signal_track(*, signal_id: int, status: str, pnl_total_pct: floa
     if st not in ("WIN", "LOSS", "BE", "CLOSED"):
         st = "CLOSED"
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             UPDATE signal_tracks
@@ -1461,7 +1458,7 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
             WHERE market=$1;
             """
 
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         row = await conn.fetchrow(q, market, since, until)
 
     if not row:
@@ -1505,7 +1502,7 @@ async def trade_perf_bucket_global(market: str, *, since: dt.datetime, until: dt
             "sum_pnl_pct": 0.0,
         }
 
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         row = await conn.fetchrow(
             """
             WITH last_outcome AS (
@@ -1562,7 +1559,7 @@ async def trade_perf_bucket_global(market: str, *, since: dt.datetime, until: dt
 async def get_signal_bot_settings() -> Dict[str, Any]:
     """Get signal bot global settings."""
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         try:
             row = await conn.fetchrow(
                 "SELECT pause_signals, maintenance_mode, updated_at, support_username FROM signal_bot_settings WHERE id=1"
@@ -1582,7 +1579,7 @@ async def get_signal_bot_settings() -> Dict[str, Any]:
 async def set_signal_bot_settings(*, pause_signals: bool, maintenance_mode: bool, support_username: str | None = None) -> None:
     """Persist signal bot settings."""
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         try:
             await conn.execute(
                 """
@@ -1631,7 +1628,7 @@ async def get_autotrade_bot_settings() -> Dict[str, Any]:
 async def set_autotrade_bot_settings(*, pause_autotrade: bool, maintenance_mode: bool) -> None:
     """Persist auto-trade global settings."""
     pool = get_pool()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             INSERT INTO autotrade_bot_settings(id, pause_autotrade, maintenance_mode, updated_at)
@@ -1650,7 +1647,7 @@ async def get_autotrade_settings(user_id: int) -> Dict[str, Any]:
     """Return autotrade settings for the user (with defaults)."""
     pool = get_pool()
     uid = int(user_id)
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         row = await conn.fetchrow(
             """
             SELECT user_id, spot_enabled, futures_enabled,
@@ -1713,7 +1710,7 @@ async def update_effective_futures_cap_state(user_id: int, new_effective_cap: fl
     pool = get_pool()
     uid = int(user_id)
     cap = float(new_effective_cap or 0.0)
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         # Ensure the row exists
         await conn.execute(
             """
@@ -1754,7 +1751,7 @@ async def set_effective_futures_cap_notify_now(user_id: int) -> None:
     """Mark that we have notified the user about effective cap decrease (cooldown marker)."""
     pool = get_pool()
     uid = int(user_id)
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         # Ensure the row exists
         await conn.execute(
             """
@@ -1778,7 +1775,7 @@ async def set_autotrade_toggle(user_id: int, market_type: str, enabled: bool) ->
     uid = int(user_id)
     m = (market_type or "").lower().strip()
     col = "spot_enabled" if m == "spot" else "futures_enabled"
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             f"""
             INSERT INTO autotrade_settings(user_id, {col}, updated_at)
@@ -1803,7 +1800,7 @@ async def toggle_autotrade_toggle(user_id: int, market_type: str) -> bool:
     if m not in ("spot", "futures"):
         m = "spot"
     col = "spot_enabled" if m == "spot" else "futures_enabled"
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         new_val = await conn.fetchval(
             f"""
             INSERT INTO autotrade_settings(user_id, {col}, updated_at)
@@ -1831,7 +1828,7 @@ async def set_autotrade_exchange(user_id: int, market_type: str, exchange: str) 
         if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
             ex = "binance"
     col = "spot_exchange" if m == "spot" else "futures_exchange"
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             f"""
             INSERT INTO autotrade_settings(user_id, {col}, updated_at)
@@ -1859,7 +1856,7 @@ async def set_autotrade_amount(user_id: int, market_type: str, amount_usdt: floa
         raise ValueError("SPOT amount per trade must be >= 15")
     if m != "spot" and 0 < amt < 10:
         raise ValueError("FUTURES margin per trade must be >= 10")
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             f"""
             INSERT INTO autotrade_settings(user_id, {col}, updated_at)
@@ -1880,7 +1877,7 @@ async def set_autotrade_futures_leverage(user_id: int, leverage: int) -> None:
         lev = 1
     if lev > 125:
         lev = 125
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             INSERT INTO autotrade_settings(user_id, futures_leverage, updated_at)
@@ -1899,7 +1896,7 @@ async def set_autotrade_futures_cap(user_id: int, cap_usdt: float) -> None:
     cap = float(cap_usdt or 0.0)
     if cap < 0:
         cap = 0.0
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             INSERT INTO autotrade_settings(user_id, futures_cap, updated_at)
@@ -1939,7 +1936,7 @@ async def set_spot_exchange_priority(user_id: int, priority: list[str] | str) ->
     csv = ",".join(out)
     first = out[0] if out else "binance"
 
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute("INSERT INTO autotrade_settings(user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING;", uid)
         await conn.execute(
             """
@@ -1971,7 +1968,7 @@ async def get_autotrade_keys_status(user_id: int) -> List[Dict[str, Any]]:
     """Return list with statuses for all stored keys."""
     pool = get_pool()
     uid = int(user_id)
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         rows = await conn.fetch(
             """
             SELECT exchange, market_type, is_active, last_ok_at, last_error, last_error_at
@@ -2013,7 +2010,7 @@ async def get_autotrade_keys_row(*, user_id: int, exchange: str, market_type: st
             ex = "binance"
     if mt not in ("spot", "futures"):
         mt = "spot"
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         r = await conn.fetchrow(
             """
             SELECT user_id, exchange, market_type, api_key_enc, api_secret_enc, passphrase_enc,
@@ -2059,7 +2056,7 @@ async def create_autotrade_position(
     if side not in ("BUY", "SELL"):
         side = "BUY"
     alloc = float(allocated_usdt or 0.0)
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         # Prevent duplicates: if there is already an OPEN position for this symbol, do nothing.
         row = await conn.fetchrow(
             """
@@ -2135,7 +2132,7 @@ async def reserve_autotrade_position(
     if side not in ("BUY", "SELL"):
         side = "BUY"
 
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         row = await conn.fetchrow(
             """
             WITH ins AS (
@@ -2177,7 +2174,7 @@ async def close_autotrade_position(
     st = (status or "CLOSED").upper().strip()
     if st not in ("CLOSED", "ERROR"):
         st = "CLOSED"
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             UPDATE autotrade_positions
@@ -2219,7 +2216,7 @@ async def cleanup_autotrade_reservation(
     if not ref or not sym:
         return False
 
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         res = await conn.execute(
             """
             DELETE FROM autotrade_positions
@@ -2246,7 +2243,7 @@ async def autotrade_health_snapshot(*, stale_minutes: int = 10, sample_limit: in
     lim = int(sample_limit or 10)
     if lim < 0:
         lim = 0
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         open_cnt = await conn.fetchval(
             """SELECT COUNT(*) FROM autotrade_positions WHERE status='OPEN'"""
         )
@@ -2288,7 +2285,7 @@ async def list_open_autotrade_positions(*, limit: int = 200) -> List[Dict[str, A
         lim = 1
     if lim > 2000:
         lim = 2000
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         rows = await conn.fetch(
             """
             SELECT id, user_id, signal_id, exchange, market_type, symbol, side, allocated_usdt, api_order_ref, meta, opened_at
@@ -2360,7 +2357,7 @@ async def release_autotrade_position_lock(*, row_id: int, owner: str) -> None:
     own = str(owner or "").strip()
     if not own:
         own = "worker"
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             UPDATE autotrade_positions
@@ -2386,7 +2383,7 @@ async def touch_autotrade_position_lock(*, row_id: int, owner: str, lease_sec: i
     own = str(owner or "").strip()
     if not own:
         own = "worker"
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             UPDATE autotrade_positions
@@ -2405,7 +2402,7 @@ async def touch_autotrade_position_lock(*, row_id: int, owner: str, lease_sec: i
 async def update_autotrade_order_ref(*, row_id: int, api_order_ref: str) -> None:
     pool = get_pool()
     rid = int(row_id)
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             UPDATE autotrade_positions
@@ -2439,7 +2436,7 @@ async def update_autotrade_position_meta(*, row_id: int, meta: Any, replace: boo
     except Exception:
         patch_json = "{}"
 
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         if replace:
             await conn.execute(
                 """
@@ -2488,7 +2485,7 @@ async def upsert_autotrade_keys(
             ex = "binance"
     if mt not in ("spot", "futures"):
         mt = "spot"
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             INSERT INTO autotrade_keys(user_id, exchange, market_type, api_key_enc, api_secret_enc, passphrase_enc,
@@ -2527,7 +2524,7 @@ async def mark_autotrade_key_error(
     uid = int(user_id)
     ex = (exchange or "binance").lower().strip()
     mt = (market_type or "spot").lower().strip()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         # Only deactivate keys on *credential/permission* failures. Network/rate-limit/order-parameter
         # errors should not permanently disable a key.
         if bool(deactivate):
@@ -2568,7 +2565,7 @@ async def disable_autotrade_key(*, user_id: int, exchange: str, market_type: str
         ex = "binance"
     if mt == "spot" and ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
         ex = "binance"
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             INSERT INTO autotrade_keys(user_id, exchange, market_type, is_active, last_error, last_error_at, updated_at)
@@ -2585,7 +2582,7 @@ async def get_autotrade_used_usdt(user_id: int, market_type: str) -> float:
     pool = get_pool()
     uid = int(user_id)
     mt = (market_type or "spot").lower().strip()
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         v = await conn.fetchval(
             """
             SELECT COALESCE(SUM(allocated_usdt), 0)
@@ -2632,7 +2629,7 @@ async def get_autotrade_stats(
 
     mt_where = "" if mt == "all" else "AND market_type=$2"
 
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         # opened
         if mt == "all":
             opened = await conn.fetchval(
@@ -2731,7 +2728,7 @@ async def count_closed_autotrade_positions(*, user_id: int, market_type: str = "
     n = int(last_n or 0)
     if n <= 0:
         n = 5
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         try:
             rows = await conn.fetch(
                 """
@@ -2761,7 +2758,7 @@ async def kv_get_json(key: str) -> Optional[dict]:
     k = str(key or "").strip()
     if not k:
         return None
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         row = await conn.fetchrow("SELECT value FROM kv_store WHERE key=$1", k)
         if not row:
             return None
@@ -2776,7 +2773,7 @@ async def kv_set_json(key: str, value: dict) -> None:
     if not k:
         return
     # asyncpg will encode dict -> jsonb automatically
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
             INSERT INTO kv_store(key, value, updated_at)
@@ -2820,7 +2817,7 @@ async def candles_cache_get(ex_name: str, market: str, symbol: str, tf: str, lim
     if not pool:
         return None, None
     key = _cc_key(ex_name, market, symbol, tf, limit)
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         row = await conn.fetchrow("SELECT payload, updated_at FROM candles_cache WHERE key=$1", key)
         return None if not row else (row["payload"], row["updated_at"])
 
@@ -2829,7 +2826,7 @@ async def candles_cache_set(ex_name: str, market: str, symbol: str, tf: str, lim
     if not pool:
         return
     key = _cc_key(ex_name, market, symbol, tf, limit)
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             "INSERT INTO candles_cache(key,payload,updated_at) VALUES ($1,$2,NOW()) "
             "ON CONFLICT (key) DO UPDATE SET payload=EXCLUDED.payload, updated_at=NOW()",
@@ -2844,7 +2841,7 @@ async def candles_cache_purge(max_age_sec: int) -> int:
     max_age_sec = int(max_age_sec or 0)
     if max_age_sec <= 0:
         return 0
-    async with pool.acquire() as conn:
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         res = await conn.execute(
             "DELETE FROM candles_cache WHERE updated_at < (NOW() - ($1::int * INTERVAL '1 second'))",
             max_age_sec
