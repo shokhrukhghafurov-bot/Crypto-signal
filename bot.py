@@ -646,6 +646,16 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
                 mid_loop(broadcast_signal, broadcast_macro_alert),
                 name="mid-scanner",
             )
+            # Expose task ref to backend (for /health + status loop diagnostics)
+            try:
+                setattr(backend, "_mid_scanner_task", TASKS["mid-scanner"])
+            except Exception:
+                pass
+            # Monitor task so crashes are visible in logs/health
+            try:
+                _attach_task_monitor("mid-scanner", TASKS["mid-scanner"])
+            except Exception:
+                pass
             # repeat last MID tick summary in logs so it doesn't get lost
             TASKS["mid-summary-hb"] = asyncio.create_task(mid_summary_heartbeat_loop(), name="mid-summary-hb")
             # log once per minute: pending/expired/triggered + last tick age (explains 'why no signals')
