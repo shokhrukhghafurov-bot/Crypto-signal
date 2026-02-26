@@ -16876,3 +16876,20 @@ try:
     Backend.analyze_symbol_institutional = analyze_symbol_institutional  # type: ignore[attr-defined]
 except Exception:
     pass
+
+# --- MID scanner API compatibility ---
+# Some deployments ended up with a Backend class that missed scanner_loop_mid
+# (typically due to an old/partial file being deployed). Bot expects this method
+# when MID_SCANNER_ENABLED=1.
+try:
+    if not hasattr(Backend, "scanner_loop_mid"):
+        async def _missing_scanner_loop_mid(self, *args, **kwargs):
+            raise RuntimeError(
+                "Backend.scanner_loop_mid is missing. This build is inconsistent: "
+                "MID_SCANNER_ENABLED=1 requires MID scanner implementation. "
+                "Redeploy ensuring updated backend.py is used."
+            )
+
+        Backend.scanner_loop_mid = _missing_scanner_loop_mid  # type: ignore[attr-defined]
+except Exception:
+    pass
