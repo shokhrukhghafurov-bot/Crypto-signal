@@ -7600,6 +7600,240 @@ def _mid_structure_trap_ok(*, direction: str, entry: float, df1hi: pd.DataFrame)
     return (True, "")
 
 
+
+# ================== MID institutional TA engines (Structure/Regime/Sweep/BO-RT/OB) ==================
+
+def _mid_bool_env(name: str, default: str = "0") -> bool:
+    try:
+        v = os.getenv(name, default)
+        return str(v).strip().lower() not in ("0", "false", "no", "off", "")
+    except Exception:
+        return False
+
+
+def _mid_market_regime(df30i: pd.DataFrame, df1hi: pd.DataFrame, *, entry: float, atr30: float, adx30: float | None) -> str:
+    """Classify MID regime using 30m as primary with 1h confirmation.
+    Returns one of: TRENDING, RANGING, EXPANSION, COMPRESSION.
+    """
+    try:
+        if df30i is None or df30i.empty:
+            return "—"
+        adx = float(adx30) if (adx30 is not None and adx30 == adx30) else float(df30i.iloc[-1].get("adx", float("nan")))
+        atrp = (float(atr30) / float(entry) * 100.0) if (entry and atr30) else 0.0
+
+        # EMA distance and its change (compression vs expansion proxy)
+        ema50 = df30i["ema50"].astype(float)
+        ema200 = df30i["ema200"].astype(float)
+        dist = (ema50 - ema200).abs() / df30i["close"].astype(float).replace(0, np.nan)
+        dist_now = float(dist.iloc[-1]) if len(dist) else 0.0
+        dist_prev = float(dist.iloc[-6]) if len(dist) >= 7 else dist_now
+        dist_chg = dist_now - dist_prev
+
+        # ATR slope (expansion/compression proxy)
+        atrs = df30i.get("atr", None)
+        atr_now = float(atr30)
+        atr_sma = float("nan")
+        if atrs is not None:
+            try:
+                atr_sma = float(pd.Series(atrs).astype(float).rolling(20).mean().iloc[-1])
+            except Exception:
+                atr_sma = float("nan")
+
+        atr_rising = (not np.isnan(atr_sma)) and atr_now > atr_sma * 1.05
+        atr_falling = (not np.isnan(atr_sma)) and atr_now < atr_sma * 0.95
+
+        # Thresholds (tunable)
+        adx_tr = float(os.getenv("MID_REGIME_ADX_TREND", "25") or 25)
+        adx_rg = float(os.getenv("MID_REGIME_ADX_RANGE", "18") or 18)
+
+        # Decide
+        if (not np.isnan(adx)) and adx >= adx_tr and dist_chg >= 0:
+            return "TRENDING"
+        if (not np.isnan(adx)) and adx <= adx_rg and dist_now <= float(os.getenv("MID_REGIME_EMA_DIST_MAX", "0.010") or 0.010):
+            # If volatility expands while ADX low, treat as EXPANSION (breakout risk)
+            if atr_rising or (atrp >= float(os.getenv("MID_REGIME_ATR_PCT_EXP", "2.2") or 2.2) and dist_chg > 0):
+                return "EXPANSION"
+            return "RANGING"
+        if atr_rising and dist_chg > 0:
+            return "EXPANSION"
+        if atr_falling and dist_chg < 0:
+            return "COMPRESSION"
+        # Fallback: trending-ish if EMA distance is meaningful
+        if dist_now >= float(os.getenv("MID_REGIME_EMA_DIST_TREND", "0.015") or 0.015) and (not np.isnan(adx)) and adx >= 20:
+            return "TRENDING"
+        return "—"
+    except Exception:
+        return "—"
+
+
+def _mid_structure_hhhl(df: pd.DataFrame, *, lookback: int = 220, pivot: int = 3) -> str:
+    """Return HH-HL / LH-LL / RANGE / — based on pivot highs/lows on 1h (or 30m)."""
+    try:
+        if df is None or df.empty or len(df) < 60:
+            return "—"
+        d = df.tail(lookback).copy()
+        highs = d["high"].astype(float).values
+        lows = d["low"].astype(float).values
+
+        ph = _pivot_points(highs, left=pivot, right=pivot, mode="high")
+        pl = _pivot_points(lows, left=pivot, right=pivot, mode="low")
+        if len(ph) < 2 or len(pl) < 2:
+            return "—"
+        (_, h1), (_, h2) = ph[-2], ph[-1]
+        (_, l1), (_, l2) = pl[-2], pl[-1]
+
+        # Tiny tolerance to treat near-equals as range
+        tol = float(os.getenv("MID_STRUCTURE_TOL_PCT", "0.001") or 0.001)  # 0.1%
+        hh = h2 > h1 * (1.0 + tol)
+        lh = h2 < h1 * (1.0 - tol)
+        hl = l2 > l1 * (1.0 + tol)
+        ll = l2 < l1 * (1.0 - tol)
+
+        if hh and hl:
+            return "HH-HL"
+        if lh and ll:
+            return "LH-LL"
+
+        # Range if both roughly equal
+        if (abs(h2 - h1) <= abs(h1) * tol * 2) and (abs(l2 - l1) <= abs(l1) * tol * 2):
+            return "RANGE"
+        return "—"
+    except Exception:
+        return "—"
+
+
+def _mid_liquidity_sweep_5m(df5i: pd.DataFrame, *, lookback: int = 20) -> Tuple[bool, bool, str]:
+    """Detect simple stop-sweep on 5m vs recent extremes.
+    Returns (sweep_long, sweep_short, txt).
+    """
+    try:
+        if df5i is None or df5i.empty or len(df5i) < lookback + 3:
+            return (False, False, "—")
+        d = df5i.tail(lookback + 2).copy()
+        # Use prior extremes excluding last bar
+        prev = d.iloc[:-1]
+        last = d.iloc[-1]
+        prev_low = float(prev["low"].astype(float).min())
+        prev_high = float(prev["high"].astype(float).max())
+        low = float(last.get("low", np.nan))
+        high = float(last.get("high", np.nan))
+        close = float(last.get("close", np.nan))
+        if np.isnan(low) or np.isnan(high) or np.isnan(close):
+            return (False, False, "—")
+
+        # Tolerance to avoid micro-wicks
+        atr5 = float(last.get("atr", np.nan))
+        tol = max((atr5 if (atr5 == atr5 and atr5 > 0) else 0.0) * 0.10, close * float(os.getenv("MID_SWEEP_TOL_PCT", "0.0008") or 0.0008))
+        sweep_long = (low < prev_low - tol) and (close > prev_low + tol * 0.2)
+        sweep_short = (high > prev_high + tol) and (close < prev_high - tol * 0.2)
+
+        txt = "SWEEP↑" if sweep_long else ("SWEEP↓" if sweep_short else "—")
+        return (bool(sweep_long), bool(sweep_short), txt)
+    except Exception:
+        return (False, False, "—")
+
+
+def _mid_breakout_retest_trigger(df5i: pd.DataFrame, *, direction: str, support: float | None, resistance: float | None, atr5: float) -> Tuple[bool, str]:
+    """Detect breakout and (optional) retest on 5m using provided S/R levels.
+    Returns (triggered, label).
+    """
+    try:
+        if df5i is None or df5i.empty or len(df5i) < 10:
+            return (False, "—")
+        diru = str(direction or "").upper()
+        d = df5i.tail(int(os.getenv("MID_BORT_LOOKBACK_5M", "36") or 36)).copy()
+        highs = d["high"].astype(float).values
+        lows = d["low"].astype(float).values
+        closes = d["close"].astype(float).values
+
+        tol = max(float(atr5) * 0.25 if (atr5 and atr5 > 0) else 0.0, float(closes[-1]) * float(os.getenv("MID_BORT_TOL_PCT", "0.0015") or 0.0015))
+        retest_bars = int(os.getenv("MID_RETEST_MAX_BARS_5M", "8") or 8)
+
+        sup = float(support) if (support is not None and support == support) else float("nan")
+        res = float(resistance) if (resistance is not None and resistance == resistance) else float("nan")
+
+        bo_up = None
+        if not np.isnan(res) and res > 0:
+            for i in range(1, len(closes)):
+                if closes[i - 1] <= res and closes[i] > res:
+                    bo_up = i
+                    break
+        bo_dn = None
+        if not np.isnan(sup) and sup > 0:
+            for i in range(1, len(closes)):
+                if closes[i - 1] >= sup and closes[i] < sup:
+                    bo_dn = i
+                    break
+
+        def _has_retest(start_idx: int, lvl: float, side: str) -> bool:
+            jmax = min(len(closes), start_idx + 1 + max(1, retest_bars))
+            for j in range(start_idx + 1, jmax):
+                if side == "UP":
+                    if (lows[j] <= lvl + tol) and (closes[j] > lvl):
+                        return True
+                else:
+                    if (highs[j] >= lvl - tol) and (closes[j] < lvl):
+                        return True
+            return False
+
+        if diru == "LONG" and bo_up is not None:
+            return (True, "BO↑+RT" if _has_retest(bo_up, res, "UP") else "BO↑")
+        if diru == "SHORT" and bo_dn is not None:
+            return (True, "BO↓+RT" if _has_retest(bo_dn, sup, "DN") else "BO↓")
+        return (False, "—")
+    except Exception:
+        return (False, "—")
+
+
+def _mid_order_block(df30i: pd.DataFrame, *, direction: str, atr30: float) -> Tuple[Optional[Tuple[float, float]], bool]:
+    """Detect a simple order block on 30m and whether current 5m price is retesting it.
+    Returns (zone(low,high), valid_found). Zone is in absolute price.
+    """
+    try:
+        if df30i is None or df30i.empty or len(df30i) < 60:
+            return (None, False)
+        diru = str(direction or "").upper()
+        d = df30i.tail(int(os.getenv("MID_OB_LOOKBACK_30M", "160") or 160)).copy()
+        atr_mult = float(os.getenv("MID_OB_ATR_IMPULSE_MULT", "1.2") or 1.2)
+        # Impulse definition: body >= atr_mult * ATR(30m)
+        atr = float(atr30)
+        if atr <= 0 or np.isnan(atr):
+            return (None, False)
+
+        o = d["open"].astype(float).values
+        h = d["high"].astype(float).values
+        l = d["low"].astype(float).values
+        c = d["close"].astype(float).values
+
+        # Search from most recent backwards: last opposite candle before an impulse candle
+        zone = None
+        for i in range(len(d) - 3, 2, -1):
+            body_next = abs(c[i + 1] - o[i + 1])
+            if body_next < atr_mult * atr:
+                continue
+            # direction impulse
+            imp_up = c[i + 1] > o[i + 1]
+            imp_dn = c[i + 1] < o[i + 1]
+            # candidate candle i: opposite color
+            bear_i = c[i] < o[i]
+            bull_i = c[i] > o[i]
+
+            if diru == "LONG" and imp_up and bear_i:
+                lo = min(l[i], c[i], o[i])
+                hi = max(o[i], c[i])  # body top (more conservative)
+                zone = (float(lo), float(hi))
+                break
+            if diru == "SHORT" and imp_dn and bull_i:
+                hi = max(h[i], c[i], o[i])
+                lo = min(o[i], c[i])  # body bottom
+                zone = (float(lo), float(hi))
+                break
+
+        return (zone, bool(zone is not None))
+    except Exception:
+        return (None, False)
+
+# ================== END MID institutional TA engines ==================
 def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame, symbol: str = "", diag: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
@@ -7790,6 +8024,94 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 return None
     except Exception:
         pass
+
+    # ------------------ MID institutional engines (optional) ------------------
+    mid_regime = "—"
+    struct_hhhl_1h = "—"
+    sweep_long = sweep_short = False
+    sweep_txt = "—"
+    bo_rt_trigger = False
+    bo_rt_label = "—"
+    ob_zone = None  # (low, high)
+    ob_found = False
+    ob_retest = False
+
+    try:
+        use_regime = _mid_bool_env("MID_USE_REGIME", "1")
+        use_structure = _mid_bool_env("MID_USE_STRUCTURE_ENGINE", "1")
+        use_sweep = _mid_bool_env("MID_USE_LIQUIDITY_SWEEP", "1")
+        use_bort = _mid_bool_env("MID_USE_BREAKOUT_RETEST", "1")
+        use_ob = _mid_bool_env("MID_USE_ORDER_BLOCK", "1")
+        require_trigger = _mid_bool_env("MID_REQUIRE_TRIGGER", "1")
+
+        if use_regime:
+            mid_regime = _mid_market_regime(df30i, df1hi, entry=float(entry), atr30=float(atr30), adx30=(float(adx30) if not np.isnan(adx30) else None))
+
+        if use_structure:
+            struct_hhhl_1h = _mid_structure_hhhl(df1hi, lookback=int(os.getenv("MID_STRUCTURE_LOOKBACK_1H", "220") or 220), pivot=int(os.getenv("MID_STRUCTURE_PIVOT", "3") or 3))
+            # Hard block if structure contradicts direction
+            if str(dir_trend).upper() == "LONG" and struct_hhhl_1h == "LH-LL":
+                _fail("structure", "structure_mismatch")
+                return None
+            if str(dir_trend).upper() == "SHORT" and struct_hhhl_1h == "HH-HL":
+                _fail("structure", "structure_mismatch")
+                return None
+
+        # Liquidity sweep trigger on 5m
+        if use_sweep:
+            lb = int(os.getenv("MID_SWEEP_LOOKBACK_5M", "20") or 20)
+            sweep_long, sweep_short, sweep_txt = _mid_liquidity_sweep_5m(df5i, lookback=lb)
+
+        # Breakout+Retest trigger (levels from 30m, fallback to 1h)
+        sup_lvl = res_lvl = None
+        try:
+            sup_lvl, res_lvl = _nearest_levels(df30i, lookback=int(os.getenv("MID_BORT_LEVEL_LOOKBACK_30M", "180") or 180), swing=int(os.getenv("MID_BORT_LEVEL_SWING", "3") or 3))
+            if sup_lvl is None and res_lvl is None:
+                sup_lvl, res_lvl = _nearest_levels(df1hi, lookback=240, swing=3)
+        except Exception:
+            sup_lvl = res_lvl = None
+
+        if use_bort:
+            bo_rt_trigger, bo_rt_label = _mid_breakout_retest_trigger(df5i, direction=str(dir_trend), support=sup_lvl, resistance=res_lvl, atr5=float(atr5))
+
+        # Order block on 30m + retest on 5m
+        if use_ob:
+            ob_zone, ob_found = _mid_order_block(df30i, direction=str(dir_trend), atr30=float(atr30))
+            if ob_found and ob_zone and df5i is not None and not df5i.empty:
+                try:
+                    zlo, zhi = float(ob_zone[0]), float(ob_zone[1])
+                    if zhi < zlo:
+                        zlo, zhi = zhi, zlo
+                    last5r = df5i.iloc[-1]
+                    lo5 = float(last5r.get("low", np.nan))
+                    hi5 = float(last5r.get("high", np.nan))
+                    tol = max(float(atr5) * 0.25 if (atr5 and atr5 > 0) else 0.0, float(entry) * float(os.getenv("MID_OB_TOL_PCT", "0.0015") or 0.0015))
+                    if (not np.isnan(lo5)) and (not np.isnan(hi5)):
+                        ob_retest = (hi5 >= zlo - tol) and (lo5 <= zhi + tol)
+                except Exception:
+                    ob_retest = False
+
+        # Regime gating: in ranges, ignore pure breakouts; prefer sweep/OB retests.
+        if use_regime and mid_regime == "RANGING":
+            if bo_rt_trigger and (not (sweep_long or sweep_short) and (not ob_retest)):
+                # prevent range fake breakouts
+                _fail("structure", "regime_range_no_breakout")
+                return None
+
+        # Require at least one execution trigger for MID (institutional quality)
+        if require_trigger:
+            trig_ok = False
+            if str(dir_trend).upper() == "LONG":
+                trig_ok = bool(sweep_long) or bool(bo_rt_trigger) or bool(ob_retest)
+            else:
+                trig_ok = bool(sweep_short) or bool(bo_rt_trigger) or bool(ob_retest)
+            if not trig_ok:
+                _fail("other", "no_trigger")
+                return None
+    except Exception:
+        # Never block if engine fails unexpectedly.
+        pass
+
 
     # --- Dynamic TP2/RR for MID ---
 
@@ -8298,6 +8620,12 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "support": support,
         "resistance": resistance,
         "breakout_retest": breakout_retest,
+        "regime": mid_regime,
+        "structure_hhhl_1h": struct_hhhl_1h,
+        "sweep": sweep_txt,
+        "bo_rt": bo_rt_label,
+        "ob_zone": ob_zone,
+        "ob_retest": bool(ob_retest),
         "channel": channel,
         "mstruct": mstruct,
         "range_pos": range_pos_txt,
@@ -8805,14 +9133,15 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
         eq_hi = ta.get("eq_hi", None)
         eq_lo = ta.get("eq_lo", None)
         sweep = ta.get("sweep", "")
+        obtxt = "YES" if bool(ta.get("ob_retest", False)) else "—"
         lines = [
             f"📊 TA score: {int(round(float(score))):d}/100 | Mode: {mode_txt}",
             f"RSI(5m): {rsi:.1f} | MACD hist(5m): {macd_hist:.4f}",
             f"ADX 30m/1h: {adx_30m:.1f}/{adx_1h:.1f} | ATR% (30m): {atr_pct:.2f}",
             f"BB: {bb} | Vol xAvg: {volx:.2f} | VWAP: {vwap}",
-            f"Ch: {ch} | PA: {pa}",
+            f"Ch: {ch} | PA: {pa} | Regime: {ta.get('regime', '—')}",
             f"Liquidity: EQH: {(_fmt_int_space(eq_hi) if eq_hi is not None else '—')} | EQL: {(_fmt_int_space(eq_lo) if eq_lo is not None else '—')} | Sweep(5m): {sweep or '—'}",
-            f"Breakout/Retest: {br}",
+            f"Breakout/Retest: {br} | OB retest: {obtxt}",
             f"Pattern: {pattern} | Support: {sup} | Resistance: {res}",
         ]
         trap_ok = bool(ta.get("trap_ok", True))
