@@ -336,11 +336,11 @@
     "analysis_trend_strong_down": "🔴 Strong downtrend",
     "analysis_trend_pullback": "🟡 Pullback within uptrend",
     "analysis_prompt": "🔍 Send a ticker to analyze (e.g., BTC, ETH, SOLUSDT).",
-    "entry_status_label": "ENTRY STATUS",
-    "entry_status_wait": "WAIT",
-    "entry_status_ready": "READY",
-    "entry_status_confirmed": "CONFIRMED ✅",
-    "entry_status_invalid": "INVALID ❌"
+    "lbl_entry_status": "ENTRY STATUS",
+    "entry_status_ready": "READY (in zone)  ⚠️ wait for confirmation",
+    "entry_status_wait": "WAIT (out of zone)",
+    "entry_status_confirmed": "CONFIRMED ✅ confirmed",
+    "entry_status_invalid": "INVALID ❌ invalidated"
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -679,10 +679,10 @@
     "analysis_trend_strong_down": "🔴 Сильный нисходящий",
     "analysis_trend_pullback": "🟡 Коррекция внутри восходящего тренда",
     "analysis_prompt": "🔍 Напиши тикер для анализа (пример: BTC, ETH, SOLUSDT).",
-    "entry_status_label": "СТАТУС ВХОДА",
-    "entry_status_wait": "WAIT (ждать)",
-    "entry_status_ready": "READY (в зоне)",
-    "entry_status_confirmed": "CONFIRMED ✅ (вход)",
-    "entry_status_invalid": "INVALID ❌ (сетап сломан)"
+    "lbl_entry_status": "СТАТУС ВХОДА",
+    "entry_status_ready": "READY (в зоне)  ⚠️ ждать подтверждение",
+    "entry_status_wait": "WAIT (вне зоны)",
+    "entry_status_confirmed": "CONFIRMED ✅ подтверждено",
+    "entry_status_invalid": "INVALID ❌ отмена"
   }
 }
