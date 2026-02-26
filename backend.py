@@ -11693,6 +11693,16 @@ class Backend:
                             pass
                         await emit_signal_cb(sig)
                         _mid_emitted += 1
+                        try:
+                            st = getattr(self, "_mid_status", None)
+                            if not isinstance(st, dict):
+                                st = {}
+                                setattr(self, "_mid_status", st)
+                            st["setup_found_total"] = int(st.get("setup_found_total", 0) or 0) + 1
+                            st["last_tick_setups"] = int(st.get("last_tick_setups", 0) or 0) + 1
+                            st["last_tick_emitted"] = int(st.get("last_tick_emitted", 0) or 0) + 1
+                        except Exception:
+                            pass
                         await asyncio.sleep(2)
 
             except Exception:
@@ -11950,6 +11960,75 @@ async def remove_mid_pending(self, key: str) -> None:
     except Exception:
         pass
 
+
+async def mid_status_snapshot(self) -> dict:
+    """Return lightweight MID status for /health and periodic logs."""
+    try:
+        now = time.time()
+        # pending in KV
+        pending_items = []
+        try:
+            pending_items = await self._mid_pending_load()
+        except Exception:
+            pending_items = []
+        pending_count = len(pending_items) if isinstance(pending_items, list) else 0
+
+        st = getattr(self, "_mid_status", None)
+        if not isinstance(st, dict):
+            st = {}
+            setattr(self, "_mid_status", st)
+
+        def _iget(k: str, d=0):
+            try:
+                return st.get(k, d)
+            except Exception:
+                return d
+
+        last_tick_ts = float(_iget("last_tick_ts", 0.0) or 0.0)
+        last_tick_done_ts = float(_iget("last_tick_done_ts", 0.0) or 0.0)
+
+        return {
+            "pending": pending_count,
+            "setup_found_total": int(_iget("setup_found_total", 0) or 0),
+            "pending_created_total": int(_iget("pending_created_total", 0) or 0),
+            "pending_triggered_total": int(_iget("pending_triggered_total", 0) or 0),
+            "pending_expired_total": int(_iget("pending_expired_total", 0) or 0),
+            "last_tick_ts": last_tick_ts,
+            "last_tick_done_ts": last_tick_done_ts,
+            "last_tick_age_sec": (now - last_tick_ts) if last_tick_ts else None,
+            "last_tick_summary": str(_iget("last_tick_summary", "") or ""),
+            "last_tick_setups": int(_iget("last_tick_setups", 0) or 0),
+            "last_tick_pending_created": int(_iget("last_tick_pending_created", 0) or 0),
+            "last_tick_emitted": int(_iget("last_tick_emitted", 0) or 0),
+        }
+    except Exception:
+        return {"pending": 0}
+
+async def mid_status_summary_loop(self) -> None:
+    """Logs MID status once per minute to explain 'why signals are few'."""
+    try:
+        every = int(os.getenv("MID_STATUS_SUMMARY_EVERY_SEC", "60") or 60)
+    except Exception:
+        every = 60
+    if every <= 0:
+        return
+    logger.info("[mid][status] summary loop enabled every=%ss", every)
+    while True:
+        await asyncio.sleep(every)
+        try:
+            snap = await self.mid_status_snapshot()
+            logger.info(
+                "[mid][status] pending=%s setup_found=%s created=%s triggered=%s expired=%s last_tick_age=%s",
+                snap.get("pending"),
+                snap.get("setup_found_total"),
+                snap.get("pending_created_total"),
+                snap.get("pending_triggered_total"),
+                snap.get("pending_expired_total"),
+                (None if snap.get("last_tick_age_sec") is None else int(float(snap.get("last_tick_age_sec") or 0))),
+            )
+        except Exception:
+            logger.exception("[mid][status] summary loop error")
+
 async def mid_pending_trigger_loop(self, emit_signal_cb):
     """Background loop: checks pending setups and emits a signal only when price reaches entry and TA is still confirmed."""
     enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
@@ -11962,6 +12041,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
     logger.info("[mid][pending] trigger loop started poll=%.2fs ttl=%.1fmin tol_atr=%.3f tol_pct=%.4f",
                 poll, ttl_min, tol_atr, tol_pct)
+
+    # status counters
+    st = getattr(self, "_mid_status", None)
+    if not isinstance(st, dict):
+        st = {}
+        setattr(self, "_mid_status", st)
 
     while True:
         try:
@@ -11980,6 +12065,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         continue
                     # expire
                     if (now - created) > ttl_min * 60:
+                        try:
+                            st["pending_expired_total"] = int(st.get("pending_expired_total", 0) or 0) + 1
+                        except Exception:
+                            pass
                         continue
 
                     # load candles (also gives fallback price)
@@ -12106,6 +12195,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     await emit_signal_cb(sig)
                     logger.info("[mid][pending] EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, entry, float(price), tol)
+                    try:
+                        st["pending_triggered_total"] = int(st.get("pending_triggered_total", 0) or 0) + 1
+                    except Exception:
+                        pass
                     # emitted: do not keep
                 except Exception:
                     keep.append(it)
@@ -12229,6 +12322,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             async def _mid_tick_body():
                 start_total = time.time()
                 start = start_total
+                # MID status tracking (for /health + logs)
+                st = getattr(self, "_mid_status", None)
+                if not isinstance(st, dict):
+                    st = {}
+                    setattr(self, "_mid_status", st)
+                st["last_tick_ts"] = start_total
+                # reset per-tick counters
+                st["last_tick_setups"] = 0
+                st["last_tick_pending_created"] = 0
+                st["last_tick_emitted"] = 0
+                st["last_tick_summary"] = ""
                 start_scan = start_total
                 prefetch_elapsed = 0.0
                 # --- Candles diagnostics (per tick) ---
@@ -14346,6 +14450,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                         }
                                         await self.add_mid_pending(rec)
                                         self.mark_mid_pending(sym, direction=direction, market=market)
+                                        try:
+                                            st = getattr(self, "_mid_status", None)
+                                            if not isinstance(st, dict):
+                                                st = {}
+                                                setattr(self, "_mid_status", st)
+                                            st["setup_found_total"] = int(st.get("setup_found_total", 0) or 0) + 1
+                                            st["pending_created_total"] = int(st.get("pending_created_total", 0) or 0) + 1
+                                            st["last_tick_setups"] = int(st.get("last_tick_setups", 0) or 0) + 1
+                                            st["last_tick_pending_created"] = int(st.get("last_tick_pending_created", 0) or 0) + 1
+                                        except Exception:
+                                            pass
                                         _rej_add(sym, "pending_saved")
                                     else:
                                         _rej_add(sym, "pending_cooldown")
@@ -14542,6 +14657,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         _mid_set_last_summary(summary)
                     except Exception:
                         pass
+                    try:
+                        st = getattr(self, "_mid_status", None)
+                        if not isinstance(st, dict):
+                            st = {}
+                            setattr(self, "_mid_status", st)
+                        st["last_tick_summary"] = str(summary)
+                        st["last_tick_done_ts"] = time.time()
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 return elapsed
@@ -14556,6 +14680,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 logger.warning("[mid][summary] %s; skipped (set MID_TICK_TIMEOUT_SEC=0 to disable)", summary)
                 try:
                     _mid_set_last_summary(summary)
+                except Exception:
+                    pass
+                try:
+                    st = getattr(self, "_mid_status", None)
+                    if not isinstance(st, dict):
+                        st = {}
+                        setattr(self, "_mid_status", st)
+                    st["last_tick_summary"] = str(summary)
+                    st["last_tick_done_ts"] = time.time()
                 except Exception:
                     pass
                 tick_elapsed = None
@@ -16891,5 +17024,27 @@ try:
             )
 
         Backend.scanner_loop_mid = _missing_scanner_loop_mid  # type: ignore[attr-defined]
+except Exception:
+    pass
+
+# --- Hotfix: ensure MID pending-entry helpers are bound as Backend methods ---
+# In some merges these functions were added at module level (indentation), so hasattr(backend, ...) becomes False
+# and MID pending mode silently disables emission forever. Bind them explicitly.
+try:
+    _mid_bind = {
+        'mark_emitted_mid': globals().get('mark_emitted_mid'),
+        'can_add_mid_pending': globals().get('can_add_mid_pending'),
+        'mark_mid_pending': globals().get('mark_mid_pending'),
+        '_mid_pending_load': globals().get('_mid_pending_load'),
+        '_mid_pending_save': globals().get('_mid_pending_save'),
+        'add_mid_pending': globals().get('add_mid_pending'),
+        'remove_mid_pending': globals().get('remove_mid_pending'),
+        'mid_pending_trigger_loop': globals().get('mid_pending_trigger_loop'),
+        'mid_status_snapshot': globals().get('mid_status_snapshot'),
+        'mid_status_summary_loop': globals().get('mid_status_summary_loop'),
+    }
+    for _name, _fn in list(_mid_bind.items()):
+        if callable(_fn) and (not hasattr(Backend, _name)):
+            setattr(Backend, _name, _fn)
 except Exception:
     pass
