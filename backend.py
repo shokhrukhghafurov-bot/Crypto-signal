@@ -78,19 +78,19 @@ if _TEST_MODE and _TEST_MODE_SCOPE in ("MID","ALL"):
         "MID_MIN_ADX_1H": "0",
         "MID_MIN_ADX_30M": "0",
         "MID_HTF_STRONG_ADX_MIN": "0",
-        "MID_MIN_RR": "1",
+        "MID_MIN_RR": "0.5",
         "MID_MIN_RR_IF_ADX_GT_25": "0.5",
         "MID_RR_DISCOUNT": "1.0",
-        "MID_MIN_SCORE_FUTURES": "80",
-        "MID_MIN_SCORE_SPOT": "80",
-        "MID_MIN_CONFIDENCE": "80",
+        "MID_MIN_SCORE_FUTURES": "90",
+        "MID_MIN_SCORE_SPOT": "90",
+        "MID_MIN_CONFIDENCE": "0",
         "MID_MIN_VOL_X": "0",
         # --- MID regime / filters ---
         "MID_NEWS_FILTER": "1",
         "MID_MACRO_FILTER": "1",
         "MID_RANGE_POS_FILTER": "0",
         "MID_TOP_FILTERS": "0",
-        "MID_TRAP_FILTERS": "0",
+        "MID_TRAP_FILTERS": "1",
         "MID_ALLOW_RANGE": "1",
         "MID_ALLOW_COUNTERTREND_WITH_5M_REVERSAL": "1",
         # Optional: avoid "no repeat" during test
@@ -8623,9 +8623,10 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     except Exception:
         pass
 
-
-    # Score / confidence: use unified TA score to avoid constant 100s
-    ta_score = _ta_score(
+    # Score / confidence: base unified TA score + MID institutional confluence bonus
+    # NOTE: _ta_score is 0..100 by design (smooth squashing). MID bonus can push total above 100
+    # if MID_SCORE_ALLOW_OVER_100=1.
+    ta_score_base = _ta_score(
         direction=dir_trend,
         adx1=adx30,
         adx4=adx1h,
@@ -8638,8 +8639,132 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         mstruct=mstruct,
         pat_bias=pat_bias,
         atr_pct=atr_pct,
-)
-    confidence = ta_score
+    )
+
+    # MID confluence bonus: incorporate institutional engines (regime/structure/liquidity/OB/BO+RT/VWAP/FVG)
+    mid_bonus = 0.0
+    mid_bonus_parts: Dict[str, float] = {}
+    fvg_kind = "—"
+    fvg_active = False
+    try:
+        # Regime
+        if mid_regime == "EXPANSION":
+            mid_bonus += 10.0
+            mid_bonus_parts["regime"] = mid_bonus_parts.get("regime", 0.0) + 10.0
+        elif mid_regime == "TRENDING":
+            mid_bonus += 6.0
+            mid_bonus_parts["regime"] = mid_bonus_parts.get("regime", 0.0) + 6.0
+        elif mid_regime == "COMPRESSION":
+            mid_bonus -= 4.0
+            mid_bonus_parts["regime"] = mid_bonus_parts.get("regime", 0.0) - 4.0
+        elif mid_regime == "RANGING":
+            mid_bonus -= 8.0
+            mid_bonus_parts["regime"] = mid_bonus_parts.get("regime", 0.0) - 8.0
+
+        # Market structure alignment (1h)
+        if struct_hhhl_1h == "HH-HL":
+            _v = 6.0 if str(dir_trend).upper() == "LONG" else -6.0
+            mid_bonus += _v
+            mid_bonus_parts["structure"] = mid_bonus_parts.get("structure", 0.0) + _v
+        elif struct_hhhl_1h == "LH-LL":
+            _v = 6.0 if str(dir_trend).upper() == "SHORT" else -6.0
+            mid_bonus += _v
+            mid_bonus_parts["structure"] = mid_bonus_parts.get("structure", 0.0) + _v
+
+        # Execution triggers
+        if (str(dir_trend).upper() == "LONG" and sweep_long) or (str(dir_trend).upper() == "SHORT" and sweep_short):
+            mid_bonus += 7.0
+            mid_bonus_parts["liquidity_sweep"] = mid_bonus_parts.get("liquidity_sweep", 0.0) + 7.0
+        if bo_rt_trigger:
+            mid_bonus += 5.0
+            mid_bonus_parts["breakout_retest"] = mid_bonus_parts.get("breakout_retest", 0.0) + 5.0
+        if ob_retest:
+            mid_bonus += 6.0
+            mid_bonus_parts["order_block"] = mid_bonus_parts.get("order_block", 0.0) + 6.0
+
+        # VWAP bias on 30m
+        if (not np.isnan(vwap_val)) and float(vwap_val) > 0:
+            if str(dir_trend).upper() == "LONG":
+                _v = 2.0 if float(entry) > float(vwap_val) else -2.0
+                mid_bonus += _v
+                mid_bonus_parts["vwap_bias"] = mid_bonus_parts.get("vwap_bias", 0.0) + _v
+            else:
+                _v = 2.0 if float(entry) < float(vwap_val) else -2.0
+                mid_bonus += _v
+                mid_bonus_parts["vwap_bias"] = mid_bonus_parts.get("vwap_bias", 0.0) + _v
+
+        # Simple FVG (Fair Value Gap) detection on 30m (last 220 bars)
+        try:
+            _df = df30i.tail(220).reset_index(drop=True)
+            if len(_df) >= 20:
+                h = _df["high"].astype(float).values
+                l = _df["low"].astype(float).values
+
+                last_zone = None  # (kind, z_lo, z_hi, idx)
+                for i in range(2, len(_df)):
+                    # Bullish imbalance: current low above high two candles back
+                    if l[i] > h[i - 2]:
+                        last_zone = ("BULL", float(h[i - 2]), float(l[i]), i)
+                    # Bearish imbalance: current high below low two candles back
+                    elif h[i] < l[i - 2]:
+                        last_zone = ("BEAR", float(h[i]), float(l[i - 2]), i)
+
+                if last_zone:
+                    kind, zlo, zhi, _i = last_zone
+                    z0, z1 = (zlo, zhi) if zlo <= zhi else (zhi, zlo)
+                    tol = max(float(atr30) * 0.15 if (atr30 and float(atr30) > 0) else 0.0, float(entry) * 0.0008)
+                    px = float(entry)
+                    fvg_kind = kind
+                    fvg_active = bool((px >= (z0 - tol)) and (px <= (z1 + tol)))
+                    if fvg_active:
+                        mid_bonus += 4.0
+                        mid_bonus_parts["fvg"] = mid_bonus_parts.get("fvg", 0.0) + 4.0
+        except Exception:
+            fvg_kind = "—"
+            fvg_active = False
+
+    except Exception:
+        mid_bonus = 0.0
+        mid_bonus_parts = {}
+        fvg_kind = "—"
+        fvg_active = False
+
+    # Total score (base + bonus). Optionally allow >100 for internal tuning.
+    try:
+        score_total = float(ta_score_base) + float(mid_bonus)
+    except Exception:
+        score_total = float(ta_score_base) if isinstance(ta_score_base, (int, float)) else 0.0
+
+    allow_over_100 = (os.getenv("MID_SCORE_ALLOW_OVER_100", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    try:
+        ta_score_total = int(round(score_total))
+    except Exception:
+        ta_score_total = int(ta_score_base) if isinstance(ta_score_base, (int, float)) else 0
+
+    # Confidence is always 0..100 (used by scanners/thresholds).
+    confidence = int(max(0, min(100, round(score_total))))
+    ta_score_display = int(max(0, min(100, ta_score_total))) if not allow_over_100 else int(ta_score_total)
+
+    # Min score gate (env): blocks low-quality setups early so they appear in summary as score_low.
+    try:
+        mkt_u2 = str(market or "SPOT").upper()
+        min_score = int(os.getenv("MID_MIN_SCORE_SPOT", "76")) if mkt_u2 == "SPOT" else int(os.getenv("MID_MIN_SCORE_FUTURES", "72"))
+        if min_score > 0 and int(confidence) < int(min_score):
+            _fail("other", f"score_low score={int(confidence)} min={int(min_score)}")
+            return None
+    except Exception:
+        pass
+
+    # Optional per-signal logging of score breakdown (very useful for tuning)
+    try:
+        if (os.getenv("MID_LOG_SCORE_BREAKDOWN", "0") or "0").strip().lower() in ("1", "true", "yes", "on"):
+            parts_txt = ",".join([f"{k}={v:+.0f}" for k, v in sorted(mid_bonus_parts.items())]) if mid_bonus_parts else ""
+            logger.info("[mid][score] %s dir=%s base=%s bonus=%+.0f total=%s conf=%s %s",
+                        symbol, str(dir_trend).upper(), int(ta_score_base), float(mid_bonus), int(ta_score_total), int(confidence),
+                        ("{" + parts_txt + "}") if parts_txt else "")
+    except Exception:
+        pass
+
 
     ta: Dict[str, Any] = {
         "direction": dir_trend,
@@ -8676,12 +8801,20 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "bo_rt": bo_rt_label,
         "ob_zone": ob_zone,
         "ob_retest": bool(ob_retest),
+        "fvg": fvg_kind,
+        "fvg_active": bool(fvg_active),
+        "mid_bonus": float(mid_bonus),
+        "mid_bonus_parts": dict(mid_bonus_parts) if isinstance(mid_bonus_parts, dict) else {},
         "channel": channel,
         "mstruct": mstruct,
         "range_pos": range_pos_txt,
         "range_pos_val": (range_pos if range_pos is not None else 0.0),
         "rsi_div": rsi_div,
-        "ta_score": ta_score,
+        # ta_score = total score (can be >100 if MID_SCORE_ALLOW_OVER_100=1)
+        "ta_score": int(ta_score_display),
+        "ta_score_base": int(ta_score_base) if isinstance(ta_score_base, (int, float)) else 0,
+        "ta_score_total": int(ta_score_total),
+        "ta_score_conf": int(confidence),
     }
     ta["ta_block"] = _fmt_ta_block_mid(ta)
     return ta
