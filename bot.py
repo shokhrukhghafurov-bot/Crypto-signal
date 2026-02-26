@@ -621,12 +621,13 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
         interval = int((os.getenv("MID_SCAN_INTERVAL_SECONDS", "").strip() or os.getenv("MID_SCAN_INTERVAL_SEC", "45").strip()) or 45)
         top_n = int(os.getenv("MID_TOP_N", "70") or 70)
 
-        # Diagnostics: catch "imported wrong backend" cases
+        # Diagnostics: catch "imported wrong backend" cases (most common reason for has_method=False)
         try:
-            import backend as _backend_mod
-            logger.info("[mid] backend module file=%s", getattr(_backend_mod, "__file__", "?"))
+            import inspect
+            cls_file = inspect.getfile(backend.__class__)
+            logger.info("[mid] backend class=%s file=%s", backend.__class__.__name__, cls_file)
         except Exception:
-            pass
+            logger.info("[mid] backend class=%s file=?", getattr(backend.__class__, "__name__", "Backend"))
 
         logger.info(
             "[mid] starting MID scanner (5m/30m/1h) interval=%ss top_n=%s has_method=%s",
@@ -644,7 +645,8 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
             # Don't silently skip. This is exactly the bug user saw in logs.
             logger.error(
                 "MID_SCANNER_ENABLED=1 but Backend has no scanner_loop_mid. "
-                "Check deploy/import: backend.py not updated?"
+                "This usually means Railway deployed an old build or imported a different backend.py. "
+                "Check the '[mid] backend class=... file=...' line above."
             )
             return
 
