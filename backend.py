@@ -11656,6 +11656,64 @@ class Backend:
                 # If you still want to see successful prefill lines, enable MID_LOG_PREFILL_OK=1.
                 _mid_log_prefill_ok = os.getenv("MID_LOG_PREFILL_OK", "0").strip().lower() in ("1","true","yes","on")
 
+                # --- Candles REST hardening (semaphore + retry + circuit breaker) ---
+                try:
+                    _mid_sem_max = int(os.getenv("MID_CANDLES_SEMAPHORE", os.getenv("CANDLES_SEMAPHORE_MAX", "18")) or 18)
+                    _mid_sem_max = max(1, min(80, _mid_sem_max))
+                except Exception:
+                    _mid_sem_max = 18
+                try:
+                    _mid_sem = getattr(self, "_mid_candles_sem", None)
+                    if _mid_sem is None or getattr(_mid_sem, "_value", None) is None:
+                        _mid_sem = asyncio.Semaphore(_mid_sem_max)
+                        setattr(self, "_mid_candles_sem", _mid_sem)
+                except Exception:
+                    _mid_sem = None
+
+                try:
+                    _mid_ex_health = getattr(self, "_mid_candles_ex_health", None)
+                    if _mid_ex_health is None:
+                        _mid_ex_health = {}
+                        setattr(self, "_mid_candles_ex_health", _mid_ex_health)
+                except Exception:
+                    _mid_ex_health = {}
+
+                def _mid_health_get(ex: str, mkt: str) -> dict:
+                    k = (str(ex).upper(), str(mkt).upper())
+                    d = _mid_ex_health.get(k)
+                    if not isinstance(d, dict):
+                        d = {"score": 0.5, "fail_streak": 0, "cooldown_until": 0.0, "last": 0.0}
+                        _mid_ex_health[k] = d
+                    return d
+
+                def _mid_is_transient_exc(e: Exception) -> bool:
+                    try:
+                        s = (str(e) or "").lower()
+                    except Exception:
+                        s = ""
+                    return any(x in s for x in (
+                        "timeout", "timed out", "temporarily", "try again", "429", "too many", "rate", "limit",
+                        "bad gateway", "gateway", "service unavailable", "502", "503", "504",
+                        "connection", "reset", "refused", "unreachable", "dns"
+                    ))
+
+                async def _mid_call_with_retry(fn):
+                    max_tries = int(os.getenv("MID_CANDLES_RETRY", os.getenv("CANDLES_RETRY", "2")) or 2)
+                    max_tries = max(1, min(3, max_tries))
+                    base = float(os.getenv("MID_CANDLES_RETRY_BACKOFF_SEC", os.getenv("CANDLES_RETRY_BACKOFF_SEC", "0.35")) or 0.35)
+                    base = max(0.05, min(2.0, base))
+                    for attempt in range(1, max_tries + 1):
+                        try:
+                            return await fn()
+                        except Exception as e:
+                            if attempt >= max_tries or (not _mid_is_transient_exc(e)):
+                                raise
+                            try:
+                                jitter = (0.15 * base) * (0.5 + (time.time() % 1.0))
+                            except Exception:
+                                jitter = 0.0
+                            await asyncio.sleep(base * (2 ** (attempt - 1)) + jitter)
+
                 def _mid_diag_add(symb: str, ex_name: str, market: str, tf: str, status: str, reason: str = '') -> None:
                     nonlocal _mid_diag_lines
                     try:
@@ -11987,6 +12045,16 @@ class Backend:
                                 _mid_candles_unsupported += 1
                                 return None
 
+                            # Circuit breaker: skip exchange/market temporarily after repeated transient failures
+                            try:
+                                _h = _mid_health_get(ex_name, mkt)
+                                _cd = float(_h.get('cooldown_until', 0.0) or 0.0)
+                                if _cd and time.time() < _cd:
+                                    _mid_diag_add(symb, ex_name, mkt, tf, 'cooldown')
+                                    return None
+                            except Exception:
+                                _h = None
+
                             def _mid_rest_is_fresh(df: Optional[pd.DataFrame]) -> bool:
                                 """Validate REST candles freshness. Reject stale REST to avoid using old data."""
                                 try:
@@ -12056,7 +12124,9 @@ class Backend:
                                 except Exception:
                                     # If exchangeInfo fails, fall back to request (old behavior)
                                     pass
-                                df = await api.klines_binance(symb, tf, limit, market=market)
+                                async def _call_binance():
+                                    return await api.klines_binance(symb, tf, limit, market=market)
+                                df = await _mid_call_with_retry(_call_binance)
                                 if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                     return pd.DataFrame()
@@ -12064,9 +12134,19 @@ class Backend:
                                 if dfn is None:
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
                                     return pd.DataFrame()
+                                try:
+                                    if _h is not None:
+                                        prev = float(_h.get('score', 0.5) or 0.5)
+                                        _h['score'] = prev * 0.8 + 0.2 * 1.0
+                                        _h['fail_streak'] = 0
+                                        _h['last'] = time.time()
+                                except Exception:
+                                    pass
                                 return dfn
                             if ex_name == "BYBIT":
-                                df = await api.klines_bybit(symb, tf, limit, market=market)
+                                async def _call_bybit():
+                                    return await api.klines_bybit(symb, tf, limit, market=market)
+                                df = await _mid_call_with_retry(_call_bybit)
                                 if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                     return pd.DataFrame()
@@ -12074,9 +12154,19 @@ class Backend:
                                 if dfn is None:
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
                                     return pd.DataFrame()
+                                try:
+                                    if _h is not None:
+                                        prev = float(_h.get('score', 0.5) or 0.5)
+                                        _h['score'] = prev * 0.8 + 0.2 * 1.0
+                                        _h['fail_streak'] = 0
+                                        _h['last'] = time.time()
+                                except Exception:
+                                    pass
                                 return dfn
                             if ex_name == "OKX":
-                                df = await api.klines_okx(symb, tf, limit, market=market)
+                                async def _call_okx():
+                                    return await api.klines_okx(symb, tf, limit, market=market)
+                                df = await _mid_call_with_retry(_call_okx)
                                 if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                     return pd.DataFrame()
@@ -12084,9 +12174,19 @@ class Backend:
                                 if dfn is None:
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
                                     return pd.DataFrame()
+                                try:
+                                    if _h is not None:
+                                        prev = float(_h.get('score', 0.5) or 0.5)
+                                        _h['score'] = prev * 0.8 + 0.2 * 1.0
+                                        _h['fail_streak'] = 0
+                                        _h['last'] = time.time()
+                                except Exception:
+                                    pass
                                 return dfn
                             if ex_name == "GATEIO":
-                                df = await api.klines_gateio(symb, tf, limit)
+                                async def _call_gateio():
+                                    return await api.klines_gateio(symb, tf, limit)
+                                df = await _mid_call_with_retry(_call_gateio)
                                 if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                     return pd.DataFrame()
@@ -12094,9 +12194,19 @@ class Backend:
                                 if dfn is None:
                                     _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
                                     return pd.DataFrame()
+                                try:
+                                    if _h is not None:
+                                        prev = float(_h.get('score', 0.5) or 0.5)
+                                        _h['score'] = prev * 0.8 + 0.2 * 1.0
+                                        _h['fail_streak'] = 0
+                                        _h['last'] = time.time()
+                                except Exception:
+                                    pass
                                 return dfn
                             # default MEXC
-                            df = await api.klines_mexc(symb, tf, limit)
+                            async def _call_mexc():
+                                return await api.klines_mexc(symb, tf, limit)
+                            df = await _mid_call_with_retry(_call_mexc)
                             if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                 _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                 return pd.DataFrame()
@@ -12104,6 +12214,14 @@ class Backend:
                             if dfn is None:
                                 _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
                                 return pd.DataFrame()
+                            try:
+                                if _h is not None:
+                                    prev = float(_h.get('score', 0.5) or 0.5)
+                                    _h['score'] = prev * 0.8 + 0.2 * 1.0
+                                    _h['fail_streak'] = 0
+                                    _h['last'] = time.time()
+                            except Exception:
+                                pass
                             return dfn
 
                     except Exception as e:
@@ -12146,6 +12264,24 @@ class Backend:
                                 lst = _mid_candles_fail_samples[(ex_name, tf)]
                                 if len(lst) < _mid_candles_log_samples:
                                     lst.append(f"{type(e).__name__}: {e}")
+                        except Exception:
+                            pass
+
+                        # Health score / circuit breaker for transient failures
+                        try:
+                            if _h is not None and _mid_is_transient_exc(e):
+                                prev = float(_h.get('score', 0.5) or 0.5)
+                                _h['score'] = max(0.05, prev * 0.75)
+                                fs = int(_h.get('fail_streak', 0) or 0) + 1
+                                _h['fail_streak'] = fs
+                                _h['last'] = time.time()
+                                trip_n = int(os.getenv('MID_CANDLES_CB_FAILS', os.getenv('CANDLES_CB_FAILS', '3')) or 3)
+                                trip_n = max(2, min(10, trip_n))
+                                cooldown = float(os.getenv('MID_CANDLES_CB_COOLDOWN_SEC', os.getenv('CANDLES_CB_COOLDOWN_SEC', '180')) or 180)
+                                cooldown = max(30.0, min(900.0, cooldown))
+                                if fs >= trip_n:
+                                    _h['cooldown_until'] = time.time() + cooldown
+                                    _h['fail_streak'] = 0
                         except Exception:
                             pass
                         return None
@@ -15877,38 +16013,211 @@ async def _backend_load_candles(self: "Backend", symbol: str, tf: str, market: s
     if limit is None:
         limit = 300 if tf in ("1h","4h") else 500
 
+    # ------------------------------
+    # Production hardening (MID+TA):
+    # - concurrency guard (semaphore)
+    # - small TTL cache (prevents duplicate REST hits within a tick)
+    # - retry with backoff for transient network/rate errors
+    # - exchange health score + circuit breaker cooldown
+    # ------------------------------
+
+    # Per-backend semaphore for all candles REST requests
+    try:
+        sem_max = int(os.getenv("MID_CANDLES_SEMAPHORE", os.getenv("CANDLES_SEMAPHORE_MAX", "18")) or 18)
+        sem_max = max(1, min(80, sem_max))
+    except Exception:
+        sem_max = 18
+    try:
+        sem = getattr(self, "_candles_sem", None)
+        if sem is None or getattr(sem, "_value", None) is None:
+            sem = asyncio.Semaphore(sem_max)
+            setattr(self, "_candles_sem", sem)
+    except Exception:
+        sem = None
+
+    # Tick-local / short TTL cache
+    try:
+        cache_ttl = float(os.getenv("MID_CANDLES_CACHE_TTL_SEC", os.getenv("CANDLES_CACHE_TTL_SEC", "20")) or 20)
+        cache_ttl = max(0.0, min(300.0, cache_ttl))
+    except Exception:
+        cache_ttl = 20.0
+    cache_key = (sym, tf, mkt, int(limit))
+    if cache_ttl > 0:
+        try:
+            cc = getattr(self, "_candles_cache", None)
+            if cc is None:
+                cc = {}
+                setattr(self, "_candles_cache", cc)
+            hit = cc.get(cache_key)
+            if hit:
+                ts, df_cached = hit
+                if (time.time() - float(ts)) <= cache_ttl and df_cached is not None and not getattr(df_cached, "empty", True):
+                    try:
+                        return df_cached.copy(deep=False).reset_index(drop=True)
+                    except Exception:
+                        return df_cached.reset_index(drop=True)
+        except Exception:
+            pass
+
+    # Exchange health + cooldown (circuit breaker)
+    try:
+        health = getattr(self, "_candles_ex_health", None)
+        if health is None:
+            health = {}
+            setattr(self, "_candles_ex_health", health)
+    except Exception:
+        health = {}
+
+    def _health_get(ex: str) -> dict:
+        k = (ex, mkt)
+        d = health.get(k)
+        if not isinstance(d, dict):
+            d = {"score": 0.5, "fail_streak": 0, "cooldown_until": 0.0, "last": 0.0}
+            health[k] = d
+        return d
+
+    def _is_transient_exc(e: Exception) -> bool:
+        try:
+            s = (str(e) or "").lower()
+        except Exception:
+            s = ""
+        # conservative set: timeouts, 429, 5xx, generic network issues
+        return any(x in s for x in (
+            "timeout", "timed out", "temporarily", "try again", "429", "too many", "rate", "limit",
+            "bad gateway", "gateway", "service unavailable", "502", "503", "504",
+            "connection", "reset", "refused", "unreachable", "dns"
+        ))
+
+    async def _call_with_retry(fn, *, ex_name: str):
+        # Retries only for transient errors
+        max_tries = int(os.getenv("MID_CANDLES_RETRY", os.getenv("CANDLES_RETRY", "2")) or 2)
+        max_tries = max(1, min(3, max_tries))
+        base = float(os.getenv("MID_CANDLES_RETRY_BACKOFF_SEC", os.getenv("CANDLES_RETRY_BACKOFF_SEC", "0.35")) or 0.35)
+        base = max(0.05, min(2.0, base))
+        for attempt in range(1, max_tries + 1):
+            try:
+                return await fn()
+            except Exception as e:
+                if attempt >= max_tries or not _is_transient_exc(e):
+                    raise
+                # exponential backoff + jitter
+                try:
+                    jitter = (0.15 * base) * (0.5 + (time.time() % 1.0))
+                except Exception:
+                    jitter = 0.0
+                await asyncio.sleep(base * (2 ** (attempt - 1)) + jitter)
+
     # Prefer exchanges depending on market
     if mkt == "FUTURES":
-        ex_order = ["BYBIT", "BINANCE", "OKX"]
+        base_order = ["BYBIT", "BINANCE", "OKX"]
     else:
-        ex_order = ["BINANCE", "OKX", "BYBIT", "GATEIO", "MEXC"]
+        base_order = ["BINANCE", "OKX", "BYBIT", "GATEIO", "MEXC"]
+
+    # Reorder by health score (stable sort preserving base_order as tie breaker)
+    now_ts = time.time()
+    scored = []
+    for ex in base_order:
+        h = _health_get(ex)
+        cd = float(h.get("cooldown_until", 0.0) or 0.0)
+        if cd and now_ts < cd:
+            continue
+        try:
+            sc = float(h.get("score", 0.5) or 0.5)
+        except Exception:
+            sc = 0.5
+        scored.append((ex, sc))
+    # if all cooled down, fall back to base order
+    if scored:
+        ex_order = [ex for ex, _ in sorted(scored, key=lambda t: t[1], reverse=True)]
+    else:
+        ex_order = list(base_order)
 
     async with MultiExchangeData() as api:
         for ex in ex_order:
+            h = _health_get(ex)
+            # one more cooldown check (race safe)
             try:
+                if float(h.get("cooldown_until", 0.0) or 0.0) > time.time():
+                    continue
+            except Exception:
+                pass
+
+            async def _do_call():
                 if ex == "BINANCE":
-                    df = await api.klines_binance(sym, tf, limit=limit, market=mkt)
-                elif ex == "BYBIT":
-                    df = await api.klines_bybit(sym, tf, limit=limit, market=mkt)
-                elif ex == "OKX":
-                    df = await api.klines_okx(sym, tf, limit=limit, market=mkt)
-                elif ex == "GATEIO":
+                    return await api.klines_binance(sym, tf, limit=limit, market=mkt)
+                if ex == "BYBIT":
+                    return await api.klines_bybit(sym, tf, limit=limit, market=mkt)
+                if ex == "OKX":
+                    return await api.klines_okx(sym, tf, limit=limit, market=mkt)
+                if ex == "GATEIO":
                     if mkt == "FUTURES":
-                        continue
-                    df = await api.klines_gateio(sym, tf, limit=limit)
-                else:  # MEXC
-                    if mkt == "FUTURES":
-                        continue
-                    df = await api.klines_mexc(sym, tf, limit=limit)
+                        return None
+                    return await api.klines_gateio(sym, tf, limit=limit)
+                # MEXC
+                if mkt == "FUTURES":
+                    return None
+                return await api.klines_mexc(sym, tf, limit=limit)
+
+            try:
+                if sem is not None:
+                    async with sem:
+                        df = await _call_with_retry(_do_call, ex_name=ex)
+                else:
+                    df = await _call_with_retry(_do_call, ex_name=ex)
 
                 dfn = _mid_norm_ohlcv(df)
                 if dfn is None or getattr(dfn, "empty", True):
+                    # treat empty as a soft fail (doesn't trip cooldown aggressively)
+                    try:
+                        h["score"] = float(h.get("score", 0.5) or 0.5) * 0.9
+                        h["fail_streak"] = int(h.get("fail_streak", 0) or 0) + 1
+                        h["last"] = time.time()
+                    except Exception:
+                        pass
                     continue
+
                 # Ensure volume exists
                 if "volume" not in dfn.columns:
                     dfn["volume"] = np.nan
-                return dfn.reset_index(drop=True)
+
+                # success -> update health score + reset fail streak
+                try:
+                    prev = float(h.get("score", 0.5) or 0.5)
+                    h["score"] = prev * 0.8 + 0.2 * 1.0
+                    h["fail_streak"] = 0
+                    h["last"] = time.time()
+                except Exception:
+                    pass
+
+                out = dfn.reset_index(drop=True)
+                if cache_ttl > 0:
+                    try:
+                        cc = getattr(self, "_candles_cache", None)
+                        if isinstance(cc, dict):
+                            cc[cache_key] = (time.time(), out)
+                    except Exception:
+                        pass
+                return out
+
             except Exception:
+                # failure -> degrade score; trip circuit breaker if repeated failures
+                try:
+                    prev = float(h.get("score", 0.5) or 0.5)
+                    h["score"] = max(0.05, prev * 0.75)
+                    fs = int(h.get("fail_streak", 0) or 0) + 1
+                    h["fail_streak"] = fs
+                    h["last"] = time.time()
+
+                    # circuit breaker
+                    trip_n = int(os.getenv("MID_CANDLES_CB_FAILS", os.getenv("CANDLES_CB_FAILS", "3")) or 3)
+                    trip_n = max(2, min(10, trip_n))
+                    cooldown = float(os.getenv("MID_CANDLES_CB_COOLDOWN_SEC", os.getenv("CANDLES_CB_COOLDOWN_SEC", "180")) or 180)
+                    cooldown = max(30.0, min(900.0, cooldown))
+                    if fs >= trip_n:
+                        h["cooldown_until"] = time.time() + cooldown
+                        h["fail_streak"] = 0
+                except Exception:
+                    pass
                 continue
     return pd.DataFrame()
 
