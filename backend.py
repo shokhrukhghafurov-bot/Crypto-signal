@@ -3633,17 +3633,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
     # Best-effort; never crash.
     while True:
         try:
-            try:
-                rows = await db_store.claim_open_autotrade_positions(owner=manager_worker_id, limit=manager_batch, lease_sec=manager_lease_sec)
-            except (TimeoutError, asyncio.TimeoutError) as e:
-                logger.warning("[autotrade] DB timeout while claiming positions (%s). Backing off.", e)
-                await asyncio.sleep(float(os.getenv("DB_BACKOFF_SEC", "5") or 5))
-                continue
-            except Exception as e:
-                logger.warning("[autotrade] DB error while claiming positions (%s). Backing off.", e)
-                await asyncio.sleep(float(os.getenv("DB_BACKOFF_SEC", "5") or 5))
-                continue
-
+            rows = await db_store.claim_open_autotrade_positions(owner=manager_worker_id, limit=manager_batch, lease_sec=manager_lease_sec)
             for r in rows:
                 rid = int((r or {}).get('id') or 0)
                 # Refresh lease so other replicas won't steal it mid-processing.
@@ -10908,15 +10898,9 @@ class Backend:
                 pass
             try:
                 rows = await db_store.list_active_trades(limit=500)
-            except (TimeoutError, asyncio.TimeoutError) as e:
-                # DB transient stall: don't spam stacktraces, just back off.
-                logger.warning("track_loop: DB timeout (%s). Backing off.", e)
-                rows = []
-                await asyncio.sleep(float(os.getenv("DB_BACKOFF_SEC", "5") or 5))
             except Exception:
                 logger.exception("track_loop: failed to load active trades from DB")
                 rows = []
-                await asyncio.sleep(float(os.getenv("DB_BACKOFF_SEC", "5") or 5))
 
             for row in rows:
                 try:
@@ -11596,6 +11580,17 @@ class Backend:
                         # Risk/TA notes (human-readable)
                         risk_note = _fmt_ta_block(best_r)
 
+                        # Emit cooldown (keyed by market+symbol+direction)
+                        if not self.can_emit_mid(sym, best_dir, market):
+                            _mid_skip_cooldown += 1
+                            _rej_add(sym, "cooldown")
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, best_dir, market, "cooldown")
+                            except Exception:
+                                pass
+                            continue
+
+
                         # SPOT+SHORT is not executable -> convert to FUTURES unless Futures are forced off by news/macro
                         if market == "SPOT" and best_dir == "SHORT":
                             if news_act == "FUTURES_OFF" or mac_act == "FUTURES_OFF":
@@ -11711,24 +11706,28 @@ class Backend:
 # ------------------ Auto-trade diagnostics (admin) ------------------
 
 
-    def can_emit_mid(self, symbol: str) -> bool:
+    def can_emit_mid(self, symbol: str, direction: str = "", market: str = "") -> bool:
+        """Cooldown for emitting MID signals.
+        Keyed by market+symbol+direction so SPOT/FUTURES and LONG/SHORT don't conflict.
+        """
         cooldown_min = int(os.getenv("MID_COOLDOWN_MINUTES", "180"))
         m = getattr(self, "_last_emit_mid", None)
         if m is None:
             self._last_emit_mid = {}
             m = self._last_emit_mid
-        ts = m.get(symbol)
+        key = f"{str(market or '').upper()}:{symbol}:{str(direction or '').upper()}" if (market or direction) else symbol
+        ts = m.get(key)
         return ts is None or (time.time() - float(ts)) >= cooldown_min * 60
 
-    def mark_emitted_mid(self, symbol: str) -> None:
+def mark_emitted_mid(self, symbol: str, direction: str = "", market: str = "") -> None:
         m = getattr(self, "_last_emit_mid", None)
         if m is None:
             self._last_emit_mid = {}
             m = self._last_emit_mid
-        m[symbol] = time.time()
+        key = f"{str(market or '').upper()}:{symbol}:{str(direction or '').upper()}" if (market or direction) else symbol
+        m[key] = time.time()
 
-
-# ---------------- MID pending entry (wait for price to reach entry + re-confirm TA) ----------------
+# ---------------- MID pending entry# ---------------- MID pending entry (wait for price to reach entry + re-confirm TA) ----------------
 
 def can_add_mid_pending(self, symbol: str, direction: str = "", market: str = "") -> bool:
     """Cooldown for adding the same pending setup (prevents KV spam).
@@ -12098,7 +12097,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         ts=time.time(),
                     )
 
-                    self.mark_emitted_mid(sym)
+                    self.mark_emitted_mid(sym, sig.direction, sig.market)
                     self.last_signal = sig
                     if sig.market == "SPOT":
                         self.last_spot_signal = sig
@@ -14354,7 +14353,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     _rej_add(sym, "pending_error")
                                 # do NOT emit now
                             else:
-                                self.mark_emitted_mid(sym)
+                                self.mark_emitted_mid(sym, sig.direction, sig.market)
                                 self.last_signal = sig
                                 if sig.market == "SPOT":
                                     self.last_spot_signal = sig
