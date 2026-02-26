@@ -13919,13 +13919,89 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
     mkt = (market or "FUTURES").strip().upper()
     lang = (lang or "ru").lower()
 
-    # ---------- load candles ----------
-    df5 = await self.load_candles(sym, "5m", mkt)
-    df1 = await self.load_candles(sym, "1h", mkt)
-    df4 = await self.load_candles(sym, "4h", mkt)
+    def _df_valid(df) -> bool:
+        """Strict validation to prevent fake 0-valued analysis when candles fetch fails."""
+        try:
+            if df is None or getattr(df, "empty", True):
+                return False
+            if len(df) < 60:
+                return False
+            # Guard against placeholder frames (all zeros)
+            for col in ("close", "high", "low"):
+                if col in df.columns:
+                    try:
+                        mx = float(df[col].astype(float).max())
+                    except Exception:
+                        return False
+                    if mx <= 0:
+                        return False
+            if "close" in df.columns:
+                try:
+                    if float(df["close"].astype(float).iloc[-1]) <= 0:
+                        return False
+                except Exception:
+                    return False
+            return True
+        except Exception:
+            return False
 
-    if df5 is None or getattr(df5, "empty", True) or len(df5) < 60:
-        return f"⚠️ no candles for {sym}"
+    # --------- AUTO market selection (SPOT priority -> FUTURES fallback) ---------
+    if mkt == "AUTO":
+        candidates: list[tuple[str, str]] = [("SPOT", sym), ("FUTURES", sym)]
+
+        # Meme-contract alias: futures may use 1000x contract tickers (e.g., 1000PEPEUSDT)
+        if sym.endswith("USDT"):
+            base = sym[:-4]
+            if base in ("PEPE",):
+                candidates.append(("FUTURES", f"1000{base}USDT"))
+
+        chosen_mkt = None
+        chosen_sym = None
+        df5 = None
+        df1 = None
+        df4 = None
+
+        for cmkt, csym in candidates:
+            try:
+                t5 = await self.load_candles(csym, "5m", cmkt)
+            except Exception:
+                t5 = None
+            if _df_valid(t5):
+                chosen_mkt, chosen_sym = cmkt, csym
+                df5 = t5
+                # load higher TFs best-effort
+                try:
+                    df1 = await self.load_candles(csym, "1h", cmkt)
+                except Exception:
+                    df1 = None
+                try:
+                    df4 = await self.load_candles(csym, "4h", cmkt)
+                except Exception:
+                    df4 = None
+                break
+
+        if chosen_mkt is None or chosen_sym is None or not _df_valid(df5):
+            hint = ""
+            if sym.endswith("USDT") and sym[:-4] == "PEPE":
+                hint = "\n\nПодсказка: для PEPE фьючерса часто используется 1000PEPEUSDT"
+            return f"❌ Нет данных для {sym} (AUTO).{hint}"
+
+        # apply chosen
+        mkt = chosen_mkt
+        sym = chosen_sym
+
+    else:
+        # ---------- load candles ----------
+        df5 = await self.load_candles(sym, "5m", mkt)
+        df1 = await self.load_candles(sym, "1h", mkt)
+        df4 = await self.load_candles(sym, "4h", mkt)
+
+    # Validate candles (avoid fake 0-valued analysis)
+    if not _df_valid(df5):
+        hint = ""
+        if sym.endswith("USDT") and sym[:-4] == "PEPE":
+            hint = "\n\nПодсказка: для PEPE фьючерса часто используется 1000PEPEUSDT"
+        return f"❌ Нет свечей/цены для {sym} ({mkt}).{hint}"
 
     # ---------- indicators ----------
     df5 = _add_indicators(df5)
