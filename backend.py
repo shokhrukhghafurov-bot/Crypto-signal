@@ -17075,13 +17075,33 @@ except Exception:
 try:
     if not hasattr(Backend, "scanner_loop_mid"):
         async def _missing_scanner_loop_mid(self, *args, **kwargs):
-            raise RuntimeError(
-                "Backend.scanner_loop_mid is missing. This build is inconsistent: "
-                "MID_SCANNER_ENABLED=1 requires MID scanner implementation. "
-                "Redeploy ensuring updated backend.py is used."
-            )
+            # Do not hard-crash the whole process; record status and exit.
+            try:
+                st = getattr(self, '_mid_status', None)
+                if not isinstance(st, dict):
+                    st = {}
+                    setattr(self, '_mid_status', st)
+                st['task_error'] = 'missing_scanner_loop_mid_impl'
+                st['task_state'] = 'DONE'
+            except Exception:
+                pass
+            try:
+                logger.error('[mid] scanner_loop_mid missing: MID_SCANNER_ENABLED=1 but backend.py has no implementation')
+            except Exception:
+                pass
+            return
 
         Backend.scanner_loop_mid = _missing_scanner_loop_mid  # type: ignore[attr-defined]
+except Exception:
+    pass
+
+
+# --- MID backend feature diagnostics (startup) ---
+try:
+    _has_mid = hasattr(Backend, 'scanner_loop_mid')
+    _fn = getattr(Backend, 'scanner_loop_mid', None)
+    _fn_name = getattr(_fn, '__name__', None)
+    logger.info('[mid] backend feature scanner_loop_mid=%s fn=%s', _has_mid, _fn_name)
 except Exception:
     pass
 
