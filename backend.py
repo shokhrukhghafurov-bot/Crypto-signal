@@ -67,13 +67,13 @@ if _TEST_MODE and _TEST_MODE_SCOPE in ("MID","ALL"):
     # We set os.environ overrides BEFORE the rest of the module reads env vars into globals.
     _overrides = {
         # --- MID alignment / HTF guards ---
-        "MID_TF_ALIGN_MIN": "0",
-        "MID_REQUIRE_30M_TREND": "0",
-        "MID_REQUIRE_STRUCTURE_ALIGN": "0",
-        "MID_REQUIRE_VWAP_ALIGN": "0",
-        "MID_GUARD_HTF_ALIGN": "0",
-        "MID_GUARD_VWAP": "0",
-        "MID_GUARD_TREND_ADX_MIN": "0",
+        "MID_TF_ALIGN_MIN": "1",
+        "MID_REQUIRE_30M_TREND": "1",
+        "MID_REQUIRE_STRUCTURE_ALIGN": "1",
+        "MID_REQUIRE_VWAP_ALIGN": "1",
+        "MID_GUARD_HTF_ALIGN": "1",
+        "MID_GUARD_VWAP": "1",
+        "MID_GUARD_TREND_ADX_MIN": "28",
         # --- MID ADX / RR / score ---
         "MID_MIN_ADX_1H": "0",
         "MID_MIN_ADX_30M": "0",
