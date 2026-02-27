@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-02-27_v10"
+MID_BUILD_TAG = "MID_BUILD_2026-02-27_v11"
 
 import asyncio
 import json
@@ -643,6 +643,7 @@ MID_REJECT_ALIASES = {
     "timeout": "candles_unavailable",
     "tick_budget": "candles_unavailable",
     "no_market_any": "candles_unavailable",
+    "no_candidate": "candles_unavailable",
     "futures_existence_check_failed": "candles_unavailable",
     "no_futures_contract": "candles_unavailable",
     "futures_forced_off": "candles_unavailable",
@@ -711,6 +712,12 @@ def mid_reject(reason: str) -> str:
         if not r:
             return "not_enough_data"
         token = r.split()[0].strip().strip(";:,.()[]{}")
+
+        # Prefix-style legacy reasons
+        # e.g. "symbol_timeout_10s" -> candles_unavailable
+        if token.startswith("symbol_timeout"):
+            return "candles_unavailable"
+
         key = MID_REJECT_ALIASES.get(token) or MID_REJECT_ALIASES.get(r)
         if key and key in MID_REJECT_REASONS:
             return key
@@ -14201,7 +14208,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             if lst is None:
                                 lst = []
                                 _rej_examples_map[key] = lst
-                            if len(lst) < _rej_examples_max:
+                            if len(lst) < _rej_examples:
                                 lst.append(str(_sym))
 
                             # Stage flow: this symbol ended in rejection
