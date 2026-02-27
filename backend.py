@@ -10248,15 +10248,6 @@ class Backend:
         # Called best-effort once per track_loop cycle.
         self.health_tick_cb = None
 
-        # Hardening: prevent accidental instance-attribute shadowing of class methods.
-        # If some config/merge mistakenly set `self.scanner_loop_mid = None`, bot.py would
-        # think MID scanner is missing even though Backend defines it.
-        try:
-            if "scanner_loop_mid" in getattr(self, "__dict__", {}) and not callable(getattr(self, "scanner_loop_mid", None)):
-                del self.__dict__["scanner_loop_mid"]
-        except Exception:
-            pass
-
 
 
     def set_mid_trap_sink(self, cb) -> None:
@@ -17478,5 +17469,19 @@ try:
     for _name, _fn in list(_mid_bind.items()):
         if callable(_fn) and (not hasattr(Backend, _name)):
             setattr(Backend, _name, _fn)
+except Exception:
+    pass
+
+
+# --- Hotfix: bind scanner_loop_mid if it was accidentally defined at module level or lost during merges ---
+# Some Railway builds ended up with scanner_loop_mid outside the Backend class (indentation/merge artifact).
+# In that case, the bot sees Backend.scanner_loop_mid == None and disables MID scanning.
+# We only bind if the class attribute is missing or not callable, and a callable module-level function exists.
+try:
+    _cls_attr = getattr(Backend, 'scanner_loop_mid', None)
+    if not callable(_cls_attr):
+        _fn = globals().get('scanner_loop_mid')
+        if callable(_fn):
+            setattr(Backend, 'scanner_loop_mid', _fn)
 except Exception:
     pass
