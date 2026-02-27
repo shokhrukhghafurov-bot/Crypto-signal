@@ -12325,6 +12325,20 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
     def _pending_mark_fail(it: dict, reason: str, now_ts: float) -> bool:
         """Return True to keep pending, False to drop."""
+        # "Smart delete": some reasons are terminal (setup invalidated) and we drop
+        # the pending immediately instead of waiting for max_fails/max_attempts.
+        # This is configurable via env MID_PENDING_HARD_FAIL_REASONS.
+        try:
+            _hard = os.getenv("MID_PENDING_HARD_FAIL_REASONS", "structure_broken,invalidation_hit,trend_flip").strip()
+            hard_set = {s.strip().lower() for s in _hard.split(",") if s.strip()}
+            r0 = str(reason or "fail").strip().lower()
+            if r0 in hard_set:
+                it["fail_count"] = int(it.get("fail_count") or 0) + 1
+                it["last_fail_reason"] = str(reason or "fail")
+                it["last_fail_ts"] = float(now_ts)
+                return False
+        except Exception:
+            pass
         try:
             it["fail_count"] = int(it.get("fail_count") or 0) + 1
             it["last_fail_reason"] = str(reason or "fail")
@@ -12444,6 +12458,23 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         if attempt_gap_sec > 0 and last_try > 0 and (now - last_try) < attempt_gap_sec:
                             keep.append(it)
                             any_wait = True
+                            continue
+                    except Exception:
+                        pass
+
+                    # Smart delete (terminal invalidation): if higher-timeframe structure
+                    # is clearly opposite to the pending direction, drop immediately.
+                    try:
+                        struct_1h = _mid_structure_hhhl(
+                            df1h,
+                            lookback=int(os.getenv("MID_STRUCTURE_LOOKBACK_1H", "220") or 220),
+                            pivot=int(os.getenv("MID_STRUCTURE_PIVOT", "3") or 3),
+                        )
+                        if str(direction).upper() == "LONG" and struct_1h == "LH-LL":
+                            _pending_mark_fail(it, "structure_broken", now)
+                            continue
+                        if str(direction).upper() == "SHORT" and struct_1h == "HH-HL":
+                            _pending_mark_fail(it, "structure_broken", now)
                             continue
                     except Exception:
                         pass
