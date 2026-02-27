@@ -12549,6 +12549,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             keep.append(it)
                             any_wait = True
                         continue
+                    # Hard blocks (late entry, near extremes, etc.) must be enforced on TRIGGER.
+                    if bool(ta.get("blocked")):
+                        reason = str(ta.get("block_reason") or "blocked").strip() or "blocked"
+                        if _pending_mark_fail(it, reason, now):
+                            keep.append(it)
+                            any_wait = True
+                        continue
                     if not bool(ta.get("trap_ok", True)):
                         if _pending_mark_fail(it, "trap_block", now):
                             keep.append(it)
@@ -12566,6 +12573,52 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # apply the same filters here at trigger moment.
                     postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
                     if postsetup_only:
+                        # Score/quality threshold (same logic as scan stage)
+                        try:
+                            use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
+                            if use_main:
+                                min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
+                                min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
+                            else:
+                                min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76") or 76)
+                                min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
+                            need = float(min_score_fut if market == "FUTURES" else min_score_spot)
+                            score = float(ta.get("confidence") or ta.get("score") or 0.0)
+                            if need and score < need:
+                                if _pending_mark_fail(it, "score_low", now):
+                                    keep.append(it)
+                                    any_wait = True
+                                continue
+                        except Exception:
+                            pass
+                        # Regime/vol thresholds
+                        try:
+                            min_adx_30m = float(os.getenv("MID_MIN_ADX_30M","0") or 0)
+                            min_adx_1h = float(os.getenv("MID_MIN_ADX_1H","0") or 0)
+                            adx30 = float(ta.get("adx1") or ta.get("adx_30m") or 0.0)
+                            adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
+                            if min_adx_30m and adx30 < min_adx_30m:
+                                if _pending_mark_fail(it, "regime_block", now):
+                                    keep.append(it)
+                                    any_wait = True
+                                continue
+                            if min_adx_1h and adx1h < min_adx_1h:
+                                if _pending_mark_fail(it, "regime_block", now):
+                                    keep.append(it)
+                                    any_wait = True
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            min_atr_pct = float(os.getenv("MID_MIN_ATR_PCT","0") or 0)
+                            atrp = float(ta.get("atr_pct") or 0.0)
+                            if min_atr_pct and atrp < min_atr_pct:
+                                if _pending_mark_fail(it, "volatility_block", now):
+                                    keep.append(it)
+                                    any_wait = True
+                                continue
+                        except Exception:
+                            pass
                         try:
                             # RR filter
                             min_rr = float(os.getenv("MID_MIN_RR", "0") or 0)
@@ -14862,7 +14915,15 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), "align_mismatch")
                                 except Exception:
                                     pass
-                                continue
+                                # If user runs pending/trigger model, do not reject during SCAN.
+                                # Mark as a risk flag and let TRIGGER confirmations decide.
+                                if not (pending_enabled and postsetup_only):
+                                    continue
+                                try:
+                                    base_r.setdefault("risk_flags", [])
+                                    base_r["risk_flags"].append("htf_misaligned")
+                                except Exception:
+                                    pass
                             else:
                                 # Soft alignment: don't reject, but apply confidence penalty so only strong setups pass.
                                 try:
@@ -14889,7 +14950,13 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx30<{min_adx_30m:g} adx={adx30:g}")
                             except Exception:
                                 pass
-                            continue
+                            if not (pending_enabled and postsetup_only):
+                                continue
+                            try:
+                                base_r.setdefault("risk_flags", [])
+                                base_r["risk_flags"].append("adx30_low")
+                            except Exception:
+                                pass
                         if min_adx_1h and adx1h < min_adx_1h:
                             _mid_f_adx += 1
                             _rej_add(sym, "regime_block")
@@ -14897,7 +14964,13 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx1h<{min_adx_1h:g} adx={adx1h:g}")
                             except Exception:
                                 pass
-                            continue
+                            if not (pending_enabled and postsetup_only):
+                                continue
+                            try:
+                                base_r.setdefault("risk_flags", [])
+                                base_r["risk_flags"].append("adx1h_low")
+                            except Exception:
+                                pass
                         if min_atr_pct and atrp < min_atr_pct:
                             _mid_f_atr += 1
                             _rej_add(sym, "volatility_block")
@@ -14905,7 +14978,13 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"atr_pct<{min_atr_pct:g} atr%={atrp:g}")
                             except Exception:
                                 pass
-                            continue
+                            if not (pending_enabled and postsetup_only):
+                                continue
+                            try:
+                                base_r.setdefault("risk_flags", [])
+                                base_r["risk_flags"].append("atrpct_low")
+                            except Exception:
+                                pass
 
                         market = choose_market(adx30, atrp)
                         if not allow_futures:
@@ -14933,6 +15012,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 pass
                             if not (pending_enabled and postsetup_only):
                                 continue
+                            try:
+                                base_r.setdefault("risk_flags", [])
+                                base_r["risk_flags"].append("score_low")
+                            except Exception:
+                                pass
                         if rr < float(min_rr):
                             _mid_f_rr += 1
                             _rej_add(sym, "score_low")
@@ -14942,6 +15026,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 pass
                             if not (pending_enabled and postsetup_only):
                                 continue
+                            try:
+                                base_r.setdefault("risk_flags", [])
+                                base_r["risk_flags"].append("rr_low")
+                            except Exception:
+                                pass
 
                         direction = str(base_r.get("direction","")).upper()
                         entry = float(base_r["entry"]); sl = float(base_r["sl"])
@@ -14958,6 +15047,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 pass
                             if not (pending_enabled and postsetup_only):
                                 continue
+                            try:
+                                base_r.setdefault("risk_flags", [])
+                                base_r["risk_flags"].append("vol_low")
+                            except Exception:
+                                pass
 
                         # 2) Must be on the correct side of VWAP + far enough from VWAP (avoid chop)
                         vwap_val_num = float(base_r.get("vwap_val", 0.0) or 0.0)
@@ -14973,6 +15067,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         pass
                                     if not (pending_enabled and postsetup_only):
                                         continue
+                                    try:
+                                        base_r.setdefault("risk_flags", [])
+                                        base_r["risk_flags"].append("vwap_bias")
+                                    except Exception:
+                                        pass
                                 if direction == "LONG" and not (entry > vwap_val_num):
                                     _mid_f_align += 1
                                     _rej_add(sym, "vwap_dist")
@@ -14982,6 +15081,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         pass
                                     if not (pending_enabled and postsetup_only):
                                         continue
+                                    try:
+                                        base_r.setdefault("risk_flags", [])
+                                        base_r["risk_flags"].append("vwap_bias")
+                                    except Exception:
+                                        pass
                             if mid_min_vwap_dist_atr > 0:
                                 if abs(entry - vwap_val_num) < (atr30 * mid_min_vwap_dist_atr):
                                     _mid_f_atr += 1
@@ -14993,6 +15097,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         pass
                                     if not (pending_enabled and postsetup_only):
                                         continue
+                                    try:
+                                        base_r.setdefault("risk_flags", [])
+                                        base_r["risk_flags"].append("vwap_dist")
+                                    except Exception:
+                                        pass
 
 
 
@@ -15008,6 +15117,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         pass
                                     if not (pending_enabled and postsetup_only):
                                         continue
+                                    try:
+                                        base_r.setdefault("risk_flags", [])
+                                        base_r["risk_flags"].append("liq_sweep_missing")
+                                    except Exception:
+                                        pass
                                 if direction == "SHORT" and not bool(base_r.get("sweep_short", False)):
                                     _mid_f_score += 1
                                     _rej_add(sym, "liquidity_fail")
@@ -15017,6 +15131,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         pass
                                     if not (pending_enabled and postsetup_only):
                                         continue
+                                    try:
+                                        base_r.setdefault("risk_flags", [])
+                                        base_r["risk_flags"].append("liq_sweep_missing")
+                                    except Exception:
+                                        pass
                             except Exception:
                                 pass
                         if tp_policy == "R":
@@ -15122,6 +15241,51 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     entry_low = float(z[0]) if z else None
                                     entry_high = float(z[1]) if z else None
 
+                                    # Pending model requires a real entry zone. Without zone it's not a setup.
+                                    if entry_low is None or entry_high is None:
+                                        _rej_add(sym, "no_entry_zone")
+                                        continue
+                                    try:
+                                        if float(entry_low) <= 0 or float(entry_high) <= 0 or float(entry_high) < float(entry_low):
+                                            _rej_add(sym, "no_entry_zone")
+                                            continue
+                                    except Exception:
+                                        _rej_add(sym, "no_entry_zone")
+                                        continue
+
+                                    # Collect risk flags from scan stage (when MID_FILTERS_AFTER_SETUP=1).
+                                    risk_flags = []
+                                    try:
+                                        rf = base_r.get("risk_flags")
+                                        if isinstance(rf, list):
+                                            risk_flags = [str(x) for x in rf if str(x).strip()]
+                                    except Exception:
+                                        risk_flags = []
+                                    # Trap/block reasons are also useful as flags when scan does not reject.
+                                    try:
+                                        if pending_enabled and postsetup_only:
+                                            tr = str(base_r.get("trap_reason") or "").strip()
+                                            br = str(base_r.get("block_reason") or "").strip()
+                                            if tr:
+                                                risk_flags.append(f"trap:{tr.split()[0]}")
+                                            if br:
+                                                risk_flags.append(f"block:{br.split()[0]}")
+                                    except Exception:
+                                        pass
+                                    # Dedupe, keep order
+                                    try:
+                                        seen_rf = set()
+                                        _tmp = []
+                                        for x in risk_flags:
+                                            x0 = str(x).strip()
+                                            if not x0 or x0 in seen_rf:
+                                                continue
+                                            seen_rf.add(x0)
+                                            _tmp.append(x0)
+                                        risk_flags = _tmp
+                                    except Exception:
+                                        pass
+
                                     rec = {
                                         "key": key,
                                         "market": market,
@@ -15141,6 +15305,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "source_exchange": best_name,
                                         "available_exchanges": conf_names,
                                         "risk_note": risk_note,
+                                        "risk_flags": risk_flags,
                                         "created_ts": time.time(),
                                         "trigger_attempts": 0,
                                         "fail_count": 0,
