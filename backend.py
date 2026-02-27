@@ -618,6 +618,8 @@ MID_PENDING_EXPIRED_TOTAL = 0
 MID_REJECT_REASONS = {
     "candles_unavailable",
     "not_enough_data",
+    # Candles were OK, but the setup didn't pass filters (TA/structure/trap/trigger/etc).
+    "no_signal",
     "pending_wait",
     "ttl_expired",
     "late_entry",
@@ -650,6 +652,10 @@ MID_REJECT_ALIASES = {
     "candles_unavailable": "candles_unavailable",
     "empty_df": "not_enough_data",
     "not_enough_data": "not_enough_data",
+    # candles OK but filtered
+    "no_signal": "no_signal",
+    "filtered": "no_signal",
+    "filter": "no_signal",
 
     # pending
     "pending_wait": "pending_wait",
@@ -14480,7 +14486,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         if not chosen_r:
                             if found_ok_candles:
                                 # Candles were OK but no signal on any venue.
-                                _rej_add(sym, "not_enough_data")
+                                # IMPORTANT: this is not a data problem. Candles were present and long enough,
+                                # but the setup didn't pass filters (trap/structure/trigger/etc).
+                                _rej_add(sym, "no_signal")
                                 try:
                                     _mid_no_signal += 1
                                     stages = list(_mid_no_signal_stages_by_sym.get(sym) or [])
