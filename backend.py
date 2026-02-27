@@ -612,6 +612,79 @@ MID_PENDING_CREATED_TOTAL = 0
 MID_PENDING_TRIGGERED_TOTAL = 0
 MID_PENDING_EXPIRED_TOTAL = 0
 
+# --- MID reject digest (rolling window, for /health) ---
+# Tracks top reasons across stages: candles_unavailable / not_enough_data / pending_wait / etc.
+MID_REJECT_EVENTS = []  # list[(ts, reason_key)]
+MID_REJECT_MAX_EVENTS = 50000
+
+def _mid_reject_key(reason: str) -> str:
+    """Normalize reject reason into a compact key."""
+    try:
+        r = (reason or "").strip().lower()
+        if not r:
+            return "unknown"
+        # take token before first whitespace to keep buckets stable
+        k = r.split()[0].strip().strip(";:,.()[]{}")
+        if not k:
+            return "unknown"
+        if len(k) > 64:
+            k = k[:64]
+        return k
+    except Exception:
+        return "unknown"
+
+def _mid_reject_add(reason: str, n: int = 1) -> None:
+    """Best-effort add to rolling reject window (never raises)."""
+    global MID_REJECT_EVENTS
+    try:
+        k = _mid_reject_key(reason)
+        if not k:
+            return
+        ts = time.time()
+        cnt = max(1, int(n or 1))
+        for _ in range(min(cnt, 20)):
+            MID_REJECT_EVENTS.append((ts, k))
+        # cap memory
+        if len(MID_REJECT_EVENTS) > MID_REJECT_MAX_EVENTS:
+            MID_REJECT_EVENTS = MID_REJECT_EVENTS[-MID_REJECT_MAX_EVENTS:]
+    except Exception:
+        pass
+
+def _mid_reject_digest_top(topn: int = 3) -> list[dict]:
+    """Return top reject reasons within the rolling window (safe)."""
+    try:
+        try:
+            window_sec = int(float(os.getenv("MID_REJECT_WINDOW_SEC", "900") or 900))
+        except Exception:
+            window_sec = 900
+        window_sec = max(30, min(window_sec, 24 * 3600))
+        now = time.time()
+        cutoff = now - float(window_sec)
+
+        # prune old
+        if MID_REJECT_EVENTS:
+            i0 = 0
+            for i, (ts, _k) in enumerate(MID_REJECT_EVENTS):
+                if float(ts) >= cutoff:
+                    i0 = i
+                    break
+            else:
+                i0 = len(MID_REJECT_EVENTS)
+            if i0 > 0:
+                del MID_REJECT_EVENTS[:i0]
+
+        counts = defaultdict(int)
+        for ts, k in MID_REJECT_EVENTS:
+            if float(ts) >= cutoff:
+                counts[str(k)] += 1
+        items = sorted(counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+        out = []
+        for k, v in items[:max(1, int(topn or 3))]:
+            out.append({"reason": str(k), "count": int(v)})
+        return out
+    except Exception:
+        return []
+
 # Per-tick hard-block breakdown snapshot (for /health and minute status logs)
 MID_LAST_HARDBLOCK_TOP = ""
 MID_LAST_HARDBLOCK_SAMPLES = None  # dict[str, list[str]]
@@ -11541,6 +11614,12 @@ class Backend:
                             _r = str(_reason or "").strip() or "unknown"
                             _rej_counts[_r] += 1
 
+                            # Also feed rolling reject digest for /health (best-effort).
+                            try:
+                                _mid_reject_add(_r)
+                            except Exception:
+                                pass
+
                             # Normalize to base reason names expected in summary
                             _map = {
                                 "score": "score_low",
@@ -12044,6 +12123,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             items = await self._mid_pending_load()
             now = time.time()
             keep: list[dict] = []
+            any_wait = False
             for it in items:
                 try:
                     sym = str(it.get("symbol") or "")
@@ -12060,6 +12140,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             _mid_metrics_inc("pending_expired", 1)
                         except Exception:
                             pass
+                        try:
+                            _mid_reject_add("ttl_expired")
+                        except Exception:
+                            pass
                         continue
 
                     # load candles (also gives fallback price)
@@ -12068,6 +12152,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     df1h = await self.load_candles(sym, "1h", market)
                     if df5 is None or getattr(df5, "empty", True) or df30 is None or getattr(df30, "empty", True) or df1h is None or getattr(df1h, "empty", True):
                         keep.append(it)
+                        any_wait = True
                         continue
 
                     # price (prefer same source exchange; fallback to df close)
@@ -12092,6 +12177,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             price = px_close
                     except Exception:
                         keep.append(it)
+                        any_wait = True
                         continue
 
                     try:
@@ -12123,27 +12209,33 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     if use_zone:
                         if not (float(price) >= (lo - tol) and float(price) <= (hi + tol)):
                             keep.append(it)
+                            any_wait = True
                             continue
                     else:
                         if abs(float(price) - entry0) > tol:
                             keep.append(it)
+                            any_wait = True
                             continue
 
                     # re-confirm TA at trigger moment
                     ta = evaluate_on_exchange_mid_v2(df5, df30, df1h)
                     if not ta:
                         keep.append(it)
+                        any_wait = True
                         continue
                     if str(ta.get("direction") or "").upper() != direction:
                         keep.append(it)
+                        any_wait = True
                         continue
                     if not bool(ta.get("trap_ok", True)):
                         keep.append(it)
+                        any_wait = True
                         continue
 
                     min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
                     if int(float(ta.get("confidence") or 0)) < int(min_conf):
                         keep.append(it)
+                        any_wait = True
                         continue
 
                     # Emit final signal
@@ -12190,11 +12282,24 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         _mid_metrics_inc("pending_triggered", 1)
                     except Exception:
                         pass
+                    try:
+                        _mid_reject_add("pending_triggered")
+                    except Exception:
+                        pass
                     # emitted: do not keep
                 except Exception:
                     keep.append(it)
+                    any_wait = True
 
             await self._mid_pending_save(keep)
+
+            # If there is anything still pending after this poll, count it as a "pending_wait" stage.
+            # (This helps /health show whether signals are "missing" because price/TA hasn't confirmed yet.)
+            try:
+                if any_wait and keep:
+                    _mid_reject_add("pending_wait")
+            except Exception:
+                pass
         except Exception:
             logger.exception("[mid][pending] loop error")
 
@@ -12230,6 +12335,16 @@ async def mid_status_snapshot(self) -> dict:
         except Exception:
             ttl_min = 60.0
 
+        # Rolling reject digest (top-3) for quick "why no signals" diagnosis.
+        try:
+            reject_top = _mid_reject_digest_top(3)
+        except Exception:
+            reject_top = []
+        try:
+            window_sec = int(float(os.getenv("MID_REJECT_WINDOW_SEC", "900") or 900))
+        except Exception:
+            window_sec = 900
+
         return {
             "pending": int(len(pending_items)),
             "pending_ttl_min": float(ttl_min),
@@ -12243,6 +12358,8 @@ async def mid_status_snapshot(self) -> dict:
             "last_tick_ts": last_tick_ts if last_tick_ts > 0 else None,
             "last_tick_ago_s": float(last_tick_ago) if last_tick_ago is not None else None,
             "last_summary": snap.get("last_summary"),
+            "reject_digest_window_sec": int(window_sec),
+            "reject_digest_top3": reject_top,
         }
     except Exception:
         return {"pending": None, "last_tick_ts": None}
@@ -13900,6 +14017,12 @@ async def mid_status_summary_loop(self) -> None:
                                     return
                                 _rej_seen.add(_sym)
                                 _rej_reason_by_sym[_sym] = _reason
+
+                                # Also feed rolling reject digest for /health (best-effort).
+                                try:
+                                    _mid_reject_add(str(_reason or "unknown"))
+                                except Exception:
+                                    pass
                                 # Also collect normalized base reason for per-symbol aggregation.
                                 try:
                                     _r = str(_reason or '').strip() or 'unknown'
