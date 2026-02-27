@@ -8489,7 +8489,12 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         if use_regime and mid_regime == "RANGING":
             if bo_rt_trigger and (not (sweep_long or sweep_short) and (not ob_retest)):
                 # prevent range fake breakouts
-                _fail("structure", "regime_range_no_breakout")
+                try:
+                    _phase = str(_MID_EVAL_PHASE.get() or "scan")
+                except Exception:
+                    _phase = "scan"
+                if not (pending_enabled and postsetup_only and _phase == "scan"):
+                    _fail("structure", "regime_range_no_breakout")
                 if not (pending_enabled and postsetup_only):
                     return None
                 try:
@@ -8506,7 +8511,12 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             else:
                 trig_ok = bool(sweep_short) or bool(bo_rt_trigger) or bool(ob_retest)
             if not trig_ok:
-                _fail("other", "no_trigger")
+                try:
+                    _phase = str(_MID_EVAL_PHASE.get() or "scan")
+                except Exception:
+                    _phase = "scan"
+                if not (pending_enabled and postsetup_only and _phase == "scan"):
+                    _fail("other", "no_trigger")
                 if not (pending_enabled and postsetup_only):
                     return None
                 try:
@@ -14903,6 +14913,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         # Mode switch: create setups first, apply filters later at trigger.
                         pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
                         postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
+                        scan_soft = bool(pending_enabled and postsetup_only)
                         # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
                         # If user wants filters only after setup (pending/trigger model),
                         # do NOT reject setups during scan due to trap/block flags.
@@ -14922,7 +14933,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
                             _mid_f_align += 1
                             if not structure_align_soft:
-                                _rej_add(sym, "htf_misaligned")
+                                if not scan_soft:
+                                    _rej_add(sym, "htf_misaligned")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), "align_mismatch")
                                 except Exception:
@@ -14957,7 +14969,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
 
                         if min_adx_30m and adx30 < min_adx_30m:
                             _mid_f_adx += 1
-                            _rej_add(sym, "regime_block")
+                            if not scan_soft:
+                                _rej_add(sym, "regime_block")
                             try:
                                 self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx30<{min_adx_30m:g} adx={adx30:g}")
                             except Exception:
@@ -14971,7 +14984,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 pass
                         if min_adx_1h and adx1h < min_adx_1h:
                             _mid_f_adx += 1
-                            _rej_add(sym, "regime_block")
+                            if not scan_soft:
+                                _rej_add(sym, "regime_block")
                             try:
                                 self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx1h<{min_adx_1h:g} adx={adx1h:g}")
                             except Exception:
@@ -14985,7 +14999,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 pass
                         if min_atr_pct and atrp < min_atr_pct:
                             _mid_f_atr += 1
-                            _rej_add(sym, "volatility_block")
+                            if not scan_soft:
+                                _rej_add(sym, "volatility_block")
                             try:
                                 self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"atr_pct<{min_atr_pct:g} atr%={atrp:g}")
                             except Exception:
@@ -15008,7 +15023,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         min_conf = min_score_fut if market == "FUTURES" else min_score_spot
                         if conf < float(min_conf):
                             _mid_f_score += 1
-                            _rej_add(sym, "score_low")
+                            if not scan_soft:
+                                _rej_add(sym, "score_low")
                             try:
                                 _mid_ta_score_low += 1
                                 _missing = float(min_conf) - float(conf)
@@ -15031,7 +15047,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 pass
                         if rr < float(min_rr):
                             _mid_f_rr += 1
-                            _rej_add(sym, "score_low")
+                            if not scan_soft:
+                                _rej_add(sym, "score_low")
                             try:
                                 self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"rr<{float(min_rr):g} rr={rr:g}")
                             except Exception:
@@ -15052,7 +15069,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         volx = float(base_r.get("rel_vol", 0.0) or 0.0)
                         if mid_min_vol_x and volx < mid_min_vol_x:
                             _mid_f_score += 1
-                            _rej_add(sym, "volatility_block")
+                            if not scan_soft:
+                                _rej_add(sym, "volatility_block")
                             try:
                                 self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"vol_x<{mid_min_vol_x:g} vol_x={volx:g}")
                             except Exception:
@@ -15072,7 +15090,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             if mid_require_vwap_bias:
                                 if direction == "SHORT" and not (entry < vwap_val_num):
                                     _mid_f_align += 1
-                                    _rej_add(sym, "vwap_dist")
+                                    if not scan_soft:
+                                        _rej_add(sym, "vwap_dist")
                                     try:
                                         self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_short entry>=vwap vwap={vwap_val_num:g}")
                                     except Exception:
@@ -15086,7 +15105,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         pass
                                 if direction == "LONG" and not (entry > vwap_val_num):
                                     _mid_f_align += 1
-                                    _rej_add(sym, "vwap_dist")
+                                    if not scan_soft:
+                                        _rej_add(sym, "vwap_dist")
                                     try:
                                         self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_long entry<=vwap vwap={vwap_val_num:g}")
                                     except Exception:
@@ -15101,7 +15121,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             if mid_min_vwap_dist_atr > 0:
                                 if abs(entry - vwap_val_num) < (atr30 * mid_min_vwap_dist_atr):
                                     _mid_f_atr += 1
-                                    _rej_add(sym, "vwap_dist")
+                                    if not scan_soft:
+                                        _rej_add(sym, "vwap_dist")
                                     try:
                                         dist = abs(entry - vwap_val_num) / atr30 if atr30 else 0.0
                                         self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_far {dist:.2g}atr")
@@ -15122,7 +15143,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             try:
                                 if direction == "LONG" and not bool(base_r.get("sweep_long", False)):
                                     _mid_f_score += 1
-                                    _rej_add(sym, "liquidity_fail")
+                                    if not scan_soft:
+                                        _rej_add(sym, "liquidity_fail")
                                     try:
                                         self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, "liq_sweep_missing_long")
                                     except Exception:
@@ -15136,7 +15158,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         pass
                                 if direction == "SHORT" and not bool(base_r.get("sweep_short", False)):
                                     _mid_f_score += 1
-                                    _rej_add(sym, "liquidity_fail")
+                                    if not scan_soft:
+                                        _rej_add(sym, "liquidity_fail")
                                     try:
                                         self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, "liq_sweep_missing_short")
                                     except Exception:
