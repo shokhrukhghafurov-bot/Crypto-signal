@@ -12303,6 +12303,33 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
     logger.info("[mid][pending] trigger loop started poll=%.2fs ttl=%.1fmin tol_atr=%.3f tol_pct=%.4f",
                 poll, ttl_min, tol_atr, tol_pct)
 
+    # Pending persistence is already in Postgres (kv_store key 'mid_pending').
+    # Here we track trigger attempts/fails and prune noisy pendings automatically.
+    max_fails = int(os.getenv("MID_PENDING_MAX_FAILS", "12") or 12)
+    max_attempts = int(os.getenv("MID_PENDING_MAX_ATTEMPTS", "50") or 50)
+
+    def _pending_mark_attempt(it: dict, now_ts: float) -> None:
+        try:
+            it["trigger_attempts"] = int(it.get("trigger_attempts") or 0) + 1
+            it["last_attempt_ts"] = float(now_ts)
+        except Exception:
+            pass
+
+    def _pending_mark_fail(it: dict, reason: str, now_ts: float) -> bool:
+        """Return True to keep pending, False to drop."""
+        try:
+            it["fail_count"] = int(it.get("fail_count") or 0) + 1
+            it["last_fail_reason"] = str(reason or "fail")
+            it["last_fail_ts"] = float(now_ts)
+            if max_attempts > 0 and int(it.get("trigger_attempts") or 0) >= max_attempts:
+                return False
+            if max_fails > 0 and int(it.get("fail_count") or 0) >= max_fails:
+                return False
+        except Exception:
+            return True
+        return True
+
+
     while True:
         try:
             items = await self._mid_pending_load()
@@ -12402,6 +12429,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             any_wait = True
                             continue
 
+                    # We reached entry/zone: count this as a trigger attempt (persisted in DB kv_store).
+                    _pending_mark_attempt(it, now)
+
                     # re-confirm TA at trigger moment
                     _ph_tok = None
                     try:
@@ -12417,22 +12447,26 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
                     if not ta:
-                        keep.append(it)
-                        any_wait = True
+                        if _pending_mark_fail(it, "no_ta", now):
+                            keep.append(it)
+                            any_wait = True
                         continue
                     if str(ta.get("direction") or "").upper() != direction:
-                        keep.append(it)
-                        any_wait = True
+                        if _pending_mark_fail(it, "direction_mismatch", now):
+                            keep.append(it)
+                            any_wait = True
                         continue
                     if not bool(ta.get("trap_ok", True)):
-                        keep.append(it)
-                        any_wait = True
+                        if _pending_mark_fail(it, "trap_block", now):
+                            keep.append(it)
+                            any_wait = True
                         continue
 
                     min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
                     if int(float(ta.get("confidence") or 0)) < int(min_conf):
-                        keep.append(it)
-                        any_wait = True
+                        if _pending_mark_fail(it, "confidence_low", now):
+                            keep.append(it)
+                            any_wait = True
                         continue
 
                     # If scan stage skipped hard filters (MID_FILTERS_AFTER_SETUP=1),
@@ -12444,7 +12478,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             min_rr = float(os.getenv("MID_MIN_RR", "0") or 0)
                             rr = float(ta.get("rr") or 0.0)
                             if min_rr and rr < min_rr:
-                                keep.append(it); any_wait = True
+                                if _pending_mark_fail(it, "rr_low", now):
+                                    keep.append(it)
+                                    any_wait = True
                                 continue
                         except Exception:
                             pass
@@ -12453,7 +12489,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or 0)
                             volx = float(ta.get("rel_vol") or 0.0)
                             if mid_min_vol_x and volx < mid_min_vol_x:
-                                keep.append(it); any_wait = True
+                                if _pending_mark_fail(it, "vol_low", now):
+                                    keep.append(it)
+                                    any_wait = True
                                 continue
                         except Exception:
                             pass
@@ -12469,14 +12507,20 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             if vwap_val > 0 and atr30 and atr30 > 0:
                                 if mid_require_vwap_bias:
                                     if direction_u == "SHORT" and not (entry_check < vwap_val):
-                                        keep.append(it); any_wait = True
+                                        if _pending_mark_fail(it, "vwap_bias", now):
+                                            keep.append(it)
+                                            any_wait = True
                                         continue
                                     if direction_u == "LONG" and not (entry_check > vwap_val):
-                                        keep.append(it); any_wait = True
+                                        if _pending_mark_fail(it, "vwap_bias", now):
+                                            keep.append(it)
+                                            any_wait = True
                                         continue
                                 if mid_min_vwap_dist_atr > 0:
                                     if abs(entry_check - vwap_val) < (atr30 * mid_min_vwap_dist_atr):
-                                        keep.append(it); any_wait = True
+                                        if _pending_mark_fail(it, "vwap_dist", now):
+                                            keep.append(it)
+                                            any_wait = True
                                         continue
                         except Exception:
                             pass
@@ -12485,10 +12529,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             req = os.getenv("MID_REQUIRE_LIQ_SWEEP", "0").strip().lower() in ("1","true","yes","on")
                             if req:
                                 if str(direction).upper() == "LONG" and not bool(ta.get("sweep_long", False)):
-                                    keep.append(it); any_wait = True
+                                    if _pending_mark_fail(it, "liq_sweep_missing", now):
+                                        keep.append(it)
+                                        any_wait = True
                                     continue
                                 if str(direction).upper() == "SHORT" and not bool(ta.get("sweep_short", False)):
-                                    keep.append(it); any_wait = True
+                                    if _pending_mark_fail(it, "liq_sweep_missing", now):
+                                        keep.append(it)
+                                        any_wait = True
                                     continue
                         except Exception:
                             pass
@@ -15001,6 +15049,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "available_exchanges": conf_names,
                                         "risk_note": risk_note,
                                         "created_ts": time.time(),
+                                        "trigger_attempts": 0,
+                                        "fail_count": 0,
+                                        "last_attempt_ts": 0.0,
+                                        "last_fail_ts": 0.0,
+                                        "last_fail_reason": "",
                                         "min_confidence": int(os.getenv("MID_MIN_CONFIDENCE", "0") or 0),
                                     }
                                     await self.add_mid_pending(rec)
