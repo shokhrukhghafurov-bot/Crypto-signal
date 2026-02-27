@@ -688,6 +688,21 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
                 mids = [n for n in dir(backend) if 'mid' in n.lower() and 'scan' in n.lower()]
                 if mids:
                     logger.error("[mid] available methods containing 'mid'+'scan': %s", ", ".join(sorted(mids)[:40]))
+                # Also dump the attribute itself (type/name/module/qualname) to understand why it's not callable.
+                try:
+                    attr = getattr(backend, "scanner_loop_mid", None)
+                    logger.error(
+                        "[mid] scanner_loop_mid attr: type=%s callable=%s name=%s qual=%s module=%s repr=%r",
+                        type(attr).__name__,
+                        callable(attr),
+                        getattr(attr, "__name__", None),
+                        getattr(attr, "__qualname__", None),
+                        getattr(attr, "__module__", None),
+                        attr,
+                    )
+                except Exception:
+                    pass
+
             except Exception:
                 pass
             return
