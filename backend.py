@@ -612,6 +612,10 @@ MID_PENDING_CREATED_TOTAL = 0
 MID_PENDING_TRIGGERED_TOTAL = 0
 MID_PENDING_EXPIRED_TOTAL = 0
 
+# Per-tick hard-block breakdown snapshot (for /health and minute status logs)
+MID_LAST_HARDBLOCK_TOP = ""
+MID_LAST_HARDBLOCK_SAMPLES = None  # dict[str, list[str]]
+
 _MID_STATUS_LAST_LOG_TS = 0.0
 _MID_STATUS_LAST_SNAP = {
     "setups_found": 0,
@@ -647,6 +651,8 @@ def _mid_metrics_snapshot() -> dict:
             "pending_triggered": int(MID_PENDING_TRIGGERED_TOTAL),
             "pending_expired": int(MID_PENDING_EXPIRED_TOTAL),
             "hard_blocks": int(_mid_hard_block_total()),
+            "hardblock_top": str(MID_LAST_HARDBLOCK_TOP or "") or None,
+            "hardblock_samples": MID_LAST_HARDBLOCK_SAMPLES if isinstance(MID_LAST_HARDBLOCK_SAMPLES, dict) else None,
             "last_summary": str(MID_LAST_SUMMARY) if MID_LAST_SUMMARY else None,
             "last_summary_ts": float(MID_LAST_SUMMARY_TS or 0.0),
         }
@@ -658,6 +664,8 @@ def _mid_metrics_snapshot() -> dict:
             "pending_triggered": 0,
             "pending_expired": 0,
             "hard_blocks": 0,
+            "hardblock_top": None,
+            "hardblock_samples": None,
             "last_summary": None,
             "last_summary_ts": 0.0,
         }
@@ -12230,6 +12238,8 @@ async def mid_status_snapshot(self) -> dict:
             "pending_triggered_total": int(snap.get("pending_triggered") or 0),
             "pending_expired_total": int(snap.get("pending_expired") or 0),
             "hard_blocks_total": int(snap.get("hard_blocks") or 0),
+            "hardblock_top_last_tick": snap.get("hardblock_top"),
+            "hardblock_samples_last_tick": snap.get("hardblock_samples"),
             "last_tick_ts": last_tick_ts if last_tick_ts > 0 else None,
             "last_tick_ago_s": float(last_tick_ago) if last_tick_ago is not None else None,
             "last_summary": snap.get("last_summary"),
@@ -12309,6 +12319,14 @@ async def mid_status_summary_loop(self) -> None:
             else:
                 parts.append(f"pending=? (created+{df_p_created} trig+{df_p_trig} exp+{df_p_exp})")
             parts.append(f"blocks+{df_blocks}")
+
+            # Show top hard-block reasons from the *last MID tick* (helps instantly see which filter cuts most).
+            try:
+                hb_top = snap.get("hardblock_top")
+                if hb_top:
+                    parts.append(f"hb_top={hb_top}")
+            except Exception:
+                pass
 
             # Optional: include last summary tail if user wants it
             try:
@@ -12442,6 +12460,11 @@ async def mid_status_summary_loop(self) -> None:
                 start = start_total
                 start_scan = start_total
                 prefetch_elapsed = 0.0
+                # Reset per-tick hard-block buckets so /health can show "what filters cut" for the last tick.
+                try:
+                    _mid_hardblock_reset_tick()
+                except Exception:
+                    pass
                 # --- Candles diagnostics (per tick) ---
                 _mid_diag_enabled = str(os.getenv('MID_CANDLES_LOG_DIAG', os.getenv('MID_CANDLES_LOG_FAIL', '1')) or '1').strip().lower() not in ('0','false','no','off')
                 _mid_diag_max = int(os.getenv('MID_CANDLES_DIAG_MAX', '200') or 200)
@@ -14693,6 +14716,17 @@ async def mid_status_summary_loop(self) -> None:
                             hb = _mid_hardblock_dump(int(os.getenv("MID_HARDBLOCK_TOP", "6") or "6"))
                             if hb:
                                 logger.info("[mid][hardblock] %s", hb)
+                    except Exception:
+                        pass
+
+                    # Save a small hard-block snapshot for /health & minute status log (even if logging is disabled).
+                    try:
+                        global MID_LAST_HARDBLOCK_TOP, MID_LAST_HARDBLOCK_SAMPLES
+                        MID_LAST_HARDBLOCK_TOP = _mid_hardblock_dump(3)
+                        try:
+                            MID_LAST_HARDBLOCK_SAMPLES = {k: list(v)[:2] for k, v in dict(_MID_HARD_BLOCK_SAMPLES).items()}  # type: ignore[name-defined]
+                        except Exception:
+                            MID_LAST_HARDBLOCK_SAMPLES = None
                     except Exception:
                         pass
 
