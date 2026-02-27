@@ -16888,21 +16888,19 @@ except Exception:
     pass
 
 # --- MID scanner API compatibility ---
-# Some deployments ended up with a Backend class that missed scanner_loop_mid
-# (typically due to an old/partial file being deployed). Bot expects this method
-# when MID_SCANNER_ENABLED=1.
-try:
-    if not hasattr(Backend, "scanner_loop_mid"):
-        async def _missing_scanner_loop_mid(self, *args, **kwargs):
-            raise RuntimeError(
-                "Backend.scanner_loop_mid is missing. This build is inconsistent: "
-                "MID_SCANNER_ENABLED=1 requires MID scanner implementation. "
-                "Redeploy ensuring updated backend.py is used."
-            )
-
-        Backend.scanner_loop_mid = _missing_scanner_loop_mid  # type: ignore[attr-defined]
-except Exception:
-    pass
+# IMPORTANT:
+# DO NOT monkey-patch Backend.scanner_loop_mid at import time.
+#
+# Why:
+# In production we observed cases where a real implementation existed in the file,
+# but a compatibility shim still ended up overriding it, causing the bot to
+# detect a stub (_missing_scanner_loop_mid) and skip MID scanning entirely.
+#
+# The bot already performs robust runtime diagnostics and will log a clear error
+# if the method is actually missing.
+#
+# If you ever need a stub again for legacy builds, make it opt-in via an env flag
+# and only patch when the attribute is truly absent.
 
 # --- Hotfix: ensure MID pending-entry helpers are bound as Backend methods ---
 # In some merges these functions were added at module level (indentation), so hasattr(backend, ...) becomes False
