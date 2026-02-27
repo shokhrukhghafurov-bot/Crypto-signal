@@ -625,7 +625,7 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
         try:
             import inspect
             cls_file = inspect.getfile(backend.__class__)
-            logger.info("[mid] backend class=%s file=%s", backend.__class__.__name__, cls_file)        # Extra: verify the actual backend.py content to catch 'wrong file in container' cases.
+            logger.info("[mid] backend class=%s file=%s", backend.__class__.__name__, cls_file)        # Extra: verify the actual backend.py content to catch 'wrong file in container' cases.
         try:
             import hashlib
             _bp = cls_file if 'cls_file' in locals() else None
