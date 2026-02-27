@@ -604,6 +604,64 @@ def _top_cooldown_for_error(provider: str, err: Exception) -> int:
 MID_LAST_SUMMARY = None
 MID_LAST_SUMMARY_TS = 0.0
 
+# --- MID status metrics (for /health and per-minute log summary) ---
+# These counters answer: "why no signals?" → no setups vs pending waiting vs filters/blocks.
+MID_LAST_TICK_TS = 0.0
+MID_SETUPS_FOUND_TOTAL = 0
+MID_PENDING_CREATED_TOTAL = 0
+MID_PENDING_TRIGGERED_TOTAL = 0
+MID_PENDING_EXPIRED_TOTAL = 0
+
+_MID_STATUS_LAST_LOG_TS = 0.0
+_MID_STATUS_LAST_SNAP = {
+    "setups_found": 0,
+    "pending_created": 0,
+    "pending_triggered": 0,
+    "pending_expired": 0,
+    "hard_blocks": 0,
+}
+
+def _mid_metrics_inc(name: str, n: int = 1) -> None:
+    """Best-effort global metrics increment (never raises)."""
+    global MID_SETUPS_FOUND_TOTAL, MID_PENDING_CREATED_TOTAL, MID_PENDING_TRIGGERED_TOTAL, MID_PENDING_EXPIRED_TOTAL
+    try:
+        k = str(name or "").strip().lower()
+        if k == "setups_found":
+            MID_SETUPS_FOUND_TOTAL += int(n)
+        elif k == "pending_created":
+            MID_PENDING_CREATED_TOTAL += int(n)
+        elif k == "pending_triggered":
+            MID_PENDING_TRIGGERED_TOTAL += int(n)
+        elif k == "pending_expired":
+            MID_PENDING_EXPIRED_TOTAL += int(n)
+    except Exception:
+        pass
+
+def _mid_metrics_snapshot() -> dict:
+    """Return current totals snapshot (safe)."""
+    try:
+        return {
+            "last_tick_ts": float(MID_LAST_TICK_TS or 0.0),
+            "setups_found": int(MID_SETUPS_FOUND_TOTAL),
+            "pending_created": int(MID_PENDING_CREATED_TOTAL),
+            "pending_triggered": int(MID_PENDING_TRIGGERED_TOTAL),
+            "pending_expired": int(MID_PENDING_EXPIRED_TOTAL),
+            "hard_blocks": int(_mid_hard_block_total()),
+            "last_summary": str(MID_LAST_SUMMARY) if MID_LAST_SUMMARY else None,
+            "last_summary_ts": float(MID_LAST_SUMMARY_TS or 0.0),
+        }
+    except Exception:
+        return {
+            "last_tick_ts": 0.0,
+            "setups_found": 0,
+            "pending_created": 0,
+            "pending_triggered": 0,
+            "pending_expired": 0,
+            "hard_blocks": 0,
+            "last_summary": None,
+            "last_summary_ts": 0.0,
+        }
+
 def _mid_set_last_summary(summary: str) -> None:
     global MID_LAST_SUMMARY, MID_LAST_SUMMARY_TS
     MID_LAST_SUMMARY = summary
@@ -11990,6 +12048,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         continue
                     # expire
                     if (now - created) > ttl_min * 60:
+                        try:
+                            _mid_metrics_inc("pending_expired", 1)
+                        except Exception:
+                            pass
                         continue
 
                     # load candles (also gives fallback price)
@@ -12116,6 +12178,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     await emit_signal_cb(sig)
                     logger.info("[mid][pending] EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, entry, float(price), tol)
+                    try:
+                        _mid_metrics_inc("pending_triggered", 1)
+                    except Exception:
+                        pass
                     # emitted: do not keep
                 except Exception:
                     keep.append(it)
@@ -12125,6 +12191,141 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             logger.exception("[mid][pending] loop error")
 
         await asyncio.sleep(max(1.0, poll))
+
+
+# --- MID status: /health snapshot + per-minute log summary ---
+
+async def mid_status_snapshot(self) -> dict:
+    """Short MID status for /health.
+
+    Shows: pending count, setups found, last tick time, and pending outcomes.
+    Never raises.
+    """
+    try:
+        now = time.time()
+        snap = _mid_metrics_snapshot()
+        pending_items: list[dict] = []
+        try:
+            if hasattr(self, "_mid_pending_load"):
+                pending_items = await self._mid_pending_load()  # type: ignore[attr-defined]
+            else:
+                st = await db_store.kv_get_json("mid_pending") or {}
+                items = st.get("items", [])
+                pending_items = items if isinstance(items, list) else []
+        except Exception:
+            pending_items = []
+
+        last_tick_ts = float(snap.get("last_tick_ts") or 0.0)
+        last_tick_ago = (now - last_tick_ts) if last_tick_ts > 0 else None
+        try:
+            ttl_min = float(os.getenv("MID_PENDING_TTL_MIN", "60") or 60.0)
+        except Exception:
+            ttl_min = 60.0
+
+        return {
+            "pending": int(len(pending_items)),
+            "pending_ttl_min": float(ttl_min),
+            "setups_found_total": int(snap.get("setups_found") or 0),
+            "pending_created_total": int(snap.get("pending_created") or 0),
+            "pending_triggered_total": int(snap.get("pending_triggered") or 0),
+            "pending_expired_total": int(snap.get("pending_expired") or 0),
+            "hard_blocks_total": int(snap.get("hard_blocks") or 0),
+            "last_tick_ts": last_tick_ts if last_tick_ts > 0 else None,
+            "last_tick_ago_s": float(last_tick_ago) if last_tick_ago is not None else None,
+            "last_summary": snap.get("last_summary"),
+        }
+    except Exception:
+        return {"pending": None, "last_tick_ts": None}
+
+
+async def mid_status_summary_loop(self) -> None:
+    """Logs one compact MID status line every N seconds (default: 60).
+
+    Helps understand "why no signals":
+    - setups+0 → no setups found
+    - pending>0 and trig+0 → waiting for entry / price didn't reach zone
+    - hard_blocks+X → filters are cutting
+    """
+    global _MID_STATUS_LAST_LOG_TS, _MID_STATUS_LAST_SNAP
+    try:
+        every = int(float(os.getenv("MID_STATUS_EVERY_SEC", os.getenv("MID_STATUS_LOG_EVERY_SEC", "60")) or 60))
+    except Exception:
+        every = 60
+    if every <= 0:
+        return
+
+    # Delay a bit to avoid noisy startup logs.
+    await asyncio.sleep(min(15, max(1, every // 4)))
+    logger.info("[mid][status] summary enabled every=%ss (set MID_STATUS_EVERY_SEC=0 to disable)", every)
+
+    while True:
+        await asyncio.sleep(max(5, every))
+        try:
+            now = time.time()
+            snap = _mid_metrics_snapshot()
+
+            # Current pending count
+            pending_n = None
+            try:
+                if hasattr(self, "_mid_pending_load"):
+                    pending_items = await self._mid_pending_load()  # type: ignore[attr-defined]
+                    pending_n = int(len(pending_items) if isinstance(pending_items, list) else 0)
+                else:
+                    st = await db_store.kv_get_json("mid_pending") or {}
+                    items = st.get("items", [])
+                    pending_n = int(len(items) if isinstance(items, list) else 0)
+            except Exception:
+                pending_n = None
+
+            # Per-window deltas
+            prev = dict(_MID_STATUS_LAST_SNAP or {})
+            df_setups = int(snap.get("setups_found") or 0) - int(prev.get("setups_found") or 0)
+            df_p_created = int(snap.get("pending_created") or 0) - int(prev.get("pending_created") or 0)
+            df_p_trig = int(snap.get("pending_triggered") or 0) - int(prev.get("pending_triggered") or 0)
+            df_p_exp = int(snap.get("pending_expired") or 0) - int(prev.get("pending_expired") or 0)
+            df_blocks = int(snap.get("hard_blocks") or 0) - int(prev.get("hard_blocks") or 0)
+
+            _MID_STATUS_LAST_SNAP = {
+                "setups_found": int(snap.get("setups_found") or 0),
+                "pending_created": int(snap.get("pending_created") or 0),
+                "pending_triggered": int(snap.get("pending_triggered") or 0),
+                "pending_expired": int(snap.get("pending_expired") or 0),
+                "hard_blocks": int(snap.get("hard_blocks") or 0),
+            }
+            _MID_STATUS_LAST_LOG_TS = now
+
+            last_tick_ts = float(snap.get("last_tick_ts") or 0.0)
+            tick_ago = (now - last_tick_ts) if last_tick_ts > 0 else None
+
+            parts = []
+            if tick_ago is None:
+                parts.append("last_tick=never")
+            else:
+                parts.append(f"last_tick={tick_ago:.0f}s")
+
+            parts.append(f"setups+{df_setups}")
+            if pending_n is not None:
+                parts.append(f"pending={pending_n} (created+{df_p_created} trig+{df_p_trig} exp+{df_p_exp})")
+            else:
+                parts.append(f"pending=? (created+{df_p_created} trig+{df_p_trig} exp+{df_p_exp})")
+            parts.append(f"blocks+{df_blocks}")
+
+            # Optional: include last summary tail if user wants it
+            try:
+                if os.getenv("MID_STATUS_INCLUDE_LAST_SUMMARY", "0").strip().lower() not in ("0","false","no","off"):
+                    ls = snap.get("last_summary")
+                    if ls:
+                        # keep short
+                        s = str(ls)
+                        if len(s) > 220:
+                            s = s[:220] + "…"
+                        parts.append(f"summary={s}")
+            except Exception:
+                pass
+
+            logger.info("[mid][status] %s", " | ".join(parts))
+        except Exception:
+            logger.exception("[mid][status] summary loop failed")
 
 
     # ---------------- MID trap/blocked digest (anti-spam analytics) ----------------
@@ -14357,6 +14558,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                         await self.add_mid_pending(rec)
                                         self.mark_mid_pending(sym, direction=direction, market=market)
                                         _rej_add(sym, "pending_saved")
+                                        try:
+                                            _mid_metrics_inc("setups_found", 1)
+                                            _mid_metrics_inc("pending_created", 1)
+                                        except Exception:
+                                            pass
                                     else:
                                         _rej_add(sym, "pending_cooldown")
                                 except Exception:
@@ -14371,6 +14577,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     self.last_futures_signal = sig
                                 await emit_signal_cb(sig)
                                 _mid_emitted += 1
+                                try:
+                                    _mid_metrics_inc("setups_found", 1)
+                                except Exception:
+                                    pass
                                 await asyncio.sleep(2)
                                 _rej_add(sym, "emitted")
                 except Exception:
@@ -14552,6 +14762,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         _mid_set_last_summary(summary)
                     except Exception:
                         pass
+                    try:
+                        # For /health: last successful MID tick timestamp
+                        global MID_LAST_TICK_TS
+                        MID_LAST_TICK_TS = time.time()
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 return elapsed
@@ -14566,6 +14782,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 logger.warning("[mid][summary] %s; skipped (set MID_TICK_TIMEOUT_SEC=0 to disable)", summary)
                 try:
                     _mid_set_last_summary(summary)
+                except Exception:
+                    pass
+                try:
+                    global MID_LAST_TICK_TS
+                    MID_LAST_TICK_TS = time.time()
                 except Exception:
                     pass
                 tick_elapsed = None
@@ -16915,6 +17136,9 @@ try:
         'add_mid_pending': globals().get('add_mid_pending'),
         'remove_mid_pending': globals().get('remove_mid_pending'),
         'mid_pending_trigger_loop': globals().get('mid_pending_trigger_loop'),
+        # status endpoints/logs
+        'mid_status_snapshot': globals().get('mid_status_snapshot'),
+        'mid_status_summary_loop': globals().get('mid_status_summary_loop'),
     }
     for _name, _fn in list(_mid_bind.items()):
         if callable(_fn) and (not hasattr(Backend, _name)):
