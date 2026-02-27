@@ -5915,6 +5915,41 @@ async def main() -> None:
         app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/unblock", unblock_user)
         # Allow preflight
         app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204))
+        # --- Route aliases for infra panel reverse-proxy (/signal/* prefix) ---
+        # Some deployments proxy the Signal Bot under /signal, so the panel calls:
+        #   /signal/api/infra/admin/...
+        # Add aliases to match both forms.
+        def _alias(method: str, path: str, handler):
+            try:
+                app.router.add_route(method, "/signal" + path, handler)
+            except Exception:
+                # ignore duplicates
+                pass
+
+        for _m, _p, _h in [
+            ("GET", "/health", health),
+
+            ("GET", "/api/infra/admin/bot/users", bot_list_users),
+            ("POST", "/api/infra/admin/bot/users", bot_create_user),
+            ("POST", "/api/infra/admin/bot/users/{telegram_id}/{action}", bot_user_action),
+
+            ("GET", "/api/infra/admin/signal/stats", signal_stats),
+            ("GET", "/api/infra/admin/signal/users", list_users),
+            ("POST", "/api/infra/admin/signal/users", save_user),
+            ("POST", "/api/infra/admin/signal/users/{telegram_id}/block", block_user),
+            ("POST", "/api/infra/admin/signal/users/{telegram_id}/unblock", unblock_user),
+
+            ("GET", "/api/infra/admin/signal/settings", signal_get_settings),
+            ("POST", "/api/infra/admin/signal/settings", signal_save_settings),
+
+            ("GET", "/api/infra/admin/autotrade/settings", autotrade_get_settings),
+            ("POST", "/api/infra/admin/autotrade/settings", autotrade_save_settings),
+
+            ("POST", "/api/infra/admin/signal/broadcast", signal_broadcast_text),
+            ("POST", "/api/infra/admin/signal/send/{telegram_id}", signal_send_text),
+        ]:
+            _alias(_m, _p, _h)
+
         return app
 
     async def _start_http_server() -> None:
@@ -6076,9 +6111,8 @@ async def main() -> None:
             port = int(os.getenv("PORT", "8080"))
         except Exception:
             port = 8080
-        app = web.Application()
+        app = await _admin_http_app()
         # Health endpoint
-        app.router.add_get("/health", lambda r: web.json_response({"ok": True, "mode": "webhook", "primary": bool(is_primary)}))
         # Telegram webhook handler
         SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=(WEBHOOK_SECRET_TOKEN or None)).register(app, path=WEBHOOK_PATH)
         setup_application(app, dp, bot=bot)
