@@ -6058,12 +6058,11 @@ async def main() -> None:
     WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
 
     if WEBHOOK_MODE:
+        # --- Webhook setup (idempotent; only PRIMARY calls setWebhook) ---
         if not WEBHOOK_BASE_URL:
             logger.error("WEBHOOK_MODE=1 but WEBHOOK_BASE_URL is empty; webhook will not be set.")
         else:
             webhook_url = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
-
-            # Important: only the PRIMARY replica should call Telegram setWebhook
             if is_primary:
                 try:
                     await _ensure_webhook(bot, webhook_url, secret_token=(WEBHOOK_SECRET_TOKEN or None))
@@ -6072,48 +6071,29 @@ async def main() -> None:
             else:
                 logger.info("Not primary -> skip setWebhook (webhook routing still active).")
 
-    # Background loops ONLY on primary
-    if not is_primary:
+        # --- Start aiohttp webhook server (required in WEBHOOK_MODE) ---
+        try:
+            port = int(os.getenv("PORT", "8080"))
+        except Exception:
+            port = 8080
+        app = web.Application()
+        # Health endpoint
+        app.router.add_get("/health", lambda r: web.json_response({"ok": True, "mode": "webhook", "primary": bool(is_primary)}))
+        # Telegram webhook handler
+        SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=(WEBHOOK_SECRET_TOKEN or None)).register(app, path=WEBHOOK_PATH)
+        setup_application(app, dp, bot=bot)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, host="0.0.0.0", port=port)
+        await site.start()
+        logger.info("Webhook HTTP server started on 0.0.0.0:%s path=%s", port, WEBHOOK_PATH)
+
+        # --- Background loops ---
+        if not is_primary:
             logger.warning("Webhook WORKER replica started: skipping background loops (scanner/track/outcomes).")
-    else:
-        # (MID trap digest is started inside _start_mid_components)
-            # --- WS candles aggregator (production) ---
-            ws_enabled = os.getenv('CANDLES_WS_ENABLED', '0').strip().lower() not in ('0','false','no','off')
-            ws_role = os.getenv('WORKER_ROLE', '').strip().upper()
-            ws_force = os.getenv('CANDLES_WS_RUN_ON_ANY', '0').strip().lower() not in ('0','false','no','off')
-            if not ws_enabled:
-                logger.info('[ws-candles] disabled (set CANDLES_WS_ENABLED=1 to enable)')
-            else:
-                can_run_ws = ws_force or (ws_role == 'WS_CANDLES') or is_primary
-                if not can_run_ws:
-                    logger.info('[ws-candles] enabled but not primary; skipping (set WORKER_ROLE=WS_CANDLES or CANDLES_WS_RUN_ON_ANY=1 to force)')
-                else:
-                    try:
-                        from backend import ws_candles_service_loop
-                        logger.info('[ws-candles] starting WS candles aggregator (role=%s primary=%s)', ws_role or 'MAIN', is_primary)
-                        TASKS['ws-candles'] = asyncio.create_task(ws_candles_service_loop(backend), name='ws-candles')
-                        _health_mark_ok('ws-candles')
-                        _attach_task_monitor('ws-candles', TASKS['ws-candles'])
-                        TASKS['ws-candles-hb'] = asyncio.create_task(_task_heartbeat_loop('ws-candles', interval_sec=10.0), name='ws-candles-hb')
-                    except Exception as e:
-                        logger.error('[ws-candles] failed to start WS candles aggregator: %s', e)
-
-# --- Candles cache cleanup (optional, runs ONLY on primary) ---
-            cleanup_enabled = os.getenv("CANDLES_CACHE_CLEANUP_ENABLED", "1").strip().lower() not in ("0","false","no","off")
-            if cleanup_enabled:
-                try:
-                    from backend import candles_cache_cleanup_loop
-                    logger.info("[candles-cleanup] starting candles_cache cleanup loop")
-                    TASKS["candles-cleanup"] = asyncio.create_task(candles_cache_cleanup_loop(backend), name="candles-cleanup")
-                    _health_mark_ok("candles-cleanup")
-                    _attach_task_monitor("candles-cleanup", TASKS["candles-cleanup"])
-                    TASKS["candles-cleanup-hb"] = asyncio.create_task(_task_heartbeat_loop("candles-cleanup", interval_sec=60.0), name="candles-cleanup-hb")
-                except Exception as e:
-                    logger.error("[candles-cleanup] failed to start cleanup loop: %s", e)
-
+        else:
             logger.info("Starting track_loop")
             if hasattr(backend, "track_loop"):
-                # Let backend report liveness for Smart Manager (once per cycle)
                 try:
                     backend.health_tick_cb = lambda: _health_mark_ok("smart-manager")
                 except Exception:
@@ -6124,27 +6104,32 @@ async def main() -> None:
             else:
                 logger.warning("Backend has no track_loop; skipping")
 
-            logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
+            logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv("SCAN_INTERVAL_SECONDS",""), os.getenv("TOP_N",""))
             asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
 
-            # ⚡ MID TREND scanner + MID trap digest (works in webhook mode too)
+            # MID components (scanner + pending loop)
             _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
 
             logger.info("Starting signal_outcome_loop")
             asyncio.create_task(signal_outcome_loop())
 
         # Auto-trade manager can run on all replicas (cluster-safe via DB lease/locks)
-        TASKS["autotrade-manager"] = asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error), name="autotrade-manager")
+        TASKS["autotrade-manager"] = asyncio.create_task(
+            autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error),
+            name="autotrade-manager",
+        )
         _health_mark_ok("autotrade-manager")
         _attach_task_monitor("autotrade-manager", TASKS["autotrade-manager"])
-        TASKS["autotrade-manager-heartbeat"] = asyncio.create_task(_task_heartbeat_loop("autotrade-manager", interval_sec=5.0), name="autotrade-manager-heartbeat")
+        TASKS["autotrade-manager-heartbeat"] = asyncio.create_task(
+            _task_heartbeat_loop("autotrade-manager", interval_sec=5.0),
+            name="autotrade-manager-heartbeat",
+        )
 
         TASKS["health-status"] = asyncio.create_task(_health_status_loop(), name="health-status")
         _attach_task_monitor("health-status", TASKS["health-status"])
 
         logger.info("Webhook mode active; waiting for HTTP requests")
         await asyncio.Event().wait()
-
     # --- Polling mode (legacy) ---
     # Start admin HTTP API on all replicas
     asyncio.create_task(_start_http_server())
