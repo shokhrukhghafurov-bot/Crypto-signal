@@ -17706,7 +17706,12 @@ try:
         'mid_status_summary_loop': globals().get('mid_status_summary_loop'),
     }
     for _name, _fn in list(_mid_bind.items()):
-        if callable(_fn) and (not hasattr(Backend, _name)):
+        # Bind if missing OR present-but-broken (e.g. None / non-callable placeholder)
+        try:
+            _cur = getattr(Backend, _name, None)
+        except Exception:
+            _cur = None
+        if callable(_fn) and (not callable(_cur)):
             setattr(Backend, _name, _fn)
 except Exception:
     pass
