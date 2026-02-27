@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-02-28_v12"
+MID_BUILD_TAG = "MID_BUILD_2026-02-28_v13"
 
 import asyncio
 import json
@@ -14703,10 +14703,13 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 return 0
 
                         chosen_r: Optional[Dict[str, Any]] = None
+                        chosen_df5 = None  # trigger TF candles (e.g. 5m)
+                        chosen_df30 = None  # mid TF candles (e.g. 30m)
+                        chosen_df1h = None  # trend TF candles (e.g. 1h)
                         found_ok_candles: bool = False  # candles were present and had enough bars on at least one venue
 
                         async def _choose_exchange_mid():
-                            nonlocal chosen_name, chosen_market, chosen_r, found_ok_candles
+                            nonlocal chosen_name, chosen_market, chosen_r, found_ok_candles, chosen_df5, chosen_df30, chosen_df1h
                             primary = _mid_primary_for_symbol(sym)
                             # try primary first, then the other primary (if any), then fallbacks
                             if MID_CANDLES_LIGHT_MODE or MID_CANDLES_BINANCE_FIRST:
@@ -14821,6 +14824,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                             chosen_name = name
                                             chosen_market = mkt
                                             chosen_r = r
+                                            chosen_df5 = a
+                                            chosen_df30 = b
+                                            chosen_df1h = c
                                             return
                                     except Exception:
                                         continue
@@ -15306,7 +15312,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     key = f"{market}:{sym}:{direction}"
 
                                     # Build smarter entry zone from OB/FVG/Channel (optional)
-                                    z, z_src = _mid_build_entry_zone(df5, df30, df1h, direction=direction, entry=float(entry))
+                                    z, z_src = _mid_build_entry_zone(chosen_df5, chosen_df30, chosen_df1h, direction=direction, entry=float(entry))
                                     entry_low = float(z[0]) if z else None
                                     entry_high = float(z[1]) if z else None
 
