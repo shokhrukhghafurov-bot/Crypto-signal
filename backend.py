@@ -10248,6 +10248,15 @@ class Backend:
         # Called best-effort once per track_loop cycle.
         self.health_tick_cb = None
 
+        # Hardening: prevent accidental instance-attribute shadowing of class methods.
+        # If some config/merge mistakenly set `self.scanner_loop_mid = None`, bot.py would
+        # think MID scanner is missing even though Backend defines it.
+        try:
+            if "scanner_loop_mid" in getattr(self, "__dict__", {}) and not callable(getattr(self, "scanner_loop_mid", None)):
+                del self.__dict__["scanner_loop_mid"]
+        except Exception:
+            pass
+
 
 
     def set_mid_trap_sink(self, cb) -> None:
