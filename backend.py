@@ -12307,6 +12307,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
     # Here we track trigger attempts/fails and prune noisy pendings automatically.
     max_fails = int(os.getenv("MID_PENDING_MAX_FAILS", "12") or 12)
     max_attempts = int(os.getenv("MID_PENDING_MAX_ATTEMPTS", "50") or 50)
+    # Debounce attempts so "trigger_attempts" doesn't explode when price sits inside the zone.
+    # Counts at most once per N seconds while price is in-zone.
+    try:
+        attempt_gap_sec = float(os.getenv("MID_PENDING_MIN_ATTEMPT_GAP_SEC", "30") or 30.0)
+    except Exception:
+        attempt_gap_sec = 30.0
+    if attempt_gap_sec < 0:
+        attempt_gap_sec = 0.0
 
     def _pending_mark_attempt(it: dict, now_ts: float) -> None:
         try:
@@ -12428,6 +12436,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             keep.append(it)
                             any_wait = True
                             continue
+
+                    # Debounce: if price is still in-zone and we've checked very recently,
+                    # don't count another attempt and don't re-run heavy confirmations yet.
+                    try:
+                        last_try = float(it.get("last_attempt_ts") or 0.0)
+                        if attempt_gap_sec > 0 and last_try > 0 and (now - last_try) < attempt_gap_sec:
+                            keep.append(it)
+                            any_wait = True
+                            continue
+                    except Exception:
+                        pass
 
                     # We reached entry/zone: count this as a trigger attempt (persisted in DB kv_store).
                     _pending_mark_attempt(it, now)
