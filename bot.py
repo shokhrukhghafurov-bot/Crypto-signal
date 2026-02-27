@@ -6175,18 +6175,22 @@ async def main() -> None:
     is_primary, _primary_lock_conn = await _acquire_primary_lock()
 
     # --- Webhook routing (enabled on ALL replicas) ---
+    # --- Webhook routing (enabled on ALL replicas) ---
     WEBHOOK_MODE = os.getenv("WEBHOOK_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
     WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip() or "/webhook"
     WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()
     WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
 
     if WEBHOOK_MODE:
+        # Start admin HTTP API on all replicas (Status dashboard uses it)
+        TASKS["http-server"] = asyncio.create_task(_start_http_server(), name="http-server")
+        _attach_task_monitor("http-server", TASKS["http-server"])
+
+        # Set Telegram webhook ONLY on primary (avoid 429 flood-control)
         if not WEBHOOK_BASE_URL:
             logger.error("WEBHOOK_MODE=1 but WEBHOOK_BASE_URL is empty; webhook will not be set.")
         else:
             webhook_url = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
-
-            # Important: only the PRIMARY replica should call Telegram setWebhook
             if is_primary:
                 try:
                     await _ensure_webhook(bot, webhook_url, secret_token=(WEBHOOK_SECRET_TOKEN or None))
@@ -6195,11 +6199,11 @@ async def main() -> None:
             else:
                 logger.info("Not primary -> skip setWebhook (webhook routing still active).")
 
-    # Background loops ONLY on primary
+        # Background loops ONLY on primary
         if not is_primary:
             logger.warning("Webhook WORKER replica started: skipping background loops (scanner/track/outcomes).")
         else:
-			# (MID trap digest is started inside _start_mid_components)
+            # (MID trap digest is started inside _start_mid_components)
             # --- WS candles aggregator (production) ---
             ws_enabled = os.getenv('CANDLES_WS_ENABLED', '0').strip().lower() not in ('0','false','no','off')
             ws_role = os.getenv('WORKER_ROLE', '').strip().upper()
@@ -6221,7 +6225,7 @@ async def main() -> None:
                     except Exception as e:
                         logger.error('[ws-candles] failed to start WS candles aggregator: %s', e)
 
-# --- Candles cache cleanup (optional, runs ONLY on primary) ---
+            # --- Candles cache cleanup (optional, runs ONLY on primary) ---
             cleanup_enabled = os.getenv("CANDLES_CACHE_CLEANUP_ENABLED", "1").strip().lower() not in ("0","false","no","off")
             if cleanup_enabled:
                 try:
@@ -6265,12 +6269,8 @@ async def main() -> None:
         TASKS["health-status"] = asyncio.create_task(_health_status_loop(), name="health-status")
         _attach_task_monitor("health-status", TASKS["health-status"])
 
-                # Start admin HTTP API (Status dashboard)
-        asyncio.create_task(_start_http_server())
-
-logger.info("Webhook mode active; waiting for HTTP requests")
+        logger.info("Webhook mode active; waiting for HTTP requests")
         await asyncio.Event().wait()
-
     # --- Polling mode (legacy) ---
     # Start admin HTTP API on all replicas
     asyncio.create_task(_start_http_server())
