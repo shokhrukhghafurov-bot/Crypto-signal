@@ -13230,6 +13230,23 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
             else:
                 min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76"))
                 min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72"))
+            # --- MID config visibility (debug) ---
+            # Railway env is a common source of "it should be 1 but behaves like 0" issues.
+            # Log the effective flags and key thresholds once per tick.
+            try:
+                pending_enabled = str(os.getenv("MID_PENDING_ENABLED", "0") or "0").strip().lower() not in ("0","false","no","off")
+                postsetup_only = str(os.getenv("MID_FILTERS_AFTER_SETUP", "0") or "0").strip().lower() not in ("0","false","no","off")
+                require_trigger = str(os.getenv("MID_REQUIRE_TRIGGER", "1") or "1").strip().lower() not in ("0","false","no","off")
+                min_conf = int(os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
+                ttl_min = float(os.getenv("MID_PENDING_TTL_MIN", os.getenv("MID_PENDING_TTL_MINUTES", "150")) or 150)
+                logger.info(
+                    "[mid][cfg] pending_enabled=%s postsetup_only=%s require_trigger=%s min_score_fut=%s min_score_spot=%s min_conf=%s top_n=%s ttl_min=%s",
+                    int(pending_enabled), int(postsetup_only), int(require_trigger),
+                    int(min_score_fut), int(min_score_spot), int(min_conf),
+                    int(top_n), float(ttl_min)
+                )
+            except Exception:
+                pass
             min_rr = float(os.getenv("MID_MIN_RR","2.0"))
 
             min_adx_30m = float(os.getenv("MID_MIN_ADX_30M","0") or "0")
