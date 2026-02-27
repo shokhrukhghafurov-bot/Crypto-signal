@@ -96,7 +96,7 @@ if _TEST_MODE and _TEST_MODE_SCOPE in ("MID","ALL"):
         "MID_ALLOW_RANGE": "1",
         "MID_ALLOW_COUNTERTREND_WITH_5M_REVERSAL": "1",
          "MID_BLOCK_BB_BOUNCE":  "0",
-         "MID_REQUIRE_TRIGGER":  "1",
+         "MID_REQUIRE_TRIGGER":  "0",
         # Optional: avoid "no repeat" during test
         "MID_SYMBOL_COOLDOWN_MIN": os.getenv("MID_SYMBOL_COOLDOWN_MIN", "0") or "0",
     }
