@@ -620,25 +620,20 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
     try:
         interval = int((os.getenv("MID_SCAN_INTERVAL_SECONDS", "").strip() or os.getenv("MID_SCAN_INTERVAL_SEC", "45").strip()) or 45)
         top_n = int(os.getenv("MID_TOP_N", "70") or 70)
-
         # Diagnostics: catch "imported wrong backend" cases (most common reason for has_method=False)
         try:
-            import inspect
+            import inspect, hashlib
             cls_file = inspect.getfile(backend.__class__)
-            logger.info("[mid] backend class=%s file=%s", backend.__class__.__name__, cls_file)        # Extra: verify the actual backend.py content to catch 'wrong file in container' cases.
-        try:
-            import hashlib
-            _bp = cls_file if 'cls_file' in locals() else None
-            if _bp and isinstance(_bp, str) and _bp.endswith('.py'):
-                with open(_bp, 'rb') as _f:
+            logger.info("[mid] backend class=%s file=%s", backend.__class__.__name__, cls_file)
+            if isinstance(cls_file, str) and cls_file.endswith(".py"):
+                with open(cls_file, "rb") as _f:
                     _raw = _f.read()
                 _sha = hashlib.sha256(_raw).hexdigest()[:12]
-                _txt = _raw.decode('utf-8', errors='ignore')
-                _has_def = 'async def scanner_loop_mid' in _txt
-                _idx = _txt.find('async def scanner_loop_mid')
-                _line = _txt[:_idx].count('
-') + 1 if _idx >= 0 else None
-                logger.info('[mid] backend.py sha256=%s has_scanner_def=%s line=%s', _sha, _has_def, _line)
+                _txt = _raw.decode("utf-8", errors="ignore")
+                _idx = _txt.find("async def scanner_loop_mid")
+                _has_def = _idx >= 0
+                _line = _txt[:_idx].count("\n") + 1 if _idx >= 0 else None
+                logger.info("[mid] backend.py sha256=%s has_scanner_def=%s line=%s", _sha, _has_def, _line)
         except Exception:
             pass
 
