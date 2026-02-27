@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = \"MID_BUILD_2026-02-27_v6"
+MID_BUILD_TAG = "MID_BUILD_2026-02-27_v9"
 
 import asyncio
 import json
