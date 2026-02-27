@@ -6265,7 +6265,10 @@ async def main() -> None:
         TASKS["health-status"] = asyncio.create_task(_health_status_loop(), name="health-status")
         _attach_task_monitor("health-status", TASKS["health-status"])
 
-        logger.info("Webhook mode active; waiting for HTTP requests")
+                # Start admin HTTP API (Status dashboard)
+        asyncio.create_task(_start_http_server())
+
+logger.info("Webhook mode active; waiting for HTTP requests")
         await asyncio.Event().wait()
 
     # --- Polling mode (legacy) ---
