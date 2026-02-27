@@ -14518,6 +14518,20 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     _rej_seen = set()
                     _rej_counts = {}
                     _rej_examples_map = {}
+
+                    # Per-tick pending "not created" reasons (one reason per symbol)
+                    _mid_pending_not_created = {}  # sym -> reason
+                    def _pending_skip(sym0, reason0):
+                        try:
+                            s0 = str(sym0 or "").upper().strip()
+                            if not s0:
+                                return
+                            if s0 in _mid_pending_not_created:
+                                return
+                            r0 = str(reason0 or "").strip() or "unknown"
+                            _mid_pending_not_created[s0] = r0
+                        except Exception:
+                            pass
                     _rej_full = os.getenv("MID_REJECT_DIGEST_FULL", "0").strip().lower() in ("1","true","yes","on")
                     _rej_full_max = int(os.getenv("MID_REJECT_DIGEST_FULL_MAX", str(_mid_scanned)) or _mid_scanned)
                     _rej_reason_by_sym = {}  # sym -> reason
@@ -15056,6 +15070,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             except Exception:
                                 pass
                             if not (pending_enabled and postsetup_only):
+                                _pending_skip(sym, f"score<{float(min_conf):g} score={float(conf):g}")
                                 continue
                             try:
                                 base_r.setdefault("risk_flags", [])
@@ -15071,6 +15086,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             except Exception:
                                 pass
                             if not (pending_enabled and postsetup_only):
+                                _pending_skip(sym, f"rr<{float(min_rr):g} rr={float(rr):g}")
                                 continue
                             try:
                                 base_r.setdefault("risk_flags", [])
@@ -15295,13 +15311,16 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
 
                                     # Pending model requires a real entry zone. Without zone it's not a setup.
                                     if entry_low is None or entry_high is None:
+                                        _pending_skip(sym, f"no_zone src={z_src or 'n/a'}")
                                         _rej_add(sym, "no_entry_zone")
                                         continue
                                     try:
                                         if float(entry_low) <= 0 or float(entry_high) <= 0 or float(entry_high) < float(entry_low):
+                                            _pending_skip(sym, "zone_invalid")
                                             _rej_add(sym, "no_entry_zone")
                                             continue
                                     except Exception:
+                                        _pending_skip(sym, "zone_invalid")
                                         _rej_add(sym, "no_entry_zone")
                                         continue
 
@@ -15377,6 +15396,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         pass
                                 else:
                                     _mid_f_cooldown += 1  # pending add cooldown; not a rejection
+                                    _pending_skip(sym, "cooldown")
                                     logger.debug(f"[mid][pending] cooldown skip sym={sym} dir={direction} market={market}")
                             except Exception:
                                 _rej_add(sym, "not_enough_data")
@@ -15476,6 +15496,23 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         f"prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
                     )
                     logger.info("[mid][summary] %s", summary)
+
+                    # One-line per-symbol reason why a pending was NOT created (scan stage).
+                    try:
+                        if isinstance(_mid_pending_not_created, dict) and _mid_pending_not_created:
+                            try:
+                                topn = int(os.getenv("MID_PENDING_NOT_CREATED_TOPN", "20") or 20)
+                            except Exception:
+                                topn = 20
+                            items = sorted(_mid_pending_not_created.items(), key=lambda kv: kv[0])
+                            shown = items[:topn] if topn and topn > 0 else items
+                            rest = len(items) - len(shown)
+                            s = " ".join([f"{k}={v}" for k, v in shown])
+                            if rest > 0:
+                                s = s + f" +{rest}more"
+                            logger.info("[mid][pending][not_created] %s", s)
+                    except Exception:
+                        pass
 
                     # Adaptive regime snapshot (avg across evaluated symbols for this tick)
                     try:
