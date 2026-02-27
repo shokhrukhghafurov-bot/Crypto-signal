@@ -92,11 +92,11 @@ if _TEST_MODE and _TEST_MODE_SCOPE in ("MID","ALL"):
         "MID_MACRO_FILTER": "1",
         "MID_RANGE_POS_FILTER": "0",
         "MID_TOP_FILTERS": "0",
-        "MID_TRAP_FILTERS": "0",
+        "MID_TRAP_FILTERS": "1",
         "MID_ALLOW_RANGE": "1",
         "MID_ALLOW_COUNTERTREND_WITH_5M_REVERSAL": "1",
          "MID_BLOCK_BB_BOUNCE":  "0",
-         "MID_REQUIRE_TRIGGER":  "0",
+         "MID_REQUIRE_TRIGGER":  "1",
         # Optional: avoid "no repeat" during test
         "MID_SYMBOL_COOLDOWN_MIN": os.getenv("MID_SYMBOL_COOLDOWN_MIN", "0") or "0",
     }
@@ -5509,6 +5509,18 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                       htf_dir_1h: str | None = None, htf_dir_30m: str | None = None, adx_30m: float | None = None) -> str | None:
     """Return human-readable MID BLOCKED reason (for logging + error-bot), or None if allowed."""
     try:
+        # If MID pending-entry mode is enabled, we should NOT hard-block a candidate just because
+        # the current price is already far from a recent extreme or far from VWAP.
+        # In pending mode we store the setup and wait for price to come back into the entry zone,
+        # so late_entry_atr / vwap_dist_atr would incorrectly kill most setups.
+        #
+        # Toggle:
+        #   MID_PENDING_ENABLED=1
+        #   MID_PENDING_SKIP_HARDBLOCKS=1   (default)
+        _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+        _pending_skip_hb = os.getenv("MID_PENDING_SKIP_HARDBLOCKS", "1").strip().lower() not in ("0", "false", "no", "off")
+        _skip_late_vwap_blocks = bool(_pending_enabled and _pending_skip_hb)
+
         # ULTRA SAFE: tighten filters dynamically for near-zero SL preference
         late_entry_max = MID_ULTRA_LATE_ENTRY_ATR_MAX if MID_ULTRA_SAFE else MID_LATE_ENTRY_ATR_MAX
         vwap_dist_max = MID_ULTRA_VWAP_DIST_ATR_MAX if MID_ULTRA_SAFE else MID_VWAP_DIST_ATR_MAX
@@ -5622,7 +5634,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
             _mid_adapt_vol_mult = 1.0
             _mid_adapt_bounce_scale = 1.0
 
-        if atr_30m and atr_30m > 0:
+        if atr_30m and atr_30m > 0 and not _skip_late_vwap_blocks:
             if side.upper() == "LONG":
                 move_from_low = (close - recent_low) / atr_30m
                 if move_from_low > late_entry_max:
@@ -5722,9 +5734,10 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                     if b in ("mid→high", "low→mid", "↑high"):
                         return f"bb_bounce_zone={bb_pos}"
 
-            dist = abs(close - vwap) / atr_30m if vwap is not None else 0.0
-            if dist > vwap_dist_max:
-                return f"vwap_dist_atr={dist:.2f} > {vwap_dist_max:g}"
+            if not _skip_late_vwap_blocks:
+                dist = abs(close - vwap) / atr_30m if vwap is not None else 0.0
+                if dist > vwap_dist_max:
+                    return f"vwap_dist_atr={dist:.2f} > {vwap_dist_max:g}"
 
             body_atr = (abs(close - o) / atr_30m) if o is not None else 0.0
             if avg_vol and avg_vol > 0:
