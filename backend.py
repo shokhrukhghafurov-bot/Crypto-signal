@@ -8437,6 +8437,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         use_bort = _mid_bool_env("MID_USE_BREAKOUT_RETEST", "1")
         use_ob = _mid_bool_env("MID_USE_ORDER_BLOCK", "1")
         require_trigger = _mid_bool_env("MID_REQUIRE_TRIGGER", "1")
+        pending_enabled = _mid_bool_env("MID_PENDING_ENABLED", "0")
+        postsetup_only = _mid_bool_env("MID_FILTERS_AFTER_SETUP", "0")
 
         if use_regime:
             mid_regime = _mid_market_regime(df30i, df1hi, entry=float(entry), atr30=float(atr30), adx30=(float(adx30) if not np.isnan(adx30) else None))
@@ -8483,16 +8485,20 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                     if (not np.isnan(lo5)) and (not np.isnan(hi5)):
                         ob_retest = (hi5 >= zlo - tol) and (lo5 <= zhi + tol)
                 except Exception:
-                    ob_retest = False
-
-        # Regime gating: in ranges, ignore pure breakouts; prefer sweep/OB retests.
+                    ob_retest = False        # Regime gating: in ranges, ignore pure breakouts; prefer sweep/OB retests.
         if use_regime and mid_regime == "RANGING":
             if bo_rt_trigger and (not (sweep_long or sweep_short) and (not ob_retest)):
                 # prevent range fake breakouts
                 _fail("structure", "regime_range_no_breakout")
-                return None
-
-        # Require at least one execution trigger for MID (institutional quality)
+                if not (pending_enabled and postsetup_only):
+                    return None
+                try:
+                    base_r.setdefault("risk_flags", [])
+                    base_r["risk_flags"].append("regime_range_no_breakout")
+                except Exception:
+                    pass        # Require at least one execution trigger for MID (institutional quality)
+        # NOTE: In pending model (MID_PENDING_ENABLED=1 + MID_FILTERS_AFTER_SETUP=1),
+        # we do NOT block setup creation here; we only flag it and let TRIGGER-stage confirm.
         if require_trigger:
             trig_ok = False
             if str(dir_trend).upper() == "LONG":
@@ -8501,7 +8507,13 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 trig_ok = bool(sweep_short) or bool(bo_rt_trigger) or bool(ob_retest)
             if not trig_ok:
                 _fail("other", "no_trigger")
-                return None
+                if not (pending_enabled and postsetup_only):
+                    return None
+                try:
+                    base_r.setdefault("risk_flags", [])
+                    base_r["risk_flags"].append("no_trigger")
+                except Exception:
+                    pass
     except Exception:
         # Never block if engine fails unexpectedly.
         pass
