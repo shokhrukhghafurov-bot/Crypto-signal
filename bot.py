@@ -638,10 +638,30 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
             pass
 
         # Be defensive: older builds sometimes used different method names.
+        # IMPORTANT hardening:
+        # In some prod deployments we saw `getattr(instance, 'scanner_loop_mid')` return None
+        # even though the class defined the method (instance attribute shadowing or proxy wrappers).
+        # Try the instance attr first; if it's missing/not-callable, fall back to the class attr
+        # and bind it to the instance.
+        def _resolve_bound(obj, name: str):
+            try:
+                v = getattr(obj, name, None)
+                if callable(v):
+                    return v
+            except Exception:
+                v = None
+            try:
+                cv = getattr(obj.__class__, name, None)
+                if callable(cv):
+                    return cv.__get__(obj, obj.__class__)
+            except Exception:
+                return None
+            return None
+
         mid_loop = (
-            getattr(backend, 'scanner_loop_mid', None)
-            or getattr(backend, 'mid_scanner_loop', None)
-            or getattr(backend, 'scanner_mid_loop', None)
+            _resolve_bound(backend, 'scanner_loop_mid')
+            or _resolve_bound(backend, 'mid_scanner_loop')
+            or _resolve_bound(backend, 'scanner_mid_loop')
         )
 
         # If a compatibility stub is present, treat as missing implementation.
@@ -698,15 +718,25 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
                     logger.error("[mid] available methods containing 'mid'+'scan': %s", ", ".join(sorted(mids)[:40]))
                 # Also dump the attribute itself (type/name/module/qualname) to understand why it's not callable.
                 try:
-                    attr = getattr(backend, "scanner_loop_mid", None)
+                    attr_i = getattr(backend, "scanner_loop_mid", None)
+                    attr_c = getattr(getattr(backend, "__class__", object), "scanner_loop_mid", None)
                     logger.error(
-                        "[mid] scanner_loop_mid attr: type=%s callable=%s name=%s qual=%s module=%s repr=%r",
-                        type(attr).__name__,
-                        callable(attr),
-                        getattr(attr, "__name__", None),
-                        getattr(attr, "__qualname__", None),
-                        getattr(attr, "__module__", None),
-                        attr,
+                        "[mid] scanner_loop_mid instance attr: type=%s callable=%s name=%s qual=%s module=%s repr=%r",
+                        type(attr_i).__name__,
+                        callable(attr_i),
+                        getattr(attr_i, "__name__", None),
+                        getattr(attr_i, "__qualname__", None),
+                        getattr(attr_i, "__module__", None),
+                        attr_i,
+                    )
+                    logger.error(
+                        "[mid] scanner_loop_mid class attr: type=%s callable=%s name=%s qual=%s module=%s repr=%r",
+                        type(attr_c).__name__,
+                        callable(attr_c),
+                        getattr(attr_c, "__name__", None),
+                        getattr(attr_c, "__qualname__", None),
+                        getattr(attr_c, "__module__", None),
+                        attr_c,
                     )
                 except Exception:
                     pass
