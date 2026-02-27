@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-02-27_v9"
+MID_BUILD_TAG = "MID_BUILD_2026-02-27_v10"
 
 import asyncio
 import json
@@ -612,28 +612,175 @@ MID_PENDING_CREATED_TOTAL = 0
 MID_PENDING_TRIGGERED_TOTAL = 0
 MID_PENDING_EXPIRED_TOTAL = 0
 
+
+# --- MID unified reject reasons (single registry) ---
+# IMPORTANT: Use ONLY these keys for MID reject/block/skip reasons.
+MID_REJECT_REASONS = {
+    "candles_unavailable",
+    "not_enough_data",
+    "pending_wait",
+    "ttl_expired",
+    "late_entry",
+    "vwap_dist",
+    "anti_bounce",
+    "score_low",
+    "confidence_low",
+    "trap_block",
+    "htf_misaligned",
+    "regime_block",
+    "volatility_block",
+    "liquidity_fail",
+    "structure_fail",
+}
+
+# Aliases from legacy log words -> registry keys (to avoid drift like "no_candles" vs "candles_unavailable")
+MID_REJECT_ALIASES = {
+    # candles / data
+    "no_candles": "candles_unavailable",
+    "candles_fail": "candles_unavailable",
+    "rest_fail": "candles_unavailable",
+    "net_fail": "candles_unavailable",
+    "timeout": "candles_unavailable",
+    "tick_budget": "candles_unavailable",
+    "no_market_any": "candles_unavailable",
+    "futures_existence_check_failed": "candles_unavailable",
+    "no_futures_contract": "candles_unavailable",
+    "futures_forced_off": "candles_unavailable",
+    "candles_unavailable": "candles_unavailable",
+    "empty_df": "not_enough_data",
+    "not_enough_data": "not_enough_data",
+
+    # pending
+    "pending_wait": "pending_wait",
+    "pending_cooldown": "pending_wait",
+
+    # ttl
+    "ttl_expired": "ttl_expired",
+    "expired": "ttl_expired",
+
+    # filters
+    "late_entry": "late_entry",
+    "late_entry_atr": "late_entry",
+    "vwap_dist": "vwap_dist",
+    "vwap_dist_atr": "vwap_dist",
+    "vwap_bias": "vwap_dist",
+    "vwap_too_close": "vwap_dist",
+    "anti_bounce": "anti_bounce",
+    "anti_bounce_long": "anti_bounce",
+    "anti_bounce_short": "anti_bounce",
+
+    "score": "score_low",
+    "score_low": "score_low",
+    "rr": "score_low",
+
+    "confidence_low": "confidence_low",
+
+    "trap": "trap_block",
+    "hardblock": "trap_block",
+    "blocked_symbol": "trap_block",
+    "cooldown": "trap_block",
+    "emitted": "trap_block",
+    "macro_pause_all": "trap_block",
+    "news_pause_all": "trap_block",
+
+    "align_mismatch": "htf_misaligned",
+    "htf_misaligned": "htf_misaligned",
+
+    "regime": "regime_block",
+    "regime_block": "regime_block",
+    "adx_30m": "regime_block",
+    "adx_1h": "regime_block",
+
+    "atr_pct": "volatility_block",
+    "vol_x": "volatility_block",
+    "volatility_block": "volatility_block",
+
+    "liq_sweep_missing": "liquidity_fail",
+    "liquidity_fail": "liquidity_fail",
+
+    "structure_fail": "structure_fail",
+    "structure": "structure_fail",
+    "bos": "structure_fail",
+    "choch": "structure_fail",
+}
+
+def mid_reject(reason: str) -> str:
+    """Return a registry key for any reject/block/skip reason (never raises)."""
+    try:
+        r = (reason or "").strip().lower()
+        if not r:
+            return "not_enough_data"
+        token = r.split()[0].strip().strip(";:,.()[]{}")
+        key = MID_REJECT_ALIASES.get(token) or MID_REJECT_ALIASES.get(r)
+        if key and key in MID_REJECT_REASONS:
+            return key
+        # If already a valid key, keep it.
+        if token in MID_REJECT_REASONS:
+            return token
+        if r in MID_REJECT_REASONS:
+            return r
+        return "not_enough_data"
+    except Exception:
+        return "not_enough_data"
+
+
+# --- MID stage flow (rolling window, for /health) ---
+# STAGE FLOW (last 15m): scanned / passed_ta / created_pending / triggered / rejected
+MID_STAGE_EVENTS: list[tuple[float, str]] = []
+MID_STAGE_MAX_EVENTS = 200000
+
+def _mid_stage_add(stage: str, n: int = 1) -> None:
+    """Best-effort add to rolling stage window (never raises)."""
+    global MID_STAGE_EVENTS
+    try:
+        st = (stage or "").strip().lower()
+        if not st:
+            return
+        ts = time.time()
+        cnt = max(1, int(n or 1))
+        for _ in range(min(cnt, 50)):
+            MID_STAGE_EVENTS.append((ts, st))
+        if len(MID_STAGE_EVENTS) > MID_STAGE_MAX_EVENTS:
+            MID_STAGE_EVENTS = MID_STAGE_EVENTS[-MID_STAGE_MAX_EVENTS:]
+    except Exception:
+        pass
+
+def _mid_stage_counts(window_sec: int = 900) -> dict:
+    """Counts of stages within last window_sec."""
+    try:
+        now = time.time()
+        cutoff = now - float(window_sec)
+        out = defaultdict(int)
+        # prune old
+        global MID_STAGE_EVENTS
+        if MID_STAGE_EVENTS:
+            # keep only relevant tail (events are append-only, ts non-decreasing in practice)
+            i = 0
+            for i, (ts, _) in enumerate(MID_STAGE_EVENTS):
+                if ts >= cutoff:
+                    break
+            else:
+                i = len(MID_STAGE_EVENTS)
+            if i > 0:
+                MID_STAGE_EVENTS = MID_STAGE_EVENTS[i:]
+        for ts, st in MID_STAGE_EVENTS:
+            if ts >= cutoff:
+                out[st] += 1
+        return dict(out)
+    except Exception:
+        return {}
 # --- MID reject digest (rolling window, for /health) ---
 # Tracks top reasons across stages: candles_unavailable / not_enough_data / pending_wait / etc.
 MID_REJECT_EVENTS = []  # list[(ts, reason_key)]
 MID_REJECT_MAX_EVENTS = 50000
 
+
 def _mid_reject_key(reason: str) -> str:
-    """Normalize reject reason into a compact key."""
-    try:
-        r = (reason or "").strip().lower()
-        if not r:
-            return "unknown"
-        # take token before first whitespace to keep buckets stable
-        k = r.split()[0].strip().strip(";:,.()[]{}")
-        if not k:
-            return "unknown"
-        if len(k) > 64:
-            k = k[:64]
-        return k
-    except Exception:
-        return "unknown"
+    """Normalize reject reason into a registry key (see MID_REJECT_REASONS)."""
+    return mid_reject(reason)
 
 def _mid_reject_add(reason: str, n: int = 1) -> None:
+
     """Best-effort add to rolling reject window (never raises)."""
     global MID_REJECT_EVENTS
     try:
@@ -11738,7 +11885,7 @@ class Backend:
                         # Emit cooldown (keyed by market+symbol+direction)
                         if not self.can_emit_mid(sym, best_dir, market):
                             _mid_skip_cooldown += 1
-                            _rej_add(sym, "cooldown")
+                            _rej_add(sym, "trap_block")
                             try:
                                 self._mid_digest_add(self._mid_trap_digest_stats, sym, best_dir, market, "cooldown")
                             except Exception:
@@ -11749,7 +11896,7 @@ class Backend:
                         # SPOT+SHORT is not executable -> convert to FUTURES unless Futures are forced off by news/macro
                         if market == "SPOT" and best_dir == "SHORT":
                             if news_act == "FUTURES_OFF" or mac_act == "FUTURES_OFF":
-                                _rej_add(sym, "futures_forced_off")
+                                _rej_add(sym, "candles_unavailable")
                                 continue
                             market = "FUTURES"
                             risk_note = (risk_note + "\n" if risk_note else "") + "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
@@ -11795,11 +11942,11 @@ class Backend:
                                 _fut_ok = await asyncio.gather(_pair_exists("BINANCE"), _pair_exists("BYBIT"), _pair_exists("OKX"))
                                 if not any(bool(x) for x in _fut_ok):
                                     logger.info("[scanner] skip %s FUTURES: no contract on BINANCE/BYBIT/OKX (best_source=%s)", sym, best_name)
-                                    _rej_add(sym, "no_futures_contract")
+                                    _rej_add(sym, "candles_unavailable")
                                     continue
                             except Exception as _e:
                                 logger.info("[scanner] skip %s FUTURES: futures existence check failed: %s", sym, _e)
-                                _rej_add(sym, "futures_existence_check_failed")
+                                _rej_add(sym, "candles_unavailable")
                                 continue
 
 # Exchanges where the instrument exists for the given market.
@@ -12283,7 +12430,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         pass
                     try:
-                        _mid_reject_add("pending_triggered")
+                        _mid_stage_add("triggered", 1)
                     except Exception:
                         pass
                     # emitted: do not keep
@@ -12345,6 +12492,19 @@ async def mid_status_snapshot(self) -> dict:
         except Exception:
             window_sec = 900
 
+        # Stage flow breakdown (last 15m)
+        try:
+            stage_counts = _mid_stage_counts(900)
+            stage_flow = {
+                "scanned": int(stage_counts.get("scanned", 0)),
+                "passed_ta": int(stage_counts.get("passed_ta", 0)),
+                "created_pending": int(stage_counts.get("created_pending", 0)),
+                "triggered": int(stage_counts.get("triggered", 0)),
+                "rejected": int(stage_counts.get("rejected", 0)),
+            }
+        except Exception:
+            stage_flow = None
+
         return {
             "pending": int(len(pending_items)),
             "pending_ttl_min": float(ttl_min),
@@ -12360,6 +12520,7 @@ async def mid_status_snapshot(self) -> dict:
             "last_summary": snap.get("last_summary"),
             "reject_digest_window_sec": int(window_sec),
             "reject_digest_top3": reject_top,
+            "stage_flow_last_15m": stage_flow,
         }
     except Exception:
         return {"pending": None, "last_tick_ts": None}
@@ -12431,6 +12592,21 @@ async def mid_status_summary_loop(self) -> None:
                 parts.append(f"last_tick={tick_ago:.0f}s")
 
             parts.append(f"setups+{df_setups}")
+
+
+            # Stage flow (last 15m)
+            try:
+                st = _mid_stage_counts(900)
+                parts.append("stage15m=" + ",".join([
+                    f"scanned={int(st.get('scanned',0))}",
+                    f"passed_ta={int(st.get('passed_ta',0))}",
+                    f"created_pending={int(st.get('created_pending',0))}",
+                    f"triggered={int(st.get('triggered',0))}",
+                    f"rejected={int(st.get('rejected',0))}",
+                ]))
+            except Exception:
+                pass
+
             if pending_n is not None:
                 parts.append(f"pending={pending_n} (created+{df_p_created} trig+{df_p_trig} exp+{df_p_exp})")
             else:
@@ -13928,7 +14104,7 @@ async def mid_status_summary_loop(self) -> None:
                                 _kept = []
                                 for _s in symbols:
                                     if is_blocked_symbol(_s):
-                                        _rej_add(_s, "blocked_symbol")
+                                        _rej_add(_s, "trap_block")
                                         continue
                                     _ok = False
                                     # Try both markets because later we may fall back FUTURES->SPOT
@@ -13946,7 +14122,7 @@ async def mid_status_summary_loop(self) -> None:
                                         _kept.append(_s)
                                     else:
                                         # remember for routing diagnostics
-                                        _rej_add(_s, "no_market_any")
+                                        _rej_add(_s, "candles_unavailable")
                                 symbols = _kept
                             except Exception:
                                 pass
@@ -14008,45 +14184,34 @@ async def mid_status_summary_loop(self) -> None:
                         # can show a breakdown like: other=43{score_low=6,rr_low=3,...}
                         _rej_reasons_by_sym = defaultdict(list)  # sym -> [base_reason...]
 
-                        def _rej_add(_sym: str, _reason: str):
-                            """Record exactly one terminal reason per symbol per tick."""
+                        def _rej_add(_sym: str, _reason: str) -> None:
+                            """Record exactly one terminal reject reason per symbol per tick (MID registry keys)."""
                             if not _rej_enabled:
                                 return
                             try:
                                 if _sym in _rej_seen:
                                     return
                                 _rej_seen.add(_sym)
-                                _rej_reason_by_sym[_sym] = _reason
 
-                                # Also feed rolling reject digest for /health (best-effort).
-                                try:
-                                    _mid_reject_add(str(_reason or "unknown"))
-                                except Exception:
-                                    pass
-                                # Also collect normalized base reason for per-symbol aggregation.
-                                try:
-                                    _r = str(_reason or '').strip() or 'unknown'
-                                    _base = _r.split()[0] if _r else 'unknown'
-                                    for _sep in ('=', ':'):
-                                        if _sep in _base:
-                                            _base = _base.split(_sep, 1)[0]
-                                    _base = _base.strip() or 'unknown'
-                                    _map = {'score': 'score_low', 'rr': 'rr_low', 'confidence': 'confidence_low'}
-                                    _base = _map.get(_base, _base)
-                                    if len(_base) > 64:
-                                        _base = _base[:64]
-                                    _rej_reasons_by_sym[str(_sym)].append(_base)
-                                except Exception:
-                                    pass
-                                _rej_counts[_reason] = int(_rej_counts.get(_reason, 0) or 0) + 1
-                                lst = _rej_examples_map.get(_reason)
+                                key = mid_reject(_reason)
+
+                                _rej_reason_by_sym[_sym] = key
+                                _rej_counts[key] = int(_rej_counts.get(key, 0) or 0) + 1
+                                lst = _rej_examples_map.get(key)
                                 if lst is None:
                                     lst = []
-                                    _rej_examples_map[_reason] = lst
-                                if len(lst) < _rej_examples:
-                                    lst.append(_sym)
+                                    _rej_examples_map[key] = lst
+                                if len(lst) < _rej_examples_max:
+                                    lst.append(str(_sym))
+
+                                # Stage flow: this symbol ended in rejection
+                                _mid_stage_add("rejected", 1)
+
+                                # Rolling reject digest for /health
+                                _mid_reject_add(key)
                             except Exception:
-                                return
+                                pass
+
                         logger.info("[mid] tick start TOP_N=%s interval=%ss pool=%s scanned=%s (MID_TOP_N_SYMBOLS=%s)", top_n, interval, _mid_pool, _mid_scanned, top_n_symbols)
                         logger.info("[mid][scanner] symbols loaded: %s (pool=%s)", _mid_scanned, _mid_pool)
                         mac_act, mac_ev, mac_win = self.macro.current_action()
@@ -14089,6 +14254,7 @@ async def mid_status_summary_loop(self) -> None:
                         start_scan = time.time()
                         prefetch_elapsed = float(start_scan - start_total)
                         for sym in symbols:
+                            _mid_stage_add("scanned", 1)
                             # Hard budget per MID tick (prevents very long ticks during exchange issues)
                             if mid_tick_budget_sec and mid_tick_budget_sec > 0:
                                 if (time.time() - start_scan) > float(mid_tick_budget_sec):
@@ -14101,7 +14267,7 @@ async def mid_status_summary_loop(self) -> None:
                                     break
                             if is_blocked_symbol(sym):
                                 _mid_skip_blocked += 1
-                                _rej_add(sym, "blocked_symbol")
+                                _rej_add(sym, "trap_block")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "blocked_symbol")
                                 except Exception:
@@ -14109,7 +14275,7 @@ async def mid_status_summary_loop(self) -> None:
                                 continue
                             if not self.can_emit_mid(sym):
                                 _mid_skip_cooldown += 1
-                                _rej_add(sym, "cooldown")
+                                _rej_add(sym, "trap_block")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "cooldown")
                                 except Exception:
@@ -14118,7 +14284,7 @@ async def mid_status_summary_loop(self) -> None:
 
                             if MACRO_FILTER and mac_act == "PAUSE_ALL":
                                 _mid_skip_macro += 1
-                                _rej_add(sym, "macro_pause_all")
+                                _rej_add(sym, "trap_block")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "macro_pause_all")
                                 except Exception:
@@ -14129,7 +14295,7 @@ async def mid_status_summary_loop(self) -> None:
                                 news_act = await self.news.action_for_symbol(api.session, sym)
                                 if news_act == "PAUSE_ALL":
                                     _mid_skip_news += 1
-                                    _rej_add(sym, "news_pause_all")
+                                    _rej_add(sym, "trap_block")
                                     try:
                                         self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "news_pause_all")
                                     except Exception:
@@ -14307,7 +14473,7 @@ async def mid_status_summary_loop(self) -> None:
                             if not chosen_r:
                                 if found_ok_candles:
                                     # Candles were OK but no signal on any venue.
-                                    _rej_add(sym, "no_signal")
+                                    _rej_add(sym, "not_enough_data")
                                     try:
                                         _mid_no_signal += 1
                                         stages = list(_mid_no_signal_stages_by_sym.get(sym) or [])
@@ -14422,7 +14588,7 @@ async def mid_status_summary_loop(self) -> None:
                             if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
                                 _mid_f_align += 1
                                 if not structure_align_soft:
-                                    _rej_add(sym, "align_mismatch")
+                                    _rej_add(sym, "htf_misaligned")
                                     try:
                                         self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), "align_mismatch")
                                     except Exception:
@@ -14449,7 +14615,7 @@ async def mid_status_summary_loop(self) -> None:
 
                             if min_adx_30m and adx30 < min_adx_30m:
                                 _mid_f_adx += 1
-                                _rej_add(sym, "adx_30m")
+                                _rej_add(sym, "regime_block")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx30<{min_adx_30m:g} adx={adx30:g}")
                                 except Exception:
@@ -14457,7 +14623,7 @@ async def mid_status_summary_loop(self) -> None:
                                 continue
                             if min_adx_1h and adx1h < min_adx_1h:
                                 _mid_f_adx += 1
-                                _rej_add(sym, "adx_1h")
+                                _rej_add(sym, "regime_block")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx1h<{min_adx_1h:g} adx={adx1h:g}")
                                 except Exception:
@@ -14465,7 +14631,7 @@ async def mid_status_summary_loop(self) -> None:
                                 continue
                             if min_atr_pct and atrp < min_atr_pct:
                                 _mid_f_atr += 1
-                                _rej_add(sym, "atr_pct")
+                                _rej_add(sym, "volatility_block")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"atr_pct<{min_atr_pct:g} atr%={atrp:g}")
                                 except Exception:
@@ -14482,7 +14648,7 @@ async def mid_status_summary_loop(self) -> None:
                             min_conf = min_score_fut if market == "FUTURES" else min_score_spot
                             if conf < float(min_conf):
                                 _mid_f_score += 1
-                                _rej_add(sym, "score")
+                                _rej_add(sym, "score_low")
                                 try:
                                     _mid_ta_score_low += 1
                                     _missing = float(min_conf) - float(conf)
@@ -14499,7 +14665,7 @@ async def mid_status_summary_loop(self) -> None:
                                 continue
                             if rr < float(min_rr):
                                 _mid_f_rr += 1
-                                _rej_add(sym, "rr")
+                                _rej_add(sym, "score_low")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"rr<{float(min_rr):g} rr={rr:g}")
                                 except Exception:
@@ -14514,7 +14680,7 @@ async def mid_status_summary_loop(self) -> None:
                             volx = float(base_r.get("rel_vol", 0.0) or 0.0)
                             if mid_min_vol_x and volx < mid_min_vol_x:
                                 _mid_f_score += 1
-                                _rej_add(sym, "vol_x")
+                                _rej_add(sym, "volatility_block")
                                 try:
                                     self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"vol_x<{mid_min_vol_x:g} vol_x={volx:g}")
                                 except Exception:
@@ -14528,7 +14694,7 @@ async def mid_status_summary_loop(self) -> None:
                                 if mid_require_vwap_bias:
                                     if direction == "SHORT" and not (entry < vwap_val_num):
                                         _mid_f_align += 1
-                                        _rej_add(sym, "vwap_bias")
+                                        _rej_add(sym, "vwap_dist")
                                         try:
                                             self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_short entry>=vwap vwap={vwap_val_num:g}")
                                         except Exception:
@@ -14536,7 +14702,7 @@ async def mid_status_summary_loop(self) -> None:
                                         continue
                                     if direction == "LONG" and not (entry > vwap_val_num):
                                         _mid_f_align += 1
-                                        _rej_add(sym, "vwap_bias")
+                                        _rej_add(sym, "vwap_dist")
                                         try:
                                             self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_long entry<=vwap vwap={vwap_val_num:g}")
                                         except Exception:
@@ -14545,7 +14711,7 @@ async def mid_status_summary_loop(self) -> None:
                                 if mid_min_vwap_dist_atr > 0:
                                     if abs(entry - vwap_val_num) < (atr30 * mid_min_vwap_dist_atr):
                                         _mid_f_atr += 1
-                                        _rej_add(sym, "vwap_too_close")
+                                        _rej_add(sym, "vwap_dist")
                                         try:
                                             dist = abs(entry - vwap_val_num) / atr30 if atr30 else 0.0
                                             self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_far {dist:.2g}atr")
@@ -14560,7 +14726,7 @@ async def mid_status_summary_loop(self) -> None:
                                 try:
                                     if direction == "LONG" and not bool(base_r.get("sweep_long", False)):
                                         _mid_f_score += 1
-                                        _rej_add(sym, "liq_sweep_missing")
+                                        _rej_add(sym, "liquidity_fail")
                                         try:
                                             self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, "liq_sweep_missing_long")
                                         except Exception:
@@ -14568,7 +14734,7 @@ async def mid_status_summary_loop(self) -> None:
                                         continue
                                     if direction == "SHORT" and not bool(base_r.get("sweep_short", False)):
                                         _mid_f_score += 1
-                                        _rej_add(sym, "liq_sweep_missing")
+                                        _rej_add(sym, "liquidity_fail")
                                         try:
                                             self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, "liq_sweep_missing_short")
                                         except Exception:
@@ -14592,7 +14758,7 @@ async def mid_status_summary_loop(self) -> None:
                                 fut_forced_off = (not allow_futures) or (news_act == "FUTURES_OFF") or (mac_act == "FUTURES_OFF")
                                 if fut_forced_off:
                                     _mid_f_futoff += 1
-                                    _rej_add(sym, "futures_forced_off")
+                                    _rej_add(sym, "candles_unavailable")
                                     continue
                                 market = "FUTURES"
                                 if risk_note:
@@ -14638,11 +14804,11 @@ async def mid_status_summary_loop(self) -> None:
                                     _fut_ok = await asyncio.gather(_pair_exists("BINANCE"), _pair_exists("BYBIT"), _pair_exists("OKX"))
                                     if not any(bool(x) for x in _fut_ok):
                                         logger.info("[scanner] skip %s FUTURES: no contract on BINANCE/BYBIT/OKX (best_source=%s)", sym, best_name)
-                                        _rej_add(sym, "no_futures_contract")
+                                        _rej_add(sym, "candles_unavailable")
                                         continue
                                 except Exception as _e:
                                     logger.info("[scanner] skip %s FUTURES: futures existence check failed: %s", sym, _e)
-                                    _rej_add(sym, "futures_existence_check_failed")
+                                    _rej_add(sym, "candles_unavailable")
                                     continue
 
     # Exchanges where the instrument exists for the given market.
@@ -14703,16 +14869,17 @@ async def mid_status_summary_loop(self) -> None:
                                         }
                                         await self.add_mid_pending(rec)
                                         self.mark_mid_pending(sym, direction=direction, market=market)
-                                        _rej_add(sym, "pending_saved")
+                                        _mid_stage_add("passed_ta", 1)
+                                        _mid_stage_add("created_pending", 1)
                                         try:
                                             _mid_metrics_inc("setups_found", 1)
                                             _mid_metrics_inc("pending_created", 1)
                                         except Exception:
                                             pass
                                     else:
-                                        _rej_add(sym, "pending_cooldown")
+                                        _rej_add(sym, "pending_wait")
                                 except Exception:
-                                    _rej_add(sym, "pending_error")
+                                    _rej_add(sym, "not_enough_data")
                                 # do NOT emit now
                             else:
                                 self.mark_emitted_mid(sym, sig.direction, sig.market)
@@ -14721,6 +14888,8 @@ async def mid_status_summary_loop(self) -> None:
                                     self.last_spot_signal = sig
                                 else:
                                     self.last_futures_signal = sig
+                                _mid_stage_add("passed_ta", 1)
+                                _mid_stage_add("triggered", 1)
                                 await emit_signal_cb(sig)
                                 _mid_emitted += 1
                                 try:
@@ -14728,7 +14897,7 @@ async def mid_status_summary_loop(self) -> None:
                                 except Exception:
                                     pass
                                 await asyncio.sleep(2)
-                                _rej_add(sym, "emitted")
+                                _rej_add(sym, "trap_block")
                 except Exception:
                     logger.exception("[mid] scanner_loop_mid error")
 
