@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+MID_BUILD_TAG = \"MID_BUILD_2026-02-27_v6"
+
 import asyncio
 import json
 from collections import defaultdict
@@ -8,9 +10,6 @@ import os
 import re
 import time
 import contextvars
-
-# Build tag for deployment verification (helps detect stale Railway layers)
-MID_BUILD_TAG = os.getenv("MID_BUILD_TAG", "MID_BUILD_2026-02-26_v5")
 
 # =======================
 # SAFE ATR PICKER FOR SL
@@ -192,9 +191,6 @@ import random
 import re
 import time
 import contextvars
-
-# Build tag for deployment verification (helps detect stale Railway layers)
-MID_BUILD_TAG = os.getenv("MID_BUILD_TAG", "MID_BUILD_2026-02-26_v5")
 
 
 import datetime as dt
@@ -9922,13 +9918,17 @@ class PriceUnavailableError(Exception):
 
 class Backend:
     def __init__(self) -> None:
-        try:
-            logger.info(f"[mid] backend build tag: {MID_BUILD_TAG}")
-        except Exception:
-            pass
         self.feed = PriceFeed()
         self.news = NewsFilter()
         self.macro = MacroCalendar()
+
+        # Build tag (to verify Railway deployed the intended backend.py)
+        try:
+            if not getattr(self, '_mid_build_logged', False):
+                logger.info(f"[mid] backend build tag: {MID_BUILD_TAG}")
+                self._mid_build_logged = True
+        except Exception:
+            pass
 
         self._rest_limiter = _RestLimiter()
         self._price_cache = _AsyncPriceCache(ttl_sec=float(os.getenv("PRICE_CACHE_TTL_SEC", "2") or 2))
@@ -11703,16 +11703,6 @@ class Backend:
                             pass
                         await emit_signal_cb(sig)
                         _mid_emitted += 1
-                        try:
-                            st = getattr(self, "_mid_status", None)
-                            if not isinstance(st, dict):
-                                st = {}
-                                setattr(self, "_mid_status", st)
-                            st["setup_found_total"] = int(st.get("setup_found_total", 0) or 0) + 1
-                            st["last_tick_setups"] = int(st.get("last_tick_setups", 0) or 0) + 1
-                            st["last_tick_emitted"] = int(st.get("last_tick_emitted", 0) or 0) + 1
-                        except Exception:
-                            pass
                         await asyncio.sleep(2)
 
             except Exception:
@@ -11970,118 +11960,6 @@ async def remove_mid_pending(self, key: str) -> None:
     except Exception:
         pass
 
-
-async def mid_status_snapshot(self) -> dict:
-    """Return lightweight MID status for /health and periodic logs."""
-    try:
-        now = time.time()
-        # pending in KV
-        pending_items = []
-        try:
-            pending_items = await self._mid_pending_load()
-        except Exception:
-            pending_items = []
-        pending_count = len(pending_items) if isinstance(pending_items, list) else 0
-
-        st = getattr(self, "_mid_status", None)
-        if not isinstance(st, dict):
-            st = {}
-            setattr(self, "_mid_status", st)
-
-        def _iget(k: str, d=0):
-            try:
-                return st.get(k, d)
-            except Exception:
-                return d
-
-        last_tick_ts = float(_iget("last_tick_ts", 0.0) or 0.0)
-        last_tick_done_ts = float(_iget("last_tick_done_ts", 0.0) or 0.0)
-        started_ts = float(_iget("started_ts", 0.0) or 0.0)
-        try:
-            interval_sec = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45") or 45)
-        except Exception:
-            interval_sec = 45
-
-        # Task diagnostics (set in bot.py via backend._mid_scanner_task)
-        task_state = None
-        task_error = None
-        try:
-            t = getattr(self, "_mid_scanner_task", None)
-            if t is not None:
-                if t.cancelled():
-                    task_state = "CANCELLED"
-                elif t.done():
-                    task_state = "DONE"
-                    try:
-                        ex = t.exception()
-                        if ex is not None:
-                            task_error = f"{type(ex).__name__}: {ex}"
-                    except Exception:
-                        task_error = "exception_unavailable"
-                else:
-                    task_state = "RUNNING"
-        except Exception:
-            task_state = None
-
-        # Next tick estimate: if last tick never happened, base it on started_ts.
-        next_in = None
-        try:
-            if last_tick_ts:
-                next_in = max(0.0, float(interval_sec) - (now - float(last_tick_ts)))
-            elif started_ts:
-                next_in = max(0.0, float(interval_sec) - (now - float(started_ts)))
-        except Exception:
-            next_in = None
-
-        return {
-            "pending": pending_count,
-            "interval_sec": int(interval_sec),
-            "setup_found_total": int(_iget("setup_found_total", 0) or 0),
-            "pending_created_total": int(_iget("pending_created_total", 0) or 0),
-            "pending_triggered_total": int(_iget("pending_triggered_total", 0) or 0),
-            "pending_expired_total": int(_iget("pending_expired_total", 0) or 0),
-            "task_state": task_state,
-            "task_error": (str(task_error) if task_error else ""),
-            "last_tick_ts": last_tick_ts,
-            "last_tick_done_ts": last_tick_done_ts,
-            "last_tick_age_sec": (now - last_tick_ts) if last_tick_ts else None,
-            "next_tick_in_sec": (None if next_in is None else float(next_in)),
-            "last_tick_summary": str(_iget("last_tick_summary", "") or ""),
-            "last_tick_setups": int(_iget("last_tick_setups", 0) or 0),
-            "last_tick_pending_created": int(_iget("last_tick_pending_created", 0) or 0),
-            "last_tick_emitted": int(_iget("last_tick_emitted", 0) or 0),
-        }
-    except Exception:
-        return {"pending": 0}
-
-async def mid_status_summary_loop(self) -> None:
-    """Logs MID status once per minute to explain 'why signals are few'."""
-    try:
-        every = int(os.getenv("MID_STATUS_SUMMARY_EVERY_SEC", "60") or 60)
-    except Exception:
-        every = 60
-    if every <= 0:
-        return
-    logger.info("[mid][status] summary loop enabled every=%ss", every)
-    while True:
-        await asyncio.sleep(every)
-        try:
-            snap = await self.mid_status_snapshot()
-            logger.info(
-                "[mid][status] task=%s pending=%s setup_found=%s created=%s triggered=%s expired=%s last_tick_age=%s next_tick_in=%s%s",
-                snap.get("task_state"),
-                snap.get("pending"),
-                snap.get("setup_found_total"),
-                snap.get("pending_created_total"),
-                snap.get("pending_triggered_total"),
-                snap.get("pending_expired_total"),
-                (None if snap.get("last_tick_age_sec") is None else int(float(snap.get("last_tick_age_sec") or 0))),
-                (None if snap.get("next_tick_in_sec") is None else int(float(snap.get("next_tick_in_sec") or 0))),
-                ("" if not (snap.get("task_error") or "").strip() else f" err={snap.get('task_error')}")
-            )
-        except Exception:
-            logger.exception("[mid][status] summary loop error")
-
 async def mid_pending_trigger_loop(self, emit_signal_cb):
     """Background loop: checks pending setups and emits a signal only when price reaches entry and TA is still confirmed."""
     enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
@@ -12094,12 +11972,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
     logger.info("[mid][pending] trigger loop started poll=%.2fs ttl=%.1fmin tol_atr=%.3f tol_pct=%.4f",
                 poll, ttl_min, tol_atr, tol_pct)
-
-    # status counters
-    st = getattr(self, "_mid_status", None)
-    if not isinstance(st, dict):
-        st = {}
-        setattr(self, "_mid_status", st)
 
     while True:
         try:
@@ -12118,10 +11990,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         continue
                     # expire
                     if (now - created) > ttl_min * 60:
-                        try:
-                            st["pending_expired_total"] = int(st.get("pending_expired_total", 0) or 0) + 1
-                        except Exception:
-                            pass
                         continue
 
                     # load candles (also gives fallback price)
@@ -12248,10 +12116,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     await emit_signal_cb(sig)
                     logger.info("[mid][pending] EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, entry, float(price), tol)
-                    try:
-                        st["pending_triggered_total"] = int(st.get("pending_triggered_total", 0) or 0) + 1
-                    except Exception:
-                        pass
                     # emitted: do not keep
                 except Exception:
                     keep.append(it)
@@ -12345,17 +12209,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
     async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
         tf_trigger, tf_mid, tf_trend = "5m", "30m", "1h"
 
-        # Initialize MID status dict early so /health and status logs can
-        # distinguish "not started yet" vs "crashed".
-        try:
-            st = getattr(self, "_mid_status", None)
-            if not isinstance(st, dict):
-                st = {}
-                setattr(self, "_mid_status", st)
-            st.setdefault("started_ts", time.time())
-        except Exception:
-            pass
-
         # --- MID candles market selection ---
         # IMPORTANT (production hardening):
         # User requested: "свечи берем только из SPOT и эти свечи для FUTURES тоже используем".
@@ -12386,21 +12239,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             async def _mid_tick_body():
                 start_total = time.time()
                 start = start_total
-                # MID status tracking (for /health + logs)
-                st = getattr(self, "_mid_status", None)
-                if not isinstance(st, dict):
-                    st = {}
-                    setattr(self, "_mid_status", st)
-                st["last_tick_ts"] = start_total
-                # reset per-tick counters
-                st["last_tick_setups"] = 0
-                st["last_tick_pending_created"] = 0
-                st["last_tick_emitted"] = 0
-                st["last_tick_summary"] = ""
-                try:
-                    logger.info("[mid] tick start interval=%ss", int(interval_sec))
-                except Exception:
-                    pass
                 start_scan = start_total
                 prefetch_elapsed = 0.0
                 # --- Candles diagnostics (per tick) ---
@@ -14518,17 +14356,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                         }
                                         await self.add_mid_pending(rec)
                                         self.mark_mid_pending(sym, direction=direction, market=market)
-                                        try:
-                                            st = getattr(self, "_mid_status", None)
-                                            if not isinstance(st, dict):
-                                                st = {}
-                                                setattr(self, "_mid_status", st)
-                                            st["setup_found_total"] = int(st.get("setup_found_total", 0) or 0) + 1
-                                            st["pending_created_total"] = int(st.get("pending_created_total", 0) or 0) + 1
-                                            st["last_tick_setups"] = int(st.get("last_tick_setups", 0) or 0) + 1
-                                            st["last_tick_pending_created"] = int(st.get("last_tick_pending_created", 0) or 0) + 1
-                                        except Exception:
-                                            pass
                                         _rej_add(sym, "pending_saved")
                                     else:
                                         _rej_add(sym, "pending_cooldown")
@@ -14725,15 +14552,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         _mid_set_last_summary(summary)
                     except Exception:
                         pass
-                    try:
-                        st = getattr(self, "_mid_status", None)
-                        if not isinstance(st, dict):
-                            st = {}
-                            setattr(self, "_mid_status", st)
-                        st["last_tick_summary"] = str(summary)
-                        st["last_tick_done_ts"] = time.time()
-                    except Exception:
-                        pass
                 except Exception:
                     pass
                 return elapsed
@@ -14748,15 +14566,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 logger.warning("[mid][summary] %s; skipped (set MID_TICK_TIMEOUT_SEC=0 to disable)", summary)
                 try:
                     _mid_set_last_summary(summary)
-                except Exception:
-                    pass
-                try:
-                    st = getattr(self, "_mid_status", None)
-                    if not isinstance(st, dict):
-                        st = {}
-                        setattr(self, "_mid_status", st)
-                    st["last_tick_summary"] = str(summary)
-                    st["last_tick_done_ts"] = time.time()
                 except Exception:
                     pass
                 tick_elapsed = None
@@ -17085,33 +16894,13 @@ except Exception:
 try:
     if not hasattr(Backend, "scanner_loop_mid"):
         async def _missing_scanner_loop_mid(self, *args, **kwargs):
-            # Do not hard-crash the whole process; record status and exit.
-            try:
-                st = getattr(self, '_mid_status', None)
-                if not isinstance(st, dict):
-                    st = {}
-                    setattr(self, '_mid_status', st)
-                st['task_error'] = 'missing_scanner_loop_mid_impl'
-                st['task_state'] = 'DONE'
-            except Exception:
-                pass
-            try:
-                logger.error('[mid] scanner_loop_mid missing: MID_SCANNER_ENABLED=1 but backend.py has no implementation')
-            except Exception:
-                pass
-            return
+            raise RuntimeError(
+                "Backend.scanner_loop_mid is missing. This build is inconsistent: "
+                "MID_SCANNER_ENABLED=1 requires MID scanner implementation. "
+                "Redeploy ensuring updated backend.py is used."
+            )
 
         Backend.scanner_loop_mid = _missing_scanner_loop_mid  # type: ignore[attr-defined]
-except Exception:
-    pass
-
-
-# --- MID backend feature diagnostics (startup) ---
-try:
-    _has_mid = hasattr(Backend, 'scanner_loop_mid')
-    _fn = getattr(Backend, 'scanner_loop_mid', None)
-    _fn_name = getattr(_fn, '__name__', None)
-    logger.info('[mid] backend feature scanner_loop_mid=%s fn=%s', _has_mid, _fn_name)
 except Exception:
     pass
 
@@ -17128,8 +16917,6 @@ try:
         'add_mid_pending': globals().get('add_mid_pending'),
         'remove_mid_pending': globals().get('remove_mid_pending'),
         'mid_pending_trigger_loop': globals().get('mid_pending_trigger_loop'),
-        'mid_status_snapshot': globals().get('mid_status_snapshot'),
-        'mid_status_summary_loop': globals().get('mid_status_summary_loop'),
     }
     for _name, _fn in list(_mid_bind.items()):
         if callable(_fn) and (not hasattr(Backend, _name)):
