@@ -5519,7 +5519,19 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         #   MID_PENDING_SKIP_HARDBLOCKS=1   (default)
         _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
         _pending_skip_hb = os.getenv("MID_PENDING_SKIP_HARDBLOCKS", "1").strip().lower() not in ("0", "false", "no", "off")
-        _skip_late_vwap_blocks = bool(_pending_enabled and _pending_skip_hb)
+        # When user wants *all* filters only after setup, we skip all hardblocks during the SCAN phase.
+        # On TRIGGER phase we must enforce the filters again.
+        _phase = "scan"
+        try:
+            _phase = str(_MID_EVAL_PHASE.get() or "scan")
+        except Exception:
+            _phase = "scan"
+        _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
+        if _pending_enabled and _postsetup_only and _phase == "scan":
+            return None
+
+        # Skip only late-entry/vwap-distance blocks during SCAN when pending mode is enabled.
+        _skip_late_vwap_blocks = bool((_phase == "scan") and _pending_enabled and _pending_skip_hb)
 
         # ULTRA SAFE: tighten filters dynamically for near-zero SL preference
         late_entry_max = MID_ULTRA_LATE_ENTRY_ATR_MAX if MID_ULTRA_SAFE else MID_LATE_ENTRY_ATR_MAX
@@ -12391,7 +12403,19 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             continue
 
                     # re-confirm TA at trigger moment
-                    ta = evaluate_on_exchange_mid_v2(df5, df30, df1h)
+                    _ph_tok = None
+                    try:
+                        _ph_tok = _MID_EVAL_PHASE.set('trigger')
+                    except Exception:
+                        _ph_tok = None
+                    try:
+                        ta = evaluate_on_exchange_mid_v2(df5, df30, df1h)
+                    finally:
+                        try:
+                            if _ph_tok is not None:
+                                _MID_EVAL_PHASE.reset(_ph_tok)
+                        except Exception:
+                            pass
                     if not ta:
                         keep.append(it)
                         any_wait = True
@@ -12410,6 +12434,64 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         keep.append(it)
                         any_wait = True
                         continue
+
+                    # If scan stage skipped hard filters (MID_FILTERS_AFTER_SETUP=1),
+                    # apply the same filters here at trigger moment.
+                    postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
+                    if postsetup_only:
+                        try:
+                            # RR filter
+                            min_rr = float(os.getenv("MID_MIN_RR", "0") or 0)
+                            rr = float(ta.get("rr") or 0.0)
+                            if min_rr and rr < min_rr:
+                                keep.append(it); any_wait = True
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            # Volume filter
+                            mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or 0)
+                            volx = float(ta.get("rel_vol") or 0.0)
+                            if mid_min_vol_x and volx < mid_min_vol_x:
+                                keep.append(it); any_wait = True
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            # VWAP bias + min distance (avoid chop)
+                            mid_require_vwap_bias = os.getenv("MID_REQUIRE_VWAP_SIDE", "0").strip().lower() in ("1","true","yes","on")
+                            mid_min_vwap_dist_atr = float(os.getenv("MID_MIN_VWAP_DIST_ATR", "0") or 0)
+                            direction_u = str(direction).upper()
+                            entry_check = float(ta.get("entry") or entry0)
+                            vwap_val = float(ta.get("vwap_val") or 0.0)
+                            atrp = float(ta.get("atr_pct") or 0.0)
+                            atr30 = abs(entry_check) * (abs(atrp) / 100.0) if (entry_check and atrp) else float(atr_abs or 0.0)
+                            if vwap_val > 0 and atr30 and atr30 > 0:
+                                if mid_require_vwap_bias:
+                                    if direction_u == "SHORT" and not (entry_check < vwap_val):
+                                        keep.append(it); any_wait = True
+                                        continue
+                                    if direction_u == "LONG" and not (entry_check > vwap_val):
+                                        keep.append(it); any_wait = True
+                                        continue
+                                if mid_min_vwap_dist_atr > 0:
+                                    if abs(entry_check - vwap_val) < (atr30 * mid_min_vwap_dist_atr):
+                                        keep.append(it); any_wait = True
+                                        continue
+                        except Exception:
+                            pass
+                        try:
+                            # Liquidity sweep requirement
+                            req = os.getenv("MID_REQUIRE_LIQ_SWEEP", "0").strip().lower() in ("1","true","yes","on")
+                            if req:
+                                if str(direction).upper() == "LONG" and not bool(ta.get("sweep_long", False)):
+                                    keep.append(it); any_wait = True
+                                    continue
+                                if str(direction).upper() == "SHORT" and not bool(ta.get("sweep_short", False)):
+                                    keep.append(it); any_wait = True
+                                    continue
+                        except Exception:
+                            pass
 
                     # Emit final signal
                     entry = float(ta.get("entry") or entry0)
@@ -14448,7 +14530,20 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         # Candles are available (non-empty + enough bars) on this venue.
                                         found_ok_candles = True
                                         _diag = {}
-                                        r = evaluate_on_exchange_mid(a, b, c, symbol=sym, diag=_diag, market=mkt_u)
+                                        # SCAN phase: build setups (pending) and optionally skip hardblocks
+                                        _ph_tok = None
+                                        try:
+                                            _ph_tok = _MID_EVAL_PHASE.set('scan')
+                                        except Exception:
+                                            _ph_tok = None
+                                        try:
+                                            r = evaluate_on_exchange_mid(a, b, c, symbol=sym, diag=_diag, market=mkt_u)
+                                        finally:
+                                            try:
+                                                if _ph_tok is not None:
+                                                    _MID_EVAL_PHASE.reset(_ph_tok)
+                                            except Exception:
+                                                pass
                                         if not r:
                                             try:
                                                 _st = str(_diag.get("fail_stage") or "other")
@@ -14599,8 +14694,13 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
 
                         best_name, best_r = chosen_name, chosen_r
                         base_r = best_r
+                        # Mode switch: create setups first, apply filters later at trigger.
+                        pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+                        postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
                         # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
-                        if base_r.get("trap_ok") is False or base_r.get("blocked") is True:
+                        # If user wants filters only after setup (pending/trigger model),
+                        # do NOT reject setups during scan due to trap/block flags.
+                        if (base_r.get("trap_ok") is False or base_r.get("blocked") is True) and not (pending_enabled and postsetup_only):
                             _mid_skip_trap += 1
 
                             _rej_add(sym, str(base_r.get("trap_reason") or base_r.get("block_reason") or "trap_block"))
@@ -14690,7 +14790,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"score<{float(min_conf):g} score={conf:g}")
                             except Exception:
                                 pass
-                            continue
+                            if not (pending_enabled and postsetup_only):
+                                continue
                         if rr < float(min_rr):
                             _mid_f_rr += 1
                             _rej_add(sym, "score_low")
@@ -14698,7 +14799,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"rr<{float(min_rr):g} rr={rr:g}")
                             except Exception:
                                 pass
-                            continue
+                            if not (pending_enabled and postsetup_only):
+                                continue
 
                         direction = str(base_r.get("direction","")).upper()
                         entry = float(base_r["entry"]); sl = float(base_r["sl"])
@@ -14713,7 +14815,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"vol_x<{mid_min_vol_x:g} vol_x={volx:g}")
                             except Exception:
                                 pass
-                            continue
+                            if not (pending_enabled and postsetup_only):
+                                continue
 
                         # 2) Must be on the correct side of VWAP + far enough from VWAP (avoid chop)
                         vwap_val_num = float(base_r.get("vwap_val", 0.0) or 0.0)
@@ -14727,7 +14830,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_short entry>=vwap vwap={vwap_val_num:g}")
                                     except Exception:
                                         pass
-                                    continue
+                                    if not (pending_enabled and postsetup_only):
+                                        continue
                                 if direction == "LONG" and not (entry > vwap_val_num):
                                     _mid_f_align += 1
                                     _rej_add(sym, "vwap_dist")
@@ -14735,7 +14839,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_long entry<=vwap vwap={vwap_val_num:g}")
                                     except Exception:
                                         pass
-                                    continue
+                                    if not (pending_enabled and postsetup_only):
+                                        continue
                             if mid_min_vwap_dist_atr > 0:
                                 if abs(entry - vwap_val_num) < (atr30 * mid_min_vwap_dist_atr):
                                     _mid_f_atr += 1
@@ -14745,7 +14850,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_far {dist:.2g}atr")
                                     except Exception:
                                         pass
-                                    continue
+                                    if not (pending_enabled and postsetup_only):
+                                        continue
 
 
 
@@ -14759,7 +14865,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, "liq_sweep_missing_long")
                                     except Exception:
                                         pass
-                                    continue
+                                    if not (pending_enabled and postsetup_only):
+                                        continue
                                 if direction == "SHORT" and not bool(base_r.get("sweep_short", False)):
                                     _mid_f_score += 1
                                     _rej_add(sym, "liquidity_fail")
@@ -14767,7 +14874,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, "liq_sweep_missing_short")
                                     except Exception:
                                         pass
-                                    continue
+                                    if not (pending_enabled and postsetup_only):
+                                        continue
                             except Exception:
                                 pass
                         if tp_policy == "R":
