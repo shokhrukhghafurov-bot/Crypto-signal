@@ -718,9 +718,10 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
         # MID pending-entry trigger loop (emit only when price reaches entry + TA reconfirmed)
         try:
             if os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off"):
-                if hasattr(backend, "mid_pending_trigger_loop"):
+                _pending_fn = getattr(backend, "mid_pending_trigger_loop", None)
+                if callable(_pending_fn):
                     TASKS["mid-pending"] = asyncio.create_task(
-                        backend.mid_pending_trigger_loop(broadcast_signal),
+                        _pending_fn(broadcast_signal),
                         name="mid-pending",
                     )
                     _health_mark_ok("mid-pending")
