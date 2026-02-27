@@ -12718,612 +12718,532 @@ async def mid_status_summary_loop(self) -> None:
 
 
 
-    async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
-        tf_trigger, tf_mid, tf_trend = "5m", "30m", "1h"
+async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
+    tf_trigger, tf_mid, tf_trend = "5m", "30m", "1h"
 
-        # --- MID candles market selection ---
-        # IMPORTANT (production hardening):
-        # User requested: "свечи берем только из SPOT и эти свечи для FUTURES тоже используем".
-        # We force MID candles to be fetched from SPOT only.
-        # (Signals can still be FUTURES — we just use SPOT klines for TA.)
-        market_mode = (os.getenv('MID_CANDLES_MARKET_MODE', 'AUTO') or 'AUTO').upper().strip()
-        allow_fut = str(os.getenv('MID_ALLOW_FUTURES', '0') or '0').strip().lower() not in ('0','false','no','off')
-        if market_mode == 'AUTO':
-            markets_try = ['FUTURES','SPOT'] if allow_fut else ['SPOT']
-        elif market_mode in ('FUTURES','SWAP','PERP','PERPS'):
-            markets_try = ['FUTURES']
-        else:
-            markets_try = ['SPOT']
-        # default/primary market used for prefetch
-        market_mid = markets_try[0] if markets_try else 'SPOT'
+    # --- MID candles market selection ---
+    # IMPORTANT (production hardening):
+    # User requested: "свечи берем только из SPOT и эти свечи для FUTURES тоже используем".
+    # We force MID candles to be fetched from SPOT only.
+    # (Signals can still be FUTURES — we just use SPOT klines for TA.)
+    market_mode = (os.getenv('MID_CANDLES_MARKET_MODE', 'AUTO') or 'AUTO').upper().strip()
+    allow_fut = str(os.getenv('MID_ALLOW_FUTURES', '0') or '0').strip().lower() not in ('0','false','no','off')
+    if market_mode == 'AUTO':
+        markets_try = ['FUTURES','SPOT'] if allow_fut else ['SPOT']
+    elif market_mode in ('FUTURES','SWAP','PERP','PERPS'):
+        markets_try = ['FUTURES']
+    else:
+        markets_try = ['SPOT']
+    # default/primary market used for prefetch
+    market_mid = markets_try[0] if markets_try else 'SPOT'
 
-        # Hard timeout for a whole MID tick (prevents 200s+ overruns).
-        # 0 = disabled.
-        mid_tick_timeout_sec = _parse_seconds_env('MID_TICK_TIMEOUT_SEC', 0.0)
+    # Hard timeout for a whole MID tick (prevents 200s+ overruns).
+    # 0 = disabled.
+    mid_tick_timeout_sec = _parse_seconds_env('MID_TICK_TIMEOUT_SEC', 0.0)
 
-        # Soft timeout per symbol (skips symbols whose data fetch is too slow).
-        # 0 = disabled.
-        mid_symbol_timeout_sec = _parse_seconds_env('MID_SYMBOL_TIMEOUT_SEC', 8.0)
-        mid_tick_budget_sec = _parse_seconds_env('MID_TICK_BUDGET_SEC', 35.0)
+    # Soft timeout per symbol (skips symbols whose data fetch is too slow).
+    # 0 = disabled.
+    mid_symbol_timeout_sec = _parse_seconds_env('MID_SYMBOL_TIMEOUT_SEC', 8.0)
+    mid_tick_budget_sec = _parse_seconds_env('MID_TICK_BUDGET_SEC', 35.0)
 
-        while True:
-            interval_sec = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45") or 45)
-            async def _mid_tick_body():
-                start_total = time.time()
-                start = start_total
-                start_scan = start_total
-                prefetch_elapsed = 0.0
-                # Reset per-tick hard-block buckets so /health can show "what filters cut" for the last tick.
-                try:
-                    _mid_hardblock_reset_tick()
-                except Exception:
-                    pass
-                # --- Candles diagnostics (per tick) ---
-                _mid_diag_enabled = str(os.getenv('MID_CANDLES_LOG_DIAG', os.getenv('MID_CANDLES_LOG_FAIL', '1')) or '1').strip().lower() not in ('0','false','no','off')
-                _mid_diag_max = int(os.getenv('MID_CANDLES_DIAG_MAX', '200') or 200)
-                _mid_diag_lines = 0
-                _mid_candles_diag = defaultdict(list)  # (symbol, tf) -> ["EX:MARKET:STATUS(:reason)", ...]
-                _mid_candles_diag_seen = defaultdict(set)  # (symbol, tf) -> {rec,...} (dedupe per tick)
+    while True:
+        interval_sec = int(os.getenv("MID_SCAN_INTERVAL_SECONDS", "45") or 45)
+        async def _mid_tick_body():
+            start_total = time.time()
+            start = start_total
+            start_scan = start_total
+            prefetch_elapsed = 0.0
+            # Reset per-tick hard-block buckets so /health can show "what filters cut" for the last tick.
+            try:
+                _mid_hardblock_reset_tick()
+            except Exception:
+                pass
+            # --- Candles diagnostics (per tick) ---
+            _mid_diag_enabled = str(os.getenv('MID_CANDLES_LOG_DIAG', os.getenv('MID_CANDLES_LOG_FAIL', '1')) or '1').strip().lower() not in ('0','false','no','off')
+            _mid_diag_max = int(os.getenv('MID_CANDLES_DIAG_MAX', '200') or 200)
+            _mid_diag_lines = 0
+            _mid_candles_diag = defaultdict(list)  # (symbol, tf) -> ["EX:MARKET:STATUS(:reason)", ...]
+            _mid_candles_diag_seen = defaultdict(set)  # (symbol, tf) -> {rec,...} (dedupe per tick)
 
-                _mid_log_candles_short = os.getenv("MID_LOG_CANDLES_SHORT", "1").strip().lower() in ("1","true","yes","on")
-                _mid_candles_short_seen = set()  # {(symbol, tf)} per tick
-                # Prefill logs are very noisy in production. Default OFF.
-                # Enable explicitly via MID_LOG_PREFILL=1 when debugging.
-                _mid_log_prefill = os.getenv("MID_LOG_PREFILL", "0").strip().lower() in ("1","true","yes","on")
-                # If you still want to see successful prefill lines, enable MID_LOG_PREFILL_OK=1.
-                _mid_log_prefill_ok = os.getenv("MID_LOG_PREFILL_OK", "0").strip().lower() in ("1","true","yes","on")
+            _mid_log_candles_short = os.getenv("MID_LOG_CANDLES_SHORT", "1").strip().lower() in ("1","true","yes","on")
+            _mid_candles_short_seen = set()  # {(symbol, tf)} per tick
+            # Prefill logs are very noisy in production. Default OFF.
+            # Enable explicitly via MID_LOG_PREFILL=1 when debugging.
+            _mid_log_prefill = os.getenv("MID_LOG_PREFILL", "0").strip().lower() in ("1","true","yes","on")
+            # If you still want to see successful prefill lines, enable MID_LOG_PREFILL_OK=1.
+            _mid_log_prefill_ok = os.getenv("MID_LOG_PREFILL_OK", "0").strip().lower() in ("1","true","yes","on")
 
-                # --- Candles REST hardening (semaphore + retry + circuit breaker) ---
-                try:
-                    _mid_sem_max = int(os.getenv("MID_CANDLES_SEMAPHORE", os.getenv("CANDLES_SEMAPHORE_MAX", "18")) or 18)
-                    _mid_sem_max = max(1, min(80, _mid_sem_max))
-                except Exception:
-                    _mid_sem_max = 18
-                try:
-                    _mid_sem = getattr(self, "_mid_candles_sem", None)
-                    if _mid_sem is None or getattr(_mid_sem, "_value", None) is None:
-                        _mid_sem = asyncio.Semaphore(_mid_sem_max)
-                        setattr(self, "_mid_candles_sem", _mid_sem)
-                except Exception:
-                    _mid_sem = None
+            # --- Candles REST hardening (semaphore + retry + circuit breaker) ---
+            try:
+                _mid_sem_max = int(os.getenv("MID_CANDLES_SEMAPHORE", os.getenv("CANDLES_SEMAPHORE_MAX", "18")) or 18)
+                _mid_sem_max = max(1, min(80, _mid_sem_max))
+            except Exception:
+                _mid_sem_max = 18
+            try:
+                _mid_sem = getattr(self, "_mid_candles_sem", None)
+                if _mid_sem is None or getattr(_mid_sem, "_value", None) is None:
+                    _mid_sem = asyncio.Semaphore(_mid_sem_max)
+                    setattr(self, "_mid_candles_sem", _mid_sem)
+            except Exception:
+                _mid_sem = None
 
-                try:
-                    _mid_ex_health = getattr(self, "_mid_candles_ex_health", None)
-                    if _mid_ex_health is None:
-                        _mid_ex_health = {}
-                        setattr(self, "_mid_candles_ex_health", _mid_ex_health)
-                except Exception:
+            try:
+                _mid_ex_health = getattr(self, "_mid_candles_ex_health", None)
+                if _mid_ex_health is None:
                     _mid_ex_health = {}
+                    setattr(self, "_mid_candles_ex_health", _mid_ex_health)
+            except Exception:
+                _mid_ex_health = {}
 
-                def _mid_health_get(ex: str, mkt: str) -> dict:
-                    k = (str(ex).upper(), str(mkt).upper())
-                    d = _mid_ex_health.get(k)
-                    if not isinstance(d, dict):
-                        d = {"score": 0.5, "fail_streak": 0, "cooldown_until": 0.0, "last": 0.0}
-                        _mid_ex_health[k] = d
-                    return d
+            def _mid_health_get(ex: str, mkt: str) -> dict:
+                k = (str(ex).upper(), str(mkt).upper())
+                d = _mid_ex_health.get(k)
+                if not isinstance(d, dict):
+                    d = {"score": 0.5, "fail_streak": 0, "cooldown_until": 0.0, "last": 0.0}
+                    _mid_ex_health[k] = d
+                return d
 
-                def _mid_is_transient_exc(e: Exception) -> bool:
+            def _mid_is_transient_exc(e: Exception) -> bool:
+                try:
+                    s = (str(e) or "").lower()
+                except Exception:
+                    s = ""
+                return any(x in s for x in (
+                    "timeout", "timed out", "temporarily", "try again", "429", "too many", "rate", "limit",
+                    "bad gateway", "gateway", "service unavailable", "502", "503", "504",
+                    "connection", "reset", "refused", "unreachable", "dns"
+                ))
+
+            async def _mid_call_with_retry(fn):
+                max_tries = int(os.getenv("MID_CANDLES_RETRY", os.getenv("CANDLES_RETRY", "2")) or 2)
+                max_tries = max(1, min(3, max_tries))
+                base = float(os.getenv("MID_CANDLES_RETRY_BACKOFF_SEC", os.getenv("CANDLES_RETRY_BACKOFF_SEC", "0.35")) or 0.35)
+                base = max(0.05, min(2.0, base))
+                for attempt in range(1, max_tries + 1):
                     try:
-                        s = (str(e) or "").lower()
-                    except Exception:
-                        s = ""
-                    return any(x in s for x in (
-                        "timeout", "timed out", "temporarily", "try again", "429", "too many", "rate", "limit",
-                        "bad gateway", "gateway", "service unavailable", "502", "503", "504",
-                        "connection", "reset", "refused", "unreachable", "dns"
-                    ))
-
-                async def _mid_call_with_retry(fn):
-                    max_tries = int(os.getenv("MID_CANDLES_RETRY", os.getenv("CANDLES_RETRY", "2")) or 2)
-                    max_tries = max(1, min(3, max_tries))
-                    base = float(os.getenv("MID_CANDLES_RETRY_BACKOFF_SEC", os.getenv("CANDLES_RETRY_BACKOFF_SEC", "0.35")) or 0.35)
-                    base = max(0.05, min(2.0, base))
-                    for attempt in range(1, max_tries + 1):
+                        return await fn()
+                    except Exception as e:
+                        if attempt >= max_tries or (not _mid_is_transient_exc(e)):
+                            raise
                         try:
-                            return await fn()
-                        except Exception as e:
-                            if attempt >= max_tries or (not _mid_is_transient_exc(e)):
-                                raise
-                            try:
-                                jitter = (0.15 * base) * (0.5 + (time.time() % 1.0))
-                            except Exception:
-                                jitter = 0.0
-                            await asyncio.sleep(base * (2 ** (attempt - 1)) + jitter)
-
-                def _mid_diag_add(symb: str, ex_name: str, market: str, tf: str, status: str, reason: str = '') -> None:
-                    nonlocal _mid_diag_lines
-                    try:
-                        key = (symb, tf)
-                        rec = f"{ex_name}:{(market or 'SPOT').upper().strip()}:{status}" + (f":{reason}" if reason else '')
-                        # Dedupe per tick: prevents storms like unsupported_cached repeated many times in diag.
-                        if rec in _mid_candles_diag_seen[key]:
-                            return
-                        _mid_candles_diag_seen[key].add(rec)
-                        _mid_candles_diag[key].append(rec)
-                        # Optional: log once per symbol/tf when candles are present but too short for indicators.
-                        try:
-                            if status == "partial" and _mid_log_candles_short and os.getenv("MID_LOG_CANDLES_SHORT_EARLY", "0").strip().lower() in ("1","true","yes","on"):
-                                k2 = (symb, tf)
-                                if k2 not in _mid_candles_short_seen:
-                                    _mid_candles_short_seen.add(k2)
-                                    logger.info("[mid][candles_short] symbol=%s tf=%s ex=%s market=%s %s", symb, tf, ex_name, (market or "SPOT"), reason)
+                            jitter = (0.15 * base) * (0.5 + (time.time() % 1.0))
                         except Exception:
-                            pass
-                        if _mid_diag_enabled and _mid_diag_lines < _mid_diag_max and status != 'OK':
-                            # Collect diagnostics; actual logging happens once per symbol when candles are finally unavailable.
-                            _mid_diag_lines += 1
+                            jitter = 0.0
+                        await asyncio.sleep(base * (2 ** (attempt - 1)) + jitter)
+
+            def _mid_diag_add(symb: str, ex_name: str, market: str, tf: str, status: str, reason: str = '') -> None:
+                nonlocal _mid_diag_lines
+                try:
+                    key = (symb, tf)
+                    rec = f"{ex_name}:{(market or 'SPOT').upper().strip()}:{status}" + (f":{reason}" if reason else '')
+                    # Dedupe per tick: prevents storms like unsupported_cached repeated many times in diag.
+                    if rec in _mid_candles_diag_seen[key]:
+                        return
+                    _mid_candles_diag_seen[key].add(rec)
+                    _mid_candles_diag[key].append(rec)
+                    # Optional: log once per symbol/tf when candles are present but too short for indicators.
+                    try:
+                        if status == "partial" and _mid_log_candles_short and os.getenv("MID_LOG_CANDLES_SHORT_EARLY", "0").strip().lower() in ("1","true","yes","on"):
+                            k2 = (symb, tf)
+                            if k2 not in _mid_candles_short_seen:
+                                _mid_candles_short_seen.add(k2)
+                                logger.info("[mid][candles_short] symbol=%s tf=%s ex=%s market=%s %s", symb, tf, ex_name, (market or "SPOT"), reason)
                     except Exception:
                         pass
-
-                if os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() in ("0","false","no"):
-                    await asyncio.sleep(10)
-                    return
-
-                # Tick-local log guard
-                _MID_TICK_CTX.set({
-                    'block': set(),
-                    'trap': set(),
-                    'candles_missing': set(),
-                    'candles_missing_sym': set(),
-                    'prefill_skip': set(),
-                    'prefill_err': set(),
-                    'prefill_empty': set(),
-                    'suppress_block': 0,
-                    'suppress_trap': 0,
-                })
-                try:
-                    _mid_adapt_reset_tick()
+                    if _mid_diag_enabled and _mid_diag_lines < _mid_diag_max and status != 'OK':
+                        # Collect diagnostics; actual logging happens once per symbol when candles are finally unavailable.
+                        _mid_diag_lines += 1
                 except Exception:
                     pass
 
+            if os.getenv("MID_SCANNER_ENABLED", "1").strip().lower() in ("0","false","no"):
+                await asyncio.sleep(10)
+                return
 
-                interval = interval_sec
-                top_n = int(os.getenv("MID_TOP_N", "50"))
-                top_n_symbols = int(os.getenv("MID_TOP_N_SYMBOLS", str(top_n)) or top_n)
-                # MID_TOP_N_SYMBOLS defines the *universe* size to load (e.g. 200).
-                # MID_TOP_N defines how many of that universe to actually scan each tick (e.g. 70).
-                if top_n_symbols < top_n:
-                    top_n_symbols = top_n
+            # Tick-local log guard
+            _MID_TICK_CTX.set({
+                'block': set(),
+                'trap': set(),
+                'candles_missing': set(),
+                'candles_missing_sym': set(),
+                'prefill_skip': set(),
+                'prefill_err': set(),
+                'prefill_empty': set(),
+                'suppress_block': 0,
+                'suppress_trap': 0,
+            })
+            try:
+                _mid_adapt_reset_tick()
+            except Exception:
+                pass
 
-                # --- MID trap digest state (persists across ticks) ---
-                if not hasattr(self, "_mid_trap_digest_stats"):
-                    self._mid_trap_digest_stats = {}
-                if not hasattr(self, "_mid_trap_digest_last_sent"):
-                    self._mid_trap_digest_last_sent = time.time()
 
-                mode = (os.getenv("MID_SIGNAL_MODE","").strip().lower()
-                        or os.getenv("SIGNAL_MODE","").strip().lower()
-                        or "strict")
-                if os.getenv("MID_STRICT","0").strip() in ("1","true","yes"):
-                    mode = "strict"
+            interval = interval_sec
+            top_n = int(os.getenv("MID_TOP_N", "50"))
+            top_n_symbols = int(os.getenv("MID_TOP_N_SYMBOLS", str(top_n)) or top_n)
+            # MID_TOP_N_SYMBOLS defines the *universe* size to load (e.g. 200).
+            # MID_TOP_N defines how many of that universe to actually scan each tick (e.g. 70).
+            if top_n_symbols < top_n:
+                top_n_symbols = top_n
 
-                # 1:1 thresholds with MAIN scanner by default
-                use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
-                if use_main:
-                    min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
-                    min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
-                else:
-                    min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76"))
-                    min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72"))
-                min_rr = float(os.getenv("MID_MIN_RR","2.0"))
+            # --- MID trap digest state (persists across ticks) ---
+            if not hasattr(self, "_mid_trap_digest_stats"):
+                self._mid_trap_digest_stats = {}
+            if not hasattr(self, "_mid_trap_digest_last_sent"):
+                self._mid_trap_digest_last_sent = time.time()
 
-                min_adx_30m = float(os.getenv("MID_MIN_ADX_30M","0") or "0")
-                min_adx_1h = float(os.getenv("MID_MIN_ADX_1H","0") or "0")
-                min_atr_pct = float(os.getenv("MID_MIN_ATR_PCT","0") or "0")
-                # HARD MID TP2-first extra filters
-                mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or "0")
-                mid_require_vwap_bias = os.getenv("MID_REQUIRE_VWAP_BIAS", "1").strip().lower() not in ("0","false","no","off")
-                mid_min_vwap_dist_atr = float(os.getenv("MID_MIN_VWAP_DIST_ATR", "0") or "0")
+            mode = (os.getenv("MID_SIGNAL_MODE","").strip().lower()
+                    or os.getenv("SIGNAL_MODE","").strip().lower()
+                    or "strict")
+            if os.getenv("MID_STRICT","0").strip() in ("1","true","yes"):
+                mode = "strict"
 
-                require_align = os.getenv("MID_REQUIRE_30M_TREND","1").strip().lower() not in ("0","false","no")
-                structure_align_soft = os.getenv("MID_STRUCTURE_ALIGN_SOFT","0").strip().lower() not in ("0","false","no")
-                structure_align_penalty = float(os.getenv("MID_STRUCTURE_ALIGN_PENALTY","8") or 8)
-                allow_futures = os.getenv("MID_ALLOW_FUTURES","1").strip().lower() not in ("0","false","no")
+            # 1:1 thresholds with MAIN scanner by default
+            use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
+            if use_main:
+                min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
+                min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
+            else:
+                min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76"))
+                min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72"))
+            min_rr = float(os.getenv("MID_MIN_RR","2.0"))
 
-                tp_policy = (os.getenv("MID_TP_POLICY","R") or "R").strip().upper()
-                tp1_r = float(os.getenv("MID_TP1_R","1.2"))
-                tp2_r = float(os.getenv("MID_TP2_R","2.8"))
+            min_adx_30m = float(os.getenv("MID_MIN_ADX_30M","0") or "0")
+            min_adx_1h = float(os.getenv("MID_MIN_ADX_1H","0") or "0")
+            min_atr_pct = float(os.getenv("MID_MIN_ATR_PCT","0") or "0")
+            # HARD MID TP2-first extra filters
+            mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or "0")
+            mid_require_vwap_bias = os.getenv("MID_REQUIRE_VWAP_BIAS", "1").strip().lower() not in ("0","false","no","off")
+            mid_min_vwap_dist_atr = float(os.getenv("MID_MIN_VWAP_DIST_ATR", "0") or "0")
 
-                # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
-                # NOTE: MID candles routing can restrict this universe further via MID_CANDLES_SOURCES / MID_ENABLE_SECONDARY_EXCHANGES
-                _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
-                scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
-                if not scan_exchanges:
-                    scan_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
+            require_align = os.getenv("MID_REQUIRE_30M_TREND","1").strip().lower() not in ("0","false","no")
+            structure_align_soft = os.getenv("MID_STRUCTURE_ALIGN_SOFT","0").strip().lower() not in ("0","false","no")
+            structure_align_penalty = float(os.getenv("MID_STRUCTURE_ALIGN_PENALTY","8") or 8)
+            allow_futures = os.getenv("MID_ALLOW_FUTURES","1").strip().lower() not in ("0","false","no")
 
-                # MID candle sources preference.
-                # If MID_CANDLES_SOURCES is not provided, we default to the same universe as SCANNER_EXCHANGES
-                # (so "сканер по все биржи" also means candles routing can use all those exchanges).
-                # Secondary exchanges (GATEIO/MEXC) are still gated by MID_ENABLE_SECONDARY_EXCHANGES.
-                _mid_sources_env = (os.getenv('MID_CANDLES_SOURCES', '') or '').strip()
-                _mid_sources = _mid_sources_env if _mid_sources_env else ','.join(scan_exchanges)
-                mid_candles_sources = [x.strip().upper() for x in _mid_sources.split(',') if x.strip()]
+            tp_policy = (os.getenv("MID_TP_POLICY","R") or "R").strip().upper()
+            tp1_r = float(os.getenv("MID_TP1_R","1.2"))
+            tp2_r = float(os.getenv("MID_TP2_R","2.8"))
+
+            # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
+            # NOTE: MID candles routing can restrict this universe further via MID_CANDLES_SOURCES / MID_ENABLE_SECONDARY_EXCHANGES
+            _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
+            scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
+            if not scan_exchanges:
+                scan_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
+
+            # MID candle sources preference.
+            # If MID_CANDLES_SOURCES is not provided, we default to the same universe as SCANNER_EXCHANGES
+            # (so "сканер по все биржи" also means candles routing can use all those exchanges).
+            # Secondary exchanges (GATEIO/MEXC) are still gated by MID_ENABLE_SECONDARY_EXCHANGES.
+            _mid_sources_env = (os.getenv('MID_CANDLES_SOURCES', '') or '').strip()
+            _mid_sources = _mid_sources_env if _mid_sources_env else ','.join(scan_exchanges)
+            mid_candles_sources = [x.strip().upper() for x in _mid_sources.split(',') if x.strip()]
+            if not mid_candles_sources:
+                mid_candles_sources = list(scan_exchanges)
+
+            # --- MID candles sources (Variant A: multi-exchange) ---
+            # We allow pulling candles from all supported adapters, and decide per-symbol dynamically.
+            # This is required for tokens that exist on GateIO/MEXC but not on Binance.
+            allowed_candle_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
+
+            mid_force_all = (os.getenv('MID_CANDLES_ALL_EXCHANGES', '1') or '1').strip().lower() in ('1','true','yes','on')
+            enable_secondary = (os.getenv('MID_ENABLE_SECONDARY_EXCHANGES','1') or '1').strip().lower() in ('1','true','yes','on')
+
+            if mid_force_all:
+                # Don't require candles sources to be present in SCANNER_EXCHANGES:
+                # SCANNER_EXCHANGES controls symbol universe; candles sources control where we fetch klines.
+                mid_candles_sources = [x for x in mid_candles_sources if x in allowed_candle_exchanges]
                 if not mid_candles_sources:
-                    mid_candles_sources = list(scan_exchanges)
+                    mid_candles_sources = allowed_candle_exchanges[:]
+            else:
+                if not enable_secondary:
+                    # hard-disable secondary unless allowed
+                    mid_candles_sources = [x for x in mid_candles_sources if x in ('BINANCE','BYBIT','OKX')] or ['BINANCE','BYBIT','OKX']
+                # Ensure candle sources are within scan_exchanges (legacy behavior)
+                mid_candles_sources = [x for x in mid_candles_sources if x in scan_exchanges] or ['BINANCE','BYBIT','OKX']
 
-                # --- MID candles sources (Variant A: multi-exchange) ---
-                # We allow pulling candles from all supported adapters, and decide per-symbol dynamically.
-                # This is required for tokens that exist on GateIO/MEXC but not on Binance.
-                allowed_candle_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
+            # Always keep BINANCE as a fallback candle source unless explicitly disabled.
+            # NOTE: Many symbols are missing on BYBIT/OKX SPOT; without BINANCE fallback MID may produce массовый no_candles/emitted=0.
+            disable_binance = (os.getenv('MID_DISABLE_BINANCE_CANDLES','0') or '0').strip().lower() in ('1','true','yes','on')
+            force_binance = (os.getenv('MID_FORCE_BINANCE_CANDLES','1') or '1').strip().lower() in ('1','true','yes','on')
+            if (not disable_binance) and force_binance:
+                if 'BINANCE' not in mid_candles_sources:
+                    mid_candles_sources = ['BINANCE'] + [x for x in mid_candles_sources if x != 'BINANCE']
 
-                mid_force_all = (os.getenv('MID_CANDLES_ALL_EXCHANGES', '1') or '1').strip().lower() in ('1','true','yes','on')
-                enable_secondary = (os.getenv('MID_ENABLE_SECONDARY_EXCHANGES','1') or '1').strip().lower() in ('1','true','yes','on')
+            # --- MID candles routing: stable primary (hash) BINANCE/BYBIT + fallback + smart cache ---
+            _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT") or "").strip()
+            mid_primary_exchanges = [x.strip().upper() for x in _primary_ex.split(",") if x.strip()]
 
-                if mid_force_all:
-                    # Don't require candles sources to be present in SCANNER_EXCHANGES:
-                    # SCANNER_EXCHANGES controls symbol universe; candles sources control where we fetch klines.
-                    mid_candles_sources = [x for x in mid_candles_sources if x in allowed_candle_exchanges]
-                    if not mid_candles_sources:
-                        mid_candles_sources = allowed_candle_exchanges[:]
-                else:
-                    if not enable_secondary:
-                        # hard-disable secondary unless allowed
-                        mid_candles_sources = [x for x in mid_candles_sources if x in ('BINANCE','BYBIT','OKX')] or ['BINANCE','BYBIT','OKX']
-                    # Ensure candle sources are within scan_exchanges (legacy behavior)
-                    mid_candles_sources = [x for x in mid_candles_sources if x in scan_exchanges] or ['BINANCE','BYBIT','OKX']
+            # Universe for MID candles routing:
+            # Use MID_CANDLES_SOURCES (already filtered by MID_ENABLE_SECONDARY_EXCHANGES and SCANNER_EXCHANGES),
+            # NOT the full scan_exchanges list. This prevents wasting time on exchanges that are not intended
+            # to be used for candles (e.g., MEXC/GATEIO futures returning empty).
+            mid_universe = list(mid_candles_sources or ["BINANCE","BYBIT","OKX"])
 
-                # Always keep BINANCE as a fallback candle source unless explicitly disabled.
-                # NOTE: Many symbols are missing on BYBIT/OKX SPOT; without BINANCE fallback MID may produce массовый no_candles/emitted=0.
-                disable_binance = (os.getenv('MID_DISABLE_BINANCE_CANDLES','0') or '0').strip().lower() in ('1','true','yes','on')
-                force_binance = (os.getenv('MID_FORCE_BINANCE_CANDLES','1') or '1').strip().lower() in ('1','true','yes','on')
-                if (not disable_binance) and force_binance:
-                    if 'BINANCE' not in mid_candles_sources:
-                        mid_candles_sources = ['BINANCE'] + [x for x in mid_candles_sources if x != 'BINANCE']
+            # Ensure at least 2 primaries; fall back to first two in universe
+            if len(mid_primary_exchanges) < 2:
+                mid_primary_exchanges = mid_universe[:2] if len(mid_universe) >= 2 else ["BINANCE", "BYBIT"]
 
-                # --- MID candles routing: stable primary (hash) BINANCE/BYBIT + fallback + smart cache ---
-                _primary_ex = (os.getenv("MID_PRIMARY_EXCHANGES", "BINANCE,BYBIT") or "").strip()
-                mid_primary_exchanges = [x.strip().upper() for x in _primary_ex.split(",") if x.strip()]
+            # Keep only those available in mid_universe
+            mid_primary_exchanges = [x for x in mid_primary_exchanges if x in mid_universe] or (mid_universe[:2] if len(mid_universe) >= 2 else ["BINANCE","BYBIT"])
 
-                # Universe for MID candles routing:
-                # Use MID_CANDLES_SOURCES (already filtered by MID_ENABLE_SECONDARY_EXCHANGES and SCANNER_EXCHANGES),
-                # NOT the full scan_exchanges list. This prevents wasting time on exchanges that are not intended
-                # to be used for candles (e.g., MEXC/GATEIO futures returning empty).
-                mid_universe = list(mid_candles_sources or ["BINANCE","BYBIT","OKX"])
+            # Fallback exchanges are the rest of the MID universe
+            mid_fallback_exchanges = [x for x in mid_universe if x not in mid_primary_exchanges]
+            mid_primary_mode = (os.getenv("MID_PRIMARY_MODE", "hash") or "hash").strip().lower()
+            mid_candles_retry = int(os.getenv("MID_CANDLES_RETRY", "1") or "1")
+            mid_cache_ttl_5m = int(os.getenv("MID_CANDLES_CACHE_TTL_5M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "60")) or "60")
+            mid_cache_ttl_30m = int(os.getenv("MID_CANDLES_CACHE_TTL_30M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "180")) or "180")
+            mid_cache_ttl_1h = int(os.getenv("MID_CANDLES_CACHE_TTL_1H", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "300")) or "300")
+            mid_cache_stale_sec = int(os.getenv("MID_CANDLES_CACHE_STALE_SEC", "900") or "900")
 
-                # Ensure at least 2 primaries; fall back to first two in universe
-                if len(mid_primary_exchanges) < 2:
-                    mid_primary_exchanges = mid_universe[:2] if len(mid_universe) >= 2 else ["BINANCE", "BYBIT"]
+            # persistent candles cache (shared across ticks)
+            if not hasattr(self, "_mid_candles_cache"):
+                self._mid_candles_cache = {}  # type: ignore[attr-defined]
+            if not hasattr(self, "_mid_candles_inflight"):
+                self._mid_candles_inflight = {}  # type: ignore[attr-defined]
+            if not hasattr(self, "_mid_klines_sem"):
+                try:
+                    self._mid_klines_sem = asyncio.Semaphore(int(os.getenv("MID_KLINES_CONCURRENCY", "15") or "15"))  # type: ignore[attr-defined]
+                except Exception:
+                    self._mid_klines_sem = asyncio.Semaphore(int(os.getenv('MID_KLINES_CONCURRENCY', '45') or 45))  # type: ignore[attr-defined]
 
-                # Keep only those available in mid_universe
-                mid_primary_exchanges = [x for x in mid_primary_exchanges if x in mid_universe] or (mid_universe[:2] if len(mid_universe) >= 2 else ["BINANCE","BYBIT"])
-
-                # Fallback exchanges are the rest of the MID universe
-                mid_fallback_exchanges = [x for x in mid_universe if x not in mid_primary_exchanges]
-                mid_primary_mode = (os.getenv("MID_PRIMARY_MODE", "hash") or "hash").strip().lower()
-                mid_candles_retry = int(os.getenv("MID_CANDLES_RETRY", "1") or "1")
-                mid_cache_ttl_5m = int(os.getenv("MID_CANDLES_CACHE_TTL_5M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "60")) or "60")
-                mid_cache_ttl_30m = int(os.getenv("MID_CANDLES_CACHE_TTL_30M", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "180")) or "180")
-                mid_cache_ttl_1h = int(os.getenv("MID_CANDLES_CACHE_TTL_1H", os.getenv("MID_CANDLES_CACHE_TTL_SEC", "300")) or "300")
-                mid_cache_stale_sec = int(os.getenv("MID_CANDLES_CACHE_STALE_SEC", "900") or "900")
-
-                # persistent candles cache (shared across ticks)
-                if not hasattr(self, "_mid_candles_cache"):
-                    self._mid_candles_cache = {}  # type: ignore[attr-defined]
-                if not hasattr(self, "_mid_candles_inflight"):
-                    self._mid_candles_inflight = {}  # type: ignore[attr-defined]
-                if not hasattr(self, "_mid_klines_sem"):
-                    try:
-                        self._mid_klines_sem = asyncio.Semaphore(int(os.getenv("MID_KLINES_CONCURRENCY", "15") or "15"))  # type: ignore[attr-defined]
-                    except Exception:
-                        self._mid_klines_sem = asyncio.Semaphore(int(os.getenv('MID_KLINES_CONCURRENCY', '45') or 45))  # type: ignore[attr-defined]
-
-                _mid_candles_cache = self._mid_candles_cache  # type: ignore[attr-defined]
-                _mid_candles_inflight = self._mid_candles_inflight  # type: ignore[attr-defined]
-                _mid_klines_sem = self._mid_klines_sem  # type: ignore[attr-defined]
+            _mid_candles_cache = self._mid_candles_cache  # type: ignore[attr-defined]
+            _mid_candles_inflight = self._mid_candles_inflight  # type: ignore[attr-defined]
+            _mid_klines_sem = self._mid_klines_sem  # type: ignore[attr-defined]
 
 
-                def _mid_cache_ttl(tf: str) -> int:
-                    t = (tf or "").lower()
-                    if t in ("5m", "5min", "5"):
-                        return mid_cache_ttl_5m
-                    if t in ("30m", "30min", "30"):
-                        return mid_cache_ttl_30m
-                    return mid_cache_ttl_1h
+            def _mid_cache_ttl(tf: str) -> int:
+                t = (tf or "").lower()
+                if t in ("5m", "5min", "5"):
+                    return mid_cache_ttl_5m
+                if t in ("30m", "30min", "30"):
+                    return mid_cache_ttl_30m
+                return mid_cache_ttl_1h
 
 
-                def _mid_tf_stale_sec(tf: str, *, kind: str = "generic") -> float:
-                    """Return max allowed candle age (seconds) for a timeframe.
+            def _mid_tf_stale_sec(tf: str, *, kind: str = "generic") -> float:
+                """Return max allowed candle age (seconds) for a timeframe.
 
-                    Priority (highest -> lowest):
-                      - MID_REST_CANDLES_MAX_AGE_SEC / MID_PERSIST_CANDLES_MAX_AGE_SEC (explicit per-source override)
-                      - MID_CANDLES_CACHE_STALE_SEC (legacy global override)
-                      - TF-aware defaults (env-overridable):
-                          5m  -> MID_TF_STALE_5M_SEC  (default 1200)
-                          30m -> MID_TF_STALE_30M_SEC (default 5400)
-                          1h  -> MID_TF_STALE_1H_SEC  (default 7200)
-                    """
-                    try:
-                        t = (tf or "").strip().lower()
-                        # Explicit per-source override (keeps backward compatibility)
-                        if kind == "rest":
-                            v = (os.getenv("MID_REST_CANDLES_MAX_AGE_SEC") or "").strip()
-                            if v:
-                                return float(v)
-                        if kind == "persist":
-                            v = (os.getenv("MID_PERSIST_CANDLES_MAX_AGE_SEC") or "").strip()
-                            if v:
-                                return float(v)
-
-                        # Legacy global override
-                        v = (os.getenv("MID_CANDLES_CACHE_STALE_SEC") or "").strip()
+                Priority (highest -> lowest):
+                  - MID_REST_CANDLES_MAX_AGE_SEC / MID_PERSIST_CANDLES_MAX_AGE_SEC (explicit per-source override)
+                  - MID_CANDLES_CACHE_STALE_SEC (legacy global override)
+                  - TF-aware defaults (env-overridable):
+                      5m  -> MID_TF_STALE_5M_SEC  (default 1200)
+                      30m -> MID_TF_STALE_30M_SEC (default 5400)
+                      1h  -> MID_TF_STALE_1H_SEC  (default 7200)
+                """
+                try:
+                    t = (tf or "").strip().lower()
+                    # Explicit per-source override (keeps backward compatibility)
+                    if kind == "rest":
+                        v = (os.getenv("MID_REST_CANDLES_MAX_AGE_SEC") or "").strip()
+                        if v:
+                            return float(v)
+                    if kind == "persist":
+                        v = (os.getenv("MID_PERSIST_CANDLES_MAX_AGE_SEC") or "").strip()
                         if v:
                             return float(v)
 
-                        # TF-aware defaults (can be overridden)
-                        if t in ("5m", "5min", "5"):
-                            v = (os.getenv("MID_TF_STALE_5M_SEC") or os.getenv("MID_STALE_5M_SEC") or "").strip()
-                            return float(v) if v else 1200.0
-                        if t in ("30m", "30min", "30"):
-                            v = (os.getenv("MID_TF_STALE_30M_SEC") or os.getenv("MID_STALE_30M_SEC") or "").strip()
-                            return float(v) if v else 5400.0
-                        # default: 1h+
-                        v = (os.getenv("MID_TF_STALE_1H_SEC") or os.getenv("MID_STALE_1H_SEC") or "").strip()
-                        return float(v) if v else 7200.0
-                    except Exception:
-                        # safest fallback
-                        return 1800.0
+                    # Legacy global override
+                    v = (os.getenv("MID_CANDLES_CACHE_STALE_SEC") or "").strip()
+                    if v:
+                        return float(v)
 
-                def _mid_primary_for_symbol(symb: str) -> str:
-                    if MID_CANDLES_LIGHT_MODE or MID_CANDLES_BINANCE_FIRST:
-                        return "BINANCE"
-                    # Prefer the exchange that produced the symbol universe (scanner), to avoid routing
-                    # a symbol to an exchange where it doesn't exist -> candles_unavailable storms.
-                    try:
-                        _pref_map = getattr(self, "_mid_symbol_pref_exchange", None)
-                        if isinstance(_pref_map, dict):
-                            _px = _pref_map.get(symb)
-                            if _px:
-                                return str(_px).upper()
-                    except Exception:
-                        pass
+                    # TF-aware defaults (can be overridden)
+                    if t in ("5m", "5min", "5"):
+                        v = (os.getenv("MID_TF_STALE_5M_SEC") or os.getenv("MID_STALE_5M_SEC") or "").strip()
+                        return float(v) if v else 1200.0
+                    if t in ("30m", "30min", "30"):
+                        v = (os.getenv("MID_TF_STALE_30M_SEC") or os.getenv("MID_STALE_30M_SEC") or "").strip()
+                        return float(v) if v else 5400.0
+                    # default: 1h+
+                    v = (os.getenv("MID_TF_STALE_1H_SEC") or os.getenv("MID_STALE_1H_SEC") or "").strip()
+                    return float(v) if v else 7200.0
+                except Exception:
+                    # safest fallback
+                    return 1800.0
 
-                    # Fallback: stable routing hash(symbol) -> primary exchange from MID_PRIMARY_EXCHANGES
-                    if not mid_primary_exchanges:
-                        return "BINANCE"
-                    if mid_primary_mode not in ("hash", "round_robin"):
-                        # unknown mode -> hash
-                        pass
-                    try:
-                        h = int.from_bytes(hashlib.sha1(symb.encode("utf-8")).digest()[:4], "big")
-                    except Exception:
-                        h = sum(ord(c) for c in symb)
-                    return mid_primary_exchanges[h % len(mid_primary_exchanges)]
-                # --- MID candles diagnostics (optional) ---
-                _mid_candles_log_fail = int(os.getenv("MID_CANDLES_LOG_FAIL", "1") or "1")
-                _mid_candles_log_samples = int(os.getenv("MID_CANDLES_LOG_FAIL_SAMPLES", "3") or "3")
-                _mid_candles_fail = defaultdict(int)  # (exchange, tf) -> count
-                _mid_candles_fail_samples = defaultdict(list)  # (exchange, tf) -> [err...]
-                _mid_candles_log_empty = int(os.getenv('MID_CANDLES_LOG_EMPTY', '1') or '1')
-                _mid_candles_log_empty_samples = int(os.getenv('MID_CANDLES_LOG_EMPTY_SAMPLES', '5') or '5')
-                _mid_candles_empty = 0
-                _mid_candles_empty_reasons = defaultdict(int)
-                _mid_candles_empty_samples = defaultdict(list)
-                _mid_candles_fallback = 0
+            def _mid_primary_for_symbol(symb: str) -> str:
+                if MID_CANDLES_LIGHT_MODE or MID_CANDLES_BINANCE_FIRST:
+                    return "BINANCE"
+                # Prefer the exchange that produced the symbol universe (scanner), to avoid routing
+                # a symbol to an exchange where it doesn't exist -> candles_unavailable storms.
+                try:
+                    _pref_map = getattr(self, "_mid_symbol_pref_exchange", None)
+                    if isinstance(_pref_map, dict):
+                        _px = _pref_map.get(symb)
+                        if _px:
+                            return str(_px).upper()
+                except Exception:
+                    pass
+
+                # Fallback: stable routing hash(symbol) -> primary exchange from MID_PRIMARY_EXCHANGES
+                if not mid_primary_exchanges:
+                    return "BINANCE"
+                if mid_primary_mode not in ("hash", "round_robin"):
+                    # unknown mode -> hash
+                    pass
+                try:
+                    h = int.from_bytes(hashlib.sha1(symb.encode("utf-8")).digest()[:4], "big")
+                except Exception:
+                    h = sum(ord(c) for c in symb)
+                return mid_primary_exchanges[h % len(mid_primary_exchanges)]
+            # --- MID candles diagnostics (optional) ---
+            _mid_candles_log_fail = int(os.getenv("MID_CANDLES_LOG_FAIL", "1") or "1")
+            _mid_candles_log_samples = int(os.getenv("MID_CANDLES_LOG_FAIL_SAMPLES", "3") or "3")
+            _mid_candles_fail = defaultdict(int)  # (exchange, tf) -> count
+            _mid_candles_fail_samples = defaultdict(list)  # (exchange, tf) -> [err...]
+            _mid_candles_log_empty = int(os.getenv('MID_CANDLES_LOG_EMPTY', '1') or '1')
+            _mid_candles_log_empty_samples = int(os.getenv('MID_CANDLES_LOG_EMPTY_SAMPLES', '5') or '5')
+            _mid_candles_empty = 0
+            _mid_candles_empty_reasons = defaultdict(int)
+            _mid_candles_empty_samples = defaultdict(list)
+            _mid_candles_fallback = 0
 
 
-                def _mid_fmt_missing_wait(tf: str, need: int, got: int) -> str:
-                    """Return ' missing=X (~Y needed)' for partial candle history diagnostics."""
-                    try:
-                        if not need:
-                            return ''
-                        missing = int(need) - int(got or 0)
-                        if missing <= 0:
-                            return ''
-                        tf_l = (tf or '').lower().strip()
-                        sec_per = 0
-                        # supports like 5m, 30m, 1h, 4h, 1d
-                        if tf_l.endswith('m') and tf_l[:-1].isdigit():
-                            sec_per = int(tf_l[:-1]) * 60
-                        elif tf_l.endswith('h') and tf_l[:-1].isdigit():
-                            sec_per = int(tf_l[:-1]) * 3600
-                        elif tf_l.endswith('d') and tf_l[:-1].isdigit():
-                            sec_per = int(tf_l[:-1]) * 86400
-                        if sec_per <= 0:
-                            return f" missing={missing}"
-                        total = missing * sec_per
-                        days = total // 86400
-                        rem = total % 86400
-                        hours = rem // 3600
-                        rem = rem % 3600
-                        mins = rem // 60
-                        if days > 0:
-                            approx = f"{days}d{hours:02d}h"
-                        elif hours > 0:
-                            approx = f"{hours}h{mins:02d}m"
-                        else:
-                            approx = f"{mins}m"
-                        return f" missing={missing} (~{approx} needed)"
-                    except Exception:
+            def _mid_fmt_missing_wait(tf: str, need: int, got: int) -> str:
+                """Return ' missing=X (~Y needed)' for partial candle history diagnostics."""
+                try:
+                    if not need:
                         return ''
+                    missing = int(need) - int(got or 0)
+                    if missing <= 0:
+                        return ''
+                    tf_l = (tf or '').lower().strip()
+                    sec_per = 0
+                    # supports like 5m, 30m, 1h, 4h, 1d
+                    if tf_l.endswith('m') and tf_l[:-1].isdigit():
+                        sec_per = int(tf_l[:-1]) * 60
+                    elif tf_l.endswith('h') and tf_l[:-1].isdigit():
+                        sec_per = int(tf_l[:-1]) * 3600
+                    elif tf_l.endswith('d') and tf_l[:-1].isdigit():
+                        sec_per = int(tf_l[:-1]) * 86400
+                    if sec_per <= 0:
+                        return f" missing={missing}"
+                    total = missing * sec_per
+                    days = total // 86400
+                    rem = total % 86400
+                    hours = rem // 3600
+                    rem = rem % 3600
+                    mins = rem // 60
+                    if days > 0:
+                        approx = f"{days}d{hours:02d}h"
+                    elif hours > 0:
+                        approx = f"{hours}h{mins:02d}m"
+                    else:
+                        approx = f"{mins}m"
+                    return f" missing={missing} (~{approx} needed)"
+                except Exception:
+                    return ''
 
 
-                async def _mid_fetch_klines_rest(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
+            async def _mid_fetch_klines_rest(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
 
 
-                    nonlocal _mid_candles_net_fail, _mid_candles_unsupported, _mid_candles_partial
-                    try:
-                        # Global MID kline concurrency guard (prevents HTTP overload -> timeouts -> no_candles)
-                        async with _mid_klines_sem:
-                            mkt = (market or 'SPOT').upper().strip()
-                            # PRODUCTION: optionally force SPOT candles to avoid FUTURES-only instrument gaps
-                            if os.getenv('MID_CANDLES_FORCE_SPOT', '0').strip().lower() not in ('0','false','no','off'):
-                                mkt = 'SPOT'
+                nonlocal _mid_candles_net_fail, _mid_candles_unsupported, _mid_candles_partial
+                try:
+                    # Global MID kline concurrency guard (prevents HTTP overload -> timeouts -> no_candles)
+                    async with _mid_klines_sem:
+                        mkt = (market or 'SPOT').upper().strip()
+                        # PRODUCTION: optionally force SPOT candles to avoid FUTURES-only instrument gaps
+                        if os.getenv('MID_CANDLES_FORCE_SPOT', '0').strip().lower() not in ('0','false','no','off'):
+                            mkt = 'SPOT'
 
-                            # PRODUCTION: drop obviously-bad symbols early (saves REST/WS limits and prevents no_candles storms)
-                            _sym = (symb or '').strip().upper()
-                            if (not _sym.isascii()) or (not _sym.endswith('USDT')) or (len(_sym) < 6) or (not re.match(r'^[A-Z0-9]{2,20}USDT$', _sym)):
-                                # Mark as unsupported to avoid repeated REST/WS attempts for clearly invalid symbols.
+                        # PRODUCTION: drop obviously-bad symbols early (saves REST/WS limits and prevents no_candles storms)
+                        _sym = (symb or '').strip().upper()
+                        if (not _sym.isascii()) or (not _sym.endswith('USDT')) or (len(_sym) < 6) or (not re.match(r'^[A-Z0-9]{2,20}USDT$', _sym)):
+                            # Mark as unsupported to avoid repeated REST/WS attempts for clearly invalid symbols.
+                            try:
+                                api._mark_unsupported(ex_name, mkt, _sym, tf)
+                            except Exception:
+                                pass
+                            _mid_diag_add(_sym, ex_name, mkt, tf, 'invalid_symbol_format')
+                            _mid_candles_unsupported += 1
+                            return None
+
+                        # Circuit breaker: skip exchange/market temporarily after repeated transient failures
+                        try:
+                            _h = _mid_health_get(ex_name, mkt)
+                            _cd = float(_h.get('cooldown_until', 0.0) or 0.0)
+                            if _cd and time.time() < _cd:
+                                _mid_diag_add(symb, ex_name, mkt, tf, 'cooldown')
+                                return None
+                        except Exception:
+                            _h = None
+
+                        def _mid_rest_is_fresh(df: Optional[pd.DataFrame]) -> bool:
+                            """Validate REST candles freshness. Reject stale REST to avoid using old data."""
+                            try:
+                                if df is None or getattr(df, 'empty', True):
+                                    return False
+                                max_age = float(_mid_tf_stale_sec(tf, kind="rest"))
+                                now_ms = int(time.time() * 1000)
+                                if "close_time_ms" in df.columns:
+                                    last_ms = int(df["close_time_ms"].iloc[-1])
+                                elif "close_time" in df.columns:
+                                    last_ms = int(df["close_time"].iloc[-1])
+                                elif "open_time_ms" in df.columns:
+                                    # approximate close from open + tf
+                                    last_ms = int(df["open_time_ms"].iloc[-1])
+                                elif "open_time" in df.columns:
+                                    last_ms = int(df["open_time"].iloc[-1])
+                                else:
+                                    return True  # cannot verify -> don't block
+                                return (now_ms - last_ms) <= int(max_age * 1000)
+                            except Exception:
+                                return True
+
+
+                        # Fast-skip pairs we already know are unsupported on this exchange/market/TF
+                        try:
+                            if api._is_unsupported_cached(ex_name, mkt, _sym, tf):
+                                _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_cached')
+                                return pd.DataFrame()
+                        except Exception:
+                            pass
+                        if ex_name in ('GATEIO','MEXC') and mkt == 'FUTURES':
+                            # Futures candles are not implemented for these adapters. Mark unsupported and skip.
+                            try:
+                                api._mark_unsupported(ex_name, mkt, symb, tf)
+                            except Exception:
+                                pass
+                            _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_market')
+                            return None
+                        # Availability check (cached): skip symbols that don't exist on this exchange/market
+                        try:
+                            if not await api._market_supported_ex(ex_name, mkt, _sym):
                                 try:
                                     api._mark_unsupported(ex_name, mkt, _sym, tf)
                                 except Exception:
                                     pass
-                                _mid_diag_add(_sym, ex_name, mkt, tf, 'invalid_symbol_format')
-                                _mid_candles_unsupported += 1
-                                return None
+                                _mid_diag_add(_sym, ex_name, mkt, tf, 'unsupported_pair')
+                                return pd.DataFrame()
+                        except Exception:
+                            # If availability check fails, fall back to request
+                            pass
 
-                            # Circuit breaker: skip exchange/market temporarily after repeated transient failures
+                        if ex_name == "BINANCE":
+                            # Avoid noisy HTTP 400 (Invalid symbol) on futures by checking exchangeInfo first.
                             try:
-                                _h = _mid_health_get(ex_name, mkt)
-                                _cd = float(_h.get('cooldown_until', 0.0) or 0.0)
-                                if _cd and time.time() < _cd:
-                                    _mid_diag_add(symb, ex_name, mkt, tf, 'cooldown')
-                                    return None
+                                if mkt == 'FUTURES':
+                                    info = api._binance_exchange_info(futures=True)
+                                    if info and isinstance(info, dict):
+                                        syms = {s.get('symbol') for s in (info.get('symbols') or []) if isinstance(s, dict)}
+                                        symb_req = api._binance_futures_symbol_alias((symb or '').upper().strip())
+                                        if (symb not in syms) and (symb_req not in syms):
+                                            try:
+                                                api._mark_unsupported(ex_name, mkt, symb, tf)
+                                            except Exception:
+                                                pass
+                                            _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_pair')
+                                            return pd.DataFrame()
                             except Exception:
-                                _h = None
-
-                            def _mid_rest_is_fresh(df: Optional[pd.DataFrame]) -> bool:
-                                """Validate REST candles freshness. Reject stale REST to avoid using old data."""
-                                try:
-                                    if df is None or getattr(df, 'empty', True):
-                                        return False
-                                    max_age = float(_mid_tf_stale_sec(tf, kind="rest"))
-                                    now_ms = int(time.time() * 1000)
-                                    if "close_time_ms" in df.columns:
-                                        last_ms = int(df["close_time_ms"].iloc[-1])
-                                    elif "close_time" in df.columns:
-                                        last_ms = int(df["close_time"].iloc[-1])
-                                    elif "open_time_ms" in df.columns:
-                                        # approximate close from open + tf
-                                        last_ms = int(df["open_time_ms"].iloc[-1])
-                                    elif "open_time" in df.columns:
-                                        last_ms = int(df["open_time"].iloc[-1])
-                                    else:
-                                        return True  # cannot verify -> don't block
-                                    return (now_ms - last_ms) <= int(max_age * 1000)
-                                except Exception:
-                                    return True
-
-
-                            # Fast-skip pairs we already know are unsupported on this exchange/market/TF
-                            try:
-                                if api._is_unsupported_cached(ex_name, mkt, _sym, tf):
-                                    _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_cached')
-                                    return pd.DataFrame()
-                            except Exception:
+                                # If exchangeInfo fails, fall back to request (old behavior)
                                 pass
-                            if ex_name in ('GATEIO','MEXC') and mkt == 'FUTURES':
-                                # Futures candles are not implemented for these adapters. Mark unsupported and skip.
-                                try:
-                                    api._mark_unsupported(ex_name, mkt, symb, tf)
-                                except Exception:
-                                    pass
-                                _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_market')
-                                return None
-                            # Availability check (cached): skip symbols that don't exist on this exchange/market
-                            try:
-                                if not await api._market_supported_ex(ex_name, mkt, _sym):
-                                    try:
-                                        api._mark_unsupported(ex_name, mkt, _sym, tf)
-                                    except Exception:
-                                        pass
-                                    _mid_diag_add(_sym, ex_name, mkt, tf, 'unsupported_pair')
-                                    return pd.DataFrame()
-                            except Exception:
-                                # If availability check fails, fall back to request
-                                pass
-
-                            if ex_name == "BINANCE":
-                                # Avoid noisy HTTP 400 (Invalid symbol) on futures by checking exchangeInfo first.
-                                try:
-                                    if mkt == 'FUTURES':
-                                        info = api._binance_exchange_info(futures=True)
-                                        if info and isinstance(info, dict):
-                                            syms = {s.get('symbol') for s in (info.get('symbols') or []) if isinstance(s, dict)}
-                                            symb_req = api._binance_futures_symbol_alias((symb or '').upper().strip())
-                                            if (symb not in syms) and (symb_req not in syms):
-                                                try:
-                                                    api._mark_unsupported(ex_name, mkt, symb, tf)
-                                                except Exception:
-                                                    pass
-                                                _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_pair')
-                                                return pd.DataFrame()
-                                except Exception:
-                                    # If exchangeInfo fails, fall back to request (old behavior)
-                                    pass
-                                async def _call_binance():
-                                    return await api.klines_binance(symb, tf, limit, market=market)
-                                df = await _mid_call_with_retry(_call_binance)
-                                if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
-                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
-                                    return pd.DataFrame()
-                                dfn = _mid_norm_ohlcv(df)
-                                if dfn is None:
-                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
-                                    return pd.DataFrame()
-                                try:
-                                    if _h is not None:
-                                        prev = float(_h.get('score', 0.5) or 0.5)
-                                        _h['score'] = prev * 0.8 + 0.2 * 1.0
-                                        _h['fail_streak'] = 0
-                                        _h['last'] = time.time()
-                                except Exception:
-                                    pass
-                                return dfn
-                            if ex_name == "BYBIT":
-                                async def _call_bybit():
-                                    return await api.klines_bybit(symb, tf, limit, market=market)
-                                df = await _mid_call_with_retry(_call_bybit)
-                                if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
-                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
-                                    return pd.DataFrame()
-                                dfn = _mid_norm_ohlcv(df)
-                                if dfn is None:
-                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
-                                    return pd.DataFrame()
-                                try:
-                                    if _h is not None:
-                                        prev = float(_h.get('score', 0.5) or 0.5)
-                                        _h['score'] = prev * 0.8 + 0.2 * 1.0
-                                        _h['fail_streak'] = 0
-                                        _h['last'] = time.time()
-                                except Exception:
-                                    pass
-                                return dfn
-                            if ex_name == "OKX":
-                                async def _call_okx():
-                                    return await api.klines_okx(symb, tf, limit, market=market)
-                                df = await _mid_call_with_retry(_call_okx)
-                                if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
-                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
-                                    return pd.DataFrame()
-                                dfn = _mid_norm_ohlcv(df)
-                                if dfn is None:
-                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
-                                    return pd.DataFrame()
-                                try:
-                                    if _h is not None:
-                                        prev = float(_h.get('score', 0.5) or 0.5)
-                                        _h['score'] = prev * 0.8 + 0.2 * 1.0
-                                        _h['fail_streak'] = 0
-                                        _h['last'] = time.time()
-                                except Exception:
-                                    pass
-                                return dfn
-                            if ex_name == "GATEIO":
-                                async def _call_gateio():
-                                    return await api.klines_gateio(symb, tf, limit)
-                                df = await _mid_call_with_retry(_call_gateio)
-                                if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
-                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
-                                    return pd.DataFrame()
-                                dfn = _mid_norm_ohlcv(df)
-                                if dfn is None:
-                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
-                                    return pd.DataFrame()
-                                try:
-                                    if _h is not None:
-                                        prev = float(_h.get('score', 0.5) or 0.5)
-                                        _h['score'] = prev * 0.8 + 0.2 * 1.0
-                                        _h['fail_streak'] = 0
-                                        _h['last'] = time.time()
-                                except Exception:
-                                    pass
-                                return dfn
-                            # default MEXC
-                            async def _call_mexc():
-                                return await api.klines_mexc(symb, tf, limit)
-                            df = await _mid_call_with_retry(_call_mexc)
+                            async def _call_binance():
+                                return await api.klines_binance(symb, tf, limit, market=market)
+                            df = await _mid_call_with_retry(_call_binance)
                             if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
                                 _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
                                 return pd.DataFrame()
@@ -13340,1785 +13260,1865 @@ async def mid_status_summary_loop(self) -> None:
                             except Exception:
                                 pass
                             return dfn
-
-                    except Exception as e:
-                        # classify candle failures
-                        is_pair_not_found = False
+                        if ex_name == "BYBIT":
+                            async def _call_bybit():
+                                return await api.klines_bybit(symb, tf, limit, market=market)
+                            df = await _mid_call_with_retry(_call_bybit)
+                            if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
+                                _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
+                                return pd.DataFrame()
+                            dfn = _mid_norm_ohlcv(df)
+                            if dfn is None:
+                                _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
+                                return pd.DataFrame()
+                            try:
+                                if _h is not None:
+                                    prev = float(_h.get('score', 0.5) or 0.5)
+                                    _h['score'] = prev * 0.8 + 0.2 * 1.0
+                                    _h['fail_streak'] = 0
+                                    _h['last'] = time.time()
+                            except Exception:
+                                pass
+                            return dfn
+                        if ex_name == "OKX":
+                            async def _call_okx():
+                                return await api.klines_okx(symb, tf, limit, market=market)
+                            df = await _mid_call_with_retry(_call_okx)
+                            if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
+                                _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
+                                return pd.DataFrame()
+                            dfn = _mid_norm_ohlcv(df)
+                            if dfn is None:
+                                _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
+                                return pd.DataFrame()
+                            try:
+                                if _h is not None:
+                                    prev = float(_h.get('score', 0.5) or 0.5)
+                                    _h['score'] = prev * 0.8 + 0.2 * 1.0
+                                    _h['fail_streak'] = 0
+                                    _h['last'] = time.time()
+                            except Exception:
+                                pass
+                            return dfn
+                        if ex_name == "GATEIO":
+                            async def _call_gateio():
+                                return await api.klines_gateio(symb, tf, limit)
+                            df = await _mid_call_with_retry(_call_gateio)
+                            if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
+                                _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
+                                return pd.DataFrame()
+                            dfn = _mid_norm_ohlcv(df)
+                            if dfn is None:
+                                _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
+                                return pd.DataFrame()
+                            try:
+                                if _h is not None:
+                                    prev = float(_h.get('score', 0.5) or 0.5)
+                                    _h['score'] = prev * 0.8 + 0.2 * 1.0
+                                    _h['fail_streak'] = 0
+                                    _h['last'] = time.time()
+                            except Exception:
+                                pass
+                            return dfn
+                        # default MEXC
+                        async def _call_mexc():
+                            return await api.klines_mexc(symb, tf, limit)
+                        df = await _mid_call_with_retry(_call_mexc)
+                        if df is not None and not getattr(df, 'empty', True) and not _mid_rest_is_fresh(df):
+                            _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'stale_rest')
+                            return pd.DataFrame()
+                        dfn = _mid_norm_ohlcv(df)
+                        if dfn is None:
+                            _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'bad_schema', 'rest')
+                            return pd.DataFrame()
                         try:
-                            msg = str(e)
-                            umsg = msg.upper()
-                            # Pair/instrument does not exist on this exchange/market
-                            if isinstance(e, ExchangeAPIError):
-                                if ('INVALID SYMBOL' in umsg) or ('-1121' in umsg) or ('SYMBOL IS INVALID' in umsg) or ('NOT SUPPORTED SYMBOL' in umsg) or ('NOT SUPPORTED SYMBOLS' in umsg) or ('INSTRUMENT ID' in umsg and 'DOESN\'T EXIST' in umsg) or ('CODE=51001' in umsg):
-                                    is_pair_not_found = True
-                            # Some wrappers may not be ExchangeAPIError but still include these markers
-                            if (not is_pair_not_found) and (('SYMBOL IS INVALID' in umsg) or ('NOT SUPPORTED SYMBOL' in umsg) or ('NOT SUPPORTED SYMBOLS' in umsg) or ('INVALID SYMBOL' in umsg) or ('CODE=51001' in umsg) or ("DOESN'T EXIST" in umsg and 'INSTRUMENT' in umsg)):
-                                is_pair_not_found = True
+                            if _h is not None:
+                                prev = float(_h.get('score', 0.5) or 0.5)
+                                _h['score'] = prev * 0.8 + 0.2 * 1.0
+                                _h['fail_streak'] = 0
+                                _h['last'] = time.time()
+                        except Exception:
+                            pass
+                        return dfn
 
-                            if is_pair_not_found:
+                except Exception as e:
+                    # classify candle failures
+                    is_pair_not_found = False
+                    try:
+                        msg = str(e)
+                        umsg = msg.upper()
+                        # Pair/instrument does not exist on this exchange/market
+                        if isinstance(e, ExchangeAPIError):
+                            if ('INVALID SYMBOL' in umsg) or ('-1121' in umsg) or ('SYMBOL IS INVALID' in umsg) or ('NOT SUPPORTED SYMBOL' in umsg) or ('NOT SUPPORTED SYMBOLS' in umsg) or ('INSTRUMENT ID' in umsg and 'DOESN\'T EXIST' in umsg) or ('CODE=51001' in umsg):
+                                is_pair_not_found = True
+                        # Some wrappers may not be ExchangeAPIError but still include these markers
+                        if (not is_pair_not_found) and (('SYMBOL IS INVALID' in umsg) or ('NOT SUPPORTED SYMBOL' in umsg) or ('NOT SUPPORTED SYMBOLS' in umsg) or ('INVALID SYMBOL' in umsg) or ('CODE=51001' in umsg) or ("DOESN'T EXIST" in umsg and 'INSTRUMENT' in umsg)):
+                            is_pair_not_found = True
+
+                        if is_pair_not_found:
+                            _mid_candles_unsupported += 1
+                            try:
+                                api._mark_unsupported(ex_name, (market or 'SPOT'), symb, tf)
+                            except Exception:
+                                pass
+                        else:
+                            # HTTP 400/404 often means unsupported interval/symbol too
+                            if isinstance(e, ExchangeAPIError) and ('HTTP 400' in msg or 'HTTP 404' in msg):
                                 _mid_candles_unsupported += 1
                                 try:
                                     api._mark_unsupported(ex_name, (market or 'SPOT'), symb, tf)
                                 except Exception:
                                     pass
                             else:
-                                # HTTP 400/404 often means unsupported interval/symbol too
-                                if isinstance(e, ExchangeAPIError) and ('HTTP 400' in msg or 'HTTP 404' in msg):
-                                    _mid_candles_unsupported += 1
-                                    try:
-                                        api._mark_unsupported(ex_name, (market or 'SPOT'), symb, tf)
-                                    except Exception:
-                                        pass
-                                else:
-                                    _mid_candles_net_fail += 1
-                                    _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'fail', f"{type(e).__name__}: {e}")
-                        except Exception:
-                            pass
-                        # swallow but count (optional)
-                        try:
-                            if _mid_candles_log_fail:
-                                _mid_candles_fail[(ex_name, tf)] += 1
-                                lst = _mid_candles_fail_samples[(ex_name, tf)]
-                                if len(lst) < _mid_candles_log_samples:
-                                    lst.append(f"{type(e).__name__}: {e}")
-                        except Exception:
-                            pass
-
-                        # Health score / circuit breaker for transient failures
-                        try:
-                            if _h is not None and _mid_is_transient_exc(e):
-                                prev = float(_h.get('score', 0.5) or 0.5)
-                                _h['score'] = max(0.05, prev * 0.75)
-                                fs = int(_h.get('fail_streak', 0) or 0) + 1
-                                _h['fail_streak'] = fs
-                                _h['last'] = time.time()
-                                trip_n = int(os.getenv('MID_CANDLES_CB_FAILS', os.getenv('CANDLES_CB_FAILS', '3')) or 3)
-                                trip_n = max(2, min(10, trip_n))
-                                cooldown = float(os.getenv('MID_CANDLES_CB_COOLDOWN_SEC', os.getenv('CANDLES_CB_COOLDOWN_SEC', '180')) or 180)
-                                cooldown = max(30.0, min(900.0, cooldown))
-                                if fs >= trip_n:
-                                    _h['cooldown_until'] = time.time() + cooldown
-                                    _h['fail_streak'] = 0
-                        except Exception:
-                            pass
-                        return None
-
-                
-                
-                async def _mid_fetch_klines_wsdb_only(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
-                                    """Return candles using only in-memory cache + persistent DB cache.
-                                    NO REST, NO retries. Used to build higher TF from WS/DB 5m without accidentally triggering REST storms.
-                                    """
-                                    nonlocal _mid_db_hit, _mid_candles_cache
-                                    try:
-                                        _sn = (symb or '').strip().upper()
-                                        _sn = _sn.replace('-', '').replace('_', '').replace(':', '').replace('/', '')
-                                        for _suf in ('SWAP','PERP','PERPETUAL','FUT','FUTURES'):
-                                            if _sn.endswith(_suf):
-                                                _sn = _sn[: -len(_suf)]
-                                                break
-                                        symb_n = _sn
-                                        key = (ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(limit))
-                                        now = time.time()
-                                        ttl = _mid_cache_ttl(tf)
-                                        cached = _mid_candles_cache.get(key)
-                                        if cached:
-                                            ts, df = cached
-                                            if (now - ts) <= ttl and df is not None and not getattr(df, 'empty', True):
-                                                _mid_db_hit += 1
-                                                _mid_diag_ok(symb_n, ex_name, market, tf, 'cache', df)
-                                                dfn = _mid_norm_ohlcv(df)
-                                                if dfn is None:
-                                                    _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'cache')
-                                                    return pd.DataFrame()
-                                                return dfn
-
-                                        persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
-                                        if persist_enabled and tf in ("5m","30m","1h"):
-                                            try:
-                                                max_age = int(float(_mid_tf_stale_sec(tf, kind="persist")))
-                                                row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(limit))
-                                                if (not row):
-                                                    try:
-                                                        ws_limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
-                                                    except Exception:
-                                                        ws_limit = 250
-                                                    if int(limit) != int(ws_limit):
-                                                        row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(ws_limit))
-                                                if row:
-                                                    blob, updated_at = row
-                                                    if updated_at is not None:
-                                                        age = (dt.datetime.now(dt.timezone.utc) - updated_at).total_seconds()
-                                                    else:
-                                                        age = 0.0
-                                                    if age <= max_age:
-                                                        dfp = db_store._cc_unpack_df(blob)
-                                                        try:
-                                                            if dfp is not None and not dfp.empty and int(limit) > 0 and len(dfp) > int(limit):
-                                                                dfp = dfp.tail(int(limit)).copy()
-                                                        except Exception:
-                                                            pass
-                                                        if dfp is not None and not dfp.empty:
-                                                            _mid_db_hit += 1
-                                                            _mid_candles_cache[key] = (now, dfp)
-                                                            _mid_diag_ok(symb_n, ex_name, market, tf, 'persist', dfp)
-                                                            dfp_n = _mid_norm_ohlcv(dfp)
-                                                            if dfp_n is None:
-                                                                _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'persist')
-                                                                return pd.DataFrame()
-                                                            return dfp_n
-                                                    else:
-                                                        _mid_diag_add(symb_n, ex_name, market, tf, 'stale_persist')
-                                            except Exception:
-                                                pass
-                                    except Exception:
-                                        pass
-                                    return None
-
-                async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
-
-                    nonlocal _mid_candles_net_fail, _mid_candles_unsupported, _mid_candles_partial, _mid_db_hit, _mid_rest_refill, _mid_candles_cache, _mid_candles_empty, _mid_candles_empty_reasons, _mid_candles_empty_samples, _mid_candles_fallback
-                    # Normalize symbol consistently for cache + unsupported markers
-                    _sn = (symb or '').strip().upper()
-                    _sn = _sn.replace('-', '').replace('_', '').replace(':', '').replace('/', '')
-                    for _suf in ('SWAP','PERP','PERPETUAL','FUT','FUTURES'):
-                        if _sn.endswith(_suf):
-                            _sn = _sn[: -len(_suf)]
-                            break
-                    symb = _sn
-                    key = (ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
-                    mkt0 = (market or 'SPOT').upper().strip()
-                    # Fast skip: known unsupported (avoid repeated empty/unsupported storms)
-                    try:
-                        if api._is_unsupported_cached(ex_name, mkt0, symb, tf):
-                            _mid_candles_unsupported += 1
-                            _mid_diag_add(symb, ex_name, mkt0, tf, 'unsupported_cached', 'pre')
-                            return None
+                                _mid_candles_net_fail += 1
+                                _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'fail', f"{type(e).__name__}: {e}")
                     except Exception:
                         pass
-                    # Fast skip: market/symbol not supported according to cached instruments
-                    # (prevents FUTURES empty responses when the contract doesn't exist)
+                    # swallow but count (optional)
                     try:
-                        if getattr(api, "_market_avail_check", False):
-                            if not _market_supported_ex(ex_name, mkt0, symb):
-                                try:
-                                    api._mark_unsupported(ex_name, mkt0, symb, tf)
-                                except Exception:
-                                    pass
-                                _mid_diag_add(symb, ex_name, mkt0, tf, 'unsupported_pair', 'pre')
-                                _mid_candles_unsupported += 1
-                                return None
+                        if _mid_candles_log_fail:
+                            _mid_candles_fail[(ex_name, tf)] += 1
+                            lst = _mid_candles_fail_samples[(ex_name, tf)]
+                            if len(lst) < _mid_candles_log_samples:
+                                lst.append(f"{type(e).__name__}: {e}")
                     except Exception:
                         pass
-                    now = time.time()
-                    ttl = _mid_cache_ttl(tf)
-                    cached = _mid_candles_cache.get(key)
-                    if cached:
-                        ts, df = cached
-                        if (now - ts) <= ttl and df is not None and not df.empty:
-                            # IMPORTANT: treat short cache (got < need) as missing on cold start.
-                            # This allows REST-prefill / REST fallback to fill history after restart.
-                            try:
-                                need_bars = int(_mid_need_bars(tf) or 0)
-                            except Exception:
-                                need_bars = 0
-                            got_bars = 0
-                            try:
-                                got_bars = int(len(df))
-                            except Exception:
-                                got_bars = 0
-                            if need_bars and got_bars < need_bars:
-                                # keep diag as partial, but do NOT return; fall through to persist/prefill/REST
-                                _mid_diag_ok(symb, ex_name, market, tf, 'cache', df)
-                            else:
-                                _mid_db_hit += 1
-                                _mid_diag_ok(symb, ex_name, market, tf, 'cache', df)
-                                return df
-                    
-                    # Persistent candles cache (Postgres) to survive restarts.
-                    persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
-                    if persist_enabled and tf in ("5m","30m","1h"):
-                        try:
-                            max_age = int(float(_mid_tf_stale_sec(tf, kind="persist")))
-                            row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
-                            if (not row):
-                                # WS-candles service usually persists with a single fixed limit (default 250).
-                                # If MID asks for a different limit (e.g. 200/120), try the WS limit as fallback
-                                # to maximize cache hits and avoid REST storms.
-                                try:
-                                    ws_limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
-                                except Exception:
-                                    ws_limit = 250
-                                if int(limit) != int(ws_limit):
-                                    row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(ws_limit))
-                            if row:
-                                blob, updated_at = row
-                                if updated_at is not None:
-                                    age = (dt.datetime.now(dt.timezone.utc) - updated_at).total_seconds()
-                                else:
-                                    age = 0.0
-                                if age <= max_age:
-                                    dfp = db_store._cc_unpack_df(blob)
-                                    try:
-                                        if dfp is not None and not dfp.empty and int(limit) > 0 and len(dfp) > int(limit):
-                                            dfp = dfp.tail(int(limit)).copy()
-                                    except Exception:
-                                        pass
-                                    if dfp is not None and not dfp.empty:
-                                        # IMPORTANT: treat short persist cache (got < need) as missing.
-                                        # This prevents cold-start got=1 from blocking signals for hours.
-                                        dfp_n = _mid_norm_ohlcv(dfp)
-                                        if dfp_n is None:
-                                            _mid_diag_add(symb, ex_name, market, tf, 'bad_schema', 'persist')
-                                            return pd.DataFrame()
-                                        try:
-                                            need_bars = int(_mid_need_bars(tf) or 0)
-                                        except Exception:
-                                            need_bars = 0
-                                        got_bars = 0
-                                        try:
-                                            got_bars = int(len(dfp_n))
-                                        except Exception:
-                                            got_bars = 0
-                                        if need_bars and got_bars < need_bars:
-                                            # record diag + cache, but fall through to prefill/REST
-                                            _mid_db_hit += 1
-                                            _mid_candles_cache[key] = (now, dfp_n)
-                                            _mid_diag_ok(symb, ex_name, market, tf, 'persist', dfp_n)
-                                        else:
-                                            _mid_db_hit += 1
-                                            _mid_candles_cache[key] = (now, dfp_n)
-                                            _mid_diag_ok(symb, ex_name, market, tf, 'persist', dfp_n)
-                                            return dfp_n
-                        except Exception:
-                            pass
 
-                    # --- REST prefill for cold start (fills history after restart) ---
-                    # WS is great for live updates but after restart may have got=1.
-                    # When enabled, if we don't have enough bars in cache/DB, we do a one-time REST prefill
-                    # (with per-symbol/TF cooldown) and persist the result to Postgres candles_cache.
-                    prefill_enabled = str(os.getenv("MID_PREFILL_FROM_REST", "0") or "0").strip().lower() not in ("0","false","no","off")
-                    prefill_only_if_missing = str(os.getenv("MID_PREFILL_ONLY_IF_MISSING", "1") or "1").strip().lower() not in ("0","false","no","off")
+                    # Health score / circuit breaker for transient failures
                     try:
-                        prefill_cooldown = float(os.getenv("MID_PREFILL_COOLDOWN_SEC", "900") or 900)
+                        if _h is not None and _mid_is_transient_exc(e):
+                            prev = float(_h.get('score', 0.5) or 0.5)
+                            _h['score'] = max(0.05, prev * 0.75)
+                            fs = int(_h.get('fail_streak', 0) or 0) + 1
+                            _h['fail_streak'] = fs
+                            _h['last'] = time.time()
+                            trip_n = int(os.getenv('MID_CANDLES_CB_FAILS', os.getenv('CANDLES_CB_FAILS', '3')) or 3)
+                            trip_n = max(2, min(10, trip_n))
+                            cooldown = float(os.getenv('MID_CANDLES_CB_COOLDOWN_SEC', os.getenv('CANDLES_CB_COOLDOWN_SEC', '180')) or 180)
+                            cooldown = max(30.0, min(900.0, cooldown))
+                            if fs >= trip_n:
+                                _h['cooldown_until'] = time.time() + cooldown
+                                _h['fail_streak'] = 0
                     except Exception:
-                        prefill_cooldown = 900.0
-                    try:
-                        prefill_timeout = float(os.getenv("MID_PREFILL_TIMEOUT_SEC", "3.5") or 3.5)
-                    except Exception:
-                        prefill_timeout = 3.5
+                        pass
+                    return None
 
-                    def _prefill_limit_for_tf(tf_: str) -> int:
-                        ttf = (tf_ or "").strip().lower()
-                        try:
-                            if ttf in ("5m","5min","5"):
-                                return int(os.getenv("MID_PREFILL_LIMIT_5M", "300") or 300)
-                            if ttf in ("30m","30min","30"):
-                                return int(os.getenv("MID_PREFILL_LIMIT_30M", "200") or 200)
-                            return int(os.getenv("MID_PREFILL_LIMIT_1H", "150") or 150)
-                        except Exception:
-                            return 300 if ttf.startswith("5") else (200 if ttf.startswith("30") else 150)
+            
+            
+            async def _mid_fetch_klines_wsdb_only(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
+                                """Return candles using only in-memory cache + persistent DB cache.
+                                NO REST, NO retries. Used to build higher TF from WS/DB 5m without accidentally triggering REST storms.
+                                """
+                                nonlocal _mid_db_hit, _mid_candles_cache
+                                try:
+                                    _sn = (symb or '').strip().upper()
+                                    _sn = _sn.replace('-', '').replace('_', '').replace(':', '').replace('/', '')
+                                    for _suf in ('SWAP','PERP','PERPETUAL','FUT','FUTURES'):
+                                        if _sn.endswith(_suf):
+                                            _sn = _sn[: -len(_suf)]
+                                            break
+                                    symb_n = _sn
+                                    key = (ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(limit))
+                                    now = time.time()
+                                    ttl = _mid_cache_ttl(tf)
+                                    cached = _mid_candles_cache.get(key)
+                                    if cached:
+                                        ts, df = cached
+                                        if (now - ts) <= ttl and df is not None and not getattr(df, 'empty', True):
+                                            _mid_db_hit += 1
+                                            _mid_diag_ok(symb_n, ex_name, market, tf, 'cache', df)
+                                            dfn = _mid_norm_ohlcv(df)
+                                            if dfn is None:
+                                                _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'cache')
+                                                return pd.DataFrame()
+                                            return dfn
 
-                    # prefill guard state
-                    if prefill_enabled and tf in ("5m","30m","1h"):
-                        try:
-                            # If we already have enough bars in WS/DB cache -> skip prefill.
-                            need = _mid_need_bars(tf) if prefill_only_if_missing else 0
-                            if need and int(limit) > 0 and int(limit) >= need:
-                                # We don't know got here because cache lookup already failed, so treat as missing.
-                                pass
-                            if not hasattr(self, "_mid_prefill_last"):
-                                self._mid_prefill_last = {}  # type: ignore[attr-defined]
-                            _pl = self._mid_prefill_last  # type: ignore[attr-defined]
-                            _pkey = (ex_name, (market or "SPOT").upper().strip(), symb, tf)
-                            last_ts = float(_pl.get(_pkey, 0.0) or 0.0)
-                            # If we have a recent successful prefill for this (market,symbol,tf),
-                            # don't hit REST again even if we rotate exchanges.
-                            if not hasattr(self, "_mid_prefill_last_ok"):
-                                self._mid_prefill_last_ok = {}  # type: ignore[attr-defined]
-                            _pl_ok = self._mid_prefill_last_ok  # type: ignore[attr-defined]
-                            _okey = ((market or "SPOT").upper().strip(), symb, tf)
-                            last_ok = float(_pl_ok.get(_okey, 0.0) or 0.0)
-                            if (time.time() - last_ok) < float(prefill_cooldown):
-                                last_ts = time.time()
-                                try:
-                                    if _mid_log_prefill:
-                                        _left = float(prefill_cooldown) - (time.time() - last_ok)
+                                    persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
+                                    if persist_enabled and tf in ("5m","30m","1h"):
                                         try:
-                                            _ctx = _MID_TICK_CTX.get()
-                                            _ps = _ctx.get('prefill_skip') if isinstance(_ctx, dict) else None
-                                            _k = (symb, tf, (market or "SPOT").upper().strip())
-                                            if isinstance(_ps, set) and _k in _ps:
-                                                pass
-                                            else:
-                                                if isinstance(_ps, set):
-                                                    _ps.add(_k)
-                                                # Skip logs are noisy; keep them on DEBUG when explicitly enabled.
-                                                logger.debug("[mid][prefill_skip] symbol=%s tf=%s market=%s reason=cooldown left=%.1fs", symb, tf, (market or "SPOT"), max(0.0, _left))
-                                        except Exception:
-                                            logger.debug("[mid][prefill_skip] symbol=%s tf=%s market=%s reason=cooldown left=%.1fs", symb, tf, (market or "SPOT"), max(0.0, _left))
-                                except Exception:
-                                    pass
-
-                            if (time.time() - last_ts) >= float(prefill_cooldown):
-                                _pl[_pkey] = float(time.time())
-                                pf_limit = _prefill_limit_for_tf(tf)
-                                # ensure prefill limit at least what caller asked
-                                try:
-                                    pf_limit = int(max(int(pf_limit), int(limit)))
-                                except Exception:
-                                    pf_limit = int(pf_limit)
-                                # Do REST prefill (single venue) with a short timeout.
-                                try:
-                                    try:
-                                        if _mid_log_prefill:
-                                            logger.debug("[mid][prefill_try] symbol=%s tf=%s market=%s ex=%s limit=%s pf_limit=%s timeout=%ss", symb, tf, (market or "SPOT"), ex_name, limit, pf_limit, prefill_timeout)
-                                    except Exception:
-                                        pass
-                                    df_pf = await asyncio.wait_for(
-                                        _mid_fetch_klines_rest(ex_name, symb, tf, int(pf_limit), market),
-                                        timeout=float(prefill_timeout),
-                                    )
-                                except Exception as _e_pf:
-                                    # If REST prefill fails, this is important: candles may be unavailable.
-                                    # Log once per (market,symbol,tf) per tick.
-                                    df_pf = None
-                                    try:
-                                        _ctx = _MID_TICK_CTX.get()
-                                        _pe = _ctx.get('prefill_err') if isinstance(_ctx, dict) else None
-                                        _k = ((market or "SPOT").upper().strip(), symb, tf, ex_name)
-                                        if isinstance(_pe, set) and _k in _pe:
-                                            pass
-                                        else:
-                                            if isinstance(_pe, set):
-                                                _pe.add(_k)
-                                            logger.warning(
-                                                "[mid][prefill_error] symbol=%s tf=%s market=%s ex=%s err=%s",
-                                                symb, tf, (market or "SPOT"), ex_name, str(_e_pf),
-                                            )
-                                    except Exception:
-                                        logger.warning(
-                                            "[mid][prefill_error] symbol=%s tf=%s market=%s ex=%s",
-                                            symb, tf, (market or "SPOT"), ex_name,
-                                        )
-                                if df_pf is not None and not getattr(df_pf, "empty", True):
-                                    # normalize once, then persist
-                                    df_pf_n = _mid_norm_ohlcv(df_pf)
-                                    if df_pf_n is not None and not getattr(df_pf_n, "empty", True):
-                                        got_pf = 0
-                                        try:
-                                            got_pf = int(len(df_pf_n))
-                                        except Exception:
-                                            got_pf = 0
-                                        # Persist under multiple common limits to maximize reuse (prefill_limit + WS limit + requested limit).
-                                        try:
-                                            if persist_enabled:
+                                            max_age = int(float(_mid_tf_stale_sec(tf, kind="persist")))
+                                            row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(limit))
+                                            if (not row):
                                                 try:
                                                     ws_limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
                                                 except Exception:
                                                     ws_limit = 250
-                                                    ws_limit = 250
-                                                if int(ws_limit) != int(pf_limit) and got_pf:
-                                                    df_ws = df_pf_n.tail(int(ws_limit)).copy() if got_pf > int(ws_limit) else df_pf_n
-                                                    blob_ws = db_store._cc_pack_df(df_ws)
-                                                    await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(ws_limit), blob_ws)
-                                                if int(limit) != int(pf_limit) and int(limit) > 0 and got_pf:
-                                                    df_req = df_pf_n.tail(int(limit)).copy() if got_pf > int(limit) else df_pf_n
-                                                    blob_req = db_store._cc_pack_df(df_req)
-                                                    await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob_req)
-                                        except Exception:
-                                            pass
-                                        # Cache in memory for this request
-                                        try:
-                                            df_ret = df_pf_n
-                                            if int(limit) > 0 and got_pf and got_pf > int(limit):
-                                                df_ret = df_pf_n.tail(int(limit)).copy()
-                                            _mid_candles_cache[key] = (now, df_ret)
-                                        except Exception:
-                                            df_ret = df_pf_n
-                                        _mid_rest_refill += 1
-                                        # Successful prefill is normal; keep it silent by default.
-                                        if _mid_log_prefill and _mid_log_prefill_ok:
-                                            try:
-                                                logger.debug(
-                                                    "[mid][prefill_ok] symbol=%s tf=%s market=%s ex=%s got=%s limit=%s pf_limit=%s",
-                                                    symb, tf, (market or "SPOT"), ex_name, got_pf, limit, pf_limit,
-                                                )
-                                            except Exception:
-                                                pass
-                                        _mid_diag_ok(symb, ex_name, market, tf, "rest_prefill", df_pf_n)
-                                        try:
-                                            if hasattr(self, "_mid_prefill_last_ok"):
-                                                self._mid_prefill_last_ok[((market or "SPOT").upper().strip(), symb, tf)] = float(time.time())  # type: ignore[attr-defined]
-                                        except Exception:
-                                            pass
-                                        return df_ret
-                                else:
-                                    # REST returned empty/no data -> that's a real problem; log once per tick.
-                                    try:
-                                        _ctx = _MID_TICK_CTX.get()
-                                        _pe0 = _ctx.get('prefill_empty') if isinstance(_ctx, dict) else None
-                                        _k0 = ((market or "SPOT").upper().strip(), symb, tf, ex_name)
-                                        if isinstance(_pe0, set) and _k0 in _pe0:
-                                            pass
-                                        else:
-                                            if isinstance(_pe0, set):
-                                                _pe0.add(_k0)
-                                            logger.warning(
-                                                "[mid][prefill_empty] symbol=%s tf=%s market=%s ex=%s pf_limit=%s",
-                                                symb, tf, (market or "SPOT"), ex_name, pf_limit,
-                                            )
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            pass
-
-
-
-                    # If TF is 30m/1h and we have 5m candles (WS/DB), build higher TF from 5m to avoid REST.
-                    if tf in ("30m", "1h"):
-                        try:
-                            tf_minutes = 30 if tf == "30m" else 60
-                            # Get 5m candles (WS/DB-first; REST only if no cache)
-                            df5 = await _mid_fetch_klines_wsdb_only(ex_name, symb, "5m", int(max(limit, 120)), market)
-                            if df5 is not None and not getattr(df5, "empty", True):
-                                d5 = df5.copy()
-                                try:
-                                    if "open_time" in d5.columns and "open_time_ms" not in d5.columns:
-                                        d5["open_time_ms"] = d5["open_time"].astype("int64")
-                                    if "close_time" in d5.columns and "close_time_ms" not in d5.columns:
-                                        d5["close_time_ms"] = d5["close_time"].astype("int64")
-                                    d5["open_time_ms"] = d5["open_time_ms"].astype("int64")
-                                    if "close_time_ms" in d5.columns:
-                                        d5["close_time_ms"] = d5["close_time_ms"].astype("int64")
-                                except Exception:
-                                    pass
-
-                                bucket_ms = tf_minutes * 60_000
-                                ot = d5["open_time_ms"].astype("int64")
-                                b = (ot // bucket_ms) * bucket_ms
-                                d5 = d5.assign(_bucket=b)
-
-                                g = d5.groupby("_bucket", sort=True)
-
-                                out = g.agg(
-                                    open_time_ms=("open_time_ms", "min"),
-                                    open=("open", "first"),
-                                    high=("high", "max"),
-                                    low=("low", "min"),
-                                    close=("close", "last"),
-                                    volume=("volume", "sum"),
-                                ).reset_index(drop=True)
-
-                                try:
-                                    if "close_time_ms" in d5.columns:
-                                        out["close_time_ms"] = g["close_time_ms"].max().values
-                                    else:
-                                        out["close_time_ms"] = out["open_time_ms"].astype("int64") + bucket_ms
-                                except Exception:
-                                    out["close_time_ms"] = out["open_time_ms"].astype("int64") + bucket_ms
-
-                                # add extra cols for packed DF compatibility
-                                for _c, _v in (
-                                    ("quote_volume", 0.0),
-                                    ("trades", 0),
-                                    ("taker_base_volume", 0.0),
-                                    ("taker_quote_volume", 0.0),
-                                    ("ignore", 0),
-                                ):
-                                    if _c not in out.columns:
-                                        out[_c] = _v
-
-                                # freshness check
-                                try:
-                                    max_age = float(os.getenv("MID_AGG_FROM_5M_MAX_AGE_SEC", "1800") or 1800)
-                                    now_ms = int(time.time() * 1000)
-                                    last_close = int(out["close_time_ms"].iloc[-1])
-                                    allowed = max(max_age, float(tf_minutes) * 60.0 * 2.0)
-                                    if (now_ms - last_close) <= int(allowed * 1000):
-                                        if int(limit) > 0 and len(out) > int(limit):
-                                            out = out.tail(int(limit)).copy()
-                                        _mid_candles_cache[key] = (now, out)
-                                        _mid_diag_add(symb, ex_name, market, tf, "OK", "agg_from_5m")
-                                        try:
-                                            if persist_enabled and tf in ("30m", "1h"):
-                                                blob = db_store._cc_pack_df(out)
-                                                await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob)
-                                        except Exception:
-                                            pass
-                                        return out
-                                    else:
-                                        _mid_diag_add(symb, ex_name, market, tf, "stale_agg_from_5m")
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-
-                    # --- REST fetch with adaptive limit (250 -> 200 -> 120) that works even when mid_candles_retry=0 ---
-                    last = None
-                    base_limit = int(limit)
-                    limits_to_try = []
-                    try:
-                        if base_limit > 0:
-                            limits_to_try.append(base_limit)
-                        if base_limit > 200:
-                            limits_to_try.append(200)
-                        if base_limit > 120:
-                            limits_to_try.append(120)
-                        _seen = set()
-                        limits_to_try = [x for x in limits_to_try if (x not in _seen and not _seen.add(x))]
-                    except Exception:
-                        limits_to_try = [int(limit)]
-                    
-                    for _i in range(max(0, mid_candles_retry) + 1):
-                        for _lim in limits_to_try:
-                            limit = int(_lim)
-                            last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, market)
-                    
-                            # If response is empty (no exception), count as EMPTY + optional adaptive behaviors
-                            if last is None or getattr(last, 'empty', False):
-                    
-                                # Bidirectional market fallback (FUTURES <-> SPOT) when requested market yields empty/None/unsupported.
-                                try:
-                                    mkt_req = (market or 'SPOT').upper().strip()
-                                    fb_global = str(os.getenv('MID_CANDLES_MARKET_FALLBACK', '1') or '1').strip().lower() not in ('0','false','no','off')
-                                    if fb_global and mkt_req in ('FUTURES', 'SPOT'):
-                                        if mkt_req == 'FUTURES':
-                                            fb_on = str(os.getenv('MID_CANDLES_FUTURES_FALLBACK_SPOT', '1') or '1').strip().lower() not in ('0','false','no','off')
-                                            alt = 'SPOT' if fb_on else None
-                                        else:
-                                            fb_on = str(os.getenv('MID_CANDLES_SPOT_FALLBACK_FUTURES', '1') or '1').strip().lower() not in ('0','false','no','off')
-                                            alt = 'FUTURES' if fb_on else None
-                                        if alt:
-                                            alt_df = await _mid_fetch_klines_rest(ex_name, symb, tf, int(limit), alt)
-                                            if alt_df is not None and not getattr(alt_df, 'empty', True):
-                                                # Cache write-through under BOTH markets to suppress repeated empties.
-                                                key_alt = (ex_name, alt, symb, tf, int(limit))
-                                                _mid_candles_cache[key_alt] = (now, alt_df)
-                                                _mid_candles_cache[key] = (now, alt_df)
-                                                # write-through to persistent cache
-                                                try:
-                                                    persist_enabled = str(os.getenv('MID_PERSIST_CANDLES', '1') or '1').strip().lower() not in ('0','false','no','off')
-                                                    if persist_enabled and tf in ('5m','30m','1h'):
-                                                        blob = db_store._cc_pack_df(alt_df)
-                                                        await db_store.candles_cache_set(ex_name, alt, symb, tf, int(limit), blob)
-                                                        await db_store.candles_cache_set(ex_name, mkt_req, symb, tf, int(limit), blob)
-                                                except Exception:
-                                                    pass
-                                                _mid_candles_fallback += 1
-                                                _mid_diag_add(symb, ex_name, mkt_req, tf, 'OK', f"fallback_{alt.lower()}")
-                                                return alt_df
-                                except Exception:
-                                    pass
-                    
-                                # If we got an empty dataframe, it often means the instrument doesn't exist for this market (esp. OKX SWAP).
-                                # Re-check market availability and convert empty->unsupported_pair to avoid repeated empty storms.
-                                try:
-                                    mkt_now = (market or 'SPOT').upper().strip()
-                                    if await api._market_supported_ex(ex_name, mkt_now, symb) is False:
-                                        try:
-                                            api._mark_unsupported(ex_name, mkt_now, symb, tf)
-                                        except Exception:
-                                            pass
-                                        _mid_diag_add(symb, ex_name, mkt_now, tf, 'unsupported_pair')
-                                        _mid_candles_unsupported += 1
-                                        return None
-                                except Exception:
-                                    pass
-                    
-                                # If REST returned empty on the *smallest* limit for BYBIT/OKX FUTURES, treat as unsupported to stop storms.
-                                try:
-                                    mkt_now2 = (market or 'SPOT').upper().strip()
-                                    empty_as_unsup = str(os.getenv('MID_EMPTY_FUTURES_AS_UNSUPPORTED', '1') or '1').strip().lower() not in ('0','false','no','off')
-                                    is_last_lim = (int(limit) <= 120) or (limit == limits_to_try[-1])
-                                    is_last_try = (_i >= max(0, mid_candles_retry))
-                                    if empty_as_unsup and mkt_now2 == 'FUTURES' and ex_name in ('BYBIT','OKX') and is_last_lim and is_last_try:
-                                        try:
-                                            api._mark_unsupported(ex_name, mkt_now2, symb, tf)
-                                        except Exception:
-                                            pass
-                                        _mid_diag_add(symb, ex_name, mkt_now2, tf, 'unsupported_pair', 'empty_futures')
-                                        _mid_candles_unsupported += 1
-                                        return None
-                                except Exception:
-                                    pass
-                    
-                                
-                                # If REST returned empty repeatedly (any exchange/market), optionally treat it as unsupported
-                                # to avoid repeated empty storms and let other venues win quickly.
-                                try:
-                                    mkt_now2 = (market or 'SPOT').upper().strip()
-                                    empty_as_unsup_all = str(os.getenv('MID_EMPTY_AS_UNSUPPORTED', '1') or '1').strip().lower() not in ('0','false','no','off')
-                                    min_lim = int(os.getenv('MID_EMPTY_AS_UNSUPPORTED_MIN_LIMIT', '120') or 120)
-                                    is_small_lim = (int(limit) <= min_lim) or (limit == limits_to_try[0])
-                                    is_last_try = (_i >= max(0, mid_candles_retry))
-                                    if empty_as_unsup_all and is_small_lim and is_last_try:
-                                        try:
-                                            api._mark_unsupported(ex_name, mkt_now2, symb, tf)
-                                        except Exception:
-                                            pass
-                                        _mid_diag_add(symb, ex_name, mkt_now2, tf, 'unsupported_pair', 'empty')
-                                        _mid_candles_unsupported += 1
-                                        return None
-                                except Exception:
-                                    pass
-# If it was explicitly marked unsupported (e.g. market not implemented),
-                                # don't count it as an "empty candles" sample.
-                                if api._is_unsupported_cached(ex_name, (market or 'SPOT').upper().strip(), symb, tf):
-                                    _mid_candles_unsupported += 1
-                                    return None
-
-                                # Treat persistent "empty" as unsupported_pair (most often: contract doesn't exist).
-                                # This makes MID immediately try other markets/exchanges instead of accumulating empty storms.
-                                try:
-                                    api._mark_unsupported(ex_name, (market or 'SPOT').upper().strip(), symb, tf)
-                                except Exception:
-                                    pass
-                                _mid_diag_add(symb, ex_name, (market or 'SPOT').upper().strip(), tf, 'unsupported_pair', 'empty')
-                                _mid_candles_unsupported += 1
-                                return None
-                    
-                            # got non-empty candles
-                            break
-                        else:
-                            # all limits empty for this retry iteration
-                            last = __import__('pandas').DataFrame()
-                    
-                        if last is not None and not getattr(last, 'empty', True):
-                            break
-                    
-                        # tiny backoff reduces rate-limit bursts and improves success on flaky networks
-                        if _i < max(0, mid_candles_retry):
-                            try:
-                                await __import__('asyncio').sleep(0.15 * (_i + 1))
-                            except Exception:
-                                pass
-                    
-                    if last is not None and not getattr(last, 'empty', True):
-                        # Accept REST candles only if newest candle is reasonably fresh (prevents stale REST poisoning).
-                        try:
-                            rest_max_age = float(os.getenv('MID_REST_CANDLES_MAX_AGE_SEC', '1800') or 1800)
-                            tf_sec = 300.0 if tf == '5m' else (1800.0 if tf == '30m' else (3600.0 if tf == '1h' else 0.0))
-                            allowed = max(rest_max_age, tf_sec * 2.0) if tf_sec > 0 else rest_max_age
-                            now_ms = int(__import__('time').time() * 1000)
-                            if 'close_time_ms' in last.columns:
-                                _last_close = int(float(last['close_time_ms'].iloc[-1]))
-                            elif 'close_time' in last.columns:
-                                _last_close = int(float(last['close_time'].iloc[-1]))
-                            else:
-                                _last_close = 0
-                            if _last_close > 0 and (now_ms - _last_close) > int(allowed * 1000):
-                                _mid_diag_add(symb, ex_name, market, tf, 'stale_rest')
-                                last = __import__('pandas').DataFrame()
-                        except Exception:
-                            pass
-                    
-                    if last is not None and not getattr(last, 'empty', True):
-                        _mid_candles_cache[key] = (now, last)
-                        # write-through to persistent cache
-                        try:
-                            persist_enabled = str(os.getenv('MID_PERSIST_CANDLES', '1') or '1').strip().lower() not in ('0','false','no','off')
-                            if persist_enabled and tf in ('5m','30m','1h'):
-                                blob = db_store._cc_pack_df(last)
-                                await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob)
-                        except Exception:
-                            pass
-                        _mid_rest_refill += 1
-                        _mid_diag_ok(symb, ex_name, market, tf, 'rest', last)
-                        return last
-                    
-                    # fallback to stale cache if available and not too old
-                    if cached:
-                        ts, df = cached
-                        if (now - ts) <= float(_mid_tf_stale_sec(tf, kind="cache")) and df is not None and not df.empty:
-                            return df
-                    return None
-
-                try:
-                    async with MultiExchangeData() as api:
-                        await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
-                        # Same best-effort symbols loading as MAIN scanner.
-                        # --- MID symbols pool (independent from MAIN scanner cache) ---
-                        if not hasattr(self, "_mid_symbols_cache"):
-                            self._mid_symbols_cache = []
-                            self._mid_symbols_cache_ts = 0.0
-                        try:
-                            symbols_pool = await api.get_top_usdt_symbols(top_n_symbols)
-                            if symbols_pool:
-                                # Normalize symbols across exchanges (OKX uses BTC-USDT / BTC-USDT-SWAP, Gate may use BTC_USDT).
-                                # Internally we use canonical BASEQUOTE like BTCUSDT.
-                                def _mid_norm_symbol(s: str) -> str:
-                                    u = (s or "").upper().strip()
-                                    # Remove common separators
-                                    u = u.replace("-", "").replace("_", "").replace(":", "")
-                                    # Strip derivative suffixes
-                                    for suf in ("SWAP", "PERP", "FUT", "FUTURES"):
-                                        if u.endswith(suf):
-                                            u = u[: -len(suf)]
-                                            break
-                                    return u
-
-                                symbols_pool = [_mid_norm_symbol(x) for x in symbols_pool if x]
-                                # Production hardening: drop obviously invalid symbols early (prevents invalid_symbol_format/no_candles storms)
-                                _sym_ok = re.compile(r'^[A-Z0-9]{2,20}USDT$')
-                                symbols_pool = [x for x in symbols_pool if x and x.isascii() and x.endswith('USDT') and _sym_ok.match(x)]
-                                # de-duplicate (some exchanges/pools can return duplicates)
-                                symbols_pool = list(dict.fromkeys(symbols_pool))
-                                self._mid_symbols_cache = list(symbols_pool)
-                                self._mid_symbols_cache_ts = time.time()
-                                # remember which exchange provided this universe (so MID prefers correct candles exchange)
-                                try:
-                                    _pref_ex = getattr(api, 'last_top_provider', None)
-                                    if _pref_ex:
-                                        self._mid_symbols_cache_provider = str(_pref_ex)
-                                        self._mid_symbol_pref_exchange = {s: str(_pref_ex) for s in symbols_pool}
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            if getattr(self, "_mid_symbols_cache", None):
-                                logger.warning("[mid] get_top_usdt_symbols failed (%s); using cached symbols (%s)", e, len(self._mid_symbols_cache))
-                                symbols_pool = list(self._mid_symbols_cache)
-                                try:
-                                    _pref_ex = getattr(self, '_mid_symbols_cache_provider', None)
-                                    if _pref_ex:
-                                        self._mid_symbol_pref_exchange = {s: str(_pref_ex) for s in symbols_pool}
-                                except Exception:
-                                    pass
-                            else:
-                                raise
-                        # Scan only first MID_TOP_N symbols from the loaded universe.
-                        # FIX: remove blocked/stable symbols BEFORE slicing to TOP_N
-                        _filtered_pool = [s for s in symbols_pool if not is_blocked_symbol(s)]
-                        symbols = list(_filtered_pool[:max(0, int(top_n))])
-                        # ensure unique symbols per tick (preserve order)
-                        if symbols:
-                            symbols = list(dict.fromkeys(symbols))
-                        # Prefilter symbols that are not available on ANY configured MID candle source.
-                        # This removes candles_unavailable storms like FXSUSDT and reduces wasted HTTP calls.
-                        try:
-                            prefilter = (os.getenv("MID_PREFILTER_UNSUPPORTED_SYMBOLS", "1") or "1").strip().lower() in ("1","true","yes","on")
-                        except Exception:
-                            prefilter = True
-                        if prefilter and symbols:
-                            try:
-                                _kept = []
-                                for _s in symbols:
-                                    if is_blocked_symbol(_s):
-                                        _rej_add(_s, "trap_block")
-                                        continue
-                                    _ok = False
-                                    # Try both markets because later we may fall back FUTURES->SPOT
-                                    for _mkt in ("FUTURES","SPOT"):
-                                        for _ex in (mid_universe or ["BINANCE","BYBIT","OKX"]):
-                                            try:
-                                                if _market_supported_ex(_ex, _mkt, _s):
-                                                    _ok = True
-                                                    break
-                                            except Exception:
-                                                continue
-                                        if _ok:
-                                            break
-                                    if _ok:
-                                        _kept.append(_s)
-                                    else:
-                                        # remember for routing diagnostics
-                                        _rej_add(_s, "candles_unavailable")
-                                symbols = _kept
-                            except Exception:
-                                pass
-                        # --- MID tick counters / diagnostics ---
-                        _mid_scanned = len(symbols)
-                        _mid_pool = len(symbols_pool)
-                        _mid_emitted = 0
-                        _mid_skip_blocked = 0
-                        _mid_skip_cooldown = 0
-                        _mid_skip_macro = 0
-                        _mid_skip_news = 0
-                        _mid_skip_trap = 0
-                        _mid_f_align = 0
-                        _mid_f_score = 0
-                        _mid_ta_score_low = 0
-                        _mid_ta_score_missing_sum = 0.0
-                        _mid_ta_score_missing_max = 0.0
-                        _mid_f_rr = 0
-                        _mid_f_adx = 0
-                        _mid_f_atr = 0
-                        _mid_f_futoff = 0
-                        _mid_candles_net_fail = 0
-                        _mid_no_signal = 0
-                        _mid_no_signal_reasons = {"trap":0,"structure":0,"trend":0,"extreme":0,"impulse":0,"other":0}
-                        _mid_no_signal_stage_by_sym = {}
-                        _mid_no_signal_stages_by_sym = {}
-                        _mid_no_signal_detail_reasons_other = {}  # base_reason -> count (stage==other only)
-                        _mid_no_signal_reasons_by_sym = {}      # sym -> [fail_reason...] per venue
-                        _rej_reasons_added = set()  # ensure _rej_reasons_by_sym merged once per sym
-  # sym -> [stage per venue with OK candles]
-                        _mid_no_signal_stage_mode = str(os.getenv("MID_NO_SIGNAL_STAGE_MODE","best")).strip().lower()
-                        if _mid_no_signal_stage_mode not in ("best","majority"):
-                            _mid_no_signal_stage_mode = "best"
-
-                        _mid_candles_unsupported = 0
-                        _mid_candles_partial = 0
-                        _mid_db_hit = 0
-                        _mid_rest_refill = 0
-                        _c0 = api.candle_counters_snapshot()
-                        _mid_hard_block0 = _mid_hard_block_total()
-                        try:
-                            _mid_adapt_reset_tick()
-                        except Exception:
-                            pass
-                        _mid_hard_block = 0
-
-                        # --- MID reject digest (log-only): explains "scanned=N but counters don't add up" ---
-                        # MID reject digest (enabled by default; set MID_REJECT_DIGEST=0 to disable)
-                        _rej_enabled = os.getenv("MID_REJECT_DIGEST", "1").strip().lower() in ("1","true","yes","on")
-                        _rej_max_reasons = int(os.getenv("MID_REJECT_DIGEST_MAX_REASONS", "12") or 12)
-                        _rej_examples = int(os.getenv("MID_REJECT_DIGEST_EXAMPLES", "3") or 3)
-                        _rej_seen = set()
-                        _rej_counts = {}
-                        _rej_examples_map = {}
-                        _rej_full = os.getenv("MID_REJECT_DIGEST_FULL", "0").strip().lower() in ("1","true","yes","on")
-                        _rej_full_max = int(os.getenv("MID_REJECT_DIGEST_FULL_MAX", str(_mid_scanned)) or _mid_scanned)
-                        _rej_reason_by_sym = {}  # sym -> reason
-                        # Keep a list of normalized reasons too, so 'other={...}' in [mid][summary]
-                        # can show a breakdown like: other=43{score_low=6,rr_low=3,...}
-                        _rej_reasons_by_sym = defaultdict(list)  # sym -> [base_reason...]
-
-                        def _rej_add(_sym: str, _reason: str) -> None:
-                            """Record exactly one terminal reject reason per symbol per tick (MID registry keys)."""
-                            if not _rej_enabled:
-                                return
-                            try:
-                                if _sym in _rej_seen:
-                                    return
-                                _rej_seen.add(_sym)
-
-                                key = mid_reject(_reason)
-
-                                _rej_reason_by_sym[_sym] = key
-                                _rej_counts[key] = int(_rej_counts.get(key, 0) or 0) + 1
-                                lst = _rej_examples_map.get(key)
-                                if lst is None:
-                                    lst = []
-                                    _rej_examples_map[key] = lst
-                                if len(lst) < _rej_examples_max:
-                                    lst.append(str(_sym))
-
-                                # Stage flow: this symbol ended in rejection
-                                _mid_stage_add("rejected", 1)
-
-                                # Rolling reject digest for /health
-                                _mid_reject_add(key)
-                            except Exception:
-                                pass
-
-                        logger.info("[mid] tick start TOP_N=%s interval=%ss pool=%s scanned=%s (MID_TOP_N_SYMBOLS=%s)", top_n, interval, _mid_pool, _mid_scanned, top_n_symbols)
-                        logger.info("[mid][scanner] symbols loaded: %s (pool=%s)", _mid_scanned, _mid_pool)
-                        mac_act, mac_ev, mac_win = self.macro.current_action()
-                        self.last_macro_action = mac_act
-                        if MACRO_FILTER:
-                            logger.info("[mid] macro action=%s next=%s window=%s", mac_act, getattr(mac_ev, "name", None) if mac_ev else None, mac_win)
-                            if mac_act != "ALLOW" and mac_ev and mac_win and self.macro.should_notify(mac_ev):
-                                logger.info("[mid][macro] alert: action=%s event=%s window=%s", mac_act, getattr(mac_ev, "name", None), mac_win)
-                                await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
-
-
-                        # --- Architecture C: prefetch candles for all symbols (primary exchange) ---
-                        mid_prefetch = os.getenv("MID_PREFETCH_CANDLES", "1").strip().lower() in ("1","true","yes","on")
-                        if mid_prefetch and symbols:
-                            try:
-                                prefetch_limit = int(os.getenv("MID_PREFETCH_LIMIT", "250") or 250)
-                                prefetch_timeout = float(os.getenv("MID_PREFETCH_TIMEOUT_SEC", "25") or 25)
-                                groups = defaultdict(list)
-                                for _s in symbols:
-                                    if is_blocked_symbol(_s):
-                                        continue
-                                    groups[_mid_primary_for_symbol(_s)].append(_s)
-
-                                tasks = []
-                                for _ex, _syms in groups.items():
-                                    for _s in _syms:
-                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trigger, prefetch_limit, market_mid)))
-                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_mid, prefetch_limit, market_mid)))
-                                        tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trend, prefetch_limit, market_mid)))
-
-                                if tasks:
-                                    if prefetch_timeout and prefetch_timeout > 0:
-                                        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=prefetch_timeout)
-                                    else:
-                                        await asyncio.gather(*tasks, return_exceptions=True)
-                            except Exception as _e:
-                                logger.warning("[mid] candles prefetch failed: %s", _e)
-
-                        # Exclude prefetch time from per-symbol budget (budget applies to scan phase)
-                        start_scan = time.time()
-                        prefetch_elapsed = float(start_scan - start_total)
-                        for sym in symbols:
-                            _mid_stage_add("scanned", 1)
-                            # Hard budget per MID tick (prevents very long ticks during exchange issues)
-                            if mid_tick_budget_sec and mid_tick_budget_sec > 0:
-                                if (time.time() - start_scan) > float(mid_tick_budget_sec):
-                                    # Mark remaining symbols as budget-exceeded (so [mid][reject] stays honest)
-                                    try:
-                                        for _s in symbols[symbols.index(sym):]:
-                                            _rej_add(_s, 'tick_budget')
-                                    except Exception:
-                                        pass
-                                    break
-                            if is_blocked_symbol(sym):
-                                _mid_skip_blocked += 1
-                                _rej_add(sym, "trap_block")
-                                try:
-                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "blocked_symbol")
-                                except Exception:
-                                    pass
-                                continue
-                            if not self.can_emit_mid(sym):
-                                _mid_skip_cooldown += 1
-                                _rej_add(sym, "trap_block")
-                                try:
-                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "cooldown")
-                                except Exception:
-                                    pass
-                                continue
-
-                            if MACRO_FILTER and mac_act == "PAUSE_ALL":
-                                _mid_skip_macro += 1
-                                _rej_add(sym, "trap_block")
-                                try:
-                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "macro_pause_all")
-                                except Exception:
-                                    pass
-                                continue
-                            news_act = "OK"
-                            if NEWS_FILTER and CRYPTOPANIC_TOKEN:
-                                news_act = await self.news.action_for_symbol(api.session, sym)
-                                if news_act == "PAUSE_ALL":
-                                    _mid_skip_news += 1
-                                    _rej_add(sym, "trap_block")
-                                    try:
-                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "news_pause_all")
-                                    except Exception:
-                                        pass
-                                    continue
-
-                            supporters = []  # kept for compatibility with later counters (not used for multi-exchange scoring)
-                            chosen_name = None
-                            chosen_market = None
-                            # --- MID candles length requirements (diagnostics) ---
-                            # If candles are present but too short for indicators, MID will behave like "no_candles".
-                            # Log explicit need/got per TF to distinguish "didn't have time to collect" vs "bad data".
-                            def _mid_need_bars(tf: str) -> int:
-                                t = (tf or "").strip().lower()
-                                try:
-                                    if t in ("5m", "5min", "5"):
-                                        return int(os.getenv("MID_NEED_5M_BARS", os.getenv("MID_NEED_BARS_5M", "60")) or 60)
-                                    if t in ("30m", "30min", "30"):
-                                        return int(os.getenv("MID_NEED_30M_BARS", os.getenv("MID_NEED_BARS_30M", "200")) or 200)
-                                    # default: 1h+
-                                    return int(os.getenv("MID_NEED_1H_BARS", os.getenv("MID_NEED_BARS_1H", "200")) or 200)
-                                except Exception:
-                                    return 0
-
-                            
-                            def _mid_diag_ok(symb: str, ex_name: str, market: str, tf: str, source: str, df: Optional[pd.DataFrame]) -> None:
-                                """Add an OK/partial diag record including got/need bars.
-                                If got < need -> mark as partial with need/got/missing (~time needed).
-                                """
-                                try:
-                                    need = _mid_need_bars(tf)
-                                    got = int(len(df)) if df is not None else 0
-                                    if need and got < need:
-                                        _mid_diag_add(symb, ex_name, market, tf, "partial",
-                                                     f"need_{tf}_bars={need} got={got}" + _mid_fmt_missing_wait(tf, need, got))
-                                    else:
-                                        # Keep the existing OK semantics but enrich with bars count for clarity.
-                                        if got:
-                                            _mid_diag_add(symb, ex_name, market, tf, "OK", f"{source}(got={got})")
-                                        else:
-                                            _mid_diag_add(symb, ex_name, market, tf, "OK", source)
-                                except Exception:
-                                    _mid_diag_add(symb, ex_name, market, tf, "OK", source)
-
-                            def _mid_len(df: Optional[pd.DataFrame]) -> int:
-                                try:
-                                    return int(len(df)) if df is not None else 0
-                                except Exception:
-                                    return 0
-
-                            chosen_r: Optional[Dict[str, Any]] = None
-                            found_ok_candles: bool = False  # candles were present and had enough bars on at least one venue
-
-                            async def _choose_exchange_mid():
-                                nonlocal chosen_name, chosen_market, chosen_r, found_ok_candles
-                                primary = _mid_primary_for_symbol(sym)
-                                # try primary first, then the other primary (if any), then fallbacks
-                                if MID_CANDLES_LIGHT_MODE or MID_CANDLES_BINANCE_FIRST:
-                                    # "binance-first" fast path: try BINANCE first, then BYBIT/OKX, then SPOT fallbacks
-                                    _light_primary = ["BINANCE", "BYBIT", "OKX"]
-                                    try_order = []
-                                    for _x in _light_primary:
-                                        if _x not in try_order:
-                                            try_order.append(_x)
-                                    for _x in (mid_primary_exchanges or []):
-                                        if _x not in try_order:
-                                            try_order.append(_x)
-                                    for _x in (mid_fallback_exchanges or []):
-                                        if _x not in try_order:
-                                            try_order.append(_x)
-                                else:
-                                    try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
-
-                                # Try markets in order (AUTO: FUTURES->SPOT, or configured order)
-                                for mkt in markets_try:
-                                    mkt_u = (mkt or 'SPOT').upper().strip()
-                                    if mkt_u == 'FUTURES':
-                                        names = [x for x in try_order if x in ('BINANCE','BYBIT','OKX')]
-                                    else:
-                                        names = try_order
-                                    for name in names:
-                                        try:
-                                            # Fetch trigger TF first (cuts 3x HTTP load on misses -> fewer timeouts/no_candles)
-                                            a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250, mkt)
-                                            if a is None or a.empty:
-                                                continue
-
-                                            b, c = await asyncio.gather(
-                                                _mid_fetch_klines_cached(name, sym, tf_mid, 250, mkt),
-                                                _mid_fetch_klines_cached(name, sym, tf_trend, 250, mkt),
-                                                return_exceptions=True,
-                                            )
-                                            if isinstance(b, Exception):
-                                                b = None
-                                            if isinstance(c, Exception):
-                                                c = None
-
-                                            # Require true TFs for MID (no silent TF substitution).
-                                            if b is None or getattr(b, 'empty', True):
-                                                continue
-                                            if c is None or getattr(c, 'empty', True):
-                                                continue
-
-                                            # Length sanity: distinguish "empty" vs "too few bars".
-                                            n5_need = _mid_need_bars(tf_trigger)
-                                            n30_need = _mid_need_bars(tf_mid)
-                                            n1h_need = _mid_need_bars(tf_trend)
-                                            n5_got = _mid_len(a)
-                                            n30_got = _mid_len(b)
-                                            n1h_got = _mid_len(c)
-                                            if n5_need and n5_got < n5_need:
-                                                _mid_diag_add(sym, name, mkt_u, tf_trigger, "partial", f"need_{tf_trigger}_bars={n5_need} got={n5_got}" + _mid_fmt_missing_wait(tf_trigger, n5_need, n5_got))
-                                                _mid_candles_partial += 1
-                                                continue
-                                            if n30_need and n30_got < n30_need:
-                                                _mid_diag_add(sym, name, mkt_u, tf_mid, "partial", f"need_{tf_mid}_bars={n30_need} got={n30_got}" + _mid_fmt_missing_wait(tf_mid, n30_need, n30_got))
-                                                _mid_candles_partial += 1
-                                                continue
-                                            if n1h_need and n1h_got < n1h_need:
-                                                _mid_diag_add(sym, name, mkt_u, tf_trend, "partial", f"need_{tf_trend}_bars={n1h_need} got={n1h_got}" + _mid_fmt_missing_wait(tf_trend, n1h_need, n1h_got))
-                                                _mid_candles_partial += 1
-                                                continue
-
-                                            # Candles are available (non-empty + enough bars) on this venue.
-                                            found_ok_candles = True
-                                            _diag = {}
-                                            r = evaluate_on_exchange_mid(a, b, c, symbol=sym, diag=_diag, market=mkt_u)
-                                            if not r:
-                                                try:
-                                                    _st = str(_diag.get("fail_stage") or "other")
-                                                    if _st not in _mid_no_signal_reasons:
-                                                        _st = "other"
-                                                    # Collect stage per venue; we'll decide final stage when rejecting as no_signal.
-                                                    _mid_no_signal_stage_by_sym[sym] = _st  # last (debug)
-                                                    _mid_no_signal_stages_by_sym.setdefault(sym, []).append(_st)
-                                                    # Collect detailed fail reason (best-effort).
-                                                    _rr = str(_diag.get("fail_reason") or ("unknown" if str(_st or '')=='other' else _st) or "other")
-                                                    _rr = _rr.strip() or "other"
-                                                    if len(_rr) > 64:
-                                                        _rr = _rr[:64]
-                                                    _mid_no_signal_reasons_by_sym.setdefault(sym, []).append(_rr)
-                                                    # Merge per-symbol reject reasons collected by _rej_add (score_low/rr_low/etc)
+                                                if int(limit) != int(ws_limit):
+                                                    row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb_n, tf, int(ws_limit))
+                                            if row:
+                                                blob, updated_at = row
+                                                if updated_at is not None:
+                                                    age = (dt.datetime.now(dt.timezone.utc) - updated_at).total_seconds()
+                                                else:
+                                                    age = 0.0
+                                                if age <= max_age:
+                                                    dfp = db_store._cc_unpack_df(blob)
                                                     try:
-                                                        if sym not in _rej_reasons_added and '_rej_reasons_by_sym' in locals():
-                                                            for _r0 in list(_rej_reasons_by_sym.get(sym) or []):
-                                                                if _r0:
-                                                                    _mid_no_signal_reasons_by_sym.setdefault(sym, []).append(str(_r0))
-                                                            _rej_reasons_added.add(sym)
+                                                        if dfp is not None and not dfp.empty and int(limit) > 0 and len(dfp) > int(limit):
+                                                            dfp = dfp.tail(int(limit)).copy()
                                                     except Exception:
                                                         pass
-                                                except Exception:
-                                                    pass
-                                            if r:
-                                                chosen_name = name
-                                                chosen_market = mkt
-                                                chosen_r = r
-                                                return
-                                        except Exception:
-                                            continue
-
-# Soft timeout per symbol (prevents a single symbol/exchange from stalling the whole MID tick)
-                            if mid_symbol_timeout_sec and mid_symbol_timeout_sec > 0:
-                                try:
-                                    await asyncio.wait_for(_choose_exchange_mid(), timeout=float(mid_symbol_timeout_sec))
-                                except asyncio.TimeoutError:
-                                    _rej_add(sym, f"symbol_timeout_{float(mid_symbol_timeout_sec):.0f}s")
-                                    try:
-                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, '', None, 'symbol_timeout')
-                                    except Exception:
-                                        pass
-                                    continue
-                            else:
-                                await _choose_exchange_mid()
-
-                            if not chosen_r:
-                                if found_ok_candles:
-                                    # Candles were OK but no signal on any venue.
-                                    _rej_add(sym, "not_enough_data")
-                                    try:
-                                        _mid_no_signal += 1
-                                        stages = list(_mid_no_signal_stages_by_sym.get(sym) or [])
-                                        if stages:
-                                            if _mid_no_signal_stage_mode == "majority":
-                                                # pick most frequent stage; tie -> earliest (keeps primary-order preference)
-                                                counts = {}
-                                                for s in stages:
-                                                    counts[s] = counts.get(s, 0) + 1
-                                                best_s = None
-                                                best_n = -1
-                                                for s in stages:
-                                                    n = counts.get(s, 0)
-                                                    if n > best_n:
-                                                        best_n = n
-                                                        best_s = s
-                                                _st = best_s or stages[0]
-                                            else:
-                                                # "best": first venue in priority order that had OK candles
-                                                _st = stages[0]
-                                        else:
-                                            _st = str(_mid_no_signal_stage_by_sym.get(sym) or "other")
-                                        if _st not in _mid_no_signal_reasons:
-                                            _st = "other"
-                                        _mid_no_signal_reasons[_st] = int(_mid_no_signal_reasons.get(_st,0) or 0) + 1
-                                        try:
-                                            _rs = list(_mid_no_signal_reasons_by_sym.get(sym) or [])
-                                            if _rs:
-                                                if _mid_no_signal_stage_mode == 'majority':
-                                                    counts2 = {}
-                                                    for r0 in _rs:
-                                                        counts2[r0] = counts2.get(r0, 0) + 1
-                                                    best_r = None
-                                                    best_n2 = -1
-                                                    for r0 in _rs:
-                                                        n2 = counts2.get(r0, 0)
-                                                        if n2 > best_n2:
-                                                            best_n2 = n2
-                                                            best_r = r0
-                                                    _rbest = best_r or _rs[0]
+                                                    if dfp is not None and not dfp.empty:
+                                                        _mid_db_hit += 1
+                                                        _mid_candles_cache[key] = (now, dfp)
+                                                        _mid_diag_ok(symb_n, ex_name, market, tf, 'persist', dfp)
+                                                        dfp_n = _mid_norm_ohlcv(dfp)
+                                                        if dfp_n is None:
+                                                            _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'persist')
+                                                            return pd.DataFrame()
+                                                        return dfp_n
                                                 else:
-                                                    _rbest = _rs[0]
-                                            else:
-                                                _rbest = ("unknown" if str(_st or '')=='other' else str(_st or 'other'))
-                                            # Count detailed no-signal reasons only for the 'other' bucket,
-                                            # and normalize to a base reason name (e.g. "rsi_long=37.7" -> "rsi_long",
-                                            # "near_1h_low dist=..." -> "near_1h_low").
-                                            if str(_st or '') == 'other' and _rbest:
-                                                _key = str(_rbest).strip()
-                                                # base token (first word)
-                                                _key = _key.split()[0] if _key else _key
-                                                # strip value parts
-                                                for _sep in ('=', ':'):
-                                                    if _sep in _key:
-                                                        _key = _key.split(_sep, 1)[0]
-                                                _key = _key.strip()
-                                                if _key and _key != 'other':
-                                                    _mid_no_signal_detail_reasons_other[_key] = int(_mid_no_signal_detail_reasons_other.get(_key, 0) or 0) + 1
+                                                    _mid_diag_add(symb_n, ex_name, market, tf, 'stale_persist')
                                         except Exception:
                                             pass
-
-                                    except Exception:
-                                        pass
-                                    continue
-                                _rej_add(sym, "candles_unavailable")
-
-                                # Log once per symbol per tick when candles are finally unavailable (prevents spam).
-                                try:
-                                    _ctx = _MID_TICK_CTX.get()
-                                    if isinstance(_ctx, dict):
-                                        _cms = _ctx.get('candles_missing_sym')
-                                        if isinstance(_cms, set) and sym in _cms:
-                                            pass
-                                        else:
-                                            if isinstance(_cms, set):
-                                                _cms.add(sym)
-                                            # build condensed diagnostic summary for this symbol
-                                            parts = []
-                                            try:
-                                                for (s_key, tf_key), recs in _mid_candles_diag.items():
-                                                    if s_key == sym and recs:
-                                                        # keep only last few records per TF to cap size
-                                                        tail = recs[-6:]
-                                                        parts.append(f"{tf_key}=" + ",".join(tail))
-                                            except Exception:
-                                                pass
-                                            diag = " | ".join(parts)
-                                            if len(diag) > 700:
-                                                diag = diag[:700] + "…"
-                                            if diag:
-                                                logger.info(f"[mid][candles_unavailable] symbol={sym} diag={diag}")
                                 except Exception:
                                     pass
-                                continue
+                                return None
 
-                            best_name, best_r = chosen_name, chosen_r
-                            base_r = best_r
-                            # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
-                            if base_r.get("trap_ok") is False or base_r.get("blocked") is True:
-                                _mid_skip_trap += 1
+            async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
 
-                                _rej_add(sym, str(base_r.get("trap_reason") or base_r.get("block_reason") or "trap_block"))
-
-                                # collect digest stats (DO NOT forward to error-bot)
-                                _r = (base_r.get("trap_reason") or base_r.get("block_reason") or "")
-                                try:
-                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), str(_r))
-                                except Exception:
-                                    pass
-                                logger.info("[mid][trap] %s %s blocked=%s reason=%s src_best=%s", sym, str(base_r.get("direction","")).upper(), base_r.get("blocked"), base_r.get("trap_reason",""), best_name)
-                                continue
-                            if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
-                                _mid_f_align += 1
-                                if not structure_align_soft:
-                                    _rej_add(sym, "htf_misaligned")
-                                    try:
-                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), "align_mismatch")
-                                    except Exception:
-                                        pass
-                                    continue
-                                else:
-                                    # Soft alignment: don't reject, but apply confidence penalty so only strong setups pass.
-                                    try:
-                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"),
-                                                           f"align_soft_penalty={structure_align_penalty:g}")
-                                    except Exception:
-                                        pass
-                                    # Mark penalty to be applied after we read conf
-                                    base_r["__align_soft_penalty"] = float(structure_align_penalty)
-
-                            conf = float(base_r.get("confidence",0) or 0)
-                            align_pen = float(base_r.get("__align_soft_penalty", 0) or 0)
-                            if align_pen:
-                                conf = max(0.0, conf - align_pen)
-                            rr = float(base_r.get("rr",0) or 0)
-                            adx30 = float(base_r.get("adx1",0) or 0)
-                            adx1h = float(base_r.get("adx4",0) or 0)
-                            atrp = float(base_r.get("atr_pct",0) or 0)
-
-                            if min_adx_30m and adx30 < min_adx_30m:
-                                _mid_f_adx += 1
-                                _rej_add(sym, "regime_block")
-                                try:
-                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx30<{min_adx_30m:g} adx={adx30:g}")
-                                except Exception:
-                                    pass
-                                continue
-                            if min_adx_1h and adx1h < min_adx_1h:
-                                _mid_f_adx += 1
-                                _rej_add(sym, "regime_block")
-                                try:
-                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx1h<{min_adx_1h:g} adx={adx1h:g}")
-                                except Exception:
-                                    pass
-                                continue
-                            if min_atr_pct and atrp < min_atr_pct:
-                                _mid_f_atr += 1
-                                _rej_add(sym, "volatility_block")
-                                try:
-                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"atr_pct<{min_atr_pct:g} atr%={atrp:g}")
-                                except Exception:
-                                    pass
-                                continue
-
-                            market = choose_market(adx30, atrp)
-                            if not allow_futures:
-                                market = "SPOT"
-                            if market == "FUTURES" and (news_act == "FUTURES_OFF" or mac_act == "FUTURES_OFF"):
-                                _mid_f_futoff += 1
-                                market = "SPOT"
-
-                            min_conf = min_score_fut if market == "FUTURES" else min_score_spot
-                            if conf < float(min_conf):
-                                _mid_f_score += 1
-                                _rej_add(sym, "score_low")
-                                try:
-                                    _mid_ta_score_low += 1
-                                    _missing = float(min_conf) - float(conf)
-                                    if _missing > 0:
-                                        _mid_ta_score_missing_sum += _missing
-                                        if _missing > float(_mid_ta_score_missing_max):
-                                            _mid_ta_score_missing_max = _missing
-                                except Exception:
-                                    pass
-                                try:
-                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"score<{float(min_conf):g} score={conf:g}")
-                                except Exception:
-                                    pass
-                                continue
-                            if rr < float(min_rr):
-                                _mid_f_rr += 1
-                                _rej_add(sym, "score_low")
-                                try:
-                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"rr<{float(min_rr):g} rr={rr:g}")
-                                except Exception:
-                                    pass
-                                continue
-
-                            direction = str(base_r.get("direction","")).upper()
-                            entry = float(base_r["entry"]); sl = float(base_r["sl"])
-                            tp1 = float(base_r["tp1"]); tp2 = float(base_r["tp2"])
-                            # --- HARD MID filters (TP2-first) ---
-                            # 1) Volume must be real, иначе TP2 часто не добивает
-                            volx = float(base_r.get("rel_vol", 0.0) or 0.0)
-                            if mid_min_vol_x and volx < mid_min_vol_x:
-                                _mid_f_score += 1
-                                _rej_add(sym, "volatility_block")
-                                try:
-                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"vol_x<{mid_min_vol_x:g} vol_x={volx:g}")
-                                except Exception:
-                                    pass
-                                continue
-
-                            # 2) Must be on the correct side of VWAP + far enough from VWAP (avoid chop)
-                            vwap_val_num = float(base_r.get("vwap_val", 0.0) or 0.0)
-                            atr30 = abs(entry) * (abs(atrp) / 100.0) if entry > 0 else 0.0
-                            if vwap_val_num > 0 and atr30 > 0:
-                                if mid_require_vwap_bias:
-                                    if direction == "SHORT" and not (entry < vwap_val_num):
-                                        _mid_f_align += 1
-                                        _rej_add(sym, "vwap_dist")
-                                        try:
-                                            self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_short entry>=vwap vwap={vwap_val_num:g}")
-                                        except Exception:
-                                            pass
-                                        continue
-                                    if direction == "LONG" and not (entry > vwap_val_num):
-                                        _mid_f_align += 1
-                                        _rej_add(sym, "vwap_dist")
-                                        try:
-                                            self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_long entry<=vwap vwap={vwap_val_num:g}")
-                                        except Exception:
-                                            pass
-                                        continue
-                                if mid_min_vwap_dist_atr > 0:
-                                    if abs(entry - vwap_val_num) < (atr30 * mid_min_vwap_dist_atr):
-                                        _mid_f_atr += 1
-                                        _rej_add(sym, "vwap_dist")
-                                        try:
-                                            dist = abs(entry - vwap_val_num) / atr30 if atr30 else 0.0
-                                            self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_far {dist:.2g}atr")
-                                        except Exception:
-                                            pass
-                                        continue
-
-
-
-                            # 2b) Optional: require liquidity sweep in direction (SMC confirmation)
-                            if MID_REQUIRE_LIQ_SWEEP:
-                                try:
-                                    if direction == "LONG" and not bool(base_r.get("sweep_long", False)):
-                                        _mid_f_score += 1
-                                        _rej_add(sym, "liquidity_fail")
-                                        try:
-                                            self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, "liq_sweep_missing_long")
-                                        except Exception:
-                                            pass
-                                        continue
-                                    if direction == "SHORT" and not bool(base_r.get("sweep_short", False)):
-                                        _mid_f_score += 1
-                                        _rej_add(sym, "liquidity_fail")
-                                        try:
-                                            self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, "liq_sweep_missing_short")
-                                        except Exception:
-                                            pass
-                                        continue
-                                except Exception:
-                                    pass
-                            if tp_policy == "R":
-                                risk = abs(entry-sl)
-                                if risk <= 0:
-                                    continue
-                                if direction == "LONG":
-                                    tp1 = entry + risk*tp1_r; tp2 = entry + risk*tp2_r
-                                else:
-                                    tp1 = entry - risk*tp1_r; tp2 = entry - risk*tp2_r
-
-                        
-                            # Policy: SPOT + SHORT is confusing (spot has no short). Auto-convert to FUTURES.
-                            risk_note = _fmt_ta_block_mid(base_r, mode)
-                            if market == "SPOT" and str(direction).upper() == "SHORT":
-                                fut_forced_off = (not allow_futures) or (news_act == "FUTURES_OFF") or (mac_act == "FUTURES_OFF")
-                                if fut_forced_off:
-                                    _mid_f_futoff += 1
-                                    _rej_add(sym, "candles_unavailable")
-                                    continue
-                                market = "FUTURES"
-                                if risk_note:
-                                    risk_note = risk_note + "\n" + "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
-                                else:
-                                    risk_note = "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
-
-                            # Exchanges where the symbol exists (used for display and SPOT autotrade routing).
-                            async def _pair_exists(ex: str) -> bool:
-                                try:
-                                    exu = (ex or '').upper().strip()
-                                    if market == 'FUTURES':
-                                        if exu == 'BINANCE':
-                                            p = await self._fetch_rest_price('FUTURES', sym)
-                                        elif exu == 'BYBIT':
-                                            p = await self._fetch_bybit_price('FUTURES', sym)
-                                        elif exu == 'OKX':
-                                            p = await self._fetch_okx_price('FUTURES', sym)
-                                        else:
-                                            return False
-                                        return bool(p and float(p) > 0)
-                                    # SPOT
-                                    if exu == 'BINANCE':
-                                        p = await self._fetch_rest_price('SPOT', sym)
-                                    elif exu == 'BYBIT':
-                                        p = await self._fetch_bybit_price('SPOT', sym)
-                                    elif exu == 'OKX':
-                                        p = await self._fetch_okx_price('SPOT', sym)
-                                    elif exu == 'MEXC':
-                                        p = await _mexc_public_price(sym)
-                                    else:  # GATEIO
-                                        p = await _gateio_public_price(sym)
-                                    return bool(p and float(p) > 0)
-                                except Exception:
-                                    return False
-
-                        
-                            # --- HARD BLOCK: FUTURES signal must have a real futures contract on executable venues ---
-                            # If choose_market() selected FUTURES but the symbol has no futures instrument on
-                            # Binance/Bybit/OKX, we skip emitting this signal. (No auto-downgrade to SPOT.)
-                            if market == "FUTURES":
-                                try:
-                                    _fut_ok = await asyncio.gather(_pair_exists("BINANCE"), _pair_exists("BYBIT"), _pair_exists("OKX"))
-                                    if not any(bool(x) for x in _fut_ok):
-                                        logger.info("[scanner] skip %s FUTURES: no contract on BINANCE/BYBIT/OKX (best_source=%s)", sym, best_name)
-                                        _rej_add(sym, "candles_unavailable")
-                                        continue
-                                except Exception as _e:
-                                    logger.info("[scanner] skip %s FUTURES: futures existence check failed: %s", sym, _e)
-                                    _rej_add(sym, "candles_unavailable")
-                                    continue
-
-    # Exchanges where the instrument exists for the given market.
-                            _ex_order = ['BINANCE', 'BYBIT', 'OKX'] if (market == 'FUTURES' or not enable_secondary) else ['BINANCE', 'BYBIT', 'OKX', 'GATEIO', 'MEXC']
-                            _oks = await asyncio.gather(*[_pair_exists(x) for x in _ex_order])
-                            _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
-                            if not _pair_exchanges:
-                                _pair_exchanges = [best_name]
-                            conf_names = '+'.join(_pair_exchanges)
-                            sig = Signal(
-                            signal_id=self.next_signal_id(),
-                            market=market,
-                            symbol=sym,
-                            direction=direction,
-                            timeframe=f"{tf_trigger}/{tf_mid}/{tf_trend}",
-                            entry=entry, sl=sl, tp1=float(tp1), tp2=float(tp2),
-                            rr=float(tp2_r if tp_policy=="R" else rr),
-                            confidence=int(round(conf)),
-                            confirmations=conf_names,
-                            source_exchange=best_name,
-                            available_exchanges=conf_names,
-                            risk_note=risk_note,
-                            ts=time.time(),
-                            )
-                            # If MID_PENDING_ENABLED=1: save setup and emit ONLY when price reaches entry + TA reconfirmed.
-                            pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0","false","no","off")
-                            if pending_enabled:
-                                try:
-                                    if self.can_add_mid_pending(sym, direction=direction, market=market):
-                                        key = f"{market}:{sym}:{direction}"
-
-                                        # Build smarter entry zone from OB/FVG/Channel (optional)
-                                        z, z_src = _mid_build_entry_zone(df5, df30, df1h, direction=direction, entry=float(entry))
-                                        entry_low = float(z[0]) if z else None
-                                        entry_high = float(z[1]) if z else None
-
-                                        rec = {
-                                            "key": key,
-                                            "market": market,
-                                            "symbol": sym,
-                                            "direction": direction,
-                                            "timeframe": f"{tf_trigger}/{tf_mid}/{tf_trend}",
-                                            "entry": float(entry),
-                                            "entry_low": entry_low,
-                                            "entry_high": entry_high,
-                                            "entry_zone_src": str(z_src),
-                                            "sl": float(sl),
-                                            "tp1": float(tp1),
-                                            "tp2": float(tp2),
-                                            "rr": float(tp2_r if tp_policy=="R" else rr),
-                                            "confidence": int(round(conf)),
-                                            "confirmations": conf_names,
-                                            "source_exchange": best_name,
-                                            "available_exchanges": conf_names,
-                                            "risk_note": risk_note,
-                                            "created_ts": time.time(),
-                                            "min_confidence": int(os.getenv("MID_MIN_CONFIDENCE", "0") or 0),
-                                        }
-                                        await self.add_mid_pending(rec)
-                                        self.mark_mid_pending(sym, direction=direction, market=market)
-                                        _mid_stage_add("passed_ta", 1)
-                                        _mid_stage_add("created_pending", 1)
-                                        try:
-                                            _mid_metrics_inc("setups_found", 1)
-                                            _mid_metrics_inc("pending_created", 1)
-                                        except Exception:
-                                            pass
-                                    else:
-                                        _rej_add(sym, "pending_wait")
-                                except Exception:
-                                    _rej_add(sym, "not_enough_data")
-                                # do NOT emit now
-                            else:
-                                self.mark_emitted_mid(sym, sig.direction, sig.market)
-                                self.last_signal = sig
-                                if sig.market == "SPOT":
-                                    self.last_spot_signal = sig
-                                else:
-                                    self.last_futures_signal = sig
-                                _mid_stage_add("passed_ta", 1)
-                                _mid_stage_add("triggered", 1)
-                                await emit_signal_cb(sig)
-                                _mid_emitted += 1
-                                try:
-                                    _mid_metrics_inc("setups_found", 1)
-                                except Exception:
-                                    pass
-                                await asyncio.sleep(2)
-                                _rej_add(sym, "trap_block")
-                except Exception:
-                    logger.exception("[mid] scanner_loop_mid error")
-
-
-                # --- send digest every MID_TRAP_DIGEST_SEC ---
+                nonlocal _mid_candles_net_fail, _mid_candles_unsupported, _mid_candles_partial, _mid_db_hit, _mid_rest_refill, _mid_candles_cache, _mid_candles_empty, _mid_candles_empty_reasons, _mid_candles_empty_samples, _mid_candles_fallback
+                # Normalize symbol consistently for cache + unsupported markers
+                _sn = (symb or '').strip().upper()
+                _sn = _sn.replace('-', '').replace('_', '').replace(':', '').replace('/', '')
+                for _suf in ('SWAP','PERP','PERPETUAL','FUT','FUTURES'):
+                    if _sn.endswith(_suf):
+                        _sn = _sn[: -len(_suf)]
+                        break
+                symb = _sn
+                key = (ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
+                mkt0 = (market or 'SPOT').upper().strip()
+                # Fast skip: known unsupported (avoid repeated empty/unsupported storms)
                 try:
-                    self._mid_trap_digest_last_sent = await self._mid_digest_maybe_send(
-                        self._mid_trap_digest_stats, float(getattr(self, "_mid_trap_digest_last_sent", time.time()))
-                    )
+                    if api._is_unsupported_cached(ex_name, mkt0, symb, tf):
+                        _mid_candles_unsupported += 1
+                        _mid_diag_add(symb, ex_name, mkt0, tf, 'unsupported_cached', 'pre')
+                        return None
                 except Exception:
                     pass
-
-                elapsed = time.time() - start
+                # Fast skip: market/symbol not supported according to cached instruments
+                # (prevents FUTURES empty responses when the contract doesn't exist)
                 try:
-                    _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
-                    # no_candles should reflect final outcome (candles_unavailable), not intermediate misses during fallback.
-                    # Otherwise a symbol that eventually succeeds still inflates no_candles.
-                    _no_candles_final = 0
-                    try:
-                        _no_candles_final = int(_rej_counts.get('candles_unavailable', 0) or 0)
-                    except Exception:
-                        _no_candles_final = 0
-                    # Expand no_signal 'other' into aggregated fail reasons (best-effort, safe)
-                    _ns_other_details = ''
-                    try:
-                        _other_n = int(_mid_no_signal_reasons.get('other', 0) or 0)
-                        if _other_n > 0:
-                            # 0 => show all (default). >0 => show top-N + +rest.
+                    if getattr(api, "_market_avail_check", False):
+                        if not _market_supported_ex(ex_name, mkt0, symb):
                             try:
-                                topn = int(float(os.getenv('MID_NO_SIGNAL_DETAIL_TOPN', '0') or 0))
+                                api._mark_unsupported(ex_name, mkt0, symb, tf)
                             except Exception:
-                                topn = 0
-                    
-                            items = []
-                            if isinstance(_mid_no_signal_detail_reasons_other, dict) and _mid_no_signal_detail_reasons_other:
-                                items = sorted(_mid_no_signal_detail_reasons_other.items(),
-                                               key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
-                    
-                            if not items:
-                                _ns_other_details = '{untracked=%s}' % int(_other_n)
-                            else:
-                                items = [(str(k), int(v or 0)) for k, v in items if v and str(k).strip() and str(k).strip() != 'other']
-                                if items:
-                                    if topn and topn > 0:
-                                        shown = items[:topn]
-                                        rest = sum(v for _, v in items[topn:])
-                                    else:
-                                        shown = items
-                                        rest = 0
-                                    _ns_other_details = '{' + ','.join([f'{k}={v}' for k, v in shown])
-                                    if rest > 0:
-                                        _ns_other_details += f',+{rest}'
-                                    _ns_other_details += '}'
-                    except Exception as e:
-                        # Never break the tick due to summary formatting.
-                        _ns_other_details = ''
-                    
-                    # Build and log summary safely (avoid syntax/formatting issues)
-                    try:
-                        summary = (
-                            f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} "
-                            f"hardblock={_mid_hard_block} no_signal={int(_mid_no_signal)} "
-                            f"[trap={int(_mid_no_signal_reasons.get('trap',0) or 0)},"
-                            f"structure={int(_mid_no_signal_reasons.get('structure',0) or 0)},"
-                            f"trend={int(_mid_no_signal_reasons.get('trend',0) or 0)},"
-                            f"extreme={int(_mid_no_signal_reasons.get('extreme',0) or 0)},"
-                            f"impulse={int(_mid_no_signal_reasons.get('impulse',0) or 0)},"
-                            f"other={int(_mid_no_signal_reasons.get('other',0) or 0)}{_ns_other_details}] "
-                            f"cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} "
-                            f"align={_mid_f_align} score={_mid_f_score} ta_score_low={_mid_ta_score_low} ta_miss_avg={(_mid_ta_score_missing_sum/_mid_ta_score_low) if _mid_ta_score_low else 0.0:.1f} ta_miss_max={_mid_ta_score_missing_max:.1f} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} "
-                            f"no_candles={_no_candles_final} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} "
-                            f"candles_partial={_mid_candles_partial} candles_empty={_mid_candles_empty} candles_fallback={_mid_candles_fallback} "
-                            f"cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} "
-                            f"cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} "
-                            f"inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} "
-                            f"prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
-                        )
-                        logger.info("[mid][summary] %s", summary)
-
-                        # Adaptive regime snapshot (avg across evaluated symbols for this tick)
+                                pass
+                            _mid_diag_add(symb, ex_name, mkt0, tf, 'unsupported_pair', 'pre')
+                            _mid_candles_unsupported += 1
+                            return None
+                except Exception:
+                    pass
+                now = time.time()
+                ttl = _mid_cache_ttl(tf)
+                cached = _mid_candles_cache.get(key)
+                if cached:
+                    ts, df = cached
+                    if (now - ts) <= ttl and df is not None and not df.empty:
+                        # IMPORTANT: treat short cache (got < need) as missing on cold start.
+                        # This allows REST-prefill / REST fallback to fill history after restart.
                         try:
-                            _snap = _mid_adapt_snapshot()
-                            if _snap:
-                                _reg, _atrp_avg, _t_avg, _n = _snap
-                                logger.info("[mid][adaptive] regime=%s atrp=%.1f%% t=%.2f n=%s", _reg, float(_atrp_avg), float(_t_avg), int(_n))
+                            need_bars = int(_mid_need_bars(tf) or 0)
                         except Exception:
-                            pass
-                    except Exception as e:
-                        summary = f"tick done (summary_error={type(e).__name__}) scanned={_mid_scanned}"
-                        logger.warning("[mid][summary_error] %s", e)
-                        logger.info("[mid][summary] %s", summary)
-                    try:
-                        _tot = int(_mid_db_hit) + int(_mid_rest_refill)
-                        if _tot > 0:
-                            _hit_pct = int(round(100.0 * float(_mid_db_hit) / float(_tot)))
-                            _miss_pct = max(0, 100 - _hit_pct)
+                            need_bars = 0
+                        got_bars = 0
+                        try:
+                            got_bars = int(len(df))
+                        except Exception:
+                            got_bars = 0
+                        if need_bars and got_bars < need_bars:
+                            # keep diag as partial, but do NOT return; fall through to persist/prefill/REST
+                            _mid_diag_ok(symb, ex_name, market, tf, 'cache', df)
                         else:
-                            _hit_pct = 100
-                            _miss_pct = 0
-                        logger.info("[mid] cache_hit=%s%% cache_miss=%s%% (db_hit=%s rest_refill=%s)", _hit_pct, _miss_pct, _mid_db_hit, _mid_rest_refill)
-                    except Exception:
-                        pass
-
-
-                    # Optional: hardblock breakdown (top buckets)
+                            _mid_db_hit += 1
+                            _mid_diag_ok(symb, ex_name, market, tf, 'cache', df)
+                            return df
+                
+                # Persistent candles cache (Postgres) to survive restarts.
+                persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
+                if persist_enabled and tf in ("5m","30m","1h"):
                     try:
-                        if int(os.getenv("MID_HARDBLOCK_LOG", "1") or "1"):
-                            hb = _mid_hardblock_dump(int(os.getenv("MID_HARDBLOCK_TOP", "6") or "6"))
-                            if hb:
-                                logger.info("[mid][hardblock] %s", hb)
-                    except Exception:
-                        pass
-
-                    # Save a small hard-block snapshot for /health & minute status log (even if logging is disabled).
-                    try:
-                        global MID_LAST_HARDBLOCK_TOP, MID_LAST_HARDBLOCK_SAMPLES
-                        MID_LAST_HARDBLOCK_TOP = _mid_hardblock_dump(3)
-                        try:
-                            MID_LAST_HARDBLOCK_SAMPLES = {k: list(v)[:2] for k, v in dict(_MID_HARD_BLOCK_SAMPLES).items()}  # type: ignore[name-defined]
-                        except Exception:
-                            MID_LAST_HARDBLOCK_SAMPLES = None
-                    except Exception:
-                        pass
-
-                    # Per-tick breakdown of where scanned symbols went.
-                    if not _rej_enabled:
-                        logger.info("[mid][reject] disabled (set MID_REJECT_DIGEST=1 to enable)")
-                    else:
-                        try:
-                            accounted = len(_rej_seen)
-                            missing = max(0, int(_mid_scanned) - int(accounted))
-                            if missing:
-                                _rej_counts["untracked"] = int(_rej_counts.get("untracked", 0) or 0) + int(missing)
-                            top = sorted([(k, int(v)) for k, v in _rej_counts.items()], key=lambda x: (-x[1], x[0]))[:max(1, _rej_max_reasons)]
-                            parts = []
-                            for k, v in top:
-                                ex = _rej_examples_map.get(k) or []
-                                exs = ",".join(ex) if ex else ""
-                                parts.append(f"{k}={v}" + (f" [{exs}]" if exs else ""))
-                            # candles empty breakdown (top-N)
-                            # Helps debug real "no candles" cases when HTTP doesn't error.
-                            # IMPORTANT: do NOT spam this when candles were eventually fetched from another venue.
-                            # Log it only when at least one symbol ended up with candles_unavailable in this tick.
+                        max_age = int(float(_mid_tf_stale_sec(tf, kind="persist")))
+                        row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
+                        if (not row):
+                            # WS-candles service usually persists with a single fixed limit (default 250).
+                            # If MID asks for a different limit (e.g. 200/120), try the WS limit as fallback
+                            # to maximize cache hits and avoid REST storms.
                             try:
-                                if int(_rej_counts.get('candles_unavailable', 0) or 0) > 0 and _mid_candles_empty_reasons:
-                                    top_empty = sorted(_mid_candles_empty_reasons.items(), key=lambda kv: -int(kv[1] or 0))[:6]
-                                    top_s = ', '.join([f'{k}={int(v)}' for k, v in top_empty])
-                                    logger.info('[mid][candles_empty_top] total=%s top=%s', int(_mid_candles_empty), top_s)
-                                    if _mid_candles_log_empty:
-                                        for k, _v in top_empty:
-                                            samp = _mid_candles_empty_samples.get(k) or []
-                                            if samp:
-                                                logger.info('[mid][candles_empty_samples] %s :: %s', k, ','.join(samp[:max(0, int(_mid_candles_log_empty_samples))]))
+                                ws_limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
+                            except Exception:
+                                ws_limit = 250
+                            if int(limit) != int(ws_limit):
+                                row = await db_store.candles_cache_get(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(ws_limit))
+                        if row:
+                            blob, updated_at = row
+                            if updated_at is not None:
+                                age = (dt.datetime.now(dt.timezone.utc) - updated_at).total_seconds()
+                            else:
+                                age = 0.0
+                            if age <= max_age:
+                                dfp = db_store._cc_unpack_df(blob)
+                                try:
+                                    if dfp is not None and not dfp.empty and int(limit) > 0 and len(dfp) > int(limit):
+                                        dfp = dfp.tail(int(limit)).copy()
+                                except Exception:
+                                    pass
+                                if dfp is not None and not dfp.empty:
+                                    # IMPORTANT: treat short persist cache (got < need) as missing.
+                                    # This prevents cold-start got=1 from blocking signals for hours.
+                                    dfp_n = _mid_norm_ohlcv(dfp)
+                                    if dfp_n is None:
+                                        _mid_diag_add(symb, ex_name, market, tf, 'bad_schema', 'persist')
+                                        return pd.DataFrame()
+                                    try:
+                                        need_bars = int(_mid_need_bars(tf) or 0)
+                                    except Exception:
+                                        need_bars = 0
+                                    got_bars = 0
+                                    try:
+                                        got_bars = int(len(dfp_n))
+                                    except Exception:
+                                        got_bars = 0
+                                    if need_bars and got_bars < need_bars:
+                                        # record diag + cache, but fall through to prefill/REST
+                                        _mid_db_hit += 1
+                                        _mid_candles_cache[key] = (now, dfp_n)
+                                        _mid_diag_ok(symb, ex_name, market, tf, 'persist', dfp_n)
+                                    else:
+                                        _mid_db_hit += 1
+                                        _mid_candles_cache[key] = (now, dfp_n)
+                                        _mid_diag_ok(symb, ex_name, market, tf, 'persist', dfp_n)
+                                        return dfp_n
+                    except Exception:
+                        pass
+
+                # --- REST prefill for cold start (fills history after restart) ---
+                # WS is great for live updates but after restart may have got=1.
+                # When enabled, if we don't have enough bars in cache/DB, we do a one-time REST prefill
+                # (with per-symbol/TF cooldown) and persist the result to Postgres candles_cache.
+                prefill_enabled = str(os.getenv("MID_PREFILL_FROM_REST", "0") or "0").strip().lower() not in ("0","false","no","off")
+                prefill_only_if_missing = str(os.getenv("MID_PREFILL_ONLY_IF_MISSING", "1") or "1").strip().lower() not in ("0","false","no","off")
+                try:
+                    prefill_cooldown = float(os.getenv("MID_PREFILL_COOLDOWN_SEC", "900") or 900)
+                except Exception:
+                    prefill_cooldown = 900.0
+                try:
+                    prefill_timeout = float(os.getenv("MID_PREFILL_TIMEOUT_SEC", "3.5") or 3.5)
+                except Exception:
+                    prefill_timeout = 3.5
+
+                def _prefill_limit_for_tf(tf_: str) -> int:
+                    ttf = (tf_ or "").strip().lower()
+                    try:
+                        if ttf in ("5m","5min","5"):
+                            return int(os.getenv("MID_PREFILL_LIMIT_5M", "300") or 300)
+                        if ttf in ("30m","30min","30"):
+                            return int(os.getenv("MID_PREFILL_LIMIT_30M", "200") or 200)
+                        return int(os.getenv("MID_PREFILL_LIMIT_1H", "150") or 150)
+                    except Exception:
+                        return 300 if ttf.startswith("5") else (200 if ttf.startswith("30") else 150)
+
+                # prefill guard state
+                if prefill_enabled and tf in ("5m","30m","1h"):
+                    try:
+                        # If we already have enough bars in WS/DB cache -> skip prefill.
+                        need = _mid_need_bars(tf) if prefill_only_if_missing else 0
+                        if need and int(limit) > 0 and int(limit) >= need:
+                            # We don't know got here because cache lookup already failed, so treat as missing.
+                            pass
+                        if not hasattr(self, "_mid_prefill_last"):
+                            self._mid_prefill_last = {}  # type: ignore[attr-defined]
+                        _pl = self._mid_prefill_last  # type: ignore[attr-defined]
+                        _pkey = (ex_name, (market or "SPOT").upper().strip(), symb, tf)
+                        last_ts = float(_pl.get(_pkey, 0.0) or 0.0)
+                        # If we have a recent successful prefill for this (market,symbol,tf),
+                        # don't hit REST again even if we rotate exchanges.
+                        if not hasattr(self, "_mid_prefill_last_ok"):
+                            self._mid_prefill_last_ok = {}  # type: ignore[attr-defined]
+                        _pl_ok = self._mid_prefill_last_ok  # type: ignore[attr-defined]
+                        _okey = ((market or "SPOT").upper().strip(), symb, tf)
+                        last_ok = float(_pl_ok.get(_okey, 0.0) or 0.0)
+                        if (time.time() - last_ok) < float(prefill_cooldown):
+                            last_ts = time.time()
+                            try:
+                                if _mid_log_prefill:
+                                    _left = float(prefill_cooldown) - (time.time() - last_ok)
+                                    try:
+                                        _ctx = _MID_TICK_CTX.get()
+                                        _ps = _ctx.get('prefill_skip') if isinstance(_ctx, dict) else None
+                                        _k = (symb, tf, (market or "SPOT").upper().strip())
+                                        if isinstance(_ps, set) and _k in _ps:
+                                            pass
+                                        else:
+                                            if isinstance(_ps, set):
+                                                _ps.add(_k)
+                                            # Skip logs are noisy; keep them on DEBUG when explicitly enabled.
+                                            logger.debug("[mid][prefill_skip] symbol=%s tf=%s market=%s reason=cooldown left=%.1fs", symb, tf, (market or "SPOT"), max(0.0, _left))
+                                    except Exception:
+                                        logger.debug("[mid][prefill_skip] symbol=%s tf=%s market=%s reason=cooldown left=%.1fs", symb, tf, (market or "SPOT"), max(0.0, _left))
                             except Exception:
                                 pass
 
-                            logger.info("[mid][reject] scanned=%s accounted=%s missing=%s :: %s", int(_mid_scanned), int(accounted), int(missing), " | ".join(parts))
+                        if (time.time() - last_ts) >= float(prefill_cooldown):
+                            _pl[_pkey] = float(time.time())
+                            pf_limit = _prefill_limit_for_tf(tf)
+                            # ensure prefill limit at least what caller asked
+                            try:
+                                pf_limit = int(max(int(pf_limit), int(limit)))
+                            except Exception:
+                                pf_limit = int(pf_limit)
+                            # Do REST prefill (single venue) with a short timeout.
+                            try:
+                                try:
+                                    if _mid_log_prefill:
+                                        logger.debug("[mid][prefill_try] symbol=%s tf=%s market=%s ex=%s limit=%s pf_limit=%s timeout=%ss", symb, tf, (market or "SPOT"), ex_name, limit, pf_limit, prefill_timeout)
+                                except Exception:
+                                    pass
+                                df_pf = await asyncio.wait_for(
+                                    _mid_fetch_klines_rest(ex_name, symb, tf, int(pf_limit), market),
+                                    timeout=float(prefill_timeout),
+                                )
+                            except Exception as _e_pf:
+                                # If REST prefill fails, this is important: candles may be unavailable.
+                                # Log once per (market,symbol,tf) per tick.
+                                df_pf = None
+                                try:
+                                    _ctx = _MID_TICK_CTX.get()
+                                    _pe = _ctx.get('prefill_err') if isinstance(_ctx, dict) else None
+                                    _k = ((market or "SPOT").upper().strip(), symb, tf, ex_name)
+                                    if isinstance(_pe, set) and _k in _pe:
+                                        pass
+                                    else:
+                                        if isinstance(_pe, set):
+                                            _pe.add(_k)
+                                        logger.warning(
+                                            "[mid][prefill_error] symbol=%s tf=%s market=%s ex=%s err=%s",
+                                            symb, tf, (market or "SPOT"), ex_name, str(_e_pf),
+                                        )
+                                except Exception:
+                                    logger.warning(
+                                        "[mid][prefill_error] symbol=%s tf=%s market=%s ex=%s",
+                                        symb, tf, (market or "SPOT"), ex_name,
+                                    )
+                            if df_pf is not None and not getattr(df_pf, "empty", True):
+                                # normalize once, then persist
+                                df_pf_n = _mid_norm_ohlcv(df_pf)
+                                if df_pf_n is not None and not getattr(df_pf_n, "empty", True):
+                                    got_pf = 0
+                                    try:
+                                        got_pf = int(len(df_pf_n))
+                                    except Exception:
+                                        got_pf = 0
+                                    # Persist under multiple common limits to maximize reuse (prefill_limit + WS limit + requested limit).
+                                    try:
+                                        if persist_enabled:
+                                            try:
+                                                ws_limit = int(os.getenv("CANDLES_WS_LIMIT", "250") or 250)
+                                            except Exception:
+                                                ws_limit = 250
+                                                ws_limit = 250
+                                            if int(ws_limit) != int(pf_limit) and got_pf:
+                                                df_ws = df_pf_n.tail(int(ws_limit)).copy() if got_pf > int(ws_limit) else df_pf_n
+                                                blob_ws = db_store._cc_pack_df(df_ws)
+                                                await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(ws_limit), blob_ws)
+                                            if int(limit) != int(pf_limit) and int(limit) > 0 and got_pf:
+                                                df_req = df_pf_n.tail(int(limit)).copy() if got_pf > int(limit) else df_pf_n
+                                                blob_req = db_store._cc_pack_df(df_req)
+                                                await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob_req)
+                                    except Exception:
+                                        pass
+                                    # Cache in memory for this request
+                                    try:
+                                        df_ret = df_pf_n
+                                        if int(limit) > 0 and got_pf and got_pf > int(limit):
+                                            df_ret = df_pf_n.tail(int(limit)).copy()
+                                        _mid_candles_cache[key] = (now, df_ret)
+                                    except Exception:
+                                        df_ret = df_pf_n
+                                    _mid_rest_refill += 1
+                                    # Successful prefill is normal; keep it silent by default.
+                                    if _mid_log_prefill and _mid_log_prefill_ok:
+                                        try:
+                                            logger.debug(
+                                                "[mid][prefill_ok] symbol=%s tf=%s market=%s ex=%s got=%s limit=%s pf_limit=%s",
+                                                symb, tf, (market or "SPOT"), ex_name, got_pf, limit, pf_limit,
+                                            )
+                                        except Exception:
+                                            pass
+                                    _mid_diag_ok(symb, ex_name, market, tf, "rest_prefill", df_pf_n)
+                                    try:
+                                        if hasattr(self, "_mid_prefill_last_ok"):
+                                            self._mid_prefill_last_ok[((market or "SPOT").upper().strip(), symb, tf)] = float(time.time())  # type: ignore[attr-defined]
+                                    except Exception:
+                                        pass
+                                    return df_ret
+                            else:
+                                # REST returned empty/no data -> that's a real problem; log once per tick.
+                                try:
+                                    _ctx = _MID_TICK_CTX.get()
+                                    _pe0 = _ctx.get('prefill_empty') if isinstance(_ctx, dict) else None
+                                    _k0 = ((market or "SPOT").upper().strip(), symb, tf, ex_name)
+                                    if isinstance(_pe0, set) and _k0 in _pe0:
+                                        pass
+                                    else:
+                                        if isinstance(_pe0, set):
+                                            _pe0.add(_k0)
+                                        logger.warning(
+                                            "[mid][prefill_empty] symbol=%s tf=%s market=%s ex=%s pf_limit=%s",
+                                            symb, tf, (market or "SPOT"), ex_name, pf_limit,
+                                        )
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
 
-                            if _mid_candles_log_fail and _mid_candles_fail:
-                                try:
-                                    # top offenders
-                                    items = sorted(_mid_candles_fail.items(), key=lambda kv: kv[1], reverse=True)[:6]
-                                    parts2 = []
-                                    for (ex, tf), cnt in items:
-                                        samp = _mid_candles_fail_samples.get((ex, tf)) or []
-                                        s = "; ".join(samp)
-                                        parts2.append(f"{ex}:{tf}={cnt}" + (f" ({s})" if s else ""))
-                                    logger.warning("[mid][candles_fail] %s", " | ".join(parts2))
-                                except Exception:
-                                    pass
-                            # Optional: full per-symbol dump (can be verbose). Shows one reason per scanned symbol.
-                            if _rej_full:
-                                try:
-                                    maxn = max(0, int(_rej_full_max))
-                                    pairs = []
-                                    for s in symbols[:maxn]:
-                                        r = _rej_reason_by_sym.get(s) or "untracked"
-                                        pairs.append(f"{s}:{r}")
-                                    # chunk to avoid extremely long single lines
-                                    chunk = 20
-                                    for i in range(0, len(pairs), chunk):
-                                        logger.info("[mid][reject_full] %s", " | ".join(pairs[i:i+chunk]))
-                                except Exception:
-                                    pass
+
+
+                # If TF is 30m/1h and we have 5m candles (WS/DB), build higher TF from 5m to avoid REST.
+                if tf in ("30m", "1h"):
+                    try:
+                        tf_minutes = 30 if tf == "30m" else 60
+                        # Get 5m candles (WS/DB-first; REST only if no cache)
+                        df5 = await _mid_fetch_klines_wsdb_only(ex_name, symb, "5m", int(max(limit, 120)), market)
+                        if df5 is not None and not getattr(df5, "empty", True):
+                            d5 = df5.copy()
+                            try:
+                                if "open_time" in d5.columns and "open_time_ms" not in d5.columns:
+                                    d5["open_time_ms"] = d5["open_time"].astype("int64")
+                                if "close_time" in d5.columns and "close_time_ms" not in d5.columns:
+                                    d5["close_time_ms"] = d5["close_time"].astype("int64")
+                                d5["open_time_ms"] = d5["open_time_ms"].astype("int64")
+                                if "close_time_ms" in d5.columns:
+                                    d5["close_time_ms"] = d5["close_time_ms"].astype("int64")
+                            except Exception:
+                                pass
+
+                            bucket_ms = tf_minutes * 60_000
+                            ot = d5["open_time_ms"].astype("int64")
+                            b = (ot // bucket_ms) * bucket_ms
+                            d5 = d5.assign(_bucket=b)
+
+                            g = d5.groupby("_bucket", sort=True)
+
+                            out = g.agg(
+                                open_time_ms=("open_time_ms", "min"),
+                                open=("open", "first"),
+                                high=("high", "max"),
+                                low=("low", "min"),
+                                close=("close", "last"),
+                                volume=("volume", "sum"),
+                            ).reset_index(drop=True)
+
+                            try:
+                                if "close_time_ms" in d5.columns:
+                                    out["close_time_ms"] = g["close_time_ms"].max().values
+                                else:
+                                    out["close_time_ms"] = out["open_time_ms"].astype("int64") + bucket_ms
+                            except Exception:
+                                out["close_time_ms"] = out["open_time_ms"].astype("int64") + bucket_ms
+
+                            # add extra cols for packed DF compatibility
+                            for _c, _v in (
+                                ("quote_volume", 0.0),
+                                ("trades", 0),
+                                ("taker_base_volume", 0.0),
+                                ("taker_quote_volume", 0.0),
+                                ("ignore", 0),
+                            ):
+                                if _c not in out.columns:
+                                    out[_c] = _v
+
+                            # freshness check
+                            try:
+                                max_age = float(os.getenv("MID_AGG_FROM_5M_MAX_AGE_SEC", "1800") or 1800)
+                                now_ms = int(time.time() * 1000)
+                                last_close = int(out["close_time_ms"].iloc[-1])
+                                allowed = max(max_age, float(tf_minutes) * 60.0 * 2.0)
+                                if (now_ms - last_close) <= int(allowed * 1000):
+                                    if int(limit) > 0 and len(out) > int(limit):
+                                        out = out.tail(int(limit)).copy()
+                                    _mid_candles_cache[key] = (now, out)
+                                    _mid_diag_add(symb, ex_name, market, tf, "OK", "agg_from_5m")
+                                    try:
+                                        if persist_enabled and tf in ("30m", "1h"):
+                                            blob = db_store._cc_pack_df(out)
+                                            await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob)
+                                    except Exception:
+                                        pass
+                                    return out
+                                else:
+                                    _mid_diag_add(symb, ex_name, market, tf, "stale_agg_from_5m")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                # --- REST fetch with adaptive limit (250 -> 200 -> 120) that works even when mid_candles_retry=0 ---
+                last = None
+                base_limit = int(limit)
+                limits_to_try = []
+                try:
+                    if base_limit > 0:
+                        limits_to_try.append(base_limit)
+                    if base_limit > 200:
+                        limits_to_try.append(200)
+                    if base_limit > 120:
+                        limits_to_try.append(120)
+                    _seen = set()
+                    limits_to_try = [x for x in limits_to_try if (x not in _seen and not _seen.add(x))]
+                except Exception:
+                    limits_to_try = [int(limit)]
+                
+                for _i in range(max(0, mid_candles_retry) + 1):
+                    for _lim in limits_to_try:
+                        limit = int(_lim)
+                        last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, market)
+                
+                        # If response is empty (no exception), count as EMPTY + optional adaptive behaviors
+                        if last is None or getattr(last, 'empty', False):
+                
+                            # Bidirectional market fallback (FUTURES <-> SPOT) when requested market yields empty/None/unsupported.
+                            try:
+                                mkt_req = (market or 'SPOT').upper().strip()
+                                fb_global = str(os.getenv('MID_CANDLES_MARKET_FALLBACK', '1') or '1').strip().lower() not in ('0','false','no','off')
+                                if fb_global and mkt_req in ('FUTURES', 'SPOT'):
+                                    if mkt_req == 'FUTURES':
+                                        fb_on = str(os.getenv('MID_CANDLES_FUTURES_FALLBACK_SPOT', '1') or '1').strip().lower() not in ('0','false','no','off')
+                                        alt = 'SPOT' if fb_on else None
+                                    else:
+                                        fb_on = str(os.getenv('MID_CANDLES_SPOT_FALLBACK_FUTURES', '1') or '1').strip().lower() not in ('0','false','no','off')
+                                        alt = 'FUTURES' if fb_on else None
+                                    if alt:
+                                        alt_df = await _mid_fetch_klines_rest(ex_name, symb, tf, int(limit), alt)
+                                        if alt_df is not None and not getattr(alt_df, 'empty', True):
+                                            # Cache write-through under BOTH markets to suppress repeated empties.
+                                            key_alt = (ex_name, alt, symb, tf, int(limit))
+                                            _mid_candles_cache[key_alt] = (now, alt_df)
+                                            _mid_candles_cache[key] = (now, alt_df)
+                                            # write-through to persistent cache
+                                            try:
+                                                persist_enabled = str(os.getenv('MID_PERSIST_CANDLES', '1') or '1').strip().lower() not in ('0','false','no','off')
+                                                if persist_enabled and tf in ('5m','30m','1h'):
+                                                    blob = db_store._cc_pack_df(alt_df)
+                                                    await db_store.candles_cache_set(ex_name, alt, symb, tf, int(limit), blob)
+                                                    await db_store.candles_cache_set(ex_name, mkt_req, symb, tf, int(limit), blob)
+                                            except Exception:
+                                                pass
+                                            _mid_candles_fallback += 1
+                                            _mid_diag_add(symb, ex_name, mkt_req, tf, 'OK', f"fallback_{alt.lower()}")
+                                            return alt_df
+                            except Exception:
+                                pass
+                
+                            # If we got an empty dataframe, it often means the instrument doesn't exist for this market (esp. OKX SWAP).
+                            # Re-check market availability and convert empty->unsupported_pair to avoid repeated empty storms.
+                            try:
+                                mkt_now = (market or 'SPOT').upper().strip()
+                                if await api._market_supported_ex(ex_name, mkt_now, symb) is False:
+                                    try:
+                                        api._mark_unsupported(ex_name, mkt_now, symb, tf)
+                                    except Exception:
+                                        pass
+                                    _mid_diag_add(symb, ex_name, mkt_now, tf, 'unsupported_pair')
+                                    _mid_candles_unsupported += 1
+                                    return None
+                            except Exception:
+                                pass
+                
+                            # If REST returned empty on the *smallest* limit for BYBIT/OKX FUTURES, treat as unsupported to stop storms.
+                            try:
+                                mkt_now2 = (market or 'SPOT').upper().strip()
+                                empty_as_unsup = str(os.getenv('MID_EMPTY_FUTURES_AS_UNSUPPORTED', '1') or '1').strip().lower() not in ('0','false','no','off')
+                                is_last_lim = (int(limit) <= 120) or (limit == limits_to_try[-1])
+                                is_last_try = (_i >= max(0, mid_candles_retry))
+                                if empty_as_unsup and mkt_now2 == 'FUTURES' and ex_name in ('BYBIT','OKX') and is_last_lim and is_last_try:
+                                    try:
+                                        api._mark_unsupported(ex_name, mkt_now2, symb, tf)
+                                    except Exception:
+                                        pass
+                                    _mid_diag_add(symb, ex_name, mkt_now2, tf, 'unsupported_pair', 'empty_futures')
+                                    _mid_candles_unsupported += 1
+                                    return None
+                            except Exception:
+                                pass
+                
+                            
+                            # If REST returned empty repeatedly (any exchange/market), optionally treat it as unsupported
+                            # to avoid repeated empty storms and let other venues win quickly.
+                            try:
+                                mkt_now2 = (market or 'SPOT').upper().strip()
+                                empty_as_unsup_all = str(os.getenv('MID_EMPTY_AS_UNSUPPORTED', '1') or '1').strip().lower() not in ('0','false','no','off')
+                                min_lim = int(os.getenv('MID_EMPTY_AS_UNSUPPORTED_MIN_LIMIT', '120') or 120)
+                                is_small_lim = (int(limit) <= min_lim) or (limit == limits_to_try[0])
+                                is_last_try = (_i >= max(0, mid_candles_retry))
+                                if empty_as_unsup_all and is_small_lim and is_last_try:
+                                    try:
+                                        api._mark_unsupported(ex_name, mkt_now2, symb, tf)
+                                    except Exception:
+                                        pass
+                                    _mid_diag_add(symb, ex_name, mkt_now2, tf, 'unsupported_pair', 'empty')
+                                    _mid_candles_unsupported += 1
+                                    return None
+                            except Exception:
+                                pass
+# If it was explicitly marked unsupported (e.g. market not implemented),
+                            # don't count it as an "empty candles" sample.
+                            if api._is_unsupported_cached(ex_name, (market or 'SPOT').upper().strip(), symb, tf):
+                                _mid_candles_unsupported += 1
+                                return None
+
+                            # Treat persistent "empty" as unsupported_pair (most often: contract doesn't exist).
+                            # This makes MID immediately try other markets/exchanges instead of accumulating empty storms.
+                            try:
+                                api._mark_unsupported(ex_name, (market or 'SPOT').upper().strip(), symb, tf)
+                            except Exception:
+                                pass
+                            _mid_diag_add(symb, ex_name, (market or 'SPOT').upper().strip(), tf, 'unsupported_pair', 'empty')
+                            _mid_candles_unsupported += 1
+                            return None
+                
+                        # got non-empty candles
+                        break
+                    else:
+                        # all limits empty for this retry iteration
+                        last = __import__('pandas').DataFrame()
+                
+                    if last is not None and not getattr(last, 'empty', True):
+                        break
+                
+                    # tiny backoff reduces rate-limit bursts and improves success on flaky networks
+                    if _i < max(0, mid_candles_retry):
+                        try:
+                            await __import__('asyncio').sleep(0.15 * (_i + 1))
                         except Exception:
                             pass
+                
+                if last is not None and not getattr(last, 'empty', True):
+                    # Accept REST candles only if newest candle is reasonably fresh (prevents stale REST poisoning).
                     try:
-                        _mid_set_last_summary(summary)
+                        rest_max_age = float(os.getenv('MID_REST_CANDLES_MAX_AGE_SEC', '1800') or 1800)
+                        tf_sec = 300.0 if tf == '5m' else (1800.0 if tf == '30m' else (3600.0 if tf == '1h' else 0.0))
+                        allowed = max(rest_max_age, tf_sec * 2.0) if tf_sec > 0 else rest_max_age
+                        now_ms = int(__import__('time').time() * 1000)
+                        if 'close_time_ms' in last.columns:
+                            _last_close = int(float(last['close_time_ms'].iloc[-1]))
+                        elif 'close_time' in last.columns:
+                            _last_close = int(float(last['close_time'].iloc[-1]))
+                        else:
+                            _last_close = 0
+                        if _last_close > 0 and (now_ms - _last_close) > int(allowed * 1000):
+                            _mid_diag_add(symb, ex_name, market, tf, 'stale_rest')
+                            last = __import__('pandas').DataFrame()
                     except Exception:
                         pass
+                
+                if last is not None and not getattr(last, 'empty', True):
+                    _mid_candles_cache[key] = (now, last)
+                    # write-through to persistent cache
                     try:
-                        # For /health: last successful MID tick timestamp
-                        global MID_LAST_TICK_TS
-                        MID_LAST_TICK_TS = time.time()
+                        persist_enabled = str(os.getenv('MID_PERSIST_CANDLES', '1') or '1').strip().lower() not in ('0','false','no','off')
+                        if persist_enabled and tf in ('5m','30m','1h'):
+                            blob = db_store._cc_pack_df(last)
+                            await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob)
                     except Exception:
                         pass
+                    _mid_rest_refill += 1
+                    _mid_diag_ok(symb, ex_name, market, tf, 'rest', last)
+                    return last
+                
+                # fallback to stale cache if available and not too old
+                if cached:
+                    ts, df = cached
+                    if (now - ts) <= float(_mid_tf_stale_sec(tf, kind="cache")) and df is not None and not df.empty:
+                        return df
+                return None
+
+            try:
+                async with MultiExchangeData() as api:
+                    await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
+                    # Same best-effort symbols loading as MAIN scanner.
+                    # --- MID symbols pool (independent from MAIN scanner cache) ---
+                    if not hasattr(self, "_mid_symbols_cache"):
+                        self._mid_symbols_cache = []
+                        self._mid_symbols_cache_ts = 0.0
+                    try:
+                        symbols_pool = await api.get_top_usdt_symbols(top_n_symbols)
+                        if symbols_pool:
+                            # Normalize symbols across exchanges (OKX uses BTC-USDT / BTC-USDT-SWAP, Gate may use BTC_USDT).
+                            # Internally we use canonical BASEQUOTE like BTCUSDT.
+                            def _mid_norm_symbol(s: str) -> str:
+                                u = (s or "").upper().strip()
+                                # Remove common separators
+                                u = u.replace("-", "").replace("_", "").replace(":", "")
+                                # Strip derivative suffixes
+                                for suf in ("SWAP", "PERP", "FUT", "FUTURES"):
+                                    if u.endswith(suf):
+                                        u = u[: -len(suf)]
+                                        break
+                                return u
+
+                            symbols_pool = [_mid_norm_symbol(x) for x in symbols_pool if x]
+                            # Production hardening: drop obviously invalid symbols early (prevents invalid_symbol_format/no_candles storms)
+                            _sym_ok = re.compile(r'^[A-Z0-9]{2,20}USDT$')
+                            symbols_pool = [x for x in symbols_pool if x and x.isascii() and x.endswith('USDT') and _sym_ok.match(x)]
+                            # de-duplicate (some exchanges/pools can return duplicates)
+                            symbols_pool = list(dict.fromkeys(symbols_pool))
+                            self._mid_symbols_cache = list(symbols_pool)
+                            self._mid_symbols_cache_ts = time.time()
+                            # remember which exchange provided this universe (so MID prefers correct candles exchange)
+                            try:
+                                _pref_ex = getattr(api, 'last_top_provider', None)
+                                if _pref_ex:
+                                    self._mid_symbols_cache_provider = str(_pref_ex)
+                                    self._mid_symbol_pref_exchange = {s: str(_pref_ex) for s in symbols_pool}
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        if getattr(self, "_mid_symbols_cache", None):
+                            logger.warning("[mid] get_top_usdt_symbols failed (%s); using cached symbols (%s)", e, len(self._mid_symbols_cache))
+                            symbols_pool = list(self._mid_symbols_cache)
+                            try:
+                                _pref_ex = getattr(self, '_mid_symbols_cache_provider', None)
+                                if _pref_ex:
+                                    self._mid_symbol_pref_exchange = {s: str(_pref_ex) for s in symbols_pool}
+                            except Exception:
+                                pass
+                        else:
+                            raise
+                    # Scan only first MID_TOP_N symbols from the loaded universe.
+                    # FIX: remove blocked/stable symbols BEFORE slicing to TOP_N
+                    _filtered_pool = [s for s in symbols_pool if not is_blocked_symbol(s)]
+                    symbols = list(_filtered_pool[:max(0, int(top_n))])
+                    # ensure unique symbols per tick (preserve order)
+                    if symbols:
+                        symbols = list(dict.fromkeys(symbols))
+                    # Prefilter symbols that are not available on ANY configured MID candle source.
+                    # This removes candles_unavailable storms like FXSUSDT and reduces wasted HTTP calls.
+                    try:
+                        prefilter = (os.getenv("MID_PREFILTER_UNSUPPORTED_SYMBOLS", "1") or "1").strip().lower() in ("1","true","yes","on")
+                    except Exception:
+                        prefilter = True
+                    if prefilter and symbols:
+                        try:
+                            _kept = []
+                            for _s in symbols:
+                                if is_blocked_symbol(_s):
+                                    _rej_add(_s, "trap_block")
+                                    continue
+                                _ok = False
+                                # Try both markets because later we may fall back FUTURES->SPOT
+                                for _mkt in ("FUTURES","SPOT"):
+                                    for _ex in (mid_universe or ["BINANCE","BYBIT","OKX"]):
+                                        try:
+                                            if _market_supported_ex(_ex, _mkt, _s):
+                                                _ok = True
+                                                break
+                                        except Exception:
+                                            continue
+                                    if _ok:
+                                        break
+                                if _ok:
+                                    _kept.append(_s)
+                                else:
+                                    # remember for routing diagnostics
+                                    _rej_add(_s, "candles_unavailable")
+                            symbols = _kept
+                        except Exception:
+                            pass
+                    # --- MID tick counters / diagnostics ---
+                    _mid_scanned = len(symbols)
+                    _mid_pool = len(symbols_pool)
+                    _mid_emitted = 0
+                    _mid_skip_blocked = 0
+                    _mid_skip_cooldown = 0
+                    _mid_skip_macro = 0
+                    _mid_skip_news = 0
+                    _mid_skip_trap = 0
+                    _mid_f_align = 0
+                    _mid_f_score = 0
+                    _mid_ta_score_low = 0
+                    _mid_ta_score_missing_sum = 0.0
+                    _mid_ta_score_missing_max = 0.0
+                    _mid_f_rr = 0
+                    _mid_f_adx = 0
+                    _mid_f_atr = 0
+                    _mid_f_futoff = 0
+                    _mid_candles_net_fail = 0
+                    _mid_no_signal = 0
+                    _mid_no_signal_reasons = {"trap":0,"structure":0,"trend":0,"extreme":0,"impulse":0,"other":0}
+                    _mid_no_signal_stage_by_sym = {}
+                    _mid_no_signal_stages_by_sym = {}
+                    _mid_no_signal_detail_reasons_other = {}  # base_reason -> count (stage==other only)
+                    _mid_no_signal_reasons_by_sym = {}      # sym -> [fail_reason...] per venue
+                    _rej_reasons_added = set()  # ensure _rej_reasons_by_sym merged once per sym
+  # sym -> [stage per venue with OK candles]
+                    _mid_no_signal_stage_mode = str(os.getenv("MID_NO_SIGNAL_STAGE_MODE","best")).strip().lower()
+                    if _mid_no_signal_stage_mode not in ("best","majority"):
+                        _mid_no_signal_stage_mode = "best"
+
+                    _mid_candles_unsupported = 0
+                    _mid_candles_partial = 0
+                    _mid_db_hit = 0
+                    _mid_rest_refill = 0
+                    _c0 = api.candle_counters_snapshot()
+                    _mid_hard_block0 = _mid_hard_block_total()
+                    try:
+                        _mid_adapt_reset_tick()
+                    except Exception:
+                        pass
+                    _mid_hard_block = 0
+
+                    # --- MID reject digest (log-only): explains "scanned=N but counters don't add up" ---
+                    # MID reject digest (enabled by default; set MID_REJECT_DIGEST=0 to disable)
+                    _rej_enabled = os.getenv("MID_REJECT_DIGEST", "1").strip().lower() in ("1","true","yes","on")
+                    _rej_max_reasons = int(os.getenv("MID_REJECT_DIGEST_MAX_REASONS", "12") or 12)
+                    _rej_examples = int(os.getenv("MID_REJECT_DIGEST_EXAMPLES", "3") or 3)
+                    _rej_seen = set()
+                    _rej_counts = {}
+                    _rej_examples_map = {}
+                    _rej_full = os.getenv("MID_REJECT_DIGEST_FULL", "0").strip().lower() in ("1","true","yes","on")
+                    _rej_full_max = int(os.getenv("MID_REJECT_DIGEST_FULL_MAX", str(_mid_scanned)) or _mid_scanned)
+                    _rej_reason_by_sym = {}  # sym -> reason
+                    # Keep a list of normalized reasons too, so 'other={...}' in [mid][summary]
+                    # can show a breakdown like: other=43{score_low=6,rr_low=3,...}
+                    _rej_reasons_by_sym = defaultdict(list)  # sym -> [base_reason...]
+
+                    def _rej_add(_sym: str, _reason: str) -> None:
+                        """Record exactly one terminal reject reason per symbol per tick (MID registry keys)."""
+                        if not _rej_enabled:
+                            return
+                        try:
+                            if _sym in _rej_seen:
+                                return
+                            _rej_seen.add(_sym)
+
+                            key = mid_reject(_reason)
+
+                            _rej_reason_by_sym[_sym] = key
+                            _rej_counts[key] = int(_rej_counts.get(key, 0) or 0) + 1
+                            lst = _rej_examples_map.get(key)
+                            if lst is None:
+                                lst = []
+                                _rej_examples_map[key] = lst
+                            if len(lst) < _rej_examples_max:
+                                lst.append(str(_sym))
+
+                            # Stage flow: this symbol ended in rejection
+                            _mid_stage_add("rejected", 1)
+
+                            # Rolling reject digest for /health
+                            _mid_reject_add(key)
+                        except Exception:
+                            pass
+
+                    logger.info("[mid] tick start TOP_N=%s interval=%ss pool=%s scanned=%s (MID_TOP_N_SYMBOLS=%s)", top_n, interval, _mid_pool, _mid_scanned, top_n_symbols)
+                    logger.info("[mid][scanner] symbols loaded: %s (pool=%s)", _mid_scanned, _mid_pool)
+                    mac_act, mac_ev, mac_win = self.macro.current_action()
+                    self.last_macro_action = mac_act
+                    if MACRO_FILTER:
+                        logger.info("[mid] macro action=%s next=%s window=%s", mac_act, getattr(mac_ev, "name", None) if mac_ev else None, mac_win)
+                        if mac_act != "ALLOW" and mac_ev and mac_win and self.macro.should_notify(mac_ev):
+                            logger.info("[mid][macro] alert: action=%s event=%s window=%s", mac_act, getattr(mac_ev, "name", None), mac_win)
+                            await emit_macro_alert_cb(mac_act, mac_ev, mac_win, TZ_NAME)
+
+
+                    # --- Architecture C: prefetch candles for all symbols (primary exchange) ---
+                    mid_prefetch = os.getenv("MID_PREFETCH_CANDLES", "1").strip().lower() in ("1","true","yes","on")
+                    if mid_prefetch and symbols:
+                        try:
+                            prefetch_limit = int(os.getenv("MID_PREFETCH_LIMIT", "250") or 250)
+                            prefetch_timeout = float(os.getenv("MID_PREFETCH_TIMEOUT_SEC", "25") or 25)
+                            groups = defaultdict(list)
+                            for _s in symbols:
+                                if is_blocked_symbol(_s):
+                                    continue
+                                groups[_mid_primary_for_symbol(_s)].append(_s)
+
+                            tasks = []
+                            for _ex, _syms in groups.items():
+                                for _s in _syms:
+                                    tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trigger, prefetch_limit, market_mid)))
+                                    tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_mid, prefetch_limit, market_mid)))
+                                    tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trend, prefetch_limit, market_mid)))
+
+                            if tasks:
+                                if prefetch_timeout and prefetch_timeout > 0:
+                                    await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=prefetch_timeout)
+                                else:
+                                    await asyncio.gather(*tasks, return_exceptions=True)
+                        except Exception as _e:
+                            logger.warning("[mid] candles prefetch failed: %s", _e)
+
+                    # Exclude prefetch time from per-symbol budget (budget applies to scan phase)
+                    start_scan = time.time()
+                    prefetch_elapsed = float(start_scan - start_total)
+                    for sym in symbols:
+                        _mid_stage_add("scanned", 1)
+                        # Hard budget per MID tick (prevents very long ticks during exchange issues)
+                        if mid_tick_budget_sec and mid_tick_budget_sec > 0:
+                            if (time.time() - start_scan) > float(mid_tick_budget_sec):
+                                # Mark remaining symbols as budget-exceeded (so [mid][reject] stays honest)
+                                try:
+                                    for _s in symbols[symbols.index(sym):]:
+                                        _rej_add(_s, 'tick_budget')
+                                except Exception:
+                                    pass
+                                break
+                        if is_blocked_symbol(sym):
+                            _mid_skip_blocked += 1
+                            _rej_add(sym, "trap_block")
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "blocked_symbol")
+                            except Exception:
+                                pass
+                            continue
+                        if not self.can_emit_mid(sym):
+                            _mid_skip_cooldown += 1
+                            _rej_add(sym, "trap_block")
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "cooldown")
+                            except Exception:
+                                pass
+                            continue
+
+                        if MACRO_FILTER and mac_act == "PAUSE_ALL":
+                            _mid_skip_macro += 1
+                            _rej_add(sym, "trap_block")
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "macro_pause_all")
+                            except Exception:
+                                pass
+                            continue
+                        news_act = "OK"
+                        if NEWS_FILTER and CRYPTOPANIC_TOKEN:
+                            news_act = await self.news.action_for_symbol(api.session, sym)
+                            if news_act == "PAUSE_ALL":
+                                _mid_skip_news += 1
+                                _rej_add(sym, "trap_block")
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, "", None, "news_pause_all")
+                                except Exception:
+                                    pass
+                                continue
+
+                        supporters = []  # kept for compatibility with later counters (not used for multi-exchange scoring)
+                        chosen_name = None
+                        chosen_market = None
+                        # --- MID candles length requirements (diagnostics) ---
+                        # If candles are present but too short for indicators, MID will behave like "no_candles".
+                        # Log explicit need/got per TF to distinguish "didn't have time to collect" vs "bad data".
+                        def _mid_need_bars(tf: str) -> int:
+                            t = (tf or "").strip().lower()
+                            try:
+                                if t in ("5m", "5min", "5"):
+                                    return int(os.getenv("MID_NEED_5M_BARS", os.getenv("MID_NEED_BARS_5M", "60")) or 60)
+                                if t in ("30m", "30min", "30"):
+                                    return int(os.getenv("MID_NEED_30M_BARS", os.getenv("MID_NEED_BARS_30M", "200")) or 200)
+                                # default: 1h+
+                                return int(os.getenv("MID_NEED_1H_BARS", os.getenv("MID_NEED_BARS_1H", "200")) or 200)
+                            except Exception:
+                                return 0
+
+                        
+                        def _mid_diag_ok(symb: str, ex_name: str, market: str, tf: str, source: str, df: Optional[pd.DataFrame]) -> None:
+                            """Add an OK/partial diag record including got/need bars.
+                            If got < need -> mark as partial with need/got/missing (~time needed).
+                            """
+                            try:
+                                need = _mid_need_bars(tf)
+                                got = int(len(df)) if df is not None else 0
+                                if need and got < need:
+                                    _mid_diag_add(symb, ex_name, market, tf, "partial",
+                                                 f"need_{tf}_bars={need} got={got}" + _mid_fmt_missing_wait(tf, need, got))
+                                else:
+                                    # Keep the existing OK semantics but enrich with bars count for clarity.
+                                    if got:
+                                        _mid_diag_add(symb, ex_name, market, tf, "OK", f"{source}(got={got})")
+                                    else:
+                                        _mid_diag_add(symb, ex_name, market, tf, "OK", source)
+                            except Exception:
+                                _mid_diag_add(symb, ex_name, market, tf, "OK", source)
+
+                        def _mid_len(df: Optional[pd.DataFrame]) -> int:
+                            try:
+                                return int(len(df)) if df is not None else 0
+                            except Exception:
+                                return 0
+
+                        chosen_r: Optional[Dict[str, Any]] = None
+                        found_ok_candles: bool = False  # candles were present and had enough bars on at least one venue
+
+                        async def _choose_exchange_mid():
+                            nonlocal chosen_name, chosen_market, chosen_r, found_ok_candles
+                            primary = _mid_primary_for_symbol(sym)
+                            # try primary first, then the other primary (if any), then fallbacks
+                            if MID_CANDLES_LIGHT_MODE or MID_CANDLES_BINANCE_FIRST:
+                                # "binance-first" fast path: try BINANCE first, then BYBIT/OKX, then SPOT fallbacks
+                                _light_primary = ["BINANCE", "BYBIT", "OKX"]
+                                try_order = []
+                                for _x in _light_primary:
+                                    if _x not in try_order:
+                                        try_order.append(_x)
+                                for _x in (mid_primary_exchanges or []):
+                                    if _x not in try_order:
+                                        try_order.append(_x)
+                                for _x in (mid_fallback_exchanges or []):
+                                    if _x not in try_order:
+                                        try_order.append(_x)
+                            else:
+                                try_order = [primary] + [x for x in mid_primary_exchanges if x != primary] + [x for x in mid_fallback_exchanges if x != primary]
+
+                            # Try markets in order (AUTO: FUTURES->SPOT, or configured order)
+                            for mkt in markets_try:
+                                mkt_u = (mkt or 'SPOT').upper().strip()
+                                if mkt_u == 'FUTURES':
+                                    names = [x for x in try_order if x in ('BINANCE','BYBIT','OKX')]
+                                else:
+                                    names = try_order
+                                for name in names:
+                                    try:
+                                        # Fetch trigger TF first (cuts 3x HTTP load on misses -> fewer timeouts/no_candles)
+                                        a = await _mid_fetch_klines_cached(name, sym, tf_trigger, 250, mkt)
+                                        if a is None or a.empty:
+                                            continue
+
+                                        b, c = await asyncio.gather(
+                                            _mid_fetch_klines_cached(name, sym, tf_mid, 250, mkt),
+                                            _mid_fetch_klines_cached(name, sym, tf_trend, 250, mkt),
+                                            return_exceptions=True,
+                                        )
+                                        if isinstance(b, Exception):
+                                            b = None
+                                        if isinstance(c, Exception):
+                                            c = None
+
+                                        # Require true TFs for MID (no silent TF substitution).
+                                        if b is None or getattr(b, 'empty', True):
+                                            continue
+                                        if c is None or getattr(c, 'empty', True):
+                                            continue
+
+                                        # Length sanity: distinguish "empty" vs "too few bars".
+                                        n5_need = _mid_need_bars(tf_trigger)
+                                        n30_need = _mid_need_bars(tf_mid)
+                                        n1h_need = _mid_need_bars(tf_trend)
+                                        n5_got = _mid_len(a)
+                                        n30_got = _mid_len(b)
+                                        n1h_got = _mid_len(c)
+                                        if n5_need and n5_got < n5_need:
+                                            _mid_diag_add(sym, name, mkt_u, tf_trigger, "partial", f"need_{tf_trigger}_bars={n5_need} got={n5_got}" + _mid_fmt_missing_wait(tf_trigger, n5_need, n5_got))
+                                            _mid_candles_partial += 1
+                                            continue
+                                        if n30_need and n30_got < n30_need:
+                                            _mid_diag_add(sym, name, mkt_u, tf_mid, "partial", f"need_{tf_mid}_bars={n30_need} got={n30_got}" + _mid_fmt_missing_wait(tf_mid, n30_need, n30_got))
+                                            _mid_candles_partial += 1
+                                            continue
+                                        if n1h_need and n1h_got < n1h_need:
+                                            _mid_diag_add(sym, name, mkt_u, tf_trend, "partial", f"need_{tf_trend}_bars={n1h_need} got={n1h_got}" + _mid_fmt_missing_wait(tf_trend, n1h_need, n1h_got))
+                                            _mid_candles_partial += 1
+                                            continue
+
+                                        # Candles are available (non-empty + enough bars) on this venue.
+                                        found_ok_candles = True
+                                        _diag = {}
+                                        r = evaluate_on_exchange_mid(a, b, c, symbol=sym, diag=_diag, market=mkt_u)
+                                        if not r:
+                                            try:
+                                                _st = str(_diag.get("fail_stage") or "other")
+                                                if _st not in _mid_no_signal_reasons:
+                                                    _st = "other"
+                                                # Collect stage per venue; we'll decide final stage when rejecting as no_signal.
+                                                _mid_no_signal_stage_by_sym[sym] = _st  # last (debug)
+                                                _mid_no_signal_stages_by_sym.setdefault(sym, []).append(_st)
+                                                # Collect detailed fail reason (best-effort).
+                                                _rr = str(_diag.get("fail_reason") or ("unknown" if str(_st or '')=='other' else _st) or "other")
+                                                _rr = _rr.strip() or "other"
+                                                if len(_rr) > 64:
+                                                    _rr = _rr[:64]
+                                                _mid_no_signal_reasons_by_sym.setdefault(sym, []).append(_rr)
+                                                # Merge per-symbol reject reasons collected by _rej_add (score_low/rr_low/etc)
+                                                try:
+                                                    if sym not in _rej_reasons_added and '_rej_reasons_by_sym' in locals():
+                                                        for _r0 in list(_rej_reasons_by_sym.get(sym) or []):
+                                                            if _r0:
+                                                                _mid_no_signal_reasons_by_sym.setdefault(sym, []).append(str(_r0))
+                                                        _rej_reasons_added.add(sym)
+                                                except Exception:
+                                                    pass
+                                            except Exception:
+                                                pass
+                                        if r:
+                                            chosen_name = name
+                                            chosen_market = mkt
+                                            chosen_r = r
+                                            return
+                                    except Exception:
+                                        continue
+
+# Soft timeout per symbol (prevents a single symbol/exchange from stalling the whole MID tick)
+                        if mid_symbol_timeout_sec and mid_symbol_timeout_sec > 0:
+                            try:
+                                await asyncio.wait_for(_choose_exchange_mid(), timeout=float(mid_symbol_timeout_sec))
+                            except asyncio.TimeoutError:
+                                _rej_add(sym, f"symbol_timeout_{float(mid_symbol_timeout_sec):.0f}s")
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, '', None, 'symbol_timeout')
+                                except Exception:
+                                    pass
+                                continue
+                        else:
+                            await _choose_exchange_mid()
+
+                        if not chosen_r:
+                            if found_ok_candles:
+                                # Candles were OK but no signal on any venue.
+                                _rej_add(sym, "not_enough_data")
+                                try:
+                                    _mid_no_signal += 1
+                                    stages = list(_mid_no_signal_stages_by_sym.get(sym) or [])
+                                    if stages:
+                                        if _mid_no_signal_stage_mode == "majority":
+                                            # pick most frequent stage; tie -> earliest (keeps primary-order preference)
+                                            counts = {}
+                                            for s in stages:
+                                                counts[s] = counts.get(s, 0) + 1
+                                            best_s = None
+                                            best_n = -1
+                                            for s in stages:
+                                                n = counts.get(s, 0)
+                                                if n > best_n:
+                                                    best_n = n
+                                                    best_s = s
+                                            _st = best_s or stages[0]
+                                        else:
+                                            # "best": first venue in priority order that had OK candles
+                                            _st = stages[0]
+                                    else:
+                                        _st = str(_mid_no_signal_stage_by_sym.get(sym) or "other")
+                                    if _st not in _mid_no_signal_reasons:
+                                        _st = "other"
+                                    _mid_no_signal_reasons[_st] = int(_mid_no_signal_reasons.get(_st,0) or 0) + 1
+                                    try:
+                                        _rs = list(_mid_no_signal_reasons_by_sym.get(sym) or [])
+                                        if _rs:
+                                            if _mid_no_signal_stage_mode == 'majority':
+                                                counts2 = {}
+                                                for r0 in _rs:
+                                                    counts2[r0] = counts2.get(r0, 0) + 1
+                                                best_r = None
+                                                best_n2 = -1
+                                                for r0 in _rs:
+                                                    n2 = counts2.get(r0, 0)
+                                                    if n2 > best_n2:
+                                                        best_n2 = n2
+                                                        best_r = r0
+                                                _rbest = best_r or _rs[0]
+                                            else:
+                                                _rbest = _rs[0]
+                                        else:
+                                            _rbest = ("unknown" if str(_st or '')=='other' else str(_st or 'other'))
+                                        # Count detailed no-signal reasons only for the 'other' bucket,
+                                        # and normalize to a base reason name (e.g. "rsi_long=37.7" -> "rsi_long",
+                                        # "near_1h_low dist=..." -> "near_1h_low").
+                                        if str(_st or '') == 'other' and _rbest:
+                                            _key = str(_rbest).strip()
+                                            # base token (first word)
+                                            _key = _key.split()[0] if _key else _key
+                                            # strip value parts
+                                            for _sep in ('=', ':'):
+                                                if _sep in _key:
+                                                    _key = _key.split(_sep, 1)[0]
+                                            _key = _key.strip()
+                                            if _key and _key != 'other':
+                                                _mid_no_signal_detail_reasons_other[_key] = int(_mid_no_signal_detail_reasons_other.get(_key, 0) or 0) + 1
+                                    except Exception:
+                                        pass
+
+                                except Exception:
+                                    pass
+                                continue
+                            _rej_add(sym, "candles_unavailable")
+
+                            # Log once per symbol per tick when candles are finally unavailable (prevents spam).
+                            try:
+                                _ctx = _MID_TICK_CTX.get()
+                                if isinstance(_ctx, dict):
+                                    _cms = _ctx.get('candles_missing_sym')
+                                    if isinstance(_cms, set) and sym in _cms:
+                                        pass
+                                    else:
+                                        if isinstance(_cms, set):
+                                            _cms.add(sym)
+                                        # build condensed diagnostic summary for this symbol
+                                        parts = []
+                                        try:
+                                            for (s_key, tf_key), recs in _mid_candles_diag.items():
+                                                if s_key == sym and recs:
+                                                    # keep only last few records per TF to cap size
+                                                    tail = recs[-6:]
+                                                    parts.append(f"{tf_key}=" + ",".join(tail))
+                                        except Exception:
+                                            pass
+                                        diag = " | ".join(parts)
+                                        if len(diag) > 700:
+                                            diag = diag[:700] + "…"
+                                        if diag:
+                                            logger.info(f"[mid][candles_unavailable] symbol={sym} diag={diag}")
+                            except Exception:
+                                pass
+                            continue
+
+                        best_name, best_r = chosen_name, chosen_r
+                        base_r = best_r
+                        # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
+                        if base_r.get("trap_ok") is False or base_r.get("blocked") is True:
+                            _mid_skip_trap += 1
+
+                            _rej_add(sym, str(base_r.get("trap_reason") or base_r.get("block_reason") or "trap_block"))
+
+                            # collect digest stats (DO NOT forward to error-bot)
+                            _r = (base_r.get("trap_reason") or base_r.get("block_reason") or "")
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), str(_r))
+                            except Exception:
+                                pass
+                            logger.info("[mid][trap] %s %s blocked=%s reason=%s src_best=%s", sym, str(base_r.get("direction","")).upper(), base_r.get("blocked"), base_r.get("trap_reason",""), best_name)
+                            continue
+                        if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
+                            _mid_f_align += 1
+                            if not structure_align_soft:
+                                _rej_add(sym, "htf_misaligned")
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), "align_mismatch")
+                                except Exception:
+                                    pass
+                                continue
+                            else:
+                                # Soft alignment: don't reject, but apply confidence penalty so only strong setups pass.
+                                try:
+                                    self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"),
+                                                       f"align_soft_penalty={structure_align_penalty:g}")
+                                except Exception:
+                                    pass
+                                # Mark penalty to be applied after we read conf
+                                base_r["__align_soft_penalty"] = float(structure_align_penalty)
+
+                        conf = float(base_r.get("confidence",0) or 0)
+                        align_pen = float(base_r.get("__align_soft_penalty", 0) or 0)
+                        if align_pen:
+                            conf = max(0.0, conf - align_pen)
+                        rr = float(base_r.get("rr",0) or 0)
+                        adx30 = float(base_r.get("adx1",0) or 0)
+                        adx1h = float(base_r.get("adx4",0) or 0)
+                        atrp = float(base_r.get("atr_pct",0) or 0)
+
+                        if min_adx_30m and adx30 < min_adx_30m:
+                            _mid_f_adx += 1
+                            _rej_add(sym, "regime_block")
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx30<{min_adx_30m:g} adx={adx30:g}")
+                            except Exception:
+                                pass
+                            continue
+                        if min_adx_1h and adx1h < min_adx_1h:
+                            _mid_f_adx += 1
+                            _rej_add(sym, "regime_block")
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"adx1h<{min_adx_1h:g} adx={adx1h:g}")
+                            except Exception:
+                                pass
+                            continue
+                        if min_atr_pct and atrp < min_atr_pct:
+                            _mid_f_atr += 1
+                            _rej_add(sym, "volatility_block")
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"atr_pct<{min_atr_pct:g} atr%={atrp:g}")
+                            except Exception:
+                                pass
+                            continue
+
+                        market = choose_market(adx30, atrp)
+                        if not allow_futures:
+                            market = "SPOT"
+                        if market == "FUTURES" and (news_act == "FUTURES_OFF" or mac_act == "FUTURES_OFF"):
+                            _mid_f_futoff += 1
+                            market = "SPOT"
+
+                        min_conf = min_score_fut if market == "FUTURES" else min_score_spot
+                        if conf < float(min_conf):
+                            _mid_f_score += 1
+                            _rej_add(sym, "score_low")
+                            try:
+                                _mid_ta_score_low += 1
+                                _missing = float(min_conf) - float(conf)
+                                if _missing > 0:
+                                    _mid_ta_score_missing_sum += _missing
+                                    if _missing > float(_mid_ta_score_missing_max):
+                                        _mid_ta_score_missing_max = _missing
+                            except Exception:
+                                pass
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"score<{float(min_conf):g} score={conf:g}")
+                            except Exception:
+                                pass
+                            continue
+                        if rr < float(min_rr):
+                            _mid_f_rr += 1
+                            _rej_add(sym, "score_low")
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"rr<{float(min_rr):g} rr={rr:g}")
+                            except Exception:
+                                pass
+                            continue
+
+                        direction = str(base_r.get("direction","")).upper()
+                        entry = float(base_r["entry"]); sl = float(base_r["sl"])
+                        tp1 = float(base_r["tp1"]); tp2 = float(base_r["tp2"])
+                        # --- HARD MID filters (TP2-first) ---
+                        # 1) Volume must be real, иначе TP2 часто не добивает
+                        volx = float(base_r.get("rel_vol", 0.0) or 0.0)
+                        if mid_min_vol_x and volx < mid_min_vol_x:
+                            _mid_f_score += 1
+                            _rej_add(sym, "volatility_block")
+                            try:
+                                self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), f"vol_x<{mid_min_vol_x:g} vol_x={volx:g}")
+                            except Exception:
+                                pass
+                            continue
+
+                        # 2) Must be on the correct side of VWAP + far enough from VWAP (avoid chop)
+                        vwap_val_num = float(base_r.get("vwap_val", 0.0) or 0.0)
+                        atr30 = abs(entry) * (abs(atrp) / 100.0) if entry > 0 else 0.0
+                        if vwap_val_num > 0 and atr30 > 0:
+                            if mid_require_vwap_bias:
+                                if direction == "SHORT" and not (entry < vwap_val_num):
+                                    _mid_f_align += 1
+                                    _rej_add(sym, "vwap_dist")
+                                    try:
+                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_short entry>=vwap vwap={vwap_val_num:g}")
+                                    except Exception:
+                                        pass
+                                    continue
+                                if direction == "LONG" and not (entry > vwap_val_num):
+                                    _mid_f_align += 1
+                                    _rej_add(sym, "vwap_dist")
+                                    try:
+                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_bias_long entry<=vwap vwap={vwap_val_num:g}")
+                                    except Exception:
+                                        pass
+                                    continue
+                            if mid_min_vwap_dist_atr > 0:
+                                if abs(entry - vwap_val_num) < (atr30 * mid_min_vwap_dist_atr):
+                                    _mid_f_atr += 1
+                                    _rej_add(sym, "vwap_dist")
+                                    try:
+                                        dist = abs(entry - vwap_val_num) / atr30 if atr30 else 0.0
+                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, f"vwap_far {dist:.2g}atr")
+                                    except Exception:
+                                        pass
+                                    continue
+
+
+
+                        # 2b) Optional: require liquidity sweep in direction (SMC confirmation)
+                        if MID_REQUIRE_LIQ_SWEEP:
+                            try:
+                                if direction == "LONG" and not bool(base_r.get("sweep_long", False)):
+                                    _mid_f_score += 1
+                                    _rej_add(sym, "liquidity_fail")
+                                    try:
+                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, "liq_sweep_missing_long")
+                                    except Exception:
+                                        pass
+                                    continue
+                                if direction == "SHORT" and not bool(base_r.get("sweep_short", False)):
+                                    _mid_f_score += 1
+                                    _rej_add(sym, "liquidity_fail")
+                                    try:
+                                        self._mid_digest_add(self._mid_trap_digest_stats, sym, direction, entry, "liq_sweep_missing_short")
+                                    except Exception:
+                                        pass
+                                    continue
+                            except Exception:
+                                pass
+                        if tp_policy == "R":
+                            risk = abs(entry-sl)
+                            if risk <= 0:
+                                continue
+                            if direction == "LONG":
+                                tp1 = entry + risk*tp1_r; tp2 = entry + risk*tp2_r
+                            else:
+                                tp1 = entry - risk*tp1_r; tp2 = entry - risk*tp2_r
+
+                    
+                        # Policy: SPOT + SHORT is confusing (spot has no short). Auto-convert to FUTURES.
+                        risk_note = _fmt_ta_block_mid(base_r, mode)
+                        if market == "SPOT" and str(direction).upper() == "SHORT":
+                            fut_forced_off = (not allow_futures) or (news_act == "FUTURES_OFF") or (mac_act == "FUTURES_OFF")
+                            if fut_forced_off:
+                                _mid_f_futoff += 1
+                                _rej_add(sym, "candles_unavailable")
+                                continue
+                            market = "FUTURES"
+                            if risk_note:
+                                risk_note = risk_note + "\n" + "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
+                            else:
+                                risk_note = "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
+
+                        # Exchanges where the symbol exists (used for display and SPOT autotrade routing).
+                        async def _pair_exists(ex: str) -> bool:
+                            try:
+                                exu = (ex or '').upper().strip()
+                                if market == 'FUTURES':
+                                    if exu == 'BINANCE':
+                                        p = await self._fetch_rest_price('FUTURES', sym)
+                                    elif exu == 'BYBIT':
+                                        p = await self._fetch_bybit_price('FUTURES', sym)
+                                    elif exu == 'OKX':
+                                        p = await self._fetch_okx_price('FUTURES', sym)
+                                    else:
+                                        return False
+                                    return bool(p and float(p) > 0)
+                                # SPOT
+                                if exu == 'BINANCE':
+                                    p = await self._fetch_rest_price('SPOT', sym)
+                                elif exu == 'BYBIT':
+                                    p = await self._fetch_bybit_price('SPOT', sym)
+                                elif exu == 'OKX':
+                                    p = await self._fetch_okx_price('SPOT', sym)
+                                elif exu == 'MEXC':
+                                    p = await _mexc_public_price(sym)
+                                else:  # GATEIO
+                                    p = await _gateio_public_price(sym)
+                                return bool(p and float(p) > 0)
+                            except Exception:
+                                return False
+
+                    
+                        # --- HARD BLOCK: FUTURES signal must have a real futures contract on executable venues ---
+                        # If choose_market() selected FUTURES but the symbol has no futures instrument on
+                        # Binance/Bybit/OKX, we skip emitting this signal. (No auto-downgrade to SPOT.)
+                        if market == "FUTURES":
+                            try:
+                                _fut_ok = await asyncio.gather(_pair_exists("BINANCE"), _pair_exists("BYBIT"), _pair_exists("OKX"))
+                                if not any(bool(x) for x in _fut_ok):
+                                    logger.info("[scanner] skip %s FUTURES: no contract on BINANCE/BYBIT/OKX (best_source=%s)", sym, best_name)
+                                    _rej_add(sym, "candles_unavailable")
+                                    continue
+                            except Exception as _e:
+                                logger.info("[scanner] skip %s FUTURES: futures existence check failed: %s", sym, _e)
+                                _rej_add(sym, "candles_unavailable")
+                                continue
+
+# Exchanges where the instrument exists for the given market.
+                        _ex_order = ['BINANCE', 'BYBIT', 'OKX'] if (market == 'FUTURES' or not enable_secondary) else ['BINANCE', 'BYBIT', 'OKX', 'GATEIO', 'MEXC']
+                        _oks = await asyncio.gather(*[_pair_exists(x) for x in _ex_order])
+                        _pair_exchanges = [x for x, ok in zip(_ex_order, _oks) if ok]
+                        if not _pair_exchanges:
+                            _pair_exchanges = [best_name]
+                        conf_names = '+'.join(_pair_exchanges)
+                        sig = Signal(
+                        signal_id=self.next_signal_id(),
+                        market=market,
+                        symbol=sym,
+                        direction=direction,
+                        timeframe=f"{tf_trigger}/{tf_mid}/{tf_trend}",
+                        entry=entry, sl=sl, tp1=float(tp1), tp2=float(tp2),
+                        rr=float(tp2_r if tp_policy=="R" else rr),
+                        confidence=int(round(conf)),
+                        confirmations=conf_names,
+                        source_exchange=best_name,
+                        available_exchanges=conf_names,
+                        risk_note=risk_note,
+                        ts=time.time(),
+                        )
+                        # If MID_PENDING_ENABLED=1: save setup and emit ONLY when price reaches entry + TA reconfirmed.
+                        pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0","false","no","off")
+                        if pending_enabled:
+                            try:
+                                if self.can_add_mid_pending(sym, direction=direction, market=market):
+                                    key = f"{market}:{sym}:{direction}"
+
+                                    # Build smarter entry zone from OB/FVG/Channel (optional)
+                                    z, z_src = _mid_build_entry_zone(df5, df30, df1h, direction=direction, entry=float(entry))
+                                    entry_low = float(z[0]) if z else None
+                                    entry_high = float(z[1]) if z else None
+
+                                    rec = {
+                                        "key": key,
+                                        "market": market,
+                                        "symbol": sym,
+                                        "direction": direction,
+                                        "timeframe": f"{tf_trigger}/{tf_mid}/{tf_trend}",
+                                        "entry": float(entry),
+                                        "entry_low": entry_low,
+                                        "entry_high": entry_high,
+                                        "entry_zone_src": str(z_src),
+                                        "sl": float(sl),
+                                        "tp1": float(tp1),
+                                        "tp2": float(tp2),
+                                        "rr": float(tp2_r if tp_policy=="R" else rr),
+                                        "confidence": int(round(conf)),
+                                        "confirmations": conf_names,
+                                        "source_exchange": best_name,
+                                        "available_exchanges": conf_names,
+                                        "risk_note": risk_note,
+                                        "created_ts": time.time(),
+                                        "min_confidence": int(os.getenv("MID_MIN_CONFIDENCE", "0") or 0),
+                                    }
+                                    await self.add_mid_pending(rec)
+                                    self.mark_mid_pending(sym, direction=direction, market=market)
+                                    _mid_stage_add("passed_ta", 1)
+                                    _mid_stage_add("created_pending", 1)
+                                    try:
+                                        _mid_metrics_inc("setups_found", 1)
+                                        _mid_metrics_inc("pending_created", 1)
+                                    except Exception:
+                                        pass
+                                else:
+                                    _rej_add(sym, "pending_wait")
+                            except Exception:
+                                _rej_add(sym, "not_enough_data")
+                            # do NOT emit now
+                        else:
+                            self.mark_emitted_mid(sym, sig.direction, sig.market)
+                            self.last_signal = sig
+                            if sig.market == "SPOT":
+                                self.last_spot_signal = sig
+                            else:
+                                self.last_futures_signal = sig
+                            _mid_stage_add("passed_ta", 1)
+                            _mid_stage_add("triggered", 1)
+                            await emit_signal_cb(sig)
+                            _mid_emitted += 1
+                            try:
+                                _mid_metrics_inc("setups_found", 1)
+                            except Exception:
+                                pass
+                            await asyncio.sleep(2)
+                            _rej_add(sym, "trap_block")
+            except Exception:
+                logger.exception("[mid] scanner_loop_mid error")
+
+
+            # --- send digest every MID_TRAP_DIGEST_SEC ---
+            try:
+                self._mid_trap_digest_last_sent = await self._mid_digest_maybe_send(
+                    self._mid_trap_digest_stats, float(getattr(self, "_mid_trap_digest_last_sent", time.time()))
+                )
+            except Exception:
+                pass
+
+            elapsed = time.time() - start
+            try:
+                _mid_hard_block = max(0, _mid_hard_block_total() - int(_mid_hard_block0 or 0))
+                # no_candles should reflect final outcome (candles_unavailable), not intermediate misses during fallback.
+                # Otherwise a symbol that eventually succeeds still inflates no_candles.
+                _no_candles_final = 0
+                try:
+                    _no_candles_final = int(_rej_counts.get('candles_unavailable', 0) or 0)
+                except Exception:
+                    _no_candles_final = 0
+                # Expand no_signal 'other' into aggregated fail reasons (best-effort, safe)
+                _ns_other_details = ''
+                try:
+                    _other_n = int(_mid_no_signal_reasons.get('other', 0) or 0)
+                    if _other_n > 0:
+                        # 0 => show all (default). >0 => show top-N + +rest.
+                        try:
+                            topn = int(float(os.getenv('MID_NO_SIGNAL_DETAIL_TOPN', '0') or 0))
+                        except Exception:
+                            topn = 0
+                
+                        items = []
+                        if isinstance(_mid_no_signal_detail_reasons_other, dict) and _mid_no_signal_detail_reasons_other:
+                            items = sorted(_mid_no_signal_detail_reasons_other.items(),
+                                           key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
+                
+                        if not items:
+                            _ns_other_details = '{untracked=%s}' % int(_other_n)
+                        else:
+                            items = [(str(k), int(v or 0)) for k, v in items if v and str(k).strip() and str(k).strip() != 'other']
+                            if items:
+                                if topn and topn > 0:
+                                    shown = items[:topn]
+                                    rest = sum(v for _, v in items[topn:])
+                                else:
+                                    shown = items
+                                    rest = 0
+                                _ns_other_details = '{' + ','.join([f'{k}={v}' for k, v in shown])
+                                if rest > 0:
+                                    _ns_other_details += f',+{rest}'
+                                _ns_other_details += '}'
+                except Exception as e:
+                    # Never break the tick due to summary formatting.
+                    _ns_other_details = ''
+                
+                # Build and log summary safely (avoid syntax/formatting issues)
+                try:
+                    summary = (
+                        f"tick done scanned={_mid_scanned} emitted={_mid_emitted} blocked={_mid_skip_blocked} "
+                        f"hardblock={_mid_hard_block} no_signal={int(_mid_no_signal)} "
+                        f"[trap={int(_mid_no_signal_reasons.get('trap',0) or 0)},"
+                        f"structure={int(_mid_no_signal_reasons.get('structure',0) or 0)},"
+                        f"trend={int(_mid_no_signal_reasons.get('trend',0) or 0)},"
+                        f"extreme={int(_mid_no_signal_reasons.get('extreme',0) or 0)},"
+                        f"impulse={int(_mid_no_signal_reasons.get('impulse',0) or 0)},"
+                        f"other={int(_mid_no_signal_reasons.get('other',0) or 0)}{_ns_other_details}] "
+                        f"cooldown={_mid_skip_cooldown} macro={_mid_skip_macro} news={_mid_skip_news} "
+                        f"align={_mid_f_align} score={_mid_f_score} ta_score_low={_mid_ta_score_low} ta_miss_avg={(_mid_ta_score_missing_sum/_mid_ta_score_low) if _mid_ta_score_low else 0.0:.1f} ta_miss_max={_mid_ta_score_missing_max:.1f} rr={_mid_f_rr} adx={_mid_f_adx} atr={_mid_f_atr} futoff={_mid_f_futoff} "
+                        f"no_candles={_no_candles_final} candles_net_fail={_mid_candles_net_fail} candles_unsupported={_mid_candles_unsupported} "
+                        f"candles_partial={_mid_candles_partial} candles_empty={_mid_candles_empty} candles_fallback={_mid_candles_fallback} "
+                        f"cache_hit={max(0, (api.candle_counters_snapshot()[0]-_c0[0]) if 'api' in locals() else 0)} "
+                        f"cache_miss={max(0, (api.candle_counters_snapshot()[1]-_c0[1]) if 'api' in locals() else 0)} "
+                        f"inflight_wait={max(0, (api.candle_counters_snapshot()[2]-_c0[2]) if 'api' in locals() else 0)} "
+                        f"prefetch={float(prefetch_elapsed):.1f}s elapsed={float(elapsed):.1f}s total={float(time.time() - start_total):.1f}s"
+                    )
+                    logger.info("[mid][summary] %s", summary)
+
+                    # Adaptive regime snapshot (avg across evaluated symbols for this tick)
+                    try:
+                        _snap = _mid_adapt_snapshot()
+                        if _snap:
+                            _reg, _atrp_avg, _t_avg, _n = _snap
+                            logger.info("[mid][adaptive] regime=%s atrp=%.1f%% t=%.2f n=%s", _reg, float(_atrp_avg), float(_t_avg), int(_n))
+                    except Exception:
+                        pass
+                except Exception as e:
+                    summary = f"tick done (summary_error={type(e).__name__}) scanned={_mid_scanned}"
+                    logger.warning("[mid][summary_error] %s", e)
+                    logger.info("[mid][summary] %s", summary)
+                try:
+                    _tot = int(_mid_db_hit) + int(_mid_rest_refill)
+                    if _tot > 0:
+                        _hit_pct = int(round(100.0 * float(_mid_db_hit) / float(_tot)))
+                        _miss_pct = max(0, 100 - _hit_pct)
+                    else:
+                        _hit_pct = 100
+                        _miss_pct = 0
+                    logger.info("[mid] cache_hit=%s%% cache_miss=%s%% (db_hit=%s rest_refill=%s)", _hit_pct, _miss_pct, _mid_db_hit, _mid_rest_refill)
                 except Exception:
                     pass
-                return elapsed
-            tick_elapsed = None
-            try:
-                if mid_tick_timeout_sec and mid_tick_timeout_sec > 0:
-                    tick_elapsed = await asyncio.wait_for(_mid_tick_body(), timeout=mid_tick_timeout_sec)
+
+
+                # Optional: hardblock breakdown (top buckets)
+                try:
+                    if int(os.getenv("MID_HARDBLOCK_LOG", "1") or "1"):
+                        hb = _mid_hardblock_dump(int(os.getenv("MID_HARDBLOCK_TOP", "6") or "6"))
+                        if hb:
+                            logger.info("[mid][hardblock] %s", hb)
+                except Exception:
+                    pass
+
+                # Save a small hard-block snapshot for /health & minute status log (even if logging is disabled).
+                try:
+                    global MID_LAST_HARDBLOCK_TOP, MID_LAST_HARDBLOCK_SAMPLES
+                    MID_LAST_HARDBLOCK_TOP = _mid_hardblock_dump(3)
+                    try:
+                        MID_LAST_HARDBLOCK_SAMPLES = {k: list(v)[:2] for k, v in dict(_MID_HARD_BLOCK_SAMPLES).items()}  # type: ignore[name-defined]
+                    except Exception:
+                        MID_LAST_HARDBLOCK_SAMPLES = None
+                except Exception:
+                    pass
+
+                # Per-tick breakdown of where scanned symbols went.
+                if not _rej_enabled:
+                    logger.info("[mid][reject] disabled (set MID_REJECT_DIGEST=1 to enable)")
                 else:
-                    tick_elapsed = await _mid_tick_body()
-            except asyncio.TimeoutError:
-                summary = f"tick TIMEOUT after {mid_tick_timeout_sec:.1f}s (TOP_N={int(os.getenv('MID_TOP_N','50') or 50)} MID_TOP_N_SYMBOLS={int(os.getenv('MID_TOP_N_SYMBOLS', os.getenv('MID_TOP_N','50')) or (os.getenv('MID_TOP_N','50') or 50))})"
-                logger.warning("[mid][summary] %s; skipped (set MID_TICK_TIMEOUT_SEC=0 to disable)", summary)
+                    try:
+                        accounted = len(_rej_seen)
+                        missing = max(0, int(_mid_scanned) - int(accounted))
+                        if missing:
+                            _rej_counts["untracked"] = int(_rej_counts.get("untracked", 0) or 0) + int(missing)
+                        top = sorted([(k, int(v)) for k, v in _rej_counts.items()], key=lambda x: (-x[1], x[0]))[:max(1, _rej_max_reasons)]
+                        parts = []
+                        for k, v in top:
+                            ex = _rej_examples_map.get(k) or []
+                            exs = ",".join(ex) if ex else ""
+                            parts.append(f"{k}={v}" + (f" [{exs}]" if exs else ""))
+                        # candles empty breakdown (top-N)
+                        # Helps debug real "no candles" cases when HTTP doesn't error.
+                        # IMPORTANT: do NOT spam this when candles were eventually fetched from another venue.
+                        # Log it only when at least one symbol ended up with candles_unavailable in this tick.
+                        try:
+                            if int(_rej_counts.get('candles_unavailable', 0) or 0) > 0 and _mid_candles_empty_reasons:
+                                top_empty = sorted(_mid_candles_empty_reasons.items(), key=lambda kv: -int(kv[1] or 0))[:6]
+                                top_s = ', '.join([f'{k}={int(v)}' for k, v in top_empty])
+                                logger.info('[mid][candles_empty_top] total=%s top=%s', int(_mid_candles_empty), top_s)
+                                if _mid_candles_log_empty:
+                                    for k, _v in top_empty:
+                                        samp = _mid_candles_empty_samples.get(k) or []
+                                        if samp:
+                                            logger.info('[mid][candles_empty_samples] %s :: %s', k, ','.join(samp[:max(0, int(_mid_candles_log_empty_samples))]))
+                        except Exception:
+                            pass
+
+                        logger.info("[mid][reject] scanned=%s accounted=%s missing=%s :: %s", int(_mid_scanned), int(accounted), int(missing), " | ".join(parts))
+
+                        if _mid_candles_log_fail and _mid_candles_fail:
+                            try:
+                                # top offenders
+                                items = sorted(_mid_candles_fail.items(), key=lambda kv: kv[1], reverse=True)[:6]
+                                parts2 = []
+                                for (ex, tf), cnt in items:
+                                    samp = _mid_candles_fail_samples.get((ex, tf)) or []
+                                    s = "; ".join(samp)
+                                    parts2.append(f"{ex}:{tf}={cnt}" + (f" ({s})" if s else ""))
+                                logger.warning("[mid][candles_fail] %s", " | ".join(parts2))
+                            except Exception:
+                                pass
+                        # Optional: full per-symbol dump (can be verbose). Shows one reason per scanned symbol.
+                        if _rej_full:
+                            try:
+                                maxn = max(0, int(_rej_full_max))
+                                pairs = []
+                                for s in symbols[:maxn]:
+                                    r = _rej_reason_by_sym.get(s) or "untracked"
+                                    pairs.append(f"{s}:{r}")
+                                # chunk to avoid extremely long single lines
+                                chunk = 20
+                                for i in range(0, len(pairs), chunk):
+                                    logger.info("[mid][reject_full] %s", " | ".join(pairs[i:i+chunk]))
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                 try:
                     _mid_set_last_summary(summary)
                 except Exception:
                     pass
                 try:
+                    # For /health: last successful MID tick timestamp
                     global MID_LAST_TICK_TS
                     MID_LAST_TICK_TS = time.time()
                 except Exception:
                     pass
-                tick_elapsed = None
-            spent = float(tick_elapsed if tick_elapsed is not None else (mid_tick_timeout_sec or 0.0))
-            sleep_for = max(1, (interval_sec if interval_sec > 0 else 1) - int(spent))
-            await asyncio.sleep(sleep_for)
+            except Exception:
+                pass
+            return elapsed
+        tick_elapsed = None
+        try:
+            if mid_tick_timeout_sec and mid_tick_timeout_sec > 0:
+                tick_elapsed = await asyncio.wait_for(_mid_tick_body(), timeout=mid_tick_timeout_sec)
+            else:
+                tick_elapsed = await _mid_tick_body()
+        except asyncio.TimeoutError:
+            summary = f"tick TIMEOUT after {mid_tick_timeout_sec:.1f}s (TOP_N={int(os.getenv('MID_TOP_N','50') or 50)} MID_TOP_N_SYMBOLS={int(os.getenv('MID_TOP_N_SYMBOLS', os.getenv('MID_TOP_N','50')) or (os.getenv('MID_TOP_N','50') or 50))})"
+            logger.warning("[mid][summary] %s; skipped (set MID_TICK_TIMEOUT_SEC=0 to disable)", summary)
+            try:
+                _mid_set_last_summary(summary)
+            except Exception:
+                pass
+            try:
+                global MID_LAST_TICK_TS
+                MID_LAST_TICK_TS = time.time()
+            except Exception:
+                pass
+            tick_elapsed = None
+        spent = float(tick_elapsed if tick_elapsed is not None else (mid_tick_timeout_sec or 0.0))
+        sleep_for = max(1, (interval_sec if interval_sec > 0 else 1) - int(spent))
+        await asyncio.sleep(sleep_for)
 async def autotrade_healthcheck() -> dict:
     """DB-only health snapshot for autotrade. Never places orders."""
     try:
