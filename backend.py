@@ -14477,6 +14477,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     _mid_skip_macro = 0
                     _mid_skip_news = 0
                     _mid_skip_trap = 0
+                    # Pending-add local cooldown counter (diagnostic only). Must be initialized
+                    # per tick to avoid UnboundLocalError when we increment it in the pending path.
+                    _mid_f_cooldown = 0
                     _mid_f_align = 0
                     _mid_f_score = 0
                     _mid_ta_score_low = 0
