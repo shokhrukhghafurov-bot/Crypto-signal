@@ -8362,7 +8362,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     ok_trap, trap_reason = _mid_structure_trap_ok(direction=dir_trend, entry=entry, df1hi=df1hi)
     if not ok_trap:
         try:
-            
             _trap_msg = f"{symbol}|{dir_trend}|{_mid_trap_reason_key(str(trap_reason))}"
             _ctx = _MID_TICK_CTX.get()
             _tick_key = f"{symbol}|{dir_trend}|trap"
@@ -8377,20 +8376,38 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             _emit_mid_trap_event({"dir": str(dir_trend), "reason": str(trap_reason), "reason_key": _mid_trap_reason_key(str(trap_reason)), "entry": float(entry)})
         except Exception:
             pass
-        _stage = "trap"
+
+        # If user wants *all* filters only after setup (pending/trigger model),
+        # do NOT reject setups during SCAN due to trap flags. We will enforce trap again at TRIGGER.
+        _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+        _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
+        _phase = "scan"
         try:
-            _tr = str(trap_reason)
-            if "post_impulse" in _tr:
-                _stage = "impulse"
-            elif ("weak_extreme" in _tr) or ("near_" in _tr) or ("extreme" in _tr):
-                _stage = "extreme"
+            _phase = str(_MID_EVAL_PHASE.get() or "scan")
         except Exception:
-            pass
-        _fail(_stage, str(trap_reason))
-        return None
+            _phase = "scan"
+        if _pending_enabled and _postsetup_only and _phase == "scan":
+            # Mark as risk, but keep the setup.
+            try:
+                if diag is not None:
+                    diag.setdefault("risk_flags", [])
+                    diag["risk_flags"].append(f"trap:{_mid_trap_reason_key(str(trap_reason))}")
+            except Exception:
+                pass
+        else:
+            _stage = "trap"
+            try:
+                _tr = str(trap_reason)
+                if "post_impulse" in _tr:
+                    _stage = "impulse"
+                elif ("weak_extreme" in _tr) or ("near_" in _tr) or ("extreme" in _tr):
+                    _stage = "extreme"
+            except Exception:
+                pass
+            _fail(_stage, str(trap_reason))
+            return None
 
-
-    # Quality gate: avoid choppy markets (helps TP2 hit-rate)
+# Quality gate: avoid choppy markets (helps TP2 hit-rate)
     try:
         allow_range = os.getenv("MID_ALLOW_RANGE", "0").strip().lower() not in ("0","false","no","off")
         min_adx_30m = float(_mid_autotune_get_param("MID_MIN_ADX_30M", float(os.getenv("MID_MIN_ADX_30M", "0") or 0), market))
@@ -9074,14 +9091,25 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     ta_score_display = int(max(0, min(100, ta_score_total))) if not allow_over_100 else int(ta_score_total)
 
     # Min score gate (env): blocks low-quality setups early so they appear in summary as score_low.
+    # In pending-entry model with MID_FILTERS_AFTER_SETUP=1, we should NOT block setups during SCAN;
+    # the score threshold will be enforced at TRIGGER instead.
     try:
         mkt_u2 = str(market or "SPOT").upper()
         min_score = int(os.getenv("MID_MIN_SCORE_SPOT", "76")) if mkt_u2 == "SPOT" else int(os.getenv("MID_MIN_SCORE_FUTURES", "72"))
         if min_score > 0 and int(confidence) < int(min_score):
-            _fail("other", f"score_low score={int(confidence)} min={int(min_score)}")
-            return None
+            _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+            _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
+            _phase = "scan"
+            try:
+                _phase = str(_MID_EVAL_PHASE.get() or "scan")
+            except Exception:
+                _phase = "scan"
+            if not (_pending_enabled and _postsetup_only and _phase == "scan"):
+                _fail("other", f"score_low score={int(confidence)} min={int(min_score)}")
+                return None
     except Exception:
         pass
+
 
     # Optional per-signal logging of score breakdown (very useful for tuning)
     try:
@@ -9102,6 +9130,12 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "tp2": tp2,
         "rr": rr,
         "confidence": confidence,
+
+        # trap flag (setup risk) - enforced at TRIGGER
+        "trap_ok": bool(ok_trap),
+        "trap_reason": str(trap_reason or ""),
+        "blocked": (not bool(ok_trap)),
+
 
         # fields used by MID filters/formatter
         "dir1": dir_mid,
@@ -9794,7 +9828,7 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     }
     return ta
 
-def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame) -> Optional[Dict[str, Any]]:
+def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame, symbol: str = "") -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
     Produces a result dict compatible with scanner_loop_mid and a rich TA block (like MAIN),
@@ -9896,7 +9930,7 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
     # --- Anti-trap structure filters (apply to MID and MAIN candidates) ---
     trap_ok, trap_reason = _mid_structure_trap_ok(direction=str(dir_trend).upper(), entry=entry, df1hi=df1hi)
     if not bool(trap_ok):
-        # Block obvious top/bottom traps. Also emit a structured event so bot can build a digest.
+        # Emit a structured event so bot can build a digest, but do not necessarily reject here.
         try:
             if os.getenv("MID_INTERNAL_TRAP_LOG","0").strip().lower() not in ("0","false","no","off"):
                 _k = f"trap|{symbol}|{str(dir_trend).upper()}|{_mid_trap_reason_key(str(trap_reason))}"
@@ -9910,7 +9944,16 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
             })
         except Exception:
             pass
-        return None
+
+        _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0","false","no","off")
+        _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0","false","no","off")
+        _phase = "scan"
+        try:
+            _phase = str(_MID_EVAL_PHASE.get() or "scan")
+        except Exception:
+            _phase = "scan"
+        if not (_pending_enabled and _postsetup_only and _phase == "scan"):
+            return None
 
 
     # --- TA extras (MAIN-like) ---
