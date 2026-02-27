@@ -9,6 +9,9 @@ import re
 import time
 import contextvars
 
+# Build tag for deployment verification (helps detect stale Railway layers)
+MID_BUILD_TAG = os.getenv("MID_BUILD_TAG", "MID_BUILD_2026-02-26_v5")
+
 # =======================
 # SAFE ATR PICKER FOR SL
 # =======================
@@ -189,6 +192,9 @@ import random
 import re
 import time
 import contextvars
+
+# Build tag for deployment verification (helps detect stale Railway layers)
+MID_BUILD_TAG = os.getenv("MID_BUILD_TAG", "MID_BUILD_2026-02-26_v5")
 
 
 import datetime as dt
@@ -9916,6 +9922,10 @@ class PriceUnavailableError(Exception):
 
 class Backend:
     def __init__(self) -> None:
+        try:
+            logger.info(f"[mid] backend build tag: {MID_BUILD_TAG}")
+        except Exception:
+            pass
         self.feed = PriceFeed()
         self.news = NewsFilter()
         self.macro = MacroCalendar()
