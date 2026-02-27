@@ -327,6 +327,12 @@ except (ZoneInfoNotFoundError, FileNotFoundError):
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 backend = Backend()
+
+logger.info("[mid][dbg] methods can_add_mid_pending=%s add_mid_pending=%s mid_pending_trigger_loop=%s scanner_loop_mid=%s",
+            callable(getattr(backend, "can_add_mid_pending", None)),
+            callable(getattr(backend, "add_mid_pending", None)),
+            callable(getattr(backend, "mid_pending_trigger_loop", None)),
+            callable(getattr(backend, "scanner_loop_mid", None)))
 # ---------------- Admin/Error bot alerts (separate bot) ----------------
 # Send important errors / blocks to a dedicated Telegram bot to avoid polluting the main bot chat.
 ERROR_BOT_TOKEN = (os.getenv("ERROR_BOT_TOKEN") or "").strip()
