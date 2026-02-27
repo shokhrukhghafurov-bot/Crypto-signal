@@ -5033,43 +5033,7 @@ async def main() -> None:
     # NOTE: Railway public domain requires an HTTP server listening on $PORT.
     # We run a tiny aiohttp server alongside the Telegram bot.
     async def _admin_http_app() -> web.Application:
-        # --- CORS for Status UI / Admin panel ---
-        # The status dashboard is hosted on a different Railway domain and calls this API from the browser.
-        # Without CORS headers, the browser blocks requests (especially preflight OPTIONS).
-        allowed_origins_env = os.getenv("ADMIN_ALLOWED_ORIGINS", "").strip()
-        allowed_origins = [o.strip() for o in allowed_origins_env.split(",") if o.strip()]
-        # Safe default for Railway: allow any origin if not specified.
-        # (You can lock this down by setting ADMIN_ALLOWED_ORIGINS to the exact dashboard origin.)
-        if not allowed_origins:
-            allowed_origins = ["*"]
-
-        @web.middleware
-        async def cors_middleware(request: web.Request, handler):
-            # Handle preflight quickly.
-            if request.method == "OPTIONS":
-                resp = web.Response(status=204)
-            else:
-                resp = await handler(request)
-
-            origin = request.headers.get("Origin")
-            if "*" in allowed_origins:
-                allow_origin = origin or "*"
-            else:
-                allow_origin = origin if origin in allowed_origins else (allowed_origins[0] if allowed_origins else "")
-
-            if allow_origin:
-                resp.headers["Access-Control-Allow-Origin"] = allow_origin
-                resp.headers["Vary"] = "Origin"
-                resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PATCH,PUT,DELETE,OPTIONS"
-                resp.headers["Access-Control-Allow-Headers"] = request.headers.get(
-                    "Access-Control-Request-Headers",
-                    "Authorization,Content-Type,Accept",
-                )
-                resp.headers["Access-Control-Allow-Credentials"] = "true"
-                resp.headers["Access-Control-Max-Age"] = "86400"
-            return resp
-
-        app = web.Application(middlewares=[cors_middleware])
+        app = web.Application()
 
         # ---- Basic Auth ----
         ADMIN_USER = os.getenv("SIGNAL_ADMIN_USER") or os.getenv("ADMIN_USER") or "admin"
@@ -5931,71 +5895,8 @@ async def main() -> None:
             return web.json_response({"ok": True})
 
 
-        # -------- Bot/system health for Status UI --------
-
-        async def system_health(request: web.Request) -> web.Response:
-            """Compatibility endpoint for the Status UI.
-
-            The dashboard historically called /api/system_health.
-            We provide a lightweight health probe that checks DB connectivity.
-            """
-            if not _check_basic(request):
-                return _unauthorized()
-            db_ok = False
-            db_err = None
-            try:
-                async with pool.acquire() as conn:
-                    await conn.execute("SELECT 1")
-                db_ok = True
-            except Exception as e:
-                db_err = str(e)
-            return web.json_response({"ok": True, "db_ok": db_ok, "db_error": db_err})
-
-        async def bot_status(request: web.Request) -> web.Response:
-            """Compatibility endpoint for the Status UI."""
-            if not _check_basic(request):
-                return _unauthorized()
-            return web.json_response({
-                "ok": True,
-                "status": "running",
-                "timezone": str(os.getenv("TZ") or ""),
-                "build_tag": str(os.getenv("BUILD_TAG") or os.getenv("MID_BUILD_TAG") or ""),
-            })
-
-        async def bot_get_settings(request: web.Request) -> web.Response:
-            """Expose a minimal set of runtime settings for the dashboard.
-
-            NOTE: This is not meant to dump secrets. Only non-sensitive toggles are returned.
-            """
-            if not _check_basic(request):
-                return _unauthorized()
-            keys = [
-                # scanners
-                "MID_SCANNER_ENABLED",
-                "SCANNER_ENABLED",
-                "MID_ALLOW_FUTURES",
-                "MID_CANDLES_MARKET_MODE",
-                "MID_CANDLES_FORCE_SPOT",
-                # cooldown
-                "MID_COOLDOWN_MINUTES",
-                "MID_SYMBOL_COOLDOWN_MIN",
-                # thresholds
-                "MID_MIN_SCORE_FUTURES",
-                "MID_MIN_SCORE_SPOT",
-                "MID_MIN_CONFIDENCE",
-                # admin
-                "ADMIN_ALERT_ENABLED",
-            ]
-            data = {k: os.getenv(k) for k in keys}
-            return web.json_response({"ok": True, "settings": data})
-
-
         # Routes
         app.router.add_route("GET", "/health", health)
-        # Compatibility routes for existing dashboards
-        app.router.add_route("GET", "/api/system_health", system_health)
-        app.router.add_route("GET", "/api/bot_status", bot_status)
-        app.router.add_route("GET", "/api/infra/admin/bot/settings", bot_get_settings)
         app.router.add_route("GET", "/api/infra/admin/bot/users", bot_list_users)
         app.router.add_route("POST", "/api/infra/admin/bot/users", bot_create_user)
         app.router.add_route("PATCH", "/api/infra/admin/bot/users/{telegram_id}", bot_patch_user)
@@ -6012,30 +5913,6 @@ async def main() -> None:
         app.router.add_route("PATCH", "/api/infra/admin/signal/users/{telegram_id}", patch_user)
         app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/block", block_user)
         app.router.add_route("POST", "/api/infra/admin/signal/users/{telegram_id}/unblock", unblock_user)
-
-        # --- Same endpoints with /signal prefix ---
-        # Some deployments host the dashboard at / and proxy the API under /signal/....
-        # We add these aliases so the dashboard can work regardless of the base path.
-        app.router.add_route("GET", "/signal/health", health)
-        app.router.add_route("GET", "/signal/api/system_health", system_health)
-        app.router.add_route("GET", "/signal/api/bot_status", bot_status)
-        app.router.add_route("GET", "/signal/api/infra/admin/bot/settings", bot_get_settings)
-        app.router.add_route("GET", "/signal/api/infra/admin/bot/users", bot_list_users)
-        app.router.add_route("POST", "/signal/api/infra/admin/bot/users", bot_create_user)
-        app.router.add_route("PATCH", "/signal/api/infra/admin/bot/users/{telegram_id}", bot_patch_user)
-        app.router.add_route("POST", "/signal/api/infra/admin/bot/users/{telegram_id}/{action}", bot_user_action)
-        app.router.add_route("GET", "/signal/api/infra/admin/signal/settings", signal_get_settings)
-        app.router.add_route("POST", "/signal/api/infra/admin/signal/settings", signal_save_settings)
-        app.router.add_route("GET", "/signal/api/infra/admin/autotrade/settings", autotrade_get_settings)
-        app.router.add_route("POST", "/signal/api/infra/admin/autotrade/settings", autotrade_save_settings)
-        app.router.add_route("POST", "/signal/api/infra/admin/signal/broadcast", signal_broadcast_text)
-        app.router.add_route("POST", "/signal/api/infra/admin/signal/send/{telegram_id}", signal_send_text)
-        app.router.add_route("GET", "/signal/api/infra/admin/signal/stats", signal_stats)
-        app.router.add_route("GET", "/signal/api/infra/admin/signal/users", list_users)
-        app.router.add_route("POST", "/signal/api/infra/admin/signal/users", save_user)
-        app.router.add_route("PATCH", "/signal/api/infra/admin/signal/users/{telegram_id}", patch_user)
-        app.router.add_route("POST", "/signal/api/infra/admin/signal/users/{telegram_id}/block", block_user)
-        app.router.add_route("POST", "/signal/api/infra/admin/signal/users/{telegram_id}/unblock", unblock_user)
         # Allow preflight
         app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response(status=204))
         return app
@@ -6175,22 +6052,18 @@ async def main() -> None:
     is_primary, _primary_lock_conn = await _acquire_primary_lock()
 
     # --- Webhook routing (enabled on ALL replicas) ---
-    # --- Webhook routing (enabled on ALL replicas) ---
     WEBHOOK_MODE = os.getenv("WEBHOOK_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
     WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip() or "/webhook"
     WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()
     WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
 
     if WEBHOOK_MODE:
-        # Start admin HTTP API on all replicas (Status dashboard uses it)
-        TASKS["http-server"] = asyncio.create_task(_start_http_server(), name="http-server")
-        _attach_task_monitor("http-server", TASKS["http-server"])
-
-        # Set Telegram webhook ONLY on primary (avoid 429 flood-control)
         if not WEBHOOK_BASE_URL:
             logger.error("WEBHOOK_MODE=1 but WEBHOOK_BASE_URL is empty; webhook will not be set.")
         else:
             webhook_url = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
+
+            # Important: only the PRIMARY replica should call Telegram setWebhook
             if is_primary:
                 try:
                     await _ensure_webhook(bot, webhook_url, secret_token=(WEBHOOK_SECRET_TOKEN or None))
@@ -6199,11 +6072,11 @@ async def main() -> None:
             else:
                 logger.info("Not primary -> skip setWebhook (webhook routing still active).")
 
-        # Background loops ONLY on primary
+    # Background loops ONLY on primary
         if not is_primary:
             logger.warning("Webhook WORKER replica started: skipping background loops (scanner/track/outcomes).")
         else:
-            # (MID trap digest is started inside _start_mid_components)
+			# (MID trap digest is started inside _start_mid_components)
             # --- WS candles aggregator (production) ---
             ws_enabled = os.getenv('CANDLES_WS_ENABLED', '0').strip().lower() not in ('0','false','no','off')
             ws_role = os.getenv('WORKER_ROLE', '').strip().upper()
@@ -6225,7 +6098,7 @@ async def main() -> None:
                     except Exception as e:
                         logger.error('[ws-candles] failed to start WS candles aggregator: %s', e)
 
-            # --- Candles cache cleanup (optional, runs ONLY on primary) ---
+# --- Candles cache cleanup (optional, runs ONLY on primary) ---
             cleanup_enabled = os.getenv("CANDLES_CACHE_CLEANUP_ENABLED", "1").strip().lower() not in ("0","false","no","off")
             if cleanup_enabled:
                 try:
@@ -6271,6 +6144,7 @@ async def main() -> None:
 
         logger.info("Webhook mode active; waiting for HTTP requests")
         await asyncio.Event().wait()
+
     # --- Polling mode (legacy) ---
     # Start admin HTTP API on all replicas
     asyncio.create_task(_start_http_server())
