@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import difflib
 import json
 import os
@@ -65,6 +66,50 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("bot")
+
+# --- Telegram webhook safe setup (prevents flood control 429) ---
+async def _ensure_webhook(bot: Bot, target_url: str, *, secret_token: str | None = None, max_tries: int = 10) -> bool:
+    """Idempotent + flood-control-safe setWebhook.
+
+    - Checks current webhook with getWebhookInfo()
+    - If already set to target_url, does nothing
+    - On Telegram flood control (RetryAfter/429), waits the suggested time
+    - Uses exponential backoff with jitter for other transient errors
+    """
+    # 1) Check existing webhook first (avoid redundant setWebhook calls)
+    try:
+        info = await bot.get_webhook_info()
+        if getattr(info, "url", "") == target_url:
+            logger.info("Webhook already set: %s", target_url)
+            return True
+    except Exception as e:
+        logger.warning("getWebhookInfo failed (will still try setWebhook): %r", e)
+
+    delay = 2.0
+    for attempt in range(1, max_tries + 1):
+        try:
+            # drop_pending_updates=False so we don't lose updates on redeploy
+            await bot.set_webhook(url=target_url, secret_token=secret_token, drop_pending_updates=False)
+            logger.info("Webhook set to %s", target_url)
+            return True
+        except Exception as e:
+            # aiogram v3: TelegramRetryAfter has `retry_after`
+            retry_after = getattr(e, "retry_after", None)
+            if retry_after is not None:
+                wait_s = float(retry_after) + 1.0
+                logger.warning("Telegram flood control on setWebhook. Retry after %.1fs", wait_s)
+                await asyncio.sleep(wait_s)
+                continue
+
+            # Generic backoff
+            jitter = random.uniform(0.0, 0.5)
+            logger.warning("setWebhook failed (attempt %s/%s): %r; sleeping %.1fs",
+                           attempt, max_tries, e, delay + jitter)
+            await asyncio.sleep(delay + jitter)
+            delay = min(delay * 2.0, 60.0)
+
+    return False
+
 
 # --- runtime health/status (autotrade & smart-manager) ---
 TASKS: dict[str, asyncio.Task] = {}
@@ -6013,51 +6058,21 @@ async def main() -> None:
     WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
 
     if WEBHOOK_MODE:
-        # Register aiogram webhook handler into the existing aiohttp app (admin API).
-        try:
-            # _admin_http_app() creates the aiohttp application used for admin API.
-            # We add webhook handler to the same app, so Railway only needs one HTTP port.
-            async def _start_http_server() -> None:
-                try:
-                    port = int(os.getenv("PORT", "8080"))
-                except Exception:
-                    port = 8080
+        if not WEBHOOK_BASE_URL:
+            logger.error("WEBHOOK_MODE=1 but WEBHOOK_BASE_URL is empty; webhook will not be set.")
+        else:
+            webhook_url = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
 
-                app = await _admin_http_app()
-
-                # Register webhook endpoint
+            # Important: only the PRIMARY replica should call Telegram setWebhook
+            if is_primary:
                 try:
-                    handler = SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET_TOKEN or None)
-                    handler.register(app, path=WEBHOOK_PATH)
-                    setup_application(app, dp, bot=bot)
-                    logger.info("Telegram webhook route enabled at %s", WEBHOOK_PATH)
+                    await _ensure_webhook(bot, webhook_url, secret_token=(WEBHOOK_SECRET_TOKEN or None))
                 except Exception as e:
-                    logger.exception("Failed to register Telegram webhook route: %s", e)
-
-                runner = web.AppRunner(app)
-                await runner.setup()
-                site = web.TCPSite(runner, host="0.0.0.0", port=port)
-                await site.start()
-                logger.info("Admin HTTP API started on 0.0.0.0:%s", port)
-
-            asyncio.create_task(_start_http_server())
-        except Exception:
-            # If HTTP server start failed, crash is better than silently running broken.
-            raise
-
-        # Only PRIMARY sets the webhook to avoid replicas racing to set/unset it.
-        if is_primary:
-            if not WEBHOOK_BASE_URL:
-                logger.error("WEBHOOK_MODE=1 but WEBHOOK_BASE_URL is empty; webhook will not be set.")
+                    logger.exception("Failed to ensure Telegram webhook: %s", e)
             else:
-                webhook_url = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
-                try:
-                    await bot.set_webhook(webhook_url, secret_token=WEBHOOK_SECRET_TOKEN or None)
-                    logger.info("Webhook set to %s", webhook_url)
-                except Exception as e:
-                    logger.exception("Failed to set Telegram webhook: %s", e)
+                logger.info("Not primary -> skip setWebhook (webhook routing still active).")
 
-        # Background loops ONLY on primary
+    # Background loops ONLY on primary
         if not is_primary:
             logger.warning("Webhook WORKER replica started: skipping background loops (scanner/track/outcomes).")
         else:
