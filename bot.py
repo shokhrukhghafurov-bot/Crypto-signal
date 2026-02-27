@@ -637,9 +637,12 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
         )
 
         # If a compatibility stub is present, treat as missing implementation.
+        _mid_stub_reason = None
         try:
-            _mid_name = getattr(mid_loop, '__name__', '')
-            if _mid_name == '_missing_scanner_loop_mid':
+            _mid_name = getattr(mid_loop, "__name__", "")
+            _mid_qual = getattr(mid_loop, "__qualname__", "")
+            if _mid_name == "_missing_scanner_loop_mid" or _mid_qual.endswith("._missing_scanner_loop_mid"):
+                _mid_stub_reason = f"stub:{_mid_qual or _mid_name}"
                 mid_loop = None
         except Exception:
             pass
