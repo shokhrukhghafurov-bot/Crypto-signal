@@ -1,14 +1,13 @@
 
 from __future__ import annotations
 
-def utcnow():
-    return dt.datetime.now(dt.timezone.utc)
-
 import asyncpg
 import datetime as dt
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
+def utcnow():
+    return dt.datetime.now(dt.timezone.utc)
 
 _pool: Optional[asyncpg.Pool] = None
 
