@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-02-27_v11"
+MID_BUILD_TAG = "MID_BUILD_2026-02-28_v12"
 
 import asyncio
 import json
@@ -618,6 +618,7 @@ MID_PENDING_EXPIRED_TOTAL = 0
 MID_REJECT_REASONS = {
     "candles_unavailable",
     "not_enough_data",
+    "pending_exception",
     # Candles were OK, but the setup didn't pass filters (TA/structure/trap/trigger/etc).
     "no_signal",
     "pending_wait",
@@ -15312,16 +15313,16 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     # Pending model requires a real entry zone. Without zone it's not a setup.
                                     if entry_low is None or entry_high is None:
                                         _pending_skip(sym, f"no_zone src={z_src or 'n/a'}")
-                                        _rej_add(sym, "no_entry_zone")
+                                        _rej_add(sym, "no_signal")
                                         continue
                                     try:
                                         if float(entry_low) <= 0 or float(entry_high) <= 0 or float(entry_high) < float(entry_low):
                                             _pending_skip(sym, "zone_invalid")
-                                            _rej_add(sym, "no_entry_zone")
+                                            _rej_add(sym, "no_signal")
                                             continue
                                     except Exception:
                                         _pending_skip(sym, "zone_invalid")
-                                        _rej_add(sym, "no_entry_zone")
+                                        _rej_add(sym, "no_signal")
                                         continue
 
                                     # Collect risk flags from scan stage (when MID_FILTERS_AFTER_SETUP=1).
@@ -15398,8 +15399,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     _mid_f_cooldown += 1  # pending add cooldown; not a rejection
                                     _pending_skip(sym, "cooldown")
                                     logger.debug(f"[mid][pending] cooldown skip sym={sym} dir={direction} market={market}")
-                            except Exception:
-                                _rej_add(sym, "not_enough_data")
+                            except Exception as e:
+                                logger.exception("[mid][pending][scan] failed to create pending sym=%s dir=%s market=%s: %s", sym, direction, market, e)
+                                _rej_add(sym, "pending_exception")
                             # do NOT emit now
                         else:
                             self.mark_emitted_mid(sym, sig.direction, sig.market)
