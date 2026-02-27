@@ -15376,7 +15376,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     except Exception:
                                         pass
                                 else:
-                                    _rej_add(sym, "pending_wait")
+                                    _mid_f_cooldown += 1  # pending add cooldown; not a rejection
+                                    logger.debug(f"[mid][pending] cooldown skip sym={sym} dir={direction} market={market}")
                             except Exception:
                                 _rej_add(sym, "not_enough_data")
                             # do NOT emit now
