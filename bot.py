@@ -410,6 +410,53 @@ try:
 
         backend.next_signal_id = _types.MethodType(_next_signal_id, backend)
         logger.warning("[mid] Backend has no next_signal_id; installed runtime shim (compat)")
+
+        # Some builds (or old backends) may not have check_signal_openable used by /opened handler.
+        # Provide an async compat shim to avoid webhook crashes.
+        if not hasattr(backend, "check_signal_openable"):
+            async def _check_signal_openable(self, signal):
+                """Return (allowed, reason_code, current_price).
+
+                Minimal compat implementation:
+                - TTL check via SIGNAL_OPEN_TTL_SECONDS (default 1800s) if signal.ts exists
+                - If backend has _get_price(signal) use it for current_price
+                - Otherwise allow by default
+                """
+                try:
+                    import os as _os
+                    import time as _time
+                    now = _time.time()
+                    try:
+                        ttl = int(_os.getenv("SIGNAL_OPEN_TTL_SECONDS", "1800") or 0)
+                    except Exception:
+                        ttl = 1800
+                    try:
+                        sig_ts = float(getattr(signal, "ts", 0) or 0)
+                    except Exception:
+                        sig_ts = 0.0
+                    if sig_ts and ttl > 0 and (now - sig_ts) > ttl:
+                        price = 0.0
+                        if hasattr(self, "_get_price"):
+                            try:
+                                price = float(await self._get_price(signal))
+                            except Exception:
+                                price = 0.0
+                        return False, "TIME", float(price)
+
+                    price = 0.0
+                    if hasattr(self, "_get_price"):
+                        try:
+                            price = float(await self._get_price(signal))
+                        except Exception:
+                            price = 0.0
+
+                    return True, "OK", float(price)
+                except Exception:
+                    return True, "OK", 0.0
+
+            backend.check_signal_openable = _types.MethodType(_check_signal_openable, backend)
+            logger.warning("[mid] Backend has no check_signal_openable; installed runtime shim (compat)")
+
 except Exception:
     # Never fail startup because of a shim
     pass
