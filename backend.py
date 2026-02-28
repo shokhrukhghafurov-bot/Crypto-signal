@@ -14772,15 +14772,15 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     limits_to_try = [x for x in limits_to_try if (x not in _seen and not _seen.add(x))]
                 except Exception:
                     limits_to_try = [int(limit)]
-                
+
                 for _i in range(max(0, mid_candles_retry) + 1):
                     for _lim in limits_to_try:
                         limit = int(_lim)
                         last = await _mid_fetch_klines_rest(ex_name, symb, tf, limit, market)
-                
+
                         # If response is empty (no exception), count as EMPTY + optional adaptive behaviors
                         if last is None or getattr(last, 'empty', False):
-                
+
                             # Bidirectional market fallback (FUTURES <-> SPOT) when requested market yields empty/None/unsupported.
                             try:
                                 mkt_req = (market or 'SPOT').upper().strip()
@@ -14796,10 +14796,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         alt_df = await _mid_fetch_klines_rest(ex_name, symb, tf, int(limit), alt)
                                         if alt_df is not None and not getattr(alt_df, 'empty', True):
                                             # Cache write-through under BOTH markets to suppress repeated empties.
+                                            key_req = (ex_name, mkt_req, symb, tf, int(limit))
                                             key_alt = (ex_name, alt, symb, tf, int(limit))
                                             _mid_candles_cache[key_alt] = (now, alt_df)
-                                            _mid_candles_cache[key] = (now, alt_df)
-                                            # write-through to persistent cache
+                                            _mid_candles_cache[key_req] = (now, alt_df)
                                             try:
                                                 persist_enabled = str(os.getenv('MID_PERSIST_CANDLES', '1') or '1').strip().lower() not in ('0','false','no','off')
                                                 if persist_enabled and tf in ('5m','30m','1h'):
@@ -14813,7 +14813,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                             return alt_df
                             except Exception:
                                 pass
-                
+
                             # If we got an empty dataframe, it often means the instrument doesn't exist for this market (esp. OKX SWAP).
                             # Re-check market availability and convert empty->unsupported_pair to avoid repeated empty storms.
                             try:
@@ -14828,7 +14828,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     return None
                             except Exception:
                                 pass
-                
+
                             # If REST returned empty on the *smallest* limit for BYBIT/OKX FUTURES, treat as unsupported to stop storms.
                             try:
                                 mkt_now2 = (market or 'SPOT').upper().strip()
@@ -14845,8 +14845,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     return None
                             except Exception:
                                 pass
-                
-                            
+
                             # If REST returned empty repeatedly (any exchange/market), optionally treat it as unsupported
                             # to avoid repeated empty storms and let other venues win quickly.
                             try:
@@ -14865,80 +14864,72 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     return None
                             except Exception:
                                 pass
-# If it was explicitly marked unsupported (e.g. market not implemented),
-                            # don't count it as an "empty candles" sample.
-                            if api._is_unsupported_cached(ex_name, (market or 'SPOT').upper().strip(), symb, tf):
-                                _mid_candles_unsupported += 1
-                                return None
 
+                            # If it was explicitly marked unsupported (e.g. market not implemented), don't count it as an empty sample.
+                            try:
+                                if api._is_unsupported_cached(ex_name, (market or 'SPOT').upper().strip(), symb, tf):
+                                    _mid_candles_unsupported += 1
+                                    continue
+                            except Exception:
+                                pass
 
-# Empty candles: do NOT automatically mark unsupported.
-# Empty can happen on cold start / lagging WS DB / transient exchange glitches.
-# Marking unsupported here bricks major symbols for hours.
-try:
-    _mid_diag_add(symb, ex_name, (market or 'SPOT').upper().strip(), tf, 'empty')
-except Exception:
-    pass
-_mid_candles_empty += 1
-try:
-    keyr = (ex_name, (market or 'SPOT').upper().strip(), tf)
-    _mid_candles_empty_reasons[keyr] += 1
-    lst = _mid_candles_empty_samples[keyr]
-    if len(lst) < _mid_candles_log_samples:
-        lst.append(symb)
-except Exception:
-    pass
-return None
-                
-                # got non-empty candles
-                        pass  # removed invalid break
-            else:
-                # all limits empty for this retry iteration
-                last = __import__('pandas').DataFrame()
-        
-            if last is not None and not getattr(last, 'empty', True):
-                break
-        
-            # tiny backoff reduces rate-limit bursts and improves success on flaky networks
-            if _i < max(0, mid_candles_retry):
-                try:
-                    await __import__('asyncio').sleep(0.15 * (_i + 1))
-                except Exception:
-                    pass
-                
-                if last is not None and not getattr(last, 'empty', True):
-                    # Accept REST candles only if newest candle is reasonably fresh (prevents stale REST poisoning).
-                    try:
-                        rest_max_age = float(os.getenv('MID_REST_CANDLES_MAX_AGE_SEC', '1800') or 1800)
-                        tf_sec = 300.0 if tf == '5m' else (1800.0 if tf == '30m' else (3600.0 if tf == '1h' else 0.0))
-                        allowed = max(rest_max_age, tf_sec * 2.0) if tf_sec > 0 else rest_max_age
-                        now_ms = int(__import__('time').time() * 1000)
-                        if 'close_time_ms' in last.columns:
-                            _last_close = int(float(last['close_time_ms'].iloc[-1]))
-                        elif 'close_time' in last.columns:
-                            _last_close = int(float(last['close_time'].iloc[-1]))
-                        else:
-                            _last_close = 0
-                        if _last_close > 0 and (now_ms - _last_close) > int(allowed * 1000):
-                            _mid_diag_add(symb, ex_name, market, tf, 'stale_rest')
-                            last = __import__('pandas').DataFrame()
-                    except Exception:
-                        pass
-                
-                if last is not None and not getattr(last, 'empty', True):
-                    _mid_candles_cache[key] = (now, last)
-                    # write-through to persistent cache
-                    try:
-                        persist_enabled = str(os.getenv('MID_PERSIST_CANDLES', '1') or '1').strip().lower() not in ('0','false','no','off')
-                        if persist_enabled and tf in ('5m','30m','1h'):
-                            blob = db_store._cc_pack_df(last)
-                            await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob)
-                    except Exception:
-                        pass
-                    _mid_rest_refill += 1
-                    _mid_diag_ok(symb, ex_name, market, tf, 'rest', last)
-                    return last
+                            # Empty candles: do NOT automatically mark unsupported.
+                            try:
+                                _mid_diag_add(symb, ex_name, (market or 'SPOT').upper().strip(), tf, 'empty')
+                            except Exception:
+                                pass
+                            _mid_candles_empty += 1
+                            try:
+                                keyr = (ex_name, (market or 'SPOT').upper().strip(), tf)
+                                _mid_candles_empty_reasons[keyr] += 1
+                                lst = _mid_candles_empty_samples[keyr]
+                                if len(lst) < _mid_candles_log_samples:
+                                    lst.append(symb)
+                            except Exception:
+                                pass
 
+                            continue
+
+                        # got non-empty candles
+                        # Accept REST candles only if newest candle is reasonably fresh (prevents stale REST poisoning).
+                        try:
+                            rest_max_age = float(os.getenv('MID_REST_CANDLES_MAX_AGE_SEC', '1800') or 1800)
+                            tf_sec = 300.0 if tf == '5m' else (1800.0 if tf == '30m' else (3600.0 if tf == '1h' else 0.0))
+                            allowed = max(rest_max_age, tf_sec * 2.0) if tf_sec > 0 else rest_max_age
+                            now_ms = int(__import__('time').time() * 1000)
+                            if 'close_time_ms' in last.columns:
+                                _last_close = int(float(last['close_time_ms'].iloc[-1]))
+                            elif 'close_time' in last.columns:
+                                _last_close = int(float(last['close_time'].iloc[-1]))
+                            else:
+                                _last_close = 0
+                            if _last_close > 0 and (now_ms - _last_close) > int(allowed * 1000):
+                                _mid_diag_add(symb, ex_name, market, tf, 'stale_rest')
+                                continue
+                        except Exception:
+                            pass
+
+                        key = (ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
+                        _mid_candles_cache[key] = (now, last)
+                        try:
+                            persist_enabled = str(os.getenv('MID_PERSIST_CANDLES', '1') or '1').strip().lower() not in ('0','false','no','off')
+                            if persist_enabled and tf in ('5m','30m','1h'):
+                                blob = db_store._cc_pack_df(last)
+                                await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob)
+                        except Exception:
+                            pass
+                        _mid_rest_refill += 1
+                        _mid_diag_ok(symb, ex_name, market, tf, 'rest', last)
+                        return last
+
+                    # tiny backoff reduces rate-limit bursts and improves success on flaky networks
+                    if _i < max(0, mid_candles_retry):
+                        try:
+                            await __import__('asyncio').sleep(0.15 * (_i + 1))
+                        except Exception:
+                            pass
+
+                return None
                 # --- REST fallback across exchanges when WS/DB is empty ---
                 # On cold start, the WS->DB candle cache may lag or be empty. If the primary venue
                 # returns empty, try other configured venues before giving up.
@@ -15051,53 +15042,53 @@ return None
                     except Exception:
                         prefilter = True
 
-def _market_supported_ex_fast(_ex: str, _mkt: str, _sym: str) -> bool:
-    """Synchronous best-effort market availability check using already-cached markets.
-    If markets are not cached / empty (cold start), return True (permissive) to avoid mass 'unsupported' storms.
-    """
-    try:
-        if not getattr(api, "_market_avail_check", False):
-            return True
-        exu = (_ex or "").upper().strip()
-        mktu = (_mkt or "SPOT").upper().strip()
-        symu = (_sym or "").upper().strip()
-        if not symu:
-            return False
-        # Map to cache keys used by _get_*_markets
-        if exu == "BINANCE":
-            key_name = "BINANCE_FUTURES" if mktu == "FUTURES" else "BINANCE_SPOT"
-        elif exu == "BYBIT":
-            key_name = "BYBIT_LINEAR" if mktu == "FUTURES" else "BYBIT_SPOT"
-        elif exu == "OKX":
-            key_name = "OKX_SWAP" if mktu == "FUTURES" else "OKX_SPOT"
-        elif exu == "GATEIO":
-            key_name = "GATEIO"
-        elif exu == "MEXC":
-            key_name = "MEXC"
-        else:
-            return True
-        cached = getattr(api, "_markets_cache", {}).get(key_name)
-        if not cached:
-            return True
-        until, markets = cached
-        # If cached markets set is empty, treat as unknown (permissive)
-        if not markets:
-            return True
-        if exu == "GATEIO":
-            try:
-                pair = _gate_pair(symu).upper()
-            except Exception:
-                pair = symu
-            return pair in markets
-        if exu == "BINANCE" and mktu == "FUTURES":
-            try:
-                sym_req = api._binance_futures_symbol_alias(symu)
-            except Exception:
-                sym_req = symu
-            return (symu in markets) or (sym_req in markets)
-        return symu in markets
-    except Exception:
-        return True
+                    def _market_supported_ex_fast(_ex: str, _mkt: str, _sym: str) -> bool:
+                        """Synchronous best-effort market availability check using already-cached markets.
+                        If markets are not cached / empty (cold start), return True (permissive) to avoid mass 'unsupported' storms.
+                        """
+                        try:
+                            if not getattr(api, "_market_avail_check", False):
+                                return True
+                            exu = (_ex or "").upper().strip()
+                            mktu = (_mkt or "SPOT").upper().strip()
+                            symu = (_sym or "").upper().strip()
+                            if not symu:
+                                return False
+                            # Map to cache keys used by _get_*_markets
+                            if exu == "BINANCE":
+                                key_name = "BINANCE_FUTURES" if mktu == "FUTURES" else "BINANCE_SPOT"
+                            elif exu == "BYBIT":
+                                key_name = "BYBIT_LINEAR" if mktu == "FUTURES" else "BYBIT_SPOT"
+                            elif exu == "OKX":
+                                key_name = "OKX_SWAP" if mktu == "FUTURES" else "OKX_SPOT"
+                            elif exu == "GATEIO":
+                                key_name = "GATEIO"
+                            elif exu == "MEXC":
+                                key_name = "MEXC"
+                            else:
+                                return True
+                            cached = getattr(api, "_markets_cache", {}).get(key_name)
+                            if not cached:
+                                return True
+                            until, markets = cached
+                            # If cached markets set is empty, treat as unknown (permissive)
+                            if not markets:
+                                return True
+                            if exu == "GATEIO":
+                                try:
+                                    pair = _gate_pair(symu).upper()
+                                except Exception:
+                                    pair = symu
+                                return pair in markets
+                            if exu == "BINANCE" and mktu == "FUTURES":
+                                try:
+                                    sym_req = api._binance_futures_symbol_alias(symu)
+                                except Exception:
+                                    sym_req = symu
+                                return (symu in markets) or (sym_req in markets)
+                            return symu in markets
+                        except Exception:
+                            return True
 
                     if prefilter and symbols:
                         try:
