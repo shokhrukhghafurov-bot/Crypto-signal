@@ -14331,13 +14331,27 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     if cached:
                                         ts, df = cached
                                         if (now - ts) <= ttl and df is not None and not getattr(df, 'empty', True):
-                                            _mid_db_hit += 1
-                                            _mid_diag_ok(symb_n, ex_name, market, tf, 'cache', df)
-                                            dfn = _mid_norm_ohlcv(df)
-                                            if dfn is None:
-                                                _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'cache')
-                                                return pd.DataFrame()
-                                            return dfn
+                                            # IMPORTANT: if cache is too short (cold start got=1), do NOT return it here.
+                                            # Let caller fall through to prefill/REST via _mid_fetch_klines_cached.
+                                            try:
+                                                need_bars = int(_mid_need_bars(tf) or 0)
+                                            except Exception:
+                                                need_bars = 0
+                                            got_bars = 0
+                                            try:
+                                                got_bars = int(len(df))
+                                            except Exception:
+                                                got_bars = 0
+                                            if need_bars and got_bars < need_bars:
+                                                _mid_diag_add(symb_n, ex_name, market, tf, 'short_cache', f'got={got_bars}<need={need_bars}')
+                                            else:
+                                                _mid_db_hit += 1
+                                                _mid_diag_ok(symb_n, ex_name, market, tf, 'cache', df)
+                                                dfn = _mid_norm_ohlcv(df)
+                                                if dfn is None:
+                                                    _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'cache')
+                                                    return pd.DataFrame()
+                                                return dfn
 
                                     persist_enabled = str(os.getenv("MID_PERSIST_CANDLES", "1") or "1").strip().lower() not in ("0","false","no","off")
                                     if persist_enabled and tf in ("5m","30m","1h"):
@@ -14365,14 +14379,28 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     except Exception:
                                                         pass
                                                     if dfp is not None and not dfp.empty:
-                                                        _mid_db_hit += 1
-                                                        _mid_candles_cache[key] = (now, dfp)
-                                                        _mid_diag_ok(symb_n, ex_name, market, tf, 'persist', dfp)
                                                         dfp_n = _mid_norm_ohlcv(dfp)
                                                         if dfp_n is None:
                                                             _mid_diag_add(symb_n, ex_name, market, tf, 'bad_schema', 'persist')
                                                             return pd.DataFrame()
-                                                        return dfp_n
+                                                        # IMPORTANT: if persist cache is too short (cold start got=1), do NOT return it here.
+                                                        # Let caller fall through to prefill/REST via _mid_fetch_klines_cached.
+                                                        try:
+                                                            need_bars = int(_mid_need_bars(tf) or 0)
+                                                        except Exception:
+                                                            need_bars = 0
+                                                        got_bars = 0
+                                                        try:
+                                                            got_bars = int(len(dfp_n))
+                                                        except Exception:
+                                                            got_bars = 0
+                                                        if need_bars and got_bars < need_bars:
+                                                            _mid_diag_add(symb_n, ex_name, market, tf, 'short_persist', f'got={got_bars}<need={need_bars}')
+                                                        else:
+                                                            _mid_db_hit += 1
+                                                            _mid_candles_cache[key] = (now, dfp_n)
+                                                            _mid_diag_ok(symb_n, ex_name, market, tf, 'persist', dfp_n)
+                                                            return dfp_n
                                                 else:
                                                     _mid_diag_add(symb_n, ex_name, market, tf, 'stale_persist')
                                         except Exception:
