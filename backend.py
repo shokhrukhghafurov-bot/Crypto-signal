@@ -12812,6 +12812,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             # skipping ALL re-checks (TA reconfirm, blocks, trap, post-setup filters).
             # Use only for debugging the pipeline end-to-end.
             pending_instant_emit = os.getenv("MID_PENDING_INSTANT_EMIT", "0").strip().lower() in ("1","true","yes","on")
+            instant_ignore_zone = os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0").strip().lower() in ("1","true","yes","on")
             keep: list[dict] = []
             any_wait = False
             # --- per-poll diagnostics counters ---
@@ -13124,16 +13125,20 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         pass
 
-                    if use_zone:
-                        if not (float(price) >= (lo - tol) and float(price) <= (hi + tol)):
-                            keep.append(it)
-                            any_wait = True
-                            continue
-                    else:
-                        if abs(float(price) - entry0) > tol:
-                            keep.append(it)
-                            any_wait = True
-                            continue
+                    # Normally we wait until price reaches the planned entry zone/price.
+                    # For debugging (or "emit on create" behavior), you can bypass this wait:
+                    # MID_PENDING_INSTANT_EMIT=1 + MID_PENDING_INSTANT_EMIT_IGNORE_ZONE=1
+                    if not (pending_instant_emit and instant_ignore_zone):
+                        if use_zone:
+                            if not (float(price) >= (lo - tol) and float(price) <= (hi + tol)):
+                                keep.append(it)
+                                any_wait = True
+                                continue
+                        else:
+                            if abs(float(price) - entry0) > tol:
+                                keep.append(it)
+                                any_wait = True
+                                continue
 
                     # Debounce: if price is still in-zone and we've checked very recently,
                     # don't count another attempt and don't re-run heavy confirmations yet.
