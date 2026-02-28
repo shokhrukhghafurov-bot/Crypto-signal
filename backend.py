@@ -12051,7 +12051,7 @@ class Backend:
                         sig = Signal(
                             signal_id=sid,
                             market=market,
-                            symbol=sym,
+                            symbol=(sym_trade or sym),
                             direction=best_dir,
                             timeframe="15m/1h/4h",
                             entry=entry,
@@ -12524,6 +12524,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         far_atr = float(os.getenv("MID_PENDING_FAR_ATR", "1.50") or 1.50)
     except Exception:
         far_atr = 1.50
+    # When ATR is too small (vol_low), classify distances by % instead of ATR.
+    try:
+        near_pct = float(os.getenv("MID_PENDING_NEAR_PCT", "0.003") or 0.003)
+    except Exception:
+        near_pct = 0.003
+    try:
+        far_pct = float(os.getenv("MID_PENDING_FAR_PCT", "0.03") or 0.03)
+    except Exception:
+        far_pct = 0.03
+
     try:
         dbg_every = float(os.getenv("MID_PENDING_DEBUG_EVERY_SEC", "30") or 30.0)
     except Exception:
@@ -12595,6 +12605,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             for it in items:
                 try:
                     sym = str(it.get("symbol") or "")
+                    sym_trade = str(it.get("trade_symbol") or sym)
+                    sym_candles = str(it.get("candle_symbol") or sym)
                     market = str(it.get("market") or "SPOT").upper().strip()
                     if market.endswith(".FUTURES") or "FUTURES" in market:
                         market = "FUTURES"
@@ -12629,9 +12641,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         continue
 
                     # load candles (also gives fallback price)
-                    df5 = await self.load_candles(sym, "5m", market)
-                    df30 = await self.load_candles(sym, "30m", market)
-                    df1h = await self.load_candles(sym, "1h", market)
+                    df5 = await self.load_candles(sym_candles, "5m", market)
+                    df30 = await self.load_candles(sym_candles, "30m", market)
+                    df1h = await self.load_candles(sym_candles, "1h", market)
                     if df5 is None or getattr(df5, "empty", True) or df30 is None or getattr(df30, "empty", True) or df1h is None or getattr(df1h, "empty", True):
                         keep.append(it)
                         any_wait = True
@@ -12641,15 +12653,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     price = None
                     try:
                         if src_ex == "BINANCE":
-                            price = await self._fetch_binance_price("FUTURES" if market == "FUTURES" else "SPOT", sym)
+                            price = await self._fetch_binance_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
                         elif src_ex == "BYBIT":
-                            price = await self._fetch_bybit_price("FUTURES" if market == "FUTURES" else "SPOT", sym)
+                            price = await self._fetch_bybit_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
                         elif src_ex == "OKX":
-                            price = await self._fetch_okx_price("FUTURES" if market == "FUTURES" else "SPOT", sym)
+                            price = await self._fetch_okx_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
                         elif src_ex == "MEXC":
-                            price = await _mexc_public_price(sym)
+                            price = await _mexc_public_price(sym_trade)
                         elif src_ex == "GATEIO":
-                            price = await _gateio_public_price(sym)
+                            price = await _gateio_public_price(sym_trade)
                     except Exception:
                         price = None
 
@@ -12701,13 +12713,44 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         else:
                             _dist = abs(float(price) - float(entry0))
                             _zone_w = 0.0
-                        _dist_atr = float(_dist) / float(atr_abs) if float(atr_abs) > 0 else 0.0
+
+                        _dist_pct = float(_dist) / float(price) if float(price) > 0 else 0.0
+
+                        # vol_low guard: if ATR is too small, ATR-based metrics explode and become meaningless
+                        try:
+                            _min_atr_abs = float(os.getenv("MID_PENDING_MIN_ATR_ABS", "0") or 0.0)
+                        except Exception:
+                            _min_atr_abs = 0.0
+                        try:
+                            _min_atr_pct = float(os.getenv("MID_PENDING_MIN_ATR_PCT", os.getenv("MID_MIN_ATR_PCT", "0")) or 0.0)
+                        except Exception:
+                            _min_atr_pct = 0.0
+                        try:
+                            _atr_pct_now = (float(atr_abs) / float(price) * 100.0) if float(price) > 0 else 0.0
+                        except Exception:
+                            _atr_pct_now = 0.0
+                        _vol_low = False
+                        try:
+                            if (float(_min_atr_abs) > 0 and float(atr_abs) < float(_min_atr_abs)) or (float(_min_atr_pct) > 0 and float(_atr_pct_now) < float(_min_atr_pct)):
+                                _vol_low = True
+                        except Exception:
+                            _vol_low = False
+
+                        _dist_atr = None if _vol_low else (float(_dist) / float(atr_abs) if float(atr_abs) > 0 else None)
+
                         if _dist <= 0:
                             in_zone_n += 1
-                        if float(_dist_atr) <= float(near_atr):
-                            near_n += 1
-                        if float(_dist_atr) >= float(far_atr):
-                            far_n += 1
+                        if _dist_atr is not None:
+                            if float(_dist_atr) <= float(near_atr):
+                                near_n += 1
+                            if float(_dist_atr) >= float(far_atr):
+                                far_n += 1
+                        else:
+                            if float(_dist_pct) <= float(near_pct):
+                                near_n += 1
+                            if float(_dist_pct) >= float(far_pct):
+                                far_n += 1
+
                         # samples: keep a few farthest pendings for debug
                         if dbg_samples > 0:
                             try:
@@ -12715,11 +12758,24 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 _age_m = 0.0
                             try:
-                                _w_atr = float(_zone_w) / float(atr_abs) if (use_zone and float(atr_abs) > 0) else 0.0
+                                _w_atr = float(_zone_w) / float(atr_abs) if (use_zone and (not _vol_low) and float(atr_abs) > 0) else 0.0
                             except Exception:
                                 _w_atr = 0.0
-                            _txt = f"{sym} {market} {direction} px={float(price):.6g} zone={float(lo):.6g}..{float(hi):.6g} dist_atr={float(_dist_atr):.2f} w_atr={float(_w_atr):.2f} src={str(it.get('entry_zone_src') or '')} age={_age_m:.0f}m flags={it.get('risk_flags', [])}" if use_zone else f"{sym} {market} {direction} px={float(price):.6g} entry={float(entry0):.6g} dist_atr={float(_dist_atr):.2f} age={_age_m:.0f}m"
-                            samples.append((float(_dist_atr), _txt))
+
+                            if use_zone:
+                                if _dist_atr is None:
+                                    _txt = f"{sym} {market} {direction} px={float(price):.6g} zone={float(lo):.6g}..{float(hi):.6g} dist_pct={float(_dist_pct)*100.0:.2f}% w={float(_zone_w):.6g} src={str(it.get('entry_zone_src') or '')} age={_age_m:.0f}m flags={it.get('risk_flags', [])}"
+                                    samples.append((float(_dist_pct), _txt))
+                                else:
+                                    _txt = f"{sym} {market} {direction} px={float(price):.6g} zone={float(lo):.6g}..{float(hi):.6g} dist_atr={float(_dist_atr):.2f} w_atr={float(_w_atr):.2f} src={str(it.get('entry_zone_src') or '')} age={_age_m:.0f}m flags={it.get('risk_flags', [])}"
+                                    samples.append((float(_dist_atr), _txt))
+                            else:
+                                if _dist_atr is None:
+                                    _txt = f"{sym} {market} {direction} px={float(price):.6g} entry={float(entry0):.6g} dist_pct={float(_dist_pct)*100.0:.2f}% age={_age_m:.0f}m"
+                                    samples.append((float(_dist_pct), _txt))
+                                else:
+                                    _txt = f"{sym} {market} {direction} px={float(price):.6g} entry={float(entry0):.6g} dist_atr={float(_dist_atr):.2f} age={_age_m:.0f}m"
+                                    samples.append((float(_dist_atr), _txt))
                     except Exception:
                         pass
 
@@ -15583,85 +15639,84 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 marketu = str(market or "").upper().strip() or "SPOT"
 
                                 # --- AUTOTRADE reverse permission (smart mode) ---
-_can_add_pending = self.can_add_mid_pending(sym, direction=diru, market=marketu)
-_reverse_allowed = False
-try:
-    _trade = await self._mid_get_active_trade(sym, marketu)
-except Exception:
-    _trade = None
-if isinstance(_trade, dict) and _trade.get("id"):
-    try:
-        _t_side = str(_trade.get("side") or "").upper().strip() or "LONG"
-    except Exception:
-        _t_side = "LONG"
-    # If an active trade exists on same symbol+market:
-    # - same side: block creating another pending (prevents pyramiding by mistake)
-    # - opposite side: allow only if reversal conditions are met
-    if _t_side == str(diru).upper().strip():
-        _pending_skip(sym, "active_trade_same_side")
-        _mid_f_cooldown += 1
-        _can_add_pending = False
-    else:
-        try:
-            _adx_min = float(os.getenv("MID_REVERSE_ADX_MIN", "25") or 25.0)
-        except Exception:
-            _adx_min = 25.0
-        try:
-            _min_dist_atr = float(os.getenv("MID_REVERSE_MIN_DIST_ATR", "0.7") or 0.7)
-        except Exception:
-            _min_dist_atr = 0.7
-        # structure must be clearly broken versus the active trade side
-        try:
-            _struct0 = str(struct_hhhl_1h or "—")
-        except Exception:
-            _struct0 = "—"
-        _struct_broken = ((_t_side == "LONG" and _struct0 == "LH-LL") or (_t_side == "SHORT" and _struct0 == "HH-HL"))
-        # opposite liquidity sweep must be present (5m)
-        try:
-            _sweep_ok = ((str(diru).upper() == "SHORT" and bool(sweep_short)) or (str(diru).upper() == "LONG" and bool(sweep_long)))
-        except Exception:
-            _sweep_ok = False
-        # ADX must be high enough (1h)
-        try:
-            _adx_ok = (adx1h is not None) and (not np.isnan(float(adx1h))) and float(adx1h) >= float(_adx_min)
-        except Exception:
-            _adx_ok = False
-        # distance from active trade entry must be large enough (in ATR)
-        try:
-            _atr_use = float(_atr0) if (_atr0 is not None and float(_atr0) > 0) else float(entry) * 0.001
-        except Exception:
-            _atr_use = float(entry) * 0.001
-        try:
-            _dist_rev_atr = abs(float(entry) - float(_trade.get("entry") or 0.0)) / float(_atr_use) if float(_atr_use) > 0 else 0.0
-        except Exception:
-            _dist_rev_atr = 0.0
-        if _struct_broken and _adx_ok and _sweep_ok and float(_dist_rev_atr) >= float(_min_dist_atr):
-            _reverse_allowed = True
-            _can_add_pending = True  # bypass cooldown for reversal
-            try:
-                _rmn = await self.remove_mid_pending_symbol(sym, marketu)
-                if int(_rmn or 0) > 0:
-                    logger.info("[mid][pending][reverse] removed_old_pending symbol=%s market=%s n=%s", sym, marketu, _rmn)
-            except Exception:
-                pass
-            try:
-                if "reverse_allowed" not in risk_flags:
-                    risk_flags.append("reverse_allowed")
-            except Exception:
-                pass
-            try:
-                rec["reverse_of_trade_id"] = int(_trade.get("id") or 0)
-                rec["reverse_of_side"] = str(_t_side)
-                rec["reverse_dist_atr"] = float(_dist_rev_atr)
-            except Exception:
-                pass
-        else:
-            _pending_skip(sym, "active_trade_block")
-            _mid_f_cooldown += 1
-            _can_add_pending = False
+                                _can_add_pending = self.can_add_mid_pending(sym, direction=diru, market=marketu)
+                                _reverse_allowed = False
+                                try:
+                                    _trade = await self._mid_get_active_trade(sym, marketu)
+                                except Exception:
+                                    _trade = None
+                                if isinstance(_trade, dict) and _trade.get("id"):
+                                    try:
+                                        _t_side = str(_trade.get("side") or "").upper().strip() or "LONG"
+                                    except Exception:
+                                        _t_side = "LONG"
+                                    # If an active trade exists on same symbol+market:
+                                    # - same side: block creating another pending (prevents pyramiding by mistake)
+                                    # - opposite side: allow only if reversal conditions are met
+                                    if _t_side == str(diru).upper().strip():
+                                        _pending_skip(sym, "active_trade_same_side")
+                                        _mid_f_cooldown += 1
+                                        _can_add_pending = False
+                                    else:
+                                        try:
+                                            _adx_min = float(os.getenv("MID_REVERSE_ADX_MIN", "25") or 25.0)
+                                        except Exception:
+                                            _adx_min = 25.0
+                                        try:
+                                            _min_dist_atr = float(os.getenv("MID_REVERSE_MIN_DIST_ATR", "0.7") or 0.7)
+                                        except Exception:
+                                            _min_dist_atr = 0.7
+                                        # structure must be clearly broken versus the active trade side
+                                        try:
+                                            _struct0 = str(struct_hhhl_1h or "—")
+                                        except Exception:
+                                            _struct0 = "—"
+                                        _struct_broken = ((_t_side == "LONG" and _struct0 == "LH-LL") or (_t_side == "SHORT" and _struct0 == "HH-HL"))
+                                        # opposite liquidity sweep must be present (5m)
+                                        try:
+                                            _sweep_ok = ((str(diru).upper() == "SHORT" and bool(sweep_short)) or (str(diru).upper() == "LONG" and bool(sweep_long)))
+                                        except Exception:
+                                            _sweep_ok = False
+                                        # ADX must be high enough (1h)
+                                        try:
+                                            _adx_ok = (adx1h is not None) and (not np.isnan(float(adx1h))) and float(adx1h) >= float(_adx_min)
+                                        except Exception:
+                                            _adx_ok = False
+                                        # distance from active trade entry must be large enough (in ATR)
+                                        try:
+                                            _atr_use = float(_atr0) if (_atr0 is not None and float(_atr0) > 0) else float(entry) * 0.001
+                                        except Exception:
+                                            _atr_use = float(entry) * 0.001
+                                        try:
+                                            _dist_rev_atr = abs(float(entry) - float(_trade.get("entry") or 0.0)) / float(_atr_use) if float(_atr_use) > 0 else 0.0
+                                        except Exception:
+                                            _dist_rev_atr = 0.0
+                                        if _struct_broken and _adx_ok and _sweep_ok and float(_dist_rev_atr) >= float(_min_dist_atr):
+                                            _reverse_allowed = True
+                                            _can_add_pending = True  # bypass cooldown for reversal
+                                            try:
+                                                _rmn = await self.remove_mid_pending_symbol(sym, marketu)
+                                                if int(_rmn or 0) > 0:
+                                                    logger.info("[mid][pending][reverse] removed_old_pending symbol=%s market=%s n=%s", sym, marketu, _rmn)
+                                            except Exception:
+                                                pass
+                                            try:
+                                                if "reverse_allowed" not in risk_flags:
+                                                    risk_flags.append("reverse_allowed")
+                                            except Exception:
+                                                pass
+                                            try:
+                                                rec["reverse_of_trade_id"] = int(_trade.get("id") or 0)
+                                                rec["reverse_of_side"] = str(_t_side)
+                                                rec["reverse_dist_atr"] = float(_dist_rev_atr)
+                                            except Exception:
+                                                pass
+                                        else:
+                                            _pending_skip(sym, "active_trade_block")
+                                            _mid_f_cooldown += 1
+                                            _can_add_pending = False
 
-if _can_add_pending:
-
+                                if _can_add_pending:
                                     key = f"{marketu}:{sym}:{diru}"
 
                                     # Build smarter entry zone from OB/FVG/Channel (optional)
@@ -15684,7 +15739,73 @@ if _can_add_pending:
                                         _rej_add(sym, "no_signal")
                                         continue
 
-                                    # Collect risk flags from scan stage (when MID_FILTERS_AFTER_SETUP=1).
+                                    
+                                    # --- symbol multiplier / scale alignment (1000* contracts guard) ---
+                                    trade_symbol = sym
+                                    candle_symbol = sym
+                                    price_multiplier = 1.0
+                                    try:
+                                        # Best-effort: use exchange-specific trade symbol for futures (e.g., BINANCE 1000SHIBUSDT)
+                                        if str(marketu).upper() == "FUTURES":
+                                            if str(best_name or "").upper().strip() == "BINANCE":
+                                                trade_symbol = self._binance_futures_symbol_alias(sym)
+                                    except Exception:
+                                        trade_symbol = sym
+                                    try:
+                                        import re as _re
+                                        m0 = _re.match(r"^(\d+)([A-Z].+)$", str(trade_symbol or "").upper().strip())
+                                        if m0 and str(trade_symbol or "").upper().strip() != str(sym or "").upper().strip():
+                                            price_multiplier = float(m0.group(1))
+                                    except Exception:
+                                        price_multiplier = 1.0
+
+                                    # If candle-derived zone is in a different scale than the current entry price,
+                                    # try to auto-scale by detected multiplier (prevents "eternal far" pendings).
+                                    try:
+                                        _z_mid = (float(entry_low) + float(entry_high)) / 2.0
+                                        _px = float(entry)
+                                        _ratio = float(_px) / float(_z_mid) if float(_z_mid) > 0 else 0.0
+                                    except Exception:
+                                        _z_mid = 0.0
+                                        _ratio = 0.0
+                                    try:
+                                        _mul_tol = float(os.getenv("MID_MULTIPLIER_MATCH_TOL", "0.08") or 0.08)  # 8% tolerance
+                                    except Exception:
+                                        _mul_tol = 0.08
+                                    try:
+                                        if float(price_multiplier) > 1.0 and float(_z_mid) > 0 and float(_ratio) > 0:
+                                            if abs(float(_ratio) - float(price_multiplier)) / float(price_multiplier) <= float(_mul_tol):
+                                                entry_low = float(entry_low) * float(price_multiplier)
+                                                entry_high = float(entry_high) * float(price_multiplier)
+                                                try:
+                                                    z_src = f"{str(z_src)}|x{int(price_multiplier)}"
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    _z_mid = (float(entry_low) + float(entry_high)) / 2.0
+                                                    _ratio = float(_px) / float(_z_mid) if float(_z_mid) > 0 else float(_ratio)
+                                                except Exception:
+                                                    pass
+                                    except Exception:
+                                        pass
+
+                                    # Scale-mismatch guard: if px/zone_mid is wildly off, don't create pending.
+                                    try:
+                                        _scale_max = float(os.getenv("MID_PENDING_SCALE_MISMATCH_MAX", "50") or 50.0)
+                                    except Exception:
+                                        _scale_max = 50.0
+                                    try:
+                                        if float(_z_mid) > 0 and (float(_ratio) >= float(_scale_max) or float(_ratio) <= (1.0 / float(_scale_max))):
+                                            _pending_skip(sym, "scale_mismatch")
+                                            try:
+                                                _rej_ok(sym, "scale_mismatch")
+                                            except Exception:
+                                                pass
+                                            continue
+                                    except Exception:
+                                        pass
+
+# Collect risk flags from scan stage (when MID_FILTERS_AFTER_SETUP=1).
                                     risk_flags = []
                                     try:
                                         rf = base_r.get("risk_flags")
@@ -15741,8 +15862,35 @@ if _can_add_pending:
                                             _dist0 = float(entry) - float(entry_high)
                                         else:
                                             _dist0 = 0.0
+                                        
                                         _dist0_atr = float(_dist0) / float(_atr0) if float(_atr0) > 0 else 0.0
                                         _dist0_pct = float(_dist0) / float(entry) if float(entry) > 0 else 0.0
+                                        # If volatility is extremely low, ATR-based distance becomes meaningless.
+                                        # In that case, prefer percentage distance and avoid far/near classification by ATR.
+                                        try:
+                                            _min_atr_abs = float(os.getenv("MID_PENDING_MIN_ATR_ABS", "0") or 0.0)
+                                        except Exception:
+                                            _min_atr_abs = 0.0
+                                        try:
+                                            _min_atr_pct = float(os.getenv("MID_PENDING_MIN_ATR_PCT", os.getenv("MID_MIN_ATR_PCT", "0")) or 0.0)
+                                        except Exception:
+                                            _min_atr_pct = 0.0
+                                        try:
+                                            _atr_pct_now = (float(_atr0) / float(entry) * 100.0) if float(entry) > 0 else 0.0
+                                        except Exception:
+                                            _atr_pct_now = 0.0
+                                        try:
+                                            if (float(_min_atr_abs) > 0 and float(_atr0) < float(_min_atr_abs)) or (float(_min_atr_pct) > 0 and float(_atr_pct_now) < float(_min_atr_pct)):
+                                                _dist0_atr = None
+                                                _zone_w_atr = None
+                                                try:
+                                                    if "vol_low" not in risk_flags:
+                                                        risk_flags.append("vol_low")
+                                                except Exception:
+                                                    pass
+                                        except Exception:
+                                            pass
+
                                     except Exception:
                                         _atr0 = float(entry) * 0.001
                                         _zone_w_atr = 0.0
@@ -15754,9 +15902,16 @@ if _can_add_pending:
                                     # but mark and tighten TTL/limits.
                                     is_far_zone = (str(z_src or "").strip().lower() == "far")
                                     try:
+                                        
                                         _far_thr = float(os.getenv("MID_PENDING_FAR_DIST_ATR", os.getenv("MID_PENDING_FAR_ATR", "1.5")) or 1.5)
-                                        if float(_dist0_atr) >= float(_far_thr):
-                                            is_far_zone = True
+                                        _far_thr_pct = float(os.getenv("MID_PENDING_FAR_DIST_PCT", "0.03") or 0.03)
+                                        if _dist0_atr is None:
+                                            if float(_dist0_pct) >= float(_far_thr_pct):
+                                                is_far_zone = True
+                                        else:
+                                            if float(_dist0_atr) >= float(_far_thr):
+                                                is_far_zone = True
+
                                     except Exception:
                                         pass
                                     if is_far_zone:
@@ -15778,6 +15933,9 @@ if _can_add_pending:
                                         "key": key,
                                         "market": marketu,
                                         "symbol": sym,
+                                        "trade_symbol": trade_symbol if ("trade_symbol" in locals() and trade_symbol) else sym,
+                                        "candle_symbol": candle_symbol if ("candle_symbol" in locals() and candle_symbol) else sym,
+                                        "price_multiplier": float(price_multiplier) if ("price_multiplier" in locals() and price_multiplier) else 1.0,
                                         "direction": diru,
                                         "timeframe": f"{tf_trigger}/{tf_mid}/{tf_trend}",
                                         "entry": float(entry),
@@ -15785,9 +15943,9 @@ if _can_add_pending:
                                         "entry_high": entry_high,
                                         "entry_zone_src": str(z_src),
                                         "atr_at_create": float(_atr0) if ("_atr0" in locals() and _atr0) else float(entry) * 0.001,
-                                        "zone_width_atr": float(_zone_w_atr) if ("_zone_w_atr" in locals()) else 0.0,
+                                        "zone_width_atr": (float(_zone_w_atr) if (_zone_w_atr is not None) else None) if ("_zone_w_atr" in locals()) else None,
                                         "zone_width_pct": float(_zone_w_pct) if ("_zone_w_pct" in locals()) else 0.0,
-                                        "dist_to_zone_at_create_atr": float(_dist0_atr) if ("_dist0_atr" in locals()) else 0.0,
+                                        "dist_to_zone_at_create_atr": (float(_dist0_atr) if (_dist0_atr is not None) else None) if ("_dist0_atr" in locals()) else None,
                                         "dist_to_zone_at_create_pct": float(_dist0_pct) if ("_dist0_pct" in locals()) else 0.0,
                                         "sl": float(sl),
                                         "tp1": float(tp1),
@@ -15830,6 +15988,11 @@ if _can_add_pending:
                                             _pending_skip(sym, "cooldown")
                                     except Exception:
                                         _pending_skip(sym, "cooldown")
+                                    # IMPORTANT: mark as accounted so reject digest doesn't mislabel as "untracked"
+                                    try:
+                                        _rej_ok(sym, "cooldown")
+                                    except Exception:
+                                        pass
                                     logger.debug(f"[mid][pending] cooldown skip sym={sym} dir={direction} market={market}")
                             except Exception as e:
                                 logger.exception("[mid][pending][scan] failed to create pending sym=%s dir=%s market=%s: %s", sym, direction, market, e)
