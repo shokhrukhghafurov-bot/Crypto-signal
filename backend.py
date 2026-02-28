@@ -12121,22 +12121,80 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
                             risk_note = (risk_note + "\n" if risk_note else "") + "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
 
                         risk_notes = [risk_note] if risk_note else []
-                        async def _pair_exists(ex: str) -> bool:
+                                                # Exchanges where the symbol exists (used for display and routing).
+                        # FUTURES: tries exchange-specific trade symbols (e.g., 1000-token contracts) before declaring "no contract".
+                        async def _pair_exists_detail(ex: str) -> dict:
+                            exu = (ex or "").upper().strip()
+                            had_error = False
+                        
+                            def _mult_candidates(base: str):
+                                out = []
+                                raw = os.getenv("MID_MULTIPLIER_AUTO_LIST", "10,100,1000,10000") or ""
+                                for part in raw.split(","):
+                                    part = part.strip()
+                                    if not part.isdigit():
+                                        continue
+                                    m = int(part)
+                                    if m <= 1:
+                                        continue
+                                    out.append(str(m) + base)
+                                return out
+                        
                             try:
-                                exu = (ex or "").upper().strip()
-
                                 # FUTURES confirmations must be executable futures markets only
                                 if market == "FUTURES":
+                                    base = sym
+                                    # Prefer already computed trade symbol if present (e.g., 1000SHIBUSDT)
+                                    preferred = (sym_trade or base)
+                        
                                     if exu == "BINANCE":
-                                        p = await self._fetch_rest_price("FUTURES", sym)
+                                        alias = None
+                                        try:
+                                            alias = self._binance_futures_symbol_alias(base)
+                                        except Exception:
+                                            alias = None
+                                        primary = (sym_trade or alias or base)
+                                        cands = [primary]
+                                        if preferred not in cands:
+                                            cands.append(preferred)
+                                        if base not in cands:
+                                            cands.append(base)
+                                        for cand in _mult_candidates(base):
+                                            if cand not in cands:
+                                                cands.append(cand)
+                                        async def _fetch(s: str):
+                                            return await self._fetch_rest_price("FUTURES", s)
                                     elif exu == "BYBIT":
-                                        p = await self._fetch_bybit_price("FUTURES", sym)
+                                        cands = [preferred]
+                                        if base not in cands:
+                                            cands.append(base)
+                                        for cand in _mult_candidates(base):
+                                            if cand not in cands:
+                                                cands.append(cand)
+                                        async def _fetch(s: str):
+                                            return await self._fetch_bybit_price("FUTURES", s)
                                     elif exu == "OKX":
-                                        p = await self._fetch_okx_price("FUTURES", sym)
+                                        cands = [preferred]
+                                        if base not in cands:
+                                            cands.append(base)
+                                        for cand in _mult_candidates(base):
+                                            if cand not in cands:
+                                                cands.append(cand)
+                                        async def _fetch(s: str):
+                                            return await self._fetch_okx_price("FUTURES", s)
                                     else:
-                                        return False
-                                    return bool(p and float(p) > 0)
-
+                                        return {"ok": False, "had_error": False, "symbol": None}
+                        
+                                    for cand in cands:
+                                        try:
+                                            p = await _fetch(cand)
+                                            if p and float(p) > 0:
+                                                return {"ok": True, "had_error": had_error, "symbol": cand}
+                                        except Exception:
+                                            had_error = True
+                                            continue
+                                    return {"ok": False, "had_error": had_error, "symbol": None}
+                        
                                 # SPOT confirmations (supports all 5 exchanges)
                                 if exu == "BINANCE":
                                     p = await self._fetch_rest_price("SPOT", sym)
@@ -12148,9 +12206,12 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
                                     p = await _mexc_public_price(sym)
                                 else:  # GATEIO
                                     p = await _gateio_public_price(sym)
-                                return bool(p and float(p) > 0)
+                                return {"ok": bool(p and float(p) > 0), "had_error": False, "symbol": sym}
                             except Exception:
-                                return False
+                                return {"ok": False, "had_error": True, "symbol": None}
+                        
+                        async def _pair_exists(ex: str) -> bool:
+                            return bool((await _pair_exists_detail(ex)).get("ok"))
 
                         
                         # --- FUTURES contract existence check (policy-controlled) ---
@@ -12169,15 +12230,24 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
                                 _mode = "PERMISSIVE"
                             if _mode != "OFF":
                                 try:
-                                    _fut_ok = await asyncio.gather(_pair_exists("BINANCE"), _pair_exists("BYBIT"), _pair_exists("OKX"))
-                                    if not any(bool(x) for x in _fut_ok):
-                                        if _mode == "STRICT":
+                                    _fut_details = await asyncio.gather(_pair_exists_detail("BINANCE"), _pair_exists_detail("BYBIT"), _pair_exists_detail("OKX"))
+
+                                    _any_ok = any(bool(d.get("ok")) for d in _fut_details)
+
+                                    _any_err = any(bool(d.get("had_error")) for d in _fut_details)
+
+                                    if not _any_ok:
+                                        # If REST was unavailable/blocked, do not treat it as "no contract" (avoid false negatives).
+                                        if _any_err:
+                                            risk_notes.append("⚠️ Futures contract check unavailable (REST error/blocked).")
+                                            logger.info("[scanner] warn %s FUTURES: contract check unavailable (allowing) best_source=%s", sym, best_name)
+                                        elif _mode == "STRICT":
                                             logger.info("[scanner] skip %s FUTURES: no contract on BINANCE/BYBIT/OKX (best_source=%s)", sym, best_name)
                                             _rej_add(sym, "no_futures_contract")
                                             continue
                                         else:
                                             # PERMISSIVE: do not block the signal, but clearly mark it.
-                                            risk_notes.append("⚠️ Futures contract check failed (REST blocked/unknown).")
+                                            risk_notes.append("⚠️ Futures contract check failed (no contract found).")
                                             logger.info("[scanner] warn %s FUTURES: contract check failed (allowing, mode=PERMISSIVE) best_source=%s", sym, best_name)
                                 except Exception as _e:
                                     if _mode == "STRICT":
@@ -16024,33 +16094,97 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         risk_notes = [risk_note] if risk_note else []
 
                         # Exchanges where the symbol exists (used for display and SPOT autotrade routing).
-                        async def _pair_exists(ex: str) -> bool:
+                                                # Exchanges where the symbol exists (used for display and routing).
+                        # FUTURES: tries exchange-specific trade symbols (e.g., 1000-token contracts) before declaring "no contract".
+                        async def _pair_exists_detail(ex: str) -> dict:
+                            exu = (ex or "").upper().strip()
+                            had_error = False
+                        
+                            def _mult_candidates(base: str):
+                                out = []
+                                raw = os.getenv("MID_MULTIPLIER_AUTO_LIST", "10,100,1000,10000") or ""
+                                for part in raw.split(","):
+                                    part = part.strip()
+                                    if not part.isdigit():
+                                        continue
+                                    m = int(part)
+                                    if m <= 1:
+                                        continue
+                                    out.append(str(m) + base)
+                                return out
+                        
                             try:
-                                exu = (ex or '').upper().strip()
-                                if market == 'FUTURES':
-                                    if exu == 'BINANCE':
-                                        p = await self._fetch_rest_price('FUTURES', sym)
-                                    elif exu == 'BYBIT':
-                                        p = await self._fetch_bybit_price('FUTURES', sym)
-                                    elif exu == 'OKX':
-                                        p = await self._fetch_okx_price('FUTURES', sym)
+                                # FUTURES confirmations must be executable futures markets only
+                                if market == "FUTURES":
+                                    base = sym
+                                    # Prefer already computed trade symbol if present (e.g., 1000SHIBUSDT)
+                                    preferred = (sym_trade or base)
+                        
+                                    if exu == "BINANCE":
+                                        alias = None
+                                        try:
+                                            alias = self._binance_futures_symbol_alias(base)
+                                        except Exception:
+                                            alias = None
+                                        primary = (sym_trade or alias or base)
+                                        cands = [primary]
+                                        if preferred not in cands:
+                                            cands.append(preferred)
+                                        if base not in cands:
+                                            cands.append(base)
+                                        for cand in _mult_candidates(base):
+                                            if cand not in cands:
+                                                cands.append(cand)
+                                        async def _fetch(s: str):
+                                            return await self._fetch_rest_price("FUTURES", s)
+                                    elif exu == "BYBIT":
+                                        cands = [preferred]
+                                        if base not in cands:
+                                            cands.append(base)
+                                        for cand in _mult_candidates(base):
+                                            if cand not in cands:
+                                                cands.append(cand)
+                                        async def _fetch(s: str):
+                                            return await self._fetch_bybit_price("FUTURES", s)
+                                    elif exu == "OKX":
+                                        cands = [preferred]
+                                        if base not in cands:
+                                            cands.append(base)
+                                        for cand in _mult_candidates(base):
+                                            if cand not in cands:
+                                                cands.append(cand)
+                                        async def _fetch(s: str):
+                                            return await self._fetch_okx_price("FUTURES", s)
                                     else:
-                                        return False
-                                    return bool(p and float(p) > 0)
-                                # SPOT
-                                if exu == 'BINANCE':
-                                    p = await self._fetch_rest_price('SPOT', sym)
-                                elif exu == 'BYBIT':
-                                    p = await self._fetch_bybit_price('SPOT', sym)
-                                elif exu == 'OKX':
-                                    p = await self._fetch_okx_price('SPOT', sym)
-                                elif exu == 'MEXC':
+                                        return {"ok": False, "had_error": False, "symbol": None}
+                        
+                                    for cand in cands:
+                                        try:
+                                            p = await _fetch(cand)
+                                            if p and float(p) > 0:
+                                                return {"ok": True, "had_error": had_error, "symbol": cand}
+                                        except Exception:
+                                            had_error = True
+                                            continue
+                                    return {"ok": False, "had_error": had_error, "symbol": None}
+                        
+                                # SPOT confirmations (supports all 5 exchanges)
+                                if exu == "BINANCE":
+                                    p = await self._fetch_rest_price("SPOT", sym)
+                                elif exu == "BYBIT":
+                                    p = await self._fetch_bybit_price("SPOT", sym)
+                                elif exu == "OKX":
+                                    p = await self._fetch_okx_price("SPOT", sym)
+                                elif exu == "MEXC":
                                     p = await _mexc_public_price(sym)
                                 else:  # GATEIO
                                     p = await _gateio_public_price(sym)
-                                return bool(p and float(p) > 0)
+                                return {"ok": bool(p and float(p) > 0), "had_error": False, "symbol": sym}
                             except Exception:
-                                return False
+                                return {"ok": False, "had_error": True, "symbol": None}
+                        
+                        async def _pair_exists(ex: str) -> bool:
+                            return bool((await _pair_exists_detail(ex)).get("ok"))
 
                     
                         # --- FUTURES contract existence check (policy-controlled) ---
@@ -16064,14 +16198,24 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 _mode = "PERMISSIVE"
                             if _mode != "OFF":
                                 try:
-                                    _fut_ok = await asyncio.gather(_pair_exists("BINANCE"), _pair_exists("BYBIT"), _pair_exists("OKX"))
-                                    if not any(bool(x) for x in _fut_ok):
-                                        if _mode == "STRICT":
+                                    _fut_details = await asyncio.gather(_pair_exists_detail("BINANCE"), _pair_exists_detail("BYBIT"), _pair_exists_detail("OKX"))
+
+                                    _any_ok = any(bool(d.get("ok")) for d in _fut_details)
+
+                                    _any_err = any(bool(d.get("had_error")) for d in _fut_details)
+
+                                    if not _any_ok:
+                                        # If REST was unavailable/blocked, do not treat it as "no contract" (avoid false negatives).
+                                        if _any_err:
+                                            risk_notes.append("⚠️ Futures contract check unavailable (REST error/blocked).")
+                                            logger.info("[scanner] warn %s FUTURES: contract check unavailable (allowing) best_source=%s", sym, best_name)
+                                        elif _mode == "STRICT":
                                             logger.info("[scanner] skip %s FUTURES: no contract on BINANCE/BYBIT/OKX (best_source=%s)", sym, best_name)
                                             _rej_add(sym, "no_futures_contract")
                                             continue
                                         else:
-                                            risk_notes.append("⚠️ Futures contract check failed (REST blocked/unknown).")
+                                            # PERMISSIVE: do not block the signal, but clearly mark it.
+                                            risk_notes.append("⚠️ Futures contract check failed (no contract found).")
                                             logger.info("[scanner] warn %s FUTURES: contract check failed (allowing, mode=PERMISSIVE) best_source=%s", sym, best_name)
                                 except Exception as _e:
                                     if _mode == "STRICT":
