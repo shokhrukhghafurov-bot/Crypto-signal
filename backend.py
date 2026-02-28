@@ -12741,6 +12741,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         try:
             items = await self._mid_pending_load()
             now = time.time()
+            # Emergency / diagnostic switch: emit immediately when price enters the zone,
+            # skipping ALL re-checks (TA reconfirm, blocks, trap, post-setup filters).
+            # Use only for debugging the pipeline end-to-end.
+            pending_instant_emit = os.getenv("MID_PENDING_INSTANT_EMIT", "0").strip().lower() in ("1","true","yes","on")
             keep: list[dict] = []
             any_wait = False
             # --- per-poll diagnostics counters ---
@@ -13073,6 +13077,64 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             continue
                     except Exception:
                         pass
+
+                    # If enabled, emit immediately as soon as price reaches the entry zone.
+                    # NOTE: this bypasses *all* safety checks. Intended for temporary debugging only.
+                    if pending_instant_emit:
+                        try:
+                            _pending_mark_attempt(it, now)
+                        except Exception:
+                            pass
+                        try:
+                            entry_emit = float(it.get("entry") or entry0)
+                            sl_emit = float(it.get("sl") or 0.0)
+                            tp1_emit = float(it.get("tp1") or 0.0)
+                            tp2_emit = float(it.get("tp2") or 0.0)
+                            rr_emit = float(it.get("rr") or 0.0)
+                            conf_emit = int(float(it.get("confidence") or it.get("min_confidence") or 0))
+                            conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "") or str(src_ex)
+
+                            sig = Signal(
+                                signal_id=self.next_signal_id(),
+                                market=market,
+                                symbol=sym,
+                                direction=direction,
+                                timeframe=str(it.get("timeframe") or "5m/30m/1h"),
+                                entry=entry_emit,
+                                sl=sl_emit,
+                                tp1=tp1_emit,
+                                tp2=tp2_emit,
+                                rr=rr_emit,
+                                confidence=conf_emit,
+                                confirmations=conf_names,
+                                source_exchange=src_ex,
+                                available_exchanges=conf_names,
+                                risk_note=str(it.get("risk_note") or "INSTANT_EMIT (filters bypassed)"),
+                                ts=time.time(),
+                            )
+
+                            self.mark_emitted_mid(sym, sig.direction, sig.market)
+                            self.last_signal = sig
+                            if sig.market == "SPOT":
+                                self.last_spot_signal = sig
+                            else:
+                                self.last_futures_signal = sig
+
+                            await emit_signal_cb(sig)
+                            logger.info("[mid][pending] INSTANT_EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, float(entry_emit), float(price), tol)
+                            try:
+                                _mid_metrics_inc("pending_triggered", 1)
+                            except Exception:
+                                pass
+                            try:
+                                _mid_stage_add("triggered", 1)
+                            except Exception:
+                                pass
+                            # emitted: do not keep
+                            continue
+                        except Exception:
+                            # If instant emit fails for any reason, fall back to normal path.
+                            pass
 
                     # Smart delete (terminal invalidation): if higher-timeframe structure
                     # is clearly opposite to the pending direction, drop immediately.
