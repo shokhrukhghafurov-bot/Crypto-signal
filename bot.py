@@ -6155,8 +6155,25 @@ async def main() -> None:
             else:
                 logger.warning("Backend has no track_loop; skipping")
 
-            logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv("SCAN_INTERVAL_SECONDS",""), os.getenv("TOP_N",""))
-            asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+
+            logger.info(
+                "Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s",
+                os.getenv("SCAN_INTERVAL_SECONDS", ""),
+                os.getenv("TOP_N", ""),
+            )
+            # Some deployments are MID-only and intentionally do not include the legacy scanner_loop.
+            # Never crash the whole bot because of that.
+            if hasattr(backend, "scanner_loop") and callable(getattr(backend, "scanner_loop")):
+                TASKS["scanner"] = asyncio.create_task(
+                    backend.scanner_loop(broadcast_signal, broadcast_macro_alert),
+                    name="scanner",
+                )
+                _attach_task_monitor("scanner", TASKS["scanner"])
+                _health_mark_ok("scanner")
+            else:
+                logger.warning(
+                    "Backend has no scanner_loop; skipping legacy scanner (MID scanner will still run if enabled)"
+                )
 
             # MID components (scanner + pending loop)
             _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
@@ -6201,8 +6218,20 @@ async def main() -> None:
         asyncio.create_task(backend.track_loop(bot))
     else:
         logger.warning("Backend has no track_loop; skipping")
-    logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
-    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+
+    logger.info(
+        "Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s",
+        os.getenv("SCAN_INTERVAL_SECONDS", ""),
+        os.getenv("TOP_N", ""),
+    )
+    # Some deployments are MID-only and intentionally do not include the legacy scanner_loop.
+    # Never crash the whole bot because of that.
+    if hasattr(backend, "scanner_loop") and callable(getattr(backend, "scanner_loop")):
+        asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+    else:
+        logger.warning(
+            "Backend has no scanner_loop; skipping legacy scanner (MID scanner will still run if enabled)"
+        )
 
     # ⚡ MID TREND scanner + MID trap digest
     _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
