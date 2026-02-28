@@ -12225,10 +12225,38 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
         if atr is None or not math.isfinite(atr) or atr <= 0:
             atr = float(entry) * 0.001  # small fallback
 
-        # Config: width caps
-        max_w_atr = float(os.getenv("MID_PENDING_ZONE_MAX_ATR", "0.60") or 0.60)
-        min_w_atr = float(os.getenv("MID_PENDING_ZONE_MIN_ATR", "0.06") or 0.06)
-        pad_atr = float(os.getenv("MID_PENDING_ZONE_PAD_ATR", "0.05") or 0.05)
+        # Config: zone mode + caps
+        zone_mode = (os.getenv("MID_ZONE_MODE", "STRICT") or "STRICT").strip().upper()
+        if zone_mode not in ("STRICT", "ACTIVE"):
+            zone_mode = "STRICT"
+
+        # Backward-compatible defaults (old envs)
+        _max_w_atr_default = float(os.getenv("MID_PENDING_ZONE_MAX_ATR", "0.60") or 0.60)
+        _min_w_atr_default = float(os.getenv("MID_PENDING_ZONE_MIN_ATR", "0.06") or 0.06)
+        _pad_atr_default = float(os.getenv("MID_PENDING_ZONE_PAD_ATR", "0.05") or 0.05)
+
+        # New per-mode overrides (if set)
+        if zone_mode == "ACTIVE":
+            max_w_atr = float(os.getenv("MID_ZONE_MAX_WIDTH_ATR_ACTIVE", str(_max_w_atr_default)) or _max_w_atr_default)
+            min_w_atr = float(os.getenv("MID_ZONE_MIN_WIDTH_ATR_ACTIVE", str(_min_w_atr_default)) or _min_w_atr_default)
+            pad_atr = float(os.getenv("MID_ZONE_PAD_ATR_ACTIVE", str(_pad_atr_default)) or _pad_atr_default)
+            max_dist_atr = float(os.getenv("MID_ZONE_MAX_DIST_ATR_ACTIVE", "2.20") or 2.20)
+            fallback_half_atr = float(os.getenv("MID_ZONE_FALLBACK_HALF_ATR_ACTIVE", "0.35") or 0.35)
+        else:
+            max_w_atr = float(os.getenv("MID_ZONE_MAX_WIDTH_ATR_STRICT", str(_max_w_atr_default)) or _max_w_atr_default)
+            min_w_atr = float(os.getenv("MID_ZONE_MIN_WIDTH_ATR_STRICT", str(_min_w_atr_default)) or _min_w_atr_default)
+            pad_atr = float(os.getenv("MID_ZONE_PAD_ATR_STRICT", str(_pad_atr_default)) or _pad_atr_default)
+            max_dist_atr = float(os.getenv("MID_ZONE_MAX_DIST_ATR_STRICT", "0.90") or 0.90)
+            fallback_half_atr = float(os.getenv("MID_ZONE_FALLBACK_HALF_ATR_STRICT", "0.18") or 0.18)
+
+        fallback_enabled = str(os.getenv("MID_ZONE_FALLBACK_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+        # In STRICT, fallback is off by default unless explicitly enabled for strict too
+        if zone_mode == "STRICT":
+            strict_fb = str(os.getenv("MID_ZONE_FALLBACK_IN_STRICT", "0") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
+            fallback_enabled = fallback_enabled and strict_fb
+
+        fallback_max_pct = float(os.getenv("MID_ZONE_FALLBACK_MAX_PCT", "0.006") or 0.006)
+
 
         max_w = max_w_atr * atr
         min_w = min_w_atr * atr
@@ -12288,16 +12316,32 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
         hi += pad
 
         width = hi - lo
-        if width > max_w:
-            return (None, "too_wide")
+if width > max_w:
+    if fallback_enabled:
+        half = max(0.0, fallback_half_atr * atr)
+        half = min(half, float(entry) * fallback_max_pct)
+        if half > 0:
+            return ((float(entry) - half, float(entry) + half), "fallback")
+    return (None, "too_wide")
+
         if width < min_w:
             mid = (lo + hi) / 2.0
             lo = mid - min_w / 2.0
             hi = mid + min_w / 2.0
 
         # Ensure entry is not far away from zone (avoid random far zone)
-        if abs(((lo + hi) / 2.0) - float(entry)) > max(2.5 * atr, float(entry) * 0.01):
-            return (None, "far")
+dist_mid = abs(((lo + hi) / 2.0) - float(entry))
+max_dist = max(max_dist_atr * atr, float(entry) * 0.01)
+if dist_mid > max_dist:
+    if fallback_enabled:
+        # fallback: narrow zone around entry (or current price proxy) using ATR
+        half = max(0.0, fallback_half_atr * atr)
+        # also cap by pct of price
+        half = min(half, float(entry) * fallback_max_pct)
+        if half > 0:
+            return ((float(entry) - half, float(entry) + half), "fallback")
+    return (None, "far")
+
 
         return ((lo, hi), src)
     except Exception:
