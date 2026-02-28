@@ -12699,8 +12699,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
     tol_atr = float(os.getenv("MID_PENDING_ENTRY_TOL_ATR", "0.15") or 0.15)
     tol_pct = float(os.getenv("MID_PENDING_ENTRY_TOL_PCT", "0.0018") or 0.0018)
 
-    logger.info("[mid][pending] trigger loop started poll=%.2fs ttl=%.1fmin tol_atr=%.3f tol_pct=%.4f",
-                poll, ttl_min, tol_atr, tol_pct)
+    pending_instant_emit0 = os.getenv("MID_PENDING_INSTANT_EMIT", "0").strip().lower() in ("1","true","yes","on")
+    _igz_default0 = "1" if pending_instant_emit0 else "0"
+    instant_ignore_zone0 = os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", _igz_default0).strip().lower() in ("1","true","yes","on")
+    logger.info("[mid][pending] trigger loop started poll=%.2fs ttl=%.1fmin tol_atr=%.3f tol_pct=%.4f instant_emit=%s ignore_zone=%s",
+                poll, ttl_min, tol_atr, tol_pct, int(pending_instant_emit0), int(instant_ignore_zone0))
 
     # Pending persistence is already in Postgres (kv_store key 'mid_pending').
     # Here we track trigger attempts/fails and prune noisy pendings automatically.
@@ -12812,7 +12815,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             # skipping ALL re-checks (TA reconfirm, blocks, trap, post-setup filters).
             # Use only for debugging the pipeline end-to-end.
             pending_instant_emit = os.getenv("MID_PENDING_INSTANT_EMIT", "0").strip().lower() in ("1","true","yes","on")
-            instant_ignore_zone = os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0").strip().lower() in ("1","true","yes","on")
+            # If MID_PENDING_INSTANT_EMIT is enabled, default to ignoring the entry-zone wait unless explicitly disabled.
+            _igz_default = "1" if pending_instant_emit else "0"
+            instant_ignore_zone = os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", _igz_default).strip().lower() in ("1","true","yes","on")
             keep: list[dict] = []
             any_wait = False
             # --- per-poll diagnostics counters ---
