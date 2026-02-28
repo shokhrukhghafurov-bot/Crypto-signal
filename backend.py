@@ -12335,46 +12335,74 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
         return (None, "error")
 
 async def _mid_pending_load(self) -> list[dict]:
+    """Load MID pending list.
+
+    Primary storage is Postgres kv_store (key='mid_pending'). If the KV store is
+    unavailable (missing table / DB outage), fall back to in-memory storage so
+    pending + trigger can still work inside a single running process.
+    """
+    if not hasattr(self, "_mid_pending_mem"):
+        self._mid_pending_mem = []
+    if getattr(self, "_mid_pending_db_disabled", False):
+        return list(self._mid_pending_mem)
     try:
         st = await db_store.kv_get_json("mid_pending") or {}
         items = st.get("items", [])
         return items if isinstance(items, list) else []
-    except Exception:
-        return []
+    except Exception as e:
+        if not getattr(self, "_mid_pending_db_disabled", False):
+            try:
+                logger.warning("[mid][pending] kv_store unavailable; switching to in-memory pending (err=%s)", str(e)[:200])
+            except Exception:
+                pass
+        self._mid_pending_db_disabled = True
+        return list(self._mid_pending_mem)
 
 async def _mid_pending_save(self, items: list[dict]) -> None:
+    if not hasattr(self, "_mid_pending_mem"):
+        self._mid_pending_mem = []
+    # Always keep a working in-memory copy
+    try:
+        self._mid_pending_mem = list(items)
+    except Exception:
+        self._mid_pending_mem = []
+
+    if getattr(self, "_mid_pending_db_disabled", False):
+        return
     try:
         await db_store.kv_set_json("mid_pending", {"items": items})
-    except Exception:
-        pass
+    except Exception as e:
+        if not getattr(self, "_mid_pending_db_disabled", False):
+            try:
+                logger.warning("[mid][pending] kv_store write failed; switching to in-memory pending (err=%s)", str(e)[:200])
+            except Exception:
+                pass
+        self._mid_pending_db_disabled = True
 
 async def add_mid_pending(self, rec: dict) -> None:
     """Upsert pending record by key."""
-    try:
-        items = await self._mid_pending_load()
-        key = str(rec.get("key") or "").strip()
-        if not key:
-            return
-        out = []
-        replaced = False
-        for it in items:
-            try:
-                if str(it.get("key") or "") == key:
-                    out.append(rec)
-                    replaced = True
-                else:
-                    out.append(it)
-            except Exception:
-                continue
-        if not replaced:
-            out.append(rec)
-        # trim
-        max_items = int(os.getenv("MID_PENDING_MAX", "120") or 120)
-        if max_items > 0 and len(out) > max_items:
-            out = out[-max_items:]
-        await self._mid_pending_save(out)
-    except Exception:
-        pass
+    items = await self._mid_pending_load()
+    key = str(rec.get("key") or "").strip()
+    if not key:
+        return
+    out = []
+    replaced = False
+    for it in items:
+        try:
+            if str(it.get("key") or "") == key:
+                out.append(rec)
+                replaced = True
+            else:
+                out.append(it)
+        except Exception:
+            continue
+    if not replaced:
+        out.append(rec)
+    # trim
+    max_items = int(os.getenv("MID_PENDING_MAX", "120") or 120)
+    if max_items > 0 and len(out) > max_items:
+        out = out[-max_items:]
+    await self._mid_pending_save(out)
 
 async def remove_mid_pending(self, key: str) -> None:
     try:
