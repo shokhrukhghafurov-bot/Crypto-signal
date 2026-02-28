@@ -12143,57 +12143,12 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
                             try:
                                 # FUTURES confirmations must be executable futures markets only
                                 if market == "FUTURES":
-                                    base = sym
-                                    # Prefer already computed trade symbol if present (e.g., 1000SHIBUSDT)
-                                    preferred = (sym_trade or base)
-                        
-                                    if exu == "BINANCE":
-                                        alias = None
-                                        try:
-                                            alias = self._binance_futures_symbol_alias(base)
-                                        except Exception:
-                                            alias = None
-                                        primary = (sym_trade or alias or base)
-                                        cands = [primary]
-                                        if preferred not in cands:
-                                            cands.append(preferred)
-                                        if base not in cands:
-                                            cands.append(base)
-                                        for cand in _mult_candidates(base):
-                                            if cand not in cands:
-                                                cands.append(cand)
-                                        async def _fetch(s: str):
-                                            return await self._fetch_rest_price("FUTURES", s)
-                                    elif exu == "BYBIT":
-                                        cands = [preferred]
-                                        if base not in cands:
-                                            cands.append(base)
-                                        for cand in _mult_candidates(base):
-                                            if cand not in cands:
-                                                cands.append(cand)
-                                        async def _fetch(s: str):
-                                            return await self._fetch_bybit_price("FUTURES", s)
-                                    elif exu == "OKX":
-                                        cands = [preferred]
-                                        if base not in cands:
-                                            cands.append(base)
-                                        for cand in _mult_candidates(base):
-                                            if cand not in cands:
-                                                cands.append(cand)
-                                        async def _fetch(s: str):
-                                            return await self._fetch_okx_price("FUTURES", s)
-                                    else:
-                                        return {"ok": False, "had_error": False, "symbol": None}
-                        
-                                    for cand in cands:
-                                        try:
-                                            p = await _fetch(cand)
-                                            if p and float(p) > 0:
-                                                return {"ok": True, "had_error": had_error, "symbol": cand}
-                                        except Exception:
-                                            had_error = True
-                                            continue
-                                    return {"ok": False, "had_error": had_error, "symbol": None}
+                                    try:
+                                        d = await futures_contract_exists(self, exu, sym)
+                                        return d
+                                    except Exception:
+                                        return {\"ok\": False, \"had_error\": True, \"symbol\": None}
+
                         
                                 # SPOT confirmations (supports all 5 exchanges)
                                 if exu == "BINANCE":
@@ -12229,8 +12184,13 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
                             if _mode not in ("OFF", "PERMISSIVE", "STRICT"):
                                 _mode = "PERMISSIVE"
                             if _mode != "OFF":
-                                try:
-                                    _fut_details = await asyncio.gather(_pair_exists_detail("BINANCE"), _pair_exists_detail("BYBIT"), _pair_exists_detail("OKX"))
+                                try:                                    _scope = (os.getenv("MID_FUTURES_CONTRACT_CHECK_SCOPE", "BEST") or "BEST").upper().strip()
+                                    if _scope not in ("BEST", "ALL"):
+                                        _scope = "BEST"
+                                    if _scope == "BEST":
+                                        _fut_details = [await _pair_exists_detail(best_name)]
+                                    else:
+                                        _fut_details = await asyncio.gather(_pair_exists_detail("BINANCE"), _pair_exists_detail("BYBIT"), _pair_exists_detail("OKX"))
 
                                     _any_ok = any(bool(d.get("ok")) for d in _fut_details)
 
@@ -16116,57 +16076,12 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             try:
                                 # FUTURES confirmations must be executable futures markets only
                                 if market == "FUTURES":
-                                    base = sym
-                                    # Prefer already computed trade symbol if present (e.g., 1000SHIBUSDT)
-                                    preferred = (sym_trade or base)
-                        
-                                    if exu == "BINANCE":
-                                        alias = None
-                                        try:
-                                            alias = self._binance_futures_symbol_alias(base)
-                                        except Exception:
-                                            alias = None
-                                        primary = (sym_trade or alias or base)
-                                        cands = [primary]
-                                        if preferred not in cands:
-                                            cands.append(preferred)
-                                        if base not in cands:
-                                            cands.append(base)
-                                        for cand in _mult_candidates(base):
-                                            if cand not in cands:
-                                                cands.append(cand)
-                                        async def _fetch(s: str):
-                                            return await self._fetch_rest_price("FUTURES", s)
-                                    elif exu == "BYBIT":
-                                        cands = [preferred]
-                                        if base not in cands:
-                                            cands.append(base)
-                                        for cand in _mult_candidates(base):
-                                            if cand not in cands:
-                                                cands.append(cand)
-                                        async def _fetch(s: str):
-                                            return await self._fetch_bybit_price("FUTURES", s)
-                                    elif exu == "OKX":
-                                        cands = [preferred]
-                                        if base not in cands:
-                                            cands.append(base)
-                                        for cand in _mult_candidates(base):
-                                            if cand not in cands:
-                                                cands.append(cand)
-                                        async def _fetch(s: str):
-                                            return await self._fetch_okx_price("FUTURES", s)
-                                    else:
-                                        return {"ok": False, "had_error": False, "symbol": None}
-                        
-                                    for cand in cands:
-                                        try:
-                                            p = await _fetch(cand)
-                                            if p and float(p) > 0:
-                                                return {"ok": True, "had_error": had_error, "symbol": cand}
-                                        except Exception:
-                                            had_error = True
-                                            continue
-                                    return {"ok": False, "had_error": had_error, "symbol": None}
+                                    try:
+                                        d = await futures_contract_exists(self, exu, sym)
+                                        return d
+                                    except Exception:
+                                        return {\"ok\": False, \"had_error\": True, \"symbol\": None}
+
                         
                                 # SPOT confirmations (supports all 5 exchanges)
                                 if exu == "BINANCE":
@@ -16197,8 +16112,13 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             if _mode not in ("OFF", "PERMISSIVE", "STRICT"):
                                 _mode = "PERMISSIVE"
                             if _mode != "OFF":
-                                try:
-                                    _fut_details = await asyncio.gather(_pair_exists_detail("BINANCE"), _pair_exists_detail("BYBIT"), _pair_exists_detail("OKX"))
+                                try:                                    _scope = (os.getenv("MID_FUTURES_CONTRACT_CHECK_SCOPE", "BEST") or "BEST").upper().strip()
+                                    if _scope not in ("BEST", "ALL"):
+                                        _scope = "BEST"
+                                    if _scope == "BEST":
+                                        _fut_details = [await _pair_exists_detail(best_name)]
+                                    else:
+                                        _fut_details = await asyncio.gather(_pair_exists_detail("BINANCE"), _pair_exists_detail("BYBIT"), _pair_exists_detail("OKX"))
 
                                     _any_ok = any(bool(d.get("ok")) for d in _fut_details)
 
@@ -19281,6 +19201,164 @@ async def _backend_load_candles(self: "Backend", symbol: str, tf: str, market: s
                 continue
     return pd.DataFrame()
 
+
+# --- Futures instruments cache (avoids REST price checks) ---
+# Contract existence checks should NOT rely on price endpoints, because they are frequently rate-limited / blocked.
+# Instead we periodically fetch the instrument list per exchange and validate symbols locally.
+_FUT_INST_CACHE: dict = {}  # key -> {"ts": float, "symbols": set[str]}  (symbols are normalized like BTCUSDT, 1000SHIBUSDT)
+
+def _norm_sym(s: str) -> str:
+    return (s or "").upper().replace("/", "").replace("-", "").replace(" ", "")
+
+async def _fetch_binance_futures_symbols() -> set[str]:
+    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    timeout = aiohttp.ClientTimeout(total=float(os.getenv("MID_CONTRACT_HTTP_TIMEOUT_SEC", "10") or 10))
+    symbols: set[str] = set()
+    async with aiohttp.ClientSession(timeout=timeout) as sess:
+        async with sess.get(url) as r:
+            if r.status != 200:
+                raise RuntimeError(f"binance exchangeInfo http {r.status}")
+            data = await r.json()
+    for it in (data.get("symbols") or []):
+        try:
+            if it.get("status") != "TRADING":
+                continue
+            if str(it.get("quoteAsset") or "").upper() != "USDT":
+                continue
+            sym = it.get("symbol")
+            if sym:
+                symbols.add(_norm_sym(sym))
+        except Exception:
+            continue
+    return symbols
+
+async def _fetch_bybit_linear_symbols() -> set[str]:
+    # Bybit V5 instruments-info (linear perpetuals)
+    url = "https://api.bybit.com/v5/market/instruments-info"
+    timeout = aiohttp.ClientTimeout(total=float(os.getenv("MID_CONTRACT_HTTP_TIMEOUT_SEC", "10") or 10))
+    symbols: set[str] = set()
+    cursor = None
+    # cap pagination to avoid endless loops if API misbehaves
+    for _ in range(6):
+        params = {"category": "linear", "limit": "1000"}
+        if cursor:
+            params["cursor"] = cursor
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
+            async with sess.get(url, params=params) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"bybit instruments-info http {r.status}")
+                data = await r.json()
+        res = data.get("result") if isinstance(data, dict) else None
+        items = (res.get("list") or []) if isinstance(res, dict) else []
+        for it in items:
+            try:
+                sym = it.get("symbol") if isinstance(it, dict) else None
+                status = str(it.get("status") or it.get("contractStatus") or "").upper() if isinstance(it, dict) else ""
+                # statuses differ by API revisions; accept if not clearly invalid
+                if status and status not in ("TRADING", "LISTED", "ACTIVE"):
+                    if status != "TRADING":
+                        continue
+                if sym:
+                    symbols.add(_norm_sym(sym))
+            except Exception:
+                continue
+        cursor = res.get("nextPageCursor") if isinstance(res, dict) else None
+        if not cursor:
+            break
+    return symbols
+
+async def _fetch_okx_swap_symbols() -> set[str]:
+    url = "https://www.okx.com/api/v5/public/instruments"
+    timeout = aiohttp.ClientTimeout(total=float(os.getenv("MID_CONTRACT_HTTP_TIMEOUT_SEC", "10") or 10))
+    symbols: set[str] = set()
+    params = {"instType": "SWAP"}
+    async with aiohttp.ClientSession(timeout=timeout) as sess:
+        async with sess.get(url, params=params) as r:
+            if r.status != 200:
+                raise RuntimeError(f"okx instruments http {r.status}")
+            data = await r.json()
+    items = data.get("data") if isinstance(data, dict) else None
+    if isinstance(items, list):
+        for it in items:
+            try:
+                inst_id = it.get("instId") if isinstance(it, dict) else None
+                # Format: BTC-USDT-SWAP
+                if inst_id and isinstance(inst_id, str) and "-SWAP" in inst_id:
+                    parts = inst_id.split("-")
+                    if len(parts) >= 3:
+                        base, quote = parts[0].upper(), parts[1].upper()
+                        if quote == "USDT":
+                            symbols.add(_norm_sym(base + quote))
+            except Exception:
+                continue
+    return symbols
+
+async def _get_futures_symbols_cached(exchange: str) -> tuple[set[str] | None, bool]:
+    ex = (exchange or "").upper().strip()
+    ttl = float(os.getenv("MID_CONTRACT_CACHE_TTL_SEC", "1800") or 1800)
+    now = time.time()
+    key = f"FUT:{ex}"
+    ent = _FUT_INST_CACHE.get(key) or {}
+    ts = float(ent.get("ts") or 0.0)
+    # if cached and fresh, return
+    if ent.get("symbols") and (now - ts) < ttl:
+        return ent["symbols"], False
+    try:
+        if ex == "BINANCE":
+            syms = await _fetch_binance_futures_symbols()
+        elif ex == "BYBIT":
+            syms = await _fetch_bybit_linear_symbols()
+        elif ex == "OKX":
+            syms = await _fetch_okx_swap_symbols()
+        else:
+            return None, False
+        _FUT_INST_CACHE[key] = {"ts": now, "symbols": syms}
+        return syms, False
+    except Exception:
+        # cache negative for a short time to avoid hammering endpoints when blocked
+        _FUT_INST_CACHE[key] = {"ts": now, "symbols": None}
+        return None, True
+
+async def futures_contract_exists(self, exchange: str, sym_base: str) -> dict:
+    """Return dict: {ok: bool, had_error: bool, symbol: str|None}
+
+    ok=True means the futures instrument exists on the exchange.
+    had_error=True means we couldn't verify (network/ratelimit/blocked), so treat as 'unavailable'.
+    """
+    ex = (exchange or "").upper().strip()
+    base = _norm_sym(sym_base)
+    # Build candidates (support multiplier contracts like 1000SHIBUSDT)
+    cands: list[str] = []
+    try:
+        preferred = base
+        if ex == "BINANCE" and hasattr(self, "_binance_futures_symbol_alias"):
+            try:
+                preferred = _norm_sym(self._binance_futures_symbol_alias(base) or base)
+            except Exception:
+                preferred = base
+        if preferred:
+            cands.append(preferred)
+        if base and base not in cands:
+            cands.append(base)
+        # Auto multipliers
+        mults = [m.strip() for m in (os.getenv("MID_MULTIPLIER_AUTO_LIST", "10,100,1000,10000") or "").split(",") if m.strip()]
+        for m in mults:
+            if m.isdigit():
+                cand = f"{m}{base}"
+                if cand not in cands:
+                    cands.append(cand)
+    except Exception:
+        cands = [base]
+
+    syms, had_error = await _get_futures_symbols_cached(ex)
+    if syms is None:
+        return {"ok": False, "had_error": True, "symbol": None}
+    for cand in cands:
+        if cand in syms:
+            return {"ok": True, "had_error": had_error, "symbol": cand}
+    return {"ok": False, "had_error": had_error, "symbol": None}
+
+
 # Bind methods to Backend (non-invasive, avoids moving large blocks inside class)
 try:
     Backend.load_candles = _backend_load_candles  # type: ignore[attr-defined]
@@ -19323,6 +19401,7 @@ try:
         # status endpoints/logs
         'mid_status_snapshot': globals().get('mid_status_snapshot'),
         'mid_status_summary_loop': globals().get('mid_status_summary_loop'),
+        'futures_contract_exists': globals().get('futures_contract_exists'),
     }
     for _name, _fn in list(_mid_bind.items()):
         # Bind if missing OR present-but-broken (e.g. None / non-callable placeholder)
