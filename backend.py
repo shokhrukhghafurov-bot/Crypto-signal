@@ -12969,7 +12969,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                         # If TA/scan already flagged vol_low, treat it as vol_low here too (prevents dist_atr=999 spam)
                         try:
-                            if \"vol_low\" in risk_flags:
+                            if "vol_low" in risk_flags:
                                 _vol_low = True
                         except Exception:
                             pass
