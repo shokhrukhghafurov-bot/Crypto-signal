@@ -12725,6 +12725,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     sym_trade = str(it.get("trade_symbol") or sym)
                     sym_candles = str(it.get("candle_symbol") or sym)
                     market = str(it.get("market") or "SPOT").upper().strip()
+                    risk_flags = []
+                    try:
+                        rf = it.get("risk_flags")
+                        if isinstance(rf, list):
+                            risk_flags = [str(x) for x in rf if str(x).strip()]
+                        elif isinstance(rf, str) and rf.strip():
+                            risk_flags = [x.strip() for x in rf.replace(";", ",").split(",") if x.strip()]
+                    except Exception:
+                        risk_flags = []
                     if market.endswith(".FUTURES") or "FUTURES" in market:
                         market = "FUTURES"
                     elif market.endswith(".SPOT") or "SPOT" in market:
@@ -12817,6 +12826,111 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         use_zone = False
 
+                    # --- scale / multiplier auto-fix for legacy pendings (1000* contracts) ---
+                    # If stored zone is in a different scale than live price (common for 1000SHIBUSDT/1000FLOKIUSDT),
+                    # attempt to rescale the zone and/or drop the pending as scale_mismatch to avoid "eternal far".
+                    try:
+                        if use_zone:
+                            _z_mid = (float(lo) + float(hi)) / 2.0
+                        else:
+                            _z_mid = float(entry0)
+                        _px = float(price)
+                        _ratio = float(_px) / float(_z_mid) if float(_z_mid) > 0 else 0.0
+                    except Exception:
+                        _z_mid = 0.0
+                        _ratio = 0.0
+                    try:
+                        _mul_tol = float(os.getenv("MID_MULTIPLIER_MATCH_TOL", "0.08") or 0.08)
+                    except Exception:
+                        _mul_tol = 0.08
+                    try:
+                        _scale_max = float(os.getenv("MID_PENDING_SCALE_MISMATCH_MAX", "50") or 50.0)
+                    except Exception:
+                        _scale_max = 50.0
+                    try:
+                        _allowed = os.getenv("MID_MULTIPLIER_AUTO_LIST", "10,100,1000,10000")
+                        _allowed_muls = []
+                        for _t in str(_allowed).split(","):
+                            _t = str(_t).strip()
+                            if not _t:
+                                continue
+                            try:
+                                _allowed_muls.append(float(_t))
+                            except Exception:
+                                pass
+                        if not _allowed_muls:
+                            _allowed_muls = [10.0, 100.0, 1000.0, 10000.0]
+                    except Exception:
+                        _allowed_muls = [10.0, 100.0, 1000.0, 10000.0]
+
+                    _fixed = False
+                    try:
+                        if float(_z_mid) > 0 and float(_ratio) > 0:
+                            # Try to infer multiplier even if the pending was created before trade_symbol/price_multiplier existed.
+                            _det_mul = float(it.get("price_multiplier") or 1.0) if it.get("price_multiplier") is not None else 1.0
+                            _det_tag = None
+                            if float(_det_mul) <= 1.0:
+                                for _m in _allowed_muls:
+                                    _m = float(_m)
+                                    if _m <= 1.0:
+                                        continue
+                                    if abs(float(_ratio) - float(_m)) / float(_m) <= float(_mul_tol):
+                                        _det_mul = float(_m)
+                                        _det_tag = f"auto_x{int(_m)}"
+                                        break
+                                    _inv = 1.0 / float(_m)
+                                    if abs(float(_ratio) - float(_inv)) / float(_inv) <= float(_mul_tol):
+                                        _det_mul = float(_inv)
+                                        _det_tag = f"auto_div{int(_m)}"
+                                        break
+                            if float(_det_mul) != 1.0 and use_zone:
+                                lo = float(lo) * float(_det_mul)
+                                hi = float(hi) * float(_det_mul)
+                                it["entry_low"] = float(lo)
+                                it["entry_high"] = float(hi)
+                                it["price_multiplier"] = float(_det_mul)
+                                try:
+                                    _src0 = str(it.get("entry_zone_src") or "")
+                                    if _det_tag and _det_tag not in _src0:
+                                        it["entry_zone_src"] = f"{_src0}|{_det_tag}" if _src0 else _det_tag
+                                except Exception:
+                                    pass
+                                try:
+                                    # If this looks like a BINANCE futures multiplier contract, set trade_symbol alias for better price fetch.
+                                    if market == "FUTURES" and (src_ex == "BINANCE"):
+                                        if float(_det_mul) >= 10.0 and not str(sym_trade).startswith(str(int(float(_det_mul)))):
+                                            sym_trade = f"{int(float(_det_mul))}{sym}"
+                                            it["trade_symbol"] = sym_trade
+                                except Exception:
+                                    pass
+                                _fixed = True
+                                try:
+                                    _z_mid = (float(lo) + float(hi)) / 2.0
+                                    _ratio = float(_px) / float(_z_mid) if float(_z_mid) > 0 else float(_ratio)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        _fixed = False
+
+                    # If still wildly mismatched, drop immediately.
+                    try:
+                        if float(_z_mid) > 0 and float(_ratio) > 0 and (float(_ratio) >= float(_scale_max) or float(_ratio) <= (1.0 / float(_scale_max))):
+                            # mark fail reason for observability and remove
+                            try:
+                                _pending_fail(it, "scale_mismatch", now)
+                            except Exception:
+                                pass
+                            try:
+                                removed_n += 1
+                            except Exception:
+                                pass
+                            try:
+                                _mid_reject_add("scale_mismatch")
+                            except Exception:
+                                pass
+                            continue
+                    except Exception:
+                        pass
                     # --- zone distance diagnostics (no tolerance) ---
                     try:
                         if use_zone:
@@ -12852,6 +12966,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 _vol_low = True
                         except Exception:
                             _vol_low = False
+
+                        # If TA/scan already flagged vol_low, treat it as vol_low here too (prevents dist_atr=999 spam)
+                        try:
+                            if \"vol_low\" in risk_flags:
+                                _vol_low = True
+                        except Exception:
+                            pass
 
                         _dist_atr = None if _vol_low else (float(_dist) / float(atr_abs) if float(atr_abs) > 0 else None)
 
