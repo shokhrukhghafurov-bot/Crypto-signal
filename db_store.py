@@ -130,11 +130,30 @@ async def ensure_schema() -> None:
         );
         """)
 
-        # Index for maintenance / diagnostics (best-effort)
+        # ensure_kv_store_jsonb: migrate older TEXT schema to JSONB (best-effort)
         try:
-            await conn.execute("""
-            CREATE INDEX IF NOT EXISTS kv_store_updated_at_idx ON kv_store(updated_at);
-            """)
+            col = await conn.fetchrow(
+                """
+                SELECT data_type, udt_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'kv_store'
+                  AND column_name = 'value'
+                """
+            )
+            udt = (col.get('udt_name') if col else None)
+            if udt and str(udt).lower() != 'jsonb':
+                # Try cast existing values to jsonb; if fails, keep TEXT but kv_set_json will handle it.
+                await conn.execute(
+                    """
+                    ALTER TABLE kv_store
+                    ALTER COLUMN value TYPE JSONB
+                    USING CASE
+                        WHEN value IS NULL OR value='' THEN '{}'::jsonb
+                        ELSE value::jsonb
+                    END;
+                    """
+                )
         except Exception:
             pass
 
@@ -2759,8 +2778,11 @@ async def count_closed_autotrade_positions(*, user_id: int, market_type: str = "
 async def kv_get_json(key: str) -> Optional[dict]:
     """Return JSON object for a key from Postgres KV store.
 
-    Returns None if key not found.
+    Works with both JSONB and TEXT (JSON string) schemas.
+    Returns None if key not found or value is not a JSON object.
     """
+    import json
+
     pool = get_pool()
     k = str(key or "").strip()
     if not k:
@@ -2770,29 +2792,62 @@ async def kv_get_json(key: str) -> Optional[dict]:
         if not row:
             return None
         v = row.get("value")
-        return v if isinstance(v, dict) else None
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str) and v:
+            try:
+                obj = json.loads(v)
+                return obj if isinstance(obj, dict) else None
+            except Exception:
+                return None
+        return None
 
 
 async def kv_set_json(key: str, value: dict) -> None:
-    """Upsert JSON value for a key into Postgres KV store."""
+    """Upsert JSON value for a key into Postgres KV store.
+
+    NOTE: We always serialize to a JSON string to be compatible with older schemas
+    where kv_store.value might have been created as TEXT.
+    """
+    import json
+
     pool = get_pool()
     k = str(key or "").strip()
     if not k:
         return
-    # asyncpg will encode dict -> jsonb automatically
+    try:
+        payload = json.dumps(value if isinstance(value, dict) else {"value": value}, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        payload = "{}"
+
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
-        await conn.execute(
-            """
-            INSERT INTO kv_store(key, value, updated_at)
-            VALUES ($1, $2, NOW())
-            ON CONFLICT (key)
-            DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
-            """,
-            k, value
-        )
+        # Try JSONB first (preferred), fallback to TEXT if schema is old
+        try:
+            await conn.execute(
+                """
+                INSERT INTO kv_store(key, value, updated_at)
+                VALUES ($1, $2::jsonb, NOW())
+                ON CONFLICT (key)
+                DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+                """,
+                k, payload
+            )
+        except Exception:
+            # Old schema: value is TEXT
+            await conn.execute(
+                """
+                INSERT INTO kv_store(key, value, updated_at)
+                VALUES ($1, $2::text, NOW())
+                ON CONFLICT (key)
+                DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+                """,
+                k, payload
+            )
 
 
 import zlib
+import pickle
+
 import pickle
 
 def _cc_key(ex_name: str, market: str, symbol: str, tf: str, limit: int) -> str:
