@@ -386,6 +386,30 @@ try:
         backend.can_emit_mid = _types.MethodType(_can_emit_mid, backend)
         backend.mark_emitted_mid = _types.MethodType(_mark_emitted_mid, backend)
         logger.warning("[mid] Backend has no can_emit_mid; installed runtime shim (compat)")
+
+    # Some MID builds use a Backend variant without a signal id generator.
+    # Provide a monotonic in-memory sequence so scanner_loop_mid can run.
+    if not hasattr(backend, "next_signal_id"):
+        # Seed is epoch-ms to reduce collision risk across restarts.
+        if not hasattr(backend, "_signal_seq"):
+            try:
+                backend._signal_seq = int(_time.time() * 1000)
+            except Exception:
+                backend._signal_seq = 1
+
+        def _next_signal_id(self) -> int:
+            try:
+                sid = int(getattr(self, "_signal_seq", 1) or 1)
+            except Exception:
+                sid = 1
+            try:
+                setattr(self, "_signal_seq", sid + 1)
+            except Exception:
+                pass
+            return sid
+
+        backend.next_signal_id = _types.MethodType(_next_signal_id, backend)
+        logger.warning("[mid] Backend has no next_signal_id; installed runtime shim (compat)")
 except Exception:
     # Never fail startup because of a shim
     pass
