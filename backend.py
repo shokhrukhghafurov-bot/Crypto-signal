@@ -10329,7 +10329,15 @@ class Backend:
         self._symbols_cache: list[str] = []
         self._symbols_cache_ts: float = 0.0
         self.trade_stats: dict = {}
-        self._load_trade_stats()
+        # trade stats are optional; older builds may not have helpers.
+        # Never fail backend startup because of stats persistence issues.
+        try:
+            if hasattr(self, "_load_trade_stats"):
+                self._load_trade_stats()
+            else:
+                self.trade_stats = {"spot": {"days": {}, "weeks": {}}, "futures": {"days": {}, "weeks": {}}}
+        except Exception:
+            self.trade_stats = {"spot": {"days": {}, "weeks": {}}, "futures": {"days": {}, "weeks": {}}}
 
         # Optional heartbeat callback (set by bot.py) to report Smart Manager liveness.
         # Called best-effort once per track_loop cycle.
