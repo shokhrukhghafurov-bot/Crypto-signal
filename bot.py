@@ -6218,8 +6218,28 @@ async def main() -> None:
             else:
                 logger.warning("Backend has no track_loop; skipping")
 
-            logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv("SCAN_INTERVAL_SECONDS",""), os.getenv("TOP_N",""))
-            asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+            logger.info(
+                "Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s",
+                os.getenv("SCAN_INTERVAL_SECONDS", ""),
+                os.getenv("TOP_N", ""),
+            )
+
+            # Some deployments (MID-only builds) intentionally don't ship the legacy scanner_loop.
+            # Guard this call to avoid crashing the whole process.
+            if hasattr(backend, "scanner_loop"):
+                try:
+                    TASKS["scanner"] = asyncio.create_task(
+                        backend.scanner_loop(broadcast_signal, broadcast_macro_alert),
+                        name="scanner",
+                    )
+                    _health_mark_ok("scanner")
+                    _attach_task_monitor("scanner", TASKS["scanner"])
+                except Exception:
+                    logger.exception("Failed to start scanner_loop")
+            else:
+                logger.warning(
+                    "Backend has no scanner_loop; skipping (MID scanner runs via scanner_loop_mid)"
+                )
 
             # MID components (scanner + pending loop)
             _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
