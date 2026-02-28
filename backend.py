@@ -12751,6 +12751,25 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         except Exception:
             pass
 
+    def _pending_clear_cooldown(it: dict) -> None:
+        """Allow re-adding a pending immediately after it's removed/expired/emitted.
+        Clears the in-memory MID_PENDING_COOLDOWN key for this symbol+dir+market.
+        """
+        try:
+            sym0 = str(it.get('symbol') or '').upper().strip()
+            mkt0 = str(it.get('market') or '').upper().strip()
+            dir0 = str(it.get('direction') or '').upper().strip()
+            mm = getattr(self, '_last_pending_mid', None)
+            if mm is None:
+                return
+            k0 = f"{mkt0}:{sym0}:{dir0}".strip(':')
+            if not k0:
+                k0 = sym0
+            mm.pop(k0, None)
+        except Exception:
+            pass
+
+
     def _pending_mark_fail(it: dict, reason: str, now_ts: float) -> bool:
         """Return True to keep pending, False to drop."""
         # "Smart delete": some reasons are terminal (setup invalidated) and we drop
@@ -12764,6 +12783,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 it["fail_count"] = int(it.get("fail_count") or 0) + 1
                 it["last_fail_reason"] = str(reason or "fail")
                 it["last_fail_ts"] = float(now_ts)
+                _pending_clear_cooldown(it)
                 return False
         except Exception:
             pass
@@ -12774,8 +12794,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             _max_attempts_i = int(it.get("max_attempts") or max_attempts or 0)
             _max_fails_i = int(it.get("max_fails") or max_fails or 0)
             if _max_attempts_i > 0 and int(it.get("trigger_attempts") or 0) >= _max_attempts_i:
+                _pending_clear_cooldown(it)
                 return False
             if _max_fails_i > 0 and int(it.get("fail_count") or 0) >= _max_fails_i:
+                _pending_clear_cooldown(it)
                 return False
         except Exception:
             return True
@@ -12848,7 +12870,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             _mid_reject_add("ttl_expired")
                         except Exception:
                             pass
-                        continue
+                                                _pending_clear_cooldown(it)
+continue
 
                     # load candles (also gives fallback price)
                     df5 = await self.load_candles(sym_candles, "5m", market)
@@ -13416,6 +13439,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         self.last_futures_signal = sig
 
                     await emit_signal_cb(sig)
+                    _pending_clear_cooldown(it)
                     logger.info("[mid][pending] EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, entry, float(price), tol)
                     try:
                         _mid_metrics_inc("pending_triggered", 1)
