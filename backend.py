@@ -13192,11 +13192,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             )
 
                             try:
-                            self.mark_emitted_mid(sym, sig.direction, sig.market)
-                        except TypeError:
-                            # compat shim may expose mark_emitted_mid(symbol) only
-                            try:
-                                self.mark_emitted_mid(sym)
+                                self.mark_emitted_mid(sym, sig.direction, sig.market)
+                            except TypeError:
+                                # compat shim may expose mark_emitted_mid(symbol) only
+                                try:
+                                    self.mark_emitted_mid(sym)
+                                except Exception:
+                                    pass
                             except Exception:
                                 pass
                             self.last_signal = sig
@@ -13449,13 +13451,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     )
 
                     try:
-                            self.mark_emitted_mid(sym, sig.direction, sig.market)
-                        except TypeError:
-                            # compat shim may expose mark_emitted_mid(symbol) only
-                            try:
-                                self.mark_emitted_mid(sym)
-                            except Exception:
-                                pass
+                        self.mark_emitted_mid(sym, sig.direction, sig.market)
+                    except TypeError:
+                        # compat shim may expose mark_emitted_mid(symbol) only
+                        try:
+                            self.mark_emitted_mid(sym)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
                     self.last_signal = sig
                     if sig.market == "SPOT":
                         self.last_spot_signal = sig
@@ -16707,11 +16711,13 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             # do NOT emit now
                         else:
                             try:
-                            self.mark_emitted_mid(sym, sig.direction, sig.market)
-                        except TypeError:
-                            # compat shim may expose mark_emitted_mid(symbol) only
-                            try:
-                                self.mark_emitted_mid(sym)
+                                self.mark_emitted_mid(sym, sig.direction, sig.market)
+                            except TypeError:
+                                # compat shim may expose mark_emitted_mid(symbol) only
+                                try:
+                                    self.mark_emitted_mid(sym)
+                                except Exception:
+                                    pass
                             except Exception:
                                 pass
                             self.last_signal = sig
