@@ -14938,6 +14938,45 @@ return None
                     _mid_rest_refill += 1
                     _mid_diag_ok(symb, ex_name, market, tf, 'rest', last)
                     return last
+
+                # --- REST fallback across exchanges when WS/DB is empty ---
+                # On cold start, the WS->DB candle cache may lag or be empty. If the primary venue
+                # returns empty, try other configured venues before giving up.
+                try:
+                    all_ex = str(os.getenv('MID_CANDLES_ALL_EXCHANGES', '1') or '1').strip().lower() not in ('0','false','no','off')
+                except Exception:
+                    all_ex = True
+                if all_ex:
+                    try:
+                        ex_list = list(mid_universe or [])
+                    except Exception:
+                        ex_list = []
+                    if ex_list:
+                        for ex2 in ex_list:
+                            try:
+                                if not ex2 or ex2 == ex_name:
+                                    continue
+                                alt = await _mid_fetch_klines_rest(ex2, symb, tf, int(limit), market)
+                                if alt is not None and not getattr(alt, 'empty', True):
+                                    try:
+                                        key2 = (ex2, (market or 'SPOT').upper().strip(), symb, tf, int(limit))
+                                        _mid_candles_cache[key2] = (now, alt)
+                                        _mid_candles_cache[key] = (now, alt)
+                                    except Exception:
+                                        pass
+                                    try:
+                                        persist_enabled = str(os.getenv('MID_PERSIST_CANDLES', '1') or '1').strip().lower() not in ('0','false','no','off')
+                                        if persist_enabled and tf in ('5m','30m','1h'):
+                                            blob = db_store._cc_pack_df(alt)
+                                            await db_store.candles_cache_set(ex2, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob)
+                                            await db_store.candles_cache_set(ex_name, (market or 'SPOT').upper().strip(), symb, tf, int(limit), blob)
+                                    except Exception:
+                                        pass
+                                    _mid_rest_refill += 1
+                                    _mid_diag_ok(symb, ex2, market, tf, 'rest_fallback', alt)
+                                    return alt
+                            except Exception:
+                                continue
                 
                 # fallback to stale cache if available and not too old
                 if cached:
