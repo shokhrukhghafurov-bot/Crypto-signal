@@ -10525,6 +10525,45 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
     def mark_emitted(self, symbol: str) -> None:
         self._last_signal_ts[symbol.upper()] = time.time()
 
+
+
+    # --- MID compatibility shims (legacy builds may call can_emit_mid/mark_emitted_mid) ---
+    def can_emit_mid(self, symbol: str, direction: str = "", market: str = "") -> bool:
+        """Return True if MID signal emission is allowed for this key.
+
+        Compatibility: older/newer builds sometimes only have can_emit().
+        """
+        fn = getattr(self, 'can_emit', None)
+        if callable(fn):
+            try:
+                return bool(fn(symbol))
+            except TypeError:
+                # unexpected signature; fall back to per-key cooldown below
+                pass
+        cooldown_min = int(os.getenv('MID_COOLDOWN_MINUTES', '180'))
+        m = getattr(self, '_last_emit_mid', None)
+        if m is None:
+            self._last_emit_mid = {}
+            m = self._last_emit_mid
+        key = f"{str(market or '').upper()}:{symbol}:{str(direction or '').upper()}" if (market or direction) else symbol
+        ts = m.get(key)
+        return ts is None or (time.time() - float(ts)) >= cooldown_min * 60
+
+    def mark_emitted_mid(self, symbol: str, direction: str = "", market: str = "") -> None:
+        """Mark MID emission time. Compatibility with mark_emitted()."""
+        fn = getattr(self, 'mark_emitted', None)
+        if callable(fn):
+            try:
+                fn(symbol)
+                return
+            except TypeError:
+                pass
+        m = getattr(self, '_last_emit_mid', None)
+        if m is None:
+            self._last_emit_mid = {}
+            m = self._last_emit_mid
+        key = f"{str(market or '').upper()}:{symbol}:{str(direction or '').upper()}" if (market or direction) else symbol
+        m[key] = time.time()
     async def open_trade(self, user_id: int, signal: Signal, orig_text: str) -> bool:
         """Persist trade in Postgres. Returns False if already opened."""
         inserted, _tid = await db_store.open_trade_once(
