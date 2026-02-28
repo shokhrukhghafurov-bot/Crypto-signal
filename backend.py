@@ -12699,8 +12699,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
     tol_atr = float(os.getenv("MID_PENDING_ENTRY_TOL_ATR", "0.15") or 0.15)
     tol_pct = float(os.getenv("MID_PENDING_ENTRY_TOL_PCT", "0.0018") or 0.0018)
 
+    pending_instant_emit = int(os.getenv("MID_PENDING_INSTANT_EMIT", "0") or 0) == 1
+    # If instant emit is enabled, default to ignoring the zone unless explicitly disabled
+    instant_ignore_zone = int(os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0") or 0) == 1 or pending_instant_emit
+
     logger.info("[mid][pending] trigger loop started poll=%.2fs ttl=%.1fmin tol_atr=%.3f tol_pct=%.4f instant_emit=%s ignore_zone=%s",
-                poll, ttl_min, tol_atr, tol_pct, pending_instant_emit, instant_ignore_zone)
+                poll, ttl_min, tol_atr, tol_pct, int(pending_instant_emit), int(instant_ignore_zone))
 
     # Pending persistence is already in Postgres (kv_store key 'mid_pending').
     # Here we track trigger attempts/fails and prune noisy pendings automatically.
@@ -12812,8 +12816,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             # skipping ALL re-checks (TA reconfirm, blocks, trap, post-setup filters).
             # Use only for debugging the pipeline end-to-end.
             pending_instant_emit = os.getenv("MID_PENDING_INSTANT_EMIT", "0").strip().lower() in ("1","true","yes","on")
+            # default: if instant emit is on, ignore zone unless explicitly disabled
             instant_ignore_zone = (os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0").strip().lower() in ("1","true","yes","on")) or pending_instant_emit
-            logger.info("[mid][pending][cfg] instant_emit=%s ignore_zone=%s", pending_instant_emit, instant_ignore_zone)
             keep: list[dict] = []
             any_wait = False
             # --- per-poll diagnostics counters ---
@@ -13187,7 +13191,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 ts=time.time(),
                             )
 
+                            try:
                             self.mark_emitted_mid(sym, sig.direction, sig.market)
+                        except TypeError:
+                            # compat shim may expose mark_emitted_mid(symbol) only
+                            try:
+                                self.mark_emitted_mid(sym)
+                            except Exception:
+                                pass
                             self.last_signal = sig
                             if sig.market == "SPOT":
                                 self.last_spot_signal = sig
@@ -13437,7 +13448,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         ts=time.time(),
                     )
 
-                    self.mark_emitted_mid(sym, sig.direction, sig.market)
+                    try:
+                            self.mark_emitted_mid(sym, sig.direction, sig.market)
+                        except TypeError:
+                            # compat shim may expose mark_emitted_mid(symbol) only
+                            try:
+                                self.mark_emitted_mid(sym)
+                            except Exception:
+                                pass
                     self.last_signal = sig
                     if sig.market == "SPOT":
                         self.last_spot_signal = sig
@@ -16688,7 +16706,14 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 _rej_add(sym, "pending_exception")
                             # do NOT emit now
                         else:
+                            try:
                             self.mark_emitted_mid(sym, sig.direction, sig.market)
+                        except TypeError:
+                            # compat shim may expose mark_emitted_mid(symbol) only
+                            try:
+                                self.mark_emitted_mid(sym)
+                            except Exception:
+                                pass
                             self.last_signal = sig
                             if sig.market == "SPOT":
                                 self.last_spot_signal = sig
