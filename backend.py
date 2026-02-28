@@ -15638,26 +15638,34 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     diru = "LONG"
                                 marketu = str(market or "").upper().strip() or "SPOT"
 
-                                # --- AUTOTRADE reverse permission (smart mode) ---
+                                                                # --- AUTOTRADE reverse permission (smart mode) ---
                                 _can_add_pending = self.can_add_mid_pending(sym, direction=diru, market=marketu)
+
+                                # If an active trade exists for this symbol+market:
+                                #   SAME SIDE  -> block (prevents accidental pyramiding)
+                                #   OPPOSITE   -> allow ONLY if reversal conditions are all met
                                 _reverse_allowed = False
+                                _reverse_of_trade_id = None
+                                _reverse_of_side = None
+                                _reverse_dist_atr = None
+
                                 try:
                                     _trade = await self._mid_get_active_trade(sym, marketu)
                                 except Exception:
                                     _trade = None
+
                                 if isinstance(_trade, dict) and _trade.get("id"):
                                     try:
                                         _t_side = str(_trade.get("side") or "").upper().strip() or "LONG"
                                     except Exception:
                                         _t_side = "LONG"
-                                    # If an active trade exists on same symbol+market:
-                                    # - same side: block creating another pending (prevents pyramiding by mistake)
-                                    # - opposite side: allow only if reversal conditions are met
+
                                     if _t_side == str(diru).upper().strip():
                                         _pending_skip(sym, "active_trade_same_side")
                                         _mid_f_cooldown += 1
                                         _can_add_pending = False
                                     else:
+                                        # reversal gates
                                         try:
                                             _adx_min = float(os.getenv("MID_REVERSE_ADX_MIN", "25") or 25.0)
                                         except Exception:
@@ -15666,49 +15674,76 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                             _min_dist_atr = float(os.getenv("MID_REVERSE_MIN_DIST_ATR", "0.7") or 0.7)
                                         except Exception:
                                             _min_dist_atr = 0.7
-                                        # structure must be clearly broken versus the active trade side
+
+                                        # structure must be clearly broken versus the active trade side (1h structure tag)
                                         try:
                                             _struct0 = str(struct_hhhl_1h or "—")
                                         except Exception:
                                             _struct0 = "—"
                                         _struct_broken = ((_t_side == "LONG" and _struct0 == "LH-LL") or (_t_side == "SHORT" and _struct0 == "HH-HL"))
+
                                         # opposite liquidity sweep must be present (5m)
                                         try:
                                             _sweep_ok = ((str(diru).upper() == "SHORT" and bool(sweep_short)) or (str(diru).upper() == "LONG" and bool(sweep_long)))
                                         except Exception:
                                             _sweep_ok = False
+
                                         # ADX must be high enough (1h)
                                         try:
                                             _adx_ok = (adx1h is not None) and (not np.isnan(float(adx1h))) and float(adx1h) >= float(_adx_min)
                                         except Exception:
                                             _adx_ok = False
+
                                         # distance from active trade entry must be large enough (in ATR)
+                                        # Use the same ATR source as pending creation (prefer 5m ATR, else 30m ATR, else entry*0.1%).
+                                        _atr_use = None
                                         try:
-                                            _atr_use = float(_atr0) if (_atr0 is not None and float(_atr0) > 0) else float(entry) * 0.001
+                                            if 'chosen_df5' in locals() and hasattr(chosen_df5, 'columns') and 'atr' in chosen_df5.columns:
+                                                _atr_use = float(chosen_df5['atr'].astype(float).iloc[-1])
                                         except Exception:
-                                            _atr_use = float(entry) * 0.001
+                                            _atr_use = None
                                         try:
-                                            _dist_rev_atr = abs(float(entry) - float(_trade.get("entry") or 0.0)) / float(_atr_use) if float(_atr_use) > 0 else 0.0
+                                            if (_atr_use is None or _atr_use <= 0) and 'chosen_df30' in locals() and hasattr(chosen_df30, 'columns') and 'atr' in chosen_df30.columns:
+                                                _atr_use = float(chosen_df30['atr'].astype(float).iloc[-1])
+                                        except Exception:
+                                            pass
+                                        try:
+                                            if _atr_use is None or float(_atr_use) <= 0:
+                                                _atr_use = float(entry) * 0.001
+                                        except Exception:
+                                            _atr_use = 0.0
+
+                                        try:
+                                            _trade_entry = float(_trade.get("entry") or 0.0)
+                                        except Exception:
+                                            _trade_entry = 0.0
+                                        try:
+                                            _dist_rev_atr = abs(float(entry) - float(_trade_entry)) / float(_atr_use) if float(_atr_use) > 0 else 0.0
                                         except Exception:
                                             _dist_rev_atr = 0.0
+
                                         if _struct_broken and _adx_ok and _sweep_ok and float(_dist_rev_atr) >= float(_min_dist_atr):
                                             _reverse_allowed = True
                                             _can_add_pending = True  # bypass cooldown for reversal
+
+                                            # remove any existing pending for this symbol+market to avoid conflicts
                                             try:
                                                 _rmn = await self.remove_mid_pending_symbol(sym, marketu)
                                                 if int(_rmn or 0) > 0:
                                                     logger.info("[mid][pending][reverse] removed_old_pending symbol=%s market=%s n=%s", sym, marketu, _rmn)
                                             except Exception:
                                                 pass
+
+                                            # mark risk flag + store reverse metadata (will be injected into rec later)
                                             try:
                                                 if "reverse_allowed" not in risk_flags:
                                                     risk_flags.append("reverse_allowed")
                                             except Exception:
                                                 pass
                                             try:
-                                                rec["reverse_of_trade_id"] = int(_trade.get("id") or 0)
-                                                rec["reverse_of_side"] = str(_t_side)
-                                                rec["reverse_dist_atr"] = float(_dist_rev_atr)
+                                                _reverse_of_trade_id = int(_trade.get("id") or 0)
+                                                _reverse_of_side = str(_t_side)
+                                                _reverse_dist_atr = float(_dist_rev_atr)
                                             except Exception:
                                                 pass
                                         else:
@@ -15968,6 +16003,16 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "last_fail_reason": "",
                                         "min_confidence": int(os.getenv("MID_MIN_CONFIDENCE", "0") or 0),
                                     }
+                                    if _reverse_allowed:
+                                        try:
+                                            if _reverse_of_trade_id is not None:
+                                                rec["reverse_of_trade_id"] = int(_reverse_of_trade_id or 0)
+                                            if _reverse_of_side:
+                                                rec["reverse_of_side"] = str(_reverse_of_side)
+                                            if _reverse_dist_atr is not None:
+                                                rec["reverse_dist_atr"] = float(_reverse_dist_atr)
+                                        except Exception:
+                                            pass
                                     await self.add_mid_pending(rec)
                                     self.mark_mid_pending(sym, direction=diru, market=marketu)
                                     _mid_stage_add("passed_ta", 1)
