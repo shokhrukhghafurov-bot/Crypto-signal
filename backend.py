@@ -12477,8 +12477,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             for it in items:
                 try:
                     sym = str(it.get("symbol") or "")
-                    market = str(it.get("market") or "SPOT").upper()
-                    direction = str(it.get("direction") or "").upper()
+                    market = str(it.get("market") or "SPOT").upper().strip()
+                    if market.endswith(".FUTURES") or "FUTURES" in market:
+                        market = "FUTURES"
+                    elif market.endswith(".SPOT") or "SPOT" in market:
+                        market = "SPOT"
+                    direction = str(it.get("direction") or "").upper().strip()
+                    # Backward-compat: accept Enum-ish strings like 'DIRECTION.SHORT'
+                    if direction.endswith(".SHORT") or "SHORT" in direction:
+                        direction = "SHORT"
+                    elif direction.endswith(".LONG") or "LONG" in direction:
+                        direction = "LONG"
                     entry0 = float(it.get("entry") or 0.0)
                     src_ex = str(it.get("source_exchange") or "BINANCE").upper()
                     created = float(it.get("created_ts") or 0.0) or now
@@ -14594,8 +14603,13 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     # can show a breakdown like: other=43{score_low=6,rr_low=3,...}
                     _rej_reasons_by_sym = defaultdict(list)  # sym -> [base_reason...]
 
-                    def _rej_add(_sym: str, _reason: str) -> None:
-                        """Record exactly one terminal reject reason per symbol per tick (MID registry keys)."""
+                    def _rej_track(_sym: str, _reason: str, *, rejected: bool = True) -> None:
+                        """Record exactly one terminal outcome per symbol per tick.
+
+                        This powers the per-tick [mid][reject] accounting digest.
+                        When rejected=False, we do NOT increment stage=rejected nor roll it into the
+                        rolling reject window (used for /health "why no signals").
+                        """
                         if not _rej_enabled:
                             return
                         try:
@@ -14614,13 +14628,22 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             if len(lst) < _rej_examples:
                                 lst.append(str(_sym))
 
-                            # Stage flow: this symbol ended in rejection
-                            _mid_stage_add("rejected", 1)
+                            if rejected:
+                                # Stage flow: this symbol ended in rejection
+                                _mid_stage_add("rejected", 1)
 
-                            # Rolling reject digest for /health
-                            _mid_reject_add(key)
+                                # Rolling reject digest for /health
+                                _mid_reject_add(key)
                         except Exception:
                             pass
+
+                    def _rej_add(_sym: str, _reason: str) -> None:
+                        # Backward-compatible wrapper: old callsites are true rejections.
+                        _rej_track(_sym, _reason, rejected=True)
+
+                    def _rej_ok(_sym: str, _reason: str = "ok") -> None:
+                        # Terminal non-reject outcome (e.g., pending created / signal emitted).
+                        _rej_track(_sym, _reason, rejected=False)
 
                     logger.info("[mid] tick start TOP_N=%s interval=%ss pool=%s scanned=%s (MID_TOP_N_SYMBOLS=%s)", top_n, interval, _mid_pool, _mid_scanned, top_n_symbols)
                     logger.info("[mid][scanner] symbols loaded: %s (pool=%s)", _mid_scanned, _mid_pool)
@@ -15362,8 +15385,16 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0","false","no","off")
                         if pending_enabled:
                             try:
-                                if self.can_add_mid_pending(sym, direction=direction, market=market):
-                                    key = f"{market}:{sym}:{direction}"
+                                # Normalize direction/market (avoid Enum-ish strings like 'Direction.SHORT')
+                                diru = str(direction or "").upper().strip()
+                                if diru.endswith(".SHORT") or "SHORT" in diru:
+                                    diru = "SHORT"
+                                elif diru.endswith(".LONG") or "LONG" in diru:
+                                    diru = "LONG"
+                                marketu = str(market or "").upper().strip() or "SPOT"
+
+                                if self.can_add_mid_pending(sym, direction=diru, market=marketu):
+                                    key = f"{marketu}:{sym}:{diru}"
 
                                     # Build smarter entry zone from OB/FVG/Channel (optional)
                                     z, z_src = _mid_build_entry_zone(chosen_df5, chosen_df30, chosen_df1h, direction=direction, entry=float(entry))
@@ -15438,9 +15469,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
 
                                     rec = {
                                         "key": key,
-                                        "market": market,
+                                        "market": marketu,
                                         "symbol": sym,
-                                        "direction": direction,
+                                        "direction": diru,
                                         "timeframe": f"{tf_trigger}/{tf_mid}/{tf_trend}",
                                         "entry": float(entry),
                                         "entry_low": entry_low,
@@ -15468,7 +15499,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "min_confidence": int(os.getenv("MID_MIN_CONFIDENCE", "0") or 0),
                                     }
                                     await self.add_mid_pending(rec)
-                                    self.mark_mid_pending(sym, direction=direction, market=market)
+                                    self.mark_mid_pending(sym, direction=diru, market=marketu)
                                     _mid_stage_add("passed_ta", 1)
                                     _mid_stage_add("created_pending", 1)
                                     try:
@@ -15476,6 +15507,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         _mid_metrics_inc("pending_created", 1)
                                     except Exception:
                                         pass
+
+                                    # Count this symbol as a terminal non-reject outcome for the digest.
+                                    _rej_ok(sym, "pending_created")
                                 else:
                                     _mid_f_cooldown += 1  # pending add cooldown; not a rejection
                                     _pending_skip(sym, "cooldown")
@@ -15500,7 +15534,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             except Exception:
                                 pass
                             await asyncio.sleep(2)
-                            _rej_add(sym, "trap_block")
+                            # Terminal non-reject outcome for the digest.
+                            _rej_ok(sym, "emitted")
             except Exception:
                 logger.exception("[mid] scanner_loop_mid error")
 
