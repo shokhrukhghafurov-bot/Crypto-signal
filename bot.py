@@ -2836,6 +2836,67 @@ async def status_text(uid: int, *, include_subscribed: bool = False, include_hin
 
     return "\n".join(out_lines)
 
+
+async def _perf_today_fallback(user_id: int, market: str) -> dict:
+    """Compatibility shim: Backend.perf_today may be missing or have a different signature."""
+    fn = getattr(backend, "perf_today", None)
+    if callable(fn):
+        try:
+            return await fn(int(user_id), str(market))
+        except TypeError:
+            # Older builds exposed global perf_today(market)
+            return await fn(str(market))
+    tz = ZoneInfo(TZ_NAME)
+    now_tz = dt.datetime.now(tz)
+    start_tz = now_tz.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_tz = start_tz + dt.timedelta(days=1)
+    start = start_tz.astimezone(dt.timezone.utc)
+    end = end_tz.astimezone(dt.timezone.utc)
+    return await db_store.perf_bucket(int(user_id), (market or "FUTURES").upper(), since=start, until=end)
+
+async def _perf_week_fallback(user_id: int, market: str) -> dict:
+    fn = getattr(backend, "perf_week", None)
+    if callable(fn):
+        try:
+            return await fn(int(user_id), str(market))
+        except TypeError:
+            return await fn(str(market))
+    tz = ZoneInfo(TZ_NAME)
+    now_tz = dt.datetime.now(tz)
+    start_tz = (now_tz - dt.timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_tz = now_tz
+    start = start_tz.astimezone(dt.timezone.utc)
+    end = end_tz.astimezone(dt.timezone.utc)
+    return await db_store.perf_bucket(int(user_id), (market or "FUTURES").upper(), since=start, until=end)
+
+async def _report_daily_fallback(user_id: int, market: str, days: int, tz: str) -> list[dict]:
+    fn = getattr(backend, "report_daily", None)
+    if callable(fn):
+        try:
+            return await fn(int(user_id), str(market), int(days), tz=str(tz))
+        except TypeError:
+            return await fn(int(user_id), str(market), int(days))
+    return await db_store.daily_report(int(user_id), (market or "FUTURES").upper(), days=int(days), tz=str(tz))
+
+async def _report_weekly_fallback(user_id: int, market: str, weeks: int, tz: str) -> list[dict]:
+    fn = getattr(backend, "report_weekly", None)
+    if callable(fn):
+        try:
+            return await fn(int(user_id), str(market), int(weeks), tz=str(tz))
+        except TypeError:
+            return await fn(int(user_id), str(market), int(weeks))
+    return await db_store.weekly_report(int(user_id), (market or "FUTURES").upper(), weeks=int(weeks), tz=str(tz))
+
+async def _get_user_trades_fallback(user_id: int, limit: int = 50) -> list[dict]:
+    fn = getattr(backend, "get_user_trades", None)
+    if callable(fn):
+        try:
+            return await fn(int(user_id))
+        except TypeError:
+            return await fn(int(user_id), limit=int(limit))
+    return await db_store.list_user_trades(int(user_id), include_closed=False, limit=int(limit))
+
+
 async def stats_text(uid: int) -> str:
     """Render trading statistics for the user from Postgres (backend-only)."""
     # Used by nested helpers below
@@ -2845,16 +2906,16 @@ async def stats_text(uid: int) -> str:
     tz_name = TZ_NAME
 
     # ---- buckets ----
-    spot_today = await backend.perf_today(uid, "SPOT")
-    fut_today = await backend.perf_today(uid, "FUTURES")
-    spot_week = await backend.perf_week(uid, "SPOT")
-    fut_week = await backend.perf_week(uid, "FUTURES")
+    spot_today = await _perf_today_fallback(uid, "SPOT")
+    fut_today = await _perf_today_fallback(uid, "FUTURES")
+    spot_week = await _perf_week_fallback(uid, "SPOT")
+    fut_week = await _perf_week_fallback(uid, "FUTURES")
 
-    spot_days = await backend.report_daily(uid, "SPOT", 7, tz=tz_name)
-    fut_days = await backend.report_daily(uid, "FUTURES", 7, tz=tz_name)
+    spot_days = await _report_daily_fallback(uid, "SPOT", 7, tz=tz_name)
+    fut_days = await _report_daily_fallback(uid, "FUTURES", 7, tz=tz_name)
 
-    spot_weeks = await backend.report_weekly(uid, "SPOT", 4, tz=tz_name)
-    fut_weeks = await backend.report_weekly(uid, "FUTURES", 4, tz=tz_name)
+    spot_weeks = await _report_weekly_fallback(uid, "SPOT", 4, tz=tz_name)
+    fut_weeks = await _report_weekly_fallback(uid, "FUTURES", 4, tz=tz_name)
 
     # ---- formatting helpers ----
     def block_title(market: str) -> str:
@@ -3183,64 +3244,14 @@ async def notify_handler(call: types.CallbackQuery) -> None:
             except Exception:
                 pass
 
-        # performance (separate Spot / Futures)
-        spot_today = await backend.perf_today("SPOT")
-        fut_today = await backend.perf_today("FUTURES")
-        spot_week = await backend.perf_week("SPOT")
-        fut_week = await backend.perf_week("FUTURES")
-
         try:
-            spot_daily = backend.report_daily("SPOT", 7)
-            fut_daily = backend.report_daily("FUTURES", 7)
-            spot_weekly = backend.report_weekly("SPOT", 4)
-            fut_weekly = backend.report_weekly("FUTURES", 4)
-        except Exception:
-            spot_daily, fut_daily, spot_weekly, fut_weekly = [], [], [], []
-
-        spot_daily_nz = [x for x in spot_daily if "trades=0" not in x]
-        fut_daily_nz = [x for x in fut_daily if "trades=0" not in x]
-        spot_weekly_nz = [x for x in spot_weekly if "trades=0" not in x]
-        fut_weekly_nz = [x for x in fut_weekly if "trades=0" not in x]
-
-        parts = []
-        parts.append(tr(uid, "stats_title"))
-        parts.append("")
-        parts.append(tr(uid, "perf_today"))
-        parts.append("🟢 " + tr(uid, "lbl_spot"))
-        parts.append(_fmt_perf(uid, spot_today))
-        parts.append("")
-        parts.append("🔴 " + tr(uid, "lbl_futures"))
-        parts.append(_fmt_perf(uid, fut_today))
-        parts.append("")
-        parts.append(tr(uid, "perf_week"))
-        parts.append("🟢 " + tr(uid, "lbl_spot"))
-        parts.append(_fmt_perf(uid, spot_week))
-        parts.append("")
-        parts.append("🔴 " + tr(uid, "lbl_futures"))
-        parts.append(_fmt_perf(uid, fut_week))
-        parts.append("")
-        parts.append(tr(uid, "daily_title"))
-        parts.append("🟢 " + tr(uid, "lbl_spot") + ":")
-        parts.append("\n".join(spot_daily_nz) if spot_daily_nz else tr(uid, "no_closed"))
-        parts.append("")
-        parts.append("🔴 " + tr(uid, "lbl_futures") + ":")
-        parts.append("\n".join(fut_daily_nz) if fut_daily_nz else tr(uid, "no_closed"))
-        parts.append("")
-        parts.append(tr(uid, "weekly_title"))
-        parts.append("🟢 " + tr(uid, "lbl_spot") + ":")
-        parts.append("\n".join(spot_weekly_nz) if spot_weekly_nz else tr(uid, "no_closed"))
-        parts.append("")
-        parts.append("🔴 " + tr(uid, "lbl_futures") + ":")
-        parts.append("\n".join(fut_weekly_nz) if fut_weekly_nz else tr(uid, "no_closed"))
-        parts.append("")
-        parts.append(tr(uid, "tip_closed"))
-        txt = "\n".join(parts)
-
-        kb = InlineKeyboardBuilder()
-        kb.button(text=tr(uid, "refresh"), callback_data="menu:stats")
-        kb.button(text=tr(uid, "back"), callback_data="menu:back")
-        kb.adjust(2)
-        await _render_in_place(call, txt, kb.as_markup())
+            txt = await stats_text(uid)
+        except Exception as e:
+            logger.exception("menu:stats failed for uid=%s", uid)
+            txt = tr(uid, "stats_error") if ("stats_error" in I18N.get(get_lang(uid), {})) else ("Ошибка статистики. Попробуй позже.")
+            if _is_admin(uid):
+                txt += f"\n\nERR: {type(e).__name__}: {e}"
+        await safe_edit(call.message, txt, menu_kb(uid))
         return
 
     if action == "back":
@@ -3998,7 +4009,7 @@ async def trades_page(call: types.CallbackQuery) -> None:
     except Exception:
         offset = 0
 
-    all_trades = await backend.get_user_trades(call.from_user.id)
+    all_trades = await _get_user_trades_fallback(call.from_user.id)
     if not all_trades:
         await safe_send(call.from_user.id, tr(call.from_user.id, "my_trades_empty"), reply_markup=menu_kb(call.from_user.id))
         return
