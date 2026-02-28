@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-02-28_v18_far_pending"
+MID_BUILD_TAG = "MID_BUILD_2026-02-28_v20_trap2level"
 
 import asyncio
 import json
@@ -8378,35 +8378,18 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         except Exception:
             pass
 
-        # If user wants *all* filters only after setup (pending/trigger model),
-        # do NOT reject setups during SCAN due to trap flags. We will enforce trap again at TRIGGER.
-        _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
-        _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
-        _phase = "scan"
+        # Hard trap is enforced at SETUP (before creating pending) to prevent storing trap setups.
+        _stage = "trap"
         try:
-            _phase = str(_MID_EVAL_PHASE.get() or "scan")
+            _tr = str(trap_reason)
+            if "post_impulse" in _tr:
+                _stage = "impulse"
+            elif ("weak_extreme" in _tr) or ("near_" in _tr) or ("extreme" in _tr):
+                _stage = "extreme"
         except Exception:
-            _phase = "scan"
-        if _pending_enabled and _postsetup_only and _phase == "scan":
-            # Mark as risk, but keep the setup.
-            try:
-                if diag is not None:
-                    diag.setdefault("risk_flags", [])
-                    diag["risk_flags"].append(f"trap:{_mid_trap_reason_key(str(trap_reason))}")
-            except Exception:
-                pass
-        else:
-            _stage = "trap"
-            try:
-                _tr = str(trap_reason)
-                if "post_impulse" in _tr:
-                    _stage = "impulse"
-                elif ("weak_extreme" in _tr) or ("near_" in _tr) or ("extreme" in _tr):
-                    _stage = "extreme"
-            except Exception:
-                pass
-            _fail(_stage, str(trap_reason))
-            return None
+            pass
+        _fail(_stage, str(trap_reason))
+        return None
 
 # Quality gate: avoid choppy markets (helps TP2 hit-rate)
     try:
