@@ -10336,6 +10336,115 @@ class Backend:
         self.health_tick_cb = None
 
 
+async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | None, str]:
+    """Best-effort symbol existence check across supported exchanges.
+
+    Returns: (ok, provider, normalized_symbol)
+
+    - Accepts BTC, BTCUSDT, btc/usdt, etc.
+    - Tries quick REST price lookups on: Binance (spot+futures), Bybit (spot+linear), OKX (spot+swap), MEXC (spot), Gate.io (spot).
+    - Does NOT guarantee candle availability for every timeframe, but filters out obvious typos.
+    """
+    raw0 = (symbol or "").strip()
+    raw = raw0.upper().strip()
+    raw = raw.replace("/", "").replace("-", "").replace(" ", "")
+    raw = re.sub(r"[^A-Z0-9]", "", raw)
+    raw = raw.replace("USDTUSDT", "USDT").replace("USDCUSDC", "USDC")
+    if not raw:
+        return False, None, ""
+
+    # Default quote
+    if raw.endswith("USDT") or raw.endswith("USDC"):
+        sym = raw
+    else:
+        sym = raw + "USDT"
+
+    # Local helper for MEXC / Gate.io (keep timeouts short)
+    async def _mexc_price(sym_: str) -> float | None:
+        try:
+            url = "https://api.mexc.com/api/v3/ticker/price"
+            timeout = aiohttp.ClientTimeout(total=6)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(url, params={"symbol": sym_}) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json()
+            p = data.get("price") if isinstance(data, dict) else None
+            return float(p) if p is not None else None
+        except Exception:
+            return None
+
+    async def _gateio_price(sym_: str) -> float | None:
+        try:
+            # Gate pair format: BASE_USDT
+            base = sym_[:-4] if sym_.endswith("USDT") else sym_
+            pair = f"{base}_USDT"
+            url = "https://api.gateio.ws/api/v4/spot/tickers"
+            timeout = aiohttp.ClientTimeout(total=6)
+            async with aiohttp.ClientSession(timeout=timeout) as s:
+                async with s.get(url, params={"currency_pair": pair}) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json()
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                p = data[0].get("last")
+                return float(p) if p is not None else None
+            return None
+        except Exception:
+            return None
+
+    # Try providers in priority order, fast-exit on first hit.
+    try:
+        p = await self._fetch_rest_price("SPOT", sym)
+        if p is not None and p > 0:
+            return True, "BINANCE_SPOT", sym
+    except Exception:
+        pass
+    try:
+        p = await self._fetch_rest_price("FUTURES", sym)
+        if p is not None and p > 0:
+            return True, "BINANCE_FUTURES", sym
+    except Exception:
+        pass
+    try:
+        p = await self._fetch_bybit_price("SPOT", sym)
+        if p is not None and p > 0:
+            return True, "BYBIT_SPOT", sym
+    except Exception:
+        pass
+    try:
+        p = await self._fetch_bybit_price("FUTURES", sym)
+        if p is not None and p > 0:
+            return True, "BYBIT_LINEAR", sym
+    except Exception:
+        pass
+    try:
+        p = await self._fetch_okx_price("SPOT", sym)
+        if p is not None and p > 0:
+            return True, "OKX_SPOT", sym
+    except Exception:
+        pass
+    try:
+        p = await self._fetch_okx_price("FUTURES", sym)
+        if p is not None and p > 0:
+            return True, "OKX_SWAP", sym
+    except Exception:
+        pass
+    try:
+        p = await self._rest_limiter.run("mexc", lambda: _mexc_price(sym))
+        if p is not None and p > 0:
+            return True, "MEXC_SPOT", sym
+    except Exception:
+        pass
+    try:
+        p = await self._rest_limiter.run("gateio", lambda: _gateio_price(sym))
+        if p is not None and p > 0:
+            return True, "GATEIO_SPOT", sym
+    except Exception:
+        pass
+
+    return False, None, sym
+
 
     def set_mid_trap_sink(self, cb) -> None:
         """Register sink for MID trap events (used by bot to build periodic digest (>=6h))."""
