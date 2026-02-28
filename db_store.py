@@ -128,12 +128,15 @@ async def ensure_schema() -> None:
           value JSONB NOT NULL DEFAULT '{}'::jsonb,
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
-        """
+        """)
 
-        # Index for maintenance / diagnostics
-        await conn.execute("""
-        CREATE INDEX IF NOT EXISTS kv_store_updated_at_idx ON kv_store(updated_at);
-        """))
+        # Index for maintenance / diagnostics (best-effort)
+        try:
+            await conn.execute("""
+            CREATE INDEX IF NOT EXISTS kv_store_updated_at_idx ON kv_store(updated_at);
+            """)
+        except Exception:
+            pass
 
         
 
