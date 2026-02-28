@@ -364,7 +364,7 @@ try:
             last = float(m.get(sym, 0.0) or 0.0)
             return (_time.time() - last) >= float(cd or 0.0)
 
-        def _mark_emitted_mid(self, sym):
+        def _mark_emitted_mid(self, sym, *args, **kwargs):
             m = getattr(self, "_last_emit_mid", None)
             if m is None:
                 m = {}
