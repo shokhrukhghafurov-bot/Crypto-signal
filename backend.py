@@ -12813,12 +12813,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             # Use only for debugging the pipeline end-to-end.
             pending_instant_emit = os.getenv("MID_PENDING_INSTANT_EMIT", "0").strip().lower() in ("1","true","yes","on")
             instant_ignore_zone = os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0").strip().lower() in ("1","true","yes","on")
-
-            # log config once per poll (helps detect env mismatch)
-            try:
-                logger.info("[mid][pending][cfg] instant_emit=%s ignore_zone=%s", int(bool(pending_instant_emit)), int(bool(instant_ignore_zone)))
-            except Exception:
-                pass
             keep: list[dict] = []
             any_wait = False
             # --- per-poll diagnostics counters ---
@@ -12910,15 +12904,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         if price is None or not (float(price) > 0):
                             price = px_close
                     except Exception:
-                        # no live price and no candle close -> cannot evaluate now
-                        try:
-                            _pending_mark_fail(it, "price_unavailable", now)
-                        except Exception:
-                            pass
-                        try:
-                            logger.warning("[mid][pending] price unavailable sym=%s trade=%s ex=%s market=%s", sym, sym_trade, src_ex, market)
-                        except Exception:
-                            pass
                         keep.append(it)
                         any_wait = True
                         continue
@@ -13201,7 +13186,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 ts=time.time(),
                             )
 
+                            try:
                             self.mark_emitted_mid(sym, sig.direction, sig.market)
+                        except TypeError:
+                            # compat shim may expose mark_emitted_mid(symbol) only
+                            try:
+                                self.mark_emitted_mid(sym)
+                            except Exception:
+                                pass
                             self.last_signal = sig
                             if sig.market == "SPOT":
                                 self.last_spot_signal = sig
@@ -13220,12 +13212,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 pass
                             # emitted: do not keep
                             continue
-                        except Exception as e:
+                        except Exception:
                             # If instant emit fails for any reason, fall back to normal path.
-                            try:
-                                logger.error("[mid][pending] INSTANT_EMIT failed %s %s %s err=%s", sym, market, direction, str(e)[:200], exc_info=True)
-                            except Exception:
-                                pass
                             pass
 
                     # Smart delete (terminal invalidation): if higher-timeframe structure
@@ -13455,7 +13443,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         ts=time.time(),
                     )
 
-                    self.mark_emitted_mid(sym, sig.direction, sig.market)
+                    try:
+                            self.mark_emitted_mid(sym, sig.direction, sig.market)
+                        except TypeError:
+                            # compat shim may expose mark_emitted_mid(symbol) only
+                            try:
+                                self.mark_emitted_mid(sym)
+                            except Exception:
+                                pass
                     self.last_signal = sig
                     if sig.market == "SPOT":
                         self.last_spot_signal = sig
@@ -16706,7 +16701,14 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 _rej_add(sym, "pending_exception")
                             # do NOT emit now
                         else:
+                            try:
                             self.mark_emitted_mid(sym, sig.direction, sig.market)
+                        except TypeError:
+                            # compat shim may expose mark_emitted_mid(symbol) only
+                            try:
+                                self.mark_emitted_mid(sym)
+                            except Exception:
+                                pass
                             self.last_signal = sig
                             if sig.market == "SPOT":
                                 self.last_spot_signal = sig
