@@ -12699,11 +12699,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
     tol_atr = float(os.getenv("MID_PENDING_ENTRY_TOL_ATR", "0.15") or 0.15)
     tol_pct = float(os.getenv("MID_PENDING_ENTRY_TOL_PCT", "0.0018") or 0.0018)
 
-    pending_instant_emit0 = os.getenv("MID_PENDING_INSTANT_EMIT", "0").strip().lower() in ("1","true","yes","on")
-    _igz_default0 = "1" if pending_instant_emit0 else "0"
-    instant_ignore_zone0 = os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", _igz_default0).strip().lower() in ("1","true","yes","on")
-    logger.info("[mid][pending] trigger loop started poll=%.2fs ttl=%.1fmin tol_atr=%.3f tol_pct=%.4f instant_emit=%s ignore_zone=%s",
-                poll, ttl_min, tol_atr, tol_pct, int(pending_instant_emit0), int(instant_ignore_zone0))
+    logger.info("[mid][pending] trigger loop started poll=%.2fs ttl=%.1fmin tol_atr=%.3f tol_pct=%.4f",
+                poll, ttl_min, tol_atr, tol_pct)
 
     # Pending persistence is already in Postgres (kv_store key 'mid_pending').
     # Here we track trigger attempts/fails and prune noisy pendings automatically.
@@ -12815,9 +12812,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             # skipping ALL re-checks (TA reconfirm, blocks, trap, post-setup filters).
             # Use only for debugging the pipeline end-to-end.
             pending_instant_emit = os.getenv("MID_PENDING_INSTANT_EMIT", "0").strip().lower() in ("1","true","yes","on")
-            # If MID_PENDING_INSTANT_EMIT is enabled, default to ignoring the entry-zone wait unless explicitly disabled.
-            _igz_default = "1" if pending_instant_emit else "0"
-            instant_ignore_zone = os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", _igz_default).strip().lower() in ("1","true","yes","on")
+            instant_ignore_zone = os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0").strip().lower() in ("1","true","yes","on")
+
+            # log config once per poll (helps detect env mismatch)
+            try:
+                logger.info("[mid][pending][cfg] instant_emit=%s ignore_zone=%s", int(bool(pending_instant_emit)), int(bool(instant_ignore_zone)))
+            except Exception:
+                pass
             keep: list[dict] = []
             any_wait = False
             # --- per-poll diagnostics counters ---
@@ -12909,6 +12910,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         if price is None or not (float(price) > 0):
                             price = px_close
                     except Exception:
+                        # no live price and no candle close -> cannot evaluate now
+                        try:
+                            _pending_mark_fail(it, "price_unavailable", now)
+                        except Exception:
+                            pass
+                        try:
+                            logger.warning("[mid][pending] price unavailable sym=%s trade=%s ex=%s market=%s", sym, sym_trade, src_ex, market)
+                        except Exception:
+                            pass
                         keep.append(it)
                         any_wait = True
                         continue
@@ -13210,8 +13220,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 pass
                             # emitted: do not keep
                             continue
-                        except Exception:
+                        except Exception as e:
                             # If instant emit fails for any reason, fall back to normal path.
+                            try:
+                                logger.error("[mid][pending] INSTANT_EMIT failed %s %s %s err=%s", sym, market, direction, str(e)[:200], exc_info=True)
+                            except Exception:
+                                pass
                             pass
 
                     # Smart delete (terminal invalidation): if higher-timeframe structure
