@@ -4231,7 +4231,12 @@ async def trade_view(call: types.CallbackQuery) -> None:
         back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
-    t = await backend.get_trade_live_by_id(call.from_user.id, trade_id)
+    # Backward-compat: some deployments may not yet have Backend.get_trade_live_by_id
+    if hasattr(backend, "get_trade_live_by_id"):
+        t = await backend.get_trade_live_by_id(call.from_user.id, trade_id)
+    else:
+        # Fallback: show stored trade without live price enrichment
+        t = await db_store.get_trade_by_id(int(call.from_user.id), int(trade_id))
     if not t:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
         return
@@ -4246,7 +4251,10 @@ async def trade_refresh(call: types.CallbackQuery) -> None:
         back_offset = int(parts[3]) if len(parts) > 3 else 0
     except Exception:
         return
-    t = await backend.get_trade_live_by_id(call.from_user.id, trade_id)
+    if hasattr(backend, "get_trade_live_by_id"):
+        t = await backend.get_trade_live_by_id(call.from_user.id, trade_id)
+    else:
+        t = await db_store.get_trade_by_id(int(call.from_user.id), int(trade_id))
     if not t:
         await safe_send(call.from_user.id, tr(call.from_user.id, "trade_not_found"), reply_markup=menu_kb(call.from_user.id))
         return
@@ -4281,7 +4289,10 @@ async def trade_orig(call: types.CallbackQuery) -> None:
     except Exception:
         return
 
-    t = await backend.get_trade_live_by_id(call.from_user.id, trade_id)
+    if hasattr(backend, "get_trade_live_by_id"):
+        t = await backend.get_trade_live_by_id(call.from_user.id, trade_id)
+    else:
+        t = await db_store.get_trade_by_id(int(call.from_user.id), int(trade_id))
     text = (t.get("orig_text") if isinstance(t, dict) else None) if t else None
     if not text:
         await safe_send(call.from_user.id, tr(call.from_user.id, "sig_orig_title") + ": " + tr(call.from_user.id, "lbl_none"), reply_markup=menu_kb(call.from_user.id))
