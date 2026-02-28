@@ -14891,7 +14891,7 @@ except Exception:
 return None
                 
                 # got non-empty candles
-                break
+                        pass  # removed invalid break
             else:
                 # all limits empty for this retry iteration
                 last = __import__('pandas').DataFrame()
