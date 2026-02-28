@@ -12870,8 +12870,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             _mid_reject_add("ttl_expired")
                         except Exception:
                             pass
-                                                _pending_clear_cooldown(it)
-continue
+                        _pending_clear_cooldown(it)
+                        continue
 
                     # load candles (also gives fallback price)
                     df5 = await self.load_candles(sym_candles, "5m", market)
