@@ -12153,20 +12153,40 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
                                 return False
 
                         
-                        # --- HARD BLOCK: FUTURES signal must have a real futures contract on executable venues ---
-                        # If choose_market() selected FUTURES but the symbol has no futures instrument on
-                        # Binance/Bybit/OKX, we skip emitting this signal. (No auto-downgrade to SPOT.)
+                        # --- FUTURES contract existence check (policy-controlled) ---
+                        # Why this exists:
+                        #   - Some symbols appear in TA scan but are not executable as futures on Binance/Bybit/OKX.
+                        # Why it can be problematic:
+                        #   - In some deployments REST endpoints may be blocked/ratelimited, causing false "no contract".
+                        #
+                        # Policy via env MID_FUTURES_CONTRACT_CHECK:
+                        #   OFF        -> do not check
+                        #   PERMISSIVE -> if all checks fail, allow but add risk note
+                        #   STRICT     -> if all checks fail, skip
                         if market == "FUTURES":
-                            try:
-                                _fut_ok = await asyncio.gather(_pair_exists("BINANCE"), _pair_exists("BYBIT"), _pair_exists("OKX"))
-                                if not any(bool(x) for x in _fut_ok):
-                                    logger.info("[scanner] skip %s FUTURES: no contract on BINANCE/BYBIT/OKX (best_source=%s)", sym, best_name)
-                                    _rej_add(sym, "candles_unavailable")
-                                    continue
-                            except Exception as _e:
-                                logger.info("[scanner] skip %s FUTURES: futures existence check failed: %s", sym, _e)
-                                _rej_add(sym, "candles_unavailable")
-                                continue
+                            _mode = (os.getenv("MID_FUTURES_CONTRACT_CHECK", "PERMISSIVE") or "PERMISSIVE").upper().strip()
+                            if _mode not in ("OFF", "PERMISSIVE", "STRICT"):
+                                _mode = "PERMISSIVE"
+                            if _mode != "OFF":
+                                try:
+                                    _fut_ok = await asyncio.gather(_pair_exists("BINANCE"), _pair_exists("BYBIT"), _pair_exists("OKX"))
+                                    if not any(bool(x) for x in _fut_ok):
+                                        if _mode == "STRICT":
+                                            logger.info("[scanner] skip %s FUTURES: no contract on BINANCE/BYBIT/OKX (best_source=%s)", sym, best_name)
+                                            _rej_add(sym, "no_futures_contract")
+                                            continue
+                                        else:
+                                            # PERMISSIVE: do not block the signal, but clearly mark it.
+                                            risk_notes.append("⚠️ Futures contract check failed (REST blocked/unknown).")
+                                            logger.info("[scanner] warn %s FUTURES: contract check failed (allowing, mode=PERMISSIVE) best_source=%s", sym, best_name)
+                                except Exception as _e:
+                                    if _mode == "STRICT":
+                                        logger.info("[scanner] skip %s FUTURES: futures existence check failed (STRICT): %s", sym, _e)
+                                        _rej_add(sym, "no_futures_contract")
+                                        continue
+                                    else:
+                                        risk_notes.append("⚠️ Futures contract check errored (REST blocked/unknown).")
+                                        logger.info("[scanner] warn %s FUTURES: futures existence check errored (allowing, mode=PERMISSIVE): %s", sym, _e)
 
 # Exchanges where the instrument exists for the given market.
                         # FUTURES: only executable futures venues (Binance/Bybit/OKX)
@@ -15969,20 +15989,34 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 return False
 
                     
-                        # --- HARD BLOCK: FUTURES signal must have a real futures contract on executable venues ---
-                        # If choose_market() selected FUTURES but the symbol has no futures instrument on
-                        # Binance/Bybit/OKX, we skip emitting this signal. (No auto-downgrade to SPOT.)
+                        # --- FUTURES contract existence check (policy-controlled) ---
+                        # Policy via env MID_FUTURES_CONTRACT_CHECK:
+                        #   OFF        -> do not check
+                        #   PERMISSIVE -> if all checks fail, allow but add risk note
+                        #   STRICT     -> if all checks fail, skip
                         if market == "FUTURES":
-                            try:
-                                _fut_ok = await asyncio.gather(_pair_exists("BINANCE"), _pair_exists("BYBIT"), _pair_exists("OKX"))
-                                if not any(bool(x) for x in _fut_ok):
-                                    logger.info("[scanner] skip %s FUTURES: no contract on BINANCE/BYBIT/OKX (best_source=%s)", sym, best_name)
-                                    _rej_add(sym, "candles_unavailable")
-                                    continue
-                            except Exception as _e:
-                                logger.info("[scanner] skip %s FUTURES: futures existence check failed: %s", sym, _e)
-                                _rej_add(sym, "candles_unavailable")
-                                continue
+                            _mode = (os.getenv("MID_FUTURES_CONTRACT_CHECK", "PERMISSIVE") or "PERMISSIVE").upper().strip()
+                            if _mode not in ("OFF", "PERMISSIVE", "STRICT"):
+                                _mode = "PERMISSIVE"
+                            if _mode != "OFF":
+                                try:
+                                    _fut_ok = await asyncio.gather(_pair_exists("BINANCE"), _pair_exists("BYBIT"), _pair_exists("OKX"))
+                                    if not any(bool(x) for x in _fut_ok):
+                                        if _mode == "STRICT":
+                                            logger.info("[scanner] skip %s FUTURES: no contract on BINANCE/BYBIT/OKX (best_source=%s)", sym, best_name)
+                                            _rej_add(sym, "no_futures_contract")
+                                            continue
+                                        else:
+                                            risk_notes.append("⚠️ Futures contract check failed (REST blocked/unknown).")
+                                            logger.info("[scanner] warn %s FUTURES: contract check failed (allowing, mode=PERMISSIVE) best_source=%s", sym, best_name)
+                                except Exception as _e:
+                                    if _mode == "STRICT":
+                                        logger.info("[scanner] skip %s FUTURES: futures existence check failed (STRICT): %s", sym, _e)
+                                        _rej_add(sym, "no_futures_contract")
+                                        continue
+                                    else:
+                                        risk_notes.append("⚠️ Futures contract check errored (REST blocked/unknown).")
+                                        logger.info("[scanner] warn %s FUTURES: futures existence check errored (allowing, mode=PERMISSIVE): %s", sym, _e)
 
 # Exchanges where the instrument exists for the given market.
                         _ex_order = ['BINANCE', 'BYBIT', 'OKX'] if (market == 'FUTURES' or not enable_secondary) else ['BINANCE', 'BYBIT', 'OKX', 'GATEIO', 'MEXC']
