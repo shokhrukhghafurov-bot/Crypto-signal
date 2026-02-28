@@ -12316,13 +12316,13 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
         hi += pad
 
         width = hi - lo
-if width > max_w:
-    if fallback_enabled:
-        half = max(0.0, fallback_half_atr * atr)
-        half = min(half, float(entry) * fallback_max_pct)
-        if half > 0:
-            return ((float(entry) - half, float(entry) + half), "fallback")
-    return (None, "too_wide")
+        if width > max_w:
+            if fallback_enabled:
+                half = max(0.0, fallback_half_atr * atr)
+                half = min(half, float(entry) * fallback_max_pct)
+                if half > 0:
+                    return ((float(entry) - half, float(entry) + half), "fallback")
+            return (None, "too_wide")
 
         if width < min_w:
             mid = (lo + hi) / 2.0
@@ -12330,17 +12330,17 @@ if width > max_w:
             hi = mid + min_w / 2.0
 
         # Ensure entry is not far away from zone (avoid random far zone)
-dist_mid = abs(((lo + hi) / 2.0) - float(entry))
-max_dist = max(max_dist_atr * atr, float(entry) * 0.01)
-if dist_mid > max_dist:
-    if fallback_enabled:
-        # fallback: narrow zone around entry (or current price proxy) using ATR
-        half = max(0.0, fallback_half_atr * atr)
-        # also cap by pct of price
-        half = min(half, float(entry) * fallback_max_pct)
-        if half > 0:
-            return ((float(entry) - half, float(entry) + half), "fallback")
-    return (None, "far")
+        dist_mid = abs(((lo + hi) / 2.0) - float(entry))
+        max_dist = max(max_dist_atr * atr, float(entry) * 0.01)
+        if dist_mid > max_dist:
+            if fallback_enabled:
+                # fallback: narrow zone around entry (or current price proxy) using ATR
+                half = max(0.0, fallback_half_atr * atr)
+                # also cap by pct of price
+                half = min(half, float(entry) * fallback_max_pct)
+                if half > 0:
+                    return ((float(entry) - half, float(entry) + half), "fallback")
+            return (None, "far")
 
 
         return ((lo, hi), src)
