@@ -4050,35 +4050,6 @@ def _trade_pnl_if_be_after_tp1(t: dict) -> float | None:
     except Exception:
         return None
 
-
-def _fmt_trade_price(v: float | None) -> str:
-    """Adaptive price formatting for very small coins (BONK/SHIB etc).
-
-    Goal: prevent Entry/SL/TP collapsing to the same rounded number.
-    """
-    if v is None:
-        return "—"
-    try:
-        v = float(v)
-    except Exception:
-        return "—"
-    av = abs(v)
-    # Enough decimals to keep levels distinct, but not too noisy for normal coins.
-    if av >= 1:
-        dec = 6
-    elif av >= 0.01:
-        dec = 6
-    elif av >= 0.0001:
-        dec = 8
-    elif av >= 0.000001:
-        dec = 10
-    else:
-        dec = 12
-    try:
-        return f"{v:.{dec}f}"
-    except Exception:
-        return str(v)
-
 def _trade_card_text(uid: int, t: dict) -> str:
     """Unified trade card for /my trades (open trades), matching the PRO card style.
 
@@ -4126,7 +4097,7 @@ def _trade_card_text(uid: int, t: dict) -> str:
         px = None
 
     if px is not None and px > 0:
-        live_lines.append(f"💹 {tr(uid, 'lbl_price_now')}: {_fmt_trade_price(px)}")
+        live_lines.append(f"💹 {tr(uid, 'lbl_price_now')}: {px:.6f}")
         if src:
             live_lines.append(f"🔌 {tr(uid, 'lbl_price_src')}: {src}")
 
@@ -4208,11 +4179,11 @@ def _trade_card_text(uid: int, t: dict) -> str:
             pnl_total=pnl_total,
             live_block=live_block,
             checks_block=checks_block,
-            entry=_fmt_trade_price(entry),
-            sl=_fmt_trade_price(sl_v),
-            tp1=_fmt_trade_price(tp1_v) if tp1_v else "—",
-            tp2=_fmt_trade_price(tp2_v) if tp2_v else "—",
-            be_price=_fmt_trade_price(be_price) if be_price else "—",
+            entry=f"{entry:.6f}",
+            sl=f"{sl_v:.6f}",
+            tp1=f"{tp1_v:.6f}" if tp1_v else "—",
+            tp2=f"{tp2_v:.6f}" if tp2_v else "—",
+            be_price=f"{be_price:.6f}" if be_price else "—",
             opened_time=opened_time,
             event_time=tp1_time,
         )
@@ -4233,10 +4204,10 @@ def _trade_card_text(uid: int, t: dict) -> str:
         rr=rr,
         live_block=live_block,
         checks_block=checks_block,
-        entry=_fmt_trade_price(entry),
-        sl=_fmt_trade_price(sl_v) if sl_v else "—",
-        tp1=_fmt_trade_price(tp1_v) if tp1_v else "—",
-        tp2=_fmt_trade_price(tp2_v) if tp2_v else "—",
+        entry=f"{entry:.6f}",
+        sl=f"{sl_v:.6f}" if sl_v else "—",
+        tp1=f"{tp1_v:.6f}" if tp1_v else "—",
+        tp2=f"{tp2_v:.6f}" if tp2_v else "—",
         be_line="",
         opened_time=opened_time,
     )
