@@ -10373,6 +10373,141 @@ class Backend:
         self.health_tick_cb = None
 
 
+    # ---------------- MID/BOT contract methods (no shims needed) ----------------
+    # These methods are expected by bot.py and some MID scanner builds.
+    # Implement them directly in Backend to keep startup and callbacks stable.
+
+    def next_signal_id(self) -> int:
+        """Return a monotonic signal id (in-memory).
+        NOTE: bot.py allocates DB-backed signal_id for broadcasted signals via db_store.next_signal_id().
+        This counter is mainly used by some scanner builds before broadcast.
+        """
+        try:
+            sid = int(getattr(self, "_signal_seq", 1) or 1)
+        except Exception:
+            sid = 1
+        try:
+            setattr(self, "_signal_seq", sid + 1)
+        except Exception:
+            pass
+        return sid
+
+    def can_emit_mid(self, sym: str, cooldown_sec: float | None = None) -> bool:
+        """Cooldown gate for MID emits.
+        If a native can_emit/mark_emitted exists, prefer it; otherwise use a simple per-symbol timer.
+        """
+        # Prefer native can_emit if present (support multiple signatures)
+        if hasattr(self, "can_emit"):
+            try:
+                return bool(self.can_emit(sym))
+            except TypeError:
+                try:
+                    return bool(self.can_emit(sym, "mid"))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        import os as _os, time as _time
+        cd = cooldown_sec
+        if cd is None:
+            try:
+                cd = float(_os.getenv("MID_EMIT_COOLDOWN_SEC", "0") or 0.0)
+            except Exception:
+                cd = 0.0
+
+        m = getattr(self, "_last_emit_mid", None)
+        if m is None:
+            m = {}
+            try:
+                setattr(self, "_last_emit_mid", m)
+            except Exception:
+                pass
+
+        try:
+            last = float(m.get(sym, 0.0) or 0.0)
+        except Exception:
+            last = 0.0
+        return (_time.time() - last) >= float(cd or 0.0)
+
+    def mark_emitted_mid(self, sym: str, *args, **kwargs) -> None:
+        """Record last emit time for MID cooldown."""
+        import time as _time
+        m = getattr(self, "_last_emit_mid", None)
+        if m is None:
+            m = {}
+            try:
+                setattr(self, "_last_emit_mid", m)
+            except Exception:
+                pass
+        try:
+            m[sym] = _time.time()
+        except Exception:
+            pass
+
+        # Best-effort call native mark_emitted if present
+        if hasattr(self, "mark_emitted"):
+            try:
+                self.mark_emitted(sym)
+            except TypeError:
+                try:
+                    self.mark_emitted(sym, "mid")
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    async def check_signal_openable(self, signal):
+        """Return (allowed, reason_code, current_price).
+        Used by Telegram callback 'opened' to decide whether to allow opening a signal.
+        """
+        try:
+            import os as _os, time as _time
+            now = _time.time()
+            try:
+                ttl = int(_os.getenv("SIGNAL_OPEN_TTL_SECONDS", "1800") or 0)
+            except Exception:
+                ttl = 1800
+
+            try:
+                sig_ts = float(getattr(signal, "ts", 0) or 0)
+            except Exception:
+                sig_ts = 0.0
+
+            # best-effort current price
+            price = 0.0
+            if hasattr(self, "_get_price"):
+                try:
+                    price = float(await self._get_price(signal))
+                except Exception:
+                    price = 0.0
+
+            if sig_ts and ttl > 0 and (now - sig_ts) > ttl:
+                return False, "TIME", float(price)
+
+            return True, "OK", float(price)
+        except Exception:
+            return True, "OK", 0.0
+
+    async def open_trade(self, user_id: int, sig, orig_text: str = "") -> bool:
+        """Persist user 'opened' action to DB. Returns True if inserted."""
+        try:
+            import db_store as _db
+            inserted, _trade_id = await _db.open_trade_once(
+                user_id=int(user_id),
+                signal_id=int(getattr(sig, "signal_id", 0) or getattr(sig, "id", 0) or 0),
+                market=str(getattr(sig, "market", "") or "").upper() or "FUTURES",
+                symbol=str(getattr(sig, "symbol", "") or "").upper(),
+                side=str(getattr(sig, "direction", "") or getattr(sig, "side", "") or "").upper(),
+                entry=float(getattr(sig, "entry", 0.0) or 0.0),
+                tp1=(float(getattr(sig, "tp1", 0.0)) if getattr(sig, "tp1", None) is not None else None),
+                tp2=(float(getattr(sig, "tp2", 0.0)) if getattr(sig, "tp2", None) is not None else None),
+                sl=(float(getattr(sig, "sl", 0.0)) if getattr(sig, "sl", None) is not None else None),
+                orig_text=orig_text or "",
+            )
+            return bool(inserted)
+        except Exception:
+            return False
 async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | None, str]:
     """Best-effort symbol existence check across supported exchanges.
 
