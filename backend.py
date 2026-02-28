@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-02-28_v13"
+MID_BUILD_TAG = "MID_BUILD_2026-02-28_v14"
 
 import asyncio
 import json
@@ -12227,6 +12227,13 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
 
         # Config: zone mode + caps
         zone_mode = (os.getenv("MID_ZONE_MODE", "STRICT") or "STRICT").strip().upper()
+
+        # If pending model is enabled, prefer a more permissive zone mode by default (retest-style entries).
+        try:
+            if str(os.getenv("MID_PENDING_ENABLED", "0") or "0").strip().lower() in ("1","true","yes","on"):
+                zone_mode = (os.getenv("MID_PENDING_ZONE_MODE", "ACTIVE") or "ACTIVE").strip().upper()
+        except Exception:
+            pass
         if zone_mode not in ("STRICT", "ACTIVE"):
             zone_mode = "STRICT"
 
@@ -12361,13 +12368,13 @@ async def _mid_pending_save(self, items: list[dict]) -> None:
     except Exception:
         pass
 
-async def add_mid_pending(self, rec: dict) -> None:
-    """Upsert pending record by key."""
+async def add_mid_pending(self, rec: dict) -> bool:
+    """Upsert pending record by key. Returns True on success."""
     try:
         items = await self._mid_pending_load()
         key = str(rec.get("key") or "").strip()
         if not key:
-            return
+            return False
         out = []
         replaced = False
         for it in items:
@@ -12386,19 +12393,22 @@ async def add_mid_pending(self, rec: dict) -> None:
         if max_items > 0 and len(out) > max_items:
             out = out[-max_items:]
         await self._mid_pending_save(out)
+        return True
     except Exception:
-        pass
+        return False
 
-async def remove_mid_pending(self, key: str) -> None:
+async def remove_mid_pending(self, key: str) -> bool:
+    """Remove pending by key. Returns True if removed/saved."""
     try:
         k = str(key or "").strip()
         if not k:
-            return
+            return False
         items = await self._mid_pending_load()
         out = [it for it in items if str(it.get("key") or "") != k]
         await self._mid_pending_save(out)
+        return True
     except Exception:
-        pass
+        return False
 
 async def mid_pending_trigger_loop(self, emit_signal_cb):
     """Background loop: checks pending setups and emits a signal only when price reaches entry and TA is still confirmed."""
@@ -15439,15 +15449,20 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "last_fail_reason": "",
                                         "min_confidence": int(os.getenv("MID_MIN_CONFIDENCE", "0") or 0),
                                     }
-                                    await self.add_mid_pending(rec)
-                                    self.mark_mid_pending(sym, direction=direction, market=market)
-                                    _mid_stage_add("passed_ta", 1)
-                                    _mid_stage_add("created_pending", 1)
-                                    try:
-                                        _mid_metrics_inc("setups_found", 1)
-                                        _mid_metrics_inc("pending_created", 1)
-                                    except Exception:
-                                        pass
+                                    _ok = await self.add_mid_pending(rec)
+                                    if _ok:
+                                        self.mark_mid_pending(sym, direction=direction, market=market)
+                                        _mid_stage_add("passed_ta", 1)
+                                        _mid_stage_add("created_pending", 1)
+                                    else:
+                                        _pending_skip(sym, "save_fail")
+                                        logger.warning(f"[mid][pending] save_fail sym={sym} dir={direction} market={market}")
+                                    if _ok:
+                                        try:
+                                            _mid_metrics_inc("setups_found", 1)
+                                            _mid_metrics_inc("pending_created", 1)
+                                        except Exception:
+                                            pass
                                 else:
                                     _mid_f_cooldown += 1  # pending add cooldown; not a rejection
                                     _pending_skip(sym, "cooldown")
