@@ -12438,6 +12438,25 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         attempt_gap_sec = float(os.getenv("MID_PENDING_MIN_ATTEMPT_GAP_SEC", "30") or 30.0)
     except Exception:
         attempt_gap_sec = 30.0
+    # Pending diagnostics
+    try:
+        near_atr = float(os.getenv("MID_PENDING_NEAR_ATR", "0.30") or 0.30)
+    except Exception:
+        near_atr = 0.30
+    try:
+        far_atr = float(os.getenv("MID_PENDING_FAR_ATR", "1.50") or 1.50)
+    except Exception:
+        far_atr = 1.50
+    try:
+        dbg_every = float(os.getenv("MID_PENDING_DEBUG_EVERY_SEC", "30") or 30.0)
+    except Exception:
+        dbg_every = 30.0
+    try:
+        dbg_samples = int(os.getenv("MID_PENDING_DEBUG_SAMPLES", "3") or 3)
+    except Exception:
+        dbg_samples = 3
+    _last_dbg_ts = 0.0
+
     if attempt_gap_sec < 0:
         attempt_gap_sec = 0.0
 
@@ -12485,6 +12504,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             now = time.time()
             keep: list[dict] = []
             any_wait = False
+            # --- per-poll diagnostics counters ---
+            total_n = int(len(items) if isinstance(items, list) else 0)
+            in_zone_n = 0
+            near_n = 0
+            far_n = 0
+            expired_n = 0
+            removed_n = 0
+            attempts_sum = 0
+            fails_sum = 0
+            samples = []  # list of (dist_atr, text)
+
             for it in items:
                 try:
                     sym = str(it.get("symbol") or "")
@@ -12509,6 +12539,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     if (now - created) > ttl_item * 60:
                         try:
                             _mid_metrics_inc("pending_expired", 1)
+                        except Exception:
+                            pass
+                        try:
+                            expired_n += 1
                         except Exception:
                             pass
                         try:
@@ -12577,6 +12611,41 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         use_zone = False
 
+                    # --- zone distance diagnostics (no tolerance) ---
+                    try:
+                        if use_zone:
+                            if float(price) < float(lo):
+                                _dist = float(lo) - float(price)
+                            elif float(price) > float(hi):
+                                _dist = float(price) - float(hi)
+                            else:
+                                _dist = 0.0
+                            _zone_w = float(hi) - float(lo)
+                        else:
+                            _dist = abs(float(price) - float(entry0))
+                            _zone_w = 0.0
+                        _dist_atr = float(_dist) / float(atr_abs) if float(atr_abs) > 0 else 0.0
+                        if _dist <= 0:
+                            in_zone_n += 1
+                        if float(_dist_atr) <= float(near_atr):
+                            near_n += 1
+                        if float(_dist_atr) >= float(far_atr):
+                            far_n += 1
+                        # samples: keep a few farthest pendings for debug
+                        if dbg_samples > 0:
+                            try:
+                                _age_m = (now - created) / 60.0
+                            except Exception:
+                                _age_m = 0.0
+                            try:
+                                _w_atr = float(_zone_w) / float(atr_abs) if (use_zone and float(atr_abs) > 0) else 0.0
+                            except Exception:
+                                _w_atr = 0.0
+                            _txt = f"{sym} {market} {direction} px={float(price):.6g} zone={float(lo):.6g}..{float(hi):.6g} dist_atr={float(_dist_atr):.2f} w_atr={float(_w_atr):.2f} src={str(it.get('entry_zone_src') or '')} age={_age_m:.0f}m flags={it.get('risk_flags', [])}" if use_zone else f"{sym} {market} {direction} px={float(price):.6g} entry={float(entry0):.6g} dist_atr={float(_dist_atr):.2f} age={_age_m:.0f}m"
+                            samples.append((float(_dist_atr), _txt))
+                    except Exception:
+                        pass
+
                     if use_zone:
                         if not (float(price) >= (lo - tol) and float(price) <= (hi + tol)):
                             keep.append(it)
@@ -12608,9 +12677,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             pivot=int(os.getenv("MID_STRUCTURE_PIVOT", "3") or 3),
                         )
                         if str(direction).upper() == "LONG" and struct_1h == "LH-LL":
+                            try:
+                                removed_n += 1
+                            except Exception:
+                                pass
                             _pending_mark_fail(it, "structure_broken", now)
                             continue
                         if str(direction).upper() == "SHORT" and struct_1h == "HH-HL":
+                            try:
+                                removed_n += 1
+                            except Exception:
+                                pass
                             _pending_mark_fail(it, "structure_broken", now)
                             continue
                     except Exception:
@@ -12618,6 +12695,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     # We reached entry/zone: count this as a trigger attempt (persisted in DB kv_store).
                     _pending_mark_attempt(it, now)
+                    try:
+                        attempts_sum += int(it.get('trigger_attempts') or 0)
+                        fails_sum += int(it.get('fail_count') or 0)
+                    except Exception:
+                        pass
+
 
                     # re-confirm TA at trigger moment
                     _ph_tok = None
@@ -12841,6 +12924,24 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             try:
                 if any_wait and keep:
                     _mid_reject_add("pending_wait")
+            except Exception:
+                pass
+            # Periodic per-poll diagnostics (low spam, controlled by MID_PENDING_DEBUG_EVERY_SEC)
+            try:
+                if dbg_every > 0 and (time.time() - float(_last_dbg_ts or 0.0)) >= float(dbg_every):
+                    _last_dbg_ts = time.time()
+                    try:
+                        kept_n = int(len(keep) if isinstance(keep, list) else 0)
+                    except Exception:
+                        kept_n = 0
+                    a_avg = (float(attempts_sum) / float(total_n)) if total_n > 0 else 0.0
+                    f_avg = (float(fails_sum) / float(total_n)) if total_n > 0 else 0.0
+                    logger.info("[mid][pending][tick] total=%s keep=%s in_zone=%s near=%s far=%s expired_now=%s removed_now=%s attempts_avg=%.2f fails_avg=%.2f",
+                                total_n, kept_n, in_zone_n, near_n, far_n, expired_n, removed_n, a_avg, f_avg)
+                    if dbg_samples > 0 and samples:
+                        samples.sort(key=lambda x: x[0], reverse=True)
+                        for _, s in samples[:max(1, dbg_samples)]:
+                            logger.info("[mid][pending][sample] %s", s)
             except Exception:
                 pass
         except Exception:
@@ -15460,9 +15561,48 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     except Exception:
                                         pass
 
+                                    # --- Zone diagnostics at creation (helps debug why pending never triggers) ---
+                                    try:
+                                        _atr0 = None
+                                        try:
+                                            if hasattr(chosen_df5, 'columns') and 'atr' in chosen_df5.columns:
+                                                _atr0 = float(chosen_df5['atr'].astype(float).iloc[-1])
+                                        except Exception:
+                                            _atr0 = None
+                                        try:
+                                            if (_atr0 is None or _atr0 <= 0) and hasattr(chosen_df30, 'columns') and 'atr' in chosen_df30.columns:
+                                                _atr0 = float(chosen_df30['atr'].astype(float).iloc[-1])
+                                        except Exception:
+                                            pass
+                                        if _atr0 is None or _atr0 <= 0:
+                                            _atr0 = float(entry) * 0.001
+                                        _zone_w = float(entry_high) - float(entry_low)
+                                        _zone_w_atr = float(_zone_w) / float(_atr0) if float(_atr0) > 0 else 0.0
+                                        _zone_w_pct = float(_zone_w) / float(entry) if float(entry) > 0 else 0.0
+                                        if float(entry) < float(entry_low):
+                                            _dist0 = float(entry_low) - float(entry)
+                                        elif float(entry) > float(entry_high):
+                                            _dist0 = float(entry) - float(entry_high)
+                                        else:
+                                            _dist0 = 0.0
+                                        _dist0_atr = float(_dist0) / float(_atr0) if float(_atr0) > 0 else 0.0
+                                        _dist0_pct = float(_dist0) / float(entry) if float(entry) > 0 else 0.0
+                                    except Exception:
+                                        _atr0 = float(entry) * 0.001
+                                        _zone_w_atr = 0.0
+                                        _zone_w_pct = 0.0
+                                        _dist0_atr = 0.0
+                                        _dist0_pct = 0.0
+
                                     # FAR-zone handling: allow pending even if entry zone is far from current entry,
                                     # but mark and tighten TTL/limits.
-                                    is_far_zone = str(z_src or "").strip().lower() == "far"
+                                    is_far_zone = (str(z_src or "").strip().lower() == "far")
+                                    try:
+                                        _far_thr = float(os.getenv("MID_PENDING_FAR_DIST_ATR", os.getenv("MID_PENDING_FAR_ATR", "1.5")) or 1.5)
+                                        if float(_dist0_atr) >= float(_far_thr):
+                                            is_far_zone = True
+                                    except Exception:
+                                        pass
                                     if is_far_zone:
                                         try:
                                             if "far_zone" not in risk_flags:
@@ -15488,6 +15628,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "entry_low": entry_low,
                                         "entry_high": entry_high,
                                         "entry_zone_src": str(z_src),
+                                        "atr_at_create": float(_atr0) if ("_atr0" in locals() and _atr0) else float(entry) * 0.001,
+                                        "zone_width_atr": float(_zone_w_atr) if ("_zone_w_atr" in locals()) else 0.0,
+                                        "zone_width_pct": float(_zone_w_pct) if ("_zone_w_pct" in locals()) else 0.0,
+                                        "dist_to_zone_at_create_atr": float(_dist0_atr) if ("_dist0_atr" in locals()) else 0.0,
+                                        "dist_to_zone_at_create_pct": float(_dist0_pct) if ("_dist0_pct" in locals()) else 0.0,
                                         "sl": float(sl),
                                         "tp1": float(tp1),
                                         "tp2": float(tp2),
