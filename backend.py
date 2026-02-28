@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-02-28_v20_trap2level"
+MID_BUILD_TAG = "MID_BUILD_2026-02-28_v25_reverse"
 
 import asyncio
 import json
@@ -12415,6 +12415,83 @@ async def remove_mid_pending(self, key: str) -> None:
     except Exception:
         pass
 
+
+async def remove_mid_pending_symbol(self, symbol: str, market: str = "") -> int:
+    """Remove all pending records for a symbol (optionally within market). Returns removed count."""
+    try:
+        s = str(symbol or "").upper().strip()
+        if not s:
+            return 0
+        mu = (market or "").upper().strip()
+        items = await self._mid_pending_load()
+        out = []
+        removed = 0
+        for it in items:
+            try:
+                if str(it.get("symbol") or "").upper().strip() != s:
+                    out.append(it); continue
+                if mu and str(it.get("market") or "").upper().strip() != mu:
+                    out.append(it); continue
+                removed += 1
+            except Exception:
+                out.append(it)
+        if removed:
+            await self._mid_pending_save(out)
+        return int(removed)
+    except Exception:
+        return 0
+
+async def _mid_get_active_trade(self, symbol: str, market: str = "") -> dict | None:
+    """Best-effort fetch one active trade for a symbol+market from DB (cached a few seconds)."""
+    try:
+        import db_store as _db_store
+        if _db_store.get_pool() is None:
+            return None
+    except Exception:
+        return None
+    try:
+        s = str(symbol or "").upper().strip()
+        if not s:
+            return None
+        mu = (market or "").upper().strip()
+        now = time.time()
+        cache = getattr(self, "_mid_active_trade_cache", None)
+        if cache is None:
+            cache = {"ts": 0.0, "map": {}}
+            self._mid_active_trade_cache = cache
+        ttl = float(os.getenv("MID_ACTIVE_TRADE_CACHE_SEC", "8") or 8.0)
+        if (now - float(cache.get("ts") or 0.0)) > ttl:
+            try:
+                rows = await _db_store.list_active_trades(limit=int(os.getenv("MID_ACTIVE_TRADE_CACHE_LIMIT", "800") or 800))
+            except Exception:
+                rows = []
+            m = {}
+            for r in rows or []:
+                try:
+                    sym = str(r.get("symbol") or "").upper().strip()
+                    mk = str(r.get("market") or "FUTURES").upper().strip()
+                    side = str(r.get("side") or "LONG").upper().strip()
+                    entry = float(r.get("entry") or 0.0)
+                    tid = int(r.get("id") or 0)
+                    # prefer newest id
+                    k = (mk, sym)
+                    prev = m.get(k)
+                    if prev is None or int(prev.get("id") or 0) < tid:
+                        m[k] = {"id": tid, "symbol": sym, "market": mk, "side": side, "entry": entry}
+                except Exception:
+                    continue
+            cache["map"] = m
+            cache["ts"] = now
+        m = cache.get("map") or {}
+        if mu:
+            return m.get((mu, s))
+        # if market not specified, accept any
+        for (mk, sym), v in m.items():
+            if sym == s:
+                return v
+        return None
+    except Exception:
+        return None
 async def mid_pending_trigger_loop(self, emit_signal_cb):
     """Background loop: checks pending setups and emits a signal only when price reaches entry and TA is still confirmed."""
     enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
@@ -15505,7 +15582,86 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     diru = "LONG"
                                 marketu = str(market or "").upper().strip() or "SPOT"
 
-                                if self.can_add_mid_pending(sym, direction=diru, market=marketu):
+                                # --- AUTOTRADE reverse permission (smart mode) ---
+_can_add_pending = self.can_add_mid_pending(sym, direction=diru, market=marketu)
+_reverse_allowed = False
+try:
+    _trade = await self._mid_get_active_trade(sym, marketu)
+except Exception:
+    _trade = None
+if isinstance(_trade, dict) and _trade.get("id"):
+    try:
+        _t_side = str(_trade.get("side") or "").upper().strip() or "LONG"
+    except Exception:
+        _t_side = "LONG"
+    # If an active trade exists on same symbol+market:
+    # - same side: block creating another pending (prevents pyramiding by mistake)
+    # - opposite side: allow only if reversal conditions are met
+    if _t_side == str(diru).upper().strip():
+        _pending_skip(sym, "active_trade_same_side")
+        _mid_f_cooldown += 1
+        _can_add_pending = False
+    else:
+        try:
+            _adx_min = float(os.getenv("MID_REVERSE_ADX_MIN", "25") or 25.0)
+        except Exception:
+            _adx_min = 25.0
+        try:
+            _min_dist_atr = float(os.getenv("MID_REVERSE_MIN_DIST_ATR", "0.7") or 0.7)
+        except Exception:
+            _min_dist_atr = 0.7
+        # structure must be clearly broken versus the active trade side
+        try:
+            _struct0 = str(struct_hhhl_1h or "—")
+        except Exception:
+            _struct0 = "—"
+        _struct_broken = ((_t_side == "LONG" and _struct0 == "LH-LL") or (_t_side == "SHORT" and _struct0 == "HH-HL"))
+        # opposite liquidity sweep must be present (5m)
+        try:
+            _sweep_ok = ((str(diru).upper() == "SHORT" and bool(sweep_short)) or (str(diru).upper() == "LONG" and bool(sweep_long)))
+        except Exception:
+            _sweep_ok = False
+        # ADX must be high enough (1h)
+        try:
+            _adx_ok = (adx1h is not None) and (not np.isnan(float(adx1h))) and float(adx1h) >= float(_adx_min)
+        except Exception:
+            _adx_ok = False
+        # distance from active trade entry must be large enough (in ATR)
+        try:
+            _atr_use = float(_atr0) if (_atr0 is not None and float(_atr0) > 0) else float(entry) * 0.001
+        except Exception:
+            _atr_use = float(entry) * 0.001
+        try:
+            _dist_rev_atr = abs(float(entry) - float(_trade.get("entry") or 0.0)) / float(_atr_use) if float(_atr_use) > 0 else 0.0
+        except Exception:
+            _dist_rev_atr = 0.0
+        if _struct_broken and _adx_ok and _sweep_ok and float(_dist_rev_atr) >= float(_min_dist_atr):
+            _reverse_allowed = True
+            _can_add_pending = True  # bypass cooldown for reversal
+            try:
+                _rmn = await self.remove_mid_pending_symbol(sym, marketu)
+                if int(_rmn or 0) > 0:
+                    logger.info("[mid][pending][reverse] removed_old_pending symbol=%s market=%s n=%s", sym, marketu, _rmn)
+            except Exception:
+                pass
+            try:
+                if "reverse_allowed" not in risk_flags:
+                    risk_flags.append("reverse_allowed")
+            except Exception:
+                pass
+            try:
+                rec["reverse_of_trade_id"] = int(_trade.get("id") or 0)
+                rec["reverse_of_side"] = str(_t_side)
+                rec["reverse_dist_atr"] = float(_dist_rev_atr)
+            except Exception:
+                pass
+        else:
+            _pending_skip(sym, "active_trade_block")
+            _mid_f_cooldown += 1
+            _can_add_pending = False
+
+if _can_add_pending:
+
                                     key = f"{marketu}:{sym}:{diru}"
 
                                     # Build smarter entry zone from OB/FVG/Channel (optional)
@@ -15668,7 +15824,12 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     _rej_ok(sym, "pending_created")
                                 else:
                                     _mid_f_cooldown += 1  # pending add cooldown; not a rejection
-                                    _pending_skip(sym, "cooldown")
+                                    # Do not overwrite a more specific reason (e.g., active_trade_block)
+                                    try:
+                                        if str(sym or "").upper().strip() not in _mid_pending_not_created:
+                                            _pending_skip(sym, "cooldown")
+                                    except Exception:
+                                        _pending_skip(sym, "cooldown")
                                     logger.debug(f"[mid][pending] cooldown skip sym={sym} dir={direction} market={market}")
                             except Exception as e:
                                 logger.exception("[mid][pending][scan] failed to create pending sym=%s dir=%s market=%s: %s", sym, direction, market, e)
