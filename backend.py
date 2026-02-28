@@ -15959,6 +15959,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             else:
                                 risk_note = "ℹ️ Auto-converted: SPOT SHORT → FUTURES"
 
+                        risk_notes = [risk_note] if risk_note else []
+
                         # Exchanges where the symbol exists (used for display and SPOT autotrade routing).
                         async def _pair_exists(ex: str) -> bool:
                             try:
@@ -16017,6 +16019,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     else:
                                         risk_notes.append("⚠️ Futures contract check errored (REST blocked/unknown).")
                                         logger.info("[scanner] warn %s FUTURES: futures existence check errored (allowing, mode=PERMISSIVE): %s", sym, _e)
+
+
+                        # Finalize risk_note with accumulated risk_notes
+                        risk_note = "\n".join(risk_notes).strip()
 
 # Exchanges where the instrument exists for the given market.
                         _ex_order = ['BINANCE', 'BYBIT', 'OKX'] if (market == 'FUTURES' or not enable_secondary) else ['BINANCE', 'BYBIT', 'OKX', 'GATEIO', 'MEXC']
