@@ -6144,8 +6144,13 @@ async def main() -> None:
             else:
                 logger.warning("Backend has no track_loop; skipping")
 
-            logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv("SCAN_INTERVAL_SECONDS",""), os.getenv("TOP_N",""))
-            asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+            
+logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv("SCAN_INTERVAL_SECONDS",""), os.getenv("TOP_N",""))
+_scanner_fn = getattr(backend, "scanner_loop", None) or getattr(backend, "scanner_loop_mid", None)
+if _scanner_fn is None:
+    logger.warning("Backend has no scanner_loop or scanner_loop_mid; skipping")
+else:
+    asyncio.create_task(_scanner_fn(broadcast_signal, broadcast_macro_alert))
 
             # MID components (scanner + pending loop)
             _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
@@ -6190,8 +6195,13 @@ async def main() -> None:
         asyncio.create_task(backend.track_loop(bot))
     else:
         logger.warning("Backend has no track_loop; skipping")
-    logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
-    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+    
+logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv("SCAN_INTERVAL_SECONDS",""), os.getenv("TOP_N",""))
+_scanner_fn = getattr(backend, "scanner_loop", None) or getattr(backend, "scanner_loop_mid", None)
+if _scanner_fn is None:
+    logger.warning("Backend has no scanner_loop or scanner_loop_mid; skipping")
+else:
+    asyncio.create_task(_scanner_fn(broadcast_signal, broadcast_macro_alert))
 
     # ⚡ MID TREND scanner + MID trap digest
     _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
