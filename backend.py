@@ -7191,21 +7191,32 @@ class MultiExchangeData:
 
         if ex == "BINANCE" and mkt == "FUTURES":
             markets = await self._get_binance_futures_markets()
+            # IMPORTANT: be permissive on cold start / transient failures.
+            # If the markets list could not be fetched (empty set), we must NOT mark the symbol unsupported,
+            # otherwise we can brick the scanner for hours (unsupported_cached storm).
+            if not markets:
+                return True
             sym_req = self._binance_futures_symbol_alias(sym)
             return (sym in markets) or (sym_req in markets)
 
         if ex == "BINANCE" and mkt == "SPOT":
             markets = await self._get_binance_spot_markets()
+            if not markets:
+                return True
             return sym in markets
 
         if ex == "BYBIT":
             cat = "linear" if mkt == "FUTURES" else "spot"
             markets = await self._get_bybit_markets(category=cat)
+            if not markets:
+                return True
             return sym in markets
 
         if ex == "OKX":
             it = "SWAP" if mkt == "FUTURES" else "SPOT"
             markets = await self._get_okx_markets(inst_type=it)
+            if not markets:
+                return True
             return sym in markets
 
         return True
@@ -7218,9 +7229,13 @@ class MultiExchangeData:
         if ex == "GATEIO":
             pair = _gate_pair(sym).upper()
             markets = await self._get_gateio_markets()
+            if not markets:
+                return True
             return pair in markets
         if ex == "MEXC":
             markets = await self._get_mexc_markets()
+            if not markets:
+                return True
             return sym in markets
         return True
 
