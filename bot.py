@@ -328,6 +328,69 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 backend = Backend()
 
+
+# --- MID compatibility shims (older/newer backends may miss some methods) ---
+try:
+    import types as _types
+    import time as _time
+    import os as _os
+
+    if not hasattr(backend, "can_emit_mid"):
+        def _can_emit_mid(self, sym, cooldown_sec=None):
+            # Prefer native can_emit if present (support multiple signatures)
+            if hasattr(self, "can_emit"):
+                try:
+                    return self.can_emit(sym)
+                except TypeError:
+                    try:
+                        return self.can_emit(sym, "mid")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            cd = cooldown_sec
+            if cd is None:
+                try:
+                    cd = float(_os.getenv("MID_EMIT_COOLDOWN_SEC", "0") or 0.0)
+                except Exception:
+                    cd = 0.0
+
+            m = getattr(self, "_last_emit_mid", None)
+            if m is None:
+                m = {}
+                setattr(self, "_last_emit_mid", m)
+
+            last = float(m.get(sym, 0.0) or 0.0)
+            return (_time.time() - last) >= float(cd or 0.0)
+
+        def _mark_emitted_mid(self, sym):
+            m = getattr(self, "_last_emit_mid", None)
+            if m is None:
+                m = {}
+                setattr(self, "_last_emit_mid", m)
+            m[sym] = _time.time()
+
+            # Best-effort call native mark_emitted if present
+            if hasattr(self, "mark_emitted"):
+                try:
+                    self.mark_emitted(sym)
+                except TypeError:
+                    try:
+                        self.mark_emitted(sym, "mid")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+        backend.can_emit_mid = _types.MethodType(_can_emit_mid, backend)
+        backend.mark_emitted_mid = _types.MethodType(_mark_emitted_mid, backend)
+        logger.warning("[mid] Backend has no can_emit_mid; installed runtime shim (compat)")
+except Exception:
+    # Never fail startup because of a shim
+    pass
+# --- end MID shims ---
+
 logger.info("[mid][dbg] methods can_add_mid_pending=%s add_mid_pending=%s mid_pending_trigger_loop=%s scanner_loop_mid=%s",
             callable(getattr(backend, "can_add_mid_pending", None)),
             callable(getattr(backend, "add_mid_pending", None)),
@@ -6155,25 +6218,8 @@ async def main() -> None:
             else:
                 logger.warning("Backend has no track_loop; skipping")
 
-
-            logger.info(
-                "Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s",
-                os.getenv("SCAN_INTERVAL_SECONDS", ""),
-                os.getenv("TOP_N", ""),
-            )
-            # Some deployments are MID-only and intentionally do not include the legacy scanner_loop.
-            # Never crash the whole bot because of that.
-            if hasattr(backend, "scanner_loop") and callable(getattr(backend, "scanner_loop")):
-                TASKS["scanner"] = asyncio.create_task(
-                    backend.scanner_loop(broadcast_signal, broadcast_macro_alert),
-                    name="scanner",
-                )
-                _attach_task_monitor("scanner", TASKS["scanner"])
-                _health_mark_ok("scanner")
-            else:
-                logger.warning(
-                    "Backend has no scanner_loop; skipping legacy scanner (MID scanner will still run if enabled)"
-                )
+            logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv("SCAN_INTERVAL_SECONDS",""), os.getenv("TOP_N",""))
+            asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
 
             # MID components (scanner + pending loop)
             _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
@@ -6218,20 +6264,8 @@ async def main() -> None:
         asyncio.create_task(backend.track_loop(bot))
     else:
         logger.warning("Backend has no track_loop; skipping")
-
-    logger.info(
-        "Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s",
-        os.getenv("SCAN_INTERVAL_SECONDS", ""),
-        os.getenv("TOP_N", ""),
-    )
-    # Some deployments are MID-only and intentionally do not include the legacy scanner_loop.
-    # Never crash the whole bot because of that.
-    if hasattr(backend, "scanner_loop") and callable(getattr(backend, "scanner_loop")):
-        asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
-    else:
-        logger.warning(
-            "Backend has no scanner_loop; skipping legacy scanner (MID scanner will still run if enabled)"
-        )
+    logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
+    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
 
     # ⚡ MID TREND scanner + MID trap digest
     _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
