@@ -12147,7 +12147,7 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
                                         d = await futures_contract_exists(self, exu, sym)
                                         return d
                                     except Exception:
-                                        return {\"ok\": False, \"had_error\": True, \"symbol\": None}
+                                        return {"ok": False, "had_error": True, "symbol": None}
 
                         
                                 # SPOT confirmations (supports all 5 exchanges)
@@ -12184,7 +12184,8 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
                             if _mode not in ("OFF", "PERMISSIVE", "STRICT"):
                                 _mode = "PERMISSIVE"
                             if _mode != "OFF":
-                                try:                                    _scope = (os.getenv("MID_FUTURES_CONTRACT_CHECK_SCOPE", "BEST") or "BEST").upper().strip()
+                                try:
+                                    _scope = (os.getenv("MID_FUTURES_CONTRACT_CHECK_SCOPE", "BEST") or "BEST").upper().strip()
                                     if _scope not in ("BEST", "ALL"):
                                         _scope = "BEST"
                                     if _scope == "BEST":
@@ -16080,7 +16081,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         d = await futures_contract_exists(self, exu, sym)
                                         return d
                                     except Exception:
-                                        return {\"ok\": False, \"had_error\": True, \"symbol\": None}
+                                        return {"ok": False, "had_error": True, "symbol": None}
 
                         
                                 # SPOT confirmations (supports all 5 exchanges)
@@ -16112,7 +16113,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             if _mode not in ("OFF", "PERMISSIVE", "STRICT"):
                                 _mode = "PERMISSIVE"
                             if _mode != "OFF":
-                                try:                                    _scope = (os.getenv("MID_FUTURES_CONTRACT_CHECK_SCOPE", "BEST") or "BEST").upper().strip()
+                                try:
+                                    _scope = (os.getenv("MID_FUTURES_CONTRACT_CHECK_SCOPE", "BEST") or "BEST").upper().strip()
                                     if _scope not in ("BEST", "ALL"):
                                         _scope = "BEST"
                                     if _scope == "BEST":
