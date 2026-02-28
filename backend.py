@@ -619,10 +619,22 @@ MID_REJECT_REASONS = {
     "candles_unavailable",
     "not_enough_data",
     "pending_exception",
+
     # Candles were OK, but the setup didn't pass filters (TA/structure/trap/trigger/etc).
     "no_signal",
+
+    # Scanner / orchestration skips (not a setup failure).
+    "cooldown",
+    "blocked_symbol",
+    "macro_pause_all",
+    "news_pause_all",
+    "emitted",
+
+    # Pending lifecycle.
     "pending_wait",
     "ttl_expired",
+
+    # Filters (post-setup).
     "late_entry",
     "vwap_dist",
     "anti_bounce",
@@ -684,12 +696,14 @@ MID_REJECT_ALIASES = {
     "confidence_low": "confidence_low",
 
     "trap": "trap_block",
-    "hardblock": "trap_block",
-    "blocked_symbol": "trap_block",
-    "cooldown": "trap_block",
-    "emitted": "trap_block",
-    "macro_pause_all": "trap_block",
-    "news_pause_all": "trap_block",
+"hardblock": "trap_block",
+
+# orchestration skips (keep separate so reject digest is honest)
+"blocked_symbol": "blocked_symbol",
+"cooldown": "cooldown",
+"emitted": "emitted",
+"macro_pause_all": "macro_pause_all",
+"news_pause_all": "news_pause_all",
 
     "align_mismatch": "htf_misaligned",
     "htf_misaligned": "htf_misaligned",
