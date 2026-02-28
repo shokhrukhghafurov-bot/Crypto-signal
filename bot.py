@@ -460,6 +460,33 @@ try:
 except Exception:
     # Never fail startup because of a shim
     pass
+
+        # Backend.open_trade compat (used by Telegram callback "opened")
+        if not hasattr(backend, "open_trade"):
+            async def _open_trade(self, user_id: int, signal, orig_text: str = "") -> bool:
+                try:
+                    # Try to persist trade in Postgres if db_store supports it.
+                    if hasattr(db_store, "open_trade_once"):
+                        inserted, _tid = await db_store.open_trade_once(
+                            user_id=int(user_id),
+                            signal_id=int(getattr(signal, "signal_id", 0) or 0),
+                            market=str(getattr(signal, "market", "FUTURES") or "FUTURES").upper(),
+                            symbol=str(getattr(signal, "symbol", "") or ""),
+                            side=str(getattr(signal, "direction", "LONG") or "LONG").upper(),
+                            entry=float(getattr(signal, "entry", 0.0) or 0.0),
+                            tp1=float(getattr(signal, "tp1")) if getattr(signal, "tp1", None) is not None else None,
+                            tp2=float(getattr(signal, "tp2")) if getattr(signal, "tp2", None) is not None else None,
+                            sl=float(getattr(signal, "sl")) if getattr(signal, "sl", None) is not None else None,
+                            orig_text=str(orig_text or ""),
+                        )
+                        return bool(inserted)
+                except Exception:
+                    return False
+                return False
+
+            backend.open_trade = _types.MethodType(_open_trade, backend)
+            logger.warning("[mid] Backend has no open_trade; installed runtime shim (compat)")
+
 # --- end MID shims ---
 
 logger.info("[mid][dbg] methods can_add_mid_pending=%s add_mid_pending=%s mid_pending_trigger_loop=%s scanner_loop_mid=%s",
