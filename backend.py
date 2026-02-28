@@ -14400,7 +14400,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                 # (prevents FUTURES empty responses when the contract doesn't exist)
                 try:
                     if getattr(api, "_market_avail_check", False):
-                        if not _market_supported_ex(ex_name, mkt0, symb):
+                        # IMPORTANT: treat "unknown" availability (e.g. cold start / markets fetch failed) as supported.
+                        _sup = await api._market_supported_ex(ex_name, mkt0, symb)
+                        if _sup is False:
                             try:
                                 api._mark_unsupported(ex_name, mkt0, symb, tf)
                             except Exception:
@@ -14409,6 +14411,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             _mid_candles_unsupported += 1
                             return None
                 except Exception:
+                    # If availability check fails, fall back to request
                     pass
                 now = time.time()
                 ttl = _mid_cache_ttl(tf)
@@ -14852,7 +14855,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 min_lim = int(os.getenv('MID_EMPTY_AS_UNSUPPORTED_MIN_LIMIT', '120') or 120)
                                 is_small_lim = (int(limit) <= min_lim) or (limit == limits_to_try[0])
                                 is_last_try = (_i >= max(0, mid_candles_retry))
-                                if empty_as_unsup_all and is_small_lim and is_last_try:
+                                if empty_as_unsup_all and is_small_lim and is_last_try and (await api._market_supported_ex(ex_name, mkt_now2, symb)) is False:
                                     try:
                                         api._mark_unsupported(ex_name, mkt_now2, symb, tf)
                                     except Exception:
@@ -14868,15 +14871,24 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 _mid_candles_unsupported += 1
                                 return None
 
-                            # Treat persistent "empty" as unsupported_pair (most often: contract doesn't exist).
-                            # This makes MID immediately try other markets/exchanges instead of accumulating empty storms.
-                            try:
-                                api._mark_unsupported(ex_name, (market or 'SPOT').upper().strip(), symb, tf)
-                            except Exception:
-                                pass
-                            _mid_diag_add(symb, ex_name, (market or 'SPOT').upper().strip(), tf, 'unsupported_pair', 'empty')
-                            _mid_candles_unsupported += 1
-                            return None
+
+# Empty candles: do NOT automatically mark unsupported.
+# Empty can happen on cold start / lagging WS DB / transient exchange glitches.
+# Marking unsupported here bricks major symbols for hours.
+try:
+    _mid_diag_add(symb, ex_name, (market or 'SPOT').upper().strip(), tf, 'empty')
+except Exception:
+    pass
+_mid_candles_empty += 1
+try:
+    keyr = (ex_name, (market or 'SPOT').upper().strip(), tf)
+    _mid_candles_empty_reasons[keyr] += 1
+    lst = _mid_candles_empty_samples[keyr]
+    if len(lst) < _mid_candles_log_samples:
+        lst.append(symb)
+except Exception:
+    pass
+return None
                 
                         # got non-empty candles
                         break
@@ -14999,6 +15011,55 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         prefilter = (os.getenv("MID_PREFILTER_UNSUPPORTED_SYMBOLS", "1") or "1").strip().lower() in ("1","true","yes","on")
                     except Exception:
                         prefilter = True
+
+def _market_supported_ex_fast(_ex: str, _mkt: str, _sym: str) -> bool:
+    """Synchronous best-effort market availability check using already-cached markets.
+    If markets are not cached / empty (cold start), return True (permissive) to avoid mass 'unsupported' storms.
+    """
+    try:
+        if not getattr(api, "_market_avail_check", False):
+            return True
+        exu = (_ex or "").upper().strip()
+        mktu = (_mkt or "SPOT").upper().strip()
+        symu = (_sym or "").upper().strip()
+        if not symu:
+            return False
+        # Map to cache keys used by _get_*_markets
+        if exu == "BINANCE":
+            key_name = "BINANCE_FUTURES" if mktu == "FUTURES" else "BINANCE_SPOT"
+        elif exu == "BYBIT":
+            key_name = "BYBIT_LINEAR" if mktu == "FUTURES" else "BYBIT_SPOT"
+        elif exu == "OKX":
+            key_name = "OKX_SWAP" if mktu == "FUTURES" else "OKX_SPOT"
+        elif exu == "GATEIO":
+            key_name = "GATEIO"
+        elif exu == "MEXC":
+            key_name = "MEXC"
+        else:
+            return True
+        cached = getattr(api, "_markets_cache", {}).get(key_name)
+        if not cached:
+            return True
+        until, markets = cached
+        # If cached markets set is empty, treat as unknown (permissive)
+        if not markets:
+            return True
+        if exu == "GATEIO":
+            try:
+                pair = _gate_pair(symu).upper()
+            except Exception:
+                pair = symu
+            return pair in markets
+        if exu == "BINANCE" and mktu == "FUTURES":
+            try:
+                sym_req = api._binance_futures_symbol_alias(symu)
+            except Exception:
+                sym_req = symu
+            return (symu in markets) or (sym_req in markets)
+        return symu in markets
+    except Exception:
+        return True
+
                     if prefilter and symbols:
                         try:
                             _kept = []
@@ -15011,7 +15072,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 for _mkt in ("FUTURES","SPOT"):
                                     for _ex in (mid_universe or ["BINANCE","BYBIT","OKX"]):
                                         try:
-                                            if _market_supported_ex(_ex, _mkt, _s):
+                                            if _market_supported_ex_fast(_ex, _mkt, _s):
                                                 _ok = True
                                                 break
                                         except Exception:
