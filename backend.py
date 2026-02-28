@@ -14125,19 +14125,25 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
 
                         if ex_name == "BINANCE":
                             # Avoid noisy HTTP 400 (Invalid symbol) on futures by checking exchangeInfo first.
+                            # IMPORTANT: be permissive on cold start / transient failures.
+                            # If exchangeInfo returns an empty symbols list (or cannot be parsed), treat it as UNKNOWN and
+                            # do NOT mark everything as unsupported (otherwise we can brick the scanner for hours via unsupported_cached).
                             try:
                                 if mkt == 'FUTURES':
                                     info = api._binance_exchange_info(futures=True)
                                     if info and isinstance(info, dict):
-                                        syms = {s.get('symbol') for s in (info.get('symbols') or []) if isinstance(s, dict)}
-                                        symb_req = api._binance_futures_symbol_alias((symb or '').upper().strip())
-                                        if (symb not in syms) and (symb_req not in syms):
-                                            try:
-                                                api._mark_unsupported(ex_name, mkt, symb, tf)
-                                            except Exception:
-                                                pass
-                                            _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_pair')
-                                            return pd.DataFrame()
+                                        raw = (info.get('symbols') or [])
+                                        syms = {s.get('symbol') for s in raw if isinstance(s, dict) and s.get('symbol')}
+                                        # If list is empty -> don't trust it.
+                                        if syms:
+                                            symb_req = api._binance_futures_symbol_alias((symb or '').upper().strip())
+                                            if (symb not in syms) and (symb_req not in syms):
+                                                try:
+                                                    api._mark_unsupported(ex_name, mkt, symb, tf)
+                                                except Exception:
+                                                    pass
+                                                _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_pair')
+                                                return pd.DataFrame()
                             except Exception:
                                 # If exchangeInfo fails, fall back to request (old behavior)
                                 pass
@@ -14500,7 +14506,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                 # WS is great for live updates but after restart may have got=1.
                 # When enabled, if we don't have enough bars in cache/DB, we do a one-time REST prefill
                 # (with per-symbol/TF cooldown) and persist the result to Postgres candles_cache.
-                prefill_enabled = str(os.getenv("MID_PREFILL_FROM_REST", "0") or "0").strip().lower() not in ("0","false","no","off")
+                # Default ON: after restarts WS/DB often has got=1, and without REST prefill most symbols become
+                # candles_unavailable (especially on Railway cold starts). You can disable explicitly via MID_PREFILL_FROM_REST=0.
+                prefill_enabled = str(os.getenv("MID_PREFILL_FROM_REST", "1") or "1").strip().lower() not in ("0","false","no","off")
                 prefill_only_if_missing = str(os.getenv("MID_PREFILL_ONLY_IF_MISSING", "1") or "1").strip().lower() not in ("0","false","no","off")
                 try:
                     prefill_cooldown = float(os.getenv("MID_PREFILL_COOLDOWN_SEC", "900") or 900)
