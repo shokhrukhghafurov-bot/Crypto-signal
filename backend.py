@@ -15911,6 +15911,28 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     except Exception:
                                         price_multiplier = 1.0
 
+
+                                    # If we couldn't detect multiplier from trade_symbol alias, try to infer it from price/zone ratio.
+                                    # This fixes cases where the current price comes from a 1000x contract ticker (e.g. 1000SHIBUSDT),
+                                    # but candles/zone are built from the base symbol (e.g. SHIBUSDT).
+                                    if float(price_multiplier) <= 1.0:
+                                        try:
+                                            _allowed = os.getenv("MID_MULTIPLIER_AUTO_LIST", "10,100,1000,10000")
+                                            _allowed_muls = []
+                                            for _t in str(_allowed).split(","):
+                                                _t = str(_t).strip()
+                                                if not _t:
+                                                    continue
+                                                try:
+                                                    _allowed_muls.append(float(_t))
+                                                except Exception:
+                                                    pass
+                                            if not _allowed_muls:
+                                                _allowed_muls = [10.0, 100.0, 1000.0, 10000.0]
+                                            # ratio will be computed below; here we only prep the allowed list.
+                                        except Exception:
+                                            _allowed_muls = [10.0, 100.0, 1000.0, 10000.0]
+
                                     # If candle-derived zone is in a different scale than the current entry price,
                                     # try to auto-scale by detected multiplier (prevents "eternal far" pendings).
                                     try:
@@ -15925,12 +15947,42 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     except Exception:
                                         _mul_tol = 0.08
                                     try:
-                                        if float(price_multiplier) > 1.0 and float(_z_mid) > 0 and float(_ratio) > 0:
-                                            if abs(float(_ratio) - float(price_multiplier)) / float(price_multiplier) <= float(_mul_tol):
-                                                entry_low = float(entry_low) * float(price_multiplier)
-                                                entry_high = float(entry_high) * float(price_multiplier)
+                                        if float(_z_mid) > 0 and float(_ratio) > 0:
+                                            _det_mul = float(price_multiplier)
+                                            _det_tag = None
+                                            # Derive multiplier from ratio if alias-based detection didn't help.
+                                            if float(_det_mul) <= 1.0:
                                                 try:
-                                                    z_src = f"{str(z_src)}|x{int(price_multiplier)}"
+                                                    for _m in _allowed_muls:
+                                                        _m = float(_m)
+                                                        if _m <= 1.0:
+                                                            continue
+                                                        # px ~= zone * m  => scale zone by m
+                                                        if abs(float(_ratio) - float(_m)) / float(_m) <= float(_mul_tol):
+                                                            _det_mul = float(_m)
+                                                            _det_tag = f"auto_x{int(_m)}"
+                                                            break
+                                                        # px ~= zone / m => scale zone by 1/m
+                                                        _inv = 1.0 / float(_m)
+                                                        if abs(float(_ratio) - float(_inv)) / float(_inv) <= float(_mul_tol):
+                                                            _det_mul = float(_inv)
+                                                            _det_tag = f"auto_div{int(_m)}"
+                                                            break
+                                                except Exception:
+                                                    pass
+                                            # Apply scaling if detected multiplier is meaningful (not 1.0)
+                                            if float(_det_mul) != 1.0:
+                                                entry_low = float(entry_low) * float(_det_mul)
+                                                entry_high = float(entry_high) * float(_det_mul)
+                                                try:
+                                                    if _det_tag:
+                                                        z_src = f"{str(z_src)}|{_det_tag}"
+                                                    else:
+                                                        # fall back to old tag style
+                                                        if float(_det_mul) > 1.0:
+                                                            z_src = f"{str(z_src)}|x{int(_det_mul)}"
+                                                        else:
+                                                            z_src = f"{str(z_src)}|/x{int(1.0/float(_det_mul))}"
                                                 except Exception:
                                                     pass
                                                 try:
