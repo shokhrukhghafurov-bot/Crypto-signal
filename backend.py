@@ -14890,21 +14890,21 @@ except Exception:
     pass
 return None
                 
-                        # got non-empty candles
-                        break
-                    else:
-                        # all limits empty for this retry iteration
-                        last = __import__('pandas').DataFrame()
-                
-                    if last is not None and not getattr(last, 'empty', True):
-                        break
-                
-                    # tiny backoff reduces rate-limit bursts and improves success on flaky networks
-                    if _i < max(0, mid_candles_retry):
-                        try:
-                            await __import__('asyncio').sleep(0.15 * (_i + 1))
-                        except Exception:
-                            pass
+                # got non-empty candles
+                break
+            else:
+                # all limits empty for this retry iteration
+                last = __import__('pandas').DataFrame()
+        
+            if last is not None and not getattr(last, 'empty', True):
+                break
+        
+            # tiny backoff reduces rate-limit bursts and improves success on flaky networks
+            if _i < max(0, mid_candles_retry):
+                try:
+                    await __import__('asyncio').sleep(0.15 * (_i + 1))
+                except Exception:
+                    pass
                 
                 if last is not None and not getattr(last, 'empty', True):
                     # Accept REST candles only if newest candle is reasonably fresh (prevents stale REST poisoning).
