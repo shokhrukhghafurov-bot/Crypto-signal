@@ -11342,7 +11342,6 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
         """
         market = (signal.market or "FUTURES").upper()
         base = float(getattr(signal, "entry", 0) or 0) or None
-
         # Normalize symbol to avoid WS/REST mismatches caused by separators (":", "-", ".", spaces)
         # and to support multiplier contracts (e.g., 1000SHIBUSDT).
         raw_sym = str(getattr(signal, "symbol", "") or "")
@@ -11352,6 +11351,7 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             sym = re.sub(r"^(\d+)([A-Z].+)$", r"\2", sym)
         if not sym:
             sym = raw_sym.upper().strip()
+
 
         # Mock mode: keep prices around entry to avoid nonsense.
         if not USE_REAL_PRICE:
@@ -11655,6 +11655,34 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             if _is_reasonable(p):
                 _pdbg(f"SELECTED REST {exname} src={src} p={p}")
                 return float(p), str(src)
+
+
+        # --- LAST RESORT: candles_cache close (no external WS/REST needed) ---
+        try:
+            for exname in chain:
+                ex_key = (exname or "").lower()
+                for tf, lim in (("1m", 2), ("5m", 2), ("15m", 2)):
+                    row = await db_store.candles_cache_get(ex_key, market.upper(), sym.upper(), tf, int(lim))
+                    if not row:
+                        continue
+                    blob, _updated_at = row
+                    if not blob:
+                        continue
+                    dfp = db_store._cc_unpack_df(blob)
+                    if dfp is None or getattr(dfp, "empty", True):
+                        continue
+                    close_col = "close" if "close" in dfp.columns else ("c" if "c" in dfp.columns else None)
+                    if not close_col:
+                        continue
+                    try:
+                        p = float(dfp[close_col].iloc[-1])
+                    except Exception:
+                        continue
+                    if _is_reasonable(p):
+                        _pdbg(f"CANDLES_CACHE {exname} tf={tf} p={p}")
+                        return float(p), f"{exname}_CANDLES"
+        except Exception:
+            pass
 
         raise PriceUnavailableError(f"price unavailable market={market} symbol={raw_sym or sym} mode={mode}")
 
