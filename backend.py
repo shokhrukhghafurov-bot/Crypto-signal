@@ -860,6 +860,77 @@ def _mid_reject_digest_top(topn: int = 3) -> list[dict]:
     except Exception:
         return []
 
+
+# --- MID trigger reject digest (rolling window, for /health and [mid][status]) ---
+# Tracks reasons that prevented EMIT inside the pending trigger loop (structure_broken_*, trap_block, etc).
+MID_TRIG_REJECT_EVENTS: list[tuple[float, str]] = []
+MID_TRIG_REJECT_MAX_EVENTS = 80000
+
+def _mid_trig_reject_key(reason: str) -> str:
+    try:
+        r = (reason or "").strip().lower()
+        if not r:
+            return "unknown"
+        token = r.split()[0].strip().strip(";:,.()[]{}")
+        return token or "unknown"
+    except Exception:
+        return "unknown"
+
+def _mid_trig_reject_add(reason: str, n: int = 1) -> None:
+    global MID_TRIG_REJECT_EVENTS
+    try:
+        k = _mid_trig_reject_key(reason)
+        if not k:
+            return
+        ts = time.time()
+        cnt = max(1, int(n or 1))
+        for _ in range(min(cnt, 20)):
+            MID_TRIG_REJECT_EVENTS.append((ts, k))
+        if len(MID_TRIG_REJECT_EVENTS) > MID_TRIG_REJECT_MAX_EVENTS:
+            MID_TRIG_REJECT_EVENTS = MID_TRIG_REJECT_EVENTS[-MID_TRIG_REJECT_MAX_EVENTS:]
+    except Exception:
+        pass
+
+def _mid_trig_reject_digest_top(topn: int = 5, window_sec: int | None = None) -> list[dict]:
+    try:
+        if window_sec is None:
+            try:
+                window_sec = int(float(os.getenv("MID_TRIG_REJECT_WINDOW_SEC", "900") or 900))
+            except Exception:
+                window_sec = 900
+        window_sec = max(30, min(int(window_sec), 24 * 3600))
+        now = time.time()
+        cutoff = now - float(window_sec)
+
+        # prune old
+        if MID_TRIG_REJECT_EVENTS:
+            i0 = 0
+            for i, (ts, _k) in enumerate(MID_TRIG_REJECT_EVENTS):
+                if float(ts) >= cutoff:
+                    i0 = i
+                    break
+            else:
+                i0 = len(MID_TRIG_REJECT_EVENTS)
+            if i0 > 0:
+                del MID_TRIG_REJECT_EVENTS[:i0]
+
+        from collections import defaultdict
+        counts = defaultdict(int)
+        for ts, k in MID_TRIG_REJECT_EVENTS:
+            if float(ts) >= cutoff:
+                counts[str(k)] += 1
+        items = sorted(counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+        out = []
+        for k, v in items[:max(1, int(topn or 5))]:
+            out.append({"reason": str(k), "count": int(v)})
+        return out
+    except Exception:
+        return []
+
+# --- MID pending per-poll snapshot (for [mid][status]) ---
+# Updated on every pending poll; consumed by mid_status_summary_loop.
+_MID_PENDING_TICK_LAST: dict = {}
+
 # Per-tick hard-block breakdown snapshot (for /health and minute status logs)
 MID_LAST_HARDBLOCK_TOP = ""
 MID_LAST_HARDBLOCK_SAMPLES = None  # dict[str, list[str]]
@@ -12981,6 +13052,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             )
         except Exception:
             pass
+        # Add to rolling trigger-reject digest (only when not a successful emit).
+        try:
+            if str(outcome or "").lower() != "pass":
+                _mid_trig_reject_add(str(reason or "unknown"), 1)
+        except Exception:
+            pass
 
     while True:
         try:
@@ -13800,6 +13877,29 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
             await self._mid_pending_save(keep)
 
+
+
+            # Update last pending tick snapshot (used by [mid][status]).
+            try:
+                global _MID_PENDING_TICK_LAST
+                kept_n0 = int(len(keep) if isinstance(keep, list) else 0)
+                a_avg0 = (float(attempts_sum) / float(total_n)) if total_n > 0 else 0.0
+                f_avg0 = (float(fails_sum) / float(total_n)) if total_n > 0 else 0.0
+                _MID_PENDING_TICK_LAST = {
+                    "ts": time.time(),
+                    "total": int(total_n),
+                    "keep": int(kept_n0),
+                    "in_zone": int(in_zone_n),
+                    "near": int(near_n),
+                    "far": int(far_n),
+                    "expired_now": int(expired_n),
+                    "removed_now": int(removed_n),
+                    "attempts_avg": float(a_avg0),
+                    "fails_avg": float(f_avg0),
+                }
+            except Exception:
+                pass
+
             # If there is anything still pending after this poll, count it as a "pending_wait" stage.
             # (This helps /health show whether signals are "missing" because price/TA hasn't confirmed yet.)
             try:
@@ -14000,6 +14100,34 @@ async def mid_status_summary_loop(self) -> None:
             else:
                 parts.append(f"pending=? (created+{df_p_created} trig+{df_p_trig} exp+{df_p_exp})")
             parts.append(f"blocks+{df_blocks}")
+
+
+            # Include latest pending tick counters (total/keep/in_zone/near/far + avg attempts/fails)
+            try:
+                pt = _MID_PENDING_TICK_LAST or {}
+                if pt:
+                    parts.append(
+                        "pending_tick="
+                        + f"total={int(pt.get('total',0))}"
+                        + f" keep={int(pt.get('keep',0))}"
+                        + f" in_zone={int(pt.get('in_zone',0))}"
+                        + f" near={int(pt.get('near',0))}"
+                        + f" far={int(pt.get('far',0))}"
+                        + f" exp_now={int(pt.get('expired_now',0))}"
+                        + f" rm_now={int(pt.get('removed_now',0))}"
+                        + f" att_avg={float(pt.get('attempts_avg',0.0)):.2f}"
+                        + f" fail_avg={float(pt.get('fails_avg',0.0)):.2f}"
+                    )
+            except Exception:
+                pass
+
+            # Top reasons that prevented EMIT inside trigger loop (last window).
+            try:
+                trig_top = _mid_trig_reject_digest_top(topn=5)
+                if trig_top:
+                    parts.append("trig_no=" + ",".join([f"{x.get('reason')}={int(x.get('count') or 0)}" for x in trig_top]))
+            except Exception:
+                pass
 
             # Show top hard-block reasons from the *last MID tick* (helps instantly see which filter cuts most).
             try:
