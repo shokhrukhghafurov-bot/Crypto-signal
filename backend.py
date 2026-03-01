@@ -1919,7 +1919,7 @@ async def _gateio_public_price(symbol: str) -> float:
 
 
 
-async def _mexc_contract_symbol(symbol: str) -> str:
+def _mexc_contract_symbol(symbol: str) -> str:
     s = (symbol or "").upper().strip()
     # MEXC contracts usually use BASE_USDT format
     if s.endswith("USDT") and "_" not in s:
@@ -1950,7 +1950,7 @@ async def _mexc_futures_price(symbol: str) -> float:
                 return float(data.get(k) or 0.0)
     return 0.0
 
-async def _gateio_futures_contract(symbol: str) -> str:
+def _gateio_futures_contract(symbol: str) -> str:
     s = (symbol or "").upper().strip()
     # Gate futures USDT contracts use BASE_USDT
     if s.endswith("USDT") and "_" not in s:
@@ -1992,6 +1992,11 @@ async def validate_autotrade_keys(
         return {"ok": False, "read_ok": False, "trade_ok": False, "error": "unsupported_exchange"}
     if mt not in ("spot", "futures"):
         mt = "spot"
+
+    # Gate.io and MEXC are supported only for SPOT auto-trade in this codebase.
+    # Avoid any futures/contract validation calls for them.
+    if mt == "futures" and ex in ("mexc", "gateio"):
+        return {"ok": False, "read_ok": False, "trade_ok": False, "error": "unsupported_market_for_exchange"}
 
     api_key = (api_key or "").strip()
     api_secret = (api_secret or "").strip()
