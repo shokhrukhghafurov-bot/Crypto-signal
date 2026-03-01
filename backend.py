@@ -11016,17 +11016,11 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
         try:
             market = (t.get('market') or 'FUTURES').upper()
             symbol = str(t.get('symbol') or '')
-            # Normalize for price engine (supports symbols with separators and multiplier contracts)
-            sym_n = re.sub(r"[^A-Za-z0-9]", "", symbol.upper())
-            if market == 'SPOT':
-                sym_n = re.sub(r"^(\\d+)([A-Z].+)$", r"\\2", sym_n)
-            if not sym_n:
-                sym_n = symbol.upper().strip()
             side = (t.get('side') or 'LONG').upper()
             s = Signal(
                 signal_id=int(t.get('signal_id') or 0),
                 market=market,
-                symbol=sym_n,
+                symbol=symbol,
                 direction=side,
                 timeframe='',
                 entry=float(t.get('entry') or 0.0),
@@ -11055,11 +11049,7 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             out['hit_tp1'] = bool(tp1 and hit_tp(float(tp1)))
             out['hit_tp2'] = bool(tp2 and hit_tp(float(tp2)))
             return out
-        except Exception as e:
-            try:
-                logger.debug("[trade_live] price enrich failed uid=%s trade_id=%s sym=%s err=%s", user_id, trade_id, symbol, str(e))
-            except Exception:
-                pass
+        except Exception:
             return dict(t)
 
     async def remove_trade_by_id(self, user_id: int, trade_id: int) -> dict | None:
@@ -11085,19 +11075,35 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             sl=float(row.get("sl")) if row.get("sl") is not None else None,
         )
 
+        # Try to fetch a fresh price, but never block manual close for long.
+        entry_px = float(row.get("entry") or 0.0)
+        close_px: float | None = None
+        close_src = ""
         try:
-            close_px, close_src = await self._get_price_with_source(s)
+            close_px, close_src = await asyncio.wait_for(self._get_price_with_source(s), timeout=3.0)
             close_px = float(close_px)
         except Exception:
-            # Best-effort fallback: use entry if price is unavailable
-            close_px, close_src = float(row.get("entry") or 0.0), ""
+            close_px = None
+            close_src = ""
+
+        # Fallback policy:
+        # - If we couldn't fetch price, still allow close (price=None in DB event).
+        # - If entry is invalid (0/NaN), also avoid PnL math.
+        if close_px is None:
+            close_px = (entry_px if (entry_px and entry_px > 0) else None)
 
         tp1_hit = bool(row.get("tp1_hit"))
         trade_ctx = UserTrade(user_id=int(user_id), signal=s, tp1_hit=tp1_hit)
-        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(close_px), close_reason="CLOSED")
+
+        pnl = 0.0
+        try:
+            if close_px is not None and entry_px and entry_px > 0:
+                pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(close_px), close_reason="CLOSED")
+        except Exception:
+            pnl = 0.0
 
         try:
-            await db_store.close_trade(int(trade_id), status="CLOSED", price=float(close_px), pnl_total_pct=float(pnl))
+            await db_store.close_trade(int(trade_id), status="CLOSED", price=(float(close_px) if close_px is not None else None), pnl_total_pct=float(pnl))
         except Exception:
             # If DB fails, still return a message so user sees what happened.
             try:
@@ -11157,7 +11163,7 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             status=status_txt,
         )
 
-        return {"ok": True, "text": txt, "pnl_total_pct": float(pnl), "close_price": float(close_px)}
+        return {"ok": True, "text": txt, "pnl_total_pct": float(pnl), "close_price": (float(close_px) if close_px is not None else None)}
 
     async def get_user_trades(self, user_id: int) -> list[dict]:
         return await db_store.list_user_trades(int(user_id), include_closed=False, limit=50)
@@ -11342,20 +11348,10 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
         """
         market = (signal.market or "FUTURES").upper()
         base = float(getattr(signal, "entry", 0) or 0) or None
-        # Normalize symbol to avoid WS/REST mismatches caused by separators (":", "-", ".", spaces)
-        # and to support multiplier contracts (e.g., 1000SHIBUSDT).
-        raw_sym = str(getattr(signal, "symbol", "") or "")
-        sym = re.sub(r"[^A-Za-z0-9]", "", raw_sym.upper())
-        # For SPOT, leading multiplier prefixes usually don't exist; fall back to base symbol.
-        if market == "SPOT":
-            sym = re.sub(r"^(\d+)([A-Z].+)$", r"\2", sym)
-        if not sym:
-            sym = raw_sym.upper().strip()
-
 
         # Mock mode: keep prices around entry to avoid nonsense.
         if not USE_REAL_PRICE:
-            return float(self.feed.mock_price(market, sym, base=base)), "MOCK"
+            return float(self.feed.mock_price(market, signal.symbol, base=base)), "MOCK"
 
         mode = (SPOT_PRICE_SOURCE if market == "SPOT" else FUTURES_PRICE_SOURCE).upper().strip() or "MEDIAN"
         if mode not in ("BINANCE", "BYBIT", "MEDIAN"):
@@ -11364,16 +11360,20 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
         def _pdbg(msg: str):
             if PRICE_DEBUG:
                 try:
-                    logger.info(f"[price] {market} {sym}: {msg}")
+                    logger.info(f"[price] {market} {signal.symbol}: {msg}")
                 except Exception:
                     pass
 
         def _is_reasonable(p: float | None) -> bool:
             """Sanity filter to avoid using bad ticks (e.g., 0.0).
 
-            Permissive, but rejects:
+            Rejects:
               - non-finite / <= 0
-              - if entry is known: values wildly off-scale (10x away)
+              - if entry is known: values wildly off-scale
+
+            Special-case: 1000/10000-multiplier symbols (e.g. 1000SHIBUSDT).
+            Some venues quote these at a multiplied price. We accept either scale
+            (base, base*mult, base/mult) within the usual 10x band.
             """
             if p is None:
                 return False
@@ -11383,20 +11383,40 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
                 return False
             if not math.isfinite(fp) or fp <= 0:
                 return False
+
             if base is not None and base > 0:
-                lo = base * 0.10
-                hi = base * 10.0
-                if fp < lo or fp > hi:
+                # Default band around entry
+                bands: list[tuple[float, float]] = [(base * 0.10, base * 10.0)]
+
+                # Multiplier symbols: accept alternative quoting scales.
+                try:
+                    sym_u = (getattr(signal, "symbol", "") or "").upper()
+                    m0 = re.match(r"^(\d{2,6})([A-Z].*)$", sym_u)
+                    if m0:
+                        mult = int(m0.group(1))
+                        if mult >= 10:
+                            bands.append((base * 0.10 * mult, base * 10.0 * mult))
+                            bands.append((base * 0.10 / mult, base * 10.0 / mult))
+                except Exception:
+                    pass
+
+                ok = False
+                for lo, hi in bands:
+                    if fp >= lo and fp <= hi:
+                        ok = True
+                        break
+                if not ok:
                     return False
+
             return True
 
         # --- WS-only helpers (NO REST FALLBACK INSIDE) ---
         async def _binance_ws_only() -> tuple[float | None, str]:
             try:
-                await self.feed.ensure_stream(market, sym, ex="binance")
-                latest = self.feed.get_latest(market, sym, max_age_sec=self._ws_max_age_sec)
+                await self.feed.ensure_stream(market, signal.symbol, ex="binance")
+                latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec)
                 if latest is not None and float(latest) > 0:
-                    src = self.feed.get_latest_source(market, sym) or "BINANCE_WS"
+                    src = self.feed.get_latest_source(market, signal.symbol) or "BINANCE_WS"
                     # Normalize feed sources
                     if src == "WS":
                         src = "BINANCE_WS"
@@ -11411,7 +11431,7 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
 
             # cache: accept only WS-derived cached values
             try:
-                c = self._price_cache.get("binance", market, sym)
+                c = self._price_cache.get("binance", market, signal.symbol)
                 if c is not None and c[0] is not None and str(c[1]).upper().endswith("_WS") and _is_reasonable(c[0]):
                     return float(c[0]), str(c[1])
             except Exception:
@@ -11421,15 +11441,15 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
 
         async def _bybit_ws_only() -> tuple[float | None, str]:
             try:
-                await self.feed.ensure_stream(market, sym, ex="bybit")
-                latest = self.feed.get_latest(market, sym, max_age_sec=self._ws_max_age_sec, ex="bybit")
+                await self.feed.ensure_stream(market, signal.symbol, ex="bybit")
+                latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="bybit")
                 if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
                     _pdbg(f"BYBIT WS hit p={latest}")
                     return float(latest), "BYBIT_WS"
             except Exception:
                 pass
             try:
-                c = self._price_cache.get("bybit", market, sym)
+                c = self._price_cache.get("bybit", market, signal.symbol)
                 if c is not None and c[0] is not None and str(c[1]).upper().endswith("_WS") and _is_reasonable(c[0]):
                     return float(c[0]), str(c[1])
             except Exception:
@@ -11438,15 +11458,15 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
 
         async def _okx_ws_only() -> tuple[float | None, str]:
             try:
-                await self.feed.ensure_stream(market, sym, ex="okx")
-                latest = self.feed.get_latest(market, sym, max_age_sec=self._ws_max_age_sec, ex="okx")
+                await self.feed.ensure_stream(market, signal.symbol, ex="okx")
+                latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="okx")
                 if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
                     _pdbg(f"OKX WS hit p={latest}")
                     return float(latest), "OKX_WS"
             except Exception:
                 pass
             try:
-                c = self._price_cache.get("okx", market, sym)
+                c = self._price_cache.get("okx", market, signal.symbol)
                 if c is not None and c[0] is not None and str(c[1]).upper().endswith("_WS") and _is_reasonable(c[0]):
                     return float(c[0]), str(c[1])
             except Exception:
@@ -11457,15 +11477,15 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             if market != "SPOT":
                 return None, "GATEIO_WS_MISS"
             try:
-                await self.feed.ensure_stream(market, sym, ex="gateio")
-                latest = self.feed.get_latest(market, sym, max_age_sec=self._ws_max_age_sec, ex="gateio")
+                await self.feed.ensure_stream(market, signal.symbol, ex="gateio")
+                latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="gateio")
                 if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
                     _pdbg(f"GATEIO WS hit p={latest}")
                     return float(latest), "GATEIO_WS"
             except Exception:
                 pass
             try:
-                c = self._price_cache.get("gateio", market, sym)
+                c = self._price_cache.get("gateio", market, signal.symbol)
                 if c is not None and c[0] is not None and str(c[1]).upper().endswith("_WS") and _is_reasonable(c[0]):
                     return float(c[0]), str(c[1])
             except Exception:
@@ -11476,15 +11496,15 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             if market != "SPOT":
                 return None, "MEXC_WS_MISS"
             try:
-                await self.feed.ensure_stream(market, sym, ex="mexc")
-                latest = self.feed.get_latest(market, sym, max_age_sec=self._ws_max_age_sec, ex="mexc")
+                await self.feed.ensure_stream(market, signal.symbol, ex="mexc")
+                latest = self.feed.get_latest(market, signal.symbol, max_age_sec=self._ws_max_age_sec, ex="mexc")
                 if latest is not None and float(latest) > 0 and _is_reasonable(float(latest)):
                     _pdbg(f"MEXC WS hit p={latest}")
                     return float(latest), "MEXC_WS"
             except Exception:
                 pass
             try:
-                c = self._price_cache.get("mexc", market, sym)
+                c = self._price_cache.get("mexc", market, signal.symbol)
                 if c is not None and c[0] is not None and str(c[1]).upper().endswith("_WS") and _is_reasonable(c[0]):
                     return float(c[0]), str(c[1])
             except Exception:
@@ -11493,15 +11513,15 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
 
         # --- REST-only helpers (NO WS INSIDE) ---
         async def _binance_rest_only() -> tuple[float | None, str]:
-            rest = await self._fetch_rest_price(market, sym)
+            rest = await self._fetch_rest_price(market, signal.symbol)
             if _is_reasonable(rest):
                 try:
                     async with self._price_cache._mu:
-                        self._price_cache._data[("binance", market.upper(), sym.upper())] = (float(rest), "BINANCE_REST", time.time())
+                        self._price_cache._data[("binance", market.upper(), signal.symbol.upper())] = (float(rest), "BINANCE_REST", time.time())
                 except Exception:
                     pass
                 try:
-                    self.feed._set_latest(market, sym, float(rest), source="REST")
+                    self.feed._set_latest(market, signal.symbol, float(rest), source="REST")
                 except Exception:
                     pass
                 return float(rest), "BINANCE_REST"
@@ -11509,16 +11529,16 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
 
         async def _bybit_rest_only() -> tuple[float | None, str]:
             async def _fetch():
-                return await self._fetch_bybit_price(market, sym)
-            p, _src = await self._price_cached("bybit", market, sym, _fetch, src_label="BYBIT_REST")
+                return await self._fetch_bybit_price(market, signal.symbol)
+            p, _src = await self._price_cached("bybit", market, signal.symbol, _fetch, src_label="BYBIT_REST")
             if _is_reasonable(p):
                 return float(p), "BYBIT_REST"
             return None, "BYBIT_REST_MISS"
 
         async def _okx_rest_only() -> tuple[float | None, str]:
             async def _fetch():
-                return await self._fetch_okx_price(market, sym)
-            p, _src = await self._price_cached("okx", market, sym, _fetch, src_label="OKX_REST")
+                return await self._fetch_okx_price(market, signal.symbol)
+            p, _src = await self._price_cached("okx", market, signal.symbol, _fetch, src_label="OKX_REST")
             if _is_reasonable(p):
                 return float(p), "OKX_REST"
             return None, "OKX_REST_MISS"
@@ -11530,12 +11550,12 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             async def _fetch():
                 async def _do():
                     try:
-                        return await _gateio_public_price(sym)
+                        return await _gateio_public_price(signal.symbol)
                     except Exception:
                         return None
                 return await self._rest_limiter.run("gateio", _do)
 
-            p, _src = await self._price_cached("gateio", market, sym, _fetch, src_label="GATEIO_PUBLIC")
+            p, _src = await self._price_cached("gateio", market, signal.symbol, _fetch, src_label="GATEIO_PUBLIC")
             if _is_reasonable(p):
                 return float(p), "GATEIO_PUBLIC"
             return None, "GATEIO_REST_MISS"
@@ -11547,12 +11567,12 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             async def _fetch():
                 async def _do():
                     try:
-                        return await _mexc_public_price(sym)
+                        return await _mexc_public_price(signal.symbol)
                     except Exception:
                         return None
                 return await self._rest_limiter.run("mexc", _do)
 
-            p, _src = await self._price_cached("mexc", market, sym, _fetch, src_label="MEXC_PUBLIC")
+            p, _src = await self._price_cached("mexc", market, signal.symbol, _fetch, src_label="MEXC_PUBLIC")
             if _is_reasonable(p):
                 return float(p), "MEXC_PUBLIC"
             return None, "MEXC_REST_MISS"
@@ -11656,35 +11676,7 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
                 _pdbg(f"SELECTED REST {exname} src={src} p={p}")
                 return float(p), str(src)
 
-
-        # --- LAST RESORT: candles_cache close (no external WS/REST needed) ---
-        try:
-            for exname in chain:
-                ex_key = (exname or "").lower()
-                for tf, lim in (("1m", 2), ("5m", 2), ("15m", 2)):
-                    row = await db_store.candles_cache_get(ex_key, market.upper(), sym.upper(), tf, int(lim))
-                    if not row:
-                        continue
-                    blob, _updated_at = row
-                    if not blob:
-                        continue
-                    dfp = db_store._cc_unpack_df(blob)
-                    if dfp is None or getattr(dfp, "empty", True):
-                        continue
-                    close_col = "close" if "close" in dfp.columns else ("c" if "c" in dfp.columns else None)
-                    if not close_col:
-                        continue
-                    try:
-                        p = float(dfp[close_col].iloc[-1])
-                    except Exception:
-                        continue
-                    if _is_reasonable(p):
-                        _pdbg(f"CANDLES_CACHE {exname} tf={tf} p={p}")
-                        return float(p), f"{exname}_CANDLES"
-        except Exception:
-            pass
-
-        raise PriceUnavailableError(f"price unavailable market={market} symbol={raw_sym or sym} mode={mode}")
+        raise PriceUnavailableError(f"price unavailable market={market} symbol={signal.symbol} mode={mode}")
 
 
 
