@@ -13192,7 +13192,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
     pending_instant_emit = int(os.getenv("MID_PENDING_INSTANT_EMIT", "0") or 0) == 1
     # If instant emit is enabled, default to ignoring the zone unless explicitly disabled
-    instant_ignore_zone = int(os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0") or 0) == 1 or pending_instant_emit
+    instant_ignore_zone = int(os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0") or 0) == 1 
 
     logger.info("[mid][pending] trigger loop started poll=%.2fs ttl=%.1fmin tol_atr=%.3f tol_pct=%.4f instant_emit=%s ignore_zone=%s",
                 poll, ttl_min, tol_atr, tol_pct, int(pending_instant_emit), int(instant_ignore_zone))
@@ -13367,7 +13367,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             # Use only for debugging the pipeline end-to-end.
             pending_instant_emit = os.getenv("MID_PENDING_INSTANT_EMIT", "0").strip().lower() in ("1","true","yes","on")
             # default: if instant emit is on, ignore zone unless explicitly disabled
-            instant_ignore_zone = (os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0").strip().lower() in ("1","true","yes","on")) or pending_instant_emit
+            instant_ignore_zone = (os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0").strip().lower() in ("1","true","yes","on")) 
             keep: list[dict] = []
             any_wait = False
             # --- per-poll diagnostics counters ---
