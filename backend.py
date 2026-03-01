@@ -11343,15 +11343,15 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
         market = (signal.market or "FUTURES").upper()
         base = float(getattr(signal, "entry", 0) or 0) or None
 
-# Normalize symbol to avoid WS/REST mismatches caused by separators (":", "-", ".", spaces)
-# and to support multiplier contracts (e.g., 1000SHIBUSDT).
-raw_sym = str(getattr(signal, "symbol", "") or "")
-sym = re.sub(r"[^A-Za-z0-9]", "", raw_sym.upper())
-# For SPOT, leading multiplier prefixes usually don't exist; fall back to base symbol.
-if market == "SPOT":
-    sym = re.sub(r"^(\d+)([A-Z].+)$", r"\2", sym)
-if not sym:
-    sym = raw_sym.upper().strip()
+        # Normalize symbol to avoid WS/REST mismatches caused by separators (":", "-", ".", spaces)
+        # and to support multiplier contracts (e.g., 1000SHIBUSDT).
+        raw_sym = str(getattr(signal, "symbol", "") or "")
+        sym = re.sub(r"[^A-Za-z0-9]", "", raw_sym.upper())
+        # For SPOT, leading multiplier prefixes usually don't exist; fall back to base symbol.
+        if market == "SPOT":
+            sym = re.sub(r"^(\d+)([A-Z].+)$", r"\2", sym)
+        if not sym:
+            sym = raw_sym.upper().strip()
 
         # Mock mode: keep prices around entry to avoid nonsense.
         if not USE_REAL_PRICE:
