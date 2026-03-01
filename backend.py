@@ -11005,6 +11005,32 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             out['hit_tp2'] = bool(tp2 and hit_tp(float(tp2)))
             return out
         except Exception:
+            # If the main oracle fails (WS/REST chain), try a lightweight REST fallback
+            # so UI can still show live price and compute unrealized PnL.
+            try:
+                market = (t.get('market') or 'FUTURES').upper()
+                symbol = str(t.get('symbol') or '')
+                px = await self._fetch_rest_price(market, symbol)
+                if px is not None and float(px) > 0:
+                    out = dict(t)
+                    out['price_f'] = float(px)
+                    out['price_src'] = 'BINANCE_REST'
+                    # Best-effort hit checks
+                    side = (t.get('side') or 'LONG').upper()
+                    price_f = float(px)
+                    def hit_tp(lvl: float) -> bool:
+                        return price_f >= lvl if side == 'LONG' else price_f <= lvl
+                    def hit_sl(lvl: float) -> bool:
+                        return price_f <= lvl if side == 'LONG' else price_f >= lvl
+                    sl = float(t.get('sl') or 0.0) if t.get('sl') is not None else 0.0
+                    tp1 = float(t.get('tp1') or 0.0) if t.get('tp1') is not None else 0.0
+                    tp2 = float(t.get('tp2') or 0.0) if t.get('tp2') is not None else 0.0
+                    out['hit_sl'] = bool(sl and hit_sl(float(sl)))
+                    out['hit_tp1'] = bool(tp1 and hit_tp(float(tp1)))
+                    out['hit_tp2'] = bool(tp2 and hit_tp(float(tp2)))
+                    return out
+            except Exception:
+                pass
             return dict(t)
 
 
@@ -11050,6 +11076,30 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             out['hit_tp2'] = bool(tp2 and hit_tp(float(tp2)))
             return out
         except Exception:
+            # Same fallback as get_trade_live
+            try:
+                market = (t.get('market') or 'FUTURES').upper()
+                symbol = str(t.get('symbol') or '')
+                px = await self._fetch_rest_price(market, symbol)
+                if px is not None and float(px) > 0:
+                    out = dict(t)
+                    out['price_f'] = float(px)
+                    out['price_src'] = 'BINANCE_REST'
+                    side = (t.get('side') or 'LONG').upper()
+                    price_f = float(px)
+                    def hit_tp(lvl: float) -> bool:
+                        return price_f >= lvl if side == 'LONG' else price_f <= lvl
+                    def hit_sl(lvl: float) -> bool:
+                        return price_f <= lvl if side == 'LONG' else price_f >= lvl
+                    sl = float(t.get('sl') or 0.0) if t.get('sl') is not None else 0.0
+                    tp1 = float(t.get('tp1') or 0.0) if t.get('tp1') is not None else 0.0
+                    tp2 = float(t.get('tp2') or 0.0) if t.get('tp2') is not None else 0.0
+                    out['hit_sl'] = bool(sl and hit_sl(float(sl)))
+                    out['hit_tp1'] = bool(tp1 and hit_tp(float(tp1)))
+                    out['hit_tp2'] = bool(tp2 and hit_tp(float(tp2)))
+                    return out
+            except Exception:
+                pass
             return dict(t)
 
     async def remove_trade_by_id(self, user_id: int, trade_id: int) -> dict | None:
@@ -11075,35 +11125,39 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             sl=float(row.get("sl")) if row.get("sl") is not None else None,
         )
 
-        # Try to fetch a fresh price, but never block manual close for long.
-        entry_px = float(row.get("entry") or 0.0)
-        close_px: float | None = None
+        # IMPORTANT: For manual close we want a price even if the oracle is temporarily down.
+        # We therefore try:
+        #   1) WS-first oracle (_get_price_with_source)
+        #   2) Binance REST (fast, public)
+        #   3) entry price (last resort)
+        close_px = 0.0
         close_src = ""
         try:
-            close_px, close_src = await asyncio.wait_for(self._get_price_with_source(s), timeout=3.0)
-            close_px = float(close_px)
+            _px, _src = await self._get_price_with_source(s)
+            close_px = float(_px or 0.0)
+            close_src = str(_src or "")
         except Exception:
-            close_px = None
+            close_px = 0.0
             close_src = ""
 
-        # Fallback policy:
-        # - If we couldn't fetch price, still allow close (price=None in DB event).
-        # - If entry is invalid (0/NaN), also avoid PnL math.
-        if close_px is None:
-            close_px = (entry_px if (entry_px and entry_px > 0) else None)
+        if not (close_px and close_px > 0):
+            try:
+                rest_px = await self._fetch_rest_price(str(getattr(s, 'market', 'FUTURES')), str(getattr(s, 'symbol', '')))
+                if rest_px is not None and float(rest_px) > 0:
+                    close_px = float(rest_px)
+                    close_src = "BINANCE_REST"
+            except Exception:
+                pass
+
+        if not (close_px and close_px > 0):
+            close_px = float(row.get("entry") or 0.0)
 
         tp1_hit = bool(row.get("tp1_hit"))
         trade_ctx = UserTrade(user_id=int(user_id), signal=s, tp1_hit=tp1_hit)
-
-        pnl = 0.0
-        try:
-            if close_px is not None and entry_px and entry_px > 0:
-                pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(close_px), close_reason="CLOSED")
-        except Exception:
-            pnl = 0.0
+        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(close_px), close_reason="CLOSED")
 
         try:
-            await db_store.close_trade(int(trade_id), status="CLOSED", price=(float(close_px) if close_px is not None else None), pnl_total_pct=float(pnl))
+            await db_store.close_trade(int(trade_id), status="CLOSED", price=float(close_px), pnl_total_pct=float(pnl))
         except Exception:
             # If DB fails, still return a message so user sees what happened.
             try:
@@ -11163,7 +11217,7 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             status=status_txt,
         )
 
-        return {"ok": True, "text": txt, "pnl_total_pct": float(pnl), "close_price": (float(close_px) if close_px is not None else None)}
+        return {"ok": True, "text": txt, "pnl_total_pct": float(pnl), "close_price": float(close_px)}
 
     async def get_user_trades(self, user_id: int) -> list[dict]:
         return await db_store.list_user_trades(int(user_id), include_closed=False, limit=50)
@@ -11367,13 +11421,9 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
         def _is_reasonable(p: float | None) -> bool:
             """Sanity filter to avoid using bad ticks (e.g., 0.0).
 
-            Rejects:
+            Permissive, but rejects:
               - non-finite / <= 0
-              - if entry is known: values wildly off-scale
-
-            Special-case: 1000/10000-multiplier symbols (e.g. 1000SHIBUSDT).
-            Some venues quote these at a multiplied price. We accept either scale
-            (base, base*mult, base/mult) within the usual 10x band.
+              - if entry is known: values wildly off-scale (10x away)
             """
             if p is None:
                 return False
@@ -11383,31 +11433,11 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
                 return False
             if not math.isfinite(fp) or fp <= 0:
                 return False
-
             if base is not None and base > 0:
-                # Default band around entry
-                bands: list[tuple[float, float]] = [(base * 0.10, base * 10.0)]
-
-                # Multiplier symbols: accept alternative quoting scales.
-                try:
-                    sym_u = (getattr(signal, "symbol", "") or "").upper()
-                    m0 = re.match(r"^(\d{2,6})([A-Z].*)$", sym_u)
-                    if m0:
-                        mult = int(m0.group(1))
-                        if mult >= 10:
-                            bands.append((base * 0.10 * mult, base * 10.0 * mult))
-                            bands.append((base * 0.10 / mult, base * 10.0 / mult))
-                except Exception:
-                    pass
-
-                ok = False
-                for lo, hi in bands:
-                    if fp >= lo and fp <= hi:
-                        ok = True
-                        break
-                if not ok:
+                lo = base * 0.10
+                hi = base * 10.0
+                if fp < lo or fp > hi:
                     return False
-
             return True
 
         # --- WS-only helpers (NO REST FALLBACK INSIDE) ---
