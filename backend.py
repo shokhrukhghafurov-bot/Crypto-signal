@@ -951,6 +951,51 @@ def _mid_trig_reject_digest_top(topn: int = 5, window_sec: int | None = None, *,
     except Exception:
         return []
 
+
+def _mid_trig_reject_digest_counts(window_sec: int | None = None, *, bucket: str = "inzone") -> dict[str, int]:
+    """Return full counts of trigger reject reasons within the rolling window for a bucket.
+
+    This is used by [mid][status] to print *all* reasons (optionally capped at format-time),
+    instead of only top-N.
+    """
+    try:
+        if window_sec is None:
+            try:
+                window_sec = int(float(os.getenv("MID_TRIG_REJECT_WINDOW_SEC", "900") or 900))
+            except Exception:
+                window_sec = 900
+        window_sec = max(30, min(int(window_sec), 24 * 3600))
+        now = time.time()
+        cutoff = now - float(window_sec)
+
+        b = (bucket or "inzone").strip().lower()
+        if b in ("pre", "pretrig", "all", "pretrig_no"):
+            ev = MID_PRETRIG_REJECT_EVENTS
+        else:
+            ev = MID_INZONE_REJECT_EVENTS
+
+        # prune old (in-place)
+        if ev:
+            i0 = 0
+            for i, (ts, _k) in enumerate(ev):
+                if float(ts) >= cutoff:
+                    i0 = i
+                    break
+            else:
+                i0 = len(ev)
+            if i0 > 0:
+                del ev[:i0]
+
+        from collections import defaultdict
+        counts = defaultdict(int)
+        for ts, k in ev:
+            if float(ts) >= cutoff:
+                counts[str(k)] += 1
+        return {str(k): int(v) for k, v in counts.items() if int(v) > 0}
+    except Exception:
+        return {}
+
+
 # --- MID pending per-poll snapshot (for [mid][status]) ---
 
 # Updated on every pending poll; consumed by mid_status_summary_loop.
@@ -14225,19 +14270,45 @@ async def mid_status_summary_loop(self) -> None:
             # Top reasons inside trigger loop, split by bucket.
             # - pretrig_no: checked while not in-zone (should be rare)
             # - trig_no_inzone: in-zone but blocked (this is the real "why no emit")
+            # Trigger-loop reject reasons, split by bucket.
+            # - pretrig_no: checked while not in-zone (should be rare)
+            # - trig_no_inzone: in-zone but blocked (this is the real "why no emit")
+            #
+            # We try to show *all* reasons in the rolling window (capped only for log length).
             try:
-                pre_top = _mid_trig_reject_digest_top(topn=5, bucket="pre")
-                if pre_top:
-                    parts.append("pretrig_no=" + ",".join([f"{x.get('reason')}={int(x.get('count') or 0)}" for x in pre_top]))
+                max_show = int(float(os.getenv("MID_STATUS_TRIG_REASONS_MAX", os.getenv("MID_STATUS_TRIG_REASONS", "12")) or 12))
+            except Exception:
+                max_show = 12
+            max_show = max(3, min(int(max_show), 50))
+
+            try:
+                pre_counts = _mid_trig_reject_digest_counts(bucket="pre")
+                if pre_counts:
+                    items = sorted(pre_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+                    shown = items[:max_show]
+                    more = max(0, len(items) - len(shown))
+                    s = ",".join([f"{k}={int(v)}" for k, v in shown])
+                    if more:
+                        s += f",+more={more}"
+                    parts.append("pretrig_no=" + s)
             except Exception:
                 pass
+
             try:
-                in_top = _mid_trig_reject_digest_top(topn=5, bucket="inzone")
-                if in_top:
-                    parts.append("trig_no_inzone=" + ",".join([f"{x.get('reason')}={int(x.get('count') or 0)}" for x in in_top]))
-                    # primary blocker (top-1) for quick scanning
+                in_counts = _mid_trig_reject_digest_counts(bucket="inzone")
+                if in_counts:
+                    items = sorted(in_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+                    shown = items[:max_show]
+                    more = max(0, len(items) - len(shown))
+                    s = ",".join([f"{k}={int(v)}" for k, v in shown])
+                    if more:
+                        s += f",+more={more}"
+                    parts.append("trig_no_inzone=" + s)
                     try:
-                        parts.append(f"emit_blocker={str(in_top[0].get('reason') or '')}")
+                        parts.append(f"emit_blocker={str(shown[0][0] if shown else '')}")
+                        top3 = [k for k, _v in shown[:3]]
+                        if top3:
+                            parts.append("emit_blockers=" + ",".join(top3))
                     except Exception:
                         pass
             except Exception:
