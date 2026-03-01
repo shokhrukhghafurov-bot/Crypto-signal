@@ -12565,9 +12565,11 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
             fallback_half_atr = float(os.getenv("MID_ZONE_FALLBACK_HALF_ATR_STRICT", "0.18") or 0.18)
 
         fallback_enabled = str(os.getenv("MID_ZONE_FALLBACK_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
-        # In STRICT, fallback is off by default unless explicitly enabled for strict too
+        # In STRICT we still want a safe fallback zone when OB/FVG/Channel is unusably wide
+        # or too far away. Otherwise good setups get dropped as `no_zone src=too_wide`.
+        # You can still disable this explicitly with MID_ZONE_FALLBACK_IN_STRICT=0.
         if zone_mode == "STRICT":
-            strict_fb = str(os.getenv("MID_ZONE_FALLBACK_IN_STRICT", "0") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
+            strict_fb = str(os.getenv("MID_ZONE_FALLBACK_IN_STRICT", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
             fallback_enabled = fallback_enabled and strict_fb
 
         fallback_max_pct = float(os.getenv("MID_ZONE_FALLBACK_MAX_PCT", "0.006") or 0.006)
@@ -12636,7 +12638,7 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
                 half = max(0.0, fallback_half_atr * atr)
                 half = min(half, float(entry) * fallback_max_pct)
                 if half > 0:
-                    return ((float(entry) - half, float(entry) + half), "fallback")
+                    return ((float(entry) - half, float(entry) + half), f"fallback:{src}:too_wide")
             return (None, "too_wide")
 
         if width < min_w:
@@ -12654,7 +12656,7 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
                 # also cap by pct of price
                 half = min(half, float(entry) * fallback_max_pct)
                 if half > 0:
-                    return ((float(entry) - half, float(entry) + half), "fallback")
+                    return ((float(entry) - half, float(entry) + half), f"fallback:{src}:far")
             # Optional: allow "far" zones for pending (will be flagged and handled with stricter TTL/limits).
             allow_far = str(os.getenv("MID_PENDING_ALLOW_FAR", "0") or "0").strip().lower() in ("1","true","yes","y","on")
             if allow_far:
