@@ -10359,6 +10359,15 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
 
     confidence = ta_score
 
+    # NOTE: In pending/trigger architecture, we intentionally allow SCAN to create a pending
+    # even if some hard filters would block an immediate emit. Those hard filters must be
+    # enforced at TRIGGER moment.
+    _phase = "scan"
+    try:
+        _phase = str(_MID_EVAL_PHASE.get() or "scan")
+    except Exception:
+        _phase = "scan"
+
     ta: Dict[str, Any] = {
         "direction": dir_trend,
         "entry": entry,
@@ -10369,7 +10378,10 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "confidence": confidence,
         "trap_ok": bool(trap_ok),
         "trap_reason": str(trap_reason or ""),
-        "blocked": (not bool(trap_ok)),
+        # Hard blocks (late_entry_atr / near_extremes / bb_bounce / regime_block / etc.)
+        # are applied on TRIGGER, not on SCAN when MID_FILTERS_AFTER_SETUP=1.
+        "blocked": False,
+        "block_reason": "",
 
         # fields used by MID filters/formatter
         "dir1": dir_mid,
@@ -10398,6 +10410,125 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "rsi_div": rsi_div,
         "ta_score": ta_score,
     }
+
+    # Apply hard block filters only in TRIGGER phase, so the status line can show
+    # concrete reasons like bb_bounce, near_extremes, regime_block, etc.
+    try:
+        if str(_phase).lower() == "trigger":
+            # recent extremes from 30m (stable)
+            try:
+                recent_low = float(df30i["low"].astype(float).tail(120).min())
+                recent_high = float(df30i["high"].astype(float).tail(120).max())
+            except Exception:
+                recent_low = float(df30i["low"].astype(float).min())
+                recent_high = float(df30i["high"].astype(float).max())
+
+            # 5m helpers (best-effort)
+            ema20_5m = float("nan")
+            last_vol = float("nan")
+            avg_vol = float("nan")
+            last_body = 0.0
+            bos_down_5m = False
+            bos_up_5m = False
+            two_red_5m = False
+            two_green_5m = False
+            lower_highs_5m = False
+            higher_lows_5m = False
+            try:
+                op = df5i["open"].astype(float)
+                hi = df5i["high"].astype(float)
+                lo = df5i["low"].astype(float)
+                cl = df5i["close"].astype(float)
+                if len(cl) >= 25:
+                    ema20_5m = float(cl.ewm(span=20, adjust=False).mean().iloc[-1])
+                if len(cl) >= 2 and len(op) >= 2:
+                    two_red_5m = (float(cl.iloc[-1]) < float(op.iloc[-1])) and (float(cl.iloc[-2]) < float(op.iloc[-2]))
+                    two_green_5m = (float(cl.iloc[-1]) > float(op.iloc[-1])) and (float(cl.iloc[-2]) > float(op.iloc[-2]))
+                try:
+                    last_body = abs(float(cl.iloc[-1]) - float(op.iloc[-1]))
+                except Exception:
+                    last_body = 0.0
+                try:
+                    vv = df5i["volume"].astype(float)
+                    last_vol = float(vv.iloc[-1])
+                    avg_vol = float(vv.rolling(20).mean().iloc[-1])
+                except Exception:
+                    last_vol = float("nan")
+                    avg_vol = float("nan")
+
+                # BOS heuristic (lightweight)
+                try:
+                    lb = 20
+                    k = max(2, int(MID_BOS_RECENT_BARS))
+                    if len(lo) >= lb + k + 1:
+                        prev_low = float(lo.iloc[-(lb+k+1):-(k)].min())
+                        prev_high = float(hi.iloc[-(lb+k+1):-(k)].max())
+                        for j in range(-k, 0):
+                            _low = float(lo.iloc[j]); _high = float(hi.iloc[j]); _close = float(cl.iloc[j])
+                            if (_low < prev_low) and (_close < prev_low):
+                                bos_down_5m = True
+                            if (_high > prev_high) and (_close > prev_high):
+                                bos_up_5m = True
+                except Exception:
+                    pass
+
+                # HL/LH micro-structure
+                try:
+                    tol = max(0.0, float(MID_HL_TOL_PCT))
+                    nlh = max(3, int(MID_LOWER_HIGHS_LOOKBACK))
+                    if len(hi) >= nlh:
+                        hh = [float(x) for x in hi.iloc[-nlh:].tolist()]
+                        lower_highs_5m = all(hh[i] <= hh[i-1] * (1.0 + tol) for i in range(1, len(hh)))
+                    nhl = max(3, int(MID_HIGHER_LOWS_LOOKBACK))
+                    if len(lo) >= nhl:
+                        ll = [float(x) for x in lo.iloc[-nhl:].tolist()]
+                        higher_lows_5m = all(ll[i] >= ll[i-1] * (1.0 - tol) for i in range(1, len(ll)))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            # vwap_val, bb_pos already computed above; ensure numeric fallbacks
+            vwap_num = float(vwap_val) if (vwap_val == vwap_val) else float(entry)
+            bb_pos_for_block = str(bb_pos or "—")
+
+            # Market hint: use environment if present, otherwise assume FUTURES (most strict).
+            _mkt = str(os.getenv("MID_DEFAULT_MARKET", "FUTURES") or "FUTURES").upper().strip()
+            if _mkt not in ("SPOT", "FUTURES"):
+                _mkt = "FUTURES"
+
+            reason = _mid_block_reason(
+                symbol=str(symbol or ""),
+                side=str(dir_trend),
+                close=float(entry),
+                o=float(df5i["open"].astype(float).iloc[-1]) if (df5i is not None and not getattr(df5i, "empty", True)) else float(entry),
+                recent_low=float(recent_low),
+                recent_high=float(recent_high),
+                atr_30m=float(atr30),
+                rsi_5m=float(rsi5) if (rsi5 == rsi5) else float("nan"),
+                vwap=float(vwap_num),
+                bb_pos=str(bb_pos_for_block),
+                ema20_5m=float(ema20_5m) if (ema20_5m == ema20_5m) else float("nan"),
+                bos_down_5m=bool(bos_down_5m),
+                two_red_5m=bool(two_red_5m),
+                lower_highs_5m=bool(lower_highs_5m),
+                bos_up_5m=bool(bos_up_5m),
+                two_green_5m=bool(two_green_5m),
+                higher_lows_5m=bool(higher_lows_5m),
+                last_vol=float(last_vol) if (last_vol == last_vol) else 0.0,
+                avg_vol=float(avg_vol) if (avg_vol == avg_vol) else 0.0,
+                last_body=float(last_body),
+                climax_recent_bars=int(os.getenv("MID_CLIMAX_RECENT_BARS", "12") or 12),
+                market=_mkt,
+                htf_dir_1h=str(dir_trend),
+                htf_dir_30m=str(dir_mid),
+                adx_30m=float(adx30) if (adx30 == adx30) else None,
+            )
+            if reason:
+                ta["blocked"] = True
+                ta["block_reason"] = str(reason)
+    except Exception:
+        pass
     ta["ta_block"] = _fmt_ta_block_mid(ta)
     return ta
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
@@ -13722,7 +13853,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         _ph_tok = None
                     try:
-                        ta = evaluate_on_exchange_mid_v2(df5, df30, df1h)
+                        ta = evaluate_on_exchange_mid_v2(df5, df30, df1h, symbol=sym)
                     finally:
                         try:
                             if _ph_tok is not None:
