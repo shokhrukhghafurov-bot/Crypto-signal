@@ -12909,12 +12909,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             pass
 
 
-    def _pending_mark_fail(it: dict, reason: str, now_ts: float) -> bool:
-        """Return True to keep pending, False to drop.
+    def _pending_apply_fail(it: dict, reason: str, now_ts: float) -> tuple[bool, str]:
+        """Update pending fail bookkeeping and return (keep, outcome).
+
+        outcome is one of: 'soft_fail', 'hard_fail'.
 
         Smart delete policy:
         - HARD reasons -> drop immediately (terminal invalidation)
         - SOFT reasons -> keep waiting (do not increment fail_count), but still enforce max_attempts
+        - Default -> counts as fail and is subject to caps
         """
         r0 = str(reason or "fail").strip().lower()
 
@@ -12930,7 +12933,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 it["last_fail_reason"] = str(reason or "fail")
                 it["last_fail_ts"] = float(now_ts)
                 _pending_clear_cooldown(it)
-                return False
+                return (False, "hard_fail")
         except Exception:
             pass
 
@@ -12944,8 +12947,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 _max_attempts_i = int(it.get("max_attempts") or max_attempts or 0)
                 if _max_attempts_i > 0 and int(it.get("trigger_attempts") or 0) >= _max_attempts_i:
                     _pending_clear_cooldown(it)
-                    return False
-                return True
+                    return (False, "hard_fail")
+                return (True, "soft_fail")
         except Exception:
             pass
 
@@ -12958,13 +12961,26 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             _max_fails_i = int(it.get("max_fails") or max_fails or 0)
             if _max_attempts_i > 0 and int(it.get("trigger_attempts") or 0) >= _max_attempts_i:
                 _pending_clear_cooldown(it)
-                return False
+                return (False, "hard_fail")
             if _max_fails_i > 0 and int(it.get("fail_count") or 0) >= _max_fails_i:
                 _pending_clear_cooldown(it)
-                return False
+                return (False, "hard_fail")
         except Exception:
-            return True
-        return True
+            return (True, "soft_fail")
+        return (True, "soft_fail")
+
+    def _pending_log_trigger(sym: str, market: str, direction: str, outcome: str, reason: str, it: dict, price: float) -> None:
+        try:
+            logger.info(
+                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s attempts=%s fails=%s px=%.6g",
+                str(sym), str(market), str(direction),
+                str(outcome), str(reason or ""),
+                int(it.get("trigger_attempts") or 0),
+                int(it.get("fail_count") or 0),
+                float(price),
+            )
+        except Exception:
+            pass
 
     while True:
         try:
@@ -13366,6 +13382,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 self.last_futures_signal = sig
 
                             await emit_signal_cb(sig)
+                            _pending_log_trigger(sym, market, direction, "pass", "instant_emit", it, float(price))
                             logger.info("[mid][pending] INSTANT_EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, float(entry_emit), float(price), tol)
                             try:
                                 _mid_metrics_inc("pending_triggered", 1)
@@ -13381,6 +13398,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             # If instant emit fails for any reason, fall back to normal path.
                             pass
 
+                    # We reached entry/zone: count this as a trigger attempt (persisted in DB kv_store).
+                    _pending_mark_attempt(it, now)
+
                     # Smart delete (terminal invalidation): if higher-timeframe structure
                     # is clearly opposite to the pending direction, drop immediately.
                     try:
@@ -13390,27 +13410,23 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             pivot=int(os.getenv("MID_STRUCTURE_PIVOT", "3") or 3),
                         )
                         if str(direction).upper() == "LONG" and struct_1h == "LH-LL":
-                            try:
-                                removed_n += 1
-                            except Exception:
-                                pass
-                            _pending_mark_fail(it, "structure_broken", now)
-                            continue
+                            keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
+                            _pending_log_trigger(sym, market, direction, outc, "structure_broken", it, float(price))
+                            if not keep_it:
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                                continue
                         if str(direction).upper() == "SHORT" and struct_1h == "HH-HL":
-                            try:
-                                removed_n += 1
-                            except Exception:
-                                pass
-                            _pending_mark_fail(it, "structure_broken", now)
-                            continue
-                    except Exception:
-                        pass
-
-                    # We reached entry/zone: count this as a trigger attempt (persisted in DB kv_store).
-                    _pending_mark_attempt(it, now)
-                    try:
-                        attempts_sum += int(it.get('trigger_attempts') or 0)
-                        fails_sum += int(it.get('fail_count') or 0)
+                            keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
+                            _pending_log_trigger(sym, market, direction, outc, "structure_broken", it, float(price))
+                            if not keep_it:
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                                continue
                     except Exception:
                         pass
 
@@ -13430,33 +13446,68 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
                     if not ta:
-                        if _pending_mark_fail(it, "no_ta", now):
+                        keep_it, outc = _pending_apply_fail(it, "no_ta", now)
+                        _pending_log_trigger(sym, market, direction, outc, "no_ta", it, float(price))
+                        if keep_it:
                             keep.append(it)
                             any_wait = True
+                        else:
+                            try:
+                                removed_n += 1
+                            except Exception:
+                                pass
                         continue
                     if str(ta.get("direction") or "").upper() != direction:
-                        if _pending_mark_fail(it, "direction_mismatch", now):
+                        keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
+                        _pending_log_trigger(sym, market, direction, outc, "direction_mismatch", it, float(price))
+                        if keep_it:
                             keep.append(it)
                             any_wait = True
+                        else:
+                            try:
+                                removed_n += 1
+                            except Exception:
+                                pass
                         continue
                     # Hard blocks (late entry, near extremes, etc.) must be enforced on TRIGGER.
                     if bool(ta.get("blocked")):
                         reason = str(ta.get("block_reason") or "blocked").strip() or "blocked"
-                        if _pending_mark_fail(it, reason, now):
+                        keep_it, outc = _pending_apply_fail(it, reason, now)
+                        _pending_log_trigger(sym, market, direction, outc, reason, it, float(price))
+                        if keep_it:
                             keep.append(it)
                             any_wait = True
+                        else:
+                            try:
+                                removed_n += 1
+                            except Exception:
+                                pass
                         continue
                     if not bool(ta.get("trap_ok", True)):
-                        if _pending_mark_fail(it, "trap_block", now):
+                        keep_it, outc = _pending_apply_fail(it, "trap_block", now)
+                        _pending_log_trigger(sym, market, direction, outc, "trap_block", it, float(price))
+                        if keep_it:
                             keep.append(it)
                             any_wait = True
+                        else:
+                            try:
+                                removed_n += 1
+                            except Exception:
+                                pass
                         continue
 
                     min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
                     if int(float(ta.get("confidence") or 0)) < int(min_conf):
-                        if _pending_mark_fail(it, "confidence_low", now):
+                        keep_it, outc = _pending_apply_fail(it, "confidence_low", now)
+                        _pending_log_trigger(sym, market, direction, outc, "confidence_low", it, float(price))
+                        if keep_it:
                             keep.append(it)
                             any_wait = True
+                        else:
+                            try:
+                                removed_n += 1
+                            except Exception:
+                                pass
                         continue
 
                     # If scan stage skipped hard filters (MID_FILTERS_AFTER_SETUP=1),
@@ -13475,9 +13526,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             need = float(min_score_fut if market == "FUTURES" else min_score_spot)
                             score = float(ta.get("confidence") or ta.get("score") or 0.0)
                             if need and score < need:
-                                if _pending_mark_fail(it, "score_low", now):
+                                keep_it, outc = _pending_apply_fail(it, "score_low", now)
+                                _pending_log_trigger(sym, market, direction, outc, "score_low", it, float(price))
+                                if keep_it:
                                     keep.append(it)
                                     any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
                                 continue
                         except Exception:
                             pass
@@ -13488,14 +13546,28 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             adx30 = float(ta.get("adx1") or ta.get("adx_30m") or 0.0)
                             adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
                             if min_adx_30m and adx30 < min_adx_30m:
-                                if _pending_mark_fail(it, "regime_block", now):
+                                keep_it, outc = _pending_apply_fail(it, "regime_block", now)
+                                _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
+                                if keep_it:
                                     keep.append(it)
                                     any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
                                 continue
                             if min_adx_1h and adx1h < min_adx_1h:
-                                if _pending_mark_fail(it, "regime_block", now):
+                                keep_it, outc = _pending_apply_fail(it, "regime_block", now)
+                                _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
+                                if keep_it:
                                     keep.append(it)
                                     any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
                                 continue
                         except Exception:
                             pass
@@ -13503,9 +13575,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             min_atr_pct = float(os.getenv("MID_MIN_ATR_PCT","0") or 0)
                             atrp = float(ta.get("atr_pct") or 0.0)
                             if min_atr_pct and atrp < min_atr_pct:
-                                if _pending_mark_fail(it, "volatility_block", now):
+                                keep_it, outc = _pending_apply_fail(it, "volatility_block", now)
+                                _pending_log_trigger(sym, market, direction, outc, "volatility_block", it, float(price))
+                                if keep_it:
                                     keep.append(it)
                                     any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
                                 continue
                         except Exception:
                             pass
@@ -13514,9 +13593,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             min_rr = float(os.getenv("MID_MIN_RR", "0") or 0)
                             rr = float(ta.get("rr") or 0.0)
                             if min_rr and rr < min_rr:
-                                if _pending_mark_fail(it, "rr_low", now):
+                                keep_it, outc = _pending_apply_fail(it, "rr_low", now)
+                                _pending_log_trigger(sym, market, direction, outc, "rr_low", it, float(price))
+                                if keep_it:
                                     keep.append(it)
                                     any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
                                 continue
                         except Exception:
                             pass
@@ -13525,9 +13611,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or 0)
                             volx = float(ta.get("rel_vol") or 0.0)
                             if mid_min_vol_x and volx < mid_min_vol_x:
-                                if _pending_mark_fail(it, "vol_low", now):
+                                keep_it, outc = _pending_apply_fail(it, "vol_low", now)
+                                _pending_log_trigger(sym, market, direction, outc, "vol_low", it, float(price))
+                                if keep_it:
                                     keep.append(it)
                                     any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
                                 continue
                         except Exception:
                             pass
@@ -13543,20 +13636,41 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             if vwap_val > 0 and atr30 and atr30 > 0:
                                 if mid_require_vwap_bias:
                                     if direction_u == "SHORT" and not (entry_check < vwap_val):
-                                        if _pending_mark_fail(it, "vwap_bias", now):
+                                        keep_it, outc = _pending_apply_fail(it, "vwap_bias", now)
+                                        _pending_log_trigger(sym, market, direction, outc, "vwap_bias", it, float(price))
+                                        if keep_it:
                                             keep.append(it)
                                             any_wait = True
+                                        else:
+                                            try:
+                                                removed_n += 1
+                                            except Exception:
+                                                pass
                                         continue
                                     if direction_u == "LONG" and not (entry_check > vwap_val):
-                                        if _pending_mark_fail(it, "vwap_bias", now):
+                                        keep_it, outc = _pending_apply_fail(it, "vwap_bias", now)
+                                        _pending_log_trigger(sym, market, direction, outc, "vwap_bias", it, float(price))
+                                        if keep_it:
                                             keep.append(it)
                                             any_wait = True
+                                        else:
+                                            try:
+                                                removed_n += 1
+                                            except Exception:
+                                                pass
                                         continue
                                 if mid_min_vwap_dist_atr > 0:
                                     if abs(entry_check - vwap_val) < (atr30 * mid_min_vwap_dist_atr):
-                                        if _pending_mark_fail(it, "vwap_dist", now):
+                                        keep_it, outc = _pending_apply_fail(it, "vwap_dist", now)
+                                        _pending_log_trigger(sym, market, direction, outc, "vwap_dist", it, float(price))
+                                        if keep_it:
                                             keep.append(it)
                                             any_wait = True
+                                        else:
+                                            try:
+                                                removed_n += 1
+                                            except Exception:
+                                                pass
                                         continue
                         except Exception:
                             pass
@@ -13565,14 +13679,28 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             req = os.getenv("MID_REQUIRE_LIQ_SWEEP", "0").strip().lower() in ("1","true","yes","on")
                             if req:
                                 if str(direction).upper() == "LONG" and not bool(ta.get("sweep_long", False)):
-                                    if _pending_mark_fail(it, "liq_sweep_missing", now):
+                                    keep_it, outc = _pending_apply_fail(it, "liq_sweep_missing", now)
+                                    _pending_log_trigger(sym, market, direction, outc, "liq_sweep_missing", it, float(price))
+                                    if keep_it:
                                         keep.append(it)
                                         any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
                                     continue
                                 if str(direction).upper() == "SHORT" and not bool(ta.get("sweep_short", False)):
-                                    if _pending_mark_fail(it, "liq_sweep_missing", now):
+                                    keep_it, outc = _pending_apply_fail(it, "liq_sweep_missing", now)
+                                    _pending_log_trigger(sym, market, direction, outc, "liq_sweep_missing", it, float(price))
+                                    if keep_it:
                                         keep.append(it)
                                         any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
                                     continue
                         except Exception:
                             pass
@@ -13626,6 +13754,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     await emit_signal_cb(sig)
                     _pending_clear_cooldown(it)
+                    _pending_log_trigger(sym, market, direction, "pass", "emit", it, float(price))
                     logger.info("[mid][pending] EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, entry, float(price), tol)
                     try:
                         _mid_metrics_inc("pending_triggered", 1)
@@ -13657,6 +13786,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         kept_n = int(len(keep) if isinstance(keep, list) else 0)
                     except Exception:
                         kept_n = 0
+                    # Compute averages from persisted counters (not just this poll),
+                    # so in-zone items show attempts even when debounced by attempt_gap_sec.
+                    try:
+                        attempts_sum = 0
+                        fails_sum = 0
+                        for _it in (keep or []):
+                            attempts_sum += int(_it.get("trigger_attempts") or 0)
+                            fails_sum += int(_it.get("fail_count") or 0)
+                    except Exception:
+                        pass
                     a_avg = (float(attempts_sum) / float(total_n)) if total_n > 0 else 0.0
                     f_avg = (float(fails_sum) / float(total_n)) if total_n > 0 else 0.0
                     logger.info("[mid][pending][tick] total=%s keep=%s in_zone=%s near=%s far=%s expired_now=%s removed_now=%s attempts_avg=%.2f fails_avg=%.2f",
