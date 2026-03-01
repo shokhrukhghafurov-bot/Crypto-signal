@@ -13980,8 +13980,20 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             try:
                 global _MID_PENDING_TICK_LAST
                 kept_n0 = int(len(keep) if isinstance(keep, list) else 0)
-                a_avg0 = (float(attempts_sum) / float(total_n)) if total_n > 0 else 0.0
-                f_avg0 = (float(fails_sum) / float(total_n)) if total_n > 0 else 0.0
+                # NOTE: attempts_sum/fails_sum above are per-poll counters and may stay 0.
+                # For status we want persisted, cumulative averages from the kept pending items.
+                attempts_sum0 = 0
+                fails_sum0 = 0
+                try:
+                    if isinstance(keep, list):
+                        for _it in keep:
+                            attempts_sum0 += int(_it.get("trigger_attempts") or 0)
+                            fails_sum0 += int(_it.get("fail_count") or 0)
+                except Exception:
+                    attempts_sum0 = 0
+                    fails_sum0 = 0
+                a_avg0 = (float(attempts_sum0) / float(kept_n0)) if kept_n0 > 0 else 0.0
+                f_avg0 = (float(fails_sum0) / float(kept_n0)) if kept_n0 > 0 else 0.0
                 _MID_PENDING_TICK_LAST = {
                     "ts": time.time(),
                     "total": int(total_n),
@@ -13993,6 +14005,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     "removed_now": int(removed_n),
                     "attempts_avg": float(a_avg0),
                     "fails_avg": float(f_avg0),
+                    "attempts_sum": int(attempts_sum0),
+                    "fails_sum": int(fails_sum0),
                 }
             except Exception:
                 pass
