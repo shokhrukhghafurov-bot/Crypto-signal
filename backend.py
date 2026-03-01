@@ -12565,11 +12565,9 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
             fallback_half_atr = float(os.getenv("MID_ZONE_FALLBACK_HALF_ATR_STRICT", "0.18") or 0.18)
 
         fallback_enabled = str(os.getenv("MID_ZONE_FALLBACK_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
-        # In STRICT we still want a safe fallback zone when OB/FVG/Channel is unusably wide
-        # or too far away. Otherwise good setups get dropped as `no_zone src=too_wide`.
-        # You can still disable this explicitly with MID_ZONE_FALLBACK_IN_STRICT=0.
+        # In STRICT, fallback is off by default unless explicitly enabled for strict too
         if zone_mode == "STRICT":
-            strict_fb = str(os.getenv("MID_ZONE_FALLBACK_IN_STRICT", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
+            strict_fb = str(os.getenv("MID_ZONE_FALLBACK_IN_STRICT", "0") or "0").strip().lower() in ("1", "true", "yes", "y", "on")
             fallback_enabled = fallback_enabled and strict_fb
 
         fallback_max_pct = float(os.getenv("MID_ZONE_FALLBACK_MAX_PCT", "0.006") or 0.006)
@@ -12638,7 +12636,7 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
                 half = max(0.0, fallback_half_atr * atr)
                 half = min(half, float(entry) * fallback_max_pct)
                 if half > 0:
-                    return ((float(entry) - half, float(entry) + half), f"fallback:{src}:too_wide")
+                    return ((float(entry) - half, float(entry) + half), "fallback")
             return (None, "too_wide")
 
         if width < min_w:
@@ -12656,7 +12654,7 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
                 # also cap by pct of price
                 half = min(half, float(entry) * fallback_max_pct)
                 if half > 0:
-                    return ((float(entry) - half, float(entry) + half), f"fallback:{src}:far")
+                    return ((float(entry) - half, float(entry) + half), "fallback")
             # Optional: allow "far" zones for pending (will be flagged and handled with stricter TTL/limits).
             allow_far = str(os.getenv("MID_PENDING_ALLOW_FAR", "0") or "0").strip().lower() in ("1","true","yes","y","on")
             if allow_far:
@@ -12912,14 +12910,21 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
 
     def _pending_mark_fail(it: dict, reason: str, now_ts: float) -> bool:
-        """Return True to keep pending, False to drop."""
-        # "Smart delete": some reasons are terminal (setup invalidated) and we drop
-        # the pending immediately instead of waiting for max_fails/max_attempts.
-        # This is configurable via env MID_PENDING_HARD_FAIL_REASONS.
+        """Return True to keep pending, False to drop.
+
+        Smart delete policy:
+        - HARD reasons -> drop immediately (terminal invalidation)
+        - SOFT reasons -> keep waiting (do not increment fail_count), but still enforce max_attempts
+        """
+        r0 = str(reason or "fail").strip().lower()
+
+        # HARD reasons: invalidate immediately
         try:
-            _hard = os.getenv("MID_PENDING_HARD_FAIL_REASONS", "structure_broken,invalidation_hit,trend_flip").strip()
+            _hard = os.getenv(
+                "MID_PENDING_HARD_FAIL_REASONS",
+                "structure_broken,invalidation_hit,trend_flip,direction_mismatch",
+            ).strip()
             hard_set = {s.strip().lower() for s in _hard.split(",") if s.strip()}
-            r0 = str(reason or "fail").strip().lower()
             if r0 in hard_set:
                 it["fail_count"] = int(it.get("fail_count") or 0) + 1
                 it["last_fail_reason"] = str(reason or "fail")
@@ -12928,6 +12933,23 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 return False
         except Exception:
             pass
+
+        # SOFT reasons: allow waiting (do not count as fail), but still record reason/ts
+        try:
+            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,liq_sweep_missing").strip()
+            soft_set = {s.strip().lower() for s in _soft.split(",") if s.strip()}
+            if r0 in soft_set:
+                it["last_fail_reason"] = str(reason or "fail")
+                it["last_fail_ts"] = float(now_ts)
+                _max_attempts_i = int(it.get("max_attempts") or max_attempts or 0)
+                if _max_attempts_i > 0 and int(it.get("trigger_attempts") or 0) >= _max_attempts_i:
+                    _pending_clear_cooldown(it)
+                    return False
+                return True
+        except Exception:
+            pass
+
+        # Default: count fail and apply caps
         try:
             it["fail_count"] = int(it.get("fail_count") or 0) + 1
             it["last_fail_reason"] = str(reason or "fail")
@@ -12943,7 +12965,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         except Exception:
             return True
         return True
-
 
     while True:
         try:
