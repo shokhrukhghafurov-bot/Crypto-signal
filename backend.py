@@ -931,6 +931,9 @@ def _mid_trig_reject_digest_top(topn: int = 5, window_sec: int | None = None) ->
 # Updated on every pending poll; consumed by mid_status_summary_loop.
 _MID_PENDING_TICK_LAST: dict = {}
 
+# Last trigger-loop poll counters (helps explain why no EMIT even when in_zone>0)
+_MID_TRIG_POLL_LAST: dict = {}
+
 # Per-tick hard-block breakdown snapshot (for /health and minute status logs)
 MID_LAST_HARDBLOCK_TOP = ""
 MID_LAST_HARDBLOCK_SAMPLES = None  # dict[str, list[str]]
@@ -13073,6 +13076,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             any_wait = False
             # --- per-poll diagnostics counters ---
             total_n = int(len(items) if isinstance(items, list) else 0)
+            trig_checked_n = 0
             in_zone_n = 0
             near_n = 0
             far_n = 0
@@ -13084,6 +13088,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
             for it in items:
                 try:
+                    trig_checked_n += 1
                     sym = str(it.get("symbol") or "")
                     sym_trade = str(it.get("trade_symbol") or sym)
                     sym_candles = str(it.get("candle_symbol") or sym)
@@ -13900,6 +13905,27 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             except Exception:
                 pass
 
+            # Update last trigger-loop poll counters (helps interpret trig_no buckets).
+            try:
+                global _MID_TRIG_POLL_LAST
+                _MID_TRIG_POLL_LAST = {
+                    "ts": float(now),
+                    "checked": int(trig_checked_n),
+                    "in_zone": int(in_zone_n),
+                    "keep": int(len(keep) if isinstance(keep, list) else 0),
+                    "removed_now": int(removed_n),
+                    "expired_now": int(expired_n),
+                }
+            except Exception:
+                pass
+
+            # Mark MID activity timestamp for [mid][status] (even if scanner tick is disabled).
+            try:
+                global MID_LAST_TICK_TS
+                MID_LAST_TICK_TS = float(now)
+            except Exception:
+                pass
+
             # If there is anything still pending after this poll, count it as a "pending_wait" stage.
             # (This helps /health show whether signals are "missing" because price/TA hasn't confirmed yet.)
             try:
@@ -14095,8 +14121,28 @@ async def mid_status_summary_loop(self) -> None:
             except Exception:
                 pass
 
-            if pending_n is not None:
-                parts.append(f"pending={pending_n} (created+{df_p_created} trig+{df_p_trig} exp+{df_p_exp})")
+            # Prefer trigger-loop snapshot for "pending now" to avoid confusing mismatches
+            # between kv-store view and the latest trigger poll.
+            try:
+                pt = _MID_PENDING_TICK_LAST or {}
+            except Exception:
+                pt = {}
+
+            pending_disp = pending_n
+            try:
+                if pt and isinstance(pt, dict) and "keep" in pt:
+                    pending_disp = int(pt.get("keep") or 0)
+            except Exception:
+                pass
+
+            if pending_disp is not None:
+                parts.append(f"pending={int(pending_disp)} (created+{df_p_created} trig+{df_p_trig} exp+{df_p_exp})")
+                # If DB count differs from latest trigger poll, show it explicitly (helps debug multi-instance issues)
+                try:
+                    if pending_n is not None and pt and (int(pending_n) != int(pending_disp)):
+                        parts.append(f"pending_db={int(pending_n)}")
+                except Exception:
+                    pass
             else:
                 parts.append(f"pending=? (created+{df_p_created} trig+{df_p_trig} exp+{df_p_exp})")
             parts.append(f"blocks+{df_blocks}")
@@ -14104,7 +14150,6 @@ async def mid_status_summary_loop(self) -> None:
 
             # Include latest pending tick counters (total/keep/in_zone/near/far + avg attempts/fails)
             try:
-                pt = _MID_PENDING_TICK_LAST or {}
                 if pt:
                     parts.append(
                         "pending_tick="
@@ -14118,6 +14163,15 @@ async def mid_status_summary_loop(self) -> None:
                         + f" att_avg={float(pt.get('attempts_avg',0.0)):.2f}"
                         + f" fail_avg={float(pt.get('fails_avg',0.0)):.2f}"
                     )
+            except Exception:
+                pass
+
+            # Include trigger-loop poll counters (interpreting trig_no)
+            try:
+                tp = _MID_TRIG_POLL_LAST or {}
+                if tp:
+                    parts.append(f"trig_chk={int(tp.get('checked',0))}")
+                    parts.append(f"trig_inzone={int(tp.get('in_zone',0))}")
             except Exception:
                 pass
 
