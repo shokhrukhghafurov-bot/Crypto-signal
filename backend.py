@@ -862,8 +862,15 @@ def _mid_reject_digest_top(topn: int = 3) -> list[dict]:
 
 
 # --- MID trigger reject digest (rolling window, for /health and [mid][status]) ---
-# Tracks reasons that prevented EMIT inside the pending trigger loop (structure_broken_*, trap_block, etc).
-MID_TRIG_REJECT_EVENTS: list[tuple[float, str]] = []
+# Institutional debug mode:
+# - pretrig_no: reasons recorded when a pending is checked but price is NOT (yet) in-zone
+# - trig_no_inzone: reasons recorded when price IS in-zone but EMIT is blocked by trigger filters
+#
+# NOTE: In normal flow we should only run heavy checks in-zone. This split helps prove it in logs
+# and quickly answer "why no emit?" vs "still waiting for zone".
+
+MID_PRETRIG_REJECT_EVENTS: list[tuple[float, str]] = []
+MID_INZONE_REJECT_EVENTS: list[tuple[float, str]] = []
 MID_TRIG_REJECT_MAX_EVENTS = 80000
 
 def _mid_trig_reject_key(reason: str) -> str:
@@ -876,22 +883,33 @@ def _mid_trig_reject_key(reason: str) -> str:
     except Exception:
         return "unknown"
 
-def _mid_trig_reject_add(reason: str, n: int = 1) -> None:
-    global MID_TRIG_REJECT_EVENTS
+def _mid_trig_reject_add(reason: str, n: int = 1, *, bucket: str = "inzone") -> None:
+    """Add a trigger reject reason to a rolling window bucket.
+    bucket: 'pre' / 'pretrig' / 'all' -> pretrig_no
+            'inzone' (default) -> trig_no_inzone
+    """
+    global MID_PRETRIG_REJECT_EVENTS, MID_INZONE_REJECT_EVENTS
     try:
         k = _mid_trig_reject_key(reason)
         if not k:
             return
         ts = time.time()
         cnt = max(1, int(n or 1))
+        b = (bucket or "inzone").strip().lower()
+        if b in ("pre", "pretrig", "all", "pretrig_no"):
+            ev = MID_PRETRIG_REJECT_EVENTS
+        else:
+            ev = MID_INZONE_REJECT_EVENTS
         for _ in range(min(cnt, 20)):
-            MID_TRIG_REJECT_EVENTS.append((ts, k))
-        if len(MID_TRIG_REJECT_EVENTS) > MID_TRIG_REJECT_MAX_EVENTS:
-            MID_TRIG_REJECT_EVENTS = MID_TRIG_REJECT_EVENTS[-MID_TRIG_REJECT_MAX_EVENTS:]
+            ev.append((ts, k))
+        # cap memory per bucket
+        if len(ev) > MID_TRIG_REJECT_MAX_EVENTS:
+            del ev[:-MID_TRIG_REJECT_MAX_EVENTS]
     except Exception:
         pass
 
-def _mid_trig_reject_digest_top(topn: int = 5, window_sec: int | None = None) -> list[dict]:
+def _mid_trig_reject_digest_top(topn: int = 5, window_sec: int | None = None, *, bucket: str = "inzone") -> list[dict]:
+    """Return top trigger reject reasons from a given bucket within the rolling window."""
     try:
         if window_sec is None:
             try:
@@ -902,21 +920,27 @@ def _mid_trig_reject_digest_top(topn: int = 5, window_sec: int | None = None) ->
         now = time.time()
         cutoff = now - float(window_sec)
 
-        # prune old
-        if MID_TRIG_REJECT_EVENTS:
+        b = (bucket or "inzone").strip().lower()
+        if b in ("pre", "pretrig", "all", "pretrig_no"):
+            ev = MID_PRETRIG_REJECT_EVENTS
+        else:
+            ev = MID_INZONE_REJECT_EVENTS
+
+        # prune old (in-place)
+        if ev:
             i0 = 0
-            for i, (ts, _k) in enumerate(MID_TRIG_REJECT_EVENTS):
+            for i, (ts, _k) in enumerate(ev):
                 if float(ts) >= cutoff:
                     i0 = i
                     break
             else:
-                i0 = len(MID_TRIG_REJECT_EVENTS)
+                i0 = len(ev)
             if i0 > 0:
-                del MID_TRIG_REJECT_EVENTS[:i0]
+                del ev[:i0]
 
         from collections import defaultdict
         counts = defaultdict(int)
-        for ts, k in MID_TRIG_REJECT_EVENTS:
+        for ts, k in ev:
             if float(ts) >= cutoff:
                 counts[str(k)] += 1
         items = sorted(counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
@@ -928,6 +952,7 @@ def _mid_trig_reject_digest_top(topn: int = 5, window_sec: int | None = None) ->
         return []
 
 # --- MID pending per-poll snapshot (for [mid][status]) ---
+
 # Updated on every pending poll; consumed by mid_status_summary_loop.
 _MID_PENDING_TICK_LAST: dict = {}
 
@@ -13044,6 +13069,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         return (True, "soft_fail")
 
     def _pending_log_trigger(sym: str, market: str, direction: str, outcome: str, reason: str, it: dict, price: float) -> None:
+        """Per-pending trigger decision log + rolling reject digests.
+
+        Buckets:
+          - pretrig_no: checked but not in-zone (should be rare; used to debug logic/order)
+          - trig_no_inzone: in-zone but blocked by trigger filters (what you care about for 'why no emit')
+        """
         try:
             logger.info(
                 "[mid][pending][trigger] %s %s %s outcome=%s reason=%s attempts=%s fails=%s px=%.6g",
@@ -13055,14 +13086,22 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             )
         except Exception:
             pass
+
         # Add to rolling trigger-reject digest (only when not a successful emit).
         try:
             if str(outcome or "").lower() != "pass":
-                _mid_trig_reject_add(str(reason or "unknown"), 1)
+                in_zone_flag = False
+                try:
+                    in_zone_flag = bool(it.get("_in_zone_tol") or it.get("_in_zone") or False)
+                except Exception:
+                    in_zone_flag = False
+                _mid_trig_reject_add(str(reason or "unknown"), 1, bucket=("inzone" if in_zone_flag else "pre"))
         except Exception:
             pass
 
+
     while True:
+
         try:
             items = await self._mid_pending_load()
             now = time.time()
@@ -13344,8 +13383,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             pass
 
                         _dist_atr = None if _vol_low else (float(_dist) / float(atr_abs) if float(atr_abs) > 0 else None)
-
-                        if _dist <= 0:
+                        # in-zone definition must match the trigger gate (uses tolerance).
+                        try:
+                            _in_zone_tol_now = bool(float(_dist) <= float(tol))
+                        except Exception:
+                            _in_zone_tol_now = False
+                        try:
+                            it["_in_zone_tol"] = bool(_in_zone_tol_now)
+                        except Exception:
+                            pass
+                        if _in_zone_tol_now:
                             in_zone_n += 1
                         if _dist_atr is not None:
                             if float(_dist_atr) <= float(near_atr):
@@ -13911,7 +13958,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 _MID_TRIG_POLL_LAST = {
                     "ts": float(now),
                     "checked": int(trig_checked_n),
-                    "in_zone": int(in_zone_n),
+                    "in_zone_chk": int(in_zone_n),
                     "keep": int(len(keep) if isinstance(keep, list) else 0),
                     "removed_now": int(removed_n),
                     "expired_now": int(expired_n),
@@ -14171,15 +14218,28 @@ async def mid_status_summary_loop(self) -> None:
                 tp = _MID_TRIG_POLL_LAST or {}
                 if tp:
                     parts.append(f"trig_chk={int(tp.get('checked',0))}")
-                    parts.append(f"trig_inzone={int(tp.get('in_zone',0))}")
+                    parts.append(f"trig_inzone_chk={int(tp.get('in_zone_chk',0))}")
             except Exception:
                 pass
 
-            # Top reasons that prevented EMIT inside trigger loop (last window).
+            # Top reasons inside trigger loop, split by bucket.
+            # - pretrig_no: checked while not in-zone (should be rare)
+            # - trig_no_inzone: in-zone but blocked (this is the real "why no emit")
             try:
-                trig_top = _mid_trig_reject_digest_top(topn=5)
-                if trig_top:
-                    parts.append("trig_no=" + ",".join([f"{x.get('reason')}={int(x.get('count') or 0)}" for x in trig_top]))
+                pre_top = _mid_trig_reject_digest_top(topn=5, bucket="pre")
+                if pre_top:
+                    parts.append("pretrig_no=" + ",".join([f"{x.get('reason')}={int(x.get('count') or 0)}" for x in pre_top]))
+            except Exception:
+                pass
+            try:
+                in_top = _mid_trig_reject_digest_top(topn=5, bucket="inzone")
+                if in_top:
+                    parts.append("trig_no_inzone=" + ",".join([f"{x.get('reason')}={int(x.get('count') or 0)}" for x in in_top]))
+                    # primary blocker (top-1) for quick scanning
+                    try:
+                        parts.append(f"emit_blocker={str(in_top[0].get('reason') or '')}")
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
