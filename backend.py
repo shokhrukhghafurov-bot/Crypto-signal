@@ -13403,7 +13403,36 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     # Smart delete (terminal invalidation): if higher-timeframe structure
                     # is clearly opposite to the pending direction, drop immediately.
+                    #
+                    # NOTE: We check BOTH 30m and 1h structures (requested). This protects
+                    # against cases where 1h still lags but 30m already flipped.
                     try:
+                        # 30m structure
+                        struct_30m = _mid_structure_hhhl(
+                            df30,
+                            lookback=int(os.getenv("MID_STRUCTURE_LOOKBACK_30M", "260") or 260),
+                            pivot=int(os.getenv("MID_STRUCTURE_PIVOT", "3") or 3),
+                        )
+                        if str(direction).upper() == "LONG" and struct_30m == "LH-LL":
+                            keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
+                            _pending_log_trigger(sym, market, direction, outc, "structure_broken_30m", it, float(price))
+                            if not keep_it:
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                                continue
+                        if str(direction).upper() == "SHORT" and struct_30m == "HH-HL":
+                            keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
+                            _pending_log_trigger(sym, market, direction, outc, "structure_broken_30m", it, float(price))
+                            if not keep_it:
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                                continue
+
+                        # 1h structure
                         struct_1h = _mid_structure_hhhl(
                             df1h,
                             lookback=int(os.getenv("MID_STRUCTURE_LOOKBACK_1H", "220") or 220),
@@ -13411,7 +13440,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         )
                         if str(direction).upper() == "LONG" and struct_1h == "LH-LL":
                             keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
-                            _pending_log_trigger(sym, market, direction, outc, "structure_broken", it, float(price))
+                            _pending_log_trigger(sym, market, direction, outc, "structure_broken_1h", it, float(price))
                             if not keep_it:
                                 try:
                                     removed_n += 1
@@ -13420,7 +13449,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 continue
                         if str(direction).upper() == "SHORT" and struct_1h == "HH-HL":
                             keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
-                            _pending_log_trigger(sym, market, direction, outc, "structure_broken", it, float(price))
+                            _pending_log_trigger(sym, market, direction, outc, "structure_broken_1h", it, float(price))
                             if not keep_it:
                                 try:
                                     removed_n += 1
