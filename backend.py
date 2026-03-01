@@ -12,6 +12,27 @@ import time
 import contextvars
 
 # =======================
+# Trap log toggle
+# =======================
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse common truthy/falsey env values."""
+    v = os.getenv(name)
+    if v is None:
+        return bool(default)
+    v = str(v).strip().lower()
+    return v not in ("0", "false", "no", "off", "")
+
+def _trap_log_enabled() -> bool:
+    """Allow disabling noisy [mid][trap] logs without changing trap logic.
+
+    - If LOG_TRAP_EVENTS is set: obey it.
+    - If not set: keep the previous behavior (logs stay as-is).
+    """
+    if os.getenv("LOG_TRAP_EVENTS") is None:
+        return True
+    return _env_bool("LOG_TRAP_EVENTS", False)
+
+# =======================
 # SAFE ATR PICKER FOR SL
 # =======================
 import math
@@ -8604,8 +8625,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             else:
                 if _ctx is not None:
                     _ctx.setdefault('trap', set()).add(_tick_key)
-                if _mid_trap_should_log(_trap_msg):
-                    logger.info("[mid][trap] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, trap_reason, float(entry))
+                    if _trap_log_enabled() and _mid_trap_should_log(_trap_msg):
+                        logger.info("[mid][trap] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, trap_reason, float(entry))
 
             _emit_mid_trap_event({"dir": str(dir_trend), "reason": str(trap_reason), "reason_key": _mid_trap_reason_key(str(trap_reason)), "entry": float(entry)})
         except Exception:
@@ -10171,7 +10192,7 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
     if not bool(trap_ok):
         # Emit a structured event so bot can build a digest, but do not necessarily reject here.
         try:
-            if os.getenv("MID_INTERNAL_TRAP_LOG","0").strip().lower() not in ("0","false","no","off"):
+            if _trap_log_enabled() and os.getenv("MID_INTERNAL_TRAP_LOG","0").strip().lower() not in ("0","false","no","off"):
                 _k = f"trap|{symbol}|{str(dir_trend).upper()}|{_mid_trap_reason_key(str(trap_reason))}"
                 if _mid_trap_should_log(_k):
                     logger.info('[mid][trap] %s dir=%s reason=%s entry=%.6g', symbol, str(dir_trend).upper(), str(trap_reason), float(entry))
@@ -16560,7 +16581,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 self._mid_digest_add(self._mid_trap_digest_stats, sym, str(base_r.get("direction","")), base_r.get("entry"), str(_r))
                             except Exception:
                                 pass
-                            logger.info("[mid][trap] %s %s blocked=%s reason=%s src_best=%s", sym, str(base_r.get("direction","")).upper(), base_r.get("blocked"), base_r.get("trap_reason",""), best_name)
+                            if _trap_log_enabled():
+                                logger.info("[mid][trap] %s %s blocked=%s reason=%s src_best=%s", sym, str(base_r.get("direction","")).upper(), base_r.get("blocked"), base_r.get("trap_reason",""), best_name)
                             continue
                         if require_align and str(base_r.get("dir1","")).upper() != str(base_r.get("dir4","")).upper():
                             _mid_f_align += 1
