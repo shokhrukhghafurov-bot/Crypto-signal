@@ -1918,6 +1918,61 @@ async def _gateio_public_price(symbol: str) -> float:
     return 0.0
 
 
+
+async def _mexc_contract_symbol(symbol: str) -> str:
+    s = (symbol or "").upper().strip()
+    # MEXC contracts usually use BASE_USDT format
+    if s.endswith("USDT") and "_" not in s:
+        return f"{s[:-4]}_USDT"
+    return s.replace("-", "_")
+
+async def _mexc_futures_price(symbol: str) -> float:
+    # MEXC Contract (Perpetual) public ticker
+    # Endpoint is best-effort and parsed defensively.
+    sym = _mexc_contract_symbol(symbol)
+    data = await _http_json("GET", "https://contract.mexc.com/api/v1/contract/ticker", params={"symbol": sym}, timeout_s=8)
+    # Typical shapes:
+    # { "success": true, "code": 0, "data": { "lastPrice": "..." } }
+    # or { "data": { "last_price": "..." } } or list variants.
+    d = data.get("data") if isinstance(data, dict) else None
+    if isinstance(d, dict):
+        for k in ("lastPrice", "last_price", "last", "last_price24h", "lastPrice24h"):
+            if k in d and d.get(k) is not None:
+                return float(d.get(k) or 0.0)
+    if isinstance(d, list) and d and isinstance(d[0], dict):
+        for k in ("lastPrice", "last_price", "last"):
+            if d[0].get(k) is not None:
+                return float(d[0].get(k) or 0.0)
+    # Fallback: some responses may put it at top-level
+    if isinstance(data, dict):
+        for k in ("lastPrice", "last_price", "last"):
+            if data.get(k) is not None:
+                return float(data.get(k) or 0.0)
+    return 0.0
+
+async def _gateio_futures_contract(symbol: str) -> str:
+    s = (symbol or "").upper().strip()
+    # Gate futures USDT contracts use BASE_USDT
+    if s.endswith("USDT") and "_" not in s:
+        return f"{s[:-4]}_USDT"
+    return s.replace("-", "_")
+
+async def _gateio_futures_price(symbol: str) -> float:
+    contract = _gateio_futures_contract(symbol)
+    data = await _http_json("GET", "https://api.gateio.ws/api/v4/futures/usdt/tickers", params={"contract": contract}, timeout_s=8)
+    # Response is list[dict] usually
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        for k in ("last", "last_price", "mark_price", "mark"):
+            if data[0].get(k) is not None:
+                return float(data[0].get(k) or 0.0)
+    # Sometimes dict wrapper
+    if isinstance(data, dict):
+        d = data.get("data")
+        if isinstance(d, list) and d and isinstance(d[0], dict):
+            if d[0].get("last") is not None:
+                return float(d[0].get("last") or 0.0)
+    return 0.0
+
 async def validate_autotrade_keys(
     *,
     exchange: str,
@@ -11005,32 +11060,6 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             out['hit_tp2'] = bool(tp2 and hit_tp(float(tp2)))
             return out
         except Exception:
-            # If the main oracle fails (WS/REST chain), try a lightweight REST fallback
-            # so UI can still show live price and compute unrealized PnL.
-            try:
-                market = (t.get('market') or 'FUTURES').upper()
-                symbol = str(t.get('symbol') or '')
-                px = await self._fetch_rest_price(market, symbol)
-                if px is not None and float(px) > 0:
-                    out = dict(t)
-                    out['price_f'] = float(px)
-                    out['price_src'] = 'BINANCE_REST'
-                    # Best-effort hit checks
-                    side = (t.get('side') or 'LONG').upper()
-                    price_f = float(px)
-                    def hit_tp(lvl: float) -> bool:
-                        return price_f >= lvl if side == 'LONG' else price_f <= lvl
-                    def hit_sl(lvl: float) -> bool:
-                        return price_f <= lvl if side == 'LONG' else price_f >= lvl
-                    sl = float(t.get('sl') or 0.0) if t.get('sl') is not None else 0.0
-                    tp1 = float(t.get('tp1') or 0.0) if t.get('tp1') is not None else 0.0
-                    tp2 = float(t.get('tp2') or 0.0) if t.get('tp2') is not None else 0.0
-                    out['hit_sl'] = bool(sl and hit_sl(float(sl)))
-                    out['hit_tp1'] = bool(tp1 and hit_tp(float(tp1)))
-                    out['hit_tp2'] = bool(tp2 and hit_tp(float(tp2)))
-                    return out
-            except Exception:
-                pass
             return dict(t)
 
 
@@ -11076,30 +11105,6 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             out['hit_tp2'] = bool(tp2 and hit_tp(float(tp2)))
             return out
         except Exception:
-            # Same fallback as get_trade_live
-            try:
-                market = (t.get('market') or 'FUTURES').upper()
-                symbol = str(t.get('symbol') or '')
-                px = await self._fetch_rest_price(market, symbol)
-                if px is not None and float(px) > 0:
-                    out = dict(t)
-                    out['price_f'] = float(px)
-                    out['price_src'] = 'BINANCE_REST'
-                    side = (t.get('side') or 'LONG').upper()
-                    price_f = float(px)
-                    def hit_tp(lvl: float) -> bool:
-                        return price_f >= lvl if side == 'LONG' else price_f <= lvl
-                    def hit_sl(lvl: float) -> bool:
-                        return price_f <= lvl if side == 'LONG' else price_f >= lvl
-                    sl = float(t.get('sl') or 0.0) if t.get('sl') is not None else 0.0
-                    tp1 = float(t.get('tp1') or 0.0) if t.get('tp1') is not None else 0.0
-                    tp2 = float(t.get('tp2') or 0.0) if t.get('tp2') is not None else 0.0
-                    out['hit_sl'] = bool(sl and hit_sl(float(sl)))
-                    out['hit_tp1'] = bool(tp1 and hit_tp(float(tp1)))
-                    out['hit_tp2'] = bool(tp2 and hit_tp(float(tp2)))
-                    return out
-            except Exception:
-                pass
             return dict(t)
 
     async def remove_trade_by_id(self, user_id: int, trade_id: int) -> dict | None:
@@ -11125,32 +11130,12 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             sl=float(row.get("sl")) if row.get("sl") is not None else None,
         )
 
-        # IMPORTANT: For manual close we want a price even if the oracle is temporarily down.
-        # We therefore try:
-        #   1) WS-first oracle (_get_price_with_source)
-        #   2) Binance REST (fast, public)
-        #   3) entry price (last resort)
-        close_px = 0.0
-        close_src = ""
         try:
-            _px, _src = await self._get_price_with_source(s)
-            close_px = float(_px or 0.0)
-            close_src = str(_src or "")
+            close_px, close_src = await self._get_price_with_source(s)
+            close_px = float(close_px)
         except Exception:
-            close_px = 0.0
-            close_src = ""
-
-        if not (close_px and close_px > 0):
-            try:
-                rest_px = await self._fetch_rest_price(str(getattr(s, 'market', 'FUTURES')), str(getattr(s, 'symbol', '')))
-                if rest_px is not None and float(rest_px) > 0:
-                    close_px = float(rest_px)
-                    close_src = "BINANCE_REST"
-            except Exception:
-                pass
-
-        if not (close_px and close_px > 0):
-            close_px = float(row.get("entry") or 0.0)
+            # Best-effort fallback: use entry if price is unavailable
+            close_px, close_src = float(row.get("entry") or 0.0), ""
 
         tp1_hit = bool(row.get("tp1_hit"))
         trade_ctx = UserTrade(user_id=int(user_id), signal=s, tp1_hit=tp1_hit)
@@ -11574,41 +11559,41 @@ async def resolve_symbol_any_exchange(self, symbol: str) -> tuple[bool, str | No
             return None, "OKX_REST_MISS"
 
         async def _gateio_rest_only() -> tuple[float | None, str]:
-            if market != "SPOT":
+            if market not in ("SPOT", "FUTURES"):
                 return None, "GATEIO_REST_MISS"
 
             async def _fetch():
                 async def _do():
                     try:
-                        return await _gateio_public_price(signal.symbol)
+                        return await (_gateio_public_price(signal.symbol) if market == "SPOT" else _gateio_futures_price(signal.symbol))
                     except Exception:
                         return None
                 return await self._rest_limiter.run("gateio", _do)
 
-            p, _src = await self._price_cached("gateio", market, signal.symbol, _fetch, src_label="GATEIO_PUBLIC")
+            p, _src = await self._price_cached("gateio", market, signal.symbol, _fetch, src_label=("GATEIO_PUBLIC" if market == "SPOT" else "GATEIO_FUTURES_PUBLIC"))
             if _is_reasonable(p):
-                return float(p), "GATEIO_PUBLIC"
+                return float(p), ("GATEIO_PUBLIC" if market == "SPOT" else "GATEIO_FUTURES_PUBLIC")
             return None, "GATEIO_REST_MISS"
 
         async def _mexc_rest_only() -> tuple[float | None, str]:
-            if market != "SPOT":
+            if market not in ("SPOT", "FUTURES"):
                 return None, "MEXC_REST_MISS"
 
             async def _fetch():
                 async def _do():
                     try:
-                        return await _mexc_public_price(signal.symbol)
+                        return await (_mexc_public_price(signal.symbol) if market == "SPOT" else _mexc_futures_price(signal.symbol))
                     except Exception:
                         return None
                 return await self._rest_limiter.run("mexc", _do)
 
-            p, _src = await self._price_cached("mexc", market, signal.symbol, _fetch, src_label="MEXC_PUBLIC")
+            p, _src = await self._price_cached("mexc", market, signal.symbol, _fetch, src_label=("MEXC_PUBLIC" if market == "SPOT" else "MEXC_FUTURES_PUBLIC"))
             if _is_reasonable(p):
-                return float(p), "MEXC_PUBLIC"
+                return float(p), ("MEXC_PUBLIC" if market == "SPOT" else "MEXC_FUTURES_PUBLIC")
             return None, "MEXC_REST_MISS"
 
         spot_chain = ["BINANCE", "BYBIT", "OKX", "GATEIO", "MEXC"]
-        fut_chain = ["BINANCE", "BYBIT", "OKX"]
+        fut_chain = ["BINANCE", "BYBIT", "OKX", "GATEIO", "MEXC"]
         chain = spot_chain if market == "SPOT" else fut_chain
 
         def _rotate(chain0: list[str], first: str) -> list[str]:
