@@ -9427,6 +9427,17 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "macd_hist": macd_hist5,
         "bb": bb_str,
         "rel_vol": vol_rel if (not np.isnan(vol_rel)) else 0.0,
+"last_body": float(last_body),
+"disp_body_atr": float((float(last_body) / float(atr30)) if (atr30 and float(atr30) > 0) else 0.0),
+"bos_up_5m": bool(bos_up_5m),
+"bos_down_5m": bool(bos_down_5m),
+"two_green_5m": bool(two_green_5m),
+"two_red_5m": bool(two_red_5m),
+"higher_lows_5m": bool(higher_lows_5m),
+"lower_highs_5m": bool(lower_highs_5m),
+"climax_recent_bars": int(climax_recent_bars),
+"vol_last": float(last_vol) if (last_vol == last_vol) else 0.0,
+"vol_avg": float(avg_vol) if (avg_vol == avg_vol) else 0.0,
         "vwap": vwap_txt,
         "vwap_val": vwap_val if (not np.isnan(vwap_val)) else 0.0,
         "pattern": pattern,
@@ -14123,6 +14134,175 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 pass
                         continue
 
+
+                    # --- Institutional trigger logic (adaptive by regime) ---
+                    # Goal: in CHOPPY/RANGE, require liquidity event + reclaim + micro structure confirmation,
+                    # and treat volume as a secondary confirmation (not a guillotine).
+                    try:
+                        trig_mode = os.getenv("MID_TRIGGER_MODE", "institutional").strip().lower()
+                    except Exception:
+                        trig_mode = "institutional"
+
+                    if trig_mode in ("institutional", "inst", "pro"):
+                        try:
+                            diru = str(direction).upper()
+                            mstruct = str(ta.get("mstruct") or "—").upper()
+                            regime_txt = str(ta.get("regime") or "")
+                            try:
+                                adx1h_v = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
+                            except Exception:
+                                adx1h_v = 0.0
+                            try:
+                                adx30_v = float(ta.get("adx1") or ta.get("adx_30m") or 0.0)
+                            except Exception:
+                                adx30_v = 0.0
+
+                            is_choppy = ("choppy" in regime_txt.lower()) or (mstruct == "RANGE") or (adx1h_v < 18.0)
+                            is_trend = (mstruct == "TREND") and (adx1h_v >= 22.0) and (not ("choppy" in regime_txt.lower()))
+                            reg = "TREND" if is_trend else ("RANGE" if is_choppy else "MIXED")
+
+                            # Feature flags from TA (computed on 5m / 30m / 1h)
+                            sweep_long = bool(ta.get("sweep_long", False))
+                            sweep_short = bool(ta.get("sweep_short", False))
+                            bos_up = bool(ta.get("bos_up_5m", False))
+                            bos_down = bool(ta.get("bos_down_5m", False))
+                            disp_x = 0.0
+                            try:
+                                disp_x = float(ta.get("disp_body_atr") or 0.0)
+                            except Exception:
+                                disp_x = 0.0
+                            try:
+                                entry_close = float(ta.get("entry") or entry0)
+                            except Exception:
+                                entry_close = float(entry0)
+
+                            # Reclaim: allow entry on reclaim even if price already slightly beyond the zone
+                            try:
+                                reclaim_eps = float(os.getenv("MID_INST_RECLAIM_EPS_PCT", "0.0006") or 0.0006)
+                            except Exception:
+                                reclaim_eps = 0.0006
+                            reclaim_ok = True
+                            if diru == "LONG":
+                                reclaim_ok = bool(entry_close >= (entry_high * (1.0 + reclaim_eps)))
+                            elif diru == "SHORT":
+                                reclaim_ok = bool(entry_close <= (entry_low * (1.0 - reclaim_eps)))
+
+                            # Liquidity requirement: strict in RANGE/CHOPPY, optional in TREND by default.
+                            try:
+                                req_liq_range = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP_RANGE", "1").strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_liq_range = True
+                            try:
+                                req_liq_trend = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP_TREND", "0").strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_liq_trend = False
+                            req_liq = req_liq_trend if (reg == "TREND") else req_liq_range
+
+                            liq_ok = True
+                            if req_liq:
+                                if diru == "LONG":
+                                    liq_ok = sweep_long
+                                else:
+                                    liq_ok = sweep_short
+
+                            # Micro-structure confirmation: BOS in the signal direction (strict in RANGE).
+                            try:
+                                req_bos_range = os.getenv("MID_INST_REQUIRE_BOS_RANGE", "1").strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_bos_range = True
+                            try:
+                                req_bos_trend = os.getenv("MID_INST_REQUIRE_BOS_TREND", "0").strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_bos_trend = False
+                            req_bos = req_bos_trend if (reg == "TREND") else req_bos_range
+
+                            bos_ok = True
+                            if req_bos:
+                                if diru == "LONG":
+                                    bos_ok = bos_up
+                                else:
+                                    bos_ok = bos_down
+
+                            # Displacement: require a minimum body/ATR ratio (helps avoid thin fake moves).
+                            try:
+                                disp_min_range = float(os.getenv("MID_INST_DISP_MIN_X_RANGE", "0.35") or 0.35)
+                            except Exception:
+                                disp_min_range = 0.35
+                            try:
+                                disp_min_trend = float(os.getenv("MID_INST_DISP_MIN_X_TREND", "0.25") or 0.25)
+                            except Exception:
+                                disp_min_trend = 0.25
+                            disp_min = disp_min_trend if (reg == "TREND") else disp_min_range
+                            disp_ok = bool(disp_x >= disp_min)
+
+                            # In RANGE/CHOPPY, reclaim is usually required to avoid catching falling knives.
+                            try:
+                                req_reclaim_range = os.getenv("MID_INST_REQUIRE_RECLAIM_RANGE", "1").strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_reclaim_range = True
+                            try:
+                                req_reclaim_trend = os.getenv("MID_INST_REQUIRE_RECLAIM_TREND", "0").strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_reclaim_trend = False
+                            req_reclaim = req_reclaim_trend if (reg == "TREND") else req_reclaim_range
+
+                            # Save regime/disp for downstream volume filter + logs
+                            it["_trig_inst_regime"] = reg
+                            it["_trig_inst_disp_x"] = float(disp_x)
+
+                            if req_reclaim and (not reclaim_ok):
+                                keep_it, outc = _pending_apply_fail(it, "reclaim_missing", now)
+                                _pending_log_trigger(sym, market, direction, outc, "reclaim_missing", it, float(price))
+                                if keep_it:
+                                    keep.append(it); any_wait = True
+                                else:
+                                    try: removed_n += 1
+                                    except Exception: pass
+                                continue
+
+                            if req_liq and (not liq_ok):
+                                keep_it, outc = _pending_apply_fail(it, "liq_sweep_missing", now)
+                                _pending_log_trigger(sym, market, direction, outc, "liq_sweep_missing", it, float(price))
+                                if keep_it:
+                                    keep.append(it); any_wait = True
+                                else:
+                                    try: removed_n += 1
+                                    except Exception: pass
+                                continue
+
+                            if req_bos and (not bos_ok):
+                                keep_it, outc = _pending_apply_fail(it, "bos_missing", now)
+                                _pending_log_trigger(sym, market, direction, outc, "bos_missing", it, float(price))
+                                if keep_it:
+                                    keep.append(it); any_wait = True
+                                else:
+                                    try: removed_n += 1
+                                    except Exception: pass
+                                continue
+
+                            if (not disp_ok):
+                                keep_it, outc = _pending_apply_fail(it, "displacement_weak", now)
+                                _pending_log_trigger(sym, market, direction, outc, "displacement_weak", it, float(price))
+                                if keep_it:
+                                    keep.append(it); any_wait = True
+                                else:
+                                    try: removed_n += 1
+                                    except Exception: pass
+                                continue
+
+                            # Compact institutional trigger score for debugging only (doesn't replace TA score).
+                            try:
+                                inst_score = 0
+                                inst_score += 30 if liq_ok else 0
+                                inst_score += 25 if reclaim_ok else 0
+                                inst_score += 20 if bos_ok else 0
+                                inst_score += int(min(15, max(0, round(disp_x * 10))))  # 0..15
+                                it["_trig_inst_score"] = int(inst_score)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+
                     min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
                     # confidence_low checks confidence only; if confidence is missing, fall back to score (common on some exchanges/paths).
                     try:
@@ -14311,17 +14491,34 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                                 # If volume metric missing/zero, do not block (avoid false vol_low due to empty data).
                                 if (volx and volx > 0) and (base_thr and base_thr > 0) and (volx < thr):
-                                    keep_it, outc = _pending_apply_fail(it, "vol_low", now)
-                                    _pending_log_trigger(sym, market, direction, outc, "vol_low", it, float(price))
-                                    if keep_it:
-                                        keep.append(it)
-                                        any_wait = True
-                                    else:
+                                    # Institutional: in RANGE/CHOPPY, do NOT block solely on low volume
+                                    # if liquidity + reclaim + micro-structure + displacement already passed.
+                                    try:
+                                        inst_reg = str(it.get("_trig_inst_regime") or "").upper()
+                                    except Exception:
+                                        inst_reg = ""
+                                    try:
+                                        block_vol_range = os.getenv("MID_INST_BLOCK_VOL_LOW_RANGE", "0").strip().lower() in ("1","true","yes","on")
+                                    except Exception:
+                                        block_vol_range = False
+                                    if (inst_reg == "RANGE") and (not block_vol_range):
+                                        # keep waiting or pass through (no block)
                                         try:
-                                            removed_n += 1
+                                            it["_trig_vol_thr_why"] = (str(it.get("_trig_vol_thr_why") or "") + ",IGNORED_RANGE").strip(",")
                                         except Exception:
                                             pass
-                                    continue
+                                    else:
+                                        keep_it, outc = _pending_apply_fail(it, "vol_low", now)
+                                        _pending_log_trigger(sym, market, direction, outc, "vol_low", it, float(price))
+                                        if keep_it:
+                                            keep.append(it)
+                                            any_wait = True
+                                        else:
+                                            try:
+                                                removed_n += 1
+                                            except Exception:
+                                                pass
+                                        continue
                         except Exception:
                             pass
                         try:
