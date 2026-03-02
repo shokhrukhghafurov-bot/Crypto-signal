@@ -10088,6 +10088,82 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     }
     return ta
 
+
+def _mid_micro_trap_ok(*, direction: str, entry: float, df5: pd.DataFrame, atr30: float) -> tuple[bool, str]:
+    """Micro trap for TRIGGER phase (rare + practical).
+
+    Goal: avoid killing good setups with generic 'near_extreme' etc.
+    Blocks mainly when there is an aggressive opposite impulse / micro-structure break
+    right as price is inside the entry zone.
+
+    Returns (ok, reason).
+    """
+    d = (direction or "").upper().strip()
+    if d not in ("LONG", "SHORT"):
+        return (True, "")
+
+    try:
+        if df5 is None or df5.empty:
+            return (True, "")
+    except Exception:
+        return (True, "")
+
+    # Tunables
+    lookback = max(6, int(os.getenv("MID_MICRO_TRAP_LOOKBACK_5M", "12") or 12))
+    body_frac_min = float(os.getenv("MID_MICRO_TRAP_BODY_FRAC_MIN", "0.62") or 0.62)  # body / range
+    close_edge_frac = float(os.getenv("MID_MICRO_TRAP_CLOSE_EDGE_FRAC", "0.18") or 0.18)  # close near edge
+    break_atr = float(os.getenv("MID_MICRO_TRAP_BREAK_ATR", "0.18") or 0.18)  # how far beyond swing in ATR30
+
+    try:
+        df = df5.tail(max(lookback, 4)).copy()
+        h = df["high"].astype(float).values
+        l = df["low"].astype(float).values
+        o = df["open"].astype(float).values
+        c = df["close"].astype(float).values
+        if len(c) < 4:
+            return (True, "")
+        i = len(c) - 1
+        rng = float(max(1e-12, h[i] - l[i]))
+        body = float(abs(c[i] - o[i]))
+        body_frac = body / rng
+    except Exception:
+        return (True, "")
+
+    # Aggressive opposite impulse candle
+    try:
+        if d == "LONG":
+            bearish = c[i] < o[i]
+            close_near_low = (c[i] - l[i]) / rng <= close_edge_frac
+            impulse = bearish and (body_frac >= body_frac_min) and close_near_low
+            if impulse:
+                return (False, "micro_opposite_impulse")
+        else:  # SHORT
+            bullish = c[i] > o[i]
+            close_near_high = (h[i] - c[i]) / rng <= close_edge_frac
+            impulse = bullish and (body_frac >= body_frac_min) and close_near_high
+            if impulse:
+                return (False, "micro_opposite_impulse")
+    except Exception:
+        pass
+
+    # Micro swing break against the direction (with small ATR buffer)
+    try:
+        atr = float(atr30) if float(atr30) > 0 else float(entry) * 0.001
+        buf = max(0.0, float(break_atr) * float(atr))
+        if d == "LONG":
+            swing_low = float(min(l[:-1])) if len(l) > 1 else float(l[i])
+            if float(c[i]) < float(swing_low) - buf:
+                return (False, "micro_swing_break")
+        else:
+            swing_high = float(max(h[:-1])) if len(h) > 1 else float(h[i])
+            if float(c[i]) > float(swing_high) + buf:
+                return (False, "micro_swing_break")
+    except Exception:
+        pass
+
+    return (True, "")
+
+
 def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame, symbol: str = "") -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
@@ -10187,16 +10263,29 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
 
     tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct)
     sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
-    # --- Anti-trap structure filters (apply to MID and MAIN candidates) ---
-    trap_ok, trap_reason = _mid_structure_trap_ok(direction=str(dir_trend).upper(), entry=entry, df1hi=df1hi)
+    # --- Trap filters ---
+    # Macro trap (SCAN): strict anti-trap on higher TF (structure/extremes)
+    # Micro trap (TRIGGER): rare + practical, blocks mainly on immediate opposite aggression.
+    _phase = "scan"
+    try:
+        _phase = str(_MID_EVAL_PHASE.get() or "scan")
+    except Exception:
+        _phase = "scan"
+
+    if str(_phase).lower() == "trigger":
+        trap_ok, trap_reason = _mid_micro_trap_ok(direction=str(dir_trend).upper(), entry=entry, df5=df5i, atr30=atr30)
+    else:
+        trap_ok, trap_reason = _mid_structure_trap_ok(direction=str(dir_trend).upper(), entry=entry, df1hi=df1hi)
+
     if not bool(trap_ok):
-        # Emit a structured event so bot can build a digest, but do not necessarily reject here.
+        # Emit a structured event so bot can build a digest.
         try:
             if _trap_log_enabled() and os.getenv("MID_INTERNAL_TRAP_LOG","0").strip().lower() not in ("0","false","no","off"):
-                _k = f"trap|{symbol}|{str(dir_trend).upper()}|{_mid_trap_reason_key(str(trap_reason))}"
+                _k = f"trap|{symbol}|{str(dir_trend).upper()}|{_mid_trap_reason_key(str(trap_reason))}|{str(_phase).lower()}"
                 if _mid_trap_should_log(_k):
-                    logger.info('[mid][trap] %s dir=%s reason=%s entry=%.6g', symbol, str(dir_trend).upper(), str(trap_reason), float(entry))
+                    logger.info('[mid][trap] %s phase=%s dir=%s reason=%s entry=%.6g', symbol, str(_phase).lower(), str(dir_trend).upper(), str(trap_reason), float(entry))
             _emit_mid_trap_event({
+                'phase': str(_phase).lower(),
                 'dir': str(dir_trend).upper(),
                 'reason': str(trap_reason),
                 'reason_key': _mid_trap_reason_key(str(trap_reason)),
@@ -10205,18 +10294,7 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         except Exception:
             pass
 
-        _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0","false","no","off")
-        _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0","false","no","off")
-        _phase = "scan"
-        try:
-            _phase = str(_MID_EVAL_PHASE.get() or "scan")
-        except Exception:
-            _phase = "scan"
-        if not (_pending_enabled and _postsetup_only and _phase == "scan"):
-            return None
-
-
-    # --- TA extras (MAIN-like) ---
+# --- TA extras (MAIN-like) ---
     # RSI/MACD on 5m
     rsi5 = float(last5.get("rsi", np.nan))
     macd_hist5 = float(last5.get("macd_hist", np.nan))
@@ -13639,17 +13717,26 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             pass
 
                         _dist_atr = None if _vol_low else (float(_dist) / float(atr_abs) if float(atr_abs) > 0 else None)
-                        # in-zone definition must match the trigger gate (uses tolerance).
+                        # in-zone (STRICT for entry zone; tolerance only for legacy no-zone pendings)
                         try:
-                            _in_zone_tol_now = bool(float(_dist) <= float(tol))
+                            if use_zone:
+                                _in_zone_now = bool(float(price) >= float(lo) and float(price) <= float(hi))
+                            else:
+                                _in_zone_now = bool(abs(float(price) - float(entry0)) <= float(tol))
                         except Exception:
-                            _in_zone_tol_now = False
+                            _in_zone_now = False
                         try:
-                            it["_in_zone_tol"] = bool(_in_zone_tol_now)
+                            it["_in_zone"] = bool(_in_zone_now)
                         except Exception:
                             pass
-                        if _in_zone_tol_now:
+                        try:
+                            # backward compat: some digests used _in_zone_tol
+                            it["_in_zone_tol"] = bool(_in_zone_now)
+                        except Exception:
+                            pass
+                        if _in_zone_now:
                             in_zone_n += 1
+
                         if _dist_atr is not None:
                             if float(_dist_atr) <= float(near_atr):
                                 near_n += 1
