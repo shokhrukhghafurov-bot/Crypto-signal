@@ -13923,21 +13923,29 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         if str(direction).upper() == "LONG" and struct_30m == "LH-LL":
                             keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
                             _pending_log_trigger(sym, market, direction, outc, "structure_broken_30m", it, float(price))
-                            if not keep_it:
+                            # If structure is broken we must not proceed to other trigger checks in this poll.
+                            # For soft-fail policies (env override), we keep waiting; for hard-fail we drop.
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
+                            else:
                                 try:
                                     removed_n += 1
                                 except Exception:
                                     pass
-                                continue
+                            continue
                         if str(direction).upper() == "SHORT" and struct_30m == "HH-HL":
                             keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
                             _pending_log_trigger(sym, market, direction, outc, "structure_broken_30m", it, float(price))
-                            if not keep_it:
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
+                            else:
                                 try:
                                     removed_n += 1
                                 except Exception:
                                     pass
-                                continue
+                            continue
 
                         # 1h structure
                         struct_1h = _mid_structure_hhhl(
@@ -13948,21 +13956,27 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         if str(direction).upper() == "LONG" and struct_1h == "LH-LL":
                             keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
                             _pending_log_trigger(sym, market, direction, outc, "structure_broken_1h", it, float(price))
-                            if not keep_it:
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
+                            else:
                                 try:
                                     removed_n += 1
                                 except Exception:
                                     pass
-                                continue
+                            continue
                         if str(direction).upper() == "SHORT" and struct_1h == "HH-HL":
                             keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
                             _pending_log_trigger(sym, market, direction, outc, "structure_broken_1h", it, float(price))
-                            if not keep_it:
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
+                            else:
                                 try:
                                     removed_n += 1
                                 except Exception:
                                     pass
-                                continue
+                            continue
                     except Exception:
                         pass
 
