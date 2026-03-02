@@ -14179,6 +14179,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             diru = str(direction).upper()
                             mstruct = str(ta.get("mstruct") or "—").upper()
                             regime_txt = str(ta.get("regime") or "")
+                            # Regime detection thresholds (can be tuned via env)
+                            try:
+                                adx_trend_min = float(os.getenv("MID_INST_ADX_TREND_MIN", "22") or 22.0)
+                            except Exception:
+                                adx_trend_min = 22.0
+                            try:
+                                adx_choppy_max = float(os.getenv("MID_INST_ADX_CHOPPY_MAX", "18") or 18.0)
+                            except Exception:
+                                adx_choppy_max = 18.0
                             try:
                                 adx1h_v = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
                             except Exception:
@@ -14188,10 +14197,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 adx30_v = 0.0
 
-                            is_choppy = ("choppy" in regime_txt.lower()) or (mstruct == "RANGE") or (adx1h_v < 18.0)
-                            is_trend = (mstruct == "TREND") and (adx1h_v >= 22.0) and (not ("choppy" in regime_txt.lower()))
+                            # TREND: mstruct=TREND and ADX(1h) >= adx_trend_min and not CHOPPY
+                            # RANGE/CHOPPY: mstruct=RANGE OR regime contains CHOPPY OR ADX(1h) < adx_choppy_max
+                            is_choppy = ("choppy" in regime_txt.lower()) or (mstruct == "RANGE") or (adx1h_v < float(adx_choppy_max))
+                            is_trend = (mstruct == "TREND") and (adx1h_v >= float(adx_trend_min)) and (not ("choppy" in regime_txt.lower()))
                             reg = "TREND" if is_trend else ("RANGE" if is_choppy else "MIXED")
-
                             # Feature flags from TA (computed on 5m / 30m / 1h)
                             sweep_long = bool(ta.get("sweep_long", False))
                             sweep_short = bool(ta.get("sweep_short", False))
@@ -14203,9 +14213,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 disp_x = 0.0
                             try:
-                                entry_close = float(ta.get("entry") or entry0)
+                                close5 = float(ta.get("close") or ta.get("c") or px_close or 0.0)
                             except Exception:
-                                entry_close = float(entry0)
+                                try:
+                                    close5 = float(px_close)
+                                except Exception:
+                                    close5 = float(entry0)
+
 
                             # Reclaim: allow entry on reclaim even if price already slightly beyond the zone
                             try:
@@ -14219,19 +14233,26 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 _hi = float(entry_high) if (entry_high is not None) else 0.0
                                 if _lo > 0 and _hi > 0 and _hi >= _lo:
                                     if diru == "LONG":
-                                        reclaim_ok = bool(entry_close >= (_hi * (1.0 + reclaim_eps)))
+                                        reclaim_ok = bool(close5 >= (_hi * (1.0 + reclaim_eps)))
                                     elif diru == "SHORT":
-                                        reclaim_ok = bool(entry_close <= (_lo * (1.0 - reclaim_eps)))
+                                        reclaim_ok = bool(close5 <= (_lo * (1.0 - reclaim_eps)))
                             except Exception:
                                 reclaim_ok = True
 
                             # Liquidity requirement: strict in RANGE/CHOPPY, optional in TREND by default.
                             try:
-                                req_liq_range = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP_RANGE", "1").strip().lower() in ("1","true","yes","on")
+                                _v = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP_RANGE")
+                                if _v is None or str(_v).strip() == "":
+                                    _v = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP", "1")
+                                req_liq_range = str(_v).strip().lower() in ("1","true","yes","on")
                             except Exception:
                                 req_liq_range = True
                             try:
-                                req_liq_trend = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP_TREND", "0").strip().lower() in ("1","true","yes","on")
+                                _v = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP_TREND")
+                                if _v is None or str(_v).strip() == "":
+                                    # TREND optional by default
+                                    _v = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP", "0")
+                                req_liq_trend = str(_v).strip().lower() in ("1","true","yes","on")
                             except Exception:
                                 req_liq_trend = False
                             req_liq = req_liq_trend if (reg == "TREND") else req_liq_range
@@ -14245,11 +14266,18 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                             # Micro-structure confirmation: BOS in the signal direction (strict in RANGE).
                             try:
-                                req_bos_range = os.getenv("MID_INST_REQUIRE_BOS_RANGE", "1").strip().lower() in ("1","true","yes","on")
+                                _v = os.getenv("MID_INST_REQUIRE_BOS_RANGE")
+                                if _v is None or str(_v).strip() == "":
+                                    _v = os.getenv("MID_INST_REQUIRE_BOS", "1")
+                                req_bos_range = str(_v).strip().lower() in ("1","true","yes","on")
                             except Exception:
                                 req_bos_range = True
                             try:
-                                req_bos_trend = os.getenv("MID_INST_REQUIRE_BOS_TREND", "0").strip().lower() in ("1","true","yes","on")
+                                _v = os.getenv("MID_INST_REQUIRE_BOS_TREND")
+                                if _v is None or str(_v).strip() == "":
+                                    # TREND optional by default
+                                    _v = os.getenv("MID_INST_REQUIRE_BOS", "0")
+                                req_bos_trend = str(_v).strip().lower() in ("1","true","yes","on")
                             except Exception:
                                 req_bos_trend = False
                             req_bos = req_bos_trend if (reg == "TREND") else req_bos_range
@@ -14262,24 +14290,54 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     bos_ok = bos_down
 
                             # Displacement: require a minimum body/ATR ratio (helps avoid thin fake moves).
+                            # Displacement: require a minimum body/ATR ratio (helps avoid thin fake moves).
                             try:
-                                disp_min_range = float(os.getenv("MID_INST_DISP_MIN_X_RANGE", "0.35") or 0.35)
+                                _v = os.getenv("MID_INST_REQUIRE_DISPLACEMENT_RANGE")
+                                if _v is None or str(_v).strip() == "":
+                                    _v = os.getenv("MID_INST_REQUIRE_DISPLACEMENT", "1")
+                                req_disp_range = str(_v).strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_disp_range = True
+                            try:
+                                _v = os.getenv("MID_INST_REQUIRE_DISPLACEMENT_TREND")
+                                if _v is None or str(_v).strip() == "":
+                                    # TREND optional by default
+                                    _v = os.getenv("MID_INST_REQUIRE_DISPLACEMENT", "0")
+                                req_disp_trend = str(_v).strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_disp_trend = False
+                            req_disp = req_disp_trend if (reg == "TREND") else req_disp_range
+                            try:
+                                _v = os.getenv("MID_INST_DISP_MIN_X_RANGE")
+                                if _v is None or str(_v).strip() == "":
+                                    _v = os.getenv("MID_INST_DISP_MIN", "0.35")
+                                disp_min_range = float(_v or 0.35)
                             except Exception:
                                 disp_min_range = 0.35
                             try:
-                                disp_min_trend = float(os.getenv("MID_INST_DISP_MIN_X_TREND", "0.25") or 0.25)
+                                _v = os.getenv("MID_INST_DISP_MIN_X_TREND")
+                                if _v is None or str(_v).strip() == "":
+                                    _v = os.getenv("MID_INST_DISP_MIN", "0.25")
+                                disp_min_trend = float(_v or 0.25)
                             except Exception:
                                 disp_min_trend = 0.25
                             disp_min = disp_min_trend if (reg == "TREND") else disp_min_range
-                            disp_ok = bool(disp_x >= disp_min)
+                            disp_ok = True if (not req_disp) else bool(disp_x >= disp_min)
 
                             # In RANGE/CHOPPY, reclaim is usually required to avoid catching falling knives.
                             try:
-                                req_reclaim_range = os.getenv("MID_INST_REQUIRE_RECLAIM_RANGE", "1").strip().lower() in ("1","true","yes","on")
+                                _v = os.getenv("MID_INST_REQUIRE_RECLAIM_RANGE")
+                                if _v is None or str(_v).strip() == "":
+                                    _v = os.getenv("MID_INST_REQUIRE_RECLAIM", "1")
+                                req_reclaim_range = str(_v).strip().lower() in ("1","true","yes","on")
                             except Exception:
                                 req_reclaim_range = True
                             try:
-                                req_reclaim_trend = os.getenv("MID_INST_REQUIRE_RECLAIM_TREND", "0").strip().lower() in ("1","true","yes","on")
+                                _v = os.getenv("MID_INST_REQUIRE_RECLAIM_TREND")
+                                if _v is None or str(_v).strip() == "":
+                                    # TREND optional by default
+                                    _v = os.getenv("MID_INST_REQUIRE_RECLAIM", "0")
+                                req_reclaim_trend = str(_v).strip().lower() in ("1","true","yes","on")
                             except Exception:
                                 req_reclaim_trend = False
                             req_reclaim = req_reclaim_trend if (reg == "TREND") else req_reclaim_range
