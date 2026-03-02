@@ -8922,6 +8922,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     except Exception:
         vol_rel = float("nan")
 
+
     # VWAP on 30m (typical price * vol)
     vwap_val = float("nan")
     vwap_txt = "—"
@@ -9124,7 +9125,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         # If filters fail, do not block signal.
         pass
 
-# Pattern on 5m
+    # Pattern on 5m
     pattern, pat_bias = _candle_pattern(df5i)
 
     # RSI divergence on 30m (more stable than 5m)
@@ -9427,17 +9428,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "macd_hist": macd_hist5,
         "bb": bb_str,
         "rel_vol": vol_rel if (not np.isnan(vol_rel)) else 0.0,
-"last_body": float(last_body),
-"disp_body_atr": float((float(last_body) / float(atr30)) if (atr30 and float(atr30) > 0) else 0.0),
-"bos_up_5m": bool(bos_up_5m),
-"bos_down_5m": bool(bos_down_5m),
-"two_green_5m": bool(two_green_5m),
-"two_red_5m": bool(two_red_5m),
-"higher_lows_5m": bool(higher_lows_5m),
-"lower_highs_5m": bool(lower_highs_5m),
-"climax_recent_bars": int(climax_recent_bars),
-"vol_last": float(last_vol) if (last_vol == last_vol) else 0.0,
-"vol_avg": float(avg_vol) if (avg_vol == avg_vol) else 0.0,
         "vwap": vwap_txt,
         "vwap_val": vwap_val if (not np.isnan(vwap_val)) else 0.0,
         "pattern": pattern,
@@ -10349,6 +10339,92 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
     except Exception:
         vol_rel = float("nan")
 
+    # --- 5m micro structure helpers (used by institutional trigger) ---
+    last_body = 0.0
+    disp_body_atr = 0.0
+    bos_up_5m = False
+    bos_down_5m = False
+    two_red_5m = False
+    two_green_5m = False
+    lower_highs_5m = False
+    higher_lows_5m = False
+    vol_last = float("nan")
+    vol_avg = float("nan")
+    try:
+        op = df5i["open"].astype(float)
+        hi = df5i["high"].astype(float)
+        lo = df5i["low"].astype(float)
+        cl = df5i["close"].astype(float)
+
+        if len(cl) >= 2:
+            two_red_5m = (float(cl.iloc[-1]) < float(op.iloc[-1])) and (float(cl.iloc[-2]) < float(op.iloc[-2]))
+            two_green_5m = (float(cl.iloc[-1]) > float(op.iloc[-1])) and (float(cl.iloc[-2]) > float(op.iloc[-2]))
+        try:
+            last_body = abs(float(cl.iloc[-1]) - float(op.iloc[-1]))
+        except Exception:
+            last_body = 0.0
+
+        try:
+            vv = df5i["volume"].astype(float)
+            vol_last = float(vv.iloc[-1])
+            vol_avg = float(vv.rolling(20).mean().iloc[-1])
+        except Exception:
+            vol_last = float("nan")
+            vol_avg = float("nan")
+
+        # BOS heuristic: close breaks prior swing range (lightweight)
+        try:
+            lb = 20
+            k = max(2, int(MID_BOS_RECENT_BARS))
+            if len(lo) >= lb + k + 1:
+                prev_low = float(lo.iloc[-(lb + k + 1):-(k)].min())
+                prev_high = float(hi.iloc[-(lb + k + 1):-(k)].max())
+                for j in range(-k, 0):
+                    _low = float(lo.iloc[j]); _high = float(hi.iloc[j]); _close = float(cl.iloc[j])
+                    if (_low < prev_low) and (_close < prev_low):
+                        bos_down_5m = True
+                    if (_high > prev_high) and (_close > prev_high):
+                        bos_up_5m = True
+        except Exception:
+            pass
+
+        # HL/LH micro-structure
+        try:
+            tol = max(0.0, float(MID_HL_TOL_PCT))
+            nlh = max(3, int(MID_LOWER_HIGHS_LOOKBACK))
+            if len(hi) >= nlh:
+                hh = [float(x) for x in hi.iloc[-nlh:].tolist()]
+                lower_highs_5m = all(hh[i] <= hh[i-1] * (1.0 + tol) for i in range(1, len(hh)))
+            nhl = max(3, int(MID_HIGHER_LOWS_LOOKBACK))
+            if len(lo) >= nhl:
+                ll = [float(x) for x in lo.iloc[-nhl:].tolist()]
+                higher_lows_5m = all(ll[i] >= ll[i-1] * (1.0 - tol) for i in range(1, len(ll)))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    try:
+        disp_body_atr = float(last_body) / float(atr30) if (atr30 and float(atr30) > 0) else 0.0
+    except Exception:
+        disp_body_atr = 0.0
+
+    try:
+        climax_recent_bars = int(os.getenv("MID_CLIMAX_RECENT_BARS", "12") or 12)
+    except Exception:
+        climax_recent_bars = 12
+
+    # Simple regime label for trigger gating
+    try:
+        if (str(mstruct).upper() == "TREND") and (not np.isnan(adx1h)) and float(adx1h) >= 22.0:
+            mid_regime = "TREND"
+        elif (str(mstruct).upper() == "RANGE") or ((not np.isnan(adx1h)) and float(adx1h) < 18.0):
+            mid_regime = "CHOPPY"
+        else:
+            mid_regime = "MIXED"
+    except Exception:
+        mid_regime = "MIXED"
+
     # VWAP on 30m (typical price * vol)
     vwap_val = float("nan")
     vwap_txt = "—"
@@ -10500,6 +10576,21 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "macd_hist": macd_hist5,
         "bb": bb_str,
         "rel_vol": vol_rel if (not np.isnan(vol_rel)) else 0.0,
+
+        "last_body": float(last_body),
+        "disp_body_atr": float(disp_body_atr),
+        "bos_up_5m": bool(bos_up_5m),
+        "bos_down_5m": bool(bos_down_5m),
+        "two_green_5m": bool(two_green_5m),
+        "two_red_5m": bool(two_red_5m),
+        "higher_lows_5m": bool(higher_lows_5m),
+        "lower_highs_5m": bool(lower_highs_5m),
+        "climax_recent_bars": int(climax_recent_bars),
+        "vol_last": float(vol_last) if (vol_last == vol_last) else 0.0,
+        "vol_avg": float(vol_avg) if (vol_avg == vol_avg) else 0.0,
+        "regime": str(mid_regime),
+        "score": float(ta_score),
+        "total": float(ta_score),
         "vwap": vwap_txt,
         "vwap_val": (float(vwap_val) if (not np.isnan(vwap_val)) else 0.0),
         "pattern": pattern,
@@ -10516,6 +10607,8 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "ta_score": ta_score,
     }
 
+
+
     # Apply hard block filters only in TRIGGER phase, so the status line can show
     # concrete reasons like bb_bounce, near_extremes, regime_block, etc.
     try:
@@ -10530,68 +10623,12 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
 
             # 5m helpers (best-effort)
             ema20_5m = float("nan")
-            last_vol = float("nan")
-            avg_vol = float("nan")
-            last_body = 0.0
-            bos_down_5m = False
-            bos_up_5m = False
-            two_red_5m = False
-            two_green_5m = False
-            lower_highs_5m = False
-            higher_lows_5m = False
             try:
-                op = df5i["open"].astype(float)
-                hi = df5i["high"].astype(float)
-                lo = df5i["low"].astype(float)
-                cl = df5i["close"].astype(float)
-                if len(cl) >= 25:
-                    ema20_5m = float(cl.ewm(span=20, adjust=False).mean().iloc[-1])
-                if len(cl) >= 2 and len(op) >= 2:
-                    two_red_5m = (float(cl.iloc[-1]) < float(op.iloc[-1])) and (float(cl.iloc[-2]) < float(op.iloc[-2]))
-                    two_green_5m = (float(cl.iloc[-1]) > float(op.iloc[-1])) and (float(cl.iloc[-2]) > float(op.iloc[-2]))
-                try:
-                    last_body = abs(float(cl.iloc[-1]) - float(op.iloc[-1]))
-                except Exception:
-                    last_body = 0.0
-                try:
-                    vv = df5i["volume"].astype(float)
-                    last_vol = float(vv.iloc[-1])
-                    avg_vol = float(vv.rolling(20).mean().iloc[-1])
-                except Exception:
-                    last_vol = float("nan")
-                    avg_vol = float("nan")
-
-                # BOS heuristic (lightweight)
-                try:
-                    lb = 20
-                    k = max(2, int(MID_BOS_RECENT_BARS))
-                    if len(lo) >= lb + k + 1:
-                        prev_low = float(lo.iloc[-(lb+k+1):-(k)].min())
-                        prev_high = float(hi.iloc[-(lb+k+1):-(k)].max())
-                        for j in range(-k, 0):
-                            _low = float(lo.iloc[j]); _high = float(hi.iloc[j]); _close = float(cl.iloc[j])
-                            if (_low < prev_low) and (_close < prev_low):
-                                bos_down_5m = True
-                            if (_high > prev_high) and (_close > prev_high):
-                                bos_up_5m = True
-                except Exception:
-                    pass
-
-                # HL/LH micro-structure
-                try:
-                    tol = max(0.0, float(MID_HL_TOL_PCT))
-                    nlh = max(3, int(MID_LOWER_HIGHS_LOOKBACK))
-                    if len(hi) >= nlh:
-                        hh = [float(x) for x in hi.iloc[-nlh:].tolist()]
-                        lower_highs_5m = all(hh[i] <= hh[i-1] * (1.0 + tol) for i in range(1, len(hh)))
-                    nhl = max(3, int(MID_HIGHER_LOWS_LOOKBACK))
-                    if len(lo) >= nhl:
-                        ll = [float(x) for x in lo.iloc[-nhl:].tolist()]
-                        higher_lows_5m = all(ll[i] >= ll[i-1] * (1.0 - tol) for i in range(1, len(ll)))
-                except Exception:
-                    pass
+                cl_ = df5i["close"].astype(float)
+                if len(cl_) >= 25:
+                    ema20_5m = float(cl_.ewm(span=20, adjust=False).mean().iloc[-1])
             except Exception:
-                pass
+                ema20_5m = float("nan")
 
             # vwap_val, bb_pos already computed above; ensure numeric fallbacks
             vwap_num = float(vwap_val) if (vwap_val == vwap_val) else float(entry)
@@ -10602,16 +10639,8 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
             if _mkt not in ("SPOT", "FUTURES"):
                 _mkt = "FUTURES"
 
-            # Hard-block filters (anti_bounce_*, late_entry_atr, etc.) are SCAN-only.
-            # Once pending is created, TRIGGER must not kill it due to these post-setup heuristics.
-            _phase = 'scan'
-            try:
-                _phase = str(_MID_EVAL_PHASE.get() or 'scan')
-            except Exception:
-                _phase = 'scan'
-            reason = None
-            if _phase == 'scan':
-                reason = _mid_block_reason(
+            # Hard-block filters are evaluated for diagnostics (status line) in TRIGGER phase.
+            reason = _mid_block_reason(
                 symbol=str(symbol or ""),
                 side=str(dir_trend),
                 close=float(entry),
@@ -10629,10 +10658,10 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
                 bos_up_5m=bool(bos_up_5m),
                 two_green_5m=bool(two_green_5m),
                 higher_lows_5m=bool(higher_lows_5m),
-                last_vol=float(last_vol) if (last_vol == last_vol) else 0.0,
-                avg_vol=float(avg_vol) if (avg_vol == avg_vol) else 0.0,
+                last_vol=float(vol_last) if (vol_last == vol_last) else 0.0,
+                avg_vol=float(vol_avg) if (vol_avg == vol_avg) else 0.0,
                 last_body=float(last_body),
-                climax_recent_bars=int(os.getenv("MID_CLIMAX_RECENT_BARS", "12") or 12),
+                climax_recent_bars=int(climax_recent_bars),
                 market=_mkt,
                 htf_dir_1h=str(dir_trend),
                 htf_dir_30m=str(dir_mid),
@@ -10643,8 +10672,10 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
                 ta["block_reason"] = str(reason)
     except Exception:
         pass
+
     ta["ta_block"] = _fmt_ta_block_mid(ta)
     return ta
+
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
     return "FUTURES" if (not np.isnan(adx1_max)) and adx1_max >= 28 and atr_pct_max >= 0.8 else "SPOT"
 
@@ -14181,11 +14212,18 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 reclaim_eps = float(os.getenv("MID_INST_RECLAIM_EPS_PCT", "0.0006") or 0.0006)
                             except Exception:
                                 reclaim_eps = 0.0006
+                            # Reclaim only makes sense when we have a real zone (entry_low/entry_high).
                             reclaim_ok = True
-                            if diru == "LONG":
-                                reclaim_ok = bool(entry_close >= (entry_high * (1.0 + reclaim_eps)))
-                            elif diru == "SHORT":
-                                reclaim_ok = bool(entry_close <= (entry_low * (1.0 - reclaim_eps)))
+                            try:
+                                _lo = float(entry_low) if (entry_low is not None) else 0.0
+                                _hi = float(entry_high) if (entry_high is not None) else 0.0
+                                if _lo > 0 and _hi > 0 and _hi >= _lo:
+                                    if diru == "LONG":
+                                        reclaim_ok = bool(entry_close >= (_hi * (1.0 + reclaim_eps)))
+                                    elif diru == "SHORT":
+                                        reclaim_ok = bool(entry_close <= (_lo * (1.0 - reclaim_eps)))
+                            except Exception:
+                                reclaim_ok = True
 
                             # Liquidity requirement: strict in RANGE/CHOPPY, optional in TREND by default.
                             try:
