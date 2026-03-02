@@ -13412,9 +13412,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         """
         try:
             logger.info(
-                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s attempts=%s fails=%s px=%.6g",
+                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s score=%s conf=%s trap_reason=%s in_zone=%s attempts=%s fails=%s px=%.6g",
                 str(sym), str(market), str(direction),
                 str(outcome), str(reason or ""),
+                str(it.get("_trig_score") if (it.get("_trig_score") is not None) else (it.get("ta_score") if it.get("ta_score") is not None else it.get("confidence"))),
+                str(it.get("_trig_conf") if (it.get("_trig_conf") is not None) else (it.get("confidence") if it.get("confidence") is not None else it.get("min_confidence"))),
+                str(it.get("_trig_trap_reason") if (it.get("_trig_trap_reason") is not None) else (it.get("trap_reason") or "")),
+                int(1 if (bool(it.get("_in_zone_tol") or it.get("_in_zone") or False)) else 0),
                 int(it.get("trigger_attempts") or 0),
                 int(it.get("fail_count") or 0),
                 float(price),
@@ -13960,6 +13964,28 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
                         continue
+
+                    # Snapshot trigger-time metrics for richer [mid][pending][trigger] logs
+                    try:
+                        it["_trig_conf"] = int(float(ta.get("confidence") or 0))
+                    except Exception:
+                        it["_trig_conf"] = None
+                    try:
+                        # Prefer unified score fields if present (evaluate_on_exchange_mid_v2)
+                        _s = ta.get("ta_score")
+                        if _s is None:
+                            _s = ta.get("ta_score_conf")
+                        if _s is None:
+                            _s = ta.get("ta_score_total")
+                        if _s is None:
+                            _s = ta.get("confidence")
+                        it["_trig_score"] = int(float(_s or 0))
+                    except Exception:
+                        it["_trig_score"] = None
+                    try:
+                        it["_trig_trap_reason"] = str(ta.get("trap_reason") or "")
+                    except Exception:
+                        it["_trig_trap_reason"] = ""
                     if str(ta.get("direction") or "").upper() != direction:
                         keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
                         _pending_log_trigger(sym, market, direction, outc, "direction_mismatch", it, float(price))
