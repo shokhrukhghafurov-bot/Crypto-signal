@@ -9052,7 +9052,16 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         except Exception:
             pass
 
-        reason = _mid_block_reason(
+        # Hard-block filters (anti_bounce_*, late_entry_atr, etc.) are SCAN-only.
+        # Once pending is created, TRIGGER must not kill it due to these post-setup heuristics.
+        _phase = 'scan'
+        try:
+            _phase = str(_MID_EVAL_PHASE.get() or 'scan')
+        except Exception:
+            _phase = 'scan'
+        reason = None
+        if _phase == 'scan':
+            reason = _mid_block_reason(
             symbol=symbol,
             side=str(dir_trend),
             close=float(entry),
@@ -10582,7 +10591,16 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
             if _mkt not in ("SPOT", "FUTURES"):
                 _mkt = "FUTURES"
 
-            reason = _mid_block_reason(
+            # Hard-block filters (anti_bounce_*, late_entry_atr, etc.) are SCAN-only.
+            # Once pending is created, TRIGGER must not kill it due to these post-setup heuristics.
+            _phase = 'scan'
+            try:
+                _phase = str(_MID_EVAL_PHASE.get() or 'scan')
+            except Exception:
+                _phase = 'scan'
+            reason = None
+            if _phase == 'scan':
+                reason = _mid_block_reason(
                 symbol=str(symbol or ""),
                 side=str(dir_trend),
                 close=float(entry),
@@ -14005,21 +14023,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
                         continue
-                    # Hard blocks (late entry, near extremes, etc.) must be enforced on TRIGGER.
-                    if bool(ta.get("blocked")):
-                        reason = str(ta.get("block_reason") or "blocked").strip() or "blocked"
-                        keep_it, outc = _pending_apply_fail(it, reason, now)
-                        _pending_log_trigger(sym, market, direction, outc, reason, it, float(price))
-                        if keep_it:
-                            keep.append(it)
-                            any_wait = True
-                        else:
-                            try:
-                                removed_n += 1
-                            except Exception:
-                                pass
-                        continue
-                    if not bool(ta.get("trap_ok", True)):
+                                        # NOTE: Trigger intentionally ignores ta['blocked']/block_reason (anti_bounce_*, late_entry_atr, etc.).
+if not bool(ta.get("trap_ok", True)):
                         keep_it, outc = _pending_apply_fail(it, "trap_block", now)
                         _pending_log_trigger(sym, market, direction, outc, "trap_block", it, float(price))
                         if keep_it:
