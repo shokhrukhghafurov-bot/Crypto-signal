@@ -13380,7 +13380,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
         # SOFT reasons: allow waiting (do not count as fail), but still record reason/ts
         try:
-            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,liq_sweep_missing").strip()
+            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,liq_sweep_missing,trap_block,confidence_low,score_low,no_ta").strip()
             soft_set = {s.strip().lower() for s in _soft.split(",") if s.strip()}
             if r0 in soft_set:
                 it["last_fail_reason"] = str(reason or "fail")
@@ -14005,20 +14005,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
                         continue
-                    # Hard blocks (late entry, near extremes, etc.) must be enforced on TRIGGER.
-                    if bool(ta.get("blocked")):
-                        reason = str(ta.get("block_reason") or "blocked").strip() or "blocked"
-                        keep_it, outc = _pending_apply_fail(it, reason, now)
-                        _pending_log_trigger(sym, market, direction, outc, reason, it, float(price))
-                        if keep_it:
-                            keep.append(it)
-                            any_wait = True
-                        else:
-                            try:
-                                removed_n += 1
-                            except Exception:
-                                pass
-                        continue
                     if not bool(ta.get("trap_ok", True)):
                         keep_it, outc = _pending_apply_fail(it, "trap_block", now)
                         _pending_log_trigger(sym, market, direction, outc, "trap_block", it, float(price))
@@ -14046,200 +14032,33 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 pass
                         continue
 
-                    # If scan stage skipped hard filters (MID_FILTERS_AFTER_SETUP=1),
-                    # apply the same filters here at trigger moment.
-                    postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
-                    if postsetup_only:
-                        # Score/quality threshold (same logic as scan stage)
-                        try:
-                            use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
-                            if use_main:
-                                min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
-                                min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
+
+                    # Trigger-stage filters (minimal set requested)
+                    # - score_low (quality threshold)
+                    try:
+                        use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
+                        if use_main:
+                            min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
+                            min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
+                        else:
+                            min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76") or 76)
+                            min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
+                        need = float(min_score_fut if market == "FUTURES" else min_score_spot)
+                        score = float(ta.get("ta_score") or ta.get("ta_score_conf") or ta.get("ta_score_total") or ta.get("score") or ta.get("confidence") or 0.0)
+                        if need and score < need:
+                            keep_it, outc = _pending_apply_fail(it, "score_low", now)
+                            _pending_log_trigger(sym, market, direction, outc, "score_low", it, float(price))
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
                             else:
-                                min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76") or 76)
-                                min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
-                            need = float(min_score_fut if market == "FUTURES" else min_score_spot)
-                            score = float(ta.get("confidence") or ta.get("score") or 0.0)
-                            if need and score < need:
-                                keep_it, outc = _pending_apply_fail(it, "score_low", now)
-                                _pending_log_trigger(sym, market, direction, outc, "score_low", it, float(price))
-                                if keep_it:
-                                    keep.append(it)
-                                    any_wait = True
-                                else:
-                                    try:
-                                        removed_n += 1
-                                    except Exception:
-                                        pass
-                                continue
-                        except Exception:
-                            pass
-                        # Regime/vol thresholds
-                        try:
-                            min_adx_30m = float(os.getenv("MID_MIN_ADX_30M","0") or 0)
-                            min_adx_1h = float(os.getenv("MID_MIN_ADX_1H","0") or 0)
-                            adx30 = float(ta.get("adx1") or ta.get("adx_30m") or 0.0)
-                            adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
-                            if min_adx_30m and adx30 < min_adx_30m:
-                                keep_it, outc = _pending_apply_fail(it, "regime_block", now)
-                                _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
-                                if keep_it:
-                                    keep.append(it)
-                                    any_wait = True
-                                else:
-                                    try:
-                                        removed_n += 1
-                                    except Exception:
-                                        pass
-                                continue
-                            if min_adx_1h and adx1h < min_adx_1h:
-                                keep_it, outc = _pending_apply_fail(it, "regime_block", now)
-                                _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
-                                if keep_it:
-                                    keep.append(it)
-                                    any_wait = True
-                                else:
-                                    try:
-                                        removed_n += 1
-                                    except Exception:
-                                        pass
-                                continue
-                        except Exception:
-                            pass
-                        try:
-                            min_atr_pct = float(os.getenv("MID_MIN_ATR_PCT","0") or 0)
-                            atrp = float(ta.get("atr_pct") or 0.0)
-                            if min_atr_pct and atrp < min_atr_pct:
-                                keep_it, outc = _pending_apply_fail(it, "volatility_block", now)
-                                _pending_log_trigger(sym, market, direction, outc, "volatility_block", it, float(price))
-                                if keep_it:
-                                    keep.append(it)
-                                    any_wait = True
-                                else:
-                                    try:
-                                        removed_n += 1
-                                    except Exception:
-                                        pass
-                                continue
-                        except Exception:
-                            pass
-                        try:
-                            # RR filter
-                            min_rr = float(os.getenv("MID_MIN_RR", "0") or 0)
-                            rr = float(ta.get("rr") or 0.0)
-                            if min_rr and rr < min_rr:
-                                keep_it, outc = _pending_apply_fail(it, "rr_low", now)
-                                _pending_log_trigger(sym, market, direction, outc, "rr_low", it, float(price))
-                                if keep_it:
-                                    keep.append(it)
-                                    any_wait = True
-                                else:
-                                    try:
-                                        removed_n += 1
-                                    except Exception:
-                                        pass
-                                continue
-                        except Exception:
-                            pass
-                        try:
-                            # Volume filter
-                            mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or 0)
-                            volx = float(ta.get("rel_vol") or 0.0)
-                            if mid_min_vol_x and volx < mid_min_vol_x:
-                                keep_it, outc = _pending_apply_fail(it, "vol_low", now)
-                                _pending_log_trigger(sym, market, direction, outc, "vol_low", it, float(price))
-                                if keep_it:
-                                    keep.append(it)
-                                    any_wait = True
-                                else:
-                                    try:
-                                        removed_n += 1
-                                    except Exception:
-                                        pass
-                                continue
-                        except Exception:
-                            pass
-                        try:
-                            # VWAP bias + min distance (avoid chop)
-                            mid_require_vwap_bias = os.getenv("MID_REQUIRE_VWAP_SIDE", "0").strip().lower() in ("1","true","yes","on")
-                            mid_min_vwap_dist_atr = float(os.getenv("MID_MIN_VWAP_DIST_ATR", "0") or 0)
-                            direction_u = str(direction).upper()
-                            entry_check = float(ta.get("entry") or entry0)
-                            vwap_val = float(ta.get("vwap_val") or 0.0)
-                            atrp = float(ta.get("atr_pct") or 0.0)
-                            atr30 = abs(entry_check) * (abs(atrp) / 100.0) if (entry_check and atrp) else float(atr_abs or 0.0)
-                            if vwap_val > 0 and atr30 and atr30 > 0:
-                                if mid_require_vwap_bias:
-                                    if direction_u == "SHORT" and not (entry_check < vwap_val):
-                                        keep_it, outc = _pending_apply_fail(it, "vwap_bias", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "vwap_bias", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
-                                        else:
-                                            try:
-                                                removed_n += 1
-                                            except Exception:
-                                                pass
-                                        continue
-                                    if direction_u == "LONG" and not (entry_check > vwap_val):
-                                        keep_it, outc = _pending_apply_fail(it, "vwap_bias", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "vwap_bias", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
-                                        else:
-                                            try:
-                                                removed_n += 1
-                                            except Exception:
-                                                pass
-                                        continue
-                                if mid_min_vwap_dist_atr > 0:
-                                    if abs(entry_check - vwap_val) < (atr30 * mid_min_vwap_dist_atr):
-                                        keep_it, outc = _pending_apply_fail(it, "vwap_dist", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "vwap_dist", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
-                                        else:
-                                            try:
-                                                removed_n += 1
-                                            except Exception:
-                                                pass
-                                        continue
-                        except Exception:
-                            pass
-                        try:
-                            # Liquidity sweep requirement
-                            req = os.getenv("MID_REQUIRE_LIQ_SWEEP", "0").strip().lower() in ("1","true","yes","on")
-                            if req:
-                                if str(direction).upper() == "LONG" and not bool(ta.get("sweep_long", False)):
-                                    keep_it, outc = _pending_apply_fail(it, "liq_sweep_missing", now)
-                                    _pending_log_trigger(sym, market, direction, outc, "liq_sweep_missing", it, float(price))
-                                    if keep_it:
-                                        keep.append(it)
-                                        any_wait = True
-                                    else:
-                                        try:
-                                            removed_n += 1
-                                        except Exception:
-                                            pass
-                                    continue
-                                if str(direction).upper() == "SHORT" and not bool(ta.get("sweep_short", False)):
-                                    keep_it, outc = _pending_apply_fail(it, "liq_sweep_missing", now)
-                                    _pending_log_trigger(sym, market, direction, outc, "liq_sweep_missing", it, float(price))
-                                    if keep_it:
-                                        keep.append(it)
-                                        any_wait = True
-                                    else:
-                                        try:
-                                            removed_n += 1
-                                        except Exception:
-                                            pass
-                                    continue
-                        except Exception:
-                            pass
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                            continue
+                    except Exception:
+                        pass
 
                     # Emit final signal
                     entry = float(ta.get("entry") or entry0)
