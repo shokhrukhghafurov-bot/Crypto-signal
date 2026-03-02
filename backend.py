@@ -13384,7 +13384,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
             for it in items:
                 try:
-                    trig_checked_n += 1
                     sym = str(it.get("symbol") or "")
                     sym_trade = str(it.get("trade_symbol") or sym)
                     sym_candles = str(it.get("candle_symbol") or sym)
@@ -13695,7 +13694,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # MID_PENDING_INSTANT_EMIT=1 + MID_PENDING_INSTANT_EMIT_IGNORE_ZONE=1
                     if not (pending_instant_emit and instant_ignore_zone):
                         if use_zone:
-                            if not (float(price) >= (lo - tol) and float(price) <= (hi + tol)):
+                            if not (float(price) >= lo and float(price) <= hi):
                                 keep.append(it)
                                 any_wait = True
                                 continue
@@ -13716,9 +13715,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         pass
 
+                    trig_checked_n += 1
+
                     # If enabled, emit immediately as soon as price reaches the entry zone.
                     # NOTE: this bypasses *all* safety checks. Intended for temporary debugging only.
-                    if pending_instant_emit:
+                    if pending_instant_emit and (os.getenv("MID_PENDING_INSTANT_EMIT_SKIP_CHECKS", "0").strip().lower() in ("1","true","yes","on")):
                         try:
                             _pending_mark_attempt(it, now)
                         except Exception:
