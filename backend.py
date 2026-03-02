@@ -13992,21 +13992,29 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     # Snapshot trigger-time metrics for richer [mid][pending][trigger] logs
                     try:
-                        it["_trig_conf"] = int(float(ta.get("confidence") or 0))
-                    except Exception:
-                        it["_trig_conf"] = None
-                    try:
-                        # Prefer unified score fields if present (evaluate_on_exchange_mid_v2)
-                        _s = ta.get("ta_score")
-                        if _s is None:
-                            _s = ta.get("ta_score_conf")
-                        if _s is None:
-                            _s = ta.get("ta_score_total")
-                        if _s is None:
-                            _s = ta.get("confidence")
-                        it["_trig_score"] = int(float(_s or 0))
+                        # Compute score/conf consistently to avoid score_low using confidence (double-penalty bug).
+                        try:
+                            _score = ta.get("score")
+                            if _score is None:
+                                _score = ta.get("total")
+                            if _score is None:
+                                # Backward compat / internal fields
+                                _score = ta.get("ta_score_total")
+                            if _score is None:
+                                _score = ta.get("ta_score")
+                            score_v = float(_score or 0.0)
+                        except Exception:
+                            score_v = 0.0
+                        try:
+                            _conf = ta.get("confidence")
+                            conf_v = float(_conf) if (_conf is not None and _conf != "") else float(score_v)
+                        except Exception:
+                            conf_v = float(score_v)
+                        it["_trig_score"] = int(score_v)
+                        it["_trig_conf"] = int(conf_v)
                     except Exception:
                         it["_trig_score"] = None
+                        it["_trig_conf"] = None
                     try:
                         it["_trig_trap_reason"] = str(ta.get("trap_reason") or "")
                     except Exception:
@@ -14038,7 +14046,18 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         continue
 
                     min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
-                    if int(float(ta.get("confidence") or 0)) < int(min_conf):
+                    # confidence_low checks confidence only; if confidence is missing, fall back to score (common on some exchanges/paths).
+                    try:
+                        _conf_chk = it.get("_trig_conf")
+                        if _conf_chk is None:
+                            _conf_raw = ta.get("confidence")
+                            if _conf_raw is None or _conf_raw == "":
+                                _conf_chk = float(ta.get("score") or ta.get("total") or 0.0)
+                            else:
+                                _conf_chk = float(_conf_raw or 0.0)
+                    except Exception:
+                        _conf_chk = 0.0
+                    if int(float(_conf_chk or 0.0)) < int(min_conf):
                         keep_it, outc = _pending_apply_fail(it, "confidence_low", now)
                         _pending_log_trigger(sym, market, direction, outc, "confidence_low", it, float(price))
                         if keep_it:
@@ -14065,7 +14084,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76") or 76)
                                 min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
                             need = float(min_score_fut if market == "FUTURES" else min_score_spot)
-                            score = float(ta.get("confidence") or ta.get("score") or 0.0)
+                            score = float(ta.get("score") or ta.get("total") or 0.0)
                             if need and score < need:
                                 keep_it, outc = _pending_apply_fail(it, "score_low", now)
                                 _pending_log_trigger(sym, market, direction, outc, "score_low", it, float(price))
@@ -14148,21 +14167,66 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
                         try:
-                            # Volume filter
+                            # Volume filter (smart, softer at trigger than at setup)
                             mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or 0)
-                            volx = float(ta.get("rel_vol") or 0.0)
-                            if mid_min_vol_x and volx < mid_min_vol_x:
-                                keep_it, outc = _pending_apply_fail(it, "vol_low", now)
-                                _pending_log_trigger(sym, market, direction, outc, "vol_low", it, float(price))
-                                if keep_it:
-                                    keep.append(it)
-                                    any_wait = True
-                                else:
+                            try:
+                                trig_min_vol_x = os.getenv("MID_TRIGGER_MIN_VOL_X", "").strip()
+                                trig_min_vol_x = float(trig_min_vol_x) if trig_min_vol_x != "" else (float(mid_min_vol_x) * 0.75 if mid_min_vol_x else 0.0)
+                            except Exception:
+                                trig_min_vol_x = float(mid_min_vol_x) * 0.75 if mid_min_vol_x else 0.0
+
+                            # If no trigger threshold configured/effective, do not block.
+                            if trig_min_vol_x and trig_min_vol_x > 0:
+                                try:
+                                    volx_raw = ta.get("rel_vol")
+                                    if volx_raw is None:
+                                        volx_raw = ta.get("vol_x")
+                                    volx = float(volx_raw or 0.0)
+                                except Exception:
+                                    volx = 0.0
+
+                                # If volume metric missing/zero, do not block (avoid false vol_low due to empty data).
+                                if volx and volx > 0:
+                                    thr = float(trig_min_vol_x)
+
+                                    # If ADX is strong, relax vol requirement further (trend can move on lighter volume).
                                     try:
-                                        removed_n += 1
+                                        adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
                                     except Exception:
-                                        pass
-                                continue
+                                        adx1h = 0.0
+                                    if adx1h >= 25.0:
+                                        thr *= 0.80
+
+                                    # If score/conf is very high, relax vol requirement further.
+                                    try:
+                                        s_v = float(ta.get("score") or ta.get("total") or it.get("_trig_score") or 0.0)
+                                    except Exception:
+                                        s_v = 0.0
+                                    try:
+                                        c_v = ta.get("confidence")
+                                        c_v = float(c_v) if (c_v is not None and c_v != "") else float(s_v)
+                                    except Exception:
+                                        c_v = float(s_v)
+
+                                    try:
+                                        need_v = float(need) if ("need" in locals() or "need" in globals()) else 0.0
+                                    except Exception:
+                                        need_v = 0.0
+                                    if max(s_v, c_v) >= max(90.0, (need_v + 8.0) if need_v else 90.0):
+                                        thr *= 0.80
+
+                                    if volx < thr:
+                                        keep_it, outc = _pending_apply_fail(it, "vol_low", now)
+                                        _pending_log_trigger(sym, market, direction, outc, "vol_low", it, float(price))
+                                        if keep_it:
+                                            keep.append(it)
+                                            any_wait = True
+                                        else:
+                                            try:
+                                                removed_n += 1
+                                            except Exception:
+                                                pass
+                                        continue
                         except Exception:
                             pass
                         try:
