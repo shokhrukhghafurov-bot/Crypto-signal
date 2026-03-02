@@ -14023,6 +14023,66 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         it["_trig_trap_reason"] = str(ta.get("trap_reason") or "")
                     except Exception:
                         it["_trig_trap_reason"] = ""
+
+                    # Precompute trigger-time volume debug fields (volx/thr/thr_base/thr_why) so logs are never blank,
+                    # even when an earlier trigger filter (e.g. score_low) short-circuits.
+                    try:
+                        mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or 0)
+                        try:
+                            _t = os.getenv("MID_TRIGGER_MIN_VOL_X", "").strip()
+                            trig_min_vol_x = float(_t) if _t != "" else (mid_min_vol_x * 0.75 if mid_min_vol_x else 0.0)
+                        except Exception:
+                            trig_min_vol_x = mid_min_vol_x * 0.75 if mid_min_vol_x else 0.0
+                        base_thr = float(trig_min_vol_x or 0.0)
+                        try:
+                            volx_raw = ta.get("rel_vol")
+                            if volx_raw is None:
+                                volx_raw = ta.get("vol_x")
+                            volx = float(volx_raw or 0.0)
+                        except Exception:
+                            volx = 0.0
+                        thr = float(base_thr)
+                        thr_why = []
+                        try:
+                            adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
+                        except Exception:
+                            adx1h = 0.0
+                        if adx1h >= 25.0 and thr > 0:
+                            thr *= 0.80
+                            thr_why.append("ADX")
+                        try:
+                            s_v = float(it.get("_trig_score") or 0.0)
+                        except Exception:
+                            s_v = 0.0
+                        try:
+                            c_v = float(it.get("_trig_conf") or s_v)
+                        except Exception:
+                            c_v = s_v
+                        try:
+                            use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
+                            if use_main:
+                                min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
+                                min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
+                            else:
+                                min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76") or 76)
+                                min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
+                            need_v = float(min_score_fut if market == "FUTURES" else min_score_spot)
+                        except Exception:
+                            need_v = 0.0
+                        if thr > 0 and max(s_v, c_v) >= max(90.0, (need_v + 8.0) if need_v else 90.0):
+                            thr *= 0.80
+                            thr_why.append("SCORE")
+                        it["_trig_volx"] = float(volx or 0.0)
+                        it["_trig_vol_thr_base"] = float(base_thr or 0.0)
+                        it["_trig_vol_thr"] = float(thr or 0.0)
+                        if not base_thr or base_thr <= 0:
+                            it["_trig_vol_thr_why"] = "disabled"
+                        elif not (volx and volx > 0):
+                            it["_trig_vol_thr_why"] = "skip_missing_volx"
+                        else:
+                            it["_trig_vol_thr_why"] = ",".join(thr_why) if thr_why else "base"
+                    except Exception:
+                        pass
                     if str(ta.get("direction") or "").upper() != direction:
                         keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
                         _pending_log_trigger(sym, market, direction, outc, "direction_mismatch", it, float(price))
@@ -14088,7 +14148,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76") or 76)
                                 min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
                             need = float(min_score_fut if market == "FUTURES" else min_score_spot)
-                            score = float(ta.get("score") or ta.get("total") or 0.0)
+                            score = float(it.get("_trig_score") if (it.get("_trig_score") is not None) else (ta.get("score") or ta.get("total") or 0.0))
                             if need and score < need:
                                 keep_it, outc = _pending_apply_fail(it, "score_low", now)
                                 _pending_log_trigger(sym, market, direction, outc, "score_low", it, float(price))
