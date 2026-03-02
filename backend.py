@@ -1205,6 +1205,13 @@ _MID_TICK_CTX = contextvars.ContextVar('MID_TICK_CTX', default=None)
 
 _MID_ADAPT_CTX = contextvars.ContextVar('MID_ADAPT_CTX', default=None)
 
+# Evaluation phase marker for MID (used to split MACRO trap at SCAN vs MICRO trap at TRIGGER).
+#
+# IMPORTANT: This must exist as a ContextVar. Without it, code falls back to phase="scan"
+# everywhere (because NameError is swallowed), which makes trigger-time checks incorrectly
+# run the strict macro trap and drastically reduces emits.
+_MID_EVAL_PHASE = contextvars.ContextVar('MID_EVAL_PHASE', default='scan')
+
 def _mid_adapt_reset_tick() -> None:
     """Reset adaptive regime stats for the current MID tick."""
     try:
