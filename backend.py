@@ -13437,12 +13437,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         """
         try:
             logger.info(
-                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s score=%s conf=%s trap_reason=%s in_zone=%s attempts=%s fails=%s px=%.6g",
+                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s score=%s conf=%s trap_reason=%s volx=%s thr=%s thr_base=%s thr_why=%s in_zone=%s attempts=%s fails=%s px=%.6g",
                 str(sym), str(market), str(direction),
                 str(outcome), str(reason or ""),
                 str(it.get("_trig_score") if (it.get("_trig_score") is not None) else (it.get("ta_score") if it.get("ta_score") is not None else it.get("confidence"))),
                 str(it.get("_trig_conf") if (it.get("_trig_conf") is not None) else (it.get("confidence") if it.get("confidence") is not None else it.get("min_confidence"))),
                 str(it.get("_trig_trap_reason") if (it.get("_trig_trap_reason") is not None) else (it.get("trap_reason") or "")),
+                str(it.get("_trig_volx") if (it.get("_trig_volx") is not None) else ""),
+                str(it.get("_trig_vol_thr") if (it.get("_trig_vol_thr") is not None) else ""),
+                str(it.get("_trig_vol_thr_base") if (it.get("_trig_vol_thr_base") is not None) else ""),
+                str(it.get("_trig_vol_thr_why") if (it.get("_trig_vol_thr_why") is not None) else ""),
                 int(1 if (bool(it.get("_in_zone_tol") or it.get("_in_zone") or False)) else 0),
                 int(it.get("trigger_attempts") or 0),
                 int(it.get("fail_count") or 0),
@@ -14185,48 +14189,65 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 except Exception:
                                     volx = 0.0
 
+                                # Trigger volume threshold debug (always computed, but blocks only when volx is present).
+                                base_thr = float(trig_min_vol_x or 0.0)
+                                thr = float(base_thr)
+                                thr_why = []
+
+                                # If ADX is strong, relax vol requirement further (trend can move on lighter volume).
+                                try:
+                                    adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
+                                except Exception:
+                                    adx1h = 0.0
+                                if adx1h >= 25.0:
+                                    thr *= 0.80
+                                    thr_why.append("ADX")
+
+                                # If score/conf is very high, relax vol requirement further.
+                                try:
+                                    s_v = float(ta.get("score") or ta.get("total") or it.get("_trig_score") or 0.0)
+                                except Exception:
+                                    s_v = 0.0
+                                try:
+                                    c_v = ta.get("confidence")
+                                    c_v = float(c_v) if (c_v is not None and c_v != "") else float(s_v)
+                                except Exception:
+                                    c_v = float(s_v)
+                                try:
+                                    need_v = float(need) if ("need" in locals() or "need" in globals()) else 0.0
+                                except Exception:
+                                    need_v = 0.0
+                                if max(s_v, c_v) >= max(90.0, (need_v + 8.0) if need_v else 90.0):
+                                    thr *= 0.80
+                                    thr_why.append("SCORE")
+
+                                # Store for logging, even on pass/skip.
+                                try:
+                                    it["_trig_volx"] = float(volx or 0.0)
+                                    it["_trig_vol_thr_base"] = float(base_thr or 0.0)
+                                    it["_trig_vol_thr"] = float(thr or 0.0)
+                                    if not base_thr or base_thr <= 0:
+                                        it["_trig_vol_thr_why"] = "disabled"
+                                    elif not (volx and volx > 0):
+                                        it["_trig_vol_thr_why"] = "skip_missing_volx"
+                                    else:
+                                        it["_trig_vol_thr_why"] = ",".join(thr_why) if thr_why else "base"
+                                except Exception:
+                                    pass
+
                                 # If volume metric missing/zero, do not block (avoid false vol_low due to empty data).
-                                if volx and volx > 0:
-                                    thr = float(trig_min_vol_x)
-
-                                    # If ADX is strong, relax vol requirement further (trend can move on lighter volume).
-                                    try:
-                                        adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
-                                    except Exception:
-                                        adx1h = 0.0
-                                    if adx1h >= 25.0:
-                                        thr *= 0.80
-
-                                    # If score/conf is very high, relax vol requirement further.
-                                    try:
-                                        s_v = float(ta.get("score") or ta.get("total") or it.get("_trig_score") or 0.0)
-                                    except Exception:
-                                        s_v = 0.0
-                                    try:
-                                        c_v = ta.get("confidence")
-                                        c_v = float(c_v) if (c_v is not None and c_v != "") else float(s_v)
-                                    except Exception:
-                                        c_v = float(s_v)
-
-                                    try:
-                                        need_v = float(need) if ("need" in locals() or "need" in globals()) else 0.0
-                                    except Exception:
-                                        need_v = 0.0
-                                    if max(s_v, c_v) >= max(90.0, (need_v + 8.0) if need_v else 90.0):
-                                        thr *= 0.80
-
-                                    if volx < thr:
-                                        keep_it, outc = _pending_apply_fail(it, "vol_low", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "vol_low", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
-                                        else:
-                                            try:
-                                                removed_n += 1
-                                            except Exception:
-                                                pass
-                                        continue
+                                if (volx and volx > 0) and (base_thr and base_thr > 0) and (volx < thr):
+                                    keep_it, outc = _pending_apply_fail(it, "vol_low", now)
+                                    _pending_log_trigger(sym, market, direction, outc, "vol_low", it, float(price))
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
                         except Exception:
                             pass
                         try:
