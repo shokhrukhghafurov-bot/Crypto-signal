@@ -14023,8 +14023,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
                         continue
-                                        # NOTE: Trigger intentionally ignores ta['blocked']/block_reason (anti_bounce_*, late_entry_atr, etc.).
-if not bool(ta.get("trap_ok", True)):
+                    # NOTE: Trigger intentionally ignores ta['blocked']/block_reason (anti_bounce_*, late_entry_atr, etc.).
+                    if not bool(ta.get("trap_ok", True)):
                         keep_it, outc = _pending_apply_fail(it, "trap_block", now)
                         _pending_log_trigger(sym, market, direction, outc, "trap_block", it, float(price))
                         if keep_it:
