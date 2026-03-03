@@ -13706,8 +13706,24 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
     while True:
 
         try:
-            items = await self._mid_pending_load()
-            now = time.time()
+			# Heartbeat for [mid][status]: mark the trigger-loop as alive *before* any I/O.
+			# Otherwise, a slow DB call can make status show trig_poll=stale even though the loop is running.
+			now = time.time()
+			try:
+				global _MID_TRIG_POLL_LAST
+				# Keep the keys stable so status parsing remains consistent.
+				_MID_TRIG_POLL_LAST = {
+					"ts": float(now),
+					"checked": int(0),
+					"in_zone_chk": int(0),
+					"keep": int(0),
+					"removed_now": int(0),
+					"expired_now": int(0),
+					"hb": int(1),
+				}
+			except Exception:
+				pass
+			items = await self._mid_pending_load()
             # Start per-poll trigger reject aggregation (so [mid][status] can show reasons *for this tick*).
             try:
                 _MID_TRIG_REJECT_TICK_CUR = {"ts": float(now), "pre": {}, "inzone": {}}
