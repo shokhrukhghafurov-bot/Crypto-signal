@@ -14403,10 +14403,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 except Exception:
                                     pass
                             continue
-                    try:
-                        it["_trig_checks"]["direction"] = "pass"
-                    except Exception:
-                        pass
+                    else:
+                        # Only mark as pass when it really passed.
+                        try:
+                            it["_trig_checks"]["direction"] = "pass"
+                        except Exception:
+                            pass
                     # NOTE: Trigger intentionally ignores ta['blocked']/block_reason (anti_bounce_*, late_entry_atr, etc.).
                     if not bool(ta.get("trap_ok", True)):
                         try:
@@ -14427,10 +14429,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 except Exception:
                                     pass
                             continue
-                    try:
-                        it["_trig_checks"]["trap"] = "pass"
-                    except Exception:
-                        pass
+                    else:
+                        try:
+                            it["_trig_checks"]["trap"] = "pass"
+                        except Exception:
+                            pass
                     # --- Institutional trigger logic (adaptive by regime) ---
                     # Goal: in CHOPPY/RANGE, require liquidity event + reclaim + micro structure confirmation,
                     # and treat volume as a secondary confirmation (not a guillotine).
@@ -14782,12 +14785,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                         except Exception:
                                             pass
                                     continue
-                            try:
-                                it["_trig_checks"]["score"] = "pass"
-                                it["_trig_score_need"] = float(need or 0.0)
-                                it["_trig_score_val"] = float(score or 0.0)
-                            except Exception:
-                                pass
+                            else:
+                                # Only mark score as pass if it truly passed.
+                                try:
+                                    it["_trig_checks"]["score"] = "pass"
+                                    it["_trig_score_need"] = float(need or 0.0)
+                                    it["_trig_score_val"] = float(score or 0.0)
+                                except Exception:
+                                    pass
 
                         except Exception:
                             pass
