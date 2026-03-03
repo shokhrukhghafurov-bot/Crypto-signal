@@ -14244,10 +14244,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         pass
                     if str(ta.get("direction") or "").upper() != direction:
-                    try:
-                        it["_trig_checks"]["direction"] = "fail"
-                    except Exception:
-                        pass
+                        try:
+                            it["_trig_checks"]["direction"] = "fail"
+                        except Exception:
+                            pass
                         keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
                         _pending_log_trigger(sym, market, direction, outc, "direction_mismatch", it, float(price))
                         if keep_it:
@@ -14265,10 +14265,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         pass
                     # NOTE: Trigger intentionally ignores ta['blocked']/block_reason (anti_bounce_*, late_entry_atr, etc.).
                     if not bool(ta.get("trap_ok", True)):
-                    try:
-                        it["_trig_checks"]["trap"] = "fail"
-                    except Exception:
-                        pass
+                        try:
+                            it["_trig_checks"]["trap"] = "fail"
+                        except Exception:
+                            pass
                         keep_it, outc = _pending_apply_fail(it, "trap_block", now)
                         _pending_log_trigger(sym, market, direction, outc, "trap_block", it, float(price))
                         if keep_it:
@@ -14280,8 +14280,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
                         continue
-
-
                     try:
                         it["_trig_checks"]["trap"] = "pass"
                     except Exception:
@@ -14777,10 +14775,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                         # keep waiting or pass through (no block)
                                         try:
                                             it["_trig_vol_thr_why"] = (str(it.get("_trig_vol_thr_why") or "") + ",IGNORED_RANGE").strip(",")
-                                        try:
-                                            it["_trig_checks"]["vol_x"] = "pass(ignored_range)"
                                         except Exception:
                                             pass
+                                        try:
+                                            it["_trig_checks"]["vol_x"] = "pass(ignored_range)"
                                         except Exception:
                                             pass
                                     else:
