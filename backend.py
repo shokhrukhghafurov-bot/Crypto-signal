@@ -14751,6 +14751,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # apply the same filters here at trigger moment.
                     postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
                     if postsetup_only:
+                        # Trigger score gate can be disabled separately.
+                        # Rationale: some users want score to be enforced only at scan/setup stage,
+                        # while trigger should rely on confidence + checklist only.
+                        trig_require_score = os.getenv("MID_TRIGGER_REQUIRE_SCORE", "1").strip().lower() not in ("0", "false", "no", "off")
                         # Score/quality threshold (same logic as scan stage)
                         try:
                             use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
@@ -14762,11 +14766,22 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
                             need = float(min_score_fut if market == "FUTURES" else min_score_spot)
                             score = float(it.get("_trig_score") if (it.get("_trig_score") is not None) else (ta.get("score") or ta.get("total") or 0.0))
-                            if need and score < need:
+                            # Always record values for logging/diagnostics
+                            try:
+                                it["_trig_score_need"] = float(need or 0.0)
+                                it["_trig_score_val"] = float(score or 0.0)
+                            except Exception:
+                                pass
+
+                            # If trigger score gate is disabled, mark as skip and do not block.
+                            if not trig_require_score:
+                                try:
+                                    it["_trig_checks"]["score"] = "skip"
+                                except Exception:
+                                    pass
+                            elif need and score < need:
                                 try:
                                     it["_trig_checks"]["score"] = "fail"
-                                    it["_trig_score_need"] = float(need or 0.0)
-                                    it["_trig_score_val"] = float(score or 0.0)
                                 except Exception:
                                     pass
                                 # FULL_DIAGNOSTIC: do not short-circuit. Record failure and continue
@@ -14789,8 +14804,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 # Only mark score as pass if it truly passed.
                                 try:
                                     it["_trig_checks"]["score"] = "pass"
-                                    it["_trig_score_need"] = float(need or 0.0)
-                                    it["_trig_score_val"] = float(score or 0.0)
                                 except Exception:
                                     pass
 
@@ -15913,9 +15926,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                 require_trigger = str(os.getenv("MID_REQUIRE_TRIGGER", "1") or "1").strip().lower() not in ("0","false","no","off")
                 min_conf = int(os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
                 ttl_min = float(os.getenv("MID_PENDING_TTL_MIN", os.getenv("MID_PENDING_TTL_MINUTES", "150")) or 150)
+                trig_require_score = str(os.getenv("MID_TRIGGER_REQUIRE_SCORE", "1") or "1").strip().lower() not in ("0","false","no","off")
                 logger.info(
-                    "[mid][cfg] pending_enabled=%s postsetup_only=%s require_trigger=%s min_score_fut=%s min_score_spot=%s min_conf=%s top_n=%s ttl_min=%s",
-                    int(pending_enabled), int(postsetup_only), int(require_trigger),
+                    "[mid][cfg] pending_enabled=%s postsetup_only=%s require_trigger=%s trig_require_score=%s min_score_fut=%s min_score_spot=%s min_conf=%s top_n=%s ttl_min=%s",
+                    int(pending_enabled), int(postsetup_only), int(require_trigger), int(trig_require_score),
                     int(min_score_fut), int(min_score_spot), int(min_conf),
                     int(top_n), float(ttl_min)
                 )
