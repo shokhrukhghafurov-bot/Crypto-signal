@@ -13725,6 +13725,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             if not require_trigger:
                 pending_instant_emit = True
 
+            # Track whether instant emit is enabled specifically because *all* trigger filters are disabled.
+            # In this case we want to emit immediately on zone entry even if MID_PENDING_INSTANT_EMIT_SKIP_CHECKS is not set.
+            instant_emit_due_to_nofilters = False
+
             # If trigger is enabled but ALL trigger filters are disabled, we can still do an "instant emit"
             # when price enters the zone. This keeps the trigger loop/logs active while skipping checks.
             # Enable with MID_TRIGGER_INSTANT_EMIT_NOFILTERS=1 (default: 1).
@@ -13761,6 +13765,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     no_filters = False
                 if no_filters:
                     pending_instant_emit = True
+                    instant_emit_due_to_nofilters = True
 
             # default: if instant emit is on, ignore zone unless explicitly disabled
             instant_ignore_zone = (os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0").strip().lower() in ("1","true","yes","on")) 
@@ -14124,7 +14129,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     # If enabled, emit immediately as soon as price reaches the entry zone.
                     # NOTE: this bypasses *all* safety checks. Intended for temporary debugging only.
-                    if pending_instant_emit and (os.getenv("MID_PENDING_INSTANT_EMIT_SKIP_CHECKS", "0").strip().lower() in ("1","true","yes","on")):
+                    if pending_instant_emit and (instant_emit_due_to_nofilters or (os.getenv("MID_PENDING_INSTANT_EMIT_SKIP_CHECKS", "0").strip().lower() in ("1","true","yes","on"))):
                         try:
                             _pending_mark_attempt(it, now)
                         except Exception:
