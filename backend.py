@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-02-28_v25_reverse"
+MID_BUILD_TAG = "MID_BUILD_2026-03-03_v5_1_2_trigchecks"
 
 import asyncio
 import json
@@ -13477,9 +13477,67 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
           - pretrig_no: checked but not in-zone (should be rare; used to debug logic/order)
           - trig_no_inzone: in-zone but blocked by trigger filters (what you care about for 'why no emit')
         """
+
         try:
+            # Build compact per-trigger checklist so one line shows what blocked and what passed.
+            checks = {}
+            reqs = {}
+            try:
+                if isinstance(it.get("_trig_checks"), dict):
+                    checks = dict(it.get("_trig_checks"))
+            except Exception:
+                checks = {}
+            try:
+                if isinstance(it.get("_trig_reqs"), dict):
+                    reqs = dict(it.get("_trig_reqs"))
+            except Exception:
+                reqs = {}
+
+            def _fmt_klist(keys):
+                try:
+                    return ",".join([str(k) for k in keys if str(k).strip()])
+                except Exception:
+                    return ""
+
+            passed = []
+            failed = []
+            skipped = []
+            try:
+                for k, v in checks.items():
+                    sv = str(v or "").strip().lower()
+                    if sv.startswith("pass"):
+                        passed.append(k)
+                    elif sv.startswith("fail"):
+                        failed.append(k)
+                    elif sv:
+                        skipped.append(k)
+            except Exception:
+                pass
+
+            # include tiny details for failed checks when present: fail(reclaim_missing)
+            fail_details = []
+            try:
+                for k, v in checks.items():
+                    sv = str(v or "").strip()
+                    if sv.lower().startswith("fail"):
+                        fail_details.append(f"{k}:{sv}")
+            except Exception:
+                fail_details = []
+
+            req_txt = ""
+            try:
+                if reqs:
+                    # only include truthy req flags
+                    req_items = []
+                    for k, v in reqs.items():
+                        if bool(v):
+                            req_items.append(str(k))
+                    req_txt = _fmt_klist(req_items)
+            except Exception:
+                req_txt = ""
+
             logger.info(
-                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s score=%s conf=%s trap_reason=%s volx=%s thr=%s thr_base=%s thr_why=%s in_zone=%s attempts=%s fails=%s px=%.6g",
+                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s score=%s conf=%s trap_reason=%s volx=%s thr=%s thr_base=%s thr_why=%s in_zone=%s attempts=%s fails=%s px=%.6g pass=%s fail=%s skip=%s req=%s",
                 str(sym), str(market), str(direction),
                 str(outcome), str(reason or ""),
                 str(it.get("_trig_score") if (it.get("_trig_score") is not None) else (it.get("ta_score") if it.get("ta_score") is not None else it.get("confidence"))),
@@ -13493,6 +13551,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 int(it.get("trigger_attempts") or 0),
                 int(it.get("fail_count") or 0),
                 float(price),
+                _fmt_klist(passed),
+                _fmt_klist(fail_details) if fail_details else _fmt_klist(failed),
+                _fmt_klist(skipped),
+                req_txt,
             )
         except Exception:
             pass
@@ -13949,6 +14011,24 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     # We reached entry/zone: count this as a trigger attempt (persisted in DB kv_store).
                     _pending_mark_attempt(it, now)
+                    # Init per-trigger checklists (so logs can show what passed/failed/skipped in one line)
+                    try:
+                        it["_trig_checks"] = {
+                            "zone": "pass",
+                            "structure_30m": "skip",
+                            "structure_1h": "skip",
+                            "direction": "skip",
+                            "trap": "skip",
+                            "reclaim": "skip",
+                            "bos_5m": "skip",
+                            "sweep": "skip",
+                            "displacement": "skip",
+                            "confidence": "skip",
+                            "vol_x": "skip",
+                        }
+                        it["_trig_reqs"] = {}
+                    except Exception:
+                        pass
 
                     # Smart delete (terminal invalidation): if higher-timeframe structure
                     # is clearly opposite to the pending direction, drop immediately.
@@ -13962,7 +14042,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             lookback=int(os.getenv("MID_STRUCTURE_LOOKBACK_30M", "260") or 260),
                             pivot=int(os.getenv("MID_STRUCTURE_PIVOT", "3") or 3),
                         )
+                        try:
+                            it["_trig_checks"]["structure_30m"] = "pass"
+                        except Exception:
+                            pass
                         if str(direction).upper() == "LONG" and struct_30m == "LH-LL":
+                            try:
+                                it["_trig_checks"]["structure_30m"] = "fail"
+                            except Exception:
+                                pass
                             keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
                             _pending_log_trigger(sym, market, direction, outc, "structure_broken_30m", it, float(price))
                             # If structure is broken we must not proceed to other trigger checks in this poll.
@@ -13977,6 +14065,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     pass
                             continue
                         if str(direction).upper() == "SHORT" and struct_30m == "HH-HL":
+                            try:
+                                it["_trig_checks"]["structure_30m"] = "fail"
+                            except Exception:
+                                pass
                             keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
                             _pending_log_trigger(sym, market, direction, outc, "structure_broken_30m", it, float(price))
                             if keep_it:
@@ -13995,7 +14087,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             lookback=int(os.getenv("MID_STRUCTURE_LOOKBACK_1H", "220") or 220),
                             pivot=int(os.getenv("MID_STRUCTURE_PIVOT", "3") or 3),
                         )
+                        try:
+                            it["_trig_checks"]["structure_1h"] = "pass"
+                        except Exception:
+                            pass
                         if str(direction).upper() == "LONG" and struct_1h == "LH-LL":
+                            try:
+                                it["_trig_checks"]["structure_1h"] = "fail"
+                            except Exception:
+                                pass
                             keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
                             _pending_log_trigger(sym, market, direction, outc, "structure_broken_1h", it, float(price))
                             if keep_it:
@@ -14008,6 +14108,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     pass
                             continue
                         if str(direction).upper() == "SHORT" and struct_1h == "HH-HL":
+                            try:
+                                it["_trig_checks"]["structure_1h"] = "fail"
+                            except Exception:
+                                pass
                             keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
                             _pending_log_trigger(sym, market, direction, outc, "structure_broken_1h", it, float(price))
                             if keep_it:
@@ -14140,6 +14244,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         pass
                     if str(ta.get("direction") or "").upper() != direction:
+                    try:
+                        it["_trig_checks"]["direction"] = "fail"
+                    except Exception:
+                        pass
                         keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
                         _pending_log_trigger(sym, market, direction, outc, "direction_mismatch", it, float(price))
                         if keep_it:
@@ -14151,8 +14259,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
                         continue
+                    try:
+                        it["_trig_checks"]["direction"] = "pass"
+                    except Exception:
+                        pass
                     # NOTE: Trigger intentionally ignores ta['blocked']/block_reason (anti_bounce_*, late_entry_atr, etc.).
                     if not bool(ta.get("trap_ok", True)):
+                    try:
+                        it["_trig_checks"]["trap"] = "fail"
+                    except Exception:
+                        pass
                         keep_it, outc = _pending_apply_fail(it, "trap_block", now)
                         _pending_log_trigger(sym, market, direction, outc, "trap_block", it, float(price))
                         if keep_it:
@@ -14166,6 +14282,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         continue
 
 
+                    try:
+                        it["_trig_checks"]["trap"] = "pass"
+                    except Exception:
+                        pass
                     # --- Institutional trigger logic (adaptive by regime) ---
                     # Goal: in CHOPPY/RANGE, require liquidity event + reclaim + micro structure confirmation,
                     # and treat volume as a secondary confirmation (not a guillotine).
@@ -14239,6 +14359,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 reclaim_ok = True
 
+                            try:
+                                it["_trig_checks"]["reclaim"] = "pass" if reclaim_ok else "fail"
+                            except Exception:
+                                pass
                             # Liquidity requirement: strict in RANGE/CHOPPY, optional in TREND by default.
                             try:
                                 _v = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP_RANGE")
@@ -14264,6 +14388,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 else:
                                     liq_ok = sweep_short
 
+                            try:
+                                it["_trig_reqs"]["sweep"] = bool(req_liq)
+                            except Exception:
+                                pass
+                            try:
+                                it["_trig_checks"]["sweep"] = ("pass(nr)" if (not req_liq) else ("pass" if liq_ok else "fail"))
+                            except Exception:
+                                pass
                             # Micro-structure confirmation: BOS in the signal direction (strict in RANGE).
                             try:
                                 _v = os.getenv("MID_INST_REQUIRE_BOS_RANGE")
@@ -14289,6 +14421,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 else:
                                     bos_ok = bos_down
 
+                            try:
+                                it["_trig_reqs"]["bos_5m"] = bool(req_bos)
+                            except Exception:
+                                pass
+                            try:
+                                it["_trig_checks"]["bos_5m"] = ("pass(nr)" if (not req_bos) else ("pass" if bos_ok else "fail"))
+                            except Exception:
+                                pass
                             # Displacement: require a minimum body/ATR ratio (helps avoid thin fake moves).
                             # Displacement: require a minimum body/ATR ratio (helps avoid thin fake moves).
                             try:
@@ -14324,6 +14464,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             disp_min = disp_min_trend if (reg == "TREND") else disp_min_range
                             disp_ok = True if (not req_disp) else bool(disp_x >= disp_min)
 
+                            try:
+                                it["_trig_reqs"]["displacement"] = bool(req_disp)
+                            except Exception:
+                                pass
+                            try:
+                                it["_trig_checks"]["displacement"] = ("pass(nr)" if (not req_disp) else ("pass" if disp_ok else "fail"))
+                            except Exception:
+                                pass
                             # In RANGE/CHOPPY, reclaim is usually required to avoid catching falling knives.
                             try:
                                 _v = os.getenv("MID_INST_REQUIRE_RECLAIM_RANGE")
@@ -14341,6 +14489,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 req_reclaim_trend = False
                             req_reclaim = req_reclaim_trend if (reg == "TREND") else req_reclaim_range
+                            try:
+                                it["_trig_reqs"]["reclaim"] = bool(req_reclaim)
+                                if not bool(req_reclaim):
+                                    # not required in this regime -> treat as pass (nr)
+                                    it["_trig_checks"]["reclaim"] = "pass(nr)"
+                            except Exception:
+                                pass
 
                             # Save regime/disp for downstream volume filter + logs
                             it["_trig_inst_regime"] = reg
@@ -14412,6 +14567,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         _conf_chk = 0.0
                     if int(float(_conf_chk or 0.0)) < int(min_conf):
+                        try:
+                            it["_trig_checks"]["confidence"] = "fail"
+                        except Exception:
+                            pass
                         keep_it, outc = _pending_apply_fail(it, "confidence_low", now)
                         _pending_log_trigger(sym, market, direction, outc, "confidence_low", it, float(price))
                         if keep_it:
@@ -14424,6 +14583,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 pass
                         continue
 
+                    try:
+                        it["_trig_checks"]["confidence"] = "pass"
+                    except Exception:
+                        pass
                     # If scan stage skipped hard filters (MID_FILTERS_AFTER_SETUP=1),
                     # apply the same filters here at trigger moment.
                     postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
@@ -14585,6 +14748,19 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 except Exception:
                                     pass
 
+                                try:
+                                    it["_trig_reqs"]["vol_x"] = bool(base_thr and base_thr > 0)
+                                except Exception:
+                                    pass
+                                try:
+                                    if not (base_thr and base_thr > 0):
+                                        it["_trig_checks"]["vol_x"] = "pass(nr)"
+                                    elif not (volx and volx > 0):
+                                        it["_trig_checks"]["vol_x"] = "skip_missing"
+                                    else:
+                                        it["_trig_checks"]["vol_x"] = "pass" if (volx >= thr) else "fail"
+                                except Exception:
+                                    pass
                                 # If volume metric missing/zero, do not block (avoid false vol_low due to empty data).
                                 if (volx and volx > 0) and (base_thr and base_thr > 0) and (volx < thr):
                                     # Institutional: in RANGE/CHOPPY, do NOT block solely on low volume
@@ -14601,6 +14777,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                         # keep waiting or pass through (no block)
                                         try:
                                             it["_trig_vol_thr_why"] = (str(it.get("_trig_vol_thr_why") or "") + ",IGNORED_RANGE").strip(",")
+                                        try:
+                                            it["_trig_checks"]["vol_x"] = "pass(ignored_range)"
+                                        except Exception:
+                                            pass
                                         except Exception:
                                             pass
                                     else:
