@@ -13444,6 +13444,23 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         """
         r0 = str(reason or "fail").strip().lower()
 
+
+        # Special case: direction_mismatch is *soft* by default (only used on strong reversals).
+        # This can be disabled to let it fall back to the generic soft/hard lists.
+        try:
+            if r0 == "direction_mismatch":
+                dm_soft = os.getenv("MID_PENDING_DIRECTION_MISMATCH_SOFT", "1").strip().lower() in ("1","true","yes","on")
+                if dm_soft:
+                    it["last_fail_reason"] = str(reason or "fail")
+                    it["last_fail_ts"] = float(now_ts)
+                    _max_attempts_i = int(it.get("max_attempts") or max_attempts or 0)
+                    if _max_attempts_i > 0 and int(it.get("trigger_attempts") or 0) >= _max_attempts_i:
+                        _pending_clear_cooldown(it)
+                        return (False, "hard_fail")
+                    return (True, "soft_fail")
+        except Exception:
+            pass
+
         # Track terminal trigger decision (for detailed one-line logs).
         try:
             it["_trig_term_reason"] = str(reason or "").strip() or str(it.get("_trig_term_reason") or "")
@@ -13455,7 +13472,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         try:
             _hard = os.getenv(
                 "MID_PENDING_HARD_FAIL_REASONS",
-                "structure_broken,invalidation_hit,trend_flip,direction_mismatch",
+                "structure_broken,invalidation_hit,trend_flip",
             ).strip()
             hard_set = {s.strip().lower() for s in _hard.split(",") if s.strip()}
             if r0 in hard_set:
@@ -14384,25 +14401,63 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             it["_trig_vol_thr_why"] = ",".join(thr_why) if thr_why else "base"
                     except Exception:
                         pass
-                    if str(ta.get("direction") or "").upper() != direction:
+                    # Direction check
+                    # By default we DO NOT block on minor direction flips at trigger-time because the setup was built earlier.
+                    # We only soft-fail on direction mismatch when we detect a *strong reversal* (trend + strong ADX).
+                    try:
+                        req_dir = os.getenv("MID_TRIGGER_REQUIRE_DIRECTION", "1").strip().lower() in ("1", "true", "yes", "on")
+                    except Exception:
+                        req_dir = True
+
+                    ta_dir = str(ta.get("direction") or "").upper()
+                    if not req_dir:
                         try:
-                            it["_trig_checks"]["direction"] = "fail"
+                            it["_trig_checks"]["direction"] = "skip"
                         except Exception:
                             pass
-                        if full_diag:
-                            _trig_add("direction_mismatch", "direction_mismatch")
-                        else:
-                            keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
-                            _pending_log_trigger(sym, market, direction, outc, "direction_mismatch", it, float(price))
-                            if keep_it:
-                                keep.append(it)
-                                any_wait = True
+                    elif ta_dir and ta_dir != direction:
+                        # Strong reversal heuristic:
+                        # - mstruct is TREND (not RANGE/CHOPPY)
+                        # - ADX(1h) >= MID_TRIGGER_DIR_REVERSAL_ADX_MIN
+                        try:
+                            adx_rev_min = float(os.getenv("MID_TRIGGER_DIR_REVERSAL_ADX_MIN", "28") or 28)
+                        except Exception:
+                            adx_rev_min = 28.0
+                        try:
+                            adx1h_rev = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
+                        except Exception:
+                            adx1h_rev = 0.0
+                        try:
+                            mstruct_rev = str(ta.get("mstruct") or "")
+                        except Exception:
+                            mstruct_rev = ""
+                        strong_rev = ("TREND" in mstruct_rev.upper()) and (adx1h_rev >= adx_rev_min)
+
+                        if strong_rev:
+                            try:
+                                it["_trig_checks"]["direction"] = "fail"
+                            except Exception:
+                                pass
+                            if full_diag:
+                                _trig_add("direction_mismatch", "direction_mismatch")
                             else:
-                                try:
-                                    removed_n += 1
-                                except Exception:
-                                    pass
-                            continue
+                                keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
+                                _pending_log_trigger(sym, market, direction, outc, "direction_mismatch", it, float(price))
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
+                        else:
+                            # minor flip -> ignore and allow emit
+                            try:
+                                it["_trig_checks"]["direction"] = "skip"
+                            except Exception:
+                                pass
                     else:
                         # Only mark as pass when it really passed.
                         try:
