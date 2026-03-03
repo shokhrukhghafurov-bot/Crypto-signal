@@ -21552,13 +21552,23 @@ async def futures_contract_exists(self, exchange: str, sym_base: str) -> dict:
 
 
 # --- FIX: ensure MID pending helpers exist (some builds lost them due to merge/indentation) ---
+# NOTE:
+# We cannot rely on only "add_mid_pending" presence: in some merges, add_mid_pending exists at
+# module level, but _mid_pending_load/_mid_pending_save ended up nested due to indentation.
+# That causes: AttributeError: 'Backend' object has no attribute '_mid_pending_load'
 try:
-    _mid_missing_add = not callable(globals().get("add_mid_pending"))
+    _mid_missing_pending_helpers = (
+        not callable(globals().get("_mid_pending_load"))
+        or not callable(globals().get("_mid_pending_save"))
+        or not callable(globals().get("add_mid_pending"))
+        or not callable(globals().get("remove_mid_pending"))
+    )
 except Exception:
-    _mid_missing_add = True
+    _mid_missing_pending_helpers = True
 
-if _mid_missing_add:
+if _mid_missing_pending_helpers:
     async def _mid_pending_load(self) -> list[dict]:
+        # Prefer a dedicated timeout for pending KV ops; fall back to DB_COMMAND_TIMEOUT_SEC.
         timeout_sec = float(os.getenv("MID_PENDING_KV_TIMEOUT_SEC", os.getenv("DB_COMMAND_TIMEOUT_SEC", "3")) or 3.0)
         try:
             st = await asyncio.wait_for(db_store.kv_get_json("mid_pending"), timeout=timeout_sec) or {}
