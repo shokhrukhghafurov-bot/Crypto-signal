@@ -14148,6 +14148,38 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # FULL_DIAGNOSTIC: always evaluate full checklist in-zone (no short-circuit),
                     # so logs show every failed/passed filter in one line.
                     full_diag = os.getenv("MID_TRIGGER_FULL_CHECKLIST", "1").strip().lower() in ("1","true","yes","on")
+# Trigger filter switches (so "filters off" via env truly means no blocking)
+def _env_true(name: str, default: bool = True) -> bool:
+    try:
+        v = os.getenv(name, None)
+        if v is None:
+            return bool(default)
+        return str(v).strip().lower() in ("1","true","yes","on")
+    except Exception:
+        return bool(default)
+
+req_struct_30m = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_30M", True)
+req_struct_1h = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_1H", True)
+
+# Trap: by default, follow global trap switches if they are set; otherwise enabled.
+try:
+    _trap_global = os.getenv("MID_TRAP_FILTERS", None)
+    if _trap_global is None:
+        _trap_global = os.getenv("TRAP_FILTER_ENABLED", None)
+    if _trap_global is not None:
+        req_trap = str(_trap_global).strip().lower() in ("1","true","yes","on")
+    else:
+        req_trap = True
+except Exception:
+    req_trap = True
+# Explicit per-trigger override always wins (set MID_TRIGGER_REQUIRE_TRAP=0/1)
+try:
+    _tov = os.getenv("MID_TRIGGER_REQUIRE_TRAP", "").strip()
+    if _tov != "":
+        req_trap = _env_true("MID_TRIGGER_REQUIRE_TRAP", req_trap)
+except Exception:
+    pass
+
 
                     # We track two things:
                     # - reasons: human/debug keys for logs + [mid][status]
@@ -14187,7 +14219,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             it["_trig_checks"]["structure_30m"] = "pass"
                         except Exception:
                             pass
-                        if str(direction).upper() == "LONG" and struct_30m == "LH-LL":
+                        try:
+                            if not req_struct_30m:
+                                it["_trig_checks"]["structure_30m"] = "skip"
+                        except Exception:
+                            pass
+                        if req_struct_30m and str(direction).upper() == "LONG" and struct_30m == "LH-LL":
                             try:
                                 it["_trig_checks"]["structure_30m"] = "fail"
                             except Exception:
@@ -14208,7 +14245,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     except Exception:
                                         pass
                                 continue
-                        if str(direction).upper() == "SHORT" and struct_30m == "HH-HL":
+                        if req_struct_30m and str(direction).upper() == "SHORT" and struct_30m == "HH-HL":
                             try:
                                 it["_trig_checks"]["structure_30m"] = "fail"
                             except Exception:
@@ -14235,10 +14272,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             pivot=int(os.getenv("MID_STRUCTURE_PIVOT", "3") or 3),
                         )
                         try:
-                            it["_trig_checks"]["structure_1h"] = "pass"
+                            (it\["_trig_checks"\]\["structure_1h"\] = "pass"
                         except Exception:
                             pass
-                        if str(direction).upper() == "LONG" and struct_1h == "LH-LL":
+)                        try:
+                            if not req_struct_1h:
+                                it["_trig_checks"]["structure_1h"] = "skip"
+                        except Exception:
+                            pass
+                        if req_struct_1h and str(direction).upper() == "LONG" and struct_1h == "LH-LL":
                             try:
                                 it["_trig_checks"]["structure_1h"] = "fail"
                             except Exception:
@@ -14257,7 +14299,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     except Exception:
                                         pass
                                 continue
-                        if str(direction).upper() == "SHORT" and struct_1h == "HH-HL":
+                        if req_struct_1h and str(direction).upper() == "SHORT" and struct_1h == "HH-HL":
                             try:
                                 it["_trig_checks"]["structure_1h"] = "fail"
                             except Exception:
@@ -14465,7 +14507,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
                     # NOTE: Trigger intentionally ignores ta['blocked']/block_reason (anti_bounce_*, late_entry_atr, etc.).
-                    if not bool(ta.get("trap_ok", True)):
+                    if not req_trap:
+                        try:
+                            it["_trig_checks"]["trap"] = "skip"
+                        except Exception:
+                            pass
+                    elif not bool(ta.get("trap_ok", True)):
                         try:
                             it["_trig_checks"]["trap"] = "fail"
                         except Exception:
