@@ -14911,15 +14911,25 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     # FULL_DIAGNOSTIC: after evaluating all trigger-time filters,
                     # if anything failed, apply the primary fail now (but keep all reasons for logs/status).
+                    # IMPORTANT: we log `reason=` as the *human* first-fail key (e.g. reclaim_missing),
+                    # but we apply the canonical reason (e.g. liq_sweep_missing) to preserve hard/soft policies.
                     try:
                         if full_diag and isinstance(trig_state, dict) and trig_state.get("reasons"):
+                            reasons = list(trig_state.get("reasons") or [])
                             try:
-                                it["_trig_fail_reasons"] = list(trig_state.get("reasons") or [])
+                                it["_trig_fail_reasons"] = reasons
                             except Exception:
                                 pass
-                            primary = str(trig_state.get("primary_apply") or "fail")
-                            keep_it, outc = _pending_apply_fail(it, primary, now)
-                            _pending_log_trigger(sym, market, direction, outc, primary, it, float(price))
+                            try:
+                                it["_trig_primary_reason"] = str(reasons[0] if reasons else "")
+                            except Exception:
+                                pass
+
+                            apply_reason = str(trig_state.get("primary_apply") or (reasons[0] if reasons else "fail") or "fail")
+                            log_reason = str(reasons[0] if reasons else apply_reason)
+
+                            keep_it, outc = _pending_apply_fail(it, apply_reason, now)
+                            _pending_log_trigger(sym, market, direction, outc, log_reason, it, float(price))
                             if keep_it:
                                 keep.append(it)
                                 any_wait = True
