@@ -926,6 +926,19 @@ def _mid_trig_reject_add(reason: str, n: int = 1, *, bucket: str = "inzone") -> 
         # cap memory per bucket
         if len(ev) > MID_TRIG_REJECT_MAX_EVENTS:
             del ev[:-MID_TRIG_REJECT_MAX_EVENTS]
+
+        # Also aggregate counts within the current pending poll tick (for [mid][status]).
+        try:
+            global _MID_TRIG_REJECT_TICK_CUR
+            cur = _MID_TRIG_REJECT_TICK_CUR
+            if isinstance(cur, dict):
+                add_n = min(cnt, 20)
+                bk = "pre" if b in ("pre", "pretrig", "all", "pretrig_no") else "inzone"
+                bucket_map = cur.get(bk)
+                if isinstance(bucket_map, dict):
+                    bucket_map[str(k)] = int(bucket_map.get(str(k), 0) or 0) + int(add_n)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -1024,6 +1037,12 @@ _MID_PENDING_TICK_LAST: dict = {}
 
 # Last trigger-loop poll counters (helps explain why no EMIT even when in_zone>0)
 _MID_TRIG_POLL_LAST: dict = {}
+
+# Last per-poll trigger reject counts (aggregated within the most recent pending poll).
+# Used by [mid][status] so trig_no_inzone reflects the *last tick*, not the whole rolling window.
+_MID_TRIG_REJECT_TICK_CUR = None  # dict: {"ts": float, "pre": {reason:int}, "inzone": {reason:int}}
+_MID_TRIG_REJECT_TICK_LAST: dict = {}  # same shape as CUR, but frozen after each poll
+
 
 # Per-tick hard-block breakdown snapshot (for /health and minute status logs)
 MID_LAST_HARDBLOCK_TOP = ""
@@ -13342,6 +13361,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
     logger.info("[mid][pending] trigger loop started poll=%.2fs ttl=%.1fmin tol_atr=%.3f tol_pct=%.4f instant_emit=%s ignore_zone=%s",
                 poll, ttl_min, tol_atr, tol_pct, int(pending_instant_emit), int(instant_ignore_zone))
 
+    # globals for per-poll trigger reject aggregation (used by [mid][status])
+    global _MID_TRIG_REJECT_TICK_CUR, _MID_TRIG_REJECT_TICK_LAST
+
     # Pending persistence is already in Postgres (kv_store key 'mid_pending').
     # Here we track trigger attempts/fails and prune noisy pendings automatically.
     max_fails = int(os.getenv("MID_PENDING_MAX_FAILS", "12") or 12)
@@ -13585,6 +13607,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         try:
             items = await self._mid_pending_load()
             now = time.time()
+            # Start per-poll trigger reject aggregation (so [mid][status] can show reasons *for this tick*).
+            try:
+                _MID_TRIG_REJECT_TICK_CUR = {"ts": float(now), "pre": {}, "inzone": {}}
+            except Exception:
+                pass
             # Emergency / diagnostic switch: emit immediately when price enters the zone,
             # skipping ALL re-checks (TA reconfirm, blocks, trap, post-setup filters).
             # Use only for debugging the pipeline end-to-end.
@@ -15059,6 +15086,20 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             except Exception:
                 pass
 
+            # Freeze per-poll trigger reject aggregation for [mid][status]
+            try:
+                cur = _MID_TRIG_REJECT_TICK_CUR if isinstance(_MID_TRIG_REJECT_TICK_CUR, dict) else None
+                if isinstance(cur, dict):
+                    _MID_TRIG_REJECT_TICK_LAST = {
+                        "ts": float(cur.get("ts") or now),
+                        "pre": dict(cur.get("pre") or {}),
+                        "inzone": dict(cur.get("inzone") or {}),
+                    }
+                _MID_TRIG_REJECT_TICK_CUR = None
+            except Exception:
+                _MID_TRIG_REJECT_TICK_CUR = None
+                pass
+
             # Mark MID activity timestamp for [mid][status] (even if scanner tick is disabled).
             try:
                 global MID_LAST_TICK_TS
@@ -15366,7 +15407,17 @@ async def mid_status_summary_loop(self) -> None:
 
             try:
                 if (not tp_stale) and (tp_checked > 0):
-                    pre_counts = _mid_trig_reject_digest_counts(bucket="pre")
+                    # Prefer reasons aggregated in the most recent pending poll tick.
+                    try:
+                        tl = _MID_TRIG_REJECT_TICK_LAST if isinstance(_MID_TRIG_REJECT_TICK_LAST, dict) else {}
+                        tl_ts = float(tl.get("ts") or 0.0)
+                        tl_age = (now - tl_ts) if tl_ts > 0 else None
+                        tl_stale = (tl_age is None) or (tl_age > float(os.getenv('MID_STATUS_TRIG_TICK_STALE_SEC', '120') or 120))
+                        pre_counts = dict(tl.get("pre") or {}) if (not tl_stale) else {}
+                    except Exception:
+                        pre_counts = {}
+                    if not pre_counts:
+                        pre_counts = _mid_trig_reject_digest_counts(bucket="pre")
                 else:
                     pre_counts = {}
                 if pre_counts:
@@ -15382,7 +15433,17 @@ async def mid_status_summary_loop(self) -> None:
 
             try:
                 if (not tp_stale) and (tp_checked > 0):
-                    in_counts = _mid_trig_reject_digest_counts(bucket="inzone")
+                    # Prefer reasons aggregated in the most recent pending poll tick.
+                    try:
+                        tl = _MID_TRIG_REJECT_TICK_LAST if isinstance(_MID_TRIG_REJECT_TICK_LAST, dict) else {}
+                        tl_ts = float(tl.get("ts") or 0.0)
+                        tl_age = (now - tl_ts) if tl_ts > 0 else None
+                        tl_stale = (tl_age is None) or (tl_age > float(os.getenv('MID_STATUS_TRIG_TICK_STALE_SEC', '120') or 120))
+                        in_counts = dict(tl.get("inzone") or {}) if (not tl_stale) else {}
+                    except Exception:
+                        in_counts = {}
+                    if not in_counts:
+                        in_counts = _mid_trig_reject_digest_counts(bucket="inzone")
                 else:
                     in_counts = {}
                 if in_counts:
