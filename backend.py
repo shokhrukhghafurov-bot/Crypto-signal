@@ -14272,10 +14272,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             pivot=int(os.getenv("MID_STRUCTURE_PIVOT", "3") or 3),
                         )
                         try:
-                            (it\["_trig_checks"\]\["structure_1h"\] = "pass"
+                            it["_trig_checks"]["structure_1h"] = "pass"
                         except Exception:
                             pass
-)                        try:
+                        try:
                             if not req_struct_1h:
                                 it["_trig_checks"]["structure_1h"] = "skip"
                         except Exception:
