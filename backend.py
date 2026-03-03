@@ -14041,15 +14041,26 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # FULL_DIAGNOSTIC: always evaluate full checklist in-zone (no short-circuit),
                     # so logs show every failed/passed filter in one line.
                     full_diag = os.getenv("MID_TRIGGER_FULL_CHECKLIST", "1").strip().lower() in ("1","true","yes","on")
-                    trig_state = {"primary": None, "reasons": []}
-                    def _trig_add(reason: str) -> None:
+
+                    # We track two things:
+                    # - reasons: human/debug keys for logs + [mid][status]
+                    # - primary_apply: canonical reason passed into _pending_apply_fail() (preserves existing hard/soft policies)
+                    trig_state = {"primary_apply": None, "reasons": []}
+                    def _trig_add(reason_key: str, apply_reason: str | None = None) -> None:
+                        """Record a failed trigger filter.
+
+                        reason_key: what we want to show in logs/status (e.g. bos_5m_missing)
+                        apply_reason: what to pass into _pending_apply_fail (e.g. liq_sweep_missing)
+                        """
                         try:
-                            if not reason:
+                            rk = str(reason_key or "").strip()
+                            ar = str(apply_reason or reason_key or "").strip()
+                            if not rk:
                                 return
-                            if reason not in trig_state["reasons"]:
-                                trig_state["reasons"].append(reason)
-                            if trig_state["primary"] is None:
-                                trig_state["primary"] = reason
+                            if rk not in trig_state["reasons"]:
+                                trig_state["reasons"].append(rk)
+                            if trig_state["primary_apply"] is None and ar:
+                                trig_state["primary_apply"] = ar
                         except Exception:
                             pass
 
@@ -14074,35 +14085,41 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 it["_trig_checks"]["structure_30m"] = "fail"
                             except Exception:
                                 pass
-                            keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
-                            _pending_log_trigger(sym, market, direction, outc, "structure_broken_30m", it, float(price))
-                            # If structure is broken we must not proceed to other trigger checks in this poll.
-                            # For soft-fail policies (env override), we keep waiting; for hard-fail we drop.
-                            if keep_it:
-                                keep.append(it)
-                                any_wait = True
+                            if full_diag:
+                                _trig_add("structure_broken_30m", "structure_broken")
                             else:
-                                try:
-                                    removed_n += 1
-                                except Exception:
-                                    pass
-                            continue
+                                keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
+                                _pending_log_trigger(sym, market, direction, outc, "structure_broken_30m", it, float(price))
+                                # If structure is broken we must not proceed to other trigger checks in this poll.
+                                # For soft-fail policies (env override), we keep waiting; for hard-fail we drop.
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
                         if str(direction).upper() == "SHORT" and struct_30m == "HH-HL":
                             try:
                                 it["_trig_checks"]["structure_30m"] = "fail"
                             except Exception:
                                 pass
-                            keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
-                            _pending_log_trigger(sym, market, direction, outc, "structure_broken_30m", it, float(price))
-                            if keep_it:
-                                keep.append(it)
-                                any_wait = True
+                            if full_diag:
+                                _trig_add("structure_broken_30m", "structure_broken")
                             else:
-                                try:
-                                    removed_n += 1
-                                except Exception:
-                                    pass
-                            continue
+                                keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
+                                _pending_log_trigger(sym, market, direction, outc, "structure_broken_30m", it, float(price))
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
 
                         # 1h structure
                         struct_1h = _mid_structure_hhhl(
@@ -14119,33 +14136,39 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 it["_trig_checks"]["structure_1h"] = "fail"
                             except Exception:
                                 pass
-                            keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
-                            _pending_log_trigger(sym, market, direction, outc, "structure_broken_1h", it, float(price))
-                            if keep_it:
-                                keep.append(it)
-                                any_wait = True
+                            if full_diag:
+                                _trig_add("structure_broken_1h", "structure_broken")
                             else:
-                                try:
-                                    removed_n += 1
-                                except Exception:
-                                    pass
-                            continue
+                                keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
+                                _pending_log_trigger(sym, market, direction, outc, "structure_broken_1h", it, float(price))
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
                         if str(direction).upper() == "SHORT" and struct_1h == "HH-HL":
                             try:
                                 it["_trig_checks"]["structure_1h"] = "fail"
                             except Exception:
                                 pass
-                            keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
-                            _pending_log_trigger(sym, market, direction, outc, "structure_broken_1h", it, float(price))
-                            if keep_it:
-                                keep.append(it)
-                                any_wait = True
+                            if full_diag:
+                                _trig_add("structure_broken_1h", "structure_broken")
                             else:
-                                try:
-                                    removed_n += 1
-                                except Exception:
-                                    pass
-                            continue
+                                keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
+                                _pending_log_trigger(sym, market, direction, outc, "structure_broken_1h", it, float(price))
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
                     except Exception:
                         pass
 
@@ -14271,17 +14294,20 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             it["_trig_checks"]["direction"] = "fail"
                         except Exception:
                             pass
-                        keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
-                        _pending_log_trigger(sym, market, direction, outc, "direction_mismatch", it, float(price))
-                        if keep_it:
-                            keep.append(it)
-                            any_wait = True
+                        if full_diag:
+                            _trig_add("direction_mismatch", "direction_mismatch")
                         else:
-                            try:
-                                removed_n += 1
-                            except Exception:
-                                pass
-                        continue
+                            keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
+                            _pending_log_trigger(sym, market, direction, outc, "direction_mismatch", it, float(price))
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
+                            else:
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                            continue
                     try:
                         it["_trig_checks"]["direction"] = "pass"
                     except Exception:
@@ -14292,17 +14318,20 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             it["_trig_checks"]["trap"] = "fail"
                         except Exception:
                             pass
-                        keep_it, outc = _pending_apply_fail(it, "trap_block", now)
-                        _pending_log_trigger(sym, market, direction, outc, "trap_block", it, float(price))
-                        if keep_it:
-                            keep.append(it)
-                            any_wait = True
+                        if full_diag:
+                            _trig_add("trap_block", "trap_block")
                         else:
-                            try:
-                                removed_n += 1
-                            except Exception:
-                                pass
-                        continue
+                            keep_it, outc = _pending_apply_fail(it, "trap_block", now)
+                            _pending_log_trigger(sym, market, direction, outc, "trap_block", it, float(price))
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
+                            else:
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                            continue
                     try:
                         it["_trig_checks"]["trap"] = "pass"
                     except Exception:
@@ -14523,16 +14552,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             it["_trig_inst_disp_x"] = float(disp_x)
 
                             if req_reclaim and (not reclaim_ok):
-                                _trig_add("reclaim_missing")
+                                _trig_add("reclaim_missing", "reclaim_missing")
 
                             if req_liq and (not liq_ok):
-                                _trig_add("liq_sweep_missing")
+                                # Keep apply reason as liq_sweep_missing to preserve soft-fail policy.
+                                _trig_add("sweep_missing", "liq_sweep_missing")
 
                             if req_bos and (not bos_ok):
-                                _trig_add("bos_missing")
+                                _trig_add("bos_5m_missing", "bos_missing")
 
                             if req_disp and (not disp_ok):
-                                _trig_add("displacement_weak")
+                                _trig_add("displacement_missing", "displacement_weak")
 
                             # Compact institutional trigger score for debugging only (doesn't replace TA score).
                             try:
@@ -14782,7 +14812,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                             pass
                                     else:
                                         if full_diag:
-                                            _trig_add("vol_low")
+                                            # Keep apply reason as vol_low to preserve soft-fail policy.
+                                            _trig_add("vol_x_low", "vol_low")
                                         else:
                                             keep_it, outc = _pending_apply_fail(it, "vol_low", now)
                                             _pending_log_trigger(sym, market, direction, outc, "vol_low", it, float(price))
@@ -14886,7 +14917,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 it["_trig_fail_reasons"] = list(trig_state.get("reasons") or [])
                             except Exception:
                                 pass
-                            primary = str(trig_state.get("primary") or (trig_state.get("reasons") or ["fail"])[0])
+                            primary = str(trig_state.get("primary_apply") or "fail")
                             keep_it, outc = _pending_apply_fail(it, primary, now)
                             _pending_log_trigger(sym, market, direction, outc, primary, it, float(price))
                             if keep_it:
@@ -15248,29 +15279,29 @@ async def mid_status_summary_loop(self) -> None:
 
 
             # Include latest pending tick counters (total/keep/in_zone/near/far + avg attempts/fails)
+            # Always show this segment (even if zeros) so you can instantly see if the pending trigger-loop is running.
             try:
-                if pt:
-                    parts.append(
-                        "pending_tick="
-                        + f"total={int(pt.get('total',0))}"
-                        + f" keep={int(pt.get('keep',0))}"
-                        + f" in_zone={int(pt.get('in_zone',0))}"
-                        + f" near={int(pt.get('near',0))}"
-                        + f" far={int(pt.get('far',0))}"
-                        + f" exp_now={int(pt.get('expired_now',0))}"
-                        + f" rm_now={int(pt.get('removed_now',0))}"
-                        + f" att_avg={float(pt.get('attempts_avg',0.0)):.2f}"
-                        + f" fail_avg={float(pt.get('fails_avg',0.0)):.2f}"
-                    )
+                _pt = pt if (pt and isinstance(pt, dict)) else {}
+                parts.append(
+                    "pending_tick="
+                    + f"total={int(_pt.get('total',0))}"
+                    + f" keep={int(_pt.get('keep',0))}"
+                    + f" in_zone={int(_pt.get('in_zone',0))}"
+                    + f" near={int(_pt.get('near',0))}"
+                    + f" far={int(_pt.get('far',0))}"
+                    + f" exp_now={int(_pt.get('expired_now',0))}"
+                    + f" rm_now={int(_pt.get('removed_now',0))}"
+                    + f" att_avg={float(_pt.get('attempts_avg',0.0)):.2f}"
+                    + f" fail_avg={float(_pt.get('fails_avg',0.0)):.2f}"
+                )
             except Exception:
                 pass
 
             # Include trigger-loop poll counters (interpreting trig_no)
             try:
-                tp = _MID_TRIG_POLL_LAST or {}
-                if tp:
-                    parts.append(f"trig_chk={int(tp.get('checked',0))}")
-                    parts.append(f"trig_inzone_chk={int(tp.get('in_zone_chk',0))}")
+                tp = _MID_TRIG_POLL_LAST if isinstance(_MID_TRIG_POLL_LAST, dict) else {}
+                parts.append(f"trig_chk={int(tp.get('checked',0))}")
+                parts.append(f"trig_inzone_chk={int(tp.get('in_zone_chk',0))}")
             except Exception:
                 pass
 
