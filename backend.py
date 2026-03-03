@@ -14132,9 +14132,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     # Debounce: if price is still in-zone and we've checked very recently,
                     # don't count another attempt and don't re-run heavy confirmations yet.
+                    #
+                    # IMPORTANT:
+                    # When we enabled "instant emit due to no-filters" (MID_TRIGGER_INSTANT_EMIT_NOFILTERS=1
+                    # and all trigger filters/thresholds disabled), the expected behavior is:
+                    #   in_zone -> emit immediately.
+                    # In that debug mode, debounce must NOT suppress the emit, otherwise pendings can appear
+                    # to "never reach trigger" (no [mid][pending][trigger] logs) while sitting in-zone.
                     try:
                         last_try = float(it.get("last_attempt_ts") or 0.0)
-                        if attempt_gap_sec > 0 and last_try > 0 and (now - last_try) < attempt_gap_sec:
+                        if (not instant_emit_due_to_nofilters) and attempt_gap_sec > 0 and last_try > 0 and (now - last_try) < attempt_gap_sec:
                             keep.append(it)
                             any_wait = True
                             continue
