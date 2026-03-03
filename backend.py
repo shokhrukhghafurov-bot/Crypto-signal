@@ -13398,10 +13398,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         dbg_every = float(os.getenv("MID_PENDING_DEBUG_EVERY_SEC", "30") or 30.0)
     except Exception:
         dbg_every = 30.0
+    # How many sample lines (with dist_atr etc.) to print per debug tick.
+    # Default is 0 to avoid log spam; set to 1..N if you explicitly want samples.
     try:
-        dbg_samples = int(os.getenv("MID_PENDING_DEBUG_SAMPLES", "3") or 3)
+        dbg_samples = int(os.getenv("MID_PENDING_DEBUG_SAMPLES", "0") or 0)
     except Exception:
-        dbg_samples = 3
+        dbg_samples = 0
     _last_dbg_ts = 0.0
 
     if attempt_gap_sec < 0:
