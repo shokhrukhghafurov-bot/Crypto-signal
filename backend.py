@@ -15289,30 +15289,65 @@ async def mid_status_summary_loop(self) -> None:
 
 
             # Include latest pending tick counters (total/keep/in_zone/near/far + avg attempts/fails)
-            # Always show this segment (even if zeros) so you can instantly see if the pending trigger-loop is running.
+            # Always show this segment so you can instantly see if the pending trigger-loop is running.
+            # If the trigger-loop snapshot is stale/missing while pending>0, show it as STALE instead of misleading zeros.
             try:
                 _pt = pt if (pt and isinstance(pt, dict)) else {}
-                parts.append(
-                    "pending_tick="
-                    + f"total={int(_pt.get('total',0))}"
-                    + f" keep={int(_pt.get('keep',0))}"
-                    + f" in_zone={int(_pt.get('in_zone',0))}"
-                    + f" near={int(_pt.get('near',0))}"
-                    + f" far={int(_pt.get('far',0))}"
-                    + f" exp_now={int(_pt.get('expired_now',0))}"
-                    + f" rm_now={int(_pt.get('removed_now',0))}"
-                    + f" att_avg={float(_pt.get('attempts_avg',0.0)):.2f}"
-                    + f" fail_avg={float(_pt.get('fails_avg',0.0)):.2f}"
-                )
+                pt_ts = float(_pt.get('ts') or 0.0)
+                pt_age = (now - pt_ts) if pt_ts > 0 else None
+                # consider snapshot stale if older than 2 minutes (or not present)
+                pt_stale = (pt_age is None) or (pt_age > float(os.getenv('MID_STATUS_PENDING_TICK_STALE_SEC', '120') or 120))
+
+                if pt_stale and (pending_n is not None) and int(pending_n) > 0:
+                    # we at least know how many are in DB; zone distribution is unknown without the trigger poll
+                    parts.append(
+                        "pending_tick="
+                        + "stale"
+                        + (f" age={pt_age:.0f}s" if pt_age is not None else "")
+                        + f" total={int(pending_n)}"
+                        + f" keep={int(pending_n)}"
+                        + " in_zone=na"
+                        + " near=na"
+                        + " far=na"
+                        + " exp_now=na"
+                        + " rm_now=na"
+                        + " att_avg=na"
+                        + " fail_avg=na"
+                    )
+                else:
+                    parts.append(
+                        "pending_tick="
+                        + f"total={int(_pt.get('total',0))}"
+                        + f" keep={int(_pt.get('keep',0))}"
+                        + f" in_zone={int(_pt.get('in_zone',0))}"
+                        + f" near={int(_pt.get('near',0))}"
+                        + f" far={int(_pt.get('far',0))}"
+                        + f" exp_now={int(_pt.get('expired_now',0))}"
+                        + f" rm_now={int(_pt.get('removed_now',0))}"
+                        + f" att_avg={float(_pt.get('attempts_avg',0.0)):.2f}"
+                        + f" fail_avg={float(_pt.get('fails_avg',0.0)):.2f}"
+                    )
             except Exception:
                 pass
 
             # Include trigger-loop poll counters (interpreting trig_no)
             try:
                 tp = _MID_TRIG_POLL_LAST if isinstance(_MID_TRIG_POLL_LAST, dict) else {}
-                parts.append(f"trig_chk={int(tp.get('checked',0))}")
-                parts.append(f"trig_inzone_chk={int(tp.get('in_zone_chk',0))}")
+                tp_checked = int(tp.get('checked', 0) or 0)
+                tp_inzone = int(tp.get('in_zone_chk', 0) or 0)
+                tp_ts = float(tp.get('ts') or 0.0)
+                tp_age = (now - tp_ts) if tp_ts > 0 else None
+                tp_stale = (tp_age is None) or (tp_age > float(os.getenv('MID_STATUS_TRIG_POLL_STALE_SEC', '120') or 120))
+
+                parts.append(f"trig_chk={tp_checked}")
+                parts.append(f"trig_inzone_chk={tp_inzone}")
+                if tp_stale and tp_checked == 0:
+                    # helps explain why trig_no_* buckets may be stale
+                    parts.append("trig_poll=stale" + (f" age={tp_age:.0f}s" if tp_age is not None else ""))
             except Exception:
+                tp_checked = 0
+                tp_inzone = 0
+                tp_stale = True
                 pass
 
             # Top reasons inside trigger loop, split by bucket.
@@ -15330,7 +15365,10 @@ async def mid_status_summary_loop(self) -> None:
             max_show = max(3, min(int(max_show), 50))
 
             try:
-                pre_counts = _mid_trig_reject_digest_counts(bucket="pre")
+                if (not tp_stale) and (tp_checked > 0):
+                    pre_counts = _mid_trig_reject_digest_counts(bucket="pre")
+                else:
+                    pre_counts = {}
                 if pre_counts:
                     items = sorted(pre_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
                     shown = items[:max_show]
@@ -15343,7 +15381,10 @@ async def mid_status_summary_loop(self) -> None:
                 pass
 
             try:
-                in_counts = _mid_trig_reject_digest_counts(bucket="inzone")
+                if (not tp_stale) and (tp_checked > 0):
+                    in_counts = _mid_trig_reject_digest_counts(bucket="inzone")
+                else:
+                    in_counts = {}
                 if in_counts:
                     items = sorted(in_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
                     shown = items[:max_show]
