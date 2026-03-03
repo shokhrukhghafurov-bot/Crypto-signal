@@ -151,7 +151,11 @@ MID_CLIMAX_COOLDOWN_BARS = int(os.getenv("MID_CLIMAX_COOLDOWN_BARS", "1"))   # b
 # --- MID ULTRA SAFE (reduce SL dramatically; fewer but higher-quality signals) ---
 MID_ULTRA_SAFE = os.getenv("MID_ULTRA_SAFE", "0").strip().lower() in ("1","true","yes","on")
 # Strong-trend countertrend blocker (uses 30m ADX)
-MID_HTF_ALIGN_GUARD = os.getenv("MID_HTF_ALIGN_GUARD", "1").strip().lower() not in ("0","false","no","off")
+# Support alias: MID_GUARD_HTF_ALIGN (user-facing)
+_mid_htf_guard_env = os.getenv("MID_GUARD_HTF_ALIGN", None)
+if _mid_htf_guard_env is None or str(_mid_htf_guard_env).strip() == "":
+    _mid_htf_guard_env = os.getenv("MID_HTF_ALIGN_GUARD", "1")
+MID_HTF_ALIGN_GUARD = str(_mid_htf_guard_env).strip().lower() not in ("0","false","no","off")
 MID_HTF_STRONG_ADX_MIN = float(os.getenv("MID_HTF_STRONG_ADX_MIN", "28"))   # ADX(30m) >= -> treat as strong trend
 # Allow countertrend only if 5m shows reversal structure (BOS + candle + swing)
 MID_ALLOW_COUNTERTREND_WITH_5M_REVERSAL = os.getenv("MID_ALLOW_COUNTERTREND_WITH_5M_REVERSAL", "1").strip().lower() not in ("0","false","no","off")
@@ -14133,6 +14137,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             "structure_1h": "ne",
                             "direction": "ne",
                             "trap": "ne",
+                            "bos_block": "ne",
                             "reclaim": "ne",
                             "bos_5m": "ne",
                             "sweep": "ne",
@@ -14536,6 +14541,60 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             it["_trig_checks"]["trap"] = "pass"
                         except Exception:
                             pass
+
+                    # BOS opposite-direction blockers (must obey env switches)
+                    # - MID_BLOCK_LONG_BOS_DOWN: block LONG if bos_down_5m=True
+                    # - MID_BLOCK_SHORT_BOS_UP: block SHORT if bos_up_5m=True
+                    try:
+                        req_block_long = _env_true("MID_BLOCK_LONG_BOS_DOWN", True)
+                    except Exception:
+                        req_block_long = True
+                    try:
+                        req_block_short = _env_true("MID_BLOCK_SHORT_BOS_UP", True)
+                    except Exception:
+                        req_block_short = True
+                    try:
+                        if (not req_block_long) and (not req_block_short):
+                            it["_trig_checks"]["bos_block"] = "skip"
+                        else:
+                            bos_up_5m = bool(ta.get("bos_up_5m", False))
+                            bos_down_5m = bool(ta.get("bos_down_5m", False))
+                            hit = False
+                            if str(direction).upper() == "LONG":
+                                if not req_block_long:
+                                    it["_trig_checks"]["bos_block"] = "skip"
+                                elif bos_down_5m:
+                                    hit = True
+                            elif str(direction).upper() == "SHORT":
+                                if not req_block_short:
+                                    it["_trig_checks"]["bos_block"] = "skip"
+                                elif bos_up_5m:
+                                    hit = True
+                            if hit:
+                                try:
+                                    it["_trig_checks"]["bos_block"] = "fail"
+                                except Exception:
+                                    pass
+                                if full_diag:
+                                    _trig_add("bos_block", "blocked")
+                                else:
+                                    keep_it, outc = _pending_apply_fail(it, "blocked", now)
+                                    _pending_log_trigger(sym, market, direction, outc, "bos_block", it, float(price))
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
+                            else:
+                                if it.get("_trig_checks", {}).get("bos_block") != "skip":
+                                    it["_trig_checks"]["bos_block"] = "pass"
+                    except Exception:
+                        pass
+
                     # --- Institutional trigger logic (adaptive by regime) ---
                     # Goal: in CHOPPY/RANGE, require liquidity event + reclaim + micro structure confirmation,
                     # and treat volume as a secondary confirmation (not a guillotine).
@@ -14643,7 +14702,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
                             try:
-                                it["_trig_checks"]["sweep"] = ("pass(nr)" if (not req_liq) else ("pass" if liq_ok else "fail"))
+                                # env=0 => fully skipped (must not block)
+                                it["_trig_checks"]["sweep"] = ("skip" if (not req_liq) else ("pass" if liq_ok else "fail"))
                             except Exception:
                                 pass
                             # Micro-structure confirmation: BOS in the signal direction (strict in RANGE).
@@ -14676,7 +14736,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
                             try:
-                                it["_trig_checks"]["bos_5m"] = ("pass(nr)" if (not req_bos) else ("pass" if bos_ok else "fail"))
+                                it["_trig_checks"]["bos_5m"] = ("skip" if (not req_bos) else ("pass" if bos_ok else "fail"))
                             except Exception:
                                 pass
                             # Displacement: require a minimum body/ATR ratio (helps avoid thin fake moves).
@@ -14719,7 +14779,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
                             try:
-                                it["_trig_checks"]["displacement"] = ("pass(nr)" if (not req_disp) else ("pass" if disp_ok else "fail"))
+                                it["_trig_checks"]["displacement"] = ("skip" if (not req_disp) else ("pass" if disp_ok else "fail"))
                             except Exception:
                                 pass
                             # In RANGE/CHOPPY, reclaim is usually required to avoid catching falling knives.
@@ -14742,8 +14802,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             try:
                                 it["_trig_reqs"]["reclaim"] = bool(req_reclaim)
                                 if not bool(req_reclaim):
-                                    # not required in this regime -> treat as pass (nr)
-                                    it["_trig_checks"]["reclaim"] = "pass(nr)"
+                                    # env=0 => fully skipped (must not block)
+                                    it["_trig_checks"]["reclaim"] = "skip"
                             except Exception:
                                 pass
 
@@ -16047,7 +16107,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
             mid_require_vwap_bias = os.getenv("MID_REQUIRE_VWAP_BIAS", "1").strip().lower() not in ("0","false","no","off")
             mid_min_vwap_dist_atr = float(os.getenv("MID_MIN_VWAP_DIST_ATR", "0") or "0")
 
-            require_align = os.getenv("MID_REQUIRE_30M_TREND","1").strip().lower() not in ("0","false","no")
+            # Support alias: MID_REQUIRE_STRUCTURE_ALIGN (user-facing)
+            _ra = os.getenv("MID_REQUIRE_STRUCTURE_ALIGN", None)
+            if _ra is None or str(_ra).strip() == "":
+                _ra = os.getenv("MID_REQUIRE_30M_TREND", "1")
+            require_align = str(_ra).strip().lower() not in ("0","false","no")
             structure_align_soft = os.getenv("MID_STRUCTURE_ALIGN_SOFT","0").strip().lower() not in ("0","false","no")
             structure_align_penalty = float(os.getenv("MID_STRUCTURE_ALIGN_PENALTY","8") or 8)
             allow_futures = os.getenv("MID_ALLOW_FUTURES","1").strip().lower() not in ("0","false","no")
