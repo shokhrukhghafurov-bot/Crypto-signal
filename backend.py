@@ -1047,6 +1047,9 @@ _MID_TRIG_POLL_LAST: dict = {}
 _MID_TRIG_REJECT_TICK_CUR = None  # dict: {"ts": float, "pre": {reason:int}, "inzone": {reason:int}}
 _MID_TRIG_REJECT_TICK_LAST: dict = {}  # same shape as CUR, but frozen after each poll
 
+# Auto sample log throttle (prints a few [mid][pending][sample] lines even when MID_PENDING_DEBUG_SAMPLES=0)
+_MID_PENDING_LAST_AUTO_SAMPLE_TS = 0.0
+
 
 # Per-tick hard-block breakdown snapshot (for /health and minute status logs)
 MID_LAST_HARDBLOCK_TOP = ""
@@ -13404,6 +13407,22 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         dbg_samples = int(os.getenv("MID_PENDING_DEBUG_SAMPLES", "0") or 0)
     except Exception:
         dbg_samples = 0
+
+    # Auto-sample: even if MID_PENDING_DEBUG_SAMPLES=0, print 1-3 sample lines occasionally
+    # when everything is FAR (helps debug "why far=145 and no in_zone").
+    try:
+        auto_samples = os.getenv("MID_PENDING_AUTO_SAMPLES", "1").strip().lower() in ("1","true","yes","on")
+    except Exception:
+        auto_samples = True
+    try:
+        auto_samples_gap = float(os.getenv("MID_PENDING_AUTO_SAMPLES_GAP_SEC", "300") or 300.0)
+    except Exception:
+        auto_samples_gap = 300.0
+    try:
+        auto_samples_n = int(os.getenv("MID_PENDING_AUTO_SAMPLES_N", "2") or 2)
+    except Exception:
+        auto_samples_n = 2
+    auto_samples_n = max(1, min(int(auto_samples_n), 5))
     _last_dbg_ts = 0.0
 
     if attempt_gap_sec < 0:
@@ -13698,6 +13717,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             # skipping ALL re-checks (TA reconfirm, blocks, trap, post-setup filters).
             # Use only for debugging the pipeline end-to-end.
             pending_instant_emit = os.getenv("MID_PENDING_INSTANT_EMIT", "0").strip().lower() in ("1","true","yes","on")
+            # If MID_REQUIRE_TRIGGER=0, treat it as 'emit on entry without re-checks'
+            try:
+                require_trigger = os.getenv("MID_REQUIRE_TRIGGER", "1").strip().lower() not in ("0","false","no","off")
+            except Exception:
+                require_trigger = True
+            if not require_trigger:
+                pending_instant_emit = True
+
             # default: if instant emit is on, ignore zone unless explicitly disabled
             instant_ignore_zone = (os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0").strip().lower() in ("1","true","yes","on")) 
             keep: list[dict] = []
@@ -14003,7 +14030,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 far_n += 1
 
                         # samples: keep a few farthest pendings for debug
-                        if dbg_samples > 0:
+                        if (dbg_samples > 0) or auto_samples:
                             try:
                                 _age_m = (now - created) / 60.0
                             except Exception:
