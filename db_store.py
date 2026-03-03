@@ -1,6 +1,13 @@
 
 from __future__ import annotations
 
+
+
+def _db_cmd_timeout() -> float:
+    try:
+        return float(os.getenv('DB_COMMAND_TIMEOUT_SEC', '30') or 30)
+    except Exception:
+        return 30.0
 import asyncpg
 import datetime as dt
 import logging
@@ -140,7 +147,7 @@ async def ensure_schema() -> None:
                   AND table_name = 'kv_store'
                   AND column_name = 'value'
                 """
-            )
+            , timeout=_db_cmd_timeout())
             udt = (col.get('udt_name') if col else None)
             if udt and str(udt).lower() != 'jsonb':
                 # Try cast existing values to jsonb; if fails, keep TEXT but kv_set_json will handle it.
@@ -2825,7 +2832,7 @@ async def kv_set_json(key: str, value: dict) -> None:
         try:
             await conn.execute(
                 """
-                INSERT INTO kv_store(key, value, updated_at)
+                INSERT INTO kv_store(key, value, updated_at, timeout=_db_cmd_timeout())
                 VALUES ($1, $2::jsonb, NOW())
                 ON CONFLICT (key)
                 DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
@@ -2836,7 +2843,7 @@ async def kv_set_json(key: str, value: dict) -> None:
             # Old schema: value is TEXT
             await conn.execute(
                 """
-                INSERT INTO kv_store(key, value, updated_at)
+                INSERT INTO kv_store(key, value, updated_at, timeout=_db_cmd_timeout())
                 VALUES ($1, $2::text, NOW())
                 ON CONFLICT (key)
                 DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
