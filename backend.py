@@ -13444,6 +13444,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         """
         r0 = str(reason or "fail").strip().lower()
 
+        # Track terminal trigger decision (for detailed one-line logs).
+        try:
+            it["_trig_term_reason"] = str(reason or "").strip() or str(it.get("_trig_term_reason") or "")
+            it["_trig_term_ts"] = float(now_ts or 0.0)
+        except Exception:
+            pass
+
         # HARD reasons: invalidate immediately
         try:
             _hard = os.getenv(
@@ -13521,35 +13528,42 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 except Exception:
                     return ""
 
-            passed = []
-            failed = []
-            skipped = []
-            try:
-                for k, v in checks.items():
-                    sv = str(v or "").strip().lower()
-                    if sv.startswith("pass"):
-                        passed.append(k)
-                    elif sv.startswith("fail"):
-                        failed.append(k)
-                    elif sv:
-                        skipped.append(k)
-            except Exception:
-                pass
-
-            # include tiny details for failed checks when present: fail(reclaim_missing)
-            fail_details = []
+            passed, failed, skipped, not_eval = [], [], [], []
             try:
                 for k, v in checks.items():
                     sv = str(v or "").strip()
-                    if sv.lower().startswith("fail"):
-                        fail_details.append(f"{k}:{sv}")
+                    sl = sv.lower()
+                    if sl.startswith("pass"):
+                        passed.append(k)
+                    elif sl.startswith("fail"):
+                        failed.append(k)
+                    elif sl in ("ne", "not_eval", "not-eval", "not evaluated", "skip"):
+                        # default/placeholder -> not evaluated
+                        not_eval.append(k)
+                    elif sl.startswith("skip"):
+                        # show only real/meaningful skips (missing data / explicit skip reason)
+                        if sl.startswith("skip_missing") or sl.startswith("skip(") or sl == "skip_missing":
+                            skipped.append(k)
+                        else:
+                            not_eval.append(k)
+                    elif sl:
+                        # any other non-empty marker -> treat as not evaluated (keeps logs honest)
+                        not_eval.append(k)
+            except Exception:
+                pass
+
+            # include details for failed checks: key:raw_value (e.g. reclaim:fail)
+            fail_details = []
+            try:
+                for k in failed:
+                    fail_details.append(f"{k}:{str(checks.get(k) or '').strip()}")
             except Exception:
                 fail_details = []
 
+            # required flags (truthy) list
             req_txt = ""
             try:
                 if reqs:
-                    # only include truthy req flags
                     req_items = []
                     for k, v in reqs.items():
                         if bool(v):
@@ -13558,12 +13572,52 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             except Exception:
                 req_txt = ""
 
+            # extra deep diagnostics
+            term_reason = str(it.get("_trig_term_reason") or reason or "").strip()
+            try:
+                score_need = it.get("_trig_score_need")
+            except Exception:
+                score_need = None
+            try:
+                score_val = it.get("_trig_score_val")
+                if score_val is None:
+                    score_val = it.get("_trig_score") if (it.get("_trig_score") is not None) else (it.get("ta_score") if it.get("ta_score") is not None else it.get("confidence"))
+            except Exception:
+                score_val = ""
+            try:
+                conf_val = it.get("_trig_conf") if (it.get("_trig_conf") is not None) else (it.get("confidence") if it.get("confidence") is not None else it.get("min_confidence"))
+            except Exception:
+                conf_val = ""
+            try:
+                conf_chk = it.get("_trig_conf_chk")
+            except Exception:
+                conf_chk = None
+            try:
+                conf_min = it.get("_trig_conf_min") if (it.get("_trig_conf_min") is not None) else it.get("min_confidence")
+            except Exception:
+                conf_min = ""
+            try:
+                conf_src = it.get("_trig_conf_src")
+            except Exception:
+                conf_src = ""
+
+            # full checklist key=val (sorted) for maximal debugging
+            checks_kv = ""
+            try:
+                if checks:
+                    parts = []
+                    for k in sorted(checks.keys()):
+                        parts.append(f"{k}={str(checks.get(k))}")
+                    checks_kv = ";".join(parts)
+            except Exception:
+                checks_kv = ""
+
             logger.info(
-                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s score=%s conf=%s trap_reason=%s volx=%s thr=%s thr_base=%s thr_why=%s in_zone=%s attempts=%s fails=%s px=%.6g pass=%s fail=%s skip=%s req=%s",
+                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s term=%s score=%s score_need=%s conf=%s conf_chk=%s conf_min=%s conf_src=%s trap_reason=%s volx=%s thr=%s thr_base=%s thr_why=%s in_zone=%s attempts=%s fails=%s px=%.6g pass=%s fail=%s skip=%s ne=%s req=%s checks=%s",
                 str(sym), str(market), str(direction),
-                str(outcome), str(reason or ""),
-                str(it.get("_trig_score") if (it.get("_trig_score") is not None) else (it.get("ta_score") if it.get("ta_score") is not None else it.get("confidence"))),
-                str(it.get("_trig_conf") if (it.get("_trig_conf") is not None) else (it.get("confidence") if it.get("confidence") is not None else it.get("min_confidence"))),
+                str(outcome), str(reason or ""), term_reason,
+                str(score_val), str(score_need if score_need is not None else ""),
+                str(conf_val), str(conf_chk if conf_chk is not None else ""), str(conf_min), str(conf_src),
                 str(it.get("_trig_trap_reason") if (it.get("_trig_trap_reason") is not None) else (it.get("trap_reason") or "")),
                 str(it.get("_trig_volx") if (it.get("_trig_volx") is not None) else ""),
                 str(it.get("_trig_vol_thr") if (it.get("_trig_vol_thr") is not None) else ""),
@@ -13576,10 +13630,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 _fmt_klist(passed),
                 _fmt_klist(fail_details) if fail_details else _fmt_klist(failed),
                 _fmt_klist(skipped),
+                _fmt_klist(not_eval),
                 req_txt,
+                checks_kv,
             )
         except Exception:
             pass
+
+
 
         # Add to rolling trigger-reject digest (only when not a successful emit).
         try:
@@ -14050,16 +14108,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     try:
                         it["_trig_checks"] = {
                             "zone": "pass",
-                            "structure_30m": "skip",
-                            "structure_1h": "skip",
-                            "direction": "skip",
-                            "trap": "skip",
-                            "reclaim": "skip",
-                            "bos_5m": "skip",
-                            "sweep": "skip",
-                            "displacement": "skip",
-                            "confidence": "skip",
-                            "vol_x": "skip",
+                            "structure_30m": "ne",
+                            "structure_1h": "ne",
+                            "direction": "ne",
+                            "trap": "ne",
+                            "reclaim": "ne",
+                            "bos_5m": "ne",
+                            "sweep": "ne",
+                            "displacement": "ne",
+                            "confidence": "ne",
+                            "score": "ne",
+                            "vol_x": "ne",
                         }
                         it["_trig_reqs"] = {}
                     except Exception:
@@ -14088,6 +14147,20 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 trig_state["reasons"].append(rk)
                             if trig_state["primary_apply"] is None and ar:
                                 trig_state["primary_apply"] = ar
+                            # Ensure any blocker added via _trig_add appears in fail= even if it is not part of the
+                            # built-in checklist keys. This makes "fail shows everything that blocks" iron-clad.
+                            try:
+                                if isinstance(it.get("_trig_checks"), dict):
+                                    cur = str(it["_trig_checks"].get(rk) or "").strip().lower()
+                                    if not cur or cur in ("ne", "not_eval", "not-eval", "skip"):
+                                        it["_trig_checks"][rk] = "fail"
+                                    elif cur.startswith("pass"):
+                                        # keep pass marker
+                                        pass
+                                    elif not cur.startswith("fail"):
+                                        it["_trig_checks"][rk] = "fail"
+                            except Exception:
+                                pass
                         except Exception:
                             pass
 
@@ -14621,6 +14694,20 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 _conf_chk = float(_conf_raw or 0.0)
                     except Exception:
                         _conf_chk = 0.0
+                    
+                    try:
+                        it["_trig_conf_chk"] = float(_conf_chk or 0.0)
+                        it["_trig_conf_min"] = int(min_conf)
+                        try:
+                            if it.get("_trig_conf") is not None:
+                                it["_trig_conf_src"] = "it._trig_conf"
+                            else:
+                                _cr = ta.get("confidence")
+                                it["_trig_conf_src"] = "ta.confidence" if (_cr is not None and _cr != "") else "ta.score"
+                        except Exception:
+                            it["_trig_conf_src"] = "unknown"
+                    except Exception:
+                        pass
                     if int(float(_conf_chk or 0.0)) < int(min_conf):
                         try:
                             it["_trig_checks"]["confidence"] = "fail"
@@ -14662,17 +14749,35 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             need = float(min_score_fut if market == "FUTURES" else min_score_spot)
                             score = float(it.get("_trig_score") if (it.get("_trig_score") is not None) else (ta.get("score") or ta.get("total") or 0.0))
                             if need and score < need:
-                                keep_it, outc = _pending_apply_fail(it, "score_low", now)
-                                _pending_log_trigger(sym, market, direction, outc, "score_low", it, float(price))
-                                if keep_it:
-                                    keep.append(it)
-                                    any_wait = True
+                                try:
+                                    it["_trig_checks"]["score"] = "fail"
+                                    it["_trig_score_need"] = float(need or 0.0)
+                                    it["_trig_score_val"] = float(score or 0.0)
+                                except Exception:
+                                    pass
+                                # FULL_DIAGNOSTIC: do not short-circuit. Record failure and continue
+                                # so fail= contains *all* blockers in a single line.
+                                if full_diag:
+                                    _trig_add("score_low", "score_low")
                                 else:
-                                    try:
-                                        removed_n += 1
-                                    except Exception:
-                                        pass
-                                continue
+                                    keep_it, outc = _pending_apply_fail(it, "score_low", now)
+                                    _pending_log_trigger(sym, market, direction, outc, "score_low", it, float(price))
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
+                            try:
+                                it["_trig_checks"]["score"] = "pass"
+                                it["_trig_score_need"] = float(need or 0.0)
+                                it["_trig_score_val"] = float(score or 0.0)
+                            except Exception:
+                                pass
+
                         except Exception:
                             pass
                         # Regime/vol thresholds
@@ -14685,46 +14790,55 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 adx30 = float(ta.get("adx1") or ta.get("adx_30m") or 0.0)
                                 adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
                                 if min_adx_30m and adx30 < min_adx_30m:
-                                    keep_it, outc = _pending_apply_fail(it, "regime_block", now)
-                                    _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
-                                    if keep_it:
-                                        keep.append(it)
-                                        any_wait = True
+                                    if full_diag:
+                                        _trig_add("regime_block", "regime_block")
                                     else:
-                                        try:
-                                            removed_n += 1
-                                        except Exception:
-                                            pass
-                                    continue
+                                        keep_it, outc = _pending_apply_fail(it, "regime_block", now)
+                                        _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
+                                        if keep_it:
+                                            keep.append(it)
+                                            any_wait = True
+                                        else:
+                                            try:
+                                                removed_n += 1
+                                            except Exception:
+                                                pass
+                                        continue
                                 if min_adx_1h and adx1h < min_adx_1h:
-                                    keep_it, outc = _pending_apply_fail(it, "regime_block", now)
-                                    _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
-                                    if keep_it:
-                                        keep.append(it)
-                                        any_wait = True
+                                    if full_diag:
+                                        _trig_add("regime_block", "regime_block")
                                     else:
-                                        try:
-                                            removed_n += 1
-                                        except Exception:
-                                            pass
-                                    continue
+                                        keep_it, outc = _pending_apply_fail(it, "regime_block", now)
+                                        _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
+                                        if keep_it:
+                                            keep.append(it)
+                                            any_wait = True
+                                        else:
+                                            try:
+                                                removed_n += 1
+                                            except Exception:
+                                                pass
+                                        continue
                             except Exception:
                                 pass
                         try:
                             min_atr_pct = float(os.getenv("MID_MIN_ATR_PCT","0") or 0)
                             atrp = float(ta.get("atr_pct") or 0.0)
                             if min_atr_pct and atrp < min_atr_pct:
-                                keep_it, outc = _pending_apply_fail(it, "volatility_block", now)
-                                _pending_log_trigger(sym, market, direction, outc, "volatility_block", it, float(price))
-                                if keep_it:
-                                    keep.append(it)
-                                    any_wait = True
-                                else:
-                                    try:
-                                        removed_n += 1
-                                    except Exception:
-                                        pass
-                                continue
+                                    if full_diag:
+                                        _trig_add("volatility_block", "volatility_block")
+                                    else:
+                                        keep_it, outc = _pending_apply_fail(it, "volatility_block", now)
+                                        _pending_log_trigger(sym, market, direction, outc, "volatility_block", it, float(price))
+                                        if keep_it:
+                                            keep.append(it)
+                                            any_wait = True
+                                        else:
+                                            try:
+                                                removed_n += 1
+                                            except Exception:
+                                                pass
+                                        continue
                         except Exception:
                             pass
                         try:
@@ -14875,6 +14989,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             if vwap_val > 0 and atr30 and atr30 > 0:
                                 if mid_require_vwap_bias:
                                     if direction_u == "SHORT" and not (entry_check < vwap_val):
+                                        if full_diag:
+                                            _trig_add("vwap_bias", "vwap_bias")
+                                    else:
                                         keep_it, outc = _pending_apply_fail(it, "vwap_bias", now)
                                         _pending_log_trigger(sym, market, direction, outc, "vwap_bias", it, float(price))
                                         if keep_it:
@@ -14887,6 +15004,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                                 pass
                                         continue
                                     if direction_u == "LONG" and not (entry_check > vwap_val):
+                                        if full_diag:
+                                            _trig_add("vwap_bias", "vwap_bias")
+                                    else:
                                         keep_it, outc = _pending_apply_fail(it, "vwap_bias", now)
                                         _pending_log_trigger(sym, market, direction, outc, "vwap_bias", it, float(price))
                                         if keep_it:
@@ -14900,6 +15020,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                         continue
                                 if mid_min_vwap_dist_atr > 0:
                                     if abs(entry_check - vwap_val) < (atr30 * mid_min_vwap_dist_atr):
+                                        if full_diag:
+                                            _trig_add("vwap_dist", "vwap_dist")
+                                    else:
                                         keep_it, outc = _pending_apply_fail(it, "vwap_dist", now)
                                         _pending_log_trigger(sym, market, direction, outc, "vwap_dist", it, float(price))
                                         if keep_it:
@@ -14944,7 +15067,52 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
 
-                    # FULL_DIAGNOSTIC: after evaluating all trigger-time filters,
+                    
+                    # FULL_DIAGNOSTIC safety net:
+                    # If any checklist items are marked fail but no failures were recorded via _trig_add
+                    # (e.g., a newly-added filter forgot to call _trig_add), do NOT allow "fail empty" ambiguity.
+                    # Derive blockers from the checklist so that:
+                    #   - any fail => outcome != pass
+                    #   - fail= shows everything that blocks
+                    if full_diag and isinstance(trig_state, dict) and not trig_state.get("reasons"):
+                        try:
+                            chk = it.get("_trig_checks") if isinstance(it.get("_trig_checks"), dict) else {}
+                            derived = []
+                            for k, v in (chk or {}).items():
+                                sv = str(v or "").strip().lower()
+                                if sv.startswith("fail"):
+                                    kk = str(k or "").strip()
+                                    if kk:
+                                        if kk == "score":
+                                            derived.append("score_low")
+                                        elif kk == "confidence":
+                                            derived.append("confidence_low")
+                                        elif kk == "vol_x":
+                                            derived.append("vol_x_low")
+                                        elif kk == "reclaim":
+                                            derived.append("reclaim_missing")
+                                        elif kk == "bos_5m":
+                                            derived.append("bos_5m_missing")
+                                        elif kk == "sweep":
+                                            derived.append("liq_sweep_missing")
+                                        elif kk == "displacement":
+                                            derived.append("displacement_missing")
+                                        elif kk == "structure_30m":
+                                            derived.append("structure_broken_30m")
+                                        elif kk == "structure_1h":
+                                            derived.append("structure_broken_1h")
+                                        elif kk == "direction":
+                                            derived.append("direction_mismatch")
+                                        elif kk == "trap":
+                                            derived.append("trap_block")
+                                        else:
+                                            derived.append(kk)
+                            if derived:
+                                for r in derived:
+                                    _trig_add(r, r)
+                        except Exception:
+                            pass
+# FULL_DIAGNOSTIC: after evaluating all trigger-time filters,
                     # if anything failed, apply the primary fail now (but keep all reasons for logs/status).
                     # IMPORTANT: we log `reason=` as the *human* first-fail key (e.g. reclaim_missing),
                     # but we apply the canonical reason (e.g. liq_sweep_missing) to preserve hard/soft policies.
