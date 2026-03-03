@@ -13725,6 +13725,43 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             if not require_trigger:
                 pending_instant_emit = True
 
+            # If trigger is enabled but ALL trigger filters are disabled, we can still do an "instant emit"
+            # when price enters the zone. This keeps the trigger loop/logs active while skipping checks.
+            # Enable with MID_TRIGGER_INSTANT_EMIT_NOFILTERS=1 (default: 1).
+            try:
+                instant_nofilters = os.getenv("MID_TRIGGER_INSTANT_EMIT_NOFILTERS", "1").strip().lower() in ("1","true","yes","on")
+            except Exception:
+                instant_nofilters = True
+            if instant_nofilters and require_trigger:
+                try:
+                    # Consider filters disabled if every require-* switch is OFF and numeric thresholds are <= 0.
+                    _b = lambda k, d="0": (os.getenv(k, d).strip().lower() in ("1","true","yes","on"))
+                    _f = lambda k, d="0": float(os.getenv(k, d) or d)
+                    no_filters = (
+                        (not _b("MID_TRIGGER_REQUIRE_DIRECTION", "0")) and
+                        (not _b("MID_REQUIRE_STRUCTURE_ALIGN", "0")) and
+                        (not _b("MID_REQUIRE_30M_TREND", "0")) and
+                        (not _b("MID_GUARD_HTF_ALIGN", "0")) and
+                        (not _b("MID_TRIGGER_REQUIRE_STRUCTURE_30M", "0")) and
+                        (not _b("MID_TRIGGER_REQUIRE_STRUCTURE_1H", "0")) and
+                        (not _b("MID_TRAP_FILTERS", "0")) and
+                        (not _b("MID_TRIGGER_REQUIRE_TRAP", "0")) and
+                        (not _b("MID_INST_REQUIRE_RECLAIM", "0")) and
+                        (not _b("MID_INST_REQUIRE_RECLAIM_RANGE", "0")) and
+                        (not _b("MID_INST_REQUIRE_BOS", "0")) and
+                        (not _b("MID_INST_REQUIRE_BOS_RANGE", "0")) and
+                        (not _b("MID_INST_REQUIRE_DISPLACEMENT", "0")) and
+                        (not _b("MID_INST_REQUIRE_LIQ_SWEEP", "0")) and
+                        (not _b("MID_INST_REQUIRE_LIQ_SWEEP_RANGE", "0")) and
+                        (_f("MID_TRIGGER_MIN_VOL_X", "0") <= 0.0) and
+                        (_f("MID_TRIGGER_MIN_CONFIDENCE_FUT", "0") <= 0.0) and
+                        (_f("MID_TRIGGER_MIN_CONFIDENCE_SPOT", "0") <= 0.0)
+                    )
+                except Exception:
+                    no_filters = False
+                if no_filters:
+                    pending_instant_emit = True
+
             # default: if instant emit is on, ignore zone unless explicitly disabled
             instant_ignore_zone = (os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0").strip().lower() in ("1","true","yes","on")) 
             keep: list[dict] = []
