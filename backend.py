@@ -13600,6 +13600,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 conf_src = it.get("_trig_conf_src")
             except Exception:
                 conf_src = ""
+            try:
+                conf_min_src = it.get("_trig_conf_min_src")
+            except Exception:
+                conf_min_src = ""
 
             # full checklist key=val (sorted) for maximal debugging
             checks_kv = ""
@@ -13613,11 +13617,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 checks_kv = ""
 
             logger.info(
-                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s term=%s score=%s score_need=%s conf=%s conf_chk=%s conf_min=%s conf_src=%s trap_reason=%s volx=%s thr=%s thr_base=%s thr_why=%s in_zone=%s attempts=%s fails=%s px=%.6g pass=%s fail=%s skip=%s ne=%s req=%s checks=%s",
+                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s term=%s score=%s score_need=%s conf=%s conf_chk=%s conf_min=%s conf_min_src=%s conf_src=%s trap_reason=%s volx=%s thr=%s thr_base=%s thr_why=%s in_zone=%s attempts=%s fails=%s px=%.6g pass=%s fail=%s skip=%s ne=%s req=%s checks=%s",
                 str(sym), str(market), str(direction),
                 str(outcome), str(reason or ""), term_reason,
                 str(score_val), str(score_need if score_need is not None else ""),
-                str(conf_val), str(conf_chk if conf_chk is not None else ""), str(conf_min), str(conf_src),
+                str(conf_val), str(conf_chk if conf_chk is not None else ""), str(conf_min), str(conf_min_src), str(conf_src),
                 str(it.get("_trig_trap_reason") if (it.get("_trig_trap_reason") is not None) else (it.get("trap_reason") or "")),
                 str(it.get("_trig_volx") if (it.get("_trig_volx") is not None) else ""),
                 str(it.get("_trig_vol_thr") if (it.get("_trig_vol_thr") is not None) else ""),
@@ -14668,7 +14672,28 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
 
-                    min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
+                    # Trigger-time confidence threshold can be configured separately from setup-time confidence.
+                    # Precedence: trigger env (global/per-market) -> pending.min_confidence -> MID_MIN_CONFIDENCE.
+                    try:
+                        _tconf = (os.getenv("MID_TRIGGER_MIN_CONFIDENCE", "") or "").strip()
+                        if _tconf == "":
+                            if str(market).upper() == "SPOT":
+                                _tconf = (os.getenv("MID_TRIGGER_MIN_CONFIDENCE_SPOT", "") or "").strip()
+                            else:
+                                _tconf = (os.getenv("MID_TRIGGER_MIN_CONFIDENCE_FUT", "") or "").strip()
+                    except Exception:
+                        _tconf = ""
+
+                    if _tconf != "":
+                        try:
+                            min_conf = int(float(_tconf))
+                            it["_trig_conf_min_src"] = "env.MID_TRIGGER_MIN_CONFIDENCE" if (os.getenv("MID_TRIGGER_MIN_CONFIDENCE", "") or "").strip() != "" else ("env.MID_TRIGGER_MIN_CONFIDENCE_SPOT" if str(market).upper() == "SPOT" else "env.MID_TRIGGER_MIN_CONFIDENCE_FUT")
+                        except Exception:
+                            min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
+                            it["_trig_conf_min_src"] = "pending.min_confidence" if it.get("min_confidence") is not None else "env.MID_MIN_CONFIDENCE"
+                    else:
+                        min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
+                        it["_trig_conf_min_src"] = "pending.min_confidence" if it.get("min_confidence") is not None else "env.MID_MIN_CONFIDENCE"
                     # confidence_low checks confidence only; if confidence is missing, fall back to score (common on some exchanges/paths).
                     try:
                         _conf_chk = it.get("_trig_conf")
