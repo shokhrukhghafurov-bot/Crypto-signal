@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-03-03_v5_1_2_trigchecks"
+MID_BUILD_TAG = "MID_BUILD_2026-03-03_v5_1_4_fullcheck"
 
 import asyncio
 import json
@@ -13567,7 +13567,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     in_zone_flag = bool(it.get("_in_zone_tol") or it.get("_in_zone") or False)
                 except Exception:
                     in_zone_flag = False
-                _mid_trig_reject_add(str(reason or "unknown"), 1, bucket=("inzone" if in_zone_flag else "pre"))
+                try:
+                    rs = it.get("_trig_fail_reasons")
+                    if isinstance(rs, (list, tuple)) and rs:
+                        for r in rs:
+                            _mid_trig_reject_add(str(r or "unknown"), 1, bucket=("inzone" if in_zone_flag else "pre"))
+                    else:
+                        _mid_trig_reject_add(str(reason or "unknown"), 1, bucket=("inzone" if in_zone_flag else "pre"))
+                except Exception:
+                    _mid_trig_reject_add(str(reason or "unknown"), 1, bucket=("inzone" if in_zone_flag else "pre"))
         except Exception:
             pass
 
@@ -14029,6 +14037,21 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         it["_trig_reqs"] = {}
                     except Exception:
                         pass
+
+                    # FULL_DIAGNOSTIC: always evaluate full checklist in-zone (no short-circuit),
+                    # so logs show every failed/passed filter in one line.
+                    full_diag = os.getenv("MID_TRIGGER_FULL_CHECKLIST", "1").strip().lower() in ("1","true","yes","on")
+                    trig_state = {"primary": None, "reasons": []}
+                    def _trig_add(reason: str) -> None:
+                        try:
+                            if not reason:
+                                return
+                            if reason not in trig_state["reasons"]:
+                                trig_state["reasons"].append(reason)
+                            if trig_state["primary"] is None:
+                                trig_state["primary"] = reason
+                        except Exception:
+                            pass
 
                     # Smart delete (terminal invalidation): if higher-timeframe structure
                     # is clearly opposite to the pending direction, drop immediately.
@@ -14500,44 +14523,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             it["_trig_inst_disp_x"] = float(disp_x)
 
                             if req_reclaim and (not reclaim_ok):
-                                keep_it, outc = _pending_apply_fail(it, "reclaim_missing", now)
-                                _pending_log_trigger(sym, market, direction, outc, "reclaim_missing", it, float(price))
-                                if keep_it:
-                                    keep.append(it); any_wait = True
-                                else:
-                                    try: removed_n += 1
-                                    except Exception: pass
-                                continue
+                                _trig_add("reclaim_missing")
 
                             if req_liq and (not liq_ok):
-                                keep_it, outc = _pending_apply_fail(it, "liq_sweep_missing", now)
-                                _pending_log_trigger(sym, market, direction, outc, "liq_sweep_missing", it, float(price))
-                                if keep_it:
-                                    keep.append(it); any_wait = True
-                                else:
-                                    try: removed_n += 1
-                                    except Exception: pass
-                                continue
+                                _trig_add("liq_sweep_missing")
 
                             if req_bos and (not bos_ok):
-                                keep_it, outc = _pending_apply_fail(it, "bos_missing", now)
-                                _pending_log_trigger(sym, market, direction, outc, "bos_missing", it, float(price))
-                                if keep_it:
-                                    keep.append(it); any_wait = True
-                                else:
-                                    try: removed_n += 1
-                                    except Exception: pass
-                                continue
+                                _trig_add("bos_missing")
 
-                            if (not disp_ok):
-                                keep_it, outc = _pending_apply_fail(it, "displacement_weak", now)
-                                _pending_log_trigger(sym, market, direction, outc, "displacement_weak", it, float(price))
-                                if keep_it:
-                                    keep.append(it); any_wait = True
-                                else:
-                                    try: removed_n += 1
-                                    except Exception: pass
-                                continue
+                            if req_disp and (not disp_ok):
+                                _trig_add("displacement_weak")
 
                             # Compact institutional trigger score for debugging only (doesn't replace TA score).
                             try:
@@ -14569,22 +14564,26 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             it["_trig_checks"]["confidence"] = "fail"
                         except Exception:
                             pass
-                        keep_it, outc = _pending_apply_fail(it, "confidence_low", now)
-                        _pending_log_trigger(sym, market, direction, outc, "confidence_low", it, float(price))
-                        if keep_it:
-                            keep.append(it)
-                            any_wait = True
+                        if full_diag:
+                            _trig_add("confidence_low")
                         else:
-                            try:
-                                removed_n += 1
-                            except Exception:
-                                pass
-                        continue
+                            keep_it, outc = _pending_apply_fail(it, "confidence_low", now)
+                            _pending_log_trigger(sym, market, direction, outc, "confidence_low", it, float(price))
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
+                            else:
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                            continue
+                    else:
+                        try:
+                            it["_trig_checks"]["confidence"] = "pass"
+                        except Exception:
+                            pass
 
-                    try:
-                        it["_trig_checks"]["confidence"] = "pass"
-                    except Exception:
-                        pass
                     # If scan stage skipped hard filters (MID_FILTERS_AFTER_SETUP=1),
                     # apply the same filters here at trigger moment.
                     postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
@@ -14782,17 +14781,20 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                         except Exception:
                                             pass
                                     else:
-                                        keep_it, outc = _pending_apply_fail(it, "vol_low", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "vol_low", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
+                                        if full_diag:
+                                            _trig_add("vol_low")
                                         else:
-                                            try:
-                                                removed_n += 1
-                                            except Exception:
-                                                pass
-                                        continue
+                                            keep_it, outc = _pending_apply_fail(it, "vol_low", now)
+                                            _pending_log_trigger(sym, market, direction, outc, "vol_low", it, float(price))
+                                            if keep_it:
+                                                keep.append(it)
+                                                any_wait = True
+                                            else:
+                                                try:
+                                                    removed_n += 1
+                                                except Exception:
+                                                    pass
+                                            continue
                         except Exception:
                             pass
                         try:
@@ -14875,6 +14877,29 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     continue
                         except Exception:
                             pass
+
+                    # FULL_DIAGNOSTIC: after evaluating all trigger-time filters,
+                    # if anything failed, apply the primary fail now (but keep all reasons for logs/status).
+                    try:
+                        if full_diag and isinstance(trig_state, dict) and trig_state.get("reasons"):
+                            try:
+                                it["_trig_fail_reasons"] = list(trig_state.get("reasons") or [])
+                            except Exception:
+                                pass
+                            primary = str(trig_state.get("primary") or (trig_state.get("reasons") or ["fail"])[0])
+                            keep_it, outc = _pending_apply_fail(it, primary, now)
+                            _pending_log_trigger(sym, market, direction, outc, primary, it, float(price))
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
+                            else:
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                            continue
+                    except Exception:
+                        pass
 
                     # Emit final signal
                     entry = float(ta.get("entry") or entry0)
