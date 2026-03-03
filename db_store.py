@@ -1,13 +1,6 @@
 
 from __future__ import annotations
 
-
-
-def _db_cmd_timeout() -> float:
-    try:
-        return float(os.getenv('DB_COMMAND_TIMEOUT_SEC', '30') or 30)
-    except Exception:
-        return 30.0
 import asyncpg
 import datetime as dt
 import logging
@@ -147,7 +140,7 @@ async def ensure_schema() -> None:
                   AND table_name = 'kv_store'
                   AND column_name = 'value'
                 """
-            , timeout=_db_cmd_timeout())
+            )
             udt = (col.get('udt_name') if col else None)
             if udt and str(udt).lower() != 'jsonb':
                 # Try cast existing values to jsonb; if fails, keep TEXT but kv_set_json will handle it.
@@ -2828,28 +2821,61 @@ async def kv_set_json(key: str, value: dict) -> None:
         payload = "{}"
 
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
-        # Try JSONB first (preferred), fallback to TEXT if schema is old
-        try:
-            await conn.execute(
+        # We support multiple historical schemas:
+        # 1) kv_store("key" TEXT PRIMARY KEY, "value" JSONB, updated_at TIMESTAMPTZ)
+        # 2) kv_store("key" TEXT PRIMARY KEY, "value" TEXT,  updated_at TIMESTAMPTZ)
+        # 3) same as above but WITHOUT updated_at column
+        #
+        # Using quoted identifiers makes this work even if the schema used reserved names.
+        queries = [
+            (
                 """
-                INSERT INTO kv_store(key, value, updated_at, timeout=_db_cmd_timeout())
+                INSERT INTO kv_store("key", "value", updated_at)
                 VALUES ($1, $2::jsonb, NOW())
-                ON CONFLICT (key)
-                DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+                ON CONFLICT ("key")
+                DO UPDATE SET "value"=EXCLUDED."value", updated_at=NOW()
                 """,
-                k, payload
-            )
-        except Exception:
-            # Old schema: value is TEXT
-            await conn.execute(
+                (k, payload),
+            ),
+            (
                 """
-                INSERT INTO kv_store(key, value, updated_at, timeout=_db_cmd_timeout())
-                VALUES ($1, $2::text, NOW())
-                ON CONFLICT (key)
-                DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+                INSERT INTO kv_store("key", "value")
+                VALUES ($1, $2::jsonb)
+                ON CONFLICT ("key")
+                DO UPDATE SET "value"=EXCLUDED."value"
                 """,
-                k, payload
-            )
+                (k, payload),
+            ),
+            (
+                """
+                INSERT INTO kv_store("key", "value", updated_at)
+                VALUES ($1, $2::text, NOW())
+                ON CONFLICT ("key")
+                DO UPDATE SET "value"=EXCLUDED."value", updated_at=NOW()
+                """,
+                (k, payload),
+            ),
+            (
+                """
+                INSERT INTO kv_store("key", "value")
+                VALUES ($1, $2::text)
+                ON CONFLICT ("key")
+                DO UPDATE SET "value"=EXCLUDED."value"
+                """,
+                (k, payload),
+            ),
+        ]
+
+        last_err: Exception | None = None
+        for q, args in queries:
+            try:
+                await conn.execute(q, *args)
+                return
+            except Exception as e:
+                last_err = e
+                continue
+        if last_err:
+            raise last_err
 
 
 import zlib
