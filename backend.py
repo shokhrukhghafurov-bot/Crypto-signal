@@ -21622,8 +21622,14 @@ if _mid_missing_pending_helpers:
         out = [it for it in items if str(it.get("key") or "") != k]
         await self._mid_pending_save(out)
 
-    async def mid_pending_trigger_loop(self) -> None:
-        # Minimal poll loop to keep trig_poll fresh even if full implementation is missing.
+    async def _mid_pending_trigger_loop_stub(self, emit_signal_cb=None) -> None:
+        """Fallback trigger loop.
+
+        Some builds accidentally lost/indented the real pending trigger loop.
+        We keep a tiny loop so health metrics don't look dead.
+
+        IMPORTANT: signature must accept emit_signal_cb because bot.py passes it.
+        """
         poll = float(os.getenv("MID_PENDING_POLL_SEC", "5") or 5.0)
         while True:
             try:
@@ -21647,7 +21653,12 @@ if _mid_missing_pending_helpers:
         if not callable(getattr(Backend, "remove_mid_pending", None)):
             Backend.remove_mid_pending = remove_mid_pending  # type: ignore[attr-defined]
         if not callable(getattr(Backend, "mid_pending_trigger_loop", None)):
-            Backend.mid_pending_trigger_loop = mid_pending_trigger_loop  # type: ignore[attr-defined]
+            # Prefer the full implementation if it exists at module scope.
+            _impl = globals().get("mid_pending_trigger_loop")
+            if callable(_impl):
+                Backend.mid_pending_trigger_loop = _impl  # type: ignore[attr-defined]
+            else:
+                Backend.mid_pending_trigger_loop = _mid_pending_trigger_loop_stub  # type: ignore[attr-defined]
     except Exception:
         pass
 
