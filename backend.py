@@ -15447,9 +15447,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             logger.exception("[mid][pending] loop error")
             # ensure status does not report trig_poll=stale just because the loop errored
             try:
-                # NOTE: global _MID_TRIG_POLL_LAST is already declared earlier in this function.
-                # Re-declaring it here (after assignments) triggers a SyntaxError.
-                _MID_TRIG_POLL_LAST = {
+                # Use globals() to avoid any scoping edge-cases
+                globals()["_MID_TRIG_POLL_LAST"] = {
                     "ts": float(time.time()),
                     "checked": 0,
                     "in_zone_chk": 0,
