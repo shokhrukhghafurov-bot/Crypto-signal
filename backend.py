@@ -14297,8 +14297,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
                                 min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
                             else:
-                                min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76") or 76)
-                                min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
+                                min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT", os.getenv("MID_MIN_SCORE_SPOT_SCORE", "76")) or 76)
+                                # Prefer MID_MIN_SCORE_FUT (new), fall back to MID_MIN_SCORE_FUTURES (legacy)
+                                min_score_fut = int(os.getenv("MID_MIN_SCORE_FUT", os.getenv("MID_MIN_SCORE_FUTURES", "72")) or 72)
                             need_v = float(min_score_fut if market == "FUTURES" else min_score_spot)
                         except Exception:
                             need_v = 0.0
@@ -14652,11 +14653,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
                                 min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
                             else:
-                                min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76") or 76)
-                                min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
+                                min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT", os.getenv("MID_MIN_SCORE_SPOT_SCORE", "76")) or 76)
+                                # Prefer MID_MIN_SCORE_FUT (new), fall back to MID_MIN_SCORE_FUTURES (legacy)
+                                min_score_fut = int(os.getenv("MID_MIN_SCORE_FUT", os.getenv("MID_MIN_SCORE_FUTURES", "72")) or 72)
                             need = float(min_score_fut if market == "FUTURES" else min_score_spot)
                             score = float(it.get("_trig_score") if (it.get("_trig_score") is not None) else (ta.get("score") or ta.get("total") or 0.0))
                             if need and score < need:
+                                try:
+                                    it["_trig_fail_reasons"] = ["score_low"]
+                                    it.setdefault("_trig_checks", {})["score"] = "fail"
+                                except Exception:
+                                    pass
                                 keep_it, outc = _pending_apply_fail(it, "score_low", now)
                                 _pending_log_trigger(sym, market, direction, outc, "score_low", it, float(price))
                                 if keep_it:
@@ -14672,11 +14679,18 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             pass
                         # Regime/vol thresholds
                         try:
+                            if os.getenv("MID_USE_REGIME","1").strip().lower() in ("0","false","no","off"):
+                                raise StopIteration
                             min_adx_30m = float(os.getenv("MID_MIN_ADX_30M","0") or 0)
                             min_adx_1h = float(os.getenv("MID_MIN_ADX_1H","0") or 0)
                             adx30 = float(ta.get("adx1") or ta.get("adx_30m") or 0.0)
                             adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
                             if min_adx_30m and adx30 < min_adx_30m:
+                                try:
+                                    it["_trig_fail_reasons"] = ["regime_block"]
+                                    it.setdefault("_trig_checks", {})["regime"] = "fail"
+                                except Exception:
+                                    pass
                                 keep_it, outc = _pending_apply_fail(it, "regime_block", now)
                                 _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
                                 if keep_it:
@@ -14689,6 +14703,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                         pass
                                 continue
                             if min_adx_1h and adx1h < min_adx_1h:
+                                try:
+                                    it["_trig_fail_reasons"] = ["regime_block"]
+                                    it.setdefault("_trig_checks", {})["regime"] = "fail"
+                                except Exception:
+                                    pass
                                 keep_it, outc = _pending_apply_fail(it, "regime_block", now)
                                 _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
                                 if keep_it:
@@ -14703,9 +14722,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
                         try:
+                            if os.getenv("MID_USE_REGIME","1").strip().lower() in ("0","false","no","off"):
+                                raise StopIteration
                             min_atr_pct = float(os.getenv("MID_MIN_ATR_PCT","0") or 0)
                             atrp = float(ta.get("atr_pct") or 0.0)
                             if min_atr_pct and atrp < min_atr_pct:
+                                try:
+                                    it["_trig_fail_reasons"] = ["volatility_block"]
+                                    it.setdefault("_trig_checks", {})["volatility"] = "fail"
+                                except Exception:
+                                    pass
                                 keep_it, outc = _pending_apply_fail(it, "volatility_block", now)
                                 _pending_log_trigger(sym, market, direction, outc, "volatility_block", it, float(price))
                                 if keep_it:
@@ -15143,6 +15169,19 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             except Exception:
                 pass
         except Exception:
+            # Keep [mid][status] from showing trig_poll=stale when the loop is alive but errored.
+            try:
+                globals()["_MID_TRIG_POLL_LAST"] = {
+                    "ts": float(time.time()),
+                    "checked": 0,
+                    "in_zone_chk": 0,
+                    "keep": 0,
+                    "removed_now": 0,
+                    "expired_now": 0,
+                    "error": 1,
+                }
+            except Exception:
+                pass
             logger.exception("[mid][pending] loop error")
 
         await asyncio.sleep(max(1.0, poll))
