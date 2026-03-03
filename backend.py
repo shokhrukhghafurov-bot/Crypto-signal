@@ -13192,21 +13192,221 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
 
 
     async def _mid_pending_load(self) -> list[dict]:
-        # Protect trigger loop from DB hangs (kv_store). Always time out.
-        timeout_sec = float(os.getenv("MID_PENDING_KV_TIMEOUT_SEC", os.getenv("DB_COMMAND_TIMEOUT_SEC", "3")) or 3.0)
+        if not hasattr(self, "_mid_pending_mem"):
+            self._mid_pending_mem = []
+        if getattr(self, "_mid_pending_db_disabled", False):
+            return list(self._mid_pending_mem)
+
+        timeout_sec = float(os.getenv("MID_PENDING_KV_TIMEOUT_SEC", "3.0") or 3.0)
         try:
             st = await asyncio.wait_for(db_store.kv_get_json("mid_pending"), timeout=timeout_sec) or {}
             items = st.get("items", [])
             return items if isinstance(items, list) else []
         except Exception as e:
-            logger.warning("[mid][pending] kv_store load failed/timeout (sec=%.2f): %s", timeout_sec, str(e)[:200])
-            return []
+            try:
+                logger.warning("[mid][pending] kv_store load failed/timeout; switching to in-memory pending (err=%s)", str(e)[:200])
+            except Exception:
+                pass
+            self._mid_pending_db_disabled = True
+            return list(self._mid_pending_mem)
+
+
     async def _mid_pending_save(self, items: list[dict]) -> None:
-        timeout_sec = float(os.getenv("MID_PENDING_KV_TIMEOUT_SEC", os.getenv("DB_COMMAND_TIMEOUT_SEC", "3")) or 3.0)
+        if not hasattr(self, "_mid_pending_mem"):
+            self._mid_pending_mem = []
+        try:
+            self._mid_pending_mem = list(items)
+        except Exception:
+            self._mid_pending_mem = []
+
+        if getattr(self, "_mid_pending_db_disabled", False):
+            return
+
+        timeout_sec = float(os.getenv("MID_PENDING_KV_TIMEOUT_SEC", "3.0") or 3.0)
         try:
             await asyncio.wait_for(db_store.kv_set_json("mid_pending", {"items": items}), timeout=timeout_sec)
         except Exception as e:
-            logger.warning("[mid][pending] kv_store write failed/timeout (sec=%.2f): %s", timeout_sec, str(e)[:200])
+            try:
+                logger.warning("[mid][pending] kv_store write failed/timeout; switching to in-memory pending (err=%s)", str(e)[:200])
+            except Exception:
+                pass
+            self._mid_pending_db_disabled = True
+
+async def add_mid_pending(self, rec: dict) -> None:
+    """Upsert pending record by key."""
+    items = await self._mid_pending_load()
+    key = str(rec.get("key") or "").strip()
+    if not key:
+        return
+    out = []
+    replaced = False
+    for it in items:
+        try:
+            if str(it.get("key") or "") == key:
+                out.append(rec)
+                replaced = True
+            else:
+                out.append(it)
+        except Exception:
+            continue
+    if not replaced:
+        out.append(rec)
+    # trim
+    max_items = int(os.getenv("MID_PENDING_MAX", "120") or 120)
+    if max_items > 0 and len(out) > max_items:
+        out = out[-max_items:]
+    await self._mid_pending_save(out)
+
+async def remove_mid_pending(self, key: str) -> None:
+    try:
+        k = str(key or "").strip()
+        if not k:
+            return
+        items = await self._mid_pending_load()
+        out = [it for it in items if str(it.get("key") or "") != k]
+        await self._mid_pending_save(out)
+    except Exception:
+        pass
+
+
+async def remove_mid_pending_symbol(self, symbol: str, market: str = "") -> int:
+    """Remove all pending records for a symbol (optionally within market). Returns removed count."""
+    try:
+        s = str(symbol or "").upper().strip()
+        if not s:
+            return 0
+        mu = (market or "").upper().strip()
+        items = await self._mid_pending_load()
+        out = []
+        removed = 0
+        for it in items:
+            try:
+                if str(it.get("symbol") or "").upper().strip() != s:
+                    out.append(it); continue
+                if mu and str(it.get("market") or "").upper().strip() != mu:
+                    out.append(it); continue
+                removed += 1
+            except Exception:
+                out.append(it)
+        if removed:
+            await self._mid_pending_save(out)
+        return int(removed)
+    except Exception:
+        return 0
+
+async def _mid_get_active_trade(self, symbol: str, market: str = "") -> dict | None:
+    """Best-effort fetch one active trade for a symbol+market from DB (cached a few seconds)."""
+    try:
+        import db_store as _db_store
+        if _db_store.get_pool() is None:
+            return None
+    except Exception:
+        return None
+    try:
+        s = str(symbol or "").upper().strip()
+        if not s:
+            return None
+        mu = (market or "").upper().strip()
+        now = time.time()
+        cache = getattr(self, "_mid_active_trade_cache", None)
+        if cache is None:
+            cache = {"ts": 0.0, "map": {}}
+            self._mid_active_trade_cache = cache
+        ttl = float(os.getenv("MID_ACTIVE_TRADE_CACHE_SEC", "8") or 8.0)
+        if (now - float(cache.get("ts") or 0.0)) > ttl:
+            try:
+                rows = await _db_store.list_active_trades(limit=int(os.getenv("MID_ACTIVE_TRADE_CACHE_LIMIT", "800") or 800))
+            except Exception:
+                rows = []
+            m = {}
+            for r in rows or []:
+                try:
+                    sym = str(r.get("symbol") or "").upper().strip()
+                    mk = str(r.get("market") or "FUTURES").upper().strip()
+                    side = str(r.get("side") or "LONG").upper().strip()
+                    entry = float(r.get("entry") or 0.0)
+                    tid = int(r.get("id") or 0)
+                    # prefer newest id
+                    k = (mk, sym)
+                    prev = m.get(k)
+                    if prev is None or int(prev.get("id") or 0) < tid:
+                        m[k] = {"id": tid, "symbol": sym, "market": mk, "side": side, "entry": entry}
+                except Exception:
+                    continue
+            cache["map"] = m
+            cache["ts"] = now
+        m = cache.get("map") or {}
+        if mu:
+            return m.get((mu, s))
+        # if market not specified, accept any
+        for (mk, sym), v in m.items():
+            if sym == s:
+                return v
+        return None
+    except Exception:
+        return None
+async def mid_pending_trigger_loop(self, emit_signal_cb):
+    """Background loop: checks pending setups and emits a signal only when price reaches entry and TA is still confirmed."""
+    enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+    if not enabled:
+        return
+    poll = float(os.getenv("MID_PENDING_POLL_SEC", "5") or 5.0)
+    ttl_min = float(os.getenv("MID_PENDING_TTL_MIN", "60") or 60.0)
+    tol_atr = float(os.getenv("MID_PENDING_ENTRY_TOL_ATR", "0.15") or 0.15)
+    tol_pct = float(os.getenv("MID_PENDING_ENTRY_TOL_PCT", "0.0018") or 0.0018)
+
+    pending_instant_emit = int(os.getenv("MID_PENDING_INSTANT_EMIT", "0") or 0) == 1
+    # If instant emit is enabled, default to ignoring the zone unless explicitly disabled
+    instant_ignore_zone = int(os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0") or 0) == 1 
+
+    logger.info("[mid][pending] trigger loop started poll=%.2fs ttl=%.1fmin tol_atr=%.3f tol_pct=%.4f instant_emit=%s ignore_zone=%s",
+                poll, ttl_min, tol_atr, tol_pct, int(pending_instant_emit), int(instant_ignore_zone))
+
+    # globals for per-poll trigger reject aggregation (used by [mid][status])
+    global _MID_TRIG_REJECT_TICK_CUR, _MID_TRIG_REJECT_TICK_LAST
+
+    # Pending persistence is already in Postgres (kv_store key 'mid_pending').
+    # Here we track trigger attempts/fails and prune noisy pendings automatically.
+    max_fails = int(os.getenv("MID_PENDING_MAX_FAILS", "12") or 12)
+    max_attempts = int(os.getenv("MID_PENDING_MAX_ATTEMPTS", "50") or 50)
+    # Debounce attempts so "trigger_attempts" doesn't explode when price sits inside the zone.
+    # Counts at most once per N seconds while price is in-zone.
+    try:
+        attempt_gap_sec = float(os.getenv("MID_PENDING_MIN_ATTEMPT_GAP_SEC", "30") or 30.0)
+    except Exception:
+        attempt_gap_sec = 30.0
+    # Pending diagnostics
+    try:
+        near_atr = float(os.getenv("MID_PENDING_NEAR_ATR", "0.30") or 0.30)
+    except Exception:
+        near_atr = 0.30
+    try:
+        far_atr = float(os.getenv("MID_PENDING_FAR_ATR", "1.50") or 1.50)
+    except Exception:
+        far_atr = 1.50
+    # When ATR is too small (vol_low), classify distances by % instead of ATR.
+    try:
+        near_pct = float(os.getenv("MID_PENDING_NEAR_PCT", "0.003") or 0.003)
+    except Exception:
+        near_pct = 0.003
+    try:
+        far_pct = float(os.getenv("MID_PENDING_FAR_PCT", "0.03") or 0.03)
+    except Exception:
+        far_pct = 0.03
+
+    try:
+        dbg_every = float(os.getenv("MID_PENDING_DEBUG_EVERY_SEC", "30") or 30.0)
+    except Exception:
+        dbg_every = 30.0
+    try:
+        dbg_samples = int(os.getenv("MID_PENDING_DEBUG_SAMPLES", "3") or 3)
+    except Exception:
+        dbg_samples = 3
+    _last_dbg_ts = 0.0
+
+    if attempt_gap_sec < 0:
+        attempt_gap_sec = 0.0
+
     def _pending_mark_attempt(it: dict, now_ts: float) -> None:
         try:
             it["trigger_attempts"] = int(it.get("trigger_attempts") or 0) + 1
@@ -13482,666 +13682,848 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
             pass
 
 
-    async def mid_pending_trigger_loop(self) -> None:
-        while True:
+    while True:
 
+        try:
+            items = await self._mid_pending_load()
+            now = time.time()
+            # Start per-poll trigger reject aggregation (so [mid][status] can show reasons *for this tick*).
             try:
-                items = await self._mid_pending_load()
-                now = time.time()
-                # Start per-poll trigger reject aggregation (so [mid][status] can show reasons *for this tick*).
+                _MID_TRIG_REJECT_TICK_CUR = {"ts": float(now), "pre": {}, "inzone": {}}
+            except Exception:
+                pass
+            # Emergency / diagnostic switch: emit immediately when price enters the zone,
+            # skipping ALL re-checks (TA reconfirm, blocks, trap, post-setup filters).
+            # Use only for debugging the pipeline end-to-end.
+            pending_instant_emit = os.getenv("MID_PENDING_INSTANT_EMIT", "0").strip().lower() in ("1","true","yes","on")
+            # default: if instant emit is on, ignore zone unless explicitly disabled
+            instant_ignore_zone = (os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0").strip().lower() in ("1","true","yes","on")) 
+            keep: list[dict] = []
+            any_wait = False
+            # --- per-poll diagnostics counters ---
+            total_n = int(len(items) if isinstance(items, list) else 0)
+            trig_checked_n = 0
+            in_zone_n = 0
+            near_n = 0
+            far_n = 0
+            expired_n = 0
+            removed_n = 0
+            attempts_sum = 0
+            fails_sum = 0
+            samples = []  # list of (dist_atr, text)
+
+            for it in items:
                 try:
-                    _MID_TRIG_REJECT_TICK_CUR = {"ts": float(now), "pre": {}, "inzone": {}}
-                except Exception:
-                    pass
-                # Emergency / diagnostic switch: emit immediately when price enters the zone,
-                # skipping ALL re-checks (TA reconfirm, blocks, trap, post-setup filters).
-                # Use only for debugging the pipeline end-to-end.
-                pending_instant_emit = os.getenv("MID_PENDING_INSTANT_EMIT", "0").strip().lower() in ("1","true","yes","on")
-                # default: if instant emit is on, ignore zone unless explicitly disabled
-                instant_ignore_zone = (os.getenv("MID_PENDING_INSTANT_EMIT_IGNORE_ZONE", "0").strip().lower() in ("1","true","yes","on")) 
-                keep: list[dict] = []
-                any_wait = False
-                # --- per-poll diagnostics counters ---
-                total_n = int(len(items) if isinstance(items, list) else 0)
-                trig_checked_n = 0
-                in_zone_n = 0
-                near_n = 0
-                far_n = 0
-                expired_n = 0
-                removed_n = 0
-                attempts_sum = 0
-                fails_sum = 0
-                samples = []  # list of (dist_atr, text)
-
-                for it in items:
+                    sym = str(it.get("symbol") or "")
+                    sym_trade = str(it.get("trade_symbol") or sym)
+                    sym_candles = str(it.get("candle_symbol") or sym)
+                    market = str(it.get("market") or "SPOT").upper().strip()
+                    risk_flags = []
                     try:
-                        sym = str(it.get("symbol") or "")
-                        sym_trade = str(it.get("trade_symbol") or sym)
-                        sym_candles = str(it.get("candle_symbol") or sym)
-                        market = str(it.get("market") or "SPOT").upper().strip()
+                        rf = it.get("risk_flags")
+                        if isinstance(rf, list):
+                            risk_flags = [str(x) for x in rf if str(x).strip()]
+                        elif isinstance(rf, str) and rf.strip():
+                            risk_flags = [x.strip() for x in rf.replace(";", ",").split(",") if x.strip()]
+                    except Exception:
                         risk_flags = []
+                    if market.endswith(".FUTURES") or "FUTURES" in market:
+                        market = "FUTURES"
+                    elif market.endswith(".SPOT") or "SPOT" in market:
+                        market = "SPOT"
+                    direction = str(it.get("direction") or "").upper().strip()
+                    # Backward-compat: accept Enum-ish strings like 'DIRECTION.SHORT'
+                    if direction.endswith(".SHORT") or "SHORT" in direction:
+                        direction = "SHORT"
+                    elif direction.endswith(".LONG") or "LONG" in direction:
+                        direction = "LONG"
+                    entry0 = float(it.get("entry") or 0.0)
+                    src_ex = str(it.get("source_exchange") or "BINANCE").upper()
+                    created = float(it.get("created_ts") or 0.0) or now
+                    if not sym or entry0 <= 0:
+                        continue
+                    # expire
+                    ttl_item = float(it.get("ttl_min") or ttl_min)
+                    if (now - created) > ttl_item * 60:
                         try:
-                            rf = it.get("risk_flags")
-                            if isinstance(rf, list):
-                                risk_flags = [str(x) for x in rf if str(x).strip()]
-                            elif isinstance(rf, str) and rf.strip():
-                                risk_flags = [x.strip() for x in rf.replace(";", ",").split(",") if x.strip()]
+                            _mid_metrics_inc("pending_expired", 1)
                         except Exception:
-                            risk_flags = []
-                        if market.endswith(".FUTURES") or "FUTURES" in market:
-                            market = "FUTURES"
-                        elif market.endswith(".SPOT") or "SPOT" in market:
-                            market = "SPOT"
-                        direction = str(it.get("direction") or "").upper().strip()
-                        # Backward-compat: accept Enum-ish strings like 'DIRECTION.SHORT'
-                        if direction.endswith(".SHORT") or "SHORT" in direction:
-                            direction = "SHORT"
-                        elif direction.endswith(".LONG") or "LONG" in direction:
-                            direction = "LONG"
-                        entry0 = float(it.get("entry") or 0.0)
-                        src_ex = str(it.get("source_exchange") or "BINANCE").upper()
-                        created = float(it.get("created_ts") or 0.0) or now
-                        if not sym or entry0 <= 0:
-                            continue
-                        # expire
-                        ttl_item = float(it.get("ttl_min") or ttl_min)
-                        if (now - created) > ttl_item * 60:
-                            try:
-                                _mid_metrics_inc("pending_expired", 1)
-                            except Exception:
-                                pass
-                            try:
-                                expired_n += 1
-                            except Exception:
-                                pass
-                            try:
-                                _mid_reject_add("ttl_expired")
-                            except Exception:
-                                pass
-                            _pending_clear_cooldown(it)
-                            continue
+                            pass
+                        try:
+                            expired_n += 1
+                        except Exception:
+                            pass
+                        try:
+                            _mid_reject_add("ttl_expired")
+                        except Exception:
+                            pass
+                        _pending_clear_cooldown(it)
+                        continue
 
-                        # load candles (also gives fallback price)
-                        df5 = await self.load_candles(sym_candles, "5m", market)
-                        df30 = await self.load_candles(sym_candles, "30m", market)
-                        df1h = await self.load_candles(sym_candles, "1h", market)
-                        if df5 is None or getattr(df5, "empty", True) or df30 is None or getattr(df30, "empty", True) or df1h is None or getattr(df1h, "empty", True):
-                            keep.append(it)
-                            any_wait = True
-                            continue
+                    # load candles (also gives fallback price)
+                    df5 = await self.load_candles(sym_candles, "5m", market)
+                    df30 = await self.load_candles(sym_candles, "30m", market)
+                    df1h = await self.load_candles(sym_candles, "1h", market)
+                    if df5 is None or getattr(df5, "empty", True) or df30 is None or getattr(df30, "empty", True) or df1h is None or getattr(df1h, "empty", True):
+                        keep.append(it)
+                        any_wait = True
+                        continue
 
-                        # price (prefer same source exchange; fallback to df close)
+                    # price (prefer same source exchange; fallback to df close)
+                    price = None
+                    try:
+                        if src_ex == "BINANCE":
+                            price = await self._fetch_binance_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
+                        elif src_ex == "BYBIT":
+                            price = await self._fetch_bybit_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
+                        elif src_ex == "OKX":
+                            price = await self._fetch_okx_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
+                        elif src_ex == "MEXC":
+                            price = await _mexc_public_price(sym_trade)
+                        elif src_ex == "GATEIO":
+                            price = await _gateio_public_price(sym_trade)
+                    except Exception:
                         price = None
-                        try:
-                            if src_ex == "BINANCE":
-                                price = await self._fetch_binance_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
-                            elif src_ex == "BYBIT":
-                                price = await self._fetch_bybit_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
-                            elif src_ex == "OKX":
-                                price = await self._fetch_okx_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
-                            elif src_ex == "MEXC":
-                                price = await _mexc_public_price(sym_trade)
-                            elif src_ex == "GATEIO":
-                                price = await _gateio_public_price(sym_trade)
-                        except Exception:
-                            price = None
 
-                        try:
-                            px_close = float(df5["close"].astype(float).iloc[-1])
-                            if price is None or not (float(price) > 0):
-                                price = px_close
-                        except Exception:
-                            keep.append(it)
-                            any_wait = True
-                            continue
+                    try:
+                        px_close = float(df5["close"].astype(float).iloc[-1])
+                        if price is None or not (float(price) > 0):
+                            price = px_close
+                    except Exception:
+                        keep.append(it)
+                        any_wait = True
+                        continue
 
-                        try:
-                            atr_abs = None
-                            if "atr" in df5.columns:
-                                atr_abs = float(df5["atr"].astype(float).iloc[-1])
-                            if (atr_abs is None or atr_abs <= 0) and ("atr" in df30.columns):
-                                atr_abs = float(df30["atr"].astype(float).iloc[-1])
-                            if atr_abs is None or atr_abs <= 0:
-                                atr_abs = float(price) * 0.001
-                        except Exception:
+                    try:
+                        atr_abs = None
+                        if "atr" in df5.columns:
+                            atr_abs = float(df5["atr"].astype(float).iloc[-1])
+                        if (atr_abs is None or atr_abs <= 0) and ("atr" in df30.columns):
+                            atr_abs = float(df30["atr"].astype(float).iloc[-1])
+                        if atr_abs is None or atr_abs <= 0:
                             atr_abs = float(price) * 0.001
+                    except Exception:
+                        atr_abs = float(price) * 0.001
 
-                        tol = max(float(atr_abs) * tol_atr, float(price) * tol_pct)
+                    tol = max(float(atr_abs) * tol_atr, float(price) * tol_pct)
 
-                        # trigger when price is close enough to planned entry / entry zone
-                        entry_low = it.get("entry_low")
-                        entry_high = it.get("entry_high")
+                    # trigger when price is close enough to planned entry / entry zone
+                    entry_low = it.get("entry_low")
+                    entry_high = it.get("entry_high")
+                    use_zone = False
+                    try:
+                        if entry_low is not None and entry_high is not None:
+                            lo = float(entry_low)
+                            hi = float(entry_high)
+                            if lo > 0 and hi > 0 and hi >= lo:
+                                use_zone = True
+                    except Exception:
                         use_zone = False
-                        try:
-                            if entry_low is not None and entry_high is not None:
-                                lo = float(entry_low)
-                                hi = float(entry_high)
-                                if lo > 0 and hi > 0 and hi >= lo:
-                                    use_zone = True
-                        except Exception:
-                            use_zone = False
 
-                        # --- scale / multiplier auto-fix for legacy pendings (1000* contracts) ---
-                        # If stored zone is in a different scale than live price (common for 1000SHIBUSDT/1000FLOKIUSDT),
-                        # attempt to rescale the zone and/or drop the pending as scale_mismatch to avoid "eternal far".
-                        try:
-                            if use_zone:
-                                _z_mid = (float(lo) + float(hi)) / 2.0
-                            else:
-                                _z_mid = float(entry0)
-                            _px = float(price)
-                            _ratio = float(_px) / float(_z_mid) if float(_z_mid) > 0 else 0.0
-                        except Exception:
-                            _z_mid = 0.0
-                            _ratio = 0.0
-                        try:
-                            _mul_tol = float(os.getenv("MID_MULTIPLIER_MATCH_TOL", "0.08") or 0.08)
-                        except Exception:
-                            _mul_tol = 0.08
-                        try:
-                            _scale_max = float(os.getenv("MID_PENDING_SCALE_MISMATCH_MAX", "50") or 50.0)
-                        except Exception:
-                            _scale_max = 50.0
-                        try:
-                            _allowed = os.getenv("MID_MULTIPLIER_AUTO_LIST", "10,100,1000,10000")
-                            _allowed_muls = []
-                            for _t in str(_allowed).split(","):
-                                _t = str(_t).strip()
-                                if not _t:
-                                    continue
-                                try:
-                                    _allowed_muls.append(float(_t))
-                                except Exception:
-                                    pass
-                            if not _allowed_muls:
-                                _allowed_muls = [10.0, 100.0, 1000.0, 10000.0]
-                        except Exception:
-                            _allowed_muls = [10.0, 100.0, 1000.0, 10000.0]
-
-                        _fixed = False
-                        try:
-                            if float(_z_mid) > 0 and float(_ratio) > 0:
-                                # Try to infer multiplier even if the pending was created before trade_symbol/price_multiplier existed.
-                                _det_mul = float(it.get("price_multiplier") or 1.0) if it.get("price_multiplier") is not None else 1.0
-                                _det_tag = None
-                                if float(_det_mul) <= 1.0:
-                                    for _m in _allowed_muls:
-                                        _m = float(_m)
-                                        if _m <= 1.0:
-                                            continue
-                                        if abs(float(_ratio) - float(_m)) / float(_m) <= float(_mul_tol):
-                                            _det_mul = float(_m)
-                                            _det_tag = f"auto_x{int(_m)}"
-                                            break
-                                        _inv = 1.0 / float(_m)
-                                        if abs(float(_ratio) - float(_inv)) / float(_inv) <= float(_mul_tol):
-                                            _det_mul = float(_inv)
-                                            _det_tag = f"auto_div{int(_m)}"
-                                            break
-                                if float(_det_mul) != 1.0 and use_zone:
-                                    lo = float(lo) * float(_det_mul)
-                                    hi = float(hi) * float(_det_mul)
-                                    it["entry_low"] = float(lo)
-                                    it["entry_high"] = float(hi)
-                                    it["price_multiplier"] = float(_det_mul)
-                                    try:
-                                        _src0 = str(it.get("entry_zone_src") or "")
-                                        if _det_tag and _det_tag not in _src0:
-                                            it["entry_zone_src"] = f"{_src0}|{_det_tag}" if _src0 else _det_tag
-                                    except Exception:
-                                        pass
-                                    try:
-                                        # If this looks like a BINANCE futures multiplier contract, set trade_symbol alias for better price fetch.
-                                        if market == "FUTURES" and (src_ex == "BINANCE"):
-                                            if float(_det_mul) >= 10.0 and not str(sym_trade).startswith(str(int(float(_det_mul)))):
-                                                sym_trade = f"{int(float(_det_mul))}{sym}"
-                                                it["trade_symbol"] = sym_trade
-                                    except Exception:
-                                        pass
-                                    _fixed = True
-                                    try:
-                                        _z_mid = (float(lo) + float(hi)) / 2.0
-                                        _ratio = float(_px) / float(_z_mid) if float(_z_mid) > 0 else float(_ratio)
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            _fixed = False
-
-                        # If still wildly mismatched, drop immediately.
-                        try:
-                            if float(_z_mid) > 0 and float(_ratio) > 0 and (float(_ratio) >= float(_scale_max) or float(_ratio) <= (1.0 / float(_scale_max))):
-                                # mark fail reason for observability and remove
-                                try:
-                                    _pending_fail(it, "scale_mismatch", now)
-                                except Exception:
-                                    pass
-                                try:
-                                    removed_n += 1
-                                except Exception:
-                                    pass
-                                try:
-                                    _mid_reject_add("scale_mismatch")
-                                except Exception:
-                                    pass
+                    # --- scale / multiplier auto-fix for legacy pendings (1000* contracts) ---
+                    # If stored zone is in a different scale than live price (common for 1000SHIBUSDT/1000FLOKIUSDT),
+                    # attempt to rescale the zone and/or drop the pending as scale_mismatch to avoid "eternal far".
+                    try:
+                        if use_zone:
+                            _z_mid = (float(lo) + float(hi)) / 2.0
+                        else:
+                            _z_mid = float(entry0)
+                        _px = float(price)
+                        _ratio = float(_px) / float(_z_mid) if float(_z_mid) > 0 else 0.0
+                    except Exception:
+                        _z_mid = 0.0
+                        _ratio = 0.0
+                    try:
+                        _mul_tol = float(os.getenv("MID_MULTIPLIER_MATCH_TOL", "0.08") or 0.08)
+                    except Exception:
+                        _mul_tol = 0.08
+                    try:
+                        _scale_max = float(os.getenv("MID_PENDING_SCALE_MISMATCH_MAX", "50") or 50.0)
+                    except Exception:
+                        _scale_max = 50.0
+                    try:
+                        _allowed = os.getenv("MID_MULTIPLIER_AUTO_LIST", "10,100,1000,10000")
+                        _allowed_muls = []
+                        for _t in str(_allowed).split(","):
+                            _t = str(_t).strip()
+                            if not _t:
                                 continue
-                        except Exception:
-                            pass
-                        # --- zone distance diagnostics (no tolerance) ---
-                        try:
-                            if use_zone:
-                                if float(price) < float(lo):
-                                    _dist = float(lo) - float(price)
-                                elif float(price) > float(hi):
-                                    _dist = float(price) - float(hi)
-                                else:
-                                    _dist = 0.0
-                                _zone_w = float(hi) - float(lo)
+                            try:
+                                _allowed_muls.append(float(_t))
+                            except Exception:
+                                pass
+                        if not _allowed_muls:
+                            _allowed_muls = [10.0, 100.0, 1000.0, 10000.0]
+                    except Exception:
+                        _allowed_muls = [10.0, 100.0, 1000.0, 10000.0]
+
+                    _fixed = False
+                    try:
+                        if float(_z_mid) > 0 and float(_ratio) > 0:
+                            # Try to infer multiplier even if the pending was created before trade_symbol/price_multiplier existed.
+                            _det_mul = float(it.get("price_multiplier") or 1.0) if it.get("price_multiplier") is not None else 1.0
+                            _det_tag = None
+                            if float(_det_mul) <= 1.0:
+                                for _m in _allowed_muls:
+                                    _m = float(_m)
+                                    if _m <= 1.0:
+                                        continue
+                                    if abs(float(_ratio) - float(_m)) / float(_m) <= float(_mul_tol):
+                                        _det_mul = float(_m)
+                                        _det_tag = f"auto_x{int(_m)}"
+                                        break
+                                    _inv = 1.0 / float(_m)
+                                    if abs(float(_ratio) - float(_inv)) / float(_inv) <= float(_mul_tol):
+                                        _det_mul = float(_inv)
+                                        _det_tag = f"auto_div{int(_m)}"
+                                        break
+                            if float(_det_mul) != 1.0 and use_zone:
+                                lo = float(lo) * float(_det_mul)
+                                hi = float(hi) * float(_det_mul)
+                                it["entry_low"] = float(lo)
+                                it["entry_high"] = float(hi)
+                                it["price_multiplier"] = float(_det_mul)
+                                try:
+                                    _src0 = str(it.get("entry_zone_src") or "")
+                                    if _det_tag and _det_tag not in _src0:
+                                        it["entry_zone_src"] = f"{_src0}|{_det_tag}" if _src0 else _det_tag
+                                except Exception:
+                                    pass
+                                try:
+                                    # If this looks like a BINANCE futures multiplier contract, set trade_symbol alias for better price fetch.
+                                    if market == "FUTURES" and (src_ex == "BINANCE"):
+                                        if float(_det_mul) >= 10.0 and not str(sym_trade).startswith(str(int(float(_det_mul)))):
+                                            sym_trade = f"{int(float(_det_mul))}{sym}"
+                                            it["trade_symbol"] = sym_trade
+                                except Exception:
+                                    pass
+                                _fixed = True
+                                try:
+                                    _z_mid = (float(lo) + float(hi)) / 2.0
+                                    _ratio = float(_px) / float(_z_mid) if float(_z_mid) > 0 else float(_ratio)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        _fixed = False
+
+                    # If still wildly mismatched, drop immediately.
+                    try:
+                        if float(_z_mid) > 0 and float(_ratio) > 0 and (float(_ratio) >= float(_scale_max) or float(_ratio) <= (1.0 / float(_scale_max))):
+                            # mark fail reason for observability and remove
+                            try:
+                                _pending_fail(it, "scale_mismatch", now)
+                            except Exception:
+                                pass
+                            try:
+                                removed_n += 1
+                            except Exception:
+                                pass
+                            try:
+                                _mid_reject_add("scale_mismatch")
+                            except Exception:
+                                pass
+                            continue
+                    except Exception:
+                        pass
+                    # --- zone distance diagnostics (no tolerance) ---
+                    try:
+                        if use_zone:
+                            if float(price) < float(lo):
+                                _dist = float(lo) - float(price)
+                            elif float(price) > float(hi):
+                                _dist = float(price) - float(hi)
                             else:
-                                _dist = abs(float(price) - float(entry0))
-                                _zone_w = 0.0
+                                _dist = 0.0
+                            _zone_w = float(hi) - float(lo)
+                        else:
+                            _dist = abs(float(price) - float(entry0))
+                            _zone_w = 0.0
 
-                            _dist_pct = float(_dist) / float(price) if float(price) > 0 else 0.0
+                        _dist_pct = float(_dist) / float(price) if float(price) > 0 else 0.0
 
-                            # vol_low guard: if ATR is too small, ATR-based metrics explode and become meaningless
-                            try:
-                                _min_atr_abs = float(os.getenv("MID_PENDING_MIN_ATR_ABS", "0") or 0.0)
-                            except Exception:
-                                _min_atr_abs = 0.0
-                            try:
-                                _min_atr_pct = float(os.getenv("MID_PENDING_MIN_ATR_PCT", os.getenv("MID_MIN_ATR_PCT", "0")) or 0.0)
-                            except Exception:
-                                _min_atr_pct = 0.0
-                            try:
-                                _atr_pct_now = (float(atr_abs) / float(price) * 100.0) if float(price) > 0 else 0.0
-                            except Exception:
-                                _atr_pct_now = 0.0
+                        # vol_low guard: if ATR is too small, ATR-based metrics explode and become meaningless
+                        try:
+                            _min_atr_abs = float(os.getenv("MID_PENDING_MIN_ATR_ABS", "0") or 0.0)
+                        except Exception:
+                            _min_atr_abs = 0.0
+                        try:
+                            _min_atr_pct = float(os.getenv("MID_PENDING_MIN_ATR_PCT", os.getenv("MID_MIN_ATR_PCT", "0")) or 0.0)
+                        except Exception:
+                            _min_atr_pct = 0.0
+                        try:
+                            _atr_pct_now = (float(atr_abs) / float(price) * 100.0) if float(price) > 0 else 0.0
+                        except Exception:
+                            _atr_pct_now = 0.0
+                        _vol_low = False
+                        try:
+                            if (float(_min_atr_abs) > 0 and float(atr_abs) < float(_min_atr_abs)) or (float(_min_atr_pct) > 0 and float(_atr_pct_now) < float(_min_atr_pct)):
+                                _vol_low = True
+                        except Exception:
                             _vol_low = False
-                            try:
-                                if (float(_min_atr_abs) > 0 and float(atr_abs) < float(_min_atr_abs)) or (float(_min_atr_pct) > 0 and float(_atr_pct_now) < float(_min_atr_pct)):
-                                    _vol_low = True
-                            except Exception:
-                                _vol_low = False
 
-                            # If TA/scan already flagged vol_low, treat it as vol_low here too (prevents dist_atr=999 spam)
-                            try:
-                                if "vol_low" in risk_flags:
-                                    _vol_low = True
-                            except Exception:
-                                pass
-
-                            _dist_atr = None if _vol_low else (float(_dist) / float(atr_abs) if float(atr_abs) > 0 else None)
-                            # in-zone (STRICT for entry zone; tolerance only for legacy no-zone pendings)
-                            try:
-                                if use_zone:
-                                    _in_zone_now = bool(float(price) >= float(lo) and float(price) <= float(hi))
-                                else:
-                                    _in_zone_now = bool(abs(float(price) - float(entry0)) <= float(tol))
-                            except Exception:
-                                _in_zone_now = False
-                            try:
-                                it["_in_zone"] = bool(_in_zone_now)
-                            except Exception:
-                                pass
-                            try:
-                                # backward compat: some digests used _in_zone_tol
-                                it["_in_zone_tol"] = bool(_in_zone_now)
-                            except Exception:
-                                pass
-                            if _in_zone_now:
-                                in_zone_n += 1
-
-                            if _dist_atr is not None:
-                                if float(_dist_atr) <= float(near_atr):
-                                    near_n += 1
-                                if float(_dist_atr) >= float(far_atr):
-                                    far_n += 1
-                            else:
-                                if float(_dist_pct) <= float(near_pct):
-                                    near_n += 1
-                                if float(_dist_pct) >= float(far_pct):
-                                    far_n += 1
-
-                            # samples: keep a few farthest pendings for debug
-                            if dbg_samples > 0:
-                                try:
-                                    _age_m = (now - created) / 60.0
-                                except Exception:
-                                    _age_m = 0.0
-                                try:
-                                    _w_atr = float(_zone_w) / float(atr_abs) if (use_zone and (not _vol_low) and float(atr_abs) > 0) else 0.0
-                                except Exception:
-                                    _w_atr = 0.0
-
-                                if use_zone:
-                                    if _dist_atr is None:
-                                        _txt = f"{sym} {market} {direction} px={float(price):.6g} zone={float(lo):.6g}..{float(hi):.6g} dist_pct={float(_dist_pct)*100.0:.2f}% w={float(_zone_w):.6g} src={str(it.get('entry_zone_src') or '')} age={_age_m:.0f}m flags={it.get('risk_flags', [])}"
-                                        samples.append((float(_dist_pct), _txt))
-                                    else:
-                                        _txt = f"{sym} {market} {direction} px={float(price):.6g} zone={float(lo):.6g}..{float(hi):.6g} dist_atr={float(_dist_atr):.2f} w_atr={float(_w_atr):.2f} src={str(it.get('entry_zone_src') or '')} age={_age_m:.0f}m flags={it.get('risk_flags', [])}"
-                                        samples.append((float(_dist_atr), _txt))
-                                else:
-                                    if _dist_atr is None:
-                                        _txt = f"{sym} {market} {direction} px={float(price):.6g} entry={float(entry0):.6g} dist_pct={float(_dist_pct)*100.0:.2f}% age={_age_m:.0f}m"
-                                        samples.append((float(_dist_pct), _txt))
-                                    else:
-                                        _txt = f"{sym} {market} {direction} px={float(price):.6g} entry={float(entry0):.6g} dist_atr={float(_dist_atr):.2f} age={_age_m:.0f}m"
-                                        samples.append((float(_dist_atr), _txt))
+                        # If TA/scan already flagged vol_low, treat it as vol_low here too (prevents dist_atr=999 spam)
+                        try:
+                            if "vol_low" in risk_flags:
+                                _vol_low = True
                         except Exception:
                             pass
 
-                        # Normally we wait until price reaches the planned entry zone/price.
-                        # For debugging (or "emit on create" behavior), you can bypass this wait:
-                        # MID_PENDING_INSTANT_EMIT=1 + MID_PENDING_INSTANT_EMIT_IGNORE_ZONE=1
-                        if not (pending_instant_emit and instant_ignore_zone):
-                            if use_zone:
-                                if not (float(price) >= lo and float(price) <= hi):
-                                    keep.append(it)
-                                    any_wait = True
-                                    continue
-                            else:
-                                if abs(float(price) - entry0) > tol:
-                                    keep.append(it)
-                                    any_wait = True
-                                    continue
-
-                        # Debounce: if price is still in-zone and we've checked very recently,
-                        # don't count another attempt and don't re-run heavy confirmations yet.
+                        _dist_atr = None if _vol_low else (float(_dist) / float(atr_abs) if float(atr_abs) > 0 else None)
+                        # in-zone (STRICT for entry zone; tolerance only for legacy no-zone pendings)
                         try:
-                            last_try = float(it.get("last_attempt_ts") or 0.0)
-                            if attempt_gap_sec > 0 and last_try > 0 and (now - last_try) < attempt_gap_sec:
+                            if use_zone:
+                                _in_zone_now = bool(float(price) >= float(lo) and float(price) <= float(hi))
+                            else:
+                                _in_zone_now = bool(abs(float(price) - float(entry0)) <= float(tol))
+                        except Exception:
+                            _in_zone_now = False
+                        try:
+                            it["_in_zone"] = bool(_in_zone_now)
+                        except Exception:
+                            pass
+                        try:
+                            # backward compat: some digests used _in_zone_tol
+                            it["_in_zone_tol"] = bool(_in_zone_now)
+                        except Exception:
+                            pass
+                        if _in_zone_now:
+                            in_zone_n += 1
+
+                        if _dist_atr is not None:
+                            if float(_dist_atr) <= float(near_atr):
+                                near_n += 1
+                            if float(_dist_atr) >= float(far_atr):
+                                far_n += 1
+                        else:
+                            if float(_dist_pct) <= float(near_pct):
+                                near_n += 1
+                            if float(_dist_pct) >= float(far_pct):
+                                far_n += 1
+
+                        # samples: keep a few farthest pendings for debug
+                        if dbg_samples > 0:
+                            try:
+                                _age_m = (now - created) / 60.0
+                            except Exception:
+                                _age_m = 0.0
+                            try:
+                                _w_atr = float(_zone_w) / float(atr_abs) if (use_zone and (not _vol_low) and float(atr_abs) > 0) else 0.0
+                            except Exception:
+                                _w_atr = 0.0
+
+                            if use_zone:
+                                if _dist_atr is None:
+                                    _txt = f"{sym} {market} {direction} px={float(price):.6g} zone={float(lo):.6g}..{float(hi):.6g} dist_pct={float(_dist_pct)*100.0:.2f}% w={float(_zone_w):.6g} src={str(it.get('entry_zone_src') or '')} age={_age_m:.0f}m flags={it.get('risk_flags', [])}"
+                                    samples.append((float(_dist_pct), _txt))
+                                else:
+                                    _txt = f"{sym} {market} {direction} px={float(price):.6g} zone={float(lo):.6g}..{float(hi):.6g} dist_atr={float(_dist_atr):.2f} w_atr={float(_w_atr):.2f} src={str(it.get('entry_zone_src') or '')} age={_age_m:.0f}m flags={it.get('risk_flags', [])}"
+                                    samples.append((float(_dist_atr), _txt))
+                            else:
+                                if _dist_atr is None:
+                                    _txt = f"{sym} {market} {direction} px={float(price):.6g} entry={float(entry0):.6g} dist_pct={float(_dist_pct)*100.0:.2f}% age={_age_m:.0f}m"
+                                    samples.append((float(_dist_pct), _txt))
+                                else:
+                                    _txt = f"{sym} {market} {direction} px={float(price):.6g} entry={float(entry0):.6g} dist_atr={float(_dist_atr):.2f} age={_age_m:.0f}m"
+                                    samples.append((float(_dist_atr), _txt))
+                    except Exception:
+                        pass
+
+                    # Normally we wait until price reaches the planned entry zone/price.
+                    # For debugging (or "emit on create" behavior), you can bypass this wait:
+                    # MID_PENDING_INSTANT_EMIT=1 + MID_PENDING_INSTANT_EMIT_IGNORE_ZONE=1
+                    if not (pending_instant_emit and instant_ignore_zone):
+                        if use_zone:
+                            if not (float(price) >= lo and float(price) <= hi):
                                 keep.append(it)
                                 any_wait = True
                                 continue
+                        else:
+                            if abs(float(price) - entry0) > tol:
+                                keep.append(it)
+                                any_wait = True
+                                continue
+
+                    # Debounce: if price is still in-zone and we've checked very recently,
+                    # don't count another attempt and don't re-run heavy confirmations yet.
+                    try:
+                        last_try = float(it.get("last_attempt_ts") or 0.0)
+                        if attempt_gap_sec > 0 and last_try > 0 and (now - last_try) < attempt_gap_sec:
+                            keep.append(it)
+                            any_wait = True
+                            continue
+                    except Exception:
+                        pass
+
+                    trig_checked_n += 1
+
+                    # If enabled, emit immediately as soon as price reaches the entry zone.
+                    # NOTE: this bypasses *all* safety checks. Intended for temporary debugging only.
+                    if pending_instant_emit and (os.getenv("MID_PENDING_INSTANT_EMIT_SKIP_CHECKS", "0").strip().lower() in ("1","true","yes","on")):
+                        try:
+                            _pending_mark_attempt(it, now)
                         except Exception:
                             pass
+                        try:
+                            entry_emit = float(it.get("entry") or entry0)
+                            sl_emit = float(it.get("sl") or 0.0)
+                            tp1_emit = float(it.get("tp1") or 0.0)
+                            tp2_emit = float(it.get("tp2") or 0.0)
+                            rr_emit = float(it.get("rr") or 0.0)
+                            conf_emit = int(float(it.get("confidence") or it.get("min_confidence") or 0))
+                            conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "") or str(src_ex)
 
-                        trig_checked_n += 1
+                            sig = Signal(
+                                signal_id=self.next_signal_id(),
+                                market=market,
+                                symbol=sym,
+                                direction=direction,
+                                timeframe=str(it.get("timeframe") or "5m/30m/1h"),
+                                entry=entry_emit,
+                                sl=sl_emit,
+                                tp1=tp1_emit,
+                                tp2=tp2_emit,
+                                rr=rr_emit,
+                                confidence=conf_emit,
+                                confirmations=conf_names,
+                                source_exchange=src_ex,
+                                available_exchanges=conf_names,
+                                risk_note=str(it.get("risk_note") or "INSTANT_EMIT (filters bypassed)"),
+                                ts=time.time(),
+                            )
 
-                        # If enabled, emit immediately as soon as price reaches the entry zone.
-                        # NOTE: this bypasses *all* safety checks. Intended for temporary debugging only.
-                        if pending_instant_emit and (os.getenv("MID_PENDING_INSTANT_EMIT_SKIP_CHECKS", "0").strip().lower() in ("1","true","yes","on")):
                             try:
-                                _pending_mark_attempt(it, now)
+                                self.mark_emitted_mid(sym, sig.direction, sig.market)
+                            except TypeError:
+                                # compat shim may expose mark_emitted_mid(symbol) only
+                                try:
+                                    self.mark_emitted_mid(sym)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                            self.last_signal = sig
+                            if sig.market == "SPOT":
+                                self.last_spot_signal = sig
+                            else:
+                                self.last_futures_signal = sig
+
+                            await emit_signal_cb(sig)
+                            _pending_log_trigger(sym, market, direction, "pass", "instant_emit", it, float(price))
+                            logger.info("[mid][pending] INSTANT_EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, float(entry_emit), float(price), tol)
+                            try:
+                                _mid_metrics_inc("pending_triggered", 1)
                             except Exception:
                                 pass
                             try:
-                                entry_emit = float(it.get("entry") or entry0)
-                                sl_emit = float(it.get("sl") or 0.0)
-                                tp1_emit = float(it.get("tp1") or 0.0)
-                                tp2_emit = float(it.get("tp2") or 0.0)
-                                rr_emit = float(it.get("rr") or 0.0)
-                                conf_emit = int(float(it.get("confidence") or it.get("min_confidence") or 0))
-                                conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "") or str(src_ex)
+                                _mid_stage_add("triggered", 1)
+                            except Exception:
+                                pass
+                            # emitted: do not keep
+                            continue
+                        except Exception:
+                            # If instant emit fails for any reason, fall back to normal path.
+                            pass
 
-                                sig = Signal(
-                                    signal_id=self.next_signal_id(),
-                                    market=market,
-                                    symbol=sym,
-                                    direction=direction,
-                                    timeframe=str(it.get("timeframe") or "5m/30m/1h"),
-                                    entry=entry_emit,
-                                    sl=sl_emit,
-                                    tp1=tp1_emit,
-                                    tp2=tp2_emit,
-                                    rr=rr_emit,
-                                    confidence=conf_emit,
-                                    confirmations=conf_names,
-                                    source_exchange=src_ex,
-                                    available_exchanges=conf_names,
-                                    risk_note=str(it.get("risk_note") or "INSTANT_EMIT (filters bypassed)"),
-                                    ts=time.time(),
-                                )
+                    # We reached entry/zone: count this as a trigger attempt (persisted in DB kv_store).
+                    _pending_mark_attempt(it, now)
+                    # Init per-trigger checklists (so logs can show what passed/failed/skipped in one line)
+                    try:
+                        it["_trig_checks"] = {
+                            "zone": "pass",
+                            "structure_30m": "ne",
+                            "structure_1h": "ne",
+                            "direction": "ne",
+                            "trap": "ne",
+                            "bos_block": "ne",
+                            "reclaim": "ne",
+                            "bos_5m": "ne",
+                            "sweep": "ne",
+                            "displacement": "ne",
+                            "confidence": "ne",
+                            "score": "ne",
+                            "vol_x": "ne",
+                        }
+                        it["_trig_reqs"] = {}
+                    except Exception:
+                        pass
 
-                                try:
-                                    self.mark_emitted_mid(sym, sig.direction, sig.market)
-                                except TypeError:
-                                    # compat shim may expose mark_emitted_mid(symbol) only
+                    # FULL_DIAGNOSTIC: always evaluate full checklist in-zone (no short-circuit),
+                    # so logs show every failed/passed filter in one line.
+                    full_diag = os.getenv("MID_TRIGGER_FULL_CHECKLIST", "1").strip().lower() in ("1","true","yes","on")
+                    # Trigger filter switches (so "filters off" via env truly means no blocking)
+                    def _env_true(name: str, default: bool = True) -> bool:
+                        try:
+                            v = os.getenv(name, None)
+                            if v is None:
+                                return bool(default)
+                            return str(v).strip().lower() in ("1","true","yes","on")
+                        except Exception:
+                            return bool(default)
+                    
+                    req_struct_30m = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_30M", True)
+                    req_struct_1h = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_1H", True)
+                    
+                    # Trap: by default, follow global trap switches if they are set; otherwise enabled.
+                    try:
+                        _trap_global = os.getenv("MID_TRAP_FILTERS", None)
+                        if _trap_global is None:
+                            _trap_global = os.getenv("TRAP_FILTER_ENABLED", None)
+                        if _trap_global is not None:
+                            req_trap = str(_trap_global).strip().lower() in ("1","true","yes","on")
+                        else:
+                            req_trap = True
+                    except Exception:
+                        req_trap = True
+                    # Explicit per-trigger override always wins (set MID_TRIGGER_REQUIRE_TRAP=0/1)
+                    try:
+                        _tov = os.getenv("MID_TRIGGER_REQUIRE_TRAP", "").strip()
+                        if _tov != "":
+                            req_trap = _env_true("MID_TRIGGER_REQUIRE_TRAP", req_trap)
+                    except Exception:
+                        pass
+
+
+                    # We track two things:
+                    # - reasons: human/debug keys for logs + [mid][status]
+                    # - primary_apply: canonical reason passed into _pending_apply_fail() (preserves existing hard/soft policies)
+                    trig_state = {"primary_apply": None, "reasons": []}
+                    def _trig_add(reason_key: str, apply_reason: str | None = None) -> None:
+                        """Record a failed trigger filter.
+
+                        reason_key: what we want to show in logs/status (e.g. bos_5m_missing)
+                        apply_reason: what to pass into _pending_apply_fail (e.g. liq_sweep_missing)
+                        """
+                        try:
+                            rk = str(reason_key or "").strip()
+                            ar = str(apply_reason or reason_key or "").strip()
+                            if not rk:
+                                return
+                            if rk not in trig_state["reasons"]:
+                                trig_state["reasons"].append(rk)
+                            if trig_state["primary_apply"] is None and ar:
+                                trig_state["primary_apply"] = ar
+                        except Exception:
+                            pass
+
+                    # Smart delete (terminal invalidation): if higher-timeframe structure
+                    # is clearly opposite to the pending direction, drop immediately.
+                    #
+                    # NOTE: We check BOTH 30m and 1h structures (requested). This protects
+                    # against cases where 1h still lags but 30m already flipped.
+                    try:
+                        # 30m structure
+                        struct_30m = _mid_structure_hhhl(
+                            df30,
+                            lookback=int(os.getenv("MID_STRUCTURE_LOOKBACK_30M", "260") or 260),
+                            pivot=int(os.getenv("MID_STRUCTURE_PIVOT", "3") or 3),
+                        )
+                        try:
+                            it["_trig_checks"]["structure_30m"] = "pass"
+                        except Exception:
+                            pass
+                        try:
+                            if not req_struct_30m:
+                                it["_trig_checks"]["structure_30m"] = "skip"
+                        except Exception:
+                            pass
+                        if req_struct_30m and str(direction).upper() == "LONG" and struct_30m == "LH-LL":
+                            try:
+                                it["_trig_checks"]["structure_30m"] = "fail"
+                            except Exception:
+                                pass
+                            if full_diag:
+                                _trig_add("structure_broken_30m", "structure_broken")
+                            else:
+                                keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
+                                _pending_log_trigger(sym, market, direction, outc, "structure_broken_30m", it, float(price))
+                                # If structure is broken we must not proceed to other trigger checks in this poll.
+                                # For soft-fail policies (env override), we keep waiting; for hard-fail we drop.
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
                                     try:
-                                        self.mark_emitted_mid(sym)
+                                        removed_n += 1
                                     except Exception:
                                         pass
-                                except Exception:
-                                    pass
-                                self.last_signal = sig
-                                if sig.market == "SPOT":
-                                    self.last_spot_signal = sig
-                                else:
-                                    self.last_futures_signal = sig
-
-                                await emit_signal_cb(sig)
-                                _pending_log_trigger(sym, market, direction, "pass", "instant_emit", it, float(price))
-                                logger.info("[mid][pending] INSTANT_EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, float(entry_emit), float(price), tol)
-                                try:
-                                    _mid_metrics_inc("pending_triggered", 1)
-                                except Exception:
-                                    pass
-                                try:
-                                    _mid_stage_add("triggered", 1)
-                                except Exception:
-                                    pass
-                                # emitted: do not keep
                                 continue
-                            except Exception:
-                                # If instant emit fails for any reason, fall back to normal path.
-                                pass
-
-                        # We reached entry/zone: count this as a trigger attempt (persisted in DB kv_store).
-                        _pending_mark_attempt(it, now)
-                        # Init per-trigger checklists (so logs can show what passed/failed/skipped in one line)
-                        try:
-                            it["_trig_checks"] = {
-                                "zone": "pass",
-                                "structure_30m": "ne",
-                                "structure_1h": "ne",
-                                "direction": "ne",
-                                "trap": "ne",
-                                "bos_block": "ne",
-                                "reclaim": "ne",
-                                "bos_5m": "ne",
-                                "sweep": "ne",
-                                "displacement": "ne",
-                                "confidence": "ne",
-                                "score": "ne",
-                                "vol_x": "ne",
-                            }
-                            it["_trig_reqs"] = {}
-                        except Exception:
-                            pass
-
-                        # FULL_DIAGNOSTIC: always evaluate full checklist in-zone (no short-circuit),
-                        # so logs show every failed/passed filter in one line.
-                        full_diag = os.getenv("MID_TRIGGER_FULL_CHECKLIST", "1").strip().lower() in ("1","true","yes","on")
-                        # Trigger filter switches (so "filters off" via env truly means no blocking)
-                        def _env_true(name: str, default: bool = True) -> bool:
+                        if req_struct_30m and str(direction).upper() == "SHORT" and struct_30m == "HH-HL":
                             try:
-                                v = os.getenv(name, None)
-                                if v is None:
-                                    return bool(default)
-                                return str(v).strip().lower() in ("1","true","yes","on")
+                                it["_trig_checks"]["structure_30m"] = "fail"
                             except Exception:
-                                return bool(default)
-                    
-                        req_struct_30m = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_30M", True)
-                        req_struct_1h = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_1H", True)
-                    
-                        # Trap: by default, follow global trap switches if they are set; otherwise enabled.
-                        try:
-                            _trap_global = os.getenv("MID_TRAP_FILTERS", None)
-                            if _trap_global is None:
-                                _trap_global = os.getenv("TRAP_FILTER_ENABLED", None)
-                            if _trap_global is not None:
-                                req_trap = str(_trap_global).strip().lower() in ("1","true","yes","on")
+                                pass
+                            if full_diag:
+                                _trig_add("structure_broken_30m", "structure_broken")
                             else:
-                                req_trap = True
-                        except Exception:
-                            req_trap = True
-                        # Explicit per-trigger override always wins (set MID_TRIGGER_REQUIRE_TRAP=0/1)
+                                keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
+                                _pending_log_trigger(sym, market, direction, outc, "structure_broken_30m", it, float(price))
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
+
+                        # 1h structure
+                        struct_1h = _mid_structure_hhhl(
+                            df1h,
+                            lookback=int(os.getenv("MID_STRUCTURE_LOOKBACK_1H", "220") or 220),
+                            pivot=int(os.getenv("MID_STRUCTURE_PIVOT", "3") or 3),
+                        )
                         try:
-                            _tov = os.getenv("MID_TRIGGER_REQUIRE_TRAP", "").strip()
-                            if _tov != "":
-                                req_trap = _env_true("MID_TRIGGER_REQUIRE_TRAP", req_trap)
+                            it["_trig_checks"]["structure_1h"] = "pass"
                         except Exception:
                             pass
-
-
-                        # We track two things:
-                        # - reasons: human/debug keys for logs + [mid][status]
-                        # - primary_apply: canonical reason passed into _pending_apply_fail() (preserves existing hard/soft policies)
-                        trig_state = {"primary_apply": None, "reasons": []}
-                        def _trig_add(reason_key: str, apply_reason: str | None = None) -> None:
-                            """Record a failed trigger filter.
-
-                            reason_key: what we want to show in logs/status (e.g. bos_5m_missing)
-                            apply_reason: what to pass into _pending_apply_fail (e.g. liq_sweep_missing)
-                            """
-                            try:
-                                rk = str(reason_key or "").strip()
-                                ar = str(apply_reason or reason_key or "").strip()
-                                if not rk:
-                                    return
-                                if rk not in trig_state["reasons"]:
-                                    trig_state["reasons"].append(rk)
-                                if trig_state["primary_apply"] is None and ar:
-                                    trig_state["primary_apply"] = ar
-                            except Exception:
-                                pass
-
-                        # Smart delete (terminal invalidation): if higher-timeframe structure
-                        # is clearly opposite to the pending direction, drop immediately.
-                        #
-                        # NOTE: We check BOTH 30m and 1h structures (requested). This protects
-                        # against cases where 1h still lags but 30m already flipped.
                         try:
-                            # 30m structure
-                            struct_30m = _mid_structure_hhhl(
-                                df30,
-                                lookback=int(os.getenv("MID_STRUCTURE_LOOKBACK_30M", "260") or 260),
-                                pivot=int(os.getenv("MID_STRUCTURE_PIVOT", "3") or 3),
-                            )
-                            try:
-                                it["_trig_checks"]["structure_30m"] = "pass"
-                            except Exception:
-                                pass
-                            try:
-                                if not req_struct_30m:
-                                    it["_trig_checks"]["structure_30m"] = "skip"
-                            except Exception:
-                                pass
-                            if req_struct_30m and str(direction).upper() == "LONG" and struct_30m == "LH-LL":
-                                try:
-                                    it["_trig_checks"]["structure_30m"] = "fail"
-                                except Exception:
-                                    pass
-                                if full_diag:
-                                    _trig_add("structure_broken_30m", "structure_broken")
-                                else:
-                                    keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
-                                    _pending_log_trigger(sym, market, direction, outc, "structure_broken_30m", it, float(price))
-                                    # If structure is broken we must not proceed to other trigger checks in this poll.
-                                    # For soft-fail policies (env override), we keep waiting; for hard-fail we drop.
-                                    if keep_it:
-                                        keep.append(it)
-                                        any_wait = True
-                                    else:
-                                        try:
-                                            removed_n += 1
-                                        except Exception:
-                                            pass
-                                    continue
-                            if req_struct_30m and str(direction).upper() == "SHORT" and struct_30m == "HH-HL":
-                                try:
-                                    it["_trig_checks"]["structure_30m"] = "fail"
-                                except Exception:
-                                    pass
-                                if full_diag:
-                                    _trig_add("structure_broken_30m", "structure_broken")
-                                else:
-                                    keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
-                                    _pending_log_trigger(sym, market, direction, outc, "structure_broken_30m", it, float(price))
-                                    if keep_it:
-                                        keep.append(it)
-                                        any_wait = True
-                                    else:
-                                        try:
-                                            removed_n += 1
-                                        except Exception:
-                                            pass
-                                    continue
-
-                            # 1h structure
-                            struct_1h = _mid_structure_hhhl(
-                                df1h,
-                                lookback=int(os.getenv("MID_STRUCTURE_LOOKBACK_1H", "220") or 220),
-                                pivot=int(os.getenv("MID_STRUCTURE_PIVOT", "3") or 3),
-                            )
-                            try:
-                                it["_trig_checks"]["structure_1h"] = "pass"
-                            except Exception:
-                                pass
-                            try:
-                                if not req_struct_1h:
-                                    it["_trig_checks"]["structure_1h"] = "skip"
-                            except Exception:
-                                pass
-                            if req_struct_1h and str(direction).upper() == "LONG" and struct_1h == "LH-LL":
-                                try:
-                                    it["_trig_checks"]["structure_1h"] = "fail"
-                                except Exception:
-                                    pass
-                                if full_diag:
-                                    _trig_add("structure_broken_1h", "structure_broken")
-                                else:
-                                    keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
-                                    _pending_log_trigger(sym, market, direction, outc, "structure_broken_1h", it, float(price))
-                                    if keep_it:
-                                        keep.append(it)
-                                        any_wait = True
-                                    else:
-                                        try:
-                                            removed_n += 1
-                                        except Exception:
-                                            pass
-                                    continue
-                            if req_struct_1h and str(direction).upper() == "SHORT" and struct_1h == "HH-HL":
-                                try:
-                                    it["_trig_checks"]["structure_1h"] = "fail"
-                                except Exception:
-                                    pass
-                                if full_diag:
-                                    _trig_add("structure_broken_1h", "structure_broken")
-                                else:
-                                    keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
-                                    _pending_log_trigger(sym, market, direction, outc, "structure_broken_1h", it, float(price))
-                                    if keep_it:
-                                        keep.append(it)
-                                        any_wait = True
-                                    else:
-                                        try:
-                                            removed_n += 1
-                                        except Exception:
-                                            pass
-                                    continue
+                            if not req_struct_1h:
+                                it["_trig_checks"]["structure_1h"] = "skip"
                         except Exception:
                             pass
+                        if req_struct_1h and str(direction).upper() == "LONG" and struct_1h == "LH-LL":
+                            try:
+                                it["_trig_checks"]["structure_1h"] = "fail"
+                            except Exception:
+                                pass
+                            if full_diag:
+                                _trig_add("structure_broken_1h", "structure_broken")
+                            else:
+                                keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
+                                _pending_log_trigger(sym, market, direction, outc, "structure_broken_1h", it, float(price))
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
+                        if req_struct_1h and str(direction).upper() == "SHORT" and struct_1h == "HH-HL":
+                            try:
+                                it["_trig_checks"]["structure_1h"] = "fail"
+                            except Exception:
+                                pass
+                            if full_diag:
+                                _trig_add("structure_broken_1h", "structure_broken")
+                            else:
+                                keep_it, outc = _pending_apply_fail(it, "structure_broken", now)
+                                _pending_log_trigger(sym, market, direction, outc, "structure_broken_1h", it, float(price))
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
+                    except Exception:
+                        pass
 
 
-                        # re-confirm TA at trigger moment
+                    # re-confirm TA at trigger moment
+                    _ph_tok = None
+                    try:
+                        _ph_tok = _MID_EVAL_PHASE.set('trigger')
+                    except Exception:
                         _ph_tok = None
+                    try:
+                        ta = evaluate_on_exchange_mid_v2(df5, df30, df1h, symbol=sym)
+                    finally:
                         try:
-                            _ph_tok = _MID_EVAL_PHASE.set('trigger')
+                            if _ph_tok is not None:
+                                _MID_EVAL_PHASE.reset(_ph_tok)
                         except Exception:
-                            _ph_tok = None
-                        try:
-                            ta = evaluate_on_exchange_mid_v2(df5, df30, df1h, symbol=sym)
-                        finally:
+                            pass
+                    if not ta:
+                        keep_it, outc = _pending_apply_fail(it, "no_ta", now)
+                        _pending_log_trigger(sym, market, direction, outc, "no_ta", it, float(price))
+                        if keep_it:
+                            keep.append(it)
+                            any_wait = True
+                        else:
                             try:
-                                if _ph_tok is not None:
-                                    _MID_EVAL_PHASE.reset(_ph_tok)
+                                removed_n += 1
                             except Exception:
                                 pass
-                        if not ta:
-                            keep_it, outc = _pending_apply_fail(it, "no_ta", now)
-                            _pending_log_trigger(sym, market, direction, outc, "no_ta", it, float(price))
+                        continue
+
+                    # Snapshot trigger-time metrics for richer [mid][pending][trigger] logs
+                    try:
+                        # Compute score/conf consistently to avoid score_low using confidence (double-penalty bug).
+                        try:
+                            _score = ta.get("score")
+                            if _score is None:
+                                _score = ta.get("total")
+                            if _score is None:
+                                # Backward compat / internal fields
+                                _score = ta.get("ta_score_total")
+                            if _score is None:
+                                _score = ta.get("ta_score")
+                            score_v = float(_score or 0.0)
+                        except Exception:
+                            score_v = 0.0
+                        try:
+                            _conf = ta.get("confidence")
+                            conf_v = float(_conf) if (_conf is not None and _conf != "") else float(score_v)
+                        except Exception:
+                            conf_v = float(score_v)
+                        it["_trig_score"] = int(score_v)
+                        it["_trig_conf"] = int(conf_v)
+                    except Exception:
+                        it["_trig_score"] = None
+                        it["_trig_conf"] = None
+                    try:
+                        it["_trig_trap_reason"] = str(ta.get("trap_reason") or "")
+                    except Exception:
+                        it["_trig_trap_reason"] = ""
+
+                    # Precompute trigger-time volume debug fields (volx/thr/thr_base/thr_why) so logs are never blank,
+                    # even when an earlier trigger filter (e.g. score_low) short-circuits.
+                    try:
+                        mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or 0)
+                        try:
+                            _t = os.getenv("MID_TRIGGER_MIN_VOL_X", "").strip()
+                            trig_min_vol_x = float(_t) if _t != "" else (mid_min_vol_x * 0.75 if mid_min_vol_x else 0.0)
+                        except Exception:
+                            trig_min_vol_x = mid_min_vol_x * 0.75 if mid_min_vol_x else 0.0
+                        base_thr = float(trig_min_vol_x or 0.0)
+                        try:
+                            volx_raw = ta.get("rel_vol")
+                            if volx_raw is None:
+                                volx_raw = ta.get("vol_x")
+                            volx = float(volx_raw or 0.0)
+                        except Exception:
+                            volx = 0.0
+                        thr = float(base_thr)
+                        thr_why = []
+                        try:
+                            adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
+                        except Exception:
+                            adx1h = 0.0
+                        if adx1h >= 25.0 and thr > 0:
+                            thr *= 0.80
+                            thr_why.append("ADX")
+                        try:
+                            s_v = float(it.get("_trig_score") or 0.0)
+                        except Exception:
+                            s_v = 0.0
+                        try:
+                            c_v = float(it.get("_trig_conf") or s_v)
+                        except Exception:
+                            c_v = s_v
+                        try:
+                            use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
+                            if use_main:
+                                min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
+                                min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
+                            else:
+                                min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76") or 76)
+                                 # Prefer MID_MIN_SCORE_FUT if set; fallback to MID_MIN_SCORE_FUTURES
+                                _msf = os.getenv("MID_MIN_SCORE_FUT")
+                                if _msf is not None and str(_msf).strip() != "":
+                                    min_score_fut = int(_msf)
+                                else:
+                                    min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
+                            need_v = float(min_score_fut if market == "FUTURES" else min_score_spot)
+                        except Exception:
+                            need_v = 0.0
+                        if thr > 0 and max(s_v, c_v) >= max(90.0, (need_v + 8.0) if need_v else 90.0):
+                            thr *= 0.80
+                            thr_why.append("SCORE")
+                        it["_trig_volx"] = float(volx or 0.0)
+                        it["_trig_vol_thr_base"] = float(base_thr or 0.0)
+                        it["_trig_vol_thr"] = float(thr or 0.0)
+                        if not base_thr or base_thr <= 0:
+                            it["_trig_vol_thr_why"] = "disabled"
+                        elif not (volx and volx > 0):
+                            it["_trig_vol_thr_why"] = "skip_missing_volx"
+                        else:
+                            it["_trig_vol_thr_why"] = ",".join(thr_why) if thr_why else "base"
+                    except Exception:
+                        pass
+                    # Direction check
+                    # By default we DO NOT block on minor direction flips at trigger-time because the setup was built earlier.
+                    # We only soft-fail on direction mismatch when we detect a *strong reversal* (trend + strong ADX).
+                    try:
+                        req_dir = os.getenv("MID_TRIGGER_REQUIRE_DIRECTION", "1").strip().lower() in ("1", "true", "yes", "on")
+                    except Exception:
+                        req_dir = True
+
+                    ta_dir = str(ta.get("direction") or "").upper()
+                    if not req_dir:
+                        try:
+                            it["_trig_checks"]["direction"] = "skip"
+                        except Exception:
+                            pass
+                    elif ta_dir and ta_dir != direction:
+                        # Strong reversal heuristic:
+                        # - mstruct is TREND (not RANGE/CHOPPY)
+                        # - ADX(1h) >= MID_TRIGGER_DIR_REVERSAL_ADX_MIN
+                        try:
+                            adx_rev_min = float(os.getenv("MID_TRIGGER_DIR_REVERSAL_ADX_MIN", "28") or 28)
+                        except Exception:
+                            adx_rev_min = 28.0
+                        try:
+                            adx1h_rev = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
+                        except Exception:
+                            adx1h_rev = 0.0
+                        try:
+                            mstruct_rev = str(ta.get("mstruct") or "")
+                        except Exception:
+                            mstruct_rev = ""
+                        strong_rev = ("TREND" in mstruct_rev.upper()) and (adx1h_rev >= adx_rev_min)
+
+                        if strong_rev:
+                            try:
+                                it["_trig_checks"]["direction"] = "fail"
+                            except Exception:
+                                pass
+                            if full_diag:
+                                _trig_add("direction_mismatch", "direction_mismatch")
+                            else:
+                                keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
+                                _pending_log_trigger(sym, market, direction, outc, "direction_mismatch", it, float(price))
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
+                        else:
+                            # minor flip -> ignore and allow emit
+                            try:
+                                it["_trig_checks"]["direction"] = "skip"
+                            except Exception:
+                                pass
+                    else:
+                        # Only mark as pass when it really passed.
+                        try:
+                            it["_trig_checks"]["direction"] = "pass"
+                        except Exception:
+                            pass
+                    # NOTE: Trigger intentionally ignores ta['blocked']/block_reason (anti_bounce_*, late_entry_atr, etc.).
+                    if not req_trap:
+                        try:
+                            it["_trig_checks"]["trap"] = "skip"
+                        except Exception:
+                            pass
+                    elif not bool(ta.get("trap_ok", True)):
+                        try:
+                            it["_trig_checks"]["trap"] = "fail"
+                        except Exception:
+                            pass
+                        if full_diag:
+                            _trig_add("trap_block", "trap_block")
+                        else:
+                            keep_it, outc = _pending_apply_fail(it, "trap_block", now)
+                            _pending_log_trigger(sym, market, direction, outc, "trap_block", it, float(price))
                             if keep_it:
                                 keep.append(it)
                                 any_wait = True
@@ -14151,143 +14533,50 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
                                 except Exception:
                                     pass
                             continue
-
-                        # Snapshot trigger-time metrics for richer [mid][pending][trigger] logs
+                    else:
                         try:
-                            # Compute score/conf consistently to avoid score_low using confidence (double-penalty bug).
-                            try:
-                                _score = ta.get("score")
-                                if _score is None:
-                                    _score = ta.get("total")
-                                if _score is None:
-                                    # Backward compat / internal fields
-                                    _score = ta.get("ta_score_total")
-                                if _score is None:
-                                    _score = ta.get("ta_score")
-                                score_v = float(_score or 0.0)
-                            except Exception:
-                                score_v = 0.0
-                            try:
-                                _conf = ta.get("confidence")
-                                conf_v = float(_conf) if (_conf is not None and _conf != "") else float(score_v)
-                            except Exception:
-                                conf_v = float(score_v)
-                            it["_trig_score"] = int(score_v)
-                            it["_trig_conf"] = int(conf_v)
-                        except Exception:
-                            it["_trig_score"] = None
-                            it["_trig_conf"] = None
-                        try:
-                            it["_trig_trap_reason"] = str(ta.get("trap_reason") or "")
-                        except Exception:
-                            it["_trig_trap_reason"] = ""
-
-                        # Precompute trigger-time volume debug fields (volx/thr/thr_base/thr_why) so logs are never blank,
-                        # even when an earlier trigger filter (e.g. score_low) short-circuits.
-                        try:
-                            mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or 0)
-                            try:
-                                _t = os.getenv("MID_TRIGGER_MIN_VOL_X", "").strip()
-                                trig_min_vol_x = float(_t) if _t != "" else (mid_min_vol_x * 0.75 if mid_min_vol_x else 0.0)
-                            except Exception:
-                                trig_min_vol_x = mid_min_vol_x * 0.75 if mid_min_vol_x else 0.0
-                            base_thr = float(trig_min_vol_x or 0.0)
-                            try:
-                                volx_raw = ta.get("rel_vol")
-                                if volx_raw is None:
-                                    volx_raw = ta.get("vol_x")
-                                volx = float(volx_raw or 0.0)
-                            except Exception:
-                                volx = 0.0
-                            thr = float(base_thr)
-                            thr_why = []
-                            try:
-                                adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
-                            except Exception:
-                                adx1h = 0.0
-                            if adx1h >= 25.0 and thr > 0:
-                                thr *= 0.80
-                                thr_why.append("ADX")
-                            try:
-                                s_v = float(it.get("_trig_score") or 0.0)
-                            except Exception:
-                                s_v = 0.0
-                            try:
-                                c_v = float(it.get("_trig_conf") or s_v)
-                            except Exception:
-                                c_v = s_v
-                            try:
-                                use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
-                                if use_main:
-                                    min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
-                                    min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
-                                else:
-                                    min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76") or 76)
-                                     # Prefer MID_MIN_SCORE_FUT if set; fallback to MID_MIN_SCORE_FUTURES
-                                    _msf = os.getenv("MID_MIN_SCORE_FUT")
-                                    if _msf is not None and str(_msf).strip() != "":
-                                        min_score_fut = int(_msf)
-                                    else:
-                                        min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
-                                need_v = float(min_score_fut if market == "FUTURES" else min_score_spot)
-                            except Exception:
-                                need_v = 0.0
-                            if thr > 0 and max(s_v, c_v) >= max(90.0, (need_v + 8.0) if need_v else 90.0):
-                                thr *= 0.80
-                                thr_why.append("SCORE")
-                            it["_trig_volx"] = float(volx or 0.0)
-                            it["_trig_vol_thr_base"] = float(base_thr or 0.0)
-                            it["_trig_vol_thr"] = float(thr or 0.0)
-                            if not base_thr or base_thr <= 0:
-                                it["_trig_vol_thr_why"] = "disabled"
-                            elif not (volx and volx > 0):
-                                it["_trig_vol_thr_why"] = "skip_missing_volx"
-                            else:
-                                it["_trig_vol_thr_why"] = ",".join(thr_why) if thr_why else "base"
+                            it["_trig_checks"]["trap"] = "pass"
                         except Exception:
                             pass
-                        # Direction check
-                        # By default we DO NOT block on minor direction flips at trigger-time because the setup was built earlier.
-                        # We only soft-fail on direction mismatch when we detect a *strong reversal* (trend + strong ADX).
-                        try:
-                            req_dir = os.getenv("MID_TRIGGER_REQUIRE_DIRECTION", "1").strip().lower() in ("1", "true", "yes", "on")
-                        except Exception:
-                            req_dir = True
 
-                        ta_dir = str(ta.get("direction") or "").upper()
-                        if not req_dir:
-                            try:
-                                it["_trig_checks"]["direction"] = "skip"
-                            except Exception:
-                                pass
-                        elif ta_dir and ta_dir != direction:
-                            # Strong reversal heuristic:
-                            # - mstruct is TREND (not RANGE/CHOPPY)
-                            # - ADX(1h) >= MID_TRIGGER_DIR_REVERSAL_ADX_MIN
-                            try:
-                                adx_rev_min = float(os.getenv("MID_TRIGGER_DIR_REVERSAL_ADX_MIN", "28") or 28)
-                            except Exception:
-                                adx_rev_min = 28.0
-                            try:
-                                adx1h_rev = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
-                            except Exception:
-                                adx1h_rev = 0.0
-                            try:
-                                mstruct_rev = str(ta.get("mstruct") or "")
-                            except Exception:
-                                mstruct_rev = ""
-                            strong_rev = ("TREND" in mstruct_rev.upper()) and (adx1h_rev >= adx_rev_min)
-
-                            if strong_rev:
+                    # BOS opposite-direction blockers (must obey env switches)
+                    # - MID_BLOCK_LONG_BOS_DOWN: block LONG if bos_down_5m=True
+                    # - MID_BLOCK_SHORT_BOS_UP: block SHORT if bos_up_5m=True
+                    try:
+                        req_block_long = _env_true("MID_BLOCK_LONG_BOS_DOWN", True)
+                    except Exception:
+                        req_block_long = True
+                    try:
+                        req_block_short = _env_true("MID_BLOCK_SHORT_BOS_UP", True)
+                    except Exception:
+                        req_block_short = True
+                    try:
+                        if (not req_block_long) and (not req_block_short):
+                            it["_trig_checks"]["bos_block"] = "skip"
+                        else:
+                            bos_up_5m = bool(ta.get("bos_up_5m", False))
+                            bos_down_5m = bool(ta.get("bos_down_5m", False))
+                            hit = False
+                            if str(direction).upper() == "LONG":
+                                if not req_block_long:
+                                    it["_trig_checks"]["bos_block"] = "skip"
+                                elif bos_down_5m:
+                                    hit = True
+                            elif str(direction).upper() == "SHORT":
+                                if not req_block_short:
+                                    it["_trig_checks"]["bos_block"] = "skip"
+                                elif bos_up_5m:
+                                    hit = True
+                            if hit:
                                 try:
-                                    it["_trig_checks"]["direction"] = "fail"
+                                    it["_trig_checks"]["bos_block"] = "fail"
                                 except Exception:
                                     pass
                                 if full_diag:
-                                    _trig_add("direction_mismatch", "direction_mismatch")
+                                    _trig_add("bos_block", "blocked")
                                 else:
-                                    keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
-                                    _pending_log_trigger(sym, market, direction, outc, "direction_mismatch", it, float(price))
+                                    keep_it, outc = _pending_apply_fail(it, "blocked", now)
+                                    _pending_log_trigger(sym, market, direction, outc, "bos_block", it, float(price))
                                     if keep_it:
                                         keep.append(it)
                                         any_wait = True
@@ -14298,1319 +14587,1229 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
                                             pass
                                     continue
                             else:
-                                # minor flip -> ignore and allow emit
+                                if it.get("_trig_checks", {}).get("bos_block") != "skip":
+                                    it["_trig_checks"]["bos_block"] = "pass"
+                    except Exception:
+                        pass
+
+                    # --- Institutional trigger logic (adaptive by regime) ---
+                    # Goal: in CHOPPY/RANGE, require liquidity event + reclaim + micro structure confirmation,
+                    # and treat volume as a secondary confirmation (not a guillotine).
+                    try:
+                        trig_mode = os.getenv("MID_TRIGGER_MODE", "institutional").strip().lower()
+                    except Exception:
+                        trig_mode = "institutional"
+
+                    if trig_mode in ("institutional", "inst", "pro"):
+                        try:
+                            diru = str(direction).upper()
+                            mstruct = str(ta.get("mstruct") or "—").upper()
+                            regime_txt = str(ta.get("regime") or "")
+                            # Regime detection thresholds (can be tuned via env)
+                            try:
+                                adx_trend_min = float(os.getenv("MID_INST_ADX_TREND_MIN", "22") or 22.0)
+                            except Exception:
+                                adx_trend_min = 22.0
+                            try:
+                                adx_choppy_max = float(os.getenv("MID_INST_ADX_CHOPPY_MAX", "18") or 18.0)
+                            except Exception:
+                                adx_choppy_max = 18.0
+                            try:
+                                adx1h_v = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
+                            except Exception:
+                                adx1h_v = 0.0
+                            try:
+                                adx30_v = float(ta.get("adx1") or ta.get("adx_30m") or 0.0)
+                            except Exception:
+                                adx30_v = 0.0
+
+                            # TREND: mstruct=TREND and ADX(1h) >= adx_trend_min and not CHOPPY
+                            # RANGE/CHOPPY: mstruct=RANGE OR regime contains CHOPPY OR ADX(1h) < adx_choppy_max
+                            is_choppy = ("choppy" in regime_txt.lower()) or (mstruct == "RANGE") or (adx1h_v < float(adx_choppy_max))
+                            is_trend = (mstruct == "TREND") and (adx1h_v >= float(adx_trend_min)) and (not ("choppy" in regime_txt.lower()))
+                            reg = "TREND" if is_trend else ("RANGE" if is_choppy else "MIXED")
+                            # Feature flags from TA (computed on 5m / 30m / 1h)
+                            sweep_long = bool(ta.get("sweep_long", False))
+                            sweep_short = bool(ta.get("sweep_short", False))
+                            bos_up = bool(ta.get("bos_up_5m", False))
+                            bos_down = bool(ta.get("bos_down_5m", False))
+                            disp_x = 0.0
+                            try:
+                                disp_x = float(ta.get("disp_body_atr") or 0.0)
+                            except Exception:
+                                disp_x = 0.0
+                            try:
+                                close5 = float(ta.get("close") or ta.get("c") or px_close or 0.0)
+                            except Exception:
                                 try:
-                                    it["_trig_checks"]["direction"] = "skip"
+                                    close5 = float(px_close)
                                 except Exception:
-                                    pass
-                        else:
-                            # Only mark as pass when it really passed.
+                                    close5 = float(entry0)
+
+
+                            # Reclaim: allow entry on reclaim even if price already slightly beyond the zone
                             try:
-                                it["_trig_checks"]["direction"] = "pass"
+                                reclaim_eps = float(os.getenv("MID_INST_RECLAIM_EPS_PCT", "0.0006") or 0.0006)
+                            except Exception:
+                                reclaim_eps = 0.0006
+                            # Reclaim only makes sense when we have a real zone (entry_low/entry_high).
+                            reclaim_ok = True
+                            try:
+                                _lo = float(entry_low) if (entry_low is not None) else 0.0
+                                _hi = float(entry_high) if (entry_high is not None) else 0.0
+                                if _lo > 0 and _hi > 0 and _hi >= _lo:
+                                    if diru == "LONG":
+                                        reclaim_ok = bool(close5 >= (_hi * (1.0 + reclaim_eps)))
+                                    elif diru == "SHORT":
+                                        reclaim_ok = bool(close5 <= (_lo * (1.0 - reclaim_eps)))
+                            except Exception:
+                                reclaim_ok = True
+
+                            try:
+                                it["_trig_checks"]["reclaim"] = "pass" if reclaim_ok else "fail"
                             except Exception:
                                 pass
-                        # NOTE: Trigger intentionally ignores ta['blocked']/block_reason (anti_bounce_*, late_entry_atr, etc.).
-                        if not req_trap:
+                            # Liquidity requirement: strict in RANGE/CHOPPY, optional in TREND by default.
                             try:
-                                it["_trig_checks"]["trap"] = "skip"
+                                _v = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP_RANGE")
+                                if _v is None or str(_v).strip() == "":
+                                    _v = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP", "1")
+                                req_liq_range = str(_v).strip().lower() in ("1","true","yes","on")
                             except Exception:
-                                pass
-                        elif not bool(ta.get("trap_ok", True)):
+                                req_liq_range = True
                             try:
-                                it["_trig_checks"]["trap"] = "fail"
+                                _v = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP_TREND")
+                                if _v is None or str(_v).strip() == "":
+                                    # TREND optional by default
+                                    _v = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP", "0")
+                                req_liq_trend = str(_v).strip().lower() in ("1","true","yes","on")
                             except Exception:
-                                pass
-                            if full_diag:
-                                _trig_add("trap_block", "trap_block")
-                            else:
-                                keep_it, outc = _pending_apply_fail(it, "trap_block", now)
-                                _pending_log_trigger(sym, market, direction, outc, "trap_block", it, float(price))
-                                if keep_it:
-                                    keep.append(it)
-                                    any_wait = True
+                                req_liq_trend = False
+                            req_liq = req_liq_trend if (reg == "TREND") else req_liq_range
+
+                            liq_ok = True
+                            if req_liq:
+                                if diru == "LONG":
+                                    liq_ok = sweep_long
                                 else:
-                                    try:
-                                        removed_n += 1
-                                    except Exception:
-                                        pass
-                                continue
-                        else:
+                                    liq_ok = sweep_short
+
                             try:
-                                it["_trig_checks"]["trap"] = "pass"
+                                it["_trig_reqs"]["sweep"] = bool(req_liq)
+                            except Exception:
+                                pass
+                            try:
+                                # env=0 => fully skipped (must not block)
+                                it["_trig_checks"]["sweep"] = ("skip" if (not req_liq) else ("pass" if liq_ok else "fail"))
+                            except Exception:
+                                pass
+                            # Micro-structure confirmation: BOS in the signal direction (strict in RANGE).
+                            try:
+                                _v = os.getenv("MID_INST_REQUIRE_BOS_RANGE")
+                                if _v is None or str(_v).strip() == "":
+                                    _v = os.getenv("MID_INST_REQUIRE_BOS", "1")
+                                req_bos_range = str(_v).strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_bos_range = True
+                            try:
+                                _v = os.getenv("MID_INST_REQUIRE_BOS_TREND")
+                                if _v is None or str(_v).strip() == "":
+                                    # TREND optional by default
+                                    _v = os.getenv("MID_INST_REQUIRE_BOS", "0")
+                                req_bos_trend = str(_v).strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_bos_trend = False
+                            req_bos = req_bos_trend if (reg == "TREND") else req_bos_range
+
+                            bos_ok = True
+                            if req_bos:
+                                if diru == "LONG":
+                                    bos_ok = bos_up
+                                else:
+                                    bos_ok = bos_down
+
+                            try:
+                                it["_trig_reqs"]["bos_5m"] = bool(req_bos)
+                            except Exception:
+                                pass
+                            try:
+                                it["_trig_checks"]["bos_5m"] = ("skip" if (not req_bos) else ("pass" if bos_ok else "fail"))
+                            except Exception:
+                                pass
+                            # Displacement: require a minimum body/ATR ratio (helps avoid thin fake moves).
+                            # Displacement: require a minimum body/ATR ratio (helps avoid thin fake moves).
+                            try:
+                                _v = os.getenv("MID_INST_REQUIRE_DISPLACEMENT_RANGE")
+                                if _v is None or str(_v).strip() == "":
+                                    _v = os.getenv("MID_INST_REQUIRE_DISPLACEMENT", "1")
+                                req_disp_range = str(_v).strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_disp_range = True
+                            try:
+                                _v = os.getenv("MID_INST_REQUIRE_DISPLACEMENT_TREND")
+                                if _v is None or str(_v).strip() == "":
+                                    # TREND optional by default
+                                    _v = os.getenv("MID_INST_REQUIRE_DISPLACEMENT", "0")
+                                req_disp_trend = str(_v).strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_disp_trend = False
+                            req_disp = req_disp_trend if (reg == "TREND") else req_disp_range
+                            try:
+                                _v = os.getenv("MID_INST_DISP_MIN_X_RANGE")
+                                if _v is None or str(_v).strip() == "":
+                                    _v = os.getenv("MID_INST_DISP_MIN", "0.35")
+                                disp_min_range = float(_v or 0.35)
+                            except Exception:
+                                disp_min_range = 0.35
+                            try:
+                                _v = os.getenv("MID_INST_DISP_MIN_X_TREND")
+                                if _v is None or str(_v).strip() == "":
+                                    _v = os.getenv("MID_INST_DISP_MIN", "0.25")
+                                disp_min_trend = float(_v or 0.25)
+                            except Exception:
+                                disp_min_trend = 0.25
+                            disp_min = disp_min_trend if (reg == "TREND") else disp_min_range
+                            disp_ok = True if (not req_disp) else bool(disp_x >= disp_min)
+
+                            try:
+                                it["_trig_reqs"]["displacement"] = bool(req_disp)
+                            except Exception:
+                                pass
+                            try:
+                                it["_trig_checks"]["displacement"] = ("skip" if (not req_disp) else ("pass" if disp_ok else "fail"))
+                            except Exception:
+                                pass
+                            # In RANGE/CHOPPY, reclaim is usually required to avoid catching falling knives.
+                            try:
+                                _v = os.getenv("MID_INST_REQUIRE_RECLAIM_RANGE")
+                                if _v is None or str(_v).strip() == "":
+                                    _v = os.getenv("MID_INST_REQUIRE_RECLAIM", "1")
+                                req_reclaim_range = str(_v).strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_reclaim_range = True
+                            try:
+                                _v = os.getenv("MID_INST_REQUIRE_RECLAIM_TREND")
+                                if _v is None or str(_v).strip() == "":
+                                    # TREND optional by default
+                                    _v = os.getenv("MID_INST_REQUIRE_RECLAIM", "0")
+                                req_reclaim_trend = str(_v).strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_reclaim_trend = False
+                            req_reclaim = req_reclaim_trend if (reg == "TREND") else req_reclaim_range
+                            try:
+                                it["_trig_reqs"]["reclaim"] = bool(req_reclaim)
+                                if not bool(req_reclaim):
+                                    # env=0 => fully skipped (must not block)
+                                    it["_trig_checks"]["reclaim"] = "skip"
                             except Exception:
                                 pass
 
-                        # BOS opposite-direction blockers (must obey env switches)
-                        # - MID_BLOCK_LONG_BOS_DOWN: block LONG if bos_down_5m=True
-                        # - MID_BLOCK_SHORT_BOS_UP: block SHORT if bos_up_5m=True
-                        try:
-                            req_block_long = _env_true("MID_BLOCK_LONG_BOS_DOWN", True)
-                        except Exception:
-                            req_block_long = True
-                        try:
-                            req_block_short = _env_true("MID_BLOCK_SHORT_BOS_UP", True)
-                        except Exception:
-                            req_block_short = True
-                        try:
-                            if (not req_block_long) and (not req_block_short):
-                                it["_trig_checks"]["bos_block"] = "skip"
-                            else:
-                                bos_up_5m = bool(ta.get("bos_up_5m", False))
-                                bos_down_5m = bool(ta.get("bos_down_5m", False))
-                                hit = False
-                                if str(direction).upper() == "LONG":
-                                    if not req_block_long:
-                                        it["_trig_checks"]["bos_block"] = "skip"
-                                    elif bos_down_5m:
-                                        hit = True
-                                elif str(direction).upper() == "SHORT":
-                                    if not req_block_short:
-                                        it["_trig_checks"]["bos_block"] = "skip"
-                                    elif bos_up_5m:
-                                        hit = True
-                                if hit:
-                                    try:
-                                        it["_trig_checks"]["bos_block"] = "fail"
-                                    except Exception:
-                                        pass
-                                    if full_diag:
-                                        _trig_add("bos_block", "blocked")
-                                    else:
-                                        keep_it, outc = _pending_apply_fail(it, "blocked", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "bos_block", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
-                                        else:
-                                            try:
-                                                removed_n += 1
-                                            except Exception:
-                                                pass
-                                        continue
-                                else:
-                                    if it.get("_trig_checks", {}).get("bos_block") != "skip":
-                                        it["_trig_checks"]["bos_block"] = "pass"
+                            # Save regime/disp for downstream volume filter + logs
+                            it["_trig_inst_regime"] = reg
+                            it["_trig_inst_disp_x"] = float(disp_x)
+
+                            if req_reclaim and (not reclaim_ok):
+                                _trig_add("reclaim_missing", "reclaim_missing")
+
+                            if req_liq and (not liq_ok):
+                                # Keep apply reason as liq_sweep_missing to preserve soft-fail policy.
+                                _trig_add("sweep_missing", "liq_sweep_missing")
+
+                            if req_bos and (not bos_ok):
+                                _trig_add("bos_5m_missing", "bos_missing")
+
+                            if req_disp and (not disp_ok):
+                                _trig_add("displacement_missing", "displacement_weak")
+
+                            # Compact institutional trigger score for debugging only (doesn't replace TA score).
+                            try:
+                                inst_score = 0
+                                inst_score += 30 if liq_ok else 0
+                                inst_score += 25 if reclaim_ok else 0
+                                inst_score += 20 if bos_ok else 0
+                                inst_score += int(min(15, max(0, round(disp_x * 10))))  # 0..15
+                                it["_trig_inst_score"] = int(inst_score)
+                            except Exception:
+                                pass
                         except Exception:
                             pass
 
-                        # --- Institutional trigger logic (adaptive by regime) ---
-                        # Goal: in CHOPPY/RANGE, require liquidity event + reclaim + micro structure confirmation,
-                        # and treat volume as a secondary confirmation (not a guillotine).
+                    # Trigger-time confidence threshold can be configured separately from setup-time confidence.
+                    # Precedence: trigger env (global/per-market) -> pending.min_confidence -> MID_MIN_CONFIDENCE.
+                    try:
+                        _tconf = (os.getenv("MID_TRIGGER_MIN_CONFIDENCE", "") or "").strip()
+                        if _tconf == "":
+                            if str(market).upper() == "SPOT":
+                                _tconf = (os.getenv("MID_TRIGGER_MIN_CONFIDENCE_SPOT", "") or "").strip()
+                            else:
+                                _tconf = (os.getenv("MID_TRIGGER_MIN_CONFIDENCE_FUT", "") or "").strip()
+                    except Exception:
+                        _tconf = ""
+
+                    if _tconf != "":
                         try:
-                            trig_mode = os.getenv("MID_TRIGGER_MODE", "institutional").strip().lower()
+                            min_conf = int(float(_tconf))
+                            it["_trig_conf_min_src"] = "env.MID_TRIGGER_MIN_CONFIDENCE" if (os.getenv("MID_TRIGGER_MIN_CONFIDENCE", "") or "").strip() != "" else ("env.MID_TRIGGER_MIN_CONFIDENCE_SPOT" if str(market).upper() == "SPOT" else "env.MID_TRIGGER_MIN_CONFIDENCE_FUT")
                         except Exception:
-                            trig_mode = "institutional"
-
-                        if trig_mode in ("institutional", "inst", "pro"):
-                            try:
-                                diru = str(direction).upper()
-                                mstruct = str(ta.get("mstruct") or "—").upper()
-                                regime_txt = str(ta.get("regime") or "")
-                                # Regime detection thresholds (can be tuned via env)
-                                try:
-                                    adx_trend_min = float(os.getenv("MID_INST_ADX_TREND_MIN", "22") or 22.0)
-                                except Exception:
-                                    adx_trend_min = 22.0
-                                try:
-                                    adx_choppy_max = float(os.getenv("MID_INST_ADX_CHOPPY_MAX", "18") or 18.0)
-                                except Exception:
-                                    adx_choppy_max = 18.0
-                                try:
-                                    adx1h_v = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
-                                except Exception:
-                                    adx1h_v = 0.0
-                                try:
-                                    adx30_v = float(ta.get("adx1") or ta.get("adx_30m") or 0.0)
-                                except Exception:
-                                    adx30_v = 0.0
-
-                                # TREND: mstruct=TREND and ADX(1h) >= adx_trend_min and not CHOPPY
-                                # RANGE/CHOPPY: mstruct=RANGE OR regime contains CHOPPY OR ADX(1h) < adx_choppy_max
-                                is_choppy = ("choppy" in regime_txt.lower()) or (mstruct == "RANGE") or (adx1h_v < float(adx_choppy_max))
-                                is_trend = (mstruct == "TREND") and (adx1h_v >= float(adx_trend_min)) and (not ("choppy" in regime_txt.lower()))
-                                reg = "TREND" if is_trend else ("RANGE" if is_choppy else "MIXED")
-                                # Feature flags from TA (computed on 5m / 30m / 1h)
-                                sweep_long = bool(ta.get("sweep_long", False))
-                                sweep_short = bool(ta.get("sweep_short", False))
-                                bos_up = bool(ta.get("bos_up_5m", False))
-                                bos_down = bool(ta.get("bos_down_5m", False))
-                                disp_x = 0.0
-                                try:
-                                    disp_x = float(ta.get("disp_body_atr") or 0.0)
-                                except Exception:
-                                    disp_x = 0.0
-                                try:
-                                    close5 = float(ta.get("close") or ta.get("c") or px_close or 0.0)
-                                except Exception:
-                                    try:
-                                        close5 = float(px_close)
-                                    except Exception:
-                                        close5 = float(entry0)
-
-
-                                # Reclaim: allow entry on reclaim even if price already slightly beyond the zone
-                                try:
-                                    reclaim_eps = float(os.getenv("MID_INST_RECLAIM_EPS_PCT", "0.0006") or 0.0006)
-                                except Exception:
-                                    reclaim_eps = 0.0006
-                                # Reclaim only makes sense when we have a real zone (entry_low/entry_high).
-                                reclaim_ok = True
-                                try:
-                                    _lo = float(entry_low) if (entry_low is not None) else 0.0
-                                    _hi = float(entry_high) if (entry_high is not None) else 0.0
-                                    if _lo > 0 and _hi > 0 and _hi >= _lo:
-                                        if diru == "LONG":
-                                            reclaim_ok = bool(close5 >= (_hi * (1.0 + reclaim_eps)))
-                                        elif diru == "SHORT":
-                                            reclaim_ok = bool(close5 <= (_lo * (1.0 - reclaim_eps)))
-                                except Exception:
-                                    reclaim_ok = True
-
-                                try:
-                                    it["_trig_checks"]["reclaim"] = "pass" if reclaim_ok else "fail"
-                                except Exception:
-                                    pass
-                                # Liquidity requirement: strict in RANGE/CHOPPY, optional in TREND by default.
-                                try:
-                                    _v = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP_RANGE")
-                                    if _v is None or str(_v).strip() == "":
-                                        _v = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP", "1")
-                                    req_liq_range = str(_v).strip().lower() in ("1","true","yes","on")
-                                except Exception:
-                                    req_liq_range = True
-                                try:
-                                    _v = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP_TREND")
-                                    if _v is None or str(_v).strip() == "":
-                                        # TREND optional by default
-                                        _v = os.getenv("MID_INST_REQUIRE_LIQ_SWEEP", "0")
-                                    req_liq_trend = str(_v).strip().lower() in ("1","true","yes","on")
-                                except Exception:
-                                    req_liq_trend = False
-                                req_liq = req_liq_trend if (reg == "TREND") else req_liq_range
-
-                                liq_ok = True
-                                if req_liq:
-                                    if diru == "LONG":
-                                        liq_ok = sweep_long
-                                    else:
-                                        liq_ok = sweep_short
-
-                                try:
-                                    it["_trig_reqs"]["sweep"] = bool(req_liq)
-                                except Exception:
-                                    pass
-                                try:
-                                    # env=0 => fully skipped (must not block)
-                                    it["_trig_checks"]["sweep"] = ("skip" if (not req_liq) else ("pass" if liq_ok else "fail"))
-                                except Exception:
-                                    pass
-                                # Micro-structure confirmation: BOS in the signal direction (strict in RANGE).
-                                try:
-                                    _v = os.getenv("MID_INST_REQUIRE_BOS_RANGE")
-                                    if _v is None or str(_v).strip() == "":
-                                        _v = os.getenv("MID_INST_REQUIRE_BOS", "1")
-                                    req_bos_range = str(_v).strip().lower() in ("1","true","yes","on")
-                                except Exception:
-                                    req_bos_range = True
-                                try:
-                                    _v = os.getenv("MID_INST_REQUIRE_BOS_TREND")
-                                    if _v is None or str(_v).strip() == "":
-                                        # TREND optional by default
-                                        _v = os.getenv("MID_INST_REQUIRE_BOS", "0")
-                                    req_bos_trend = str(_v).strip().lower() in ("1","true","yes","on")
-                                except Exception:
-                                    req_bos_trend = False
-                                req_bos = req_bos_trend if (reg == "TREND") else req_bos_range
-
-                                bos_ok = True
-                                if req_bos:
-                                    if diru == "LONG":
-                                        bos_ok = bos_up
-                                    else:
-                                        bos_ok = bos_down
-
-                                try:
-                                    it["_trig_reqs"]["bos_5m"] = bool(req_bos)
-                                except Exception:
-                                    pass
-                                try:
-                                    it["_trig_checks"]["bos_5m"] = ("skip" if (not req_bos) else ("pass" if bos_ok else "fail"))
-                                except Exception:
-                                    pass
-                                # Displacement: require a minimum body/ATR ratio (helps avoid thin fake moves).
-                                # Displacement: require a minimum body/ATR ratio (helps avoid thin fake moves).
-                                try:
-                                    _v = os.getenv("MID_INST_REQUIRE_DISPLACEMENT_RANGE")
-                                    if _v is None or str(_v).strip() == "":
-                                        _v = os.getenv("MID_INST_REQUIRE_DISPLACEMENT", "1")
-                                    req_disp_range = str(_v).strip().lower() in ("1","true","yes","on")
-                                except Exception:
-                                    req_disp_range = True
-                                try:
-                                    _v = os.getenv("MID_INST_REQUIRE_DISPLACEMENT_TREND")
-                                    if _v is None or str(_v).strip() == "":
-                                        # TREND optional by default
-                                        _v = os.getenv("MID_INST_REQUIRE_DISPLACEMENT", "0")
-                                    req_disp_trend = str(_v).strip().lower() in ("1","true","yes","on")
-                                except Exception:
-                                    req_disp_trend = False
-                                req_disp = req_disp_trend if (reg == "TREND") else req_disp_range
-                                try:
-                                    _v = os.getenv("MID_INST_DISP_MIN_X_RANGE")
-                                    if _v is None or str(_v).strip() == "":
-                                        _v = os.getenv("MID_INST_DISP_MIN", "0.35")
-                                    disp_min_range = float(_v or 0.35)
-                                except Exception:
-                                    disp_min_range = 0.35
-                                try:
-                                    _v = os.getenv("MID_INST_DISP_MIN_X_TREND")
-                                    if _v is None or str(_v).strip() == "":
-                                        _v = os.getenv("MID_INST_DISP_MIN", "0.25")
-                                    disp_min_trend = float(_v or 0.25)
-                                except Exception:
-                                    disp_min_trend = 0.25
-                                disp_min = disp_min_trend if (reg == "TREND") else disp_min_range
-                                disp_ok = True if (not req_disp) else bool(disp_x >= disp_min)
-
-                                try:
-                                    it["_trig_reqs"]["displacement"] = bool(req_disp)
-                                except Exception:
-                                    pass
-                                try:
-                                    it["_trig_checks"]["displacement"] = ("skip" if (not req_disp) else ("pass" if disp_ok else "fail"))
-                                except Exception:
-                                    pass
-                                # In RANGE/CHOPPY, reclaim is usually required to avoid catching falling knives.
-                                try:
-                                    _v = os.getenv("MID_INST_REQUIRE_RECLAIM_RANGE")
-                                    if _v is None or str(_v).strip() == "":
-                                        _v = os.getenv("MID_INST_REQUIRE_RECLAIM", "1")
-                                    req_reclaim_range = str(_v).strip().lower() in ("1","true","yes","on")
-                                except Exception:
-                                    req_reclaim_range = True
-                                try:
-                                    _v = os.getenv("MID_INST_REQUIRE_RECLAIM_TREND")
-                                    if _v is None or str(_v).strip() == "":
-                                        # TREND optional by default
-                                        _v = os.getenv("MID_INST_REQUIRE_RECLAIM", "0")
-                                    req_reclaim_trend = str(_v).strip().lower() in ("1","true","yes","on")
-                                except Exception:
-                                    req_reclaim_trend = False
-                                req_reclaim = req_reclaim_trend if (reg == "TREND") else req_reclaim_range
-                                try:
-                                    it["_trig_reqs"]["reclaim"] = bool(req_reclaim)
-                                    if not bool(req_reclaim):
-                                        # env=0 => fully skipped (must not block)
-                                        it["_trig_checks"]["reclaim"] = "skip"
-                                except Exception:
-                                    pass
-
-                                # Save regime/disp for downstream volume filter + logs
-                                it["_trig_inst_regime"] = reg
-                                it["_trig_inst_disp_x"] = float(disp_x)
-
-                                if req_reclaim and (not reclaim_ok):
-                                    _trig_add("reclaim_missing", "reclaim_missing")
-
-                                if req_liq and (not liq_ok):
-                                    # Keep apply reason as liq_sweep_missing to preserve soft-fail policy.
-                                    _trig_add("sweep_missing", "liq_sweep_missing")
-
-                                if req_bos and (not bos_ok):
-                                    _trig_add("bos_5m_missing", "bos_missing")
-
-                                if req_disp and (not disp_ok):
-                                    _trig_add("displacement_missing", "displacement_weak")
-
-                                # Compact institutional trigger score for debugging only (doesn't replace TA score).
-                                try:
-                                    inst_score = 0
-                                    inst_score += 30 if liq_ok else 0
-                                    inst_score += 25 if reclaim_ok else 0
-                                    inst_score += 20 if bos_ok else 0
-                                    inst_score += int(min(15, max(0, round(disp_x * 10))))  # 0..15
-                                    it["_trig_inst_score"] = int(inst_score)
-                                except Exception:
-                                    pass
-                            except Exception:
-                                pass
-
-                        # Trigger-time confidence threshold can be configured separately from setup-time confidence.
-                        # Precedence: trigger env (global/per-market) -> pending.min_confidence -> MID_MIN_CONFIDENCE.
-                        try:
-                            _tconf = (os.getenv("MID_TRIGGER_MIN_CONFIDENCE", "") or "").strip()
-                            if _tconf == "":
-                                if str(market).upper() == "SPOT":
-                                    _tconf = (os.getenv("MID_TRIGGER_MIN_CONFIDENCE_SPOT", "") or "").strip()
-                                else:
-                                    _tconf = (os.getenv("MID_TRIGGER_MIN_CONFIDENCE_FUT", "") or "").strip()
-                        except Exception:
-                            _tconf = ""
-
-                        if _tconf != "":
-                            try:
-                                min_conf = int(float(_tconf))
-                                it["_trig_conf_min_src"] = "env.MID_TRIGGER_MIN_CONFIDENCE" if (os.getenv("MID_TRIGGER_MIN_CONFIDENCE", "") or "").strip() != "" else ("env.MID_TRIGGER_MIN_CONFIDENCE_SPOT" if str(market).upper() == "SPOT" else "env.MID_TRIGGER_MIN_CONFIDENCE_FUT")
-                            except Exception:
-                                min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
-                                it["_trig_conf_min_src"] = "pending.min_confidence" if it.get("min_confidence") is not None else "env.MID_MIN_CONFIDENCE"
-                        else:
                             min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
                             it["_trig_conf_min_src"] = "pending.min_confidence" if it.get("min_confidence") is not None else "env.MID_MIN_CONFIDENCE"
-                        # confidence_low checks confidence only; if confidence is missing, fall back to score (common on some exchanges/paths).
-                        try:
-                            _conf_chk = it.get("_trig_conf")
-                            if _conf_chk is None:
-                                _conf_raw = ta.get("confidence")
-                                if _conf_raw is None or _conf_raw == "":
-                                    _conf_chk = float(ta.get("score") or ta.get("total") or 0.0)
-                                else:
-                                    _conf_chk = float(_conf_raw or 0.0)
-                        except Exception:
-                            _conf_chk = 0.0
-                    
-                        try:
-                            it["_trig_conf_chk"] = float(_conf_chk or 0.0)
-                            it["_trig_conf_min"] = int(min_conf)
-                            try:
-                                if it.get("_trig_conf") is not None:
-                                    it["_trig_conf_src"] = "it._trig_conf"
-                                else:
-                                    _cr = ta.get("confidence")
-                                    it["_trig_conf_src"] = "ta.confidence" if (_cr is not None and _cr != "") else "ta.score"
-                            except Exception:
-                                it["_trig_conf_src"] = "unknown"
-                        except Exception:
-                            pass
-                        if int(float(_conf_chk or 0.0)) < int(min_conf):
-                            try:
-                                it["_trig_checks"]["confidence"] = "fail"
-                            except Exception:
-                                pass
-                            if full_diag:
-                                _trig_add("confidence_low")
+                    else:
+                        min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
+                        it["_trig_conf_min_src"] = "pending.min_confidence" if it.get("min_confidence") is not None else "env.MID_MIN_CONFIDENCE"
+                    # confidence_low checks confidence only; if confidence is missing, fall back to score (common on some exchanges/paths).
+                    try:
+                        _conf_chk = it.get("_trig_conf")
+                        if _conf_chk is None:
+                            _conf_raw = ta.get("confidence")
+                            if _conf_raw is None or _conf_raw == "":
+                                _conf_chk = float(ta.get("score") or ta.get("total") or 0.0)
                             else:
-                                keep_it, outc = _pending_apply_fail(it, "confidence_low", now)
-                                _pending_log_trigger(sym, market, direction, outc, "confidence_low", it, float(price))
-                                if keep_it:
-                                    keep.append(it)
-                                    any_wait = True
-                                else:
-                                    try:
-                                        removed_n += 1
-                                    except Exception:
-                                        pass
-                                continue
-                        else:
-                            try:
-                                it["_trig_checks"]["confidence"] = "pass"
-                            except Exception:
-                                pass
-
-                        # If scan stage skipped hard filters (MID_FILTERS_AFTER_SETUP=1),
-                        # apply the same filters here at trigger moment.
-                        postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
-                        if postsetup_only:
-                            # Trigger score gate can be disabled separately.
-                            # Rationale: some users want score to be enforced only at scan/setup stage,
-                            # while trigger should rely on confidence + checklist only.
-                            trig_require_score = os.getenv("MID_TRIGGER_REQUIRE_SCORE", "1").strip().lower() not in ("0", "false", "no", "off")
-                            # Score/quality threshold (same logic as scan stage)
-                            try:
-                                use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
-                                if use_main:
-                                    min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
-                                    min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
-                                else:
-                                    min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76") or 76)
-                                    min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
-                                need = float(min_score_fut if market == "FUTURES" else min_score_spot)
-                                score = float(it.get("_trig_score") if (it.get("_trig_score") is not None) else (ta.get("score") or ta.get("total") or 0.0))
-                                # Always record values for logging/diagnostics
-                                try:
-                                    it["_trig_score_need"] = float(need or 0.0)
-                                    it["_trig_score_val"] = float(score or 0.0)
-                                except Exception:
-                                    pass
-
-                                # If trigger score gate is disabled, mark as skip and do not block.
-                                if not trig_require_score:
-                                    try:
-                                        it["_trig_checks"]["score"] = "skip"
-                                    except Exception:
-                                        pass
-                                elif need and score < need:
-                                    try:
-                                        it["_trig_checks"]["score"] = "fail"
-                                    except Exception:
-                                        pass
-                                    # FULL_DIAGNOSTIC: do not short-circuit. Record failure and continue
-                                    # so fail= contains *all* blockers in a single line.
-                                    if full_diag:
-                                        _trig_add("score_low", "score_low")
-                                    else:
-                                        keep_it, outc = _pending_apply_fail(it, "score_low", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "score_low", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
-                                        else:
-                                            try:
-                                                removed_n += 1
-                                            except Exception:
-                                                pass
-                                        continue
-                                else:
-                                    # Only mark score as pass if it truly passed.
-                                    try:
-                                        it["_trig_checks"]["score"] = "pass"
-                                    except Exception:
-                                        pass
-
-                            except Exception:
-                                pass
-                            # Regime/vol thresholds
-                            # NOTE: ADX/ATR gate stays active in SCAN. On TRIGGER, allow disabling regime_block via MID_USE_REGIME=0.
-                            use_regime = os.getenv("MID_USE_REGIME","1").strip().lower() not in ("0","false","no","off")
-                            if use_regime:
-                                try:
-                                    min_adx_30m = float(os.getenv("MID_MIN_ADX_30M","0") or 0)
-                                    min_adx_1h = float(os.getenv("MID_MIN_ADX_1H","0") or 0)
-                                    adx30 = float(ta.get("adx1") or ta.get("adx_30m") or 0.0)
-                                    adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
-                                    if min_adx_30m and adx30 < min_adx_30m:
-                                        keep_it, outc = _pending_apply_fail(it, "regime_block", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
-                                        else:
-                                            try:
-                                                removed_n += 1
-                                            except Exception:
-                                                pass
-                                        continue
-                                    if min_adx_1h and adx1h < min_adx_1h:
-                                        keep_it, outc = _pending_apply_fail(it, "regime_block", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
-                                        else:
-                                            try:
-                                                removed_n += 1
-                                            except Exception:
-                                                pass
-                                        continue
-                                except Exception:
-                                    pass
-                            try:
-                                min_atr_pct = float(os.getenv("MID_MIN_ATR_PCT","0") or 0)
-                                atrp = float(ta.get("atr_pct") or 0.0)
-                                if min_atr_pct and atrp < min_atr_pct:
-                                    keep_it, outc = _pending_apply_fail(it, "volatility_block", now)
-                                    _pending_log_trigger(sym, market, direction, outc, "volatility_block", it, float(price))
-                                    if keep_it:
-                                        keep.append(it)
-                                        any_wait = True
-                                    else:
-                                        try:
-                                            removed_n += 1
-                                        except Exception:
-                                            pass
-                                    continue
-                            except Exception:
-                                pass
-                            try:
-                                # RR filter
-                                min_rr = float(os.getenv("MID_MIN_RR", "0") or 0)
-                                rr = float(ta.get("rr") or 0.0)
-                                if min_rr and rr < min_rr:
-                                    keep_it, outc = _pending_apply_fail(it, "rr_low", now)
-                                    _pending_log_trigger(sym, market, direction, outc, "rr_low", it, float(price))
-                                    if keep_it:
-                                        keep.append(it)
-                                        any_wait = True
-                                    else:
-                                        try:
-                                            removed_n += 1
-                                        except Exception:
-                                            pass
-                                    continue
-                            except Exception:
-                                pass
-                            try:
-                                # Volume filter (smart, softer at trigger than at setup)
-                                mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or 0)
-                                try:
-                                    trig_min_vol_x = os.getenv("MID_TRIGGER_MIN_VOL_X", "").strip()
-                                    trig_min_vol_x = float(trig_min_vol_x) if trig_min_vol_x != "" else (float(mid_min_vol_x) * 0.75 if mid_min_vol_x else 0.0)
-                                except Exception:
-                                    trig_min_vol_x = float(mid_min_vol_x) * 0.75 if mid_min_vol_x else 0.0
-
-                                # If no trigger threshold configured/effective, do not block.
-                                if trig_min_vol_x and trig_min_vol_x > 0:
-                                    try:
-                                        volx_raw = ta.get("rel_vol")
-                                        if volx_raw is None:
-                                            volx_raw = ta.get("vol_x")
-                                        volx = float(volx_raw or 0.0)
-                                    except Exception:
-                                        volx = 0.0
-
-                                    # Trigger volume threshold debug (always computed, but blocks only when volx is present).
-                                    base_thr = float(trig_min_vol_x or 0.0)
-                                    thr = float(base_thr)
-                                    thr_why = []
-
-                                    # If ADX is strong, relax vol requirement further (trend can move on lighter volume).
-                                    try:
-                                        adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
-                                    except Exception:
-                                        adx1h = 0.0
-                                    if adx1h >= 25.0:
-                                        thr *= 0.80
-                                        thr_why.append("ADX")
-
-                                    # If score/conf is very high, relax vol requirement further.
-                                    try:
-                                        s_v = float(ta.get("score") or ta.get("total") or it.get("_trig_score") or 0.0)
-                                    except Exception:
-                                        s_v = 0.0
-                                    try:
-                                        c_v = ta.get("confidence")
-                                        c_v = float(c_v) if (c_v is not None and c_v != "") else float(s_v)
-                                    except Exception:
-                                        c_v = float(s_v)
-                                    try:
-                                        need_v = float(need) if ("need" in locals() or "need" in globals()) else 0.0
-                                    except Exception:
-                                        need_v = 0.0
-                                    if max(s_v, c_v) >= max(90.0, (need_v + 8.0) if need_v else 90.0):
-                                        thr *= 0.80
-                                        thr_why.append("SCORE")
-
-                                    # Store for logging, even on pass/skip.
-                                    try:
-                                        it["_trig_volx"] = float(volx or 0.0)
-                                        it["_trig_vol_thr_base"] = float(base_thr or 0.0)
-                                        it["_trig_vol_thr"] = float(thr or 0.0)
-                                        if not base_thr or base_thr <= 0:
-                                            it["_trig_vol_thr_why"] = "disabled"
-                                        elif not (volx and volx > 0):
-                                            it["_trig_vol_thr_why"] = "skip_missing_volx"
-                                        else:
-                                            it["_trig_vol_thr_why"] = ",".join(thr_why) if thr_why else "base"
-                                    except Exception:
-                                        pass
-
-                                    try:
-                                        it["_trig_reqs"]["vol_x"] = bool(base_thr and base_thr > 0)
-                                    except Exception:
-                                        pass
-                                    try:
-                                        if not (base_thr and base_thr > 0):
-                                            it["_trig_checks"]["vol_x"] = "pass(nr)"
-                                        elif not (volx and volx > 0):
-                                            it["_trig_checks"]["vol_x"] = "skip_missing"
-                                        else:
-                                            it["_trig_checks"]["vol_x"] = "pass" if (volx >= thr) else "fail"
-                                    except Exception:
-                                        pass
-                                    # If volume metric missing/zero, do not block (avoid false vol_low due to empty data).
-                                    if (volx and volx > 0) and (base_thr and base_thr > 0) and (volx < thr):
-                                        # Institutional: in RANGE/CHOPPY, do NOT block solely on low volume
-                                        # if liquidity + reclaim + micro-structure + displacement already passed.
-                                        try:
-                                            inst_reg = str(it.get("_trig_inst_regime") or "").upper()
-                                        except Exception:
-                                            inst_reg = ""
-                                        try:
-                                            block_vol_range = os.getenv("MID_INST_BLOCK_VOL_LOW_RANGE", "0").strip().lower() in ("1","true","yes","on")
-                                        except Exception:
-                                            block_vol_range = False
-                                        if (inst_reg == "RANGE") and (not block_vol_range):
-                                            # keep waiting or pass through (no block)
-                                            try:
-                                                it["_trig_vol_thr_why"] = (str(it.get("_trig_vol_thr_why") or "") + ",IGNORED_RANGE").strip(",")
-                                            except Exception:
-                                                pass
-                                            try:
-                                                it["_trig_checks"]["vol_x"] = "pass(ignored_range)"
-                                            except Exception:
-                                                pass
-                                        else:
-                                            if full_diag:
-                                                # Keep apply reason as vol_low to preserve soft-fail policy.
-                                                _trig_add("vol_x_low", "vol_low")
-                                            else:
-                                                keep_it, outc = _pending_apply_fail(it, "vol_low", now)
-                                                _pending_log_trigger(sym, market, direction, outc, "vol_low", it, float(price))
-                                                if keep_it:
-                                                    keep.append(it)
-                                                    any_wait = True
-                                                else:
-                                                    try:
-                                                        removed_n += 1
-                                                    except Exception:
-                                                        pass
-                                                continue
-                            except Exception:
-                                pass
-                            try:
-                                # VWAP bias + min distance (avoid chop)
-                                mid_require_vwap_bias = os.getenv("MID_REQUIRE_VWAP_SIDE", "0").strip().lower() in ("1","true","yes","on")
-                                mid_min_vwap_dist_atr = float(os.getenv("MID_MIN_VWAP_DIST_ATR", "0") or 0)
-                                direction_u = str(direction).upper()
-                                entry_check = float(ta.get("entry") or entry0)
-                                vwap_val = float(ta.get("vwap_val") or 0.0)
-                                atrp = float(ta.get("atr_pct") or 0.0)
-                                atr30 = abs(entry_check) * (abs(atrp) / 100.0) if (entry_check and atrp) else float(atr_abs or 0.0)
-                                if vwap_val > 0 and atr30 and atr30 > 0:
-                                    if mid_require_vwap_bias:
-                                        if direction_u == "SHORT" and not (entry_check < vwap_val):
-                                            keep_it, outc = _pending_apply_fail(it, "vwap_bias", now)
-                                            _pending_log_trigger(sym, market, direction, outc, "vwap_bias", it, float(price))
-                                            if keep_it:
-                                                keep.append(it)
-                                                any_wait = True
-                                            else:
-                                                try:
-                                                    removed_n += 1
-                                                except Exception:
-                                                    pass
-                                            continue
-                                        if direction_u == "LONG" and not (entry_check > vwap_val):
-                                            keep_it, outc = _pending_apply_fail(it, "vwap_bias", now)
-                                            _pending_log_trigger(sym, market, direction, outc, "vwap_bias", it, float(price))
-                                            if keep_it:
-                                                keep.append(it)
-                                                any_wait = True
-                                            else:
-                                                try:
-                                                    removed_n += 1
-                                                except Exception:
-                                                    pass
-                                            continue
-                                    if mid_min_vwap_dist_atr > 0:
-                                        if abs(entry_check - vwap_val) < (atr30 * mid_min_vwap_dist_atr):
-                                            keep_it, outc = _pending_apply_fail(it, "vwap_dist", now)
-                                            _pending_log_trigger(sym, market, direction, outc, "vwap_dist", it, float(price))
-                                            if keep_it:
-                                                keep.append(it)
-                                                any_wait = True
-                                            else:
-                                                try:
-                                                    removed_n += 1
-                                                except Exception:
-                                                    pass
-                                            continue
-                            except Exception:
-                                pass
-                            try:
-                                # Liquidity sweep requirement
-                                req = os.getenv("MID_REQUIRE_LIQ_SWEEP", "0").strip().lower() in ("1","true","yes","on")
-                                if req:
-                                    if str(direction).upper() == "LONG" and not bool(ta.get("sweep_long", False)):
-                                        keep_it, outc = _pending_apply_fail(it, "liq_sweep_missing", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "liq_sweep_missing", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
-                                        else:
-                                            try:
-                                                removed_n += 1
-                                            except Exception:
-                                                pass
-                                        continue
-                                    if str(direction).upper() == "SHORT" and not bool(ta.get("sweep_short", False)):
-                                        keep_it, outc = _pending_apply_fail(it, "liq_sweep_missing", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "liq_sweep_missing", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
-                                        else:
-                                            try:
-                                                removed_n += 1
-                                            except Exception:
-                                                pass
-                                        continue
-                            except Exception:
-                                pass
-
-                        # FULL_DIAGNOSTIC: after evaluating all trigger-time filters,
-                        # if anything failed, apply the primary fail now (but keep all reasons for logs/status).
-                        # IMPORTANT: we log `reason=` as the *human* first-fail key (e.g. reclaim_missing),
-                        # but we apply the canonical reason (e.g. liq_sweep_missing) to preserve hard/soft policies.
-                        try:
-                            if full_diag and isinstance(trig_state, dict) and trig_state.get("reasons"):
-                                reasons = list(trig_state.get("reasons") or [])
-                                try:
-                                    it["_trig_fail_reasons"] = reasons
-                                except Exception:
-                                    pass
-                                try:
-                                    it["_trig_primary_reason"] = str(reasons[0] if reasons else "")
-                                except Exception:
-                                    pass
-
-                                apply_reason = str(trig_state.get("primary_apply") or (reasons[0] if reasons else "fail") or "fail")
-                                log_reason = str(reasons[0] if reasons else apply_reason)
-
-                                keep_it, outc = _pending_apply_fail(it, apply_reason, now)
-                                _pending_log_trigger(sym, market, direction, outc, log_reason, it, float(price))
-                                if keep_it:
-                                    keep.append(it)
-                                    any_wait = True
-                                else:
-                                    try:
-                                        removed_n += 1
-                                    except Exception:
-                                        pass
-                                continue
-                        except Exception:
-                            pass
-
-                        # Emit final signal
-                        entry = float(ta.get("entry") or entry0)
-                        sl = float(ta.get("sl") or it.get("sl") or 0.0)
-                        tp1 = float(ta.get("tp1") or it.get("tp1") or 0.0)
-                        tp2 = float(ta.get("tp2") or it.get("tp2") or 0.0)
-                        rr = float(ta.get("rr") or it.get("rr") or 0.0)
-                        conf = int(float(ta.get("confidence") or it.get("confidence") or 0))
-
-                        conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "")
-                        if not conf_names:
-                            conf_names = str(src_ex)
-
-                        sig = Signal(
-                            signal_id=self.next_signal_id(),
-                            market=market,
-                            symbol=sym,
-                            direction=direction,
-                            timeframe=str(it.get("timeframe") or "5m/30m/1h"),
-                            entry=entry,
-                            sl=sl,
-                            tp1=tp1,
-                            tp2=tp2,
-                            rr=rr,
-                            confidence=conf,
-                            confirmations=conf_names,
-                            source_exchange=src_ex,
-                            available_exchanges=conf_names,
-                            risk_note=str(it.get("risk_note") or "ENTRY CONFIRMED"),
-                            ts=time.time(),
-                        )
-
-                        try:
-                            self.mark_emitted_mid(sym, sig.direction, sig.market)
-                        except TypeError:
-                            # compat shim may expose mark_emitted_mid(symbol) only
-                            try:
-                                self.mark_emitted_mid(sym)
-                            except Exception:
-                                pass
-                        except Exception:
-                            pass
-                        self.last_signal = sig
-                        if sig.market == "SPOT":
-                            self.last_spot_signal = sig
-                        else:
-                            self.last_futures_signal = sig
-
-                        await emit_signal_cb(sig)
-                        _pending_clear_cooldown(it)
-                        _pending_log_trigger(sym, market, direction, "pass", "emit", it, float(price))
-                        logger.info("[mid][pending] EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, entry, float(price), tol)
-                        try:
-                            _mid_metrics_inc("pending_triggered", 1)
-                        except Exception:
-                            pass
-                        try:
-                            _mid_stage_add("triggered", 1)
-                        except Exception:
-                            pass
-                        # emitted: do not keep
+                                _conf_chk = float(_conf_raw or 0.0)
                     except Exception:
-                        keep.append(it)
-                        any_wait = True
+                        _conf_chk = 0.0
+                    
+                    try:
+                        it["_trig_conf_chk"] = float(_conf_chk or 0.0)
+                        it["_trig_conf_min"] = int(min_conf)
+                        try:
+                            if it.get("_trig_conf") is not None:
+                                it["_trig_conf_src"] = "it._trig_conf"
+                            else:
+                                _cr = ta.get("confidence")
+                                it["_trig_conf_src"] = "ta.confidence" if (_cr is not None and _cr != "") else "ta.score"
+                        except Exception:
+                            it["_trig_conf_src"] = "unknown"
+                    except Exception:
+                        pass
+                    if int(float(_conf_chk or 0.0)) < int(min_conf):
+                        try:
+                            it["_trig_checks"]["confidence"] = "fail"
+                        except Exception:
+                            pass
+                        if full_diag:
+                            _trig_add("confidence_low")
+                        else:
+                            keep_it, outc = _pending_apply_fail(it, "confidence_low", now)
+                            _pending_log_trigger(sym, market, direction, outc, "confidence_low", it, float(price))
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
+                            else:
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                            continue
+                    else:
+                        try:
+                            it["_trig_checks"]["confidence"] = "pass"
+                        except Exception:
+                            pass
 
-                await self._mid_pending_save(keep)
+                    # If scan stage skipped hard filters (MID_FILTERS_AFTER_SETUP=1),
+                    # apply the same filters here at trigger moment.
+                    postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
+                    if postsetup_only:
+                        # Trigger score gate can be disabled separately.
+                        # Rationale: some users want score to be enforced only at scan/setup stage,
+                        # while trigger should rely on confidence + checklist only.
+                        trig_require_score = os.getenv("MID_TRIGGER_REQUIRE_SCORE", "1").strip().lower() not in ("0", "false", "no", "off")
+                        # Score/quality threshold (same logic as scan stage)
+                        try:
+                            use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
+                            if use_main:
+                                min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
+                                min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
+                            else:
+                                min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76") or 76)
+                                min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
+                            need = float(min_score_fut if market == "FUTURES" else min_score_spot)
+                            score = float(it.get("_trig_score") if (it.get("_trig_score") is not None) else (ta.get("score") or ta.get("total") or 0.0))
+                            # Always record values for logging/diagnostics
+                            try:
+                                it["_trig_score_need"] = float(need or 0.0)
+                                it["_trig_score_val"] = float(score or 0.0)
+                            except Exception:
+                                pass
+
+                            # If trigger score gate is disabled, mark as skip and do not block.
+                            if not trig_require_score:
+                                try:
+                                    it["_trig_checks"]["score"] = "skip"
+                                except Exception:
+                                    pass
+                            elif need and score < need:
+                                try:
+                                    it["_trig_checks"]["score"] = "fail"
+                                except Exception:
+                                    pass
+                                # FULL_DIAGNOSTIC: do not short-circuit. Record failure and continue
+                                # so fail= contains *all* blockers in a single line.
+                                if full_diag:
+                                    _trig_add("score_low", "score_low")
+                                else:
+                                    keep_it, outc = _pending_apply_fail(it, "score_low", now)
+                                    _pending_log_trigger(sym, market, direction, outc, "score_low", it, float(price))
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
+                            else:
+                                # Only mark score as pass if it truly passed.
+                                try:
+                                    it["_trig_checks"]["score"] = "pass"
+                                except Exception:
+                                    pass
+
+                        except Exception:
+                            pass
+                        # Regime/vol thresholds
+                        # NOTE: ADX/ATR gate stays active in SCAN. On TRIGGER, allow disabling regime_block via MID_USE_REGIME=0.
+                        use_regime = os.getenv("MID_USE_REGIME","1").strip().lower() not in ("0","false","no","off")
+                        if use_regime:
+                            try:
+                                min_adx_30m = float(os.getenv("MID_MIN_ADX_30M","0") or 0)
+                                min_adx_1h = float(os.getenv("MID_MIN_ADX_1H","0") or 0)
+                                adx30 = float(ta.get("adx1") or ta.get("adx_30m") or 0.0)
+                                adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
+                                if min_adx_30m and adx30 < min_adx_30m:
+                                    keep_it, outc = _pending_apply_fail(it, "regime_block", now)
+                                    _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
+                                if min_adx_1h and adx1h < min_adx_1h:
+                                    keep_it, outc = _pending_apply_fail(it, "regime_block", now)
+                                    _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
+                            except Exception:
+                                pass
+                        try:
+                            min_atr_pct = float(os.getenv("MID_MIN_ATR_PCT","0") or 0)
+                            atrp = float(ta.get("atr_pct") or 0.0)
+                            if min_atr_pct and atrp < min_atr_pct:
+                                keep_it, outc = _pending_apply_fail(it, "volatility_block", now)
+                                _pending_log_trigger(sym, market, direction, outc, "volatility_block", it, float(price))
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            # RR filter
+                            min_rr = float(os.getenv("MID_MIN_RR", "0") or 0)
+                            rr = float(ta.get("rr") or 0.0)
+                            if min_rr and rr < min_rr:
+                                keep_it, outc = _pending_apply_fail(it, "rr_low", now)
+                                _pending_log_trigger(sym, market, direction, outc, "rr_low", it, float(price))
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            # Volume filter (smart, softer at trigger than at setup)
+                            mid_min_vol_x = float(os.getenv("MID_MIN_VOL_X", "0") or 0)
+                            try:
+                                trig_min_vol_x = os.getenv("MID_TRIGGER_MIN_VOL_X", "").strip()
+                                trig_min_vol_x = float(trig_min_vol_x) if trig_min_vol_x != "" else (float(mid_min_vol_x) * 0.75 if mid_min_vol_x else 0.0)
+                            except Exception:
+                                trig_min_vol_x = float(mid_min_vol_x) * 0.75 if mid_min_vol_x else 0.0
+
+                            # If no trigger threshold configured/effective, do not block.
+                            if trig_min_vol_x and trig_min_vol_x > 0:
+                                try:
+                                    volx_raw = ta.get("rel_vol")
+                                    if volx_raw is None:
+                                        volx_raw = ta.get("vol_x")
+                                    volx = float(volx_raw or 0.0)
+                                except Exception:
+                                    volx = 0.0
+
+                                # Trigger volume threshold debug (always computed, but blocks only when volx is present).
+                                base_thr = float(trig_min_vol_x or 0.0)
+                                thr = float(base_thr)
+                                thr_why = []
+
+                                # If ADX is strong, relax vol requirement further (trend can move on lighter volume).
+                                try:
+                                    adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
+                                except Exception:
+                                    adx1h = 0.0
+                                if adx1h >= 25.0:
+                                    thr *= 0.80
+                                    thr_why.append("ADX")
+
+                                # If score/conf is very high, relax vol requirement further.
+                                try:
+                                    s_v = float(ta.get("score") or ta.get("total") or it.get("_trig_score") or 0.0)
+                                except Exception:
+                                    s_v = 0.0
+                                try:
+                                    c_v = ta.get("confidence")
+                                    c_v = float(c_v) if (c_v is not None and c_v != "") else float(s_v)
+                                except Exception:
+                                    c_v = float(s_v)
+                                try:
+                                    need_v = float(need) if ("need" in locals() or "need" in globals()) else 0.0
+                                except Exception:
+                                    need_v = 0.0
+                                if max(s_v, c_v) >= max(90.0, (need_v + 8.0) if need_v else 90.0):
+                                    thr *= 0.80
+                                    thr_why.append("SCORE")
+
+                                # Store for logging, even on pass/skip.
+                                try:
+                                    it["_trig_volx"] = float(volx or 0.0)
+                                    it["_trig_vol_thr_base"] = float(base_thr or 0.0)
+                                    it["_trig_vol_thr"] = float(thr or 0.0)
+                                    if not base_thr or base_thr <= 0:
+                                        it["_trig_vol_thr_why"] = "disabled"
+                                    elif not (volx and volx > 0):
+                                        it["_trig_vol_thr_why"] = "skip_missing_volx"
+                                    else:
+                                        it["_trig_vol_thr_why"] = ",".join(thr_why) if thr_why else "base"
+                                except Exception:
+                                    pass
+
+                                try:
+                                    it["_trig_reqs"]["vol_x"] = bool(base_thr and base_thr > 0)
+                                except Exception:
+                                    pass
+                                try:
+                                    if not (base_thr and base_thr > 0):
+                                        it["_trig_checks"]["vol_x"] = "pass(nr)"
+                                    elif not (volx and volx > 0):
+                                        it["_trig_checks"]["vol_x"] = "skip_missing"
+                                    else:
+                                        it["_trig_checks"]["vol_x"] = "pass" if (volx >= thr) else "fail"
+                                except Exception:
+                                    pass
+                                # If volume metric missing/zero, do not block (avoid false vol_low due to empty data).
+                                if (volx and volx > 0) and (base_thr and base_thr > 0) and (volx < thr):
+                                    # Institutional: in RANGE/CHOPPY, do NOT block solely on low volume
+                                    # if liquidity + reclaim + micro-structure + displacement already passed.
+                                    try:
+                                        inst_reg = str(it.get("_trig_inst_regime") or "").upper()
+                                    except Exception:
+                                        inst_reg = ""
+                                    try:
+                                        block_vol_range = os.getenv("MID_INST_BLOCK_VOL_LOW_RANGE", "0").strip().lower() in ("1","true","yes","on")
+                                    except Exception:
+                                        block_vol_range = False
+                                    if (inst_reg == "RANGE") and (not block_vol_range):
+                                        # keep waiting or pass through (no block)
+                                        try:
+                                            it["_trig_vol_thr_why"] = (str(it.get("_trig_vol_thr_why") or "") + ",IGNORED_RANGE").strip(",")
+                                        except Exception:
+                                            pass
+                                        try:
+                                            it["_trig_checks"]["vol_x"] = "pass(ignored_range)"
+                                        except Exception:
+                                            pass
+                                    else:
+                                        if full_diag:
+                                            # Keep apply reason as vol_low to preserve soft-fail policy.
+                                            _trig_add("vol_x_low", "vol_low")
+                                        else:
+                                            keep_it, outc = _pending_apply_fail(it, "vol_low", now)
+                                            _pending_log_trigger(sym, market, direction, outc, "vol_low", it, float(price))
+                                            if keep_it:
+                                                keep.append(it)
+                                                any_wait = True
+                                            else:
+                                                try:
+                                                    removed_n += 1
+                                                except Exception:
+                                                    pass
+                                            continue
+                        except Exception:
+                            pass
+                        try:
+                            # VWAP bias + min distance (avoid chop)
+                            mid_require_vwap_bias = os.getenv("MID_REQUIRE_VWAP_SIDE", "0").strip().lower() in ("1","true","yes","on")
+                            mid_min_vwap_dist_atr = float(os.getenv("MID_MIN_VWAP_DIST_ATR", "0") or 0)
+                            direction_u = str(direction).upper()
+                            entry_check = float(ta.get("entry") or entry0)
+                            vwap_val = float(ta.get("vwap_val") or 0.0)
+                            atrp = float(ta.get("atr_pct") or 0.0)
+                            atr30 = abs(entry_check) * (abs(atrp) / 100.0) if (entry_check and atrp) else float(atr_abs or 0.0)
+                            if vwap_val > 0 and atr30 and atr30 > 0:
+                                if mid_require_vwap_bias:
+                                    if direction_u == "SHORT" and not (entry_check < vwap_val):
+                                        keep_it, outc = _pending_apply_fail(it, "vwap_bias", now)
+                                        _pending_log_trigger(sym, market, direction, outc, "vwap_bias", it, float(price))
+                                        if keep_it:
+                                            keep.append(it)
+                                            any_wait = True
+                                        else:
+                                            try:
+                                                removed_n += 1
+                                            except Exception:
+                                                pass
+                                        continue
+                                    if direction_u == "LONG" and not (entry_check > vwap_val):
+                                        keep_it, outc = _pending_apply_fail(it, "vwap_bias", now)
+                                        _pending_log_trigger(sym, market, direction, outc, "vwap_bias", it, float(price))
+                                        if keep_it:
+                                            keep.append(it)
+                                            any_wait = True
+                                        else:
+                                            try:
+                                                removed_n += 1
+                                            except Exception:
+                                                pass
+                                        continue
+                                if mid_min_vwap_dist_atr > 0:
+                                    if abs(entry_check - vwap_val) < (atr30 * mid_min_vwap_dist_atr):
+                                        keep_it, outc = _pending_apply_fail(it, "vwap_dist", now)
+                                        _pending_log_trigger(sym, market, direction, outc, "vwap_dist", it, float(price))
+                                        if keep_it:
+                                            keep.append(it)
+                                            any_wait = True
+                                        else:
+                                            try:
+                                                removed_n += 1
+                                            except Exception:
+                                                pass
+                                        continue
+                        except Exception:
+                            pass
+                        try:
+                            # Liquidity sweep requirement
+                            req = os.getenv("MID_REQUIRE_LIQ_SWEEP", "0").strip().lower() in ("1","true","yes","on")
+                            if req:
+                                if str(direction).upper() == "LONG" and not bool(ta.get("sweep_long", False)):
+                                    keep_it, outc = _pending_apply_fail(it, "liq_sweep_missing", now)
+                                    _pending_log_trigger(sym, market, direction, outc, "liq_sweep_missing", it, float(price))
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
+                                if str(direction).upper() == "SHORT" and not bool(ta.get("sweep_short", False)):
+                                    keep_it, outc = _pending_apply_fail(it, "liq_sweep_missing", now)
+                                    _pending_log_trigger(sym, market, direction, outc, "liq_sweep_missing", it, float(price))
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
+                        except Exception:
+                            pass
+
+                    # FULL_DIAGNOSTIC: after evaluating all trigger-time filters,
+                    # if anything failed, apply the primary fail now (but keep all reasons for logs/status).
+                    # IMPORTANT: we log `reason=` as the *human* first-fail key (e.g. reclaim_missing),
+                    # but we apply the canonical reason (e.g. liq_sweep_missing) to preserve hard/soft policies.
+                    try:
+                        if full_diag and isinstance(trig_state, dict) and trig_state.get("reasons"):
+                            reasons = list(trig_state.get("reasons") or [])
+                            try:
+                                it["_trig_fail_reasons"] = reasons
+                            except Exception:
+                                pass
+                            try:
+                                it["_trig_primary_reason"] = str(reasons[0] if reasons else "")
+                            except Exception:
+                                pass
+
+                            apply_reason = str(trig_state.get("primary_apply") or (reasons[0] if reasons else "fail") or "fail")
+                            log_reason = str(reasons[0] if reasons else apply_reason)
+
+                            keep_it, outc = _pending_apply_fail(it, apply_reason, now)
+                            _pending_log_trigger(sym, market, direction, outc, log_reason, it, float(price))
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
+                            else:
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                            continue
+                    except Exception:
+                        pass
+
+                    # Emit final signal
+                    entry = float(ta.get("entry") or entry0)
+                    sl = float(ta.get("sl") or it.get("sl") or 0.0)
+                    tp1 = float(ta.get("tp1") or it.get("tp1") or 0.0)
+                    tp2 = float(ta.get("tp2") or it.get("tp2") or 0.0)
+                    rr = float(ta.get("rr") or it.get("rr") or 0.0)
+                    conf = int(float(ta.get("confidence") or it.get("confidence") or 0))
+
+                    conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "")
+                    if not conf_names:
+                        conf_names = str(src_ex)
+
+                    sig = Signal(
+                        signal_id=self.next_signal_id(),
+                        market=market,
+                        symbol=sym,
+                        direction=direction,
+                        timeframe=str(it.get("timeframe") or "5m/30m/1h"),
+                        entry=entry,
+                        sl=sl,
+                        tp1=tp1,
+                        tp2=tp2,
+                        rr=rr,
+                        confidence=conf,
+                        confirmations=conf_names,
+                        source_exchange=src_ex,
+                        available_exchanges=conf_names,
+                        risk_note=str(it.get("risk_note") or "ENTRY CONFIRMED"),
+                        ts=time.time(),
+                    )
+
+                    try:
+                        self.mark_emitted_mid(sym, sig.direction, sig.market)
+                    except TypeError:
+                        # compat shim may expose mark_emitted_mid(symbol) only
+                        try:
+                            self.mark_emitted_mid(sym)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    self.last_signal = sig
+                    if sig.market == "SPOT":
+                        self.last_spot_signal = sig
+                    else:
+                        self.last_futures_signal = sig
+
+                    await emit_signal_cb(sig)
+                    _pending_clear_cooldown(it)
+                    _pending_log_trigger(sym, market, direction, "pass", "emit", it, float(price))
+                    logger.info("[mid][pending] EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, entry, float(price), tol)
+                    try:
+                        _mid_metrics_inc("pending_triggered", 1)
+                    except Exception:
+                        pass
+                    try:
+                        _mid_stage_add("triggered", 1)
+                    except Exception:
+                        pass
+                    # emitted: do not keep
+                except Exception:
+                    keep.append(it)
+                    any_wait = True
+
+            await self._mid_pending_save(keep)
 
 
 
-                # Update last pending tick snapshot (used by [mid][status]).
+            # Update last pending tick snapshot (used by [mid][status]).
+            try:
+                global _MID_PENDING_TICK_LAST
+                kept_n0 = int(len(keep) if isinstance(keep, list) else 0)
+                # NOTE: attempts_sum/fails_sum above are per-poll counters and may stay 0.
+                # For status we want persisted, cumulative averages from the kept pending items.
+                attempts_sum0 = 0
+                fails_sum0 = 0
                 try:
-                    global _MID_PENDING_TICK_LAST
-                    kept_n0 = int(len(keep) if isinstance(keep, list) else 0)
-                    # NOTE: attempts_sum/fails_sum above are per-poll counters and may stay 0.
-                    # For status we want persisted, cumulative averages from the kept pending items.
+                    if isinstance(keep, list):
+                        for _it in keep:
+                            attempts_sum0 += int(_it.get("trigger_attempts") or 0)
+                            fails_sum0 += int(_it.get("fail_count") or 0)
+                except Exception:
                     attempts_sum0 = 0
                     fails_sum0 = 0
-                    try:
-                        if isinstance(keep, list):
-                            for _it in keep:
-                                attempts_sum0 += int(_it.get("trigger_attempts") or 0)
-                                fails_sum0 += int(_it.get("fail_count") or 0)
-                    except Exception:
-                        attempts_sum0 = 0
-                        fails_sum0 = 0
-                    a_avg0 = (float(attempts_sum0) / float(kept_n0)) if kept_n0 > 0 else 0.0
-                    f_avg0 = (float(fails_sum0) / float(kept_n0)) if kept_n0 > 0 else 0.0
-                    _MID_PENDING_TICK_LAST = {
-                        "ts": time.time(),
-                        "total": int(total_n),
-                        "keep": int(kept_n0),
-                        "in_zone": int(in_zone_n),
-                        "near": int(near_n),
-                        "far": int(far_n),
-                        "expired_now": int(expired_n),
-                        "removed_now": int(removed_n),
-                        "attempts_avg": float(a_avg0),
-                        "fails_avg": float(f_avg0),
-                        "attempts_sum": int(attempts_sum0),
-                        "fails_sum": int(fails_sum0),
-                    }
-                except Exception:
-                    pass
-
-                # Update last trigger-loop poll counters (helps interpret trig_no buckets).
-                try:
-                    global _MID_TRIG_POLL_LAST
-                    _MID_TRIG_POLL_LAST = {
-                        "ts": float(now),
-                        "checked": int(trig_checked_n),
-                        "in_zone_chk": int(in_zone_n),
-                        "keep": int(len(keep) if isinstance(keep, list) else 0),
-                        "removed_now": int(removed_n),
-                        "expired_now": int(expired_n),
-                    }
-                except Exception:
-                    pass
-
-                # Freeze per-poll trigger reject aggregation for [mid][status]
-                try:
-                    cur = _MID_TRIG_REJECT_TICK_CUR if isinstance(_MID_TRIG_REJECT_TICK_CUR, dict) else None
-                    if isinstance(cur, dict):
-                        _MID_TRIG_REJECT_TICK_LAST = {
-                            "ts": float(cur.get("ts") or now),
-                            "pre": dict(cur.get("pre") or {}),
-                            "inzone": dict(cur.get("inzone") or {}),
-                        }
-                    _MID_TRIG_REJECT_TICK_CUR = None
-                except Exception:
-                    _MID_TRIG_REJECT_TICK_CUR = None
-                    pass
-
-                # Mark MID activity timestamp for [mid][status] (even if scanner tick is disabled).
-                try:
-                    global MID_LAST_TICK_TS
-                    MID_LAST_TICK_TS = float(now)
-                except Exception:
-                    pass
-
-                # If there is anything still pending after this poll, count it as a "pending_wait" stage.
-                # (This helps /health show whether signals are "missing" because price/TA hasn't confirmed yet.)
-                try:
-                    if any_wait and keep:
-                        _mid_reject_add("pending_wait")
-                except Exception:
-                    pass
-                # Periodic per-poll diagnostics (low spam, controlled by MID_PENDING_DEBUG_EVERY_SEC)
-                try:
-                    if dbg_every > 0 and (time.time() - float(_last_dbg_ts or 0.0)) >= float(dbg_every):
-                        _last_dbg_ts = time.time()
-                        try:
-                            kept_n = int(len(keep) if isinstance(keep, list) else 0)
-                        except Exception:
-                            kept_n = 0
-                        # Compute averages from persisted counters (not just this poll),
-                        # so in-zone items show attempts even when debounced by attempt_gap_sec.
-                        try:
-                            attempts_sum = 0
-                            fails_sum = 0
-                            for _it in (keep or []):
-                                attempts_sum += int(_it.get("trigger_attempts") or 0)
-                                fails_sum += int(_it.get("fail_count") or 0)
-                        except Exception:
-                            pass
-                        a_avg = (float(attempts_sum) / float(total_n)) if total_n > 0 else 0.0
-                        f_avg = (float(fails_sum) / float(total_n)) if total_n > 0 else 0.0
-                        logger.info("[mid][pending][tick] total=%s keep=%s in_zone=%s near=%s far=%s expired_now=%s removed_now=%s attempts_avg=%.2f fails_avg=%.2f",
-                                    total_n, kept_n, in_zone_n, near_n, far_n, expired_n, removed_n, a_avg, f_avg)
-                        if dbg_samples > 0 and samples:
-                            samples.sort(key=lambda x: x[0], reverse=True)
-                            for _, s in samples[:max(1, dbg_samples)]:
-                                logger.info("[mid][pending][sample] %s", s)
-                except Exception:
-                    pass
+                a_avg0 = (float(attempts_sum0) / float(kept_n0)) if kept_n0 > 0 else 0.0
+                f_avg0 = (float(fails_sum0) / float(kept_n0)) if kept_n0 > 0 else 0.0
+                _MID_PENDING_TICK_LAST = {
+                    "ts": time.time(),
+                    "total": int(total_n),
+                    "keep": int(kept_n0),
+                    "in_zone": int(in_zone_n),
+                    "near": int(near_n),
+                    "far": int(far_n),
+                    "expired_now": int(expired_n),
+                    "removed_now": int(removed_n),
+                    "attempts_avg": float(a_avg0),
+                    "fails_avg": float(f_avg0),
+                    "attempts_sum": int(attempts_sum0),
+                    "fails_sum": int(fails_sum0),
+                }
             except Exception:
-                logger.exception("[mid][pending] loop error")
-                # ensure status does not report trig_poll=stale just because the loop errored
-                try:
-                    # NOTE: global _MID_TRIG_POLL_LAST is already declared earlier in this function.
-                    # Re-declaring it here (after assignments) triggers a SyntaxError.
-                    _MID_TRIG_POLL_LAST = {
-                        "ts": float(time.time()),
-                        "checked": 0,
-                        "in_zone_chk": 0,
-                        "keep": 0,
-                        "removed_now": 0,
-                        "expired_now": 0,
-                        "err": 1,
+                pass
+
+            # Update last trigger-loop poll counters (helps interpret trig_no buckets).
+            try:
+                global _MID_TRIG_POLL_LAST
+                _MID_TRIG_POLL_LAST = {
+                    "ts": float(now),
+                    "checked": int(trig_checked_n),
+                    "in_zone_chk": int(in_zone_n),
+                    "keep": int(len(keep) if isinstance(keep, list) else 0),
+                    "removed_now": int(removed_n),
+                    "expired_now": int(expired_n),
+                }
+            except Exception:
+                pass
+
+            # Freeze per-poll trigger reject aggregation for [mid][status]
+            try:
+                cur = _MID_TRIG_REJECT_TICK_CUR if isinstance(_MID_TRIG_REJECT_TICK_CUR, dict) else None
+                if isinstance(cur, dict):
+                    _MID_TRIG_REJECT_TICK_LAST = {
+                        "ts": float(cur.get("ts") or now),
+                        "pre": dict(cur.get("pre") or {}),
+                        "inzone": dict(cur.get("inzone") or {}),
                     }
-                except Exception:
-                    pass
+                _MID_TRIG_REJECT_TICK_CUR = None
+            except Exception:
+                _MID_TRIG_REJECT_TICK_CUR = None
+                pass
 
-            await asyncio.sleep(max(1.0, poll))
+            # Mark MID activity timestamp for [mid][status] (even if scanner tick is disabled).
+            try:
+                global MID_LAST_TICK_TS
+                MID_LAST_TICK_TS = float(now)
+            except Exception:
+                pass
+
+            # If there is anything still pending after this poll, count it as a "pending_wait" stage.
+            # (This helps /health show whether signals are "missing" because price/TA hasn't confirmed yet.)
+            try:
+                if any_wait and keep:
+                    _mid_reject_add("pending_wait")
+            except Exception:
+                pass
+            # Periodic per-poll diagnostics (low spam, controlled by MID_PENDING_DEBUG_EVERY_SEC)
+            try:
+                if dbg_every > 0 and (time.time() - float(_last_dbg_ts or 0.0)) >= float(dbg_every):
+                    _last_dbg_ts = time.time()
+                    try:
+                        kept_n = int(len(keep) if isinstance(keep, list) else 0)
+                    except Exception:
+                        kept_n = 0
+                    # Compute averages from persisted counters (not just this poll),
+                    # so in-zone items show attempts even when debounced by attempt_gap_sec.
+                    try:
+                        attempts_sum = 0
+                        fails_sum = 0
+                        for _it in (keep or []):
+                            attempts_sum += int(_it.get("trigger_attempts") or 0)
+                            fails_sum += int(_it.get("fail_count") or 0)
+                    except Exception:
+                        pass
+                    a_avg = (float(attempts_sum) / float(total_n)) if total_n > 0 else 0.0
+                    f_avg = (float(fails_sum) / float(total_n)) if total_n > 0 else 0.0
+                    logger.info("[mid][pending][tick] total=%s keep=%s in_zone=%s near=%s far=%s expired_now=%s removed_now=%s attempts_avg=%.2f fails_avg=%.2f",
+                                total_n, kept_n, in_zone_n, near_n, far_n, expired_n, removed_n, a_avg, f_avg)
+                    if dbg_samples > 0 and samples:
+                        samples.sort(key=lambda x: x[0], reverse=True)
+                        for _, s in samples[:max(1, dbg_samples)]:
+                            logger.info("[mid][pending][sample] %s", s)
+            except Exception:
+                pass
+        except Exception:
+            logger.exception("[mid][pending] loop error")
+            # ensure status does not report trig_poll=stale just because the loop errored
+            try:
+                # NOTE: global _MID_TRIG_POLL_LAST is already declared earlier in this function.
+                # Re-declaring it here (after assignments) triggers a SyntaxError.
+                _MID_TRIG_POLL_LAST = {
+                    "ts": float(time.time()),
+                    "checked": 0,
+                    "in_zone_chk": 0,
+                    "keep": 0,
+                    "removed_now": 0,
+                    "expired_now": 0,
+                    "err": 1,
+                }
+            except Exception:
+                pass
+
+        await asyncio.sleep(max(1.0, poll))
 
 
-    # --- MID status: /health snapshot + per-minute log summary ---
+# --- MID status: /health snapshot + per-minute log summary ---
 
-    async def mid_status_snapshot(self) -> dict:
-        """Short MID status for /health.
+async def mid_status_snapshot(self) -> dict:
+    """Short MID status for /health.
 
-        Shows: pending count, setups found, last tick time, and pending outcomes.
-        Never raises.
-        """
+    Shows: pending count, setups found, last tick time, and pending outcomes.
+    Never raises.
+    """
+    try:
+        now = time.time()
+        snap = _mid_metrics_snapshot()
+        pending_items: list[dict] = []
+        try:
+            if hasattr(self, "_mid_pending_load"):
+                pending_items = await self._mid_pending_load()  # type: ignore[attr-defined]
+            else:
+                st = await db_store.kv_get_json("mid_pending") or {}
+                items = st.get("items", [])
+                pending_items = items if isinstance(items, list) else []
+        except Exception:
+            pending_items = []
+
+        last_tick_ts = float(snap.get("last_tick_ts") or 0.0)
+        last_tick_ago = (now - last_tick_ts) if last_tick_ts > 0 else None
+        try:
+            ttl_min = float(os.getenv("MID_PENDING_TTL_MIN", "60") or 60.0)
+        except Exception:
+            ttl_min = 60.0
+
+        # Rolling reject digest (top-3) for quick "why no signals" diagnosis.
+        try:
+            reject_top = _mid_reject_digest_top(3)
+        except Exception:
+            reject_top = []
+        try:
+            window_sec = int(float(os.getenv("MID_REJECT_WINDOW_SEC", "900") or 900))
+        except Exception:
+            window_sec = 900
+
+        # Stage flow breakdown (last 15m)
+        try:
+            stage_counts = _mid_stage_counts(900)
+            stage_flow = {
+                "scanned": int(stage_counts.get("scanned", 0)),
+                "passed_ta": int(stage_counts.get("passed_ta", 0)),
+                "created_pending": int(stage_counts.get("created_pending", 0)),
+                "triggered": int(stage_counts.get("triggered", 0)),
+                "rejected": int(stage_counts.get("rejected", 0)),
+            }
+        except Exception:
+            stage_flow = None
+
+        return {
+            "pending": int(len(pending_items)),
+            "pending_ttl_min": float(ttl_min),
+            "setups_found_total": int(snap.get("setups_found") or 0),
+            "pending_created_total": int(snap.get("pending_created") or 0),
+            "pending_triggered_total": int(snap.get("pending_triggered") or 0),
+            "pending_expired_total": int(snap.get("pending_expired") or 0),
+            "hard_blocks_total": int(snap.get("hard_blocks") or 0),
+            "hardblock_top_last_tick": snap.get("hardblock_top"),
+            "hardblock_samples_last_tick": snap.get("hardblock_samples"),
+            "last_tick_ts": last_tick_ts if last_tick_ts > 0 else None,
+            "last_tick_ago_s": float(last_tick_ago) if last_tick_ago is not None else None,
+            "last_summary": snap.get("last_summary"),
+            "reject_digest_window_sec": int(window_sec),
+            "reject_digest_top3": reject_top,
+            "stage_flow_last_15m": stage_flow,
+        }
+    except Exception:
+        return {"pending": None, "last_tick_ts": None}
+
+
+async def mid_status_summary_loop(self) -> None:
+    """Logs one compact MID status line every N seconds (default: 60).
+
+    Helps understand "why no signals":
+    - setups+0 → no setups found
+    - pending>0 and trig+0 → waiting for entry / price didn't reach zone
+    - hard_blocks+X → filters are cutting
+    """
+    global _MID_STATUS_LAST_LOG_TS, _MID_STATUS_LAST_SNAP
+    try:
+        every = int(float(os.getenv("MID_STATUS_EVERY_SEC", os.getenv("MID_STATUS_LOG_EVERY_SEC", "60")) or 60))
+    except Exception:
+        every = 60
+    if every <= 0:
+        return
+
+    # Delay a bit to avoid noisy startup logs.
+    await asyncio.sleep(min(15, max(1, every // 4)))
+    logger.info("[mid][status] summary enabled every=%ss (set MID_STATUS_EVERY_SEC=0 to disable)", every)
+
+    while True:
+        await asyncio.sleep(max(5, every))
         try:
             now = time.time()
             snap = _mid_metrics_snapshot()
-            pending_items: list[dict] = []
+
+            # Current pending count
+            pending_n = None
             try:
                 if hasattr(self, "_mid_pending_load"):
                     pending_items = await self._mid_pending_load()  # type: ignore[attr-defined]
+                    pending_n = int(len(pending_items) if isinstance(pending_items, list) else 0)
                 else:
                     st = await db_store.kv_get_json("mid_pending") or {}
                     items = st.get("items", [])
-                    pending_items = items if isinstance(items, list) else []
+                    pending_n = int(len(items) if isinstance(items, list) else 0)
             except Exception:
-                pending_items = []
+                pending_n = None
+
+            # Per-window deltas
+            prev = dict(_MID_STATUS_LAST_SNAP or {})
+            df_setups = int(snap.get("setups_found") or 0) - int(prev.get("setups_found") or 0)
+            df_p_created = int(snap.get("pending_created") or 0) - int(prev.get("pending_created") or 0)
+            df_p_trig = int(snap.get("pending_triggered") or 0) - int(prev.get("pending_triggered") or 0)
+            df_p_exp = int(snap.get("pending_expired") or 0) - int(prev.get("pending_expired") or 0)
+            df_blocks = int(snap.get("hard_blocks") or 0) - int(prev.get("hard_blocks") or 0)
+
+            _MID_STATUS_LAST_SNAP = {
+                "setups_found": int(snap.get("setups_found") or 0),
+                "pending_created": int(snap.get("pending_created") or 0),
+                "pending_triggered": int(snap.get("pending_triggered") or 0),
+                "pending_expired": int(snap.get("pending_expired") or 0),
+                "hard_blocks": int(snap.get("hard_blocks") or 0),
+            }
+            _MID_STATUS_LAST_LOG_TS = now
 
             last_tick_ts = float(snap.get("last_tick_ts") or 0.0)
-            last_tick_ago = (now - last_tick_ts) if last_tick_ts > 0 else None
+            tick_ago = (now - last_tick_ts) if last_tick_ts > 0 else None
+
+            parts = []
+            if tick_ago is None:
+                parts.append("last_tick=never")
+            else:
+                parts.append(f"last_tick={tick_ago:.0f}s")
+
+            parts.append(f"setups+{df_setups}")
+
+
+            # Stage flow (last 15m)
             try:
-                ttl_min = float(os.getenv("MID_PENDING_TTL_MIN", "60") or 60.0)
+                st = _mid_stage_counts(900)
+                parts.append("stage15m=" + ",".join([
+                    f"scanned={int(st.get('scanned',0))}",
+                    f"passed_ta={int(st.get('passed_ta',0))}",
+                    f"created_pending={int(st.get('created_pending',0))}",
+                    f"triggered={int(st.get('triggered',0))}",
+                    f"rejected={int(st.get('rejected',0))}",
+                ]))
             except Exception:
-                ttl_min = 60.0
+                pass
 
-            # Rolling reject digest (top-3) for quick "why no signals" diagnosis.
+            # Prefer trigger-loop snapshot for "pending now" to avoid confusing mismatches
+            # between kv-store view and the latest trigger poll.
             try:
-                reject_top = _mid_reject_digest_top(3)
+                pt = _MID_PENDING_TICK_LAST or {}
             except Exception:
-                reject_top = []
+                pt = {}
+
+            pending_disp = pending_n
             try:
-                window_sec = int(float(os.getenv("MID_REJECT_WINDOW_SEC", "900") or 900))
+                if pt and isinstance(pt, dict) and "keep" in pt:
+                    pending_disp = int(pt.get("keep") or 0)
             except Exception:
-                window_sec = 900
+                pass
 
-            # Stage flow breakdown (last 15m)
+            if pending_disp is not None:
+                parts.append(f"pending={int(pending_disp)} (created+{df_p_created} trig+{df_p_trig} exp+{df_p_exp})")
+                # Always show DB pending count when available (helps reconcile in-memory vs DB)
+                try:
+                    if pending_n is not None:
+                        parts.append(f"pending_db={int(pending_n)}")
+                except Exception:
+                    pass
+            else:
+                parts.append(f"pending=? (created+{df_p_created} trig+{df_p_trig} exp+{df_p_exp})")
+            parts.append(f"blocks+{df_blocks}")
+
+            # Include latest pending tick counters (total/keep/in_zone/near/far + avg attempts/fails)
+            # Always print numeric fields (never 'na').
+            # If the trigger-loop snapshot is missing/stale, we still print the last known values,
+            # and fall back to a best-effort approximation from DB count.
             try:
-                stage_counts = _mid_stage_counts(900)
-                stage_flow = {
-                    "scanned": int(stage_counts.get("scanned", 0)),
-                    "passed_ta": int(stage_counts.get("passed_ta", 0)),
-                    "created_pending": int(stage_counts.get("created_pending", 0)),
-                    "triggered": int(stage_counts.get("triggered", 0)),
-                    "rejected": int(stage_counts.get("rejected", 0)),
-                }
+                _pt = pt if (pt and isinstance(pt, dict)) else {}
+                pt_ts = float(_pt.get('ts') or 0.0)
+                pt_age = (now - pt_ts) if pt_ts > 0 else None
+                pt_stale = (pt_age is None) or (pt_age > float(os.getenv('MID_STATUS_PENDING_TICK_STALE_SEC', '120') or 120))
+
+                # If snapshot is empty, approximate from DB count so fields are always present.
+                if not _pt:
+                    dbn = int(pending_n or 0)
+                    _pt = {
+                        'total': dbn,
+                        'keep': dbn,
+                        'in_zone': 0,
+                        'near': 0,
+                        'far': dbn,
+                        'expired_now': 0,
+                        'removed_now': 0,
+                        'attempts_avg': 0.0,
+                        'fails_avg': 0.0,
+                    }
+
+                parts.append(
+                    "pending_tick="
+                    + f"total={int(_pt.get('total',0))}"
+                    + f" keep={int(_pt.get('keep',0))}"
+                    + f" in_zone={int(_pt.get('in_zone',0))}"
+                    + f" near={int(_pt.get('near',0))}"
+                    + f" far={int(_pt.get('far',0))}"
+                    + f" exp_now={int(_pt.get('expired_now',0))}"
+                    + f" rm_now={int(_pt.get('removed_now',0))}"
+                    + f" att_avg={float(_pt.get('attempts_avg',0.0)):.2f}"
+                    + f" fail_avg={float(_pt.get('fails_avg',0.0)):.2f}"
+                )
+
+                # Optional: expose staleness as a separate compact flag (keeps the main format stable).
+                try:
+                    if pt_stale and (os.getenv('MID_STATUS_SHOW_STALE_FLAGS','0').strip().lower() in ('1','true','yes','on')):
+                        parts.append('pending_tick_stale' + (f" age={pt_age:.0f}s" if pt_age is not None else ""))
+                except Exception:
+                    pass
             except Exception:
-                stage_flow = None
+                pass
 
-            return {
-                "pending": int(len(pending_items)),
-                "pending_ttl_min": float(ttl_min),
-                "setups_found_total": int(snap.get("setups_found") or 0),
-                "pending_created_total": int(snap.get("pending_created") or 0),
-                "pending_triggered_total": int(snap.get("pending_triggered") or 0),
-                "pending_expired_total": int(snap.get("pending_expired") or 0),
-                "hard_blocks_total": int(snap.get("hard_blocks") or 0),
-                "hardblock_top_last_tick": snap.get("hardblock_top"),
-                "hardblock_samples_last_tick": snap.get("hardblock_samples"),
-                "last_tick_ts": last_tick_ts if last_tick_ts > 0 else None,
-                "last_tick_ago_s": float(last_tick_ago) if last_tick_ago is not None else None,
-                "last_summary": snap.get("last_summary"),
-                "reject_digest_window_sec": int(window_sec),
-                "reject_digest_top3": reject_top,
-                "stage_flow_last_15m": stage_flow,
-            }
-        except Exception:
-            return {"pending": None, "last_tick_ts": None}
-
-
-    async def mid_status_summary_loop(self) -> None:
-        """Logs one compact MID status line every N seconds (default: 60).
-
-        Helps understand "why no signals":
-        - setups+0 → no setups found
-        - pending>0 and trig+0 → waiting for entry / price didn't reach zone
-        - hard_blocks+X → filters are cutting
-        """
-        global _MID_STATUS_LAST_LOG_TS, _MID_STATUS_LAST_SNAP
-        try:
-            every = int(float(os.getenv("MID_STATUS_EVERY_SEC", os.getenv("MID_STATUS_LOG_EVERY_SEC", "60")) or 60))
-        except Exception:
-            every = 60
-        if every <= 0:
-            return
-
-        # Delay a bit to avoid noisy startup logs.
-        await asyncio.sleep(min(15, max(1, every // 4)))
-        logger.info("[mid][status] summary enabled every=%ss (set MID_STATUS_EVERY_SEC=0 to disable)", every)
-
-        while True:
-            await asyncio.sleep(max(5, every))
+            # Include trigger-loop poll counters (interpreting trig_no)
             try:
-                now = time.time()
-                snap = _mid_metrics_snapshot()
+                tp = _MID_TRIG_POLL_LAST if isinstance(_MID_TRIG_POLL_LAST, dict) else {}
+                tp_checked = int(tp.get('checked', 0) or 0)
+                tp_inzone = int(tp.get('in_zone_chk', 0) or 0)
+                tp_ts = float(tp.get('ts') or 0.0)
+                tp_age = (now - tp_ts) if tp_ts > 0 else None
+                tp_stale = (tp_age is None) or (tp_age > float(os.getenv('MID_STATUS_TRIG_POLL_STALE_SEC', '120') or 120))
 
-                # Current pending count
-                pending_n = None
+                parts.append(f"trig_chk={tp_checked}")
+                parts.append(f"trig_inzone_chk={tp_inzone}")
+                if tp_stale and tp_checked == 0:
+                    # helps explain why trig_no_* buckets may be stale
+                    parts.append("trig_poll=stale" + (f" age={tp_age:.0f}s" if tp_age is not None else ""))
+            except Exception:
+                tp_checked = 0
+                tp_inzone = 0
+                tp_stale = True
+                pass
+
+            # Top reasons inside trigger loop, split by bucket.
+            # - pretrig_no: checked while not in-zone (should be rare)
+            # - trig_no_inzone: in-zone but blocked (this is the real "why no emit")
+            # Trigger-loop reject reasons, split by bucket.
+            # - pretrig_no: checked while not in-zone (should be rare)
+            # - trig_no_inzone: in-zone but blocked (this is the real "why no emit")
+            #
+            # We try to show *all* reasons in the rolling window (capped only for log length).
+            try:
+                max_show = int(float(os.getenv("MID_STATUS_TRIG_REASONS_MAX", os.getenv("MID_STATUS_TRIG_REASONS", "12")) or 12))
+            except Exception:
+                max_show = 12
+            max_show = max(3, min(int(max_show), 50))
+
+            try:
+                # Prefer reasons aggregated in the most recent pending poll tick; fall back to rolling window.
                 try:
-                    if hasattr(self, "_mid_pending_load"):
-                        pending_items = await self._mid_pending_load()  # type: ignore[attr-defined]
-                        pending_n = int(len(pending_items) if isinstance(pending_items, list) else 0)
-                    else:
-                        st = await db_store.kv_get_json("mid_pending") or {}
-                        items = st.get("items", [])
-                        pending_n = int(len(items) if isinstance(items, list) else 0)
+                    tl = _MID_TRIG_REJECT_TICK_LAST if isinstance(_MID_TRIG_REJECT_TICK_LAST, dict) else {}
+                    tl_ts = float(tl.get('ts') or 0.0)
+                    tl_age = (now - tl_ts) if tl_ts > 0 else None
+                    tl_stale = (tl_age is None) or (tl_age > float(os.getenv('MID_STATUS_TRIG_TICK_STALE_SEC', '120') or 120))
+                    pre_counts = dict(tl.get('pre') or {}) if (not tl_stale) else {}
                 except Exception:
-                    pending_n = None
+                    pre_counts = {}
+                if not pre_counts:
+                    pre_counts = _mid_trig_reject_digest_counts(bucket='pre')
+                if pre_counts:
+                    items = sorted(pre_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+                    shown = items[:max_show]
+                    more = max(0, len(items) - len(shown))
+                    s = ",".join([f"{k}={int(v)}" for k, v in shown])
+                    if more:
+                        s += f",+more={more}"
+                    parts.append("pretrig_no=" + s)
+            except Exception:
+                pass
 
-                # Per-window deltas
-                prev = dict(_MID_STATUS_LAST_SNAP or {})
-                df_setups = int(snap.get("setups_found") or 0) - int(prev.get("setups_found") or 0)
-                df_p_created = int(snap.get("pending_created") or 0) - int(prev.get("pending_created") or 0)
-                df_p_trig = int(snap.get("pending_triggered") or 0) - int(prev.get("pending_triggered") or 0)
-                df_p_exp = int(snap.get("pending_expired") or 0) - int(prev.get("pending_expired") or 0)
-                df_blocks = int(snap.get("hard_blocks") or 0) - int(prev.get("hard_blocks") or 0)
-
-                _MID_STATUS_LAST_SNAP = {
-                    "setups_found": int(snap.get("setups_found") or 0),
-                    "pending_created": int(snap.get("pending_created") or 0),
-                    "pending_triggered": int(snap.get("pending_triggered") or 0),
-                    "pending_expired": int(snap.get("pending_expired") or 0),
-                    "hard_blocks": int(snap.get("hard_blocks") or 0),
-                }
-                _MID_STATUS_LAST_LOG_TS = now
-
-                last_tick_ts = float(snap.get("last_tick_ts") or 0.0)
-                tick_ago = (now - last_tick_ts) if last_tick_ts > 0 else None
-
-                parts = []
-                if tick_ago is None:
-                    parts.append("last_tick=never")
-                else:
-                    parts.append(f"last_tick={tick_ago:.0f}s")
-
-                parts.append(f"setups+{df_setups}")
-
-
-                # Stage flow (last 15m)
+            try:
+                # Prefer reasons aggregated in the most recent pending poll tick; fall back to rolling window.
                 try:
-                    st = _mid_stage_counts(900)
-                    parts.append("stage15m=" + ",".join([
-                        f"scanned={int(st.get('scanned',0))}",
-                        f"passed_ta={int(st.get('passed_ta',0))}",
-                        f"created_pending={int(st.get('created_pending',0))}",
-                        f"triggered={int(st.get('triggered',0))}",
-                        f"rejected={int(st.get('rejected',0))}",
-                    ]))
+                    tl = _MID_TRIG_REJECT_TICK_LAST if isinstance(_MID_TRIG_REJECT_TICK_LAST, dict) else {}
+                    tl_ts = float(tl.get('ts') or 0.0)
+                    tl_age = (now - tl_ts) if tl_ts > 0 else None
+                    tl_stale = (tl_age is None) or (tl_age > float(os.getenv('MID_STATUS_TRIG_TICK_STALE_SEC', '120') or 120))
+                    in_counts = dict(tl.get('inzone') or {}) if (not tl_stale) else {}
                 except Exception:
-                    pass
-
-                # Prefer trigger-loop snapshot for "pending now" to avoid confusing mismatches
-                # between kv-store view and the latest trigger poll.
-                try:
-                    pt = _MID_PENDING_TICK_LAST or {}
-                except Exception:
-                    pt = {}
-
-                pending_disp = pending_n
-                try:
-                    if pt and isinstance(pt, dict) and "keep" in pt:
-                        pending_disp = int(pt.get("keep") or 0)
-                except Exception:
-                    pass
-
-                if pending_disp is not None:
-                    parts.append(f"pending={int(pending_disp)} (created+{df_p_created} trig+{df_p_trig} exp+{df_p_exp})")
-                    # Always show DB pending count when available (helps reconcile in-memory vs DB)
+                    in_counts = {}
+                if not in_counts:
+                    in_counts = _mid_trig_reject_digest_counts(bucket='inzone')
+                if in_counts:
+                    items = sorted(in_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+                    shown = items[:max_show]
+                    more = max(0, len(items) - len(shown))
+                    s = ",".join([f"{k}={int(v)}" for k, v in shown])
+                    if more:
+                        s += f",+more={more}"
+                    parts.append("trig_no_inzone=" + s)
                     try:
-                        if pending_n is not None:
-                            parts.append(f"pending_db={int(pending_n)}")
-                    except Exception:
-                        pass
-                else:
-                    parts.append(f"pending=? (created+{df_p_created} trig+{df_p_trig} exp+{df_p_exp})")
-                parts.append(f"blocks+{df_blocks}")
-
-                # Include latest pending tick counters (total/keep/in_zone/near/far + avg attempts/fails)
-                # Always print numeric fields (never 'na').
-                # If the trigger-loop snapshot is missing/stale, we still print the last known values,
-                # and fall back to a best-effort approximation from DB count.
-                try:
-                    _pt = pt if (pt and isinstance(pt, dict)) else {}
-                    pt_ts = float(_pt.get('ts') or 0.0)
-                    pt_age = (now - pt_ts) if pt_ts > 0 else None
-                    pt_stale = (pt_age is None) or (pt_age > float(os.getenv('MID_STATUS_PENDING_TICK_STALE_SEC', '120') or 120))
-
-                    # If snapshot is empty, approximate from DB count so fields are always present.
-                    if not _pt:
-                        dbn = int(pending_n or 0)
-                        _pt = {
-                            'total': dbn,
-                            'keep': dbn,
-                            'in_zone': 0,
-                            'near': 0,
-                            'far': dbn,
-                            'expired_now': 0,
-                            'removed_now': 0,
-                            'attempts_avg': 0.0,
-                            'fails_avg': 0.0,
-                        }
-
-                    parts.append(
-                        "pending_tick="
-                        + f"total={int(_pt.get('total',0))}"
-                        + f" keep={int(_pt.get('keep',0))}"
-                        + f" in_zone={int(_pt.get('in_zone',0))}"
-                        + f" near={int(_pt.get('near',0))}"
-                        + f" far={int(_pt.get('far',0))}"
-                        + f" exp_now={int(_pt.get('expired_now',0))}"
-                        + f" rm_now={int(_pt.get('removed_now',0))}"
-                        + f" att_avg={float(_pt.get('attempts_avg',0.0)):.2f}"
-                        + f" fail_avg={float(_pt.get('fails_avg',0.0)):.2f}"
-                    )
-
-                    # Optional: expose staleness as a separate compact flag (keeps the main format stable).
-                    try:
-                        if pt_stale and (os.getenv('MID_STATUS_SHOW_STALE_FLAGS','0').strip().lower() in ('1','true','yes','on')):
-                            parts.append('pending_tick_stale' + (f" age={pt_age:.0f}s" if pt_age is not None else ""))
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
-                # Include trigger-loop poll counters (interpreting trig_no)
-                try:
-                    tp = _MID_TRIG_POLL_LAST if isinstance(_MID_TRIG_POLL_LAST, dict) else {}
-                    tp_checked = int(tp.get('checked', 0) or 0)
-                    tp_inzone = int(tp.get('in_zone_chk', 0) or 0)
-                    tp_ts = float(tp.get('ts') or 0.0)
-                    tp_age = (now - tp_ts) if tp_ts > 0 else None
-                    tp_stale = (tp_age is None) or (tp_age > float(os.getenv('MID_STATUS_TRIG_POLL_STALE_SEC', '120') or 120))
-
-                    parts.append(f"trig_chk={tp_checked}")
-                    parts.append(f"trig_inzone_chk={tp_inzone}")
-                    if tp_stale and tp_checked == 0:
-                        # helps explain why trig_no_* buckets may be stale
-                        parts.append("trig_poll=stale" + (f" age={tp_age:.0f}s" if tp_age is not None else ""))
-                except Exception:
-                    tp_checked = 0
-                    tp_inzone = 0
-                    tp_stale = True
-                    pass
-
-                # Top reasons inside trigger loop, split by bucket.
-                # - pretrig_no: checked while not in-zone (should be rare)
-                # - trig_no_inzone: in-zone but blocked (this is the real "why no emit")
-                # Trigger-loop reject reasons, split by bucket.
-                # - pretrig_no: checked while not in-zone (should be rare)
-                # - trig_no_inzone: in-zone but blocked (this is the real "why no emit")
-                #
-                # We try to show *all* reasons in the rolling window (capped only for log length).
-                try:
-                    max_show = int(float(os.getenv("MID_STATUS_TRIG_REASONS_MAX", os.getenv("MID_STATUS_TRIG_REASONS", "12")) or 12))
-                except Exception:
-                    max_show = 12
-                max_show = max(3, min(int(max_show), 50))
-
-                try:
-                    # Prefer reasons aggregated in the most recent pending poll tick; fall back to rolling window.
-                    try:
-                        tl = _MID_TRIG_REJECT_TICK_LAST if isinstance(_MID_TRIG_REJECT_TICK_LAST, dict) else {}
-                        tl_ts = float(tl.get('ts') or 0.0)
-                        tl_age = (now - tl_ts) if tl_ts > 0 else None
-                        tl_stale = (tl_age is None) or (tl_age > float(os.getenv('MID_STATUS_TRIG_TICK_STALE_SEC', '120') or 120))
-                        pre_counts = dict(tl.get('pre') or {}) if (not tl_stale) else {}
-                    except Exception:
-                        pre_counts = {}
-                    if not pre_counts:
-                        pre_counts = _mid_trig_reject_digest_counts(bucket='pre')
-                    if pre_counts:
-                        items = sorted(pre_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
-                        shown = items[:max_show]
-                        more = max(0, len(items) - len(shown))
-                        s = ",".join([f"{k}={int(v)}" for k, v in shown])
-                        if more:
-                            s += f",+more={more}"
-                        parts.append("pretrig_no=" + s)
-                except Exception:
-                    pass
-
-                try:
-                    # Prefer reasons aggregated in the most recent pending poll tick; fall back to rolling window.
-                    try:
-                        tl = _MID_TRIG_REJECT_TICK_LAST if isinstance(_MID_TRIG_REJECT_TICK_LAST, dict) else {}
-                        tl_ts = float(tl.get('ts') or 0.0)
-                        tl_age = (now - tl_ts) if tl_ts > 0 else None
-                        tl_stale = (tl_age is None) or (tl_age > float(os.getenv('MID_STATUS_TRIG_TICK_STALE_SEC', '120') or 120))
-                        in_counts = dict(tl.get('inzone') or {}) if (not tl_stale) else {}
-                    except Exception:
-                        in_counts = {}
-                    if not in_counts:
-                        in_counts = _mid_trig_reject_digest_counts(bucket='inzone')
-                    if in_counts:
-                        items = sorted(in_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
-                        shown = items[:max_show]
-                        more = max(0, len(items) - len(shown))
-                        s = ",".join([f"{k}={int(v)}" for k, v in shown])
-                        if more:
-                            s += f",+more={more}"
-                        parts.append("trig_no_inzone=" + s)
+                        parts.append(f"emit_blocker={str(shown[0][0] if shown else '')}")
                         try:
-                            parts.append(f"emit_blocker={str(shown[0][0] if shown else '')}")
-                            try:
-                                max_blk = int(float(os.getenv('MID_STATUS_EMIT_BLOCKERS_MAX','50') or 50))
-                            except Exception:
-                                max_blk = 50
-                            max_blk = max(3, min(int(max_blk), 100))
-                            blockers = [k for k, _v in items[:max_blk]]
-                            if blockers:
-                                parts.append("emit_blockers=" + ",".join(blockers))
+                            max_blk = int(float(os.getenv('MID_STATUS_EMIT_BLOCKERS_MAX','50') or 50))
                         except Exception:
-                            pass
-                except Exception:
-                    pass
-
-                # Show top hard-block reasons from the *last MID tick* (helps instantly see which filter cuts most).
-                try:
-                    hb_top = snap.get("hardblock_top")
-                    if hb_top:
-                        parts.append(f"hb_top={hb_top}")
-                except Exception:
-                    pass
-
-                # Optional: include last summary tail if user wants it
-                try:
-                    if os.getenv("MID_STATUS_INCLUDE_LAST_SUMMARY", "0").strip().lower() not in ("0","false","no","off"):
-                        ls = snap.get("last_summary")
-                        if ls:
-                            # keep short
-                            s = str(ls)
-                            if len(s) > 220:
-                                s = s[:220] + "…"
-                            parts.append(f"summary={s}")
-                except Exception:
-                    pass
-
-                logger.info("[mid][status] %s", " | ".join(parts))
+                            max_blk = 50
+                        max_blk = max(3, min(int(max_blk), 100))
+                        blockers = [k for k, _v in items[:max_blk]]
+                        if blockers:
+                            parts.append("emit_blockers=" + ",".join(blockers))
+                    except Exception:
+                        pass
             except Exception:
-                logger.exception("[mid][status] summary loop failed")
+                pass
+
+            # Show top hard-block reasons from the *last MID tick* (helps instantly see which filter cuts most).
+            try:
+                hb_top = snap.get("hardblock_top")
+                if hb_top:
+                    parts.append(f"hb_top={hb_top}")
+            except Exception:
+                pass
+
+            # Optional: include last summary tail if user wants it
+            try:
+                if os.getenv("MID_STATUS_INCLUDE_LAST_SUMMARY", "0").strip().lower() not in ("0","false","no","off"):
+                    ls = snap.get("last_summary")
+                    if ls:
+                        # keep short
+                        s = str(ls)
+                        if len(s) > 220:
+                            s = s[:220] + "…"
+                        parts.append(f"summary={s}")
+            except Exception:
+                pass
+
+            logger.info("[mid][status] %s", " | ".join(parts))
+        except Exception:
+            logger.exception("[mid][status] summary loop failed")
 
 
-        # ---------------- MID trap/blocked digest (anti-spam analytics) ----------------
+    # ---------------- MID trap/blocked digest (anti-spam analytics) ----------------
     def _mid_reason_key(self, reason: str) -> str:
         r = (reason or "").strip()
         if not r:
@@ -21349,6 +21548,98 @@ async def futures_contract_exists(self, exchange: str, sym_base: str) -> dict:
         if cand in syms:
             return {"ok": True, "had_error": had_error, "symbol": cand}
     return {"ok": False, "had_error": had_error, "symbol": None}
+
+
+
+# --- FIX: ensure MID pending helpers exist (some builds lost them due to merge/indentation) ---
+try:
+    _mid_missing_add = not callable(globals().get("add_mid_pending"))
+except Exception:
+    _mid_missing_add = True
+
+if _mid_missing_add:
+    async def _mid_pending_load(self) -> list[dict]:
+        timeout_sec = float(os.getenv("MID_PENDING_KV_TIMEOUT_SEC", os.getenv("DB_COMMAND_TIMEOUT_SEC", "3")) or 3.0)
+        try:
+            st = await asyncio.wait_for(db_store.kv_get_json("mid_pending"), timeout=timeout_sec) or {}
+            items = st.get("items", [])
+            return items if isinstance(items, list) else []
+        except Exception as e:
+            try:
+                logger.warning("[mid][pending] kv_store load failed/timeout (sec=%.2f): %s", timeout_sec, str(e)[:200])
+            except Exception:
+                pass
+            return []
+
+    async def _mid_pending_save(self, items: list[dict]) -> None:
+        timeout_sec = float(os.getenv("MID_PENDING_KV_TIMEOUT_SEC", os.getenv("DB_COMMAND_TIMEOUT_SEC", "3")) or 3.0)
+        try:
+            await asyncio.wait_for(db_store.kv_set_json("mid_pending", {"items": items}), timeout=timeout_sec)
+        except Exception as e:
+            try:
+                logger.warning("[mid][pending] kv_store write failed/timeout (sec=%.2f): %s", timeout_sec, str(e)[:200])
+            except Exception:
+                pass
+
+    async def add_mid_pending(self, rec: dict) -> None:
+        items = await self._mid_pending_load()
+        key = str(rec.get("key") or "").strip()
+        if not key:
+            return
+        out = []
+        replaced = False
+        for it in items:
+            try:
+                if str(it.get("key") or "") == key:
+                    out.append(rec)
+                    replaced = True
+                else:
+                    out.append(it)
+            except Exception:
+                continue
+        if not replaced:
+            out.append(rec)
+        max_items = int(os.getenv("MID_PENDING_MAX", "300") or 300)
+        if max_items > 0 and len(out) > max_items:
+            out = out[-max_items:]
+        await self._mid_pending_save(out)
+
+    async def remove_mid_pending(self, key: str) -> None:
+        k = str(key or "").strip()
+        if not k:
+            return
+        items = await self._mid_pending_load()
+        out = [it for it in items if str(it.get("key") or "") != k]
+        await self._mid_pending_save(out)
+
+    async def mid_pending_trigger_loop(self) -> None:
+        # Minimal poll loop to keep trig_poll fresh even if full implementation is missing.
+        poll = float(os.getenv("MID_PENDING_POLL_SEC", "5") or 5.0)
+        while True:
+            try:
+                await self._mid_pending_load()
+                try:
+                    globals()["_MID_TRIG_POLL_LAST"] = time.time()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            await asyncio.sleep(poll)
+
+    # Bind to Backend if not present
+    try:
+        if not callable(getattr(Backend, "_mid_pending_load", None)):
+            Backend._mid_pending_load = _mid_pending_load  # type: ignore[attr-defined]
+        if not callable(getattr(Backend, "_mid_pending_save", None)):
+            Backend._mid_pending_save = _mid_pending_save  # type: ignore[attr-defined]
+        if not callable(getattr(Backend, "add_mid_pending", None)):
+            Backend.add_mid_pending = add_mid_pending  # type: ignore[attr-defined]
+        if not callable(getattr(Backend, "remove_mid_pending", None)):
+            Backend.remove_mid_pending = remove_mid_pending  # type: ignore[attr-defined]
+        if not callable(getattr(Backend, "mid_pending_trigger_loop", None)):
+            Backend.mid_pending_trigger_loop = mid_pending_trigger_loop  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
 
 # Bind methods to Backend (non-invasive, avoids moving large blocks inside class)
