@@ -14147,20 +14147,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 trig_state["reasons"].append(rk)
                             if trig_state["primary_apply"] is None and ar:
                                 trig_state["primary_apply"] = ar
-                            # Ensure any blocker added via _trig_add appears in fail= even if it is not part of the
-                            # built-in checklist keys. This makes "fail shows everything that blocks" iron-clad.
-                            try:
-                                if isinstance(it.get("_trig_checks"), dict):
-                                    cur = str(it["_trig_checks"].get(rk) or "").strip().lower()
-                                    if not cur or cur in ("ne", "not_eval", "not-eval", "skip"):
-                                        it["_trig_checks"][rk] = "fail"
-                                    elif cur.startswith("pass"):
-                                        # keep pass marker
-                                        pass
-                                    elif not cur.startswith("fail"):
-                                        it["_trig_checks"][rk] = "fail"
-                            except Exception:
-                                pass
                         except Exception:
                             pass
 
@@ -14790,55 +14776,46 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 adx30 = float(ta.get("adx1") or ta.get("adx_30m") or 0.0)
                                 adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
                                 if min_adx_30m and adx30 < min_adx_30m:
-                                    if full_diag:
-                                        _trig_add("regime_block", "regime_block")
+                                    keep_it, outc = _pending_apply_fail(it, "regime_block", now)
+                                    _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
                                     else:
-                                        keep_it, outc = _pending_apply_fail(it, "regime_block", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
-                                        else:
-                                            try:
-                                                removed_n += 1
-                                            except Exception:
-                                                pass
-                                        continue
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
                                 if min_adx_1h and adx1h < min_adx_1h:
-                                    if full_diag:
-                                        _trig_add("regime_block", "regime_block")
+                                    keep_it, outc = _pending_apply_fail(it, "regime_block", now)
+                                    _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
                                     else:
-                                        keep_it, outc = _pending_apply_fail(it, "regime_block", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
-                                        else:
-                                            try:
-                                                removed_n += 1
-                                            except Exception:
-                                                pass
-                                        continue
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
                             except Exception:
                                 pass
                         try:
                             min_atr_pct = float(os.getenv("MID_MIN_ATR_PCT","0") or 0)
                             atrp = float(ta.get("atr_pct") or 0.0)
                             if min_atr_pct and atrp < min_atr_pct:
-                                    if full_diag:
-                                        _trig_add("volatility_block", "volatility_block")
-                                    else:
-                                        keep_it, outc = _pending_apply_fail(it, "volatility_block", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "volatility_block", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
-                                        else:
-                                            try:
-                                                removed_n += 1
-                                            except Exception:
-                                                pass
-                                        continue
+                                keep_it, outc = _pending_apply_fail(it, "volatility_block", now)
+                                _pending_log_trigger(sym, market, direction, outc, "volatility_block", it, float(price))
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
                         except Exception:
                             pass
                         try:
@@ -14989,9 +14966,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             if vwap_val > 0 and atr30 and atr30 > 0:
                                 if mid_require_vwap_bias:
                                     if direction_u == "SHORT" and not (entry_check < vwap_val):
-                                        if full_diag:
-                                            _trig_add("vwap_bias", "vwap_bias")
-                                    else:
                                         keep_it, outc = _pending_apply_fail(it, "vwap_bias", now)
                                         _pending_log_trigger(sym, market, direction, outc, "vwap_bias", it, float(price))
                                         if keep_it:
@@ -15004,9 +14978,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                                 pass
                                         continue
                                     if direction_u == "LONG" and not (entry_check > vwap_val):
-                                        if full_diag:
-                                            _trig_add("vwap_bias", "vwap_bias")
-                                    else:
                                         keep_it, outc = _pending_apply_fail(it, "vwap_bias", now)
                                         _pending_log_trigger(sym, market, direction, outc, "vwap_bias", it, float(price))
                                         if keep_it:
@@ -15020,9 +14991,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                         continue
                                 if mid_min_vwap_dist_atr > 0:
                                     if abs(entry_check - vwap_val) < (atr30 * mid_min_vwap_dist_atr):
-                                        if full_diag:
-                                            _trig_add("vwap_dist", "vwap_dist")
-                                    else:
                                         keep_it, outc = _pending_apply_fail(it, "vwap_dist", now)
                                         _pending_log_trigger(sym, market, direction, outc, "vwap_dist", it, float(price))
                                         if keep_it:
@@ -15067,52 +15035,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
 
-                    
-                    # FULL_DIAGNOSTIC safety net:
-                    # If any checklist items are marked fail but no failures were recorded via _trig_add
-                    # (e.g., a newly-added filter forgot to call _trig_add), do NOT allow "fail empty" ambiguity.
-                    # Derive blockers from the checklist so that:
-                    #   - any fail => outcome != pass
-                    #   - fail= shows everything that blocks
-                    if full_diag and isinstance(trig_state, dict) and not trig_state.get("reasons"):
-                        try:
-                            chk = it.get("_trig_checks") if isinstance(it.get("_trig_checks"), dict) else {}
-                            derived = []
-                            for k, v in (chk or {}).items():
-                                sv = str(v or "").strip().lower()
-                                if sv.startswith("fail"):
-                                    kk = str(k or "").strip()
-                                    if kk:
-                                        if kk == "score":
-                                            derived.append("score_low")
-                                        elif kk == "confidence":
-                                            derived.append("confidence_low")
-                                        elif kk == "vol_x":
-                                            derived.append("vol_x_low")
-                                        elif kk == "reclaim":
-                                            derived.append("reclaim_missing")
-                                        elif kk == "bos_5m":
-                                            derived.append("bos_5m_missing")
-                                        elif kk == "sweep":
-                                            derived.append("liq_sweep_missing")
-                                        elif kk == "displacement":
-                                            derived.append("displacement_missing")
-                                        elif kk == "structure_30m":
-                                            derived.append("structure_broken_30m")
-                                        elif kk == "structure_1h":
-                                            derived.append("structure_broken_1h")
-                                        elif kk == "direction":
-                                            derived.append("direction_mismatch")
-                                        elif kk == "trap":
-                                            derived.append("trap_block")
-                                        else:
-                                            derived.append(kk)
-                            if derived:
-                                for r in derived:
-                                    _trig_add(r, r)
-                        except Exception:
-                            pass
-# FULL_DIAGNOSTIC: after evaluating all trigger-time filters,
+                    # FULL_DIAGNOSTIC: after evaluating all trigger-time filters,
                     # if anything failed, apply the primary fail now (but keep all reasons for logs/status).
                     # IMPORTANT: we log `reason=` as the *human* first-fail key (e.g. reclaim_missing),
                     # but we apply the canonical reason (e.g. liq_sweep_missing) to preserve hard/soft policies.
