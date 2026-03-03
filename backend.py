@@ -13190,21 +13190,26 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
     except Exception:
         return (None, "error")
 
-async def _mid_pending_load(self) -> list[dict]:
-    """Load MID pending list.
 
-    Primary storage is Postgres kv_store (key='mid_pending'). If the KV store is
-    unavailable (missing table / DB outage), fall back to in-memory storage so
-    pending + trigger can still work inside a single running process.
-    """
-    if not hasattr(self, "_mid_pending_mem"):
-        self._mid_pending_mem = []
-    if getattr(self, "_mid_pending_db_disabled", False):
-        return list(self._mid_pending_mem)
-    try:
-        st = await db_store.kv_get_json("mid_pending") or {}
-        items = st.get("items", [])
-        return items if isinstance(items, list) else []
+    async def _mid_pending_load(self) -> list[dict]:
+        if not hasattr(self, "_mid_pending_mem"):
+            self._mid_pending_mem = []
+        if getattr(self, "_mid_pending_db_disabled", False):
+            return list(self._mid_pending_mem)
+
+        timeout_sec = float(os.getenv("MID_PENDING_KV_TIMEOUT_SEC", "3.0") or 3.0)
+        try:
+            st = await asyncio.wait_for(db_store.kv_get_json("mid_pending"), timeout=timeout_sec) or {}
+            items = st.get("items", [])
+            return items if isinstance(items, list) else []
+        except Exception as e:
+            try:
+                logger.warning("[mid][pending] kv_store load failed/timeout; switching to in-memory pending (err=%s)", str(e)[:200])
+            except Exception:
+                pass
+            self._mid_pending_db_disabled = True
+            return list(self._mid_pending_mem)
+
     except Exception as e:
         if not getattr(self, "_mid_pending_db_disabled", False):
             try:
@@ -13214,19 +13219,28 @@ async def _mid_pending_load(self) -> list[dict]:
         self._mid_pending_db_disabled = True
         return list(self._mid_pending_mem)
 
-async def _mid_pending_save(self, items: list[dict]) -> None:
-    if not hasattr(self, "_mid_pending_mem"):
-        self._mid_pending_mem = []
-    # Always keep a working in-memory copy
-    try:
-        self._mid_pending_mem = list(items)
-    except Exception:
-        self._mid_pending_mem = []
 
-    if getattr(self, "_mid_pending_db_disabled", False):
-        return
-    try:
-        await db_store.kv_set_json("mid_pending", {"items": items})
+    async def _mid_pending_save(self, items: list[dict]) -> None:
+        if not hasattr(self, "_mid_pending_mem"):
+            self._mid_pending_mem = []
+        try:
+            self._mid_pending_mem = list(items)
+        except Exception:
+            self._mid_pending_mem = []
+
+        if getattr(self, "_mid_pending_db_disabled", False):
+            return
+
+        timeout_sec = float(os.getenv("MID_PENDING_KV_TIMEOUT_SEC", "3.0") or 3.0)
+        try:
+            await asyncio.wait_for(db_store.kv_set_json("mid_pending", {"items": items}), timeout=timeout_sec)
+        except Exception as e:
+            try:
+                logger.warning("[mid][pending] kv_store write failed/timeout; switching to in-memory pending (err=%s)", str(e)[:200])
+            except Exception:
+                pass
+            self._mid_pending_db_disabled = True
+
     except Exception as e:
         if not getattr(self, "_mid_pending_db_disabled", False):
             try:
