@@ -13755,8 +13755,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             if instant_nofilters and require_trigger:
                 try:
                     # Consider filters disabled if every require-* switch is OFF and numeric thresholds are <= 0.
-                    _b = lambda k, d="0": (os.getenv(k, d).strip().lower() in ("1","true","yes","on"))
-                    _f = lambda k, d="0": float(os.getenv(k, d) or d)
+                    # NOTE: Users often provide env values with quotes, e.g. MID_TRIGGER_MIN_VOL_X="0".
+                    # Without sanitizing, bool/float parsing fails and the no-filters mode never activates.
+                    _clean = lambda v: (str(v) if v is not None else "").strip().strip('"').strip("'")
+                    _b = lambda k, d="0": (_clean(os.getenv(k, d)).lower() in ("1","true","yes","on"))
+                    _f = lambda k, d="0": float(_clean(os.getenv(k, d) or d) or d)
                     no_filters = (
                         (not _b("MID_TRIGGER_REQUIRE_DIRECTION", "0")) and
                         (not _b("MID_REQUIRE_STRUCTURE_ALIGN", "0")) and
