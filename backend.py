@@ -11781,30 +11781,85 @@ class Backend:
             return None, ex.upper()
 
     async def _fetch_rest_price(self, market: str, symbol: str) -> float | None:
-        """Binance REST fallback price (spot/futures)."""
-        m = (market or "FUTURES").upper()
-        sym = (symbol or "").upper()
-        if not sym:
-            return None
-        url = "https://api.binance.com/api/v3/ticker/price" if m == "SPOT" else "https://fapi.binance.com/fapi/v1/ticker/price"
+    """Binance REST fallback price (spot/futures).
 
-        async def _do_req():
-            try:
-                timeout = aiohttp.ClientTimeout(total=6)
-                async with aiohttp.ClientSession(timeout=timeout) as s:
-                    async with s.get(url, params={"symbol": sym}) as r:
-                        if r.status != 200:
-                            return None
-                        data = await r.json()
-                p = data.get("price") if isinstance(data, dict) else None
-                return float(p) if p is not None else None
-            except Exception:
-                return None
+    Net-fix:
+      - Try Binance spot API across api, api1, api2, api3 (some hosts/regions block api.binance.com).
+      - Optional IPv4-only connector to avoid IPv6/DNS issues (MID_NET_IPV4_ONLY=1).
+      - Optional debug logging (MID_PENDING_PX_DEBUG=1) to surface why px=NA happens.
+    """
+    import socket as _socket
+    m = (market or "FUTURES").upper()
+    sym = (symbol or "").upper()
+    if not sym:
+        return None
 
+    dbg = str(os.getenv("MID_PENDING_PX_DEBUG", "") or "").strip() in ("1", "true", "TRUE", "yes", "YES")
+    ipv4_only = str(os.getenv("MID_NET_IPV4_ONLY", "") or "").strip() in ("1", "true", "TRUE", "yes", "YES")
+
+    # Build URL candidates
+    if m == "SPOT":
+        bases = [
+            "https://api.binance.com",
+            "https://api1.binance.com",
+            "https://api2.binance.com",
+            "https://api3.binance.com",
+        ]
+        path = "/api/v3/ticker/price"
+    else:
+        bases = [
+            "https://fapi.binance.com",
+        ]
+        path = "/fapi/v1/ticker/price"
+
+    urls = [b + path for b in bases]
+
+    async def _do_req():
         try:
-            return await self._rest_limiter.run("binance", _do_req)
-        except Exception:
-            return None
+            timeout = aiohttp.ClientTimeout(total=6)
+            connector = None
+            if ipv4_only:
+                try:
+                    connector = aiohttp.TCPConnector(family=_socket.AF_INET)
+                except Exception:
+                    connector = None
+
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as s:
+                for url in urls:
+                    try:
+                        async with s.get(url, params={"symbol": sym}) as r:
+                            if r.status != 200:
+                                if dbg:
+                                    try:
+                                        body = await r.text()
+                                    except Exception:
+                                        body = ""
+                                    self.logger.info(f"[mid][px][rest] binance status={r.status} url={url} symbol={sym} body={body[:180]}")
+                                continue
+                            data = await r.json(content_type=None)
+                        p = data.get("price") if isinstance(data, dict) else None
+                        if p is None:
+                            continue
+                        return float(p)
+                    except Exception as e:
+                        if dbg:
+                            self.logger.info(f"[mid][px][rest] binance error url={url} symbol={sym} err={repr(e)}")
+                        continue
+        except Exception as e:
+            if dbg:
+                self.logger.info(f"[mid][px][rest] binance session_error symbol={sym} err={repr(e)}")
+        return None
+
+    try:
+        return await self._rest_limiter.run("binance", _do_req)
+    except Exception as e:
+        if dbg:
+            try:
+                self.logger.info(f"[mid][px][rest] binance limiter_error symbol={sym} err={repr(e)}")
+            except Exception:
+                pass
+        return None
+
 
 
 
