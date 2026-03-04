@@ -11851,19 +11851,44 @@ class Backend:
             return None
 
         try:
-            return await self._rest_limiter.run("binance", _do_req)
+            v = await self._rest_limiter.run("binance", _do_req)
         except Exception as e:
+            v = None
             if dbg:
                 try:
                     self.logger.info(f"[mid][px][rest] binance limiter_error symbol={sym} err={repr(e)}")
                 except Exception:
                     pass
-            return None
+        if v is not None:
+            return v
 
-
-
-
-
+        # Fallback order (public endpoints).
+        # This helps when Binance is blocked/unreachable from host/region.
+        try:
+            v = await self._fetch_bybit_price(m, sym)
+            if v is not None:
+                return v
+        except Exception:
+            pass
+        try:
+            v = await self._fetch_okx_price(m, sym)
+            if v is not None:
+                return v
+        except Exception:
+            pass
+        try:
+            v = await self._fetch_mexc_price(m, sym)
+            if v is not None:
+                return v
+        except Exception:
+            pass
+        try:
+            v = await self._fetch_gateio_price(m, sym)
+            if v is not None:
+                return v
+        except Exception:
+            pass
+        return None
     async def _fetch_binance_price(self, market: str, symbol: str) -> float | None:
         """Compat wrapper used by pending price prefetch.
 
@@ -11996,6 +12021,109 @@ class Backend:
         except Exception:
             return None
 
+
+    async def _fetch_bybit_price(self, market: str, symbol: str) -> float | None:
+        """Bybit public REST price (spot/linear futures).
+
+        Spot: category=spot
+        Futures: category=linear (USDT perpetual)
+        Endpoint: /v5/market/tickers
+        """
+        mkt = (market or "FUTURES").upper()
+        sym = (symbol or "").upper().replace('/', '').replace('-', '').replace(':', '')
+        if not sym:
+            return None
+        cat = "spot" if mkt == "SPOT" else "linear"
+        dbg = str(os.getenv("MID_PENDING_PX_DEBUG", "") or "").strip() in ("1", "true", "TRUE", "yes", "YES")
+
+        async def _do_req():
+            try:
+                url = "https://api.bybit.com/v5/market/tickers"
+                timeout = aiohttp.ClientTimeout(total=6)
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get(url, params={"category": cat, "symbol": sym}) as r:
+                        if r.status != 200:
+                            if dbg:
+                                try:
+                                    body = await r.text()
+                                except Exception:
+                                    body = ""
+                                self.logger.info(f"[mid][px][rest] bybit status={r.status} symbol={sym} body={body[:180]}")
+                            return None
+                        data = await r.json(content_type=None)
+                # v5 schema: {result:{list:[{lastPrice:...}]}}
+                res = data.get("result") if isinstance(data, dict) else None
+                lst = res.get("list") if isinstance(res, dict) else None
+                if isinstance(lst, list) and lst:
+                    item = lst[0]
+                    if isinstance(item, dict):
+                        p = item.get("lastPrice") or item.get("last_price")
+                        return float(p) if p is not None else None
+                return None
+            except Exception as e:
+                if dbg:
+                    self.logger.info(f"[mid][px][rest] bybit error symbol={sym} err={repr(e)}")
+                return None
+
+        try:
+            return await self._rest_limiter.run("bybit", _do_req)
+        except Exception:
+            return None
+
+    async def _fetch_okx_price(self, market: str, symbol: str) -> float | None:
+        """OKX public REST price (spot/swap best-effort).
+
+        Spot instId: BTC-USDT
+        Swap instId: BTC-USDT-SWAP
+        Endpoint: /api/v5/market/ticker
+        """
+        mkt = (market or "FUTURES").upper()
+        sym = (symbol or "").upper().replace('/', '').replace('-', '').replace(':', '')
+        if not sym or not sym.endswith('USDT') or len(sym) <= 4:
+            return None
+        base = sym[:-4]
+        inst_spot = f"{base}-USDT"
+        inst_swap = f"{base}-USDT-SWAP"
+        inst_ids = [inst_spot] if mkt == "SPOT" else [inst_swap, inst_spot]
+        dbg = str(os.getenv("MID_PENDING_PX_DEBUG", "") or "").strip() in ("1", "true", "TRUE", "yes", "YES")
+
+        async def _do_req():
+            try:
+                url = "https://www.okx.com/api/v5/market/ticker"
+                timeout = aiohttp.ClientTimeout(total=6)
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    for inst in inst_ids:
+                        try:
+                            async with s.get(url, params={"instId": inst}) as r:
+                                if r.status != 200:
+                                    if dbg:
+                                        try:
+                                            body = await r.text()
+                                        except Exception:
+                                            body = ""
+                                        self.logger.info(f"[mid][px][rest] okx status={r.status} instId={inst} body={body[:180]}")
+                                    continue
+                                data = await r.json(content_type=None)
+                            if isinstance(data, dict) and isinstance(data.get('data'), list) and data['data']:
+                                item = data['data'][0]
+                                if isinstance(item, dict):
+                                    p = item.get('last')
+                                    if p is not None:
+                                        return float(p)
+                        except Exception as e:
+                            if dbg:
+                                self.logger.info(f"[mid][px][rest] okx error instId={inst} err={repr(e)}")
+                            continue
+                return None
+            except Exception as e:
+                if dbg:
+                    self.logger.info(f"[mid][px][rest] okx session_error symbol={sym} err={repr(e)}")
+                return None
+
+        try:
+            return await self._rest_limiter.run("okx", _do_req)
+        except Exception:
+            return None
     async def _fetch_bybit_price(self, market: str, symbol: str) -> float | None:
         """Bybit REST price (spot/futures). Uses V5 tickers.
 
