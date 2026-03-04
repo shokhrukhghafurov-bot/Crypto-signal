@@ -13837,50 +13837,32 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         _pending_clear_cooldown(it)
                         continue
 
-                    # load candles (also gives fallback price)
-                    df5 = await self.load_candles(sym_candles, "5m", market)
-                    df30 = await self.load_candles(sym_candles, "30m", market)
-                    df1h = await self.load_candles(sym_candles, "1h", market)
-                    if df5 is None or getattr(df5, "empty", True) or df30 is None or getattr(df30, "empty", True) or df1h is None or getattr(df1h, "empty", True):
-                        keep.append(it)
-                        any_wait = True
-                        continue
-
-                    # price (prefer same source exchange; fallback to df close)
+                    # price (WS -> REST fallback router). Do NOT load candles unless we are at/near entry.
                     price = None
+                    px_src = "MISSING"
                     try:
-                        if src_ex == "BINANCE":
-                            price = await self._fetch_binance_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
-                        elif src_ex == "BYBIT":
-                            price = await self._fetch_bybit_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
-                        elif src_ex == "OKX":
-                            price = await self._fetch_okx_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
-                        elif src_ex == "MEXC":
-                            price = await _mexc_public_price(sym_trade)
-                        elif src_ex == "GATEIO":
-                            price = await _gateio_public_price(sym_trade)
+                        # Build a lightweight signal-like object for the price router
+                        class _PS: pass
+                        _ps = _PS()
+                        _ps.market = market
+                        _ps.symbol = sym_trade
+                        _ps.entry = float(entry0)
+                        _to = float(os.getenv("MID_PENDING_PRICE_TIMEOUT_SEC", "2") or 2.0)
+                        p, src = await asyncio.wait_for(self._get_price_with_source(_ps), timeout=max(0.5, _to))
+                        if p is not None and float(p) > 0:
+                            price = float(p)
+                            px_src = str(src or "PRICE")
                     except Exception:
                         price = None
+                        px_src = "MISSING"
 
-                    try:
-                        px_close = float(df5["close"].astype(float).iloc[-1])
-                        _px_src = "REST"
-                        if price is None or not (float(price) > 0):
-                            # Fallback when live price feed is missing: use the latest 5m candle close.
-                            price = px_close
-                            _px_src = "CANDLE5"
-                            try:
-                                px_candle_n += 1
-                            except Exception:
-                                pass
-                        try:
-                            it["_px_src"] = str(_px_src)
-                        except Exception:
-                            pass
-                    except Exception:
-                        # No usable price -> cannot classify near/far/in_zone (avoid "everything far" illusion)
+                    if price is None or not (float(price) > 0):
+                        # No usable live price -> cannot classify near/far/in_zone
                         try:
                             px_missing_n += 1
+                        except Exception:
+                            pass
+                        try:
                             it["_px_src"] = "MISSING"
                         except Exception:
                             pass
@@ -13889,14 +13871,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         continue
 
                     try:
-                        atr_abs = None
-                        if "atr" in df5.columns:
-                            atr_abs = float(df5["atr"].astype(float).iloc[-1])
-                        if (atr_abs is None or atr_abs <= 0) and ("atr" in df30.columns):
-                            atr_abs = float(df30["atr"].astype(float).iloc[-1])
-                        if atr_abs is None or atr_abs <= 0:
-                            atr_abs = float(price) * 0.001
+                        it["_px_src"] = str(px_src)
                     except Exception:
+                        pass
+
+                    # ATR approximation for distance buckets (avoid heavy candle loads when FAR).
+                    try:
+                        atr_abs = float(it.get("atr_abs") or 0.0)
+                    except Exception:
+                        atr_abs = 0.0
+                    if atr_abs is None or atr_abs <= 0:
                         atr_abs = float(price) * 0.001
 
                     tol = max(float(atr_abs) * tol_atr, float(price) * tol_pct)
@@ -13913,8 +13897,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 use_zone = True
                     except Exception:
                         use_zone = False
-
-                    # --- scale / multiplier auto-fix for legacy pendings (1000* contracts) ---
+# --- scale / multiplier auto-fix for legacy pendings (1000* contracts) ---
                     # If stored zone is in a different scale than live price (common for 1000SHIBUSDT/1000FLOKIUSDT),
                     # attempt to rescale the zone and/or drop the pending as scale_mismatch to avoid "eternal far".
                     try:
@@ -14264,6 +14247,35 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             pass
 
                     # We reached entry/zone: count this as a trigger attempt (persisted in DB kv_store).
+                    # Load candles only when we are ready to evaluate trigger checks (in-zone or instant-ignore).
+                    # This keeps the pending trigger loop fast and prevents trig_poll=stale.
+                    try:
+                        _cto = float(os.getenv("MID_PENDING_CANDLE_TIMEOUT_SEC", "6") or 6.0)
+                        df5 = await asyncio.wait_for(self.load_candles(sym_candles, "5m", market), timeout=max(1.0, _cto))
+                        df30 = await asyncio.wait_for(self.load_candles(sym_candles, "30m", market), timeout=max(1.0, _cto))
+                        df1h = await asyncio.wait_for(self.load_candles(sym_candles, "1h", market), timeout=max(1.0, _cto))
+                    except Exception:
+                        df5 = df30 = df1h = None
+
+                    if df5 is None or getattr(df5, "empty", True) or df30 is None or getattr(df30, "empty", True) or df1h is None or getattr(df1h, "empty", True):
+                        # Cannot evaluate confirmations now; keep waiting without counting an attempt.
+                        keep.append(it)
+                        any_wait = True
+                        continue
+
+                    # Refine ATR from candles when available (better tolerance/dist buckets).
+                    try:
+                        _atr0 = None
+                        if "atr" in df5.columns:
+                            _atr0 = float(df5["atr"].astype(float).iloc[-1])
+                        if (_atr0 is None or _atr0 <= 0) and ("atr" in df30.columns):
+                            _atr0 = float(df30["atr"].astype(float).iloc[-1])
+                        if _atr0 is not None and _atr0 > 0:
+                            atr_abs = float(_atr0)
+                            tol = max(float(atr_abs) * tol_atr, float(price) * tol_pct)
+                    except Exception:
+                        pass
+
                     _pending_mark_attempt(it, now)
                     # Init per-trigger checklists (so logs can show what passed/failed/skipped in one line)
                     try:
