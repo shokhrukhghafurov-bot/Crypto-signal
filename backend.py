@@ -13599,17 +13599,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             except Exception:
                 fail_details = []
 
-            # required flags (truthy) list
-            req_txt = ""
-            try:
-                if reqs:
-                    req_items = []
-                    for k, v in reqs.items():
-                        if bool(v):
-                            req_items.append(str(k))
-                    req_txt = _fmt_klist(req_items)
-            except Exception:
-                req_txt = ""
+            # NOTE: We intentionally do NOT print "req=" (required filters) in trigger logs.
+            # User-facing/debug logs should be driven by pass/fail only.
 
             # extra deep diagnostics
             term_reason = str(it.get("_trig_term_reason") or reason or "").strip()
@@ -13656,7 +13647,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 checks_kv = ""
 
             logger.info(
-                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s term=%s score=%s score_need=%s conf=%s conf_chk=%s conf_min=%s conf_min_src=%s conf_src=%s trap_reason=%s volx=%s thr=%s thr_base=%s thr_why=%s in_zone=%s attempts=%s fails=%s px=%.6g pass=%s fail=%s skip=%s ne=%s req=%s checks=%s",
+                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s term=%s score=%s score_need=%s conf=%s conf_chk=%s conf_min=%s conf_min_src=%s conf_src=%s trap_reason=%s volx=%s thr=%s thr_base=%s thr_why=%s in_zone=%s attempts=%s fails=%s px=%.6g pass=%s fail=%s skip=%s ne=%s checks=%s",
                 str(sym), str(market), str(direction),
                 str(outcome), str(reason or ""), term_reason,
                 str(score_val), str(score_need if score_need is not None else ""),
@@ -13674,7 +13665,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 _fmt_klist(fail_details) if fail_details else _fmt_klist(failed),
                 _fmt_klist(skipped),
                 _fmt_klist(not_eval),
-                req_txt,
                 checks_kv,
             )
         except Exception:
