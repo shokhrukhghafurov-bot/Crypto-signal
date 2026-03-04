@@ -13955,8 +13955,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         (not _b("MID_INST_REQUIRE_LIQ_SWEEP", "0")) and
                         (not _b("MID_INST_REQUIRE_LIQ_SWEEP_RANGE", "0")) and
                         (_f("MID_TRIGGER_MIN_VOL_X", "0") <= 0.0) and
-                        (_f("MID_TRIGGER_MIN_CONFIDENCE_FUT", "0") <= 0.0) and
-                        (_f("MID_TRIGGER_MIN_CONFIDENCE_SPOT", "0") <= 0.0)
+                        True  # confidence filter removed
                     )
                 except Exception:
                     no_filters = False
@@ -14013,6 +14012,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             _px_map = {}
 
             async def _px_fetch_one(_mkt: str, _sym: str, _src: str | None) -> tuple[float | None, str]:
+                """Fast price fetch used by pending engine.
+
+                Fixes:
+                  - Reduce px=NA/src_px=MISS by expanding REST fallbacks beyond the hinted exchange.
+                  - Keep latency bounded via short per-call timeouts + small cache.
+                """
                 _mkt = (_mkt or "SPOT").upper().strip()
                 _sym = str(_sym or "").upper().strip()
                 _src = (str(_src or "") or "").upper().strip()
@@ -14027,36 +14032,65 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 except Exception:
                     pass
 
-                async with _px_sem:
-                    # Prefer the original exchange hint first; then fall back to the global router.
-                    try:
-                        if _src == "BINANCE":
-                            px = await asyncio.wait_for(self._fetch_binance_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym), timeout=px_timeout_sec)
-                            if px is not None:
-                                _px_cache[_k] = (now2, float(px))
-                                return float(px), "BINANCE"
-                        if _src == "BYBIT":
-                            px = await asyncio.wait_for(self._fetch_bybit_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym), timeout=px_timeout_sec)
-                            if px is not None:
-                                _px_cache[_k] = (now2, float(px))
-                                return float(px), "BYBIT"
-                        if _src == "OKX":
-                            px = await asyncio.wait_for(self._fetch_okx_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym), timeout=px_timeout_sec)
-                            if px is not None:
-                                _px_cache[_k] = (now2, float(px))
-                                return float(px), "OKX"
-                    except Exception:
-                        pass
+                # Use slightly longer timeout for REST than for router (router may do WS first).
+                try:
+                    _t_rest = float(os.getenv("MID_PENDING_PX_TIMEOUT_REST_SEC", "") or 1.2)
+                except Exception:
+                    _t_rest = 1.2
+                try:
+                    _t_router = float(os.getenv("MID_PENDING_PX_TIMEOUT_ROUTER_SEC", "") or px_timeout_sec or 0.6)
+                except Exception:
+                    _t_router = float(px_timeout_sec or 0.6)
 
-                    # Final fallback: use the unified WS->REST router (median/selected sources)
+                async with _px_sem:
+                    async def _try_one(label: str, coro):
+                        try:
+                            px = await asyncio.wait_for(coro, timeout=_t_rest)
+                            if px is not None and float(px) > 0:
+                                _px_cache[_k] = (now2, float(px))
+                                return float(px), label
+                        except Exception:
+                            return None
+
+                    # 1) Hint exchange first (if any)
+                    if _src == "BINANCE":
+                        r = await _try_one("BINANCE", self._fetch_binance_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym))
+                        if r: return r
+                    elif _src == "BYBIT":
+                        r = await _try_one("BYBIT", self._fetch_bybit_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym))
+                        if r: return r
+                    elif _src == "OKX":
+                        r = await _try_one("OKX", self._fetch_okx_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym))
+                        if r: return r
+                    elif _src == "MEXC":
+                        r = await _try_one("MEXC", self._fetch_mexc_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym))
+                        if r: return r
+                    elif _src in ("GATE", "GATEIO", "GATE.IO"):
+                        r = await _try_one("GATEIO", self._fetch_gateio_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym))
+                        if r: return r
+
+                    # 2) Expanded REST fallbacks (cover cases where src hint is empty/incorrect)
+                    for _lab, _coro in (
+                        ("BINANCE", self._fetch_binance_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym)),
+                        ("BYBIT",   self._fetch_bybit_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym)),
+                        ("OKX",     self._fetch_okx_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym)),
+                        ("MEXC",    self._fetch_mexc_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym)),
+                        ("GATEIO",  self._fetch_gateio_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym)),
+                    ):
+                        r = await _try_one(_lab, _coro)
+                        if r:
+                            return r
+
+                    # 3) Final fallback: unified WS->REST router (may be slower; keep short timeout)
                     try:
                         s0 = Signal(symbol=_sym, market=_mkt, direction="LONG", timeframe="5m", entry=0.0)
-                        px, src = await asyncio.wait_for(self._get_price_with_source(s0), timeout=px_timeout_sec)
-                        if px is not None:
+                        px, src = await asyncio.wait_for(self._get_price_with_source(s0), timeout=_t_router)
+                        if px is not None and float(px) > 0:
                             _px_cache[_k] = (now2, float(px))
                             return float(px), str(src or "ROUTER")
                     except Exception:
                         pass
+
                 return None, "MISS"
 
             # Build prefetch tasks
@@ -15343,68 +15377,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
 
-                    # Trigger-time confidence threshold can be configured separately from setup-time confidence.
-                    # Precedence: trigger env (global/per-market) -> pending.min_confidence -> MID_MIN_CONFIDENCE.
+                    # Trigger-time confidence filter REMOVED permanently (per user request).
+                    # We keep diagnostics key but never block/skip based on confidence.
+                    min_conf = 0
                     try:
-                        _tconf = (os.getenv("MID_TRIGGER_MIN_CONFIDENCE", "") or "").strip()
-                        if _tconf == "":
-                            if str(market).upper() == "SPOT":
-                                _tconf = (os.getenv("MID_TRIGGER_MIN_CONFIDENCE_SPOT", "") or "").strip()
-                            else:
-                                _tconf = (os.getenv("MID_TRIGGER_MIN_CONFIDENCE_FUT", "") or "").strip()
-                    except Exception:
-                        _tconf = ""
-
-                    if _tconf != "":
-                        try:
-                            min_conf = int(float(_tconf))
-                            it["_trig_conf_min_src"] = "env.MID_TRIGGER_MIN_CONFIDENCE" if (os.getenv("MID_TRIGGER_MIN_CONFIDENCE", "") or "").strip() != "" else ("env.MID_TRIGGER_MIN_CONFIDENCE_SPOT" if str(market).upper() == "SPOT" else "env.MID_TRIGGER_MIN_CONFIDENCE_FUT")
-                        except Exception:
-                            min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
-                            it["_trig_conf_min_src"] = "pending.min_confidence" if it.get("min_confidence") is not None else "env.MID_MIN_CONFIDENCE"
-                    else:
-                        min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
-                        it["_trig_conf_min_src"] = "pending.min_confidence" if it.get("min_confidence") is not None else "env.MID_MIN_CONFIDENCE"
-                    # confidence_low: if confidence is missing, fall back to score (common on some exchanges/paths).
-                    # If min_conf <= 0 => skip (doesn't block). If both confidence and score are missing => skip_missing.
-                    try:
-                        if int(min_conf) <= 0:
-                            it["_trig_checks"]["confidence"] = "skip"
+                        it["_trig_conf_min_src"] = "disabled"
                     except Exception:
                         pass
-                    try:
-                        _conf_chk = it.get("_trig_conf")
-                        if _conf_chk is None:
-                            _conf_raw = ta.get("confidence")
-                            if _conf_raw is None or _conf_raw == "":
-                                _conf_chk = float(ta.get("score") or ta.get("total") or 0.0)
-                            else:
-                                _conf_chk = float(_conf_raw or 0.0)
-                    except Exception:
-                        _conf_chk = 0.0
-                    
-                    try:
-                        it["_trig_conf_chk"] = float(_conf_chk or 0.0)
-                        it["_trig_conf_min"] = int(min_conf)
-                        try:
-                            if it.get("_trig_conf") is not None:
-                                it["_trig_conf_src"] = "it._trig_conf"
-                            else:
-                                _cr = ta.get("confidence")
-                                it["_trig_conf_src"] = "ta.confidence" if (_cr is not None and _cr != "") else "ta.score"
-                        except Exception:
-                            it["_trig_conf_src"] = "unknown"
-                    except Exception:
-                        pass
-                    # Enforce confidence only when min_conf > 0.
-                    # If both confidence and score are missing, never fail (skip_missing).
-                    try:
-                        _cr = ta.get("confidence")
-                        _sr = ta.get("score")
-                        _tr = ta.get("total")
-                        _conf_missing = ((_cr is None or _cr == "") and _sr is None and _tr is None)
-                    except Exception:
-                        _conf_missing = False
 
                     if int(min_conf) > 0 and (not _conf_missing) and int(float(_conf_chk or 0.0)) < int(min_conf):
                         try:
@@ -15470,7 +15449,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     it["_trig_checks"]["score"] = "skip"
                                 except Exception:
                                     pass
-                            elif need and score < need:
+                            elif False and need and score < need:  # score filter removed permanently
                                 try:
                                     it["_trig_checks"]["score"] = "fail"
                                 except Exception:
@@ -16671,7 +16650,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                 pending_enabled = str(os.getenv("MID_PENDING_ENABLED", "0") or "0").strip().lower() not in ("0","false","no","off")
                 postsetup_only = str(os.getenv("MID_FILTERS_AFTER_SETUP", "0") or "0").strip().lower() not in ("0","false","no","off")
                 require_trigger = str(os.getenv("MID_REQUIRE_TRIGGER", "1") or "1").strip().lower() not in ("0","false","no","off")
-                min_conf = int(os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
+                min_conf = 0  # confidence filter removed permanently
                 ttl_min = float(os.getenv("MID_PENDING_TTL_MIN", os.getenv("MID_PENDING_TTL_MINUTES", "150")) or 150)
                 trig_require_score = str(os.getenv("MID_TRIGGER_REQUIRE_SCORE", "1") or "1").strip().lower() not in ("0","false","no","off")
                 # Trigger-time filter visibility (these often cause "all signals blocked")
