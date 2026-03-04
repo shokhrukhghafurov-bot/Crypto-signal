@@ -15363,13 +15363,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     else:
                         min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
                         it["_trig_conf_min_src"] = "pending.min_confidence" if it.get("min_confidence") is not None else "env.MID_MIN_CONFIDENCE"
-                    # confidence_low checks confidence only; if confidence is missing, fall back to score (common on some exchanges/paths).
-                    # NOTE: trigger confidence/score/volume filters are disabled (user requested).
-                    # Confidence is informational only; never blocks emit.
-                    min_conf = 0
+                    # confidence_low: if confidence is missing, fall back to score (common on some exchanges/paths).
+                    # If min_conf <= 0 => skip (doesn't block). If both confidence and score are missing => skip_missing.
                     try:
-                        it["_trig_conf_min_src"] = "disabled"
-                        it["_trig_checks"]["confidence"] = "skip"
+                        if int(min_conf) <= 0:
+                            it["_trig_checks"]["confidence"] = "skip"
                     except Exception:
                         pass
                     try:
@@ -15396,7 +15394,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             it["_trig_conf_src"] = "unknown"
                     except Exception:
                         pass
-                    if int(float(_conf_chk or 0.0)) < int(min_conf):
+                    # Enforce confidence only when min_conf > 0.
+                    # If both confidence and score are missing, never fail (skip_missing).
+                    try:
+                        _cr = ta.get("confidence")
+                        _sr = ta.get("score")
+                        _tr = ta.get("total")
+                        _conf_missing = ((_cr is None or _cr == "") and _sr is None and _tr is None)
+                    except Exception:
+                        _conf_missing = False
+
+                    if int(min_conf) > 0 and (not _conf_missing) and int(float(_conf_chk or 0.0)) < int(min_conf):
                         try:
                             it["_trig_checks"]["confidence"] = "fail"
                         except Exception:
@@ -15417,7 +15425,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             continue
                     else:
                         try:
-                            it["_trig_checks"]["confidence"] = "pass"
+                            if int(min_conf) <= 0:
+                                # already marked skip above
+                                pass
+                            elif _conf_missing:
+                                it["_trig_checks"]["confidence"] = "skip_missing"
+                            else:
+                                it["_trig_checks"]["confidence"] = "pass"
                         except Exception:
                             pass
 
@@ -15792,7 +15806,28 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         pass
 
-                    # Emit final signal
+                                        # FULL_DIAGNOSTIC: if nothing failed in this in-zone poll,
+                    # clear any stale failure state from previous attempts and
+                    # normalize not-evaluated checks to SKIP (so "fail=" truly empty => emit).
+                    try:
+                        if full_diag and (not (isinstance(trig_state, dict) and trig_state.get("reasons"))):
+                            try:
+                                it.pop("_trig_fail_reasons", None)
+                                it.pop("_trig_primary_reason", None)
+                            except Exception:
+                                pass
+                            try:
+                                tc = it.get("_trig_checks")
+                                if isinstance(tc, dict):
+                                    for _k, _v in list(tc.items()):
+                                        if _v == "ne":
+                                            tc[_k] = "skip"
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+# Emit final signal
                     entry = float(ta.get("entry") or entry0)
                     sl = float(ta.get("sl") or it.get("sl") or 0.0)
                     tp1 = float(ta.get("tp1") or it.get("tp1") or 0.0)
