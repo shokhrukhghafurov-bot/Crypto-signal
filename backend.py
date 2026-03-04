@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-03-03_v5_1_5_triggerfix"
+MID_BUILD_TAG = "MID_BUILD_2026-03-04_ultrafast_pending_v1"
 
 import asyncio
 import json
@@ -6935,8 +6935,12 @@ class _AsyncPriceCache:
                 def _consume_future_exception(_f: asyncio.Future):
                     try:
                         _ = _f.exception()
+                    except asyncio.CancelledError:
+                        # Cancelled futures raise CancelledError on .exception(); ignore.
+                        pass
                     except Exception:
                         pass
+
 
                 fut.add_done_callback(_consume_future_exception)
                 self._inflight[key] = fut
@@ -13789,6 +13793,95 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             # bucket in: in_zone, near, far, mid
             samples = []
 
+            # =========================
+            # ULTRA-FAST pending engine
+            # =========================
+            # 1) Prefetch prices concurrently (WS/REST) with a very short cache.
+            # 2) Do a quick zone distance classification by % BEFORE loading candles.
+            # 3) Load candles + run heavy trigger checklist ONLY for in-zone pendings.
+            try:
+                px_parallel = int(float(os.getenv("MID_PENDING_PARALLEL", "25") or 25))
+            except Exception:
+                px_parallel = 25
+            px_parallel = max(1, min(px_parallel, 200))
+            try:
+                px_cache_sec = float(os.getenv("MID_PENDING_PX_CACHE_SEC", "0.5") or 0.5)
+            except Exception:
+                px_cache_sec = 0.5
+            if not hasattr(self, "_mid_pending_px_cache"):
+                # key -> (ts, price)
+                self._mid_pending_px_cache = {}
+            _px_cache = getattr(self, "_mid_pending_px_cache", {}) or {}
+            _px_sem = asyncio.Semaphore(px_parallel)
+            _px_map = {}
+
+            async def _px_fetch_one(_mkt: str, _sym: str, _src: str | None) -> tuple[float | None, str]:
+                _mkt = (_mkt or "SPOT").upper().strip()
+                _sym = str(_sym or "").upper().strip()
+                _src = (str(_src or "") or "").upper().strip()
+                if not _sym:
+                    return None, "NONE"
+                _k = f"{_mkt}:{_sym}"
+                now2 = float(now)
+                try:
+                    ts0, px0 = _px_cache.get(_k, (0.0, None))
+                    if px0 is not None and (now2 - float(ts0)) <= float(px_cache_sec):
+                        return float(px0), "CACHE"
+                except Exception:
+                    pass
+
+                async with _px_sem:
+                    # Prefer the original exchange hint first; then fall back to the global router.
+                    try:
+                        if _src == "BINANCE":
+                            px = await self._fetch_binance_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym)
+                            if px is not None:
+                                _px_cache[_k] = (now2, float(px))
+                                return float(px), "BINANCE"
+                        if _src == "BYBIT":
+                            px = await self._fetch_bybit_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym)
+                            if px is not None:
+                                _px_cache[_k] = (now2, float(px))
+                                return float(px), "BYBIT"
+                        if _src == "OKX":
+                            px = await self._fetch_okx_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym)
+                            if px is not None:
+                                _px_cache[_k] = (now2, float(px))
+                                return float(px), "OKX"
+                    except Exception:
+                        pass
+
+                    # Final fallback: use the unified WS->REST router (median/selected sources)
+                    try:
+                        s0 = Signal(symbol=_sym, market=_mkt, direction="LONG", timeframe="5m", entry=0.0)
+                        px, src = await self._get_price_with_source(s0)
+                        if px is not None:
+                            _px_cache[_k] = (now2, float(px))
+                            return float(px), str(src or "ROUTER")
+                    except Exception:
+                        pass
+                return None, "MISS"
+
+            # Build prefetch tasks
+            _px_tasks = []
+            if isinstance(items, list) and items:
+                for _it in items:
+                    try:
+                        _symt = str(_it.get("trade_symbol") or _it.get("symbol") or "").upper().strip()
+                        _mkt = str(_it.get("market") or "SPOT").upper().strip()
+                        _src = str(_it.get("source_exchange") or _it.get("src_exchange") or "").upper().strip()
+                        if _symt:
+                            _k = f"{_mkt}:{_symt}"
+                            if _k not in _px_map:
+                                _px_tasks.append((_k, _mkt, _symt, _src))
+                    except Exception:
+                        continue
+            if _px_tasks:
+                async def _px_run(_k, _mkt, _symt, _src):
+                    px, _src2 = await _px_fetch_one(_mkt, _symt, _src)
+                    _px_map[_k] = px
+                await asyncio.gather(*[_px_run(a,b,c,d) for (a,b,c,d) in _px_tasks], return_exceptions=True)
+
             for it in items:
                 try:
                     sym = str(it.get("symbol") or "")
@@ -13837,32 +13930,105 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         _pending_clear_cooldown(it)
                         continue
 
-                    # price (WS -> REST fallback router). Do NOT load candles unless we are at/near entry.
+                    # ---------- ULTRA-FAST: quick zone check BEFORE candles ----------
+                    px_key = f"{market}:{str(sym_trade).upper().strip()}"
                     price = None
-                    px_src = "MISSING"
                     try:
-                        # Build a lightweight signal-like object for the price router
-                        class _PS: pass
-                        _ps = _PS()
-                        _ps.market = market
-                        _ps.symbol = sym_trade
-                        _ps.entry = float(entry0)
-                        _to = float(os.getenv("MID_PENDING_PRICE_TIMEOUT_SEC", "2") or 2.0)
-                        p, src = await asyncio.wait_for(self._get_price_with_source(_ps), timeout=max(0.5, _to))
-                        if p is not None and float(p) > 0:
-                            price = float(p)
-                            px_src = str(src or "PRICE")
+                        price = _px_map.get(px_key)
                     except Exception:
                         price = None
-                        px_src = "MISSING"
 
-                    if price is None or not (float(price) > 0):
-                        # No usable live price -> cannot classify near/far/in_zone
+                    # If we have price and price is NOT in/near the entry zone, do NOT load candles.
+                    # This keeps the trigger loop fast and prevents trig_poll=stale.
+                    try:
+                        entry0 = float(it.get("entry") or it.get("entry_mid") or 0.0)
+                    except Exception:
+                        entry0 = 0.0
+                    lo = it.get("entry_low", None)
+                    hi = it.get("entry_high", None)
+                    use_zone = (lo is not None and hi is not None)
+                    try:
+                        lo_f = float(lo) if lo is not None else None
+                        hi_f = float(hi) if hi is not None else None
+                    except Exception:
+                        lo_f, hi_f = None, None
+                        use_zone = False
+
+                    if price is not None and (not (pending_instant_emit and instant_ignore_zone)):
                         try:
-                            px_missing_n += 1
+                            if use_zone and lo_f is not None and hi_f is not None:
+                                in_zone_quick = bool(float(price) >= float(lo_f) and float(price) <= float(hi_f))
+                                z_mid = (float(lo_f) + float(hi_f)) / 2.0
+                            else:
+                                # legacy pendings without zone: use entry +/- tol
+                                tol = max(abs(float(entry0)) * float(tol_pct), float(tol_atr) * 0.0)
+                                in_zone_quick = bool(abs(float(price) - float(entry0)) <= float(tol))
+                                z_mid = float(entry0) if float(entry0) > 0 else float(price)
+                        except Exception:
+                            in_zone_quick = False
+                            z_mid = float(entry0) if float(entry0) > 0 else float(price)
+
+                        if not in_zone_quick:
+                            # classify by % only (no candles/ATR)
+                            try:
+                                dist_pct_now = abs(float(price) - float(z_mid)) / float(z_mid) if float(z_mid) > 0 else 0.0
+                            except Exception:
+                                dist_pct_now = 0.0
+                            if dist_pct_now >= float(far_pct):
+                                far_n += 1
+                            elif dist_pct_now >= float(near_pct):
+                                near_n += 1
+                            # keep waiting
+                            keep.append(it)
+                            any_wait = True
+                            continue
+
+                    # load candles (also gives fallback price)
+                    df5 = await self.load_candles(sym_candles, "5m", market)
+                    df30 = await self.load_candles(sym_candles, "30m", market)
+                    df1h = await self.load_candles(sym_candles, "1h", market)
+                    if df5 is None or getattr(df5, "empty", True) or df30 is None or getattr(df30, "empty", True) or df1h is None or getattr(df1h, "empty", True):
+                        keep.append(it)
+                        any_wait = True
+                        continue
+
+                    # price (prefer same source exchange; fallback to df close)
+                    # (ultra-fast) if price was already prefetched, reuse it.
+                    if price is None:
+                        price = None
+                    try:
+                        if src_ex == "BINANCE":
+                            price = await self._fetch_binance_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
+                        elif src_ex == "BYBIT":
+                            price = await self._fetch_bybit_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
+                        elif src_ex == "OKX":
+                            price = await self._fetch_okx_price("FUTURES" if market == "FUTURES" else "SPOT", sym_trade)
+                        elif src_ex == "MEXC":
+                            price = await _mexc_public_price(sym_trade)
+                        elif src_ex == "GATEIO":
+                            price = await _gateio_public_price(sym_trade)
+                    except Exception:
+                        price = None
+
+                    try:
+                        px_close = float(df5["close"].astype(float).iloc[-1])
+                        _px_src = "REST"
+                        if price is None or not (float(price) > 0):
+                            # Fallback when live price feed is missing: use the latest 5m candle close.
+                            price = px_close
+                            _px_src = "CANDLE5"
+                            try:
+                                px_candle_n += 1
+                            except Exception:
+                                pass
+                        try:
+                            it["_px_src"] = str(_px_src)
                         except Exception:
                             pass
+                    except Exception:
+                        # No usable price -> cannot classify near/far/in_zone (avoid "everything far" illusion)
                         try:
+                            px_missing_n += 1
                             it["_px_src"] = "MISSING"
                         except Exception:
                             pass
@@ -13871,16 +14037,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         continue
 
                     try:
-                        it["_px_src"] = str(px_src)
+                        atr_abs = None
+                        if "atr" in df5.columns:
+                            atr_abs = float(df5["atr"].astype(float).iloc[-1])
+                        if (atr_abs is None or atr_abs <= 0) and ("atr" in df30.columns):
+                            atr_abs = float(df30["atr"].astype(float).iloc[-1])
+                        if atr_abs is None or atr_abs <= 0:
+                            atr_abs = float(price) * 0.001
                     except Exception:
-                        pass
-
-                    # ATR approximation for distance buckets (avoid heavy candle loads when FAR).
-                    try:
-                        atr_abs = float(it.get("atr_abs") or 0.0)
-                    except Exception:
-                        atr_abs = 0.0
-                    if atr_abs is None or atr_abs <= 0:
                         atr_abs = float(price) * 0.001
 
                     tol = max(float(atr_abs) * tol_atr, float(price) * tol_pct)
@@ -13897,7 +14061,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 use_zone = True
                     except Exception:
                         use_zone = False
-# --- scale / multiplier auto-fix for legacy pendings (1000* contracts) ---
+
+                    # --- scale / multiplier auto-fix for legacy pendings (1000* contracts) ---
                     # If stored zone is in a different scale than live price (common for 1000SHIBUSDT/1000FLOKIUSDT),
                     # attempt to rescale the zone and/or drop the pending as scale_mismatch to avoid "eternal far".
                     try:
@@ -14247,35 +14412,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             pass
 
                     # We reached entry/zone: count this as a trigger attempt (persisted in DB kv_store).
-                    # Load candles only when we are ready to evaluate trigger checks (in-zone or instant-ignore).
-                    # This keeps the pending trigger loop fast and prevents trig_poll=stale.
-                    try:
-                        _cto = float(os.getenv("MID_PENDING_CANDLE_TIMEOUT_SEC", "6") or 6.0)
-                        df5 = await asyncio.wait_for(self.load_candles(sym_candles, "5m", market), timeout=max(1.0, _cto))
-                        df30 = await asyncio.wait_for(self.load_candles(sym_candles, "30m", market), timeout=max(1.0, _cto))
-                        df1h = await asyncio.wait_for(self.load_candles(sym_candles, "1h", market), timeout=max(1.0, _cto))
-                    except Exception:
-                        df5 = df30 = df1h = None
-
-                    if df5 is None or getattr(df5, "empty", True) or df30 is None or getattr(df30, "empty", True) or df1h is None or getattr(df1h, "empty", True):
-                        # Cannot evaluate confirmations now; keep waiting without counting an attempt.
-                        keep.append(it)
-                        any_wait = True
-                        continue
-
-                    # Refine ATR from candles when available (better tolerance/dist buckets).
-                    try:
-                        _atr0 = None
-                        if "atr" in df5.columns:
-                            _atr0 = float(df5["atr"].astype(float).iloc[-1])
-                        if (_atr0 is None or _atr0 <= 0) and ("atr" in df30.columns):
-                            _atr0 = float(df30["atr"].astype(float).iloc[-1])
-                        if _atr0 is not None and _atr0 > 0:
-                            atr_abs = float(_atr0)
-                            tol = max(float(atr_abs) * tol_atr, float(price) * tol_pct)
-                    except Exception:
-                        pass
-
                     _pending_mark_attempt(it, now)
                     # Init per-trigger checklists (so logs can show what passed/failed/skipped in one line)
                     try:
