@@ -13647,7 +13647,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 checks_kv = ""
 
             logger.info(
-                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s term=%s score=%s score_need=%s conf=%s conf_chk=%s conf_min=%s conf_min_src=%s conf_src=%s trap_reason=%s volx=%s thr=%s thr_base=%s thr_why=%s in_zone=%s attempts=%s fails=%s px=%.6g pass=%s fail=%s skip=%s ne=%s checks=%s",
+                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s in_zone=%s attempts=%s fails=%s px=%.6g pass=%s fail=%s skip=%s ne=%s checks=%s",
                 str(sym), str(market), str(direction),
                 str(outcome), str(reason or ""), term_reason,
                 str(score_val), str(score_need if score_need is not None else ""),
@@ -16235,7 +16235,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                 ttl_min = float(os.getenv("MID_PENDING_TTL_MIN", os.getenv("MID_PENDING_TTL_MINUTES", "150")) or 150)
                 trig_require_score = str(os.getenv("MID_TRIGGER_REQUIRE_SCORE", "1") or "1").strip().lower() not in ("0","false","no","off")
                 logger.info(
-                    "[mid][cfg] pending_enabled=%s postsetup_only=%s require_trigger=%s trig_require_score=%s min_score_fut=%s min_score_spot=%s min_conf=%s top_n=%s ttl_min=%s",
+                    "[mid][cfg] pending_enabled=%s postsetup_only=%s require_trigger=%s trig_require_top_n=%s ttl_min=%s",
                     int(pending_enabled), int(postsetup_only), int(require_trigger), int(trig_require_score),
                     int(min_score_fut), int(min_score_spot), int(min_conf),
                     int(top_n), float(ttl_min)
