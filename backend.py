@@ -13779,6 +13779,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             in_zone_n = 0
             near_n = 0
             far_n = 0
+            px_candle_n = 0
+            px_missing_n = 0
             expired_n = 0
             removed_n = 0
             attempts_sum = 0
@@ -13862,9 +13864,26 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     try:
                         px_close = float(df5["close"].astype(float).iloc[-1])
+                        _px_src = "REST"
                         if price is None or not (float(price) > 0):
+                            # Fallback when live price feed is missing: use the latest 5m candle close.
                             price = px_close
+                            _px_src = "CANDLE5"
+                            try:
+                                px_candle_n += 1
+                            except Exception:
+                                pass
+                        try:
+                            it["_px_src"] = str(_px_src)
+                        except Exception:
+                            pass
                     except Exception:
+                        # No usable price -> cannot classify near/far/in_zone (avoid "everything far" illusion)
+                        try:
+                            px_missing_n += 1
+                            it["_px_src"] = "MISSING"
+                        except Exception:
+                            pass
                         keep.append(it)
                         any_wait = True
                         continue
@@ -15498,6 +15517,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     "in_zone": int(in_zone_n),
                     "near": int(near_n),
                     "far": int(far_n),
+                    "px_candle": int(px_candle_n),
+                    "px_missing": int(px_missing_n),
                     "expired_now": int(expired_n),
                     "removed_now": int(removed_n),
                     "attempts_avg": float(a_avg0),
@@ -15812,14 +15833,19 @@ async def mid_status_summary_loop(self) -> None:
                 pt_stale = (pt_age is None) or (pt_age > float(os.getenv('MID_STATUS_PENDING_TICK_STALE_SEC', '120') or 120))
 
                 # If snapshot is empty, approximate from DB count so fields are always present.
-                if not _pt:
+                if (not _pt) or pt_stale:
+                    # Snapshot missing/stale: DON'T pretend everything is FAR.
+                    # We only know how many pendings exist, not their distance to entry.
                     dbn = int(pending_n or 0)
                     _pt = {
                         'total': dbn,
                         'keep': dbn,
                         'in_zone': 0,
                         'near': 0,
-                        'far': dbn,
+                        'far': 0,
+                        'px_unknown': dbn,
+                        'px_candle': 0,
+                        'px_missing': 0,
                         'expired_now': 0,
                         'removed_now': 0,
                         'attempts_avg': 0.0,
@@ -15832,7 +15858,7 @@ async def mid_status_summary_loop(self) -> None:
                     + f" keep={int(_pt.get('keep',0))}"
                     + f" in_zone={int(_pt.get('in_zone',0))}"
                     + f" near={int(_pt.get('near',0))}"
-                    + f" far={int(_pt.get('far',0))}"
+                    + f" far={int(_pt.get('far',0))}"+ (f" px_unknown={int(_pt.get('px_unknown',0))}" if ('px_unknown' in _pt) else "")+ (f" px_candle={int(_pt.get('px_candle',0))}" if ('px_candle' in _pt) else "")+ (f" px_missing={int(_pt.get('px_missing',0))}" if ('px_missing' in _pt) else "")
                     + f" exp_now={int(_pt.get('expired_now',0))}"
                     + f" rm_now={int(_pt.get('removed_now',0))}"
                     + f" att_avg={float(_pt.get('attempts_avg',0.0)):.2f}"
