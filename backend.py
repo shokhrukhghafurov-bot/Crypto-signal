@@ -11807,6 +11807,140 @@ class Backend:
             return None
 
 
+
+
+    async def _fetch_binance_price(self, market: str, symbol: str) -> float | None:
+        """Compat wrapper used by pending price prefetch.
+
+        The codebase historically had a helper named _fetch_binance_price in bot.py.
+        Pending engine expects it on Backend; map it to our Binance REST fallback.
+        """
+        try:
+            return await self._fetch_rest_price(market, symbol)
+        except Exception:
+            return None
+
+
+    async def _fetch_mexc_price(self, market: str, symbol: str) -> float | None:
+        """MEXC public REST price (spot/futures best-effort).
+
+        Spot: https://api.mexc.com/api/v3/ticker/price?symbol=BTCUSDT
+        Futures (USDT perpetual): https://contract.mexc.com/api/v1/contract/ticker?symbol=BTC_USDT
+        """
+        mkt = (market or "FUTURES").upper()
+        sym = (symbol or "").upper().replace("/", "").replace("-", "").replace(":", "")
+        if not sym:
+            return None
+
+        async def _do_req_spot():
+            try:
+                url = "https://api.mexc.com/api/v3/ticker/price"
+                timeout = aiohttp.ClientTimeout(total=6)
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get(url, params={"symbol": sym}) as r:
+                        if r.status != 200:
+                            return None
+                        data = await r.json(content_type=None)
+                if not isinstance(data, dict):
+                    return None
+                p = data.get("price")
+                return float(p) if p is not None else None
+            except Exception:
+                return None
+
+        async def _do_req_fut():
+            try:
+                # Convert BTCUSDT -> BTC_USDT for contract endpoint
+                s2 = sym
+                if s2.endswith("USDT") and len(s2) > 4:
+                    s2 = f"{s2[:-4]}_USDT"
+                url = "https://contract.mexc.com/api/v1/contract/ticker"
+                timeout = aiohttp.ClientTimeout(total=6)
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get(url, params={"symbol": s2}) as r:
+                        if r.status != 200:
+                            return None
+                        data = await r.json(content_type=None)
+                if not isinstance(data, dict):
+                    return None
+                d = data.get("data")
+                if isinstance(d, dict):
+                    p = d.get("lastPrice") or d.get("last_price") or d.get("last")
+                else:
+                    p = None
+                return float(p) if p is not None else None
+            except Exception:
+                return None
+
+        try:
+            if mkt == "SPOT":
+                return await self._rest_limiter.run("mexc", _do_req_spot)
+            return await self._rest_limiter.run("mexc", _do_req_fut)
+        except Exception:
+            return None
+
+
+    async def _fetch_gateio_price(self, market: str, symbol: str) -> float | None:
+        """Gate.io public REST price (spot/futures best-effort).
+
+        Spot: https://api.gateio.ws/api/v4/spot/tickers?currency_pair=BTC_USDT
+        Futures (USDT perpetual): https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=BTC_USDT
+        """
+        mkt = (market or "FUTURES").upper()
+        sym = (symbol or "").upper().replace("/", "").replace("-", "").replace(":", "")
+        if not sym:
+            return None
+        try:
+            pair = sym
+            if pair.endswith("USDT") and len(pair) > 4:
+                pair = f"{pair[:-4]}_USDT"
+        except Exception:
+            pair = sym
+
+        async def _do_req_spot():
+            try:
+                url = "https://api.gateio.ws/api/v4/spot/tickers"
+                timeout = aiohttp.ClientTimeout(total=6)
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get(url, params={"currency_pair": pair}) as r:
+                        if r.status != 200:
+                            return None
+                        data = await r.json(content_type=None)
+                # Returns list
+                if isinstance(data, list) and data:
+                    item = data[0]
+                    if isinstance(item, dict):
+                        p = item.get("last")
+                        return float(p) if p is not None else None
+                return None
+            except Exception:
+                return None
+
+        async def _do_req_fut():
+            try:
+                url = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
+                timeout = aiohttp.ClientTimeout(total=6)
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.get(url, params={"contract": pair}) as r:
+                        if r.status != 200:
+                            return None
+                        data = await r.json(content_type=None)
+                if isinstance(data, list) and data:
+                    item = data[0]
+                    if isinstance(item, dict):
+                        p = item.get("last")
+                        return float(p) if p is not None else None
+                return None
+            except Exception:
+                return None
+
+        try:
+            if mkt == "SPOT":
+                return await self._rest_limiter.run("gateio", _do_req_spot)
+            return await self._rest_limiter.run("gateio", _do_req_fut)
+        except Exception:
+            return None
+
     async def _fetch_bybit_price(self, market: str, symbol: str) -> float | None:
         """Bybit REST price (spot/futures). Uses V5 tickers.
 
