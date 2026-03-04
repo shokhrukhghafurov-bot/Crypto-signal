@@ -264,9 +264,46 @@ async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
         await set_user_blocked(chat_id, blocked=True)
         raise
     except TelegramBadRequest as e:
-        if "chat not found" in str(e).lower():
+        msg = str(e).lower()
+        if "chat not found" in msg:
             # Chat does not exist / user never started the bot
             await set_user_blocked(chat_id, blocked=True)
+            raise
+
+        # Common failure modes when sending large/Markdown-heavy texts.
+        # 1) Message too long -> send in chunks (Telegram hard limit is 4096).
+        if "message is too long" in msg:
+            # parse_mode can still break entities; drop it for chunked send.
+            kwargs.pop("parse_mode", None)
+            max_len = 3800
+
+            parts: list[str] = []
+            cur = ""
+            for line in text.splitlines(True):
+                if len(cur) + len(line) > max_len and cur:
+                    parts.append(cur)
+                    cur = ""
+                cur += line
+            if cur:
+                parts.append(cur)
+
+            last_res = None
+            for idx, part in enumerate(parts or [text[:max_len]]):
+                # reply_markup only on first part to avoid clutter
+                send_kwargs = dict(kwargs)
+                if "reply_markup" in send_kwargs and idx != 0:
+                    send_kwargs["reply_markup"] = None
+                last_res = await bot.send_message(chat_id, part, **send_kwargs)
+            return last_res
+
+        # 2) Markdown/HTML entity parsing issues -> retry as plain text.
+        if "can't parse entities" in msg or "can\u2019t parse entities" in msg:
+            if "parse_mode" in kwargs:
+                try:
+                    kwargs.pop("parse_mode", None)
+                    return await bot.send_message(chat_id, text, **kwargs)
+                except Exception:
+                    raise
         raise
 
 async def safe_edit_text(chat_id: int, message_id: int, text: str, *, ctx: str = "", **kwargs):
@@ -1022,22 +1059,53 @@ async def safe_edit_markup(chat_id: int, message_id: int, reply_markup, *, ctx: 
     except Exception:
         return None
 
-async def _send_long(chat_id: int, text: str, reply_markup=None) -> None:
-    # Telegram message limit ~4096 chars. Send in chunks if needed.
-    max_len = 3800
-    if len(text) <= max_len:
-        await safe_send(chat_id, text, reply_markup=reply_markup)
-        return
-    parts = []
-    cur = ""
-    for line in text.splitlines(True):
-        if len(cur) + len(line) > max_len and cur:
-            parts.append(cur)
-            cur = ""
-        cur += line
-    if cur:
-        parts.append(cur)
 
+async def _send_long(chat_id: int, text: str, reply_markup=None, *, parse_mode: str | None = None, **kwargs) -> None:
+    """Send a potentially long message by splitting it into safe-sized chunks.
+
+    Telegram hard limit is 4096 chars/message. We keep a safety margin.
+
+    IMPORTANT:
+    - If parse_mode is enabled, splitting can break entities and cause "can't parse entities".
+      Поэтому: parse_mode используем только если сообщение короткое.
+    - Never raise from here: user-facing handlers must not crash the webhook background task.
+    """
+    max_len = 3800
+
+    # Keep parse_mode only for short messages; long messages go as plain text chunks.
+    use_parse_mode = parse_mode if (parse_mode and len(text) <= max_len) else None
+
+    try:
+        if len(text) <= max_len:
+            await safe_send(chat_id, text, reply_markup=reply_markup, parse_mode=use_parse_mode, **kwargs)
+            return
+
+        parts: list[str] = []
+        cur = ""
+        for line in text.splitlines(True):
+            if len(cur) + len(line) > max_len and cur:
+                parts.append(cur)
+                cur = ""
+            cur += line
+        if cur:
+            parts.append(cur)
+
+        for idx, part in enumerate(parts):
+            # reply_markup only on first part to avoid clutter
+            await safe_send(
+                chat_id,
+                part,
+                reply_markup=reply_markup if idx == 0 else None,
+                parse_mode=use_parse_mode if idx == 0 else None,
+                **kwargs,
+            )
+    except Exception:
+        # Last-resort: swallow any Telegram/API errors to keep webhook stable.
+        try:
+            if len(text) <= max_len:
+                await safe_send(chat_id, text[:max_len], reply_markup=reply_markup)
+        except Exception:
+            pass
 
 
 async def safe_edit_old(message: types.Message | None, txt: str, kb: types.InlineKeyboardMarkup) -> None:
@@ -3686,9 +3754,11 @@ async def autotrade_input_handler(message: types.Message) -> None:
                 await message.answer(msg, reply_markup=menu_kb(uid))
                 return
 
-            # If we auto-normalized/auto-picked, prepend a small hint
+            # If we auto-normalized/auto-picked, prepend a small hint.
+            # IMPORTANT: do NOT wrap with Markdown markers here — the note can contain
+            # underscores or other characters that break Telegram entity parsing.
             if note:
-                report = f"_{note}_\n\n" + str(report)
+                report = f"ℹ️ {note}\n\n" + str(report)
 
             # Remove the progress message if it exists
             if processing_msg is not None:
@@ -3697,12 +3767,20 @@ async def autotrade_input_handler(message: types.Message) -> None:
                 except Exception:
                     pass
 
-            # Telegram Markdown (classic)
+
+            # Send report safely: handle Telegram length limits + Markdown parse errors.
+            kb = menu_kb(uid)
+            chat_id = message.chat.id
             try:
-                await message.answer(report, parse_mode="Markdown", reply_markup=menu_kb(uid))
+                # NOTE: report can be very long and contains a lot of symbols.
+                # Sending as plain text is the most reliable option (no entity parsing).
+                await _send_long(chat_id, str(report), reply_markup=kb)
             except Exception:
-                # Fallback without parse_mode if Telegram rejects formatting
-                await message.answer(report.replace("**", ""), reply_markup=menu_kb(uid))
+                # Never crash the webhook task because of Telegram formatting/length issues
+                try:
+                    await _send_long(chat_id, str(report), reply_markup=kb)
+                except Exception:
+                    pass
             return
 
         state = AUTOTRADE_INPUT.get(uid)
