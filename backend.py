@@ -13767,7 +13767,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         (not _b("MID_GUARD_HTF_ALIGN", "0")) and
                         (not _b("MID_TRIGGER_REQUIRE_STRUCTURE_30M", "0")) and
                         (not _b("MID_TRIGGER_REQUIRE_STRUCTURE_1H", "0")) and
-                        (not _b("MID_TRAP_FILTERS", "0")) and
                         (not _b("MID_TRIGGER_REQUIRE_TRAP", "0")) and
                         (not _b("MID_INST_REQUIRE_RECLAIM", "0")) and
                         (not _b("MID_INST_REQUIRE_RECLAIM_RANGE", "0")) and
