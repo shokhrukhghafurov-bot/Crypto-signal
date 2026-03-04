@@ -14162,10 +14162,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 _age_m = 0.0
                             try:
+                                # NOTE: this is an f-string on purpose. Do NOT double-brace, otherwise
+                                # the log prints literal "{sym} {market} ...".
                                 if use_zone and lo_f is not None and hi_f is not None:
-                                    _txt = f"{{sym}} {{market}} {{direction}} px=NA zone={{float(lo_f):.6g}}..{{float(hi_f):.6g}} src_px=MISS age={{_age_m:.0f}}m"
+                                    _txt = f"{sym_trade} {market} {direction} px=NA zone={float(lo_f):.6g}..{float(hi_f):.6g} src_px=MISS age={_age_m:.0f}m"
                                 else:
-                                    _txt = f"{{sym}} {{market}} {{direction}} px=NA entry={{float(entry0):.6g}} src_px=MISS age={{_age_m:.0f}}m"
+                                    _txt = f"{sym_trade} {market} {direction} px=NA entry={float(entry0):.6g} src_px=MISS age={_age_m:.0f}m"
                                 samples.append(("px_unknown", 1e9, _txt))
                             except Exception:
                                 pass
