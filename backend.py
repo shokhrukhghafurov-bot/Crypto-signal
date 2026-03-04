@@ -14663,8 +14663,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             return bool(default)
                     
-                    req_struct_30m = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_30M", True)
-                    req_struct_1h = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_1H", True)
+                    # IMPORTANT DEFAULTS:
+                    # Structure alignment at trigger-time is a *strong* filter.
+                    # If enabled by default it can block nearly all signals during pullbacks / ranges.
+                    # So we default it to OFF, and users can explicitly enable it via env.
+                    req_struct_30m = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_30M", False)
+                    req_struct_1h = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_1H", False)
                     
                     # Trap: by default, follow global trap switches if they are set; otherwise enabled.
                     try:
@@ -16633,9 +16637,16 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                 min_conf = int(os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
                 ttl_min = float(os.getenv("MID_PENDING_TTL_MIN", os.getenv("MID_PENDING_TTL_MINUTES", "150")) or 150)
                 trig_require_score = str(os.getenv("MID_TRIGGER_REQUIRE_SCORE", "1") or "1").strip().lower() not in ("0","false","no","off")
+                # Trigger-time filter visibility (these often cause "all signals blocked")
+                trig_full = str(os.getenv("MID_TRIGGER_FULL_CHECKLIST", "1") or "1").strip().lower() not in ("0","false","no","off")
+                trig_req_struct30 = str(os.getenv("MID_TRIGGER_REQUIRE_STRUCTURE_30M", "0") or "0").strip().lower() not in ("0","false","no","off")
+                trig_req_struct1h = str(os.getenv("MID_TRIGGER_REQUIRE_STRUCTURE_1H", "0") or "0").strip().lower() not in ("0","false","no","off")
+                trig_mode = str(os.getenv("MID_TRIGGER_MODE", os.getenv("MID_MODE", "")) or "").strip()
                 logger.info(
-                    "[mid][cfg] pending_enabled=%s postsetup_only=%s require_trigger=%s trig_require_score=%s min_score_fut=%s min_score_spot=%s min_conf=%s top_n=%s ttl_min=%s",
+                    "[mid][cfg] pending_enabled=%s postsetup_only=%s require_trigger=%s trig_require_score=%s trig_struct30=%s trig_struct1h=%s trig_full=%s mode=%s min_score_fut=%s min_score_spot=%s min_conf=%s top_n=%s ttl_min=%s",
                     int(pending_enabled), int(postsetup_only), int(require_trigger), int(trig_require_score),
+                    int(trig_req_struct30), int(trig_req_struct1h), int(trig_full),
+                    (trig_mode or "-"),
                     int(min_score_fut), int(min_score_spot), int(min_conf),
                     int(top_n), float(ttl_min)
                 )
