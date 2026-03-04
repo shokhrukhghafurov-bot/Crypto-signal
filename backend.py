@@ -13647,16 +13647,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 checks_kv = ""
 
             logger.info(
-                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s in_zone=%s attempts=%s fails=%s px=%.6g pass=%s fail=%s skip=%s ne=%s checks=%s",
+                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s term=%s trap_reason=%s in_zone=%s attempts=%s fails=%s px=%.6g pass=%s fail=%s skip=%s ne=%s checks=%s",
                 str(sym), str(market), str(direction),
                 str(outcome), str(reason or ""), term_reason,
-                str(score_val), str(score_need if score_need is not None else ""),
-                str(conf_val), str(conf_chk if conf_chk is not None else ""), str(conf_min), str(conf_min_src), str(conf_src),
                 str(it.get("_trig_trap_reason") if (it.get("_trig_trap_reason") is not None) else (it.get("trap_reason") or "")),
-                str(it.get("_trig_volx") if (it.get("_trig_volx") is not None) else ""),
-                str(it.get("_trig_vol_thr") if (it.get("_trig_vol_thr") is not None) else ""),
-                str(it.get("_trig_vol_thr_base") if (it.get("_trig_vol_thr_base") is not None) else ""),
-                str(it.get("_trig_vol_thr_why") if (it.get("_trig_vol_thr_why") is not None) else ""),
                 int(1 if (bool(it.get("_in_zone_tol") or it.get("_in_zone") or False)) else 0),
                 int(it.get("trigger_attempts") or 0),
                 int(it.get("fail_count") or 0),
@@ -14983,6 +14977,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         min_conf = int(it.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0)
                         it["_trig_conf_min_src"] = "pending.min_confidence" if it.get("min_confidence") is not None else "env.MID_MIN_CONFIDENCE"
                     # confidence_low checks confidence only; if confidence is missing, fall back to score (common on some exchanges/paths).
+                    # NOTE: trigger confidence/score/volume filters are disabled (user requested).
+                    # Confidence is informational only; never blocks emit.
+                    min_conf = 0
+                    try:
+                        it["_trig_conf_min_src"] = "disabled"
+                        it["_trig_checks"]["confidence"] = "skip"
+                    except Exception:
+                        pass
                     try:
                         _conf_chk = it.get("_trig_conf")
                         if _conf_chk is None:
@@ -15040,6 +15042,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         # Rationale: some users want score to be enforced only at scan/setup stage,
                         # while trigger should rely on confidence + checklist only.
                         trig_require_score = os.getenv("MID_TRIGGER_REQUIRE_SCORE", "1").strip().lower() not in ("0", "false", "no", "off")
+                        trig_require_score = False  # disabled: score filter removed from trigger
                         # Score/quality threshold (same logic as scan stage)
                         try:
                             use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
@@ -15173,6 +15176,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 trig_min_vol_x = float(mid_min_vol_x) * 0.75 if mid_min_vol_x else 0.0
 
+                            # NOTE: trigger volume filter disabled (user requested).
+                            trig_min_vol_x = 0.0
+                            try:
+                                it["_trig_checks"]["vol_x"] = "skip"
+                            except Exception:
+                                pass
                             # If no trigger threshold configured/effective, do not block.
                             if trig_min_vol_x and trig_min_vol_x > 0:
                                 try:
@@ -16235,7 +16244,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                 ttl_min = float(os.getenv("MID_PENDING_TTL_MIN", os.getenv("MID_PENDING_TTL_MINUTES", "150")) or 150)
                 trig_require_score = str(os.getenv("MID_TRIGGER_REQUIRE_SCORE", "1") or "1").strip().lower() not in ("0","false","no","off")
                 logger.info(
-                    "[mid][cfg] pending_enabled=%s postsetup_only=%s require_trigger=%s trig_require_top_n=%s ttl_min=%s",
+                    "[mid][cfg] pending_enabled=%s postsetup_only=%s require_trigger=%s trig_require_score=%s min_score_fut=%s min_score_spot=%s min_conf=%s top_n=%s ttl_min=%s",
                     int(pending_enabled), int(postsetup_only), int(require_trigger), int(trig_require_score),
                     int(min_score_fut), int(min_score_spot), int(min_conf),
                     int(top_n), float(ttl_min)
