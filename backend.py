@@ -14144,7 +14144,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # to "never reach trigger" (no [mid][pending][trigger] logs) while sitting in-zone.
                     try:
                         last_try = float(it.get("last_attempt_ts") or 0.0)
-                        if (not instant_emit_due_to_nofilters) and attempt_gap_sec > 0 and last_try > 0 and (now - last_try) < attempt_gap_sec:
+                        # If MID_PENDING_INSTANT_EMIT=1, the expected behavior is:
+                        #   when price enters the entry zone -> emit immediately.
+                        # Debounce/attempt gap must NOT suppress that.
+                        if (not instant_emit_due_to_nofilters) and (not pending_instant_emit) and attempt_gap_sec > 0 and last_try > 0 and (now - last_try) < attempt_gap_sec:
                             keep.append(it)
                             any_wait = True
                             continue
@@ -14155,7 +14158,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     # If enabled, emit immediately as soon as price reaches the entry zone.
                     # NOTE: this bypasses *all* safety checks. Intended for temporary debugging only.
-                    if pending_instant_emit and (instant_emit_due_to_nofilters or (os.getenv("MID_PENDING_INSTANT_EMIT_SKIP_CHECKS", "0").strip().lower() in ("1","true","yes","on"))):
+                    #
+                    # Behavior:
+                    #   - MID_PENDING_INSTANT_EMIT=1 + IGNORE_ZONE=0 -> emit on zone entry
+                    #   - MID_PENDING_INSTANT_EMIT=1 + IGNORE_ZONE=1 -> emit immediately (even if far)
+                    #
+                    # Backward-compat / control:
+                    #   MID_PENDING_INSTANT_EMIT_ON_ZONE=0 will restore the old behavior
+                    #   where emit required NOFILTERS mode or MID_PENDING_INSTANT_EMIT_SKIP_CHECKS=1.
+                    pending_emit_on_zone = (os.getenv("MID_PENDING_INSTANT_EMIT_ON_ZONE", "1").strip().lower() in ("1","true","yes","on"))
+                    pending_skip_checks = (os.getenv("MID_PENDING_INSTANT_EMIT_SKIP_CHECKS", "0").strip().lower() in ("1","true","yes","on"))
+                    if pending_instant_emit and (instant_ignore_zone or pending_emit_on_zone or instant_emit_due_to_nofilters or pending_skip_checks):
                         try:
                             _pending_mark_attempt(it, now)
                         except Exception:
