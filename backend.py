@@ -11895,6 +11895,65 @@ class Backend:
             return None
 
 
+
+    # -----------------------------
+    # Pending engine REST wrappers
+    # -----------------------------
+    async def _fetch_binance_price(self, market: str, symbol: str) -> float | None:
+        """Unified helper used by pending prefetch.
+
+        Historically pending loop called _fetch_binance_price/_fetch_mexc_price/_fetch_gateio_price,
+        but only _fetch_rest_price/_fetch_bybit_price/_fetch_okx_price existed.
+
+        This wrapper prevents AttributeError -> px=NA/src_px=MISS.
+        """
+        try:
+            return await self._fetch_rest_price(market, symbol)
+        except Exception:
+            return None
+
+    async def _fetch_mexc_price(self, market: str, symbol: str) -> float | None:
+        """MEXC public REST price wrapper (spot/futures)."""
+        mkt = (market or "FUTURES").upper()
+        sym = (symbol or "").upper().replace("/", "")
+        if not sym:
+            return None
+
+        async def _fetch():
+            async def _do():
+                try:
+                    return await (_mexc_public_price(sym) if mkt == "SPOT" else _mexc_futures_price(sym))
+                except Exception:
+                    return None
+            return await self._rest_limiter.run("mexc", _do)
+
+        try:
+            p, _src = await self._price_cached("mexc", mkt, sym, _fetch, src_label=("MEXC_PUBLIC" if mkt == "SPOT" else "MEXC_FUTURES_PUBLIC"))
+            return float(p) if p is not None and float(p) > 0 else None
+        except Exception:
+            return None
+
+    async def _fetch_gateio_price(self, market: str, symbol: str) -> float | None:
+        """Gate.io public REST price wrapper (spot/futures)."""
+        mkt = (market or "FUTURES").upper()
+        sym = (symbol or "").upper().replace("/", "")
+        if not sym:
+            return None
+
+        async def _fetch():
+            async def _do():
+                try:
+                    return await (_gateio_public_price(sym) if mkt == "SPOT" else _gateio_futures_price(sym))
+                except Exception:
+                    return None
+            return await self._rest_limiter.run("gateio", _do)
+
+        try:
+            p, _src = await self._price_cached("gateio", mkt, sym, _fetch, src_label=("GATEIO_PUBLIC" if mkt == "SPOT" else "GATEIO_FUTURES_PUBLIC"))
+            return float(p) if p is not None and float(p) > 0 else None
+        except Exception:
+            return None
+
     async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
         """Return (price, source) for tracking.
 
