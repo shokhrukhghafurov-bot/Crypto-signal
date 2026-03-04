@@ -13799,7 +13799,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             removed_n = 0
             attempts_sum = 0
             fails_sum = 0
-            samples = []  # list of (dist_atr, text)
+            # Samples for diagnostics: list of (bucket, dist, text)
+            # bucket in: in_zone, near, far, mid
+            samples = []
 
             for it in items:
                 try:
@@ -14089,7 +14091,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             if float(_dist_pct) >= float(far_pct):
                                 far_n += 1
 
-                        # samples: keep a few farthest pendings for debug
+                        # samples: keep a few representative pendings for debug/auto-sample
+                        # NOTE: auto_samples is enabled by default to avoid the "far=140 but no sample" confusion.
                         if (dbg_samples > 0) or auto_samples:
                             try:
                                 _age_m = (now - created) / 60.0
@@ -14100,20 +14103,44 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 _w_atr = 0.0
 
+                            # classify sample bucket using the same thresholds as counters
+                            try:
+                                _is_near = False
+                                _is_far = False
+                                if _dist_atr is not None:
+                                    _is_near = bool(float(_dist_atr) <= float(near_atr))
+                                    _is_far = bool(float(_dist_atr) >= float(far_atr))
+                                    _dist_metric = float(_dist_atr)
+                                else:
+                                    _is_near = bool(float(_dist_pct) <= float(near_pct))
+                                    _is_far = bool(float(_dist_pct) >= float(far_pct))
+                                    _dist_metric = float(_dist_pct)
+                                if _in_zone_now:
+                                    _bucket = "in_zone"
+                                elif _is_near:
+                                    _bucket = "near"
+                                elif _is_far:
+                                    _bucket = "far"
+                                else:
+                                    _bucket = "mid"
+                            except Exception:
+                                _bucket = "mid"
+                                _dist_metric = 0.0
+
                             if use_zone:
                                 if _dist_atr is None:
                                     _txt = f"{sym} {market} {direction} px={float(price):.6g} zone={float(lo):.6g}..{float(hi):.6g} dist_pct={float(_dist_pct)*100.0:.2f}% w={float(_zone_w):.6g} src={str(it.get('entry_zone_src') or '')} age={_age_m:.0f}m flags={it.get('risk_flags', [])}"
-                                    samples.append((float(_dist_pct), _txt))
+                                    samples.append((_bucket, float(_dist_metric), _txt))
                                 else:
                                     _txt = f"{sym} {market} {direction} px={float(price):.6g} zone={float(lo):.6g}..{float(hi):.6g} dist_atr={float(_dist_atr):.2f} w_atr={float(_w_atr):.2f} src={str(it.get('entry_zone_src') or '')} age={_age_m:.0f}m flags={it.get('risk_flags', [])}"
-                                    samples.append((float(_dist_atr), _txt))
+                                    samples.append((_bucket, float(_dist_metric), _txt))
                             else:
                                 if _dist_atr is None:
                                     _txt = f"{sym} {market} {direction} px={float(price):.6g} entry={float(entry0):.6g} dist_pct={float(_dist_pct)*100.0:.2f}% age={_age_m:.0f}m"
-                                    samples.append((float(_dist_pct), _txt))
+                                    samples.append((_bucket, float(_dist_metric), _txt))
                                 else:
                                     _txt = f"{sym} {market} {direction} px={float(price):.6g} entry={float(entry0):.6g} dist_atr={float(_dist_atr):.2f} age={_age_m:.0f}m"
-                                    samples.append((float(_dist_atr), _txt))
+                                    samples.append((_bucket, float(_dist_metric), _txt))
                     except Exception:
                         pass
 
@@ -15546,8 +15573,32 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     logger.info("[mid][pending][tick] total=%s keep=%s in_zone=%s near=%s far=%s expired_now=%s removed_now=%s attempts_avg=%.2f fails_avg=%.2f",
                                 total_n, kept_n, in_zone_n, near_n, far_n, expired_n, removed_n, a_avg, f_avg)
                     if dbg_samples > 0 and samples:
-                        samples.sort(key=lambda x: x[0], reverse=True)
-                        for _, s in samples[:max(1, dbg_samples)]:
+                        # sort by distance desc; ignore bucket
+                        samples.sort(key=lambda x: float(x[1]), reverse=True)
+                        for _b, _d, s in samples[:max(1, dbg_samples)]:
+                            logger.info("[mid][pending][sample] %s", s)
+            except Exception:
+                pass
+
+            # Auto-samples: even when MID_PENDING_DEBUG_SAMPLES=0, print a couple of samples occasionally.
+            # This is specifically to avoid situations like: far=140 but you never see a sample line.
+            try:
+                global _MID_PENDING_LAST_AUTO_SAMPLE_TS
+                if auto_samples and samples and dbg_samples <= 0:
+                    now2 = time.time()
+                    if (now2 - float(_MID_PENDING_LAST_AUTO_SAMPLE_TS or 0.0)) >= float(auto_samples_gap):
+                        _MID_PENDING_LAST_AUTO_SAMPLE_TS = float(now2)
+
+                        # Prefer the most useful bucket given the state.
+                        # If nothing is in-zone, show near first (if any), else far.
+                        want_bucket = "in_zone" if int(in_zone_n) > 0 else ("near" if int(near_n) > 0 else "far")
+
+                        cands = [t for t in samples if isinstance(t, tuple) and len(t) >= 3 and str(t[0]) == want_bucket]
+                        if not cands:
+                            # fallback: show farthest overall
+                            cands = [t for t in samples if isinstance(t, tuple) and len(t) >= 3]
+                        cands.sort(key=lambda x: float(x[1]), reverse=True)
+                        for _b, _d, s in cands[:max(1, int(auto_samples_n))]:
                             logger.info("[mid][pending][sample] %s", s)
             except Exception:
                 pass
