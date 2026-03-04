@@ -1223,6 +1223,33 @@ async def count_signal_sent_by_market(*, since: dt.datetime, until: dt.datetime)
     return out
 
 
+async def count_signal_tracks_for_symbol(*, market: str, symbol: str, since: dt.datetime, until: dt.datetime) -> int:
+    """Count bot-level signals opened for a (market, symbol) in [since, until).
+
+    Uses signal_tracks.opened_at (created when the bot broadcasts a signal).
+    """
+    market = str(market or '').upper().strip()
+    symbol = str(symbol or '').upper().strip()
+    if market not in ('SPOT', 'FUTURES') or not symbol:
+        return 0
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        try:
+            r = await conn.fetchval(
+                """
+                SELECT COUNT(*)::BIGINT
+                FROM signal_tracks
+                WHERE market=$1 AND symbol=$2
+                  AND opened_at >= $3 AND opened_at < $4;
+                """,
+                market, symbol, since, until,
+            )
+            return int(r or 0)
+        except Exception:
+            logger.exception('count_signal_tracks_for_symbol failed')
+            return 0
+
+
 
 
 async def count_signal_tracks_opened_by_market(*, since: dt.datetime, until: dt.datetime) -> Dict[str, int]:
