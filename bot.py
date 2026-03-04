@@ -2375,6 +2375,29 @@ async def broadcast_signal(sig: Signal) -> None:
     if sig_key in _SENT_SIG_CACHE:
         logger.info("Skip duplicate signal %s %s %s (within ttl)", sig.market, sig.symbol, sig.direction)
         return
+    # Daily cap per symbol: e.g. allow only 2 broadcasts per (market, symbol) per day.
+    # This is stronger than TTL dedup and prevents the same pair from spamming multiple times a day.
+    try:
+        cap = int(float((os.getenv("SIGNAL_DAILY_CAP_PER_SYMBOL", "2") or "2").strip()))
+    except Exception:
+        cap = 2
+    if cap > 0:
+        try:
+            mk = str(getattr(sig, 'market', '') or '').upper().strip() or 'FUTURES'
+            sym = str(getattr(sig, 'symbol', '') or '').upper().strip()
+            now_local = dt.datetime.now(TZ)
+            day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end = day_start + dt.timedelta(days=1)
+            since_utc = day_start.astimezone(dt.timezone.utc)
+            until_utc = day_end.astimezone(dt.timezone.utc)
+            already = await db_store.count_signal_tracks_for_symbol(market=mk, symbol=sym, since=since_utc, until=until_utc)
+            if int(already) >= int(cap):
+                logger.info("Skip signal by daily cap: market=%s symbol=%s already=%s cap=%s", mk, sym, already, cap)
+                return
+        except Exception:
+            # fail-open: do not block signals if DB is temporarily unavailable
+            pass
+
     _SENT_SIG_CACHE[sig_key] = now
 
     # Assign a globally unique signal_id from DB sequence (survives restarts).
