@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-03-04_ultrafast_pending_v1"
+MID_BUILD_TAG = "MID_BUILD_2026-03-04_institutional_engine_v2_mtf_avwap"
 
 import asyncio
 import json
@@ -76,7 +76,197 @@ def pick_atr_for_sl(df5, df1, df4, min_1h_bars=60):
     return 0.0, "none"
 
 
+# =======================
+# INSTITUTIONAL ANALYSIS ENGINE (no orderbook needed)
+# =======================
+# This block adds higher-quality analytics using OHLCV only:
+# - VWAP bands (1h)
+# - Volume profile (POC/VAH/VAL)
+# - Orderflow pressure proxy (delta*volume)
+# - Whale activity proxy (volume spikes)
+# - Liquidation clusters proxy (wick+volume)
+# - Smart-money score 0-100 and calibrated probabilities
 
+import statistics
+
+def _safe_float(x, default=None):
+    try:
+        v=float(x)
+        if v!=v or v in (float('inf'), float('-inf')):
+            return default
+        return v
+    except Exception:
+        return default
+
+def calc_vwap(df):
+    try:
+        if df is None or df.empty:
+            return None
+        for c in ('high','low','close','volume'):
+            if c not in df.columns:
+                return None
+        tp=(df['high'].astype(float)+df['low'].astype(float)+df['close'].astype(float))/3.0
+        vol=df['volume'].astype(float).clip(lower=0)
+        denom=float(vol.sum())
+        if denom<=0:
+            return None
+        return float((tp*vol).sum()/denom)
+    except Exception:
+        return None
+
+def calc_vwap_bands(df, stdev_mults=(1.0,2.0)):
+    """Return vwap and bands using volume-weighted stdev of typical price."""
+    try:
+        if df is None or df.empty:
+            return None
+        for c in ('high','low','close','volume'):
+            if c not in df.columns:
+                return None
+        tp=(df['high'].astype(float)+df['low'].astype(float)+df['close'].astype(float))/3.0
+        vol=df['volume'].astype(float).clip(lower=0)
+        denom=float(vol.sum())
+        if denom<=0:
+            return None
+        vwap=float((tp*vol).sum()/denom)
+        var=float(((tp-vwap)**2*vol).sum()/denom)
+        sd=var**0.5
+        bands={}
+        for m in stdev_mults:
+            bands[f'+{m}']=vwap+sd*m
+            bands[f'-{m}']=vwap-sd*m
+        return {'vwap':vwap,'sd':sd,'bands':bands}
+    except Exception:
+        return None
+
+def volume_profile(df, bins=64, value_area=0.7):
+    """Approximate volume profile from OHLCV using typical price as volume location."""
+    try:
+        if df is None or df.empty:
+            return None
+        for c in ('high','low','close','volume'):
+            if c not in df.columns:
+                return None
+        tp=(df['high'].astype(float)+df['low'].astype(float)+df['close'].astype(float))/3.0
+        vol=df['volume'].astype(float).clip(lower=0)
+        if len(tp)<10:
+            return None
+        lo=float(tp.min()); hi=float(tp.max())
+        if not (hi>lo):
+            return None
+        bins=int(max(16,min(200,bins)))
+        step=(hi-lo)/bins
+        hist=[0.0]*bins
+        for price, v in zip(tp, vol):
+            i=int((float(price)-lo)/step)
+            if i<0: i=0
+            if i>=bins: i=bins-1
+            hist[i]+=float(v)
+        total=sum(hist)
+        if total<=0:
+            return None
+        poc_i=max(range(bins), key=lambda i: hist[i])
+        poc=lo+(poc_i+0.5)*step
+        # value area around POC by expanding to higher volume side
+        target=total*float(value_area)
+        left=poc_i; right=poc_i
+        acc=hist[poc_i]
+        while acc<target and (left>0 or right<bins-1):
+            lv=hist[left-1] if left>0 else -1
+            rv=hist[right+1] if right<bins-1 else -1
+            if rv>=lv:
+                if right<bins-1:
+                    right+=1; acc+=hist[right]
+                else:
+                    left-=1; acc+=hist[left]
+            else:
+                if left>0:
+                    left-=1; acc+=hist[left]
+                else:
+                    right+=1; acc+=hist[right]
+        val=lo+left*step
+        vah=lo+(right+1)*step
+        return {'poc':poc,'val':val,'vah':vah,'range':(lo,hi)}
+    except Exception:
+        return None
+
+def orderflow_pressure(df, lookback=24):
+    """Proxy orderflow: signed volume using candle body position."""
+    try:
+        if df is None or df.empty:
+            return None
+        need=('open','high','low','close','volume')
+        if any(c not in df.columns for c in need):
+            return None
+        d=df.tail(int(max(10,lookback)))
+        o=d['open'].astype(float); h=d['high'].astype(float); l=d['low'].astype(float); c=d['close'].astype(float)
+        v=d['volume'].astype(float).clip(lower=0)
+        rng=(h-l).replace(0, float('nan'))
+        # body position [-1..+1]
+        pos=((c-o)/rng).clip(-1,1).fillna(0.0)
+        delta=float((pos*v).sum())
+        total=float(v.sum())
+        if total<=0:
+            return None
+        pressure=delta/total
+        # 0..100 index
+        idx=int(round((pressure+1)*50))
+        idx=max(0,min(100,idx))
+        mood='BUY' if pressure>0.12 else ('SELL' if pressure<-0.12 else 'NEUTRAL')
+        return {'pressure':pressure,'index':idx,'mood':mood}
+    except Exception:
+        return None
+
+def whale_activity(df, lookback=120, z_thr=2.5):
+    """Detect volume spikes (proxy whales)."""
+    try:
+        if df is None or df.empty or 'volume' not in df.columns:
+            return None
+        d=df.tail(int(max(30,lookback)))
+        vol=[float(x) for x in d['volume'].astype(float).clip(lower=0).tolist()]
+        if len(vol)<30:
+            return None
+        mu=statistics.mean(vol[:-1])
+        sd=statistics.pstdev(vol[:-1]) or 0.0
+        last=vol[-1]
+        z=(last-mu)/sd if sd>0 else 0.0
+        spike=bool(z>=float(z_thr))
+        # score 0..5
+        score=int(min(5,max(0,round(z))))
+        return {'z':z,'spike':spike,'score':score,'last':last,'mean':mu}
+    except Exception:
+        return None
+
+def liquidation_clusters(df, lookback=120, topk=2):
+    """Approximate liquidation clusters: large wick + high volume candles => likely stop runs."""
+    try:
+        if df is None or df.empty:
+            return None
+        need=('open','high','low','close','volume')
+        if any(c not in df.columns for c in need):
+            return None
+        d=df.tail(int(max(30,lookback))).copy()
+        o=d['open'].astype(float); h=d['high'].astype(float); l=d['low'].astype(float); c=d['close'].astype(float)
+        v=d['volume'].astype(float).clip(lower=0)
+        body=(c-o).abs()
+        rng=(h-l).replace(0, float('nan'))
+        wick=((rng-body)/rng).fillna(0.0).clip(0,1)
+        # score: wick% * vol zscore
+        vol=list(v.tolist())
+        mu=statistics.mean(vol) if vol else 0.0
+        sd=statistics.pstdev(vol) if vol else 0.0
+        vz=((v-mu)/sd).replace([float('inf'),float('-inf')],0.0).fillna(0.0) if sd>0 else 0.0
+        score=(wick*(1+vz)).astype(float)
+        # pick candles with highest score; cluster level = wick extremum
+        idxs=score.sort_values(ascending=False).head(int(max(1,topk))).index.tolist()
+        out=[]
+        for i in idxs:
+            # decide side by where close sits
+            side='UP' if float(c.loc[i])<float(o.loc[i]) else 'DOWN'
+            level=float(h.loc[i]) if side=='UP' else float(l.loc[i])
+            out.append({'level':level,'side':side,'score':_safe_float(score.loc[i],0.0), 'vol_z': _safe_float(vz.loc[i] if sd>0 else 0.0, 0.0)})
+        return out if out else None
+    except Exception:
+        return None
 
 # =======================
 # TEST MODE (diagnostics)
@@ -13808,6 +13998,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 px_cache_sec = float(os.getenv("MID_PENDING_PX_CACHE_SEC", "0.5") or 0.5)
             except Exception:
                 px_cache_sec = 0.5
+            try:
+                px_timeout_sec = float(os.getenv("MID_PENDING_PX_TIMEOUT_SEC", "2.0") or 2.0)
+            except Exception:
+                px_timeout_sec = 2.0
+            px_timeout_sec = max(0.5, min(px_timeout_sec, 10.0))
+
             if not hasattr(self, "_mid_pending_px_cache"):
                 # key -> (ts, price)
                 self._mid_pending_px_cache = {}
@@ -13834,17 +14030,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # Prefer the original exchange hint first; then fall back to the global router.
                     try:
                         if _src == "BINANCE":
-                            px = await self._fetch_binance_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym)
+                            px = await asyncio.wait_for(self._fetch_binance_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym), timeout=px_timeout_sec)
                             if px is not None:
                                 _px_cache[_k] = (now2, float(px))
                                 return float(px), "BINANCE"
                         if _src == "BYBIT":
-                            px = await self._fetch_bybit_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym)
+                            px = await asyncio.wait_for(self._fetch_bybit_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym), timeout=px_timeout_sec)
                             if px is not None:
                                 _px_cache[_k] = (now2, float(px))
                                 return float(px), "BYBIT"
                         if _src == "OKX":
-                            px = await self._fetch_okx_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym)
+                            px = await asyncio.wait_for(self._fetch_okx_price("FUTURES" if _mkt == "FUTURES" else "SPOT", _sym), timeout=px_timeout_sec)
                             if px is not None:
                                 _px_cache[_k] = (now2, float(px))
                                 return float(px), "OKX"
@@ -13854,7 +14050,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # Final fallback: use the unified WS->REST router (median/selected sources)
                     try:
                         s0 = Signal(symbol=_sym, market=_mkt, direction="LONG", timeframe="5m", entry=0.0)
-                        px, src = await self._get_price_with_source(s0)
+                        px, src = await asyncio.wait_for(self._get_price_with_source(s0), timeout=px_timeout_sec)
                         if px is not None:
                             _px_cache[_k] = (now2, float(px))
                             return float(px), str(src or "ROUTER")
@@ -13953,6 +14149,28 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         lo_f, hi_f = None, None
                         use_zone = False
+                    if price is None:
+                        # Price not available (WS/REST miss) -> keep pending and surface a sample so the operator can debug.
+                        try:
+                            px_missing_n += 1
+                        except Exception:
+                            pass
+                        if (dbg_samples > 0) or auto_samples:
+                            try:
+                                _age_m = (now - created) / 60.0
+                            except Exception:
+                                _age_m = 0.0
+                            try:
+                                if use_zone and lo_f is not None and hi_f is not None:
+                                    _txt = f"{{sym}} {{market}} {{direction}} px=NA zone={{float(lo_f):.6g}}..{{float(hi_f):.6g}} src_px=MISS age={{_age_m:.0f}}m"
+                                else:
+                                    _txt = f"{{sym}} {{market}} {{direction}} px=NA entry={{float(entry0):.6g}} src_px=MISS age={{_age_m:.0f}}m"
+                                samples.append(("px_unknown", 1e9, _txt))
+                            except Exception:
+                                pass
+                        keep.append(it)
+                        any_wait = True
+                        continue
 
                     if price is not None and (not (pending_instant_emit and instant_ignore_zone)):
                         try:
@@ -13960,7 +14178,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 in_zone_quick = bool(float(price) >= float(lo_f) and float(price) <= float(hi_f))
                                 z_mid = (float(lo_f) + float(hi_f)) / 2.0
                             else:
-                                # legacy pendings without zone: use entry +/- tol
                                 tol = max(abs(float(entry0)) * float(tol_pct), float(tol_atr) * 0.0)
                                 in_zone_quick = bool(abs(float(price) - float(entry0)) <= float(tol))
                                 z_mid = float(entry0) if float(entry0) > 0 else float(price)
@@ -13969,7 +14186,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             z_mid = float(entry0) if float(entry0) > 0 else float(price)
 
                         if not in_zone_quick:
-                            # classify by % only (no candles/ATR)
                             try:
                                 dist_pct_now = abs(float(price) - float(z_mid)) / float(z_mid) if float(z_mid) > 0 else 0.0
                             except Exception:
@@ -13978,7 +14194,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 far_n += 1
                             elif dist_pct_now >= float(near_pct):
                                 near_n += 1
-                            # keep waiting
                             keep.append(it)
                             any_wait = True
                             continue
@@ -15759,7 +15974,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                         # Prefer the most useful bucket given the state.
                         # If nothing is in-zone, show near first (if any), else far.
-                        want_bucket = "in_zone" if int(in_zone_n) > 0 else ("near" if int(near_n) > 0 else "far")
+                        want_bucket = "in_zone" if int(in_zone_n) > 0 else ("near" if int(near_n) > 0 else ("far" if int(far_n) > 0 else "px_unknown"))
 
                         cands = [t for t in samples if isinstance(t, tuple) and len(t) >= 3 and str(t[0]) == want_bucket]
                         if not cands:
@@ -20927,6 +21142,177 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
 
         eq_hi_line = _liq_line("Equal Highs (ликвидность сверху)", eq_hi, eq_hi_dist_pct, eq_hi_dist_atr, eq_hi_strength, eq_hi_touches, "high")
         eq_lo_line = _liq_line("Equal Lows (ликвидность снизу)", eq_lo, eq_lo_dist_pct, eq_lo_dist_atr, eq_lo_strength, eq_lo_touches, "low")
+        # ---- Multi-TF liquidity map (5m/1h/4h) + общий "магнит" ----
+        mtf_liq_lines: list[str] = []
+        magnet_level = None
+        magnet_side = None  # "high" or "low"
+        try:
+            def _tf_atr(_df: pd.DataFrame) -> float:
+                try:
+                    if _df is not None and "atr" in _df.columns:
+                        v = float(_df["atr"].astype(float).iloc[-1])
+                        if v == v and v > 0:
+                            return v
+                except Exception:
+                    pass
+                return float(atr_abs_s) if atr_abs_s and atr_abs_s > 0 else float(atr_abs) if atr_abs else 0.0
+
+            def _best_eq_mtf(_df: pd.DataFrame, _sh: list[tuple[int, float]], _sl: list[tuple[int, float]], _label: str):
+                try:
+                    if _df is None or getattr(_df, "empty", True) or (not _sh and not _sl):
+                        return None, None
+                    _price = float(price)
+                    _atr = _tf_atr(_df)
+                    _tol_atr = float(os.getenv("LIQ_EQ_TOL_ATR_MULT", "0.35") or 0.35)
+                    _tol_pct = float(os.getenv("LIQ_EQ_TOL_PCT", "0.0010") or 0.0010)
+                    _tol = max(_atr * _tol_atr, _price * _tol_pct)
+                    _max_sw = int(os.getenv("LIQ_EQ_MAX_SWINGS", "12") or 12)
+                    _min_sep = float(os.getenv("LIQ_EQ_MIN_SEP_PCT", "0.0002") or 0.0002)
+
+                    def _median(vals: list[float]) -> float:
+                        s = sorted(vals)
+                        return float(s[len(s)//2])
+
+                    def _cluster(swings: list[tuple[int, float]], side: str):
+                        if not swings:
+                            return None
+                        pts = swings[-_max_sw:]
+                        clusters: list[dict] = []
+                        for ix, v in pts:
+                            v = float(v)
+                            placed = False
+                            for c in clusters:
+                                if abs(v - float(c["level"])) <= _tol:
+                                    c["vals"].append(v)
+                                    c["idxs"].append(int(ix))
+                                    c["level"] = _median(c["vals"])
+                                    placed = True
+                                    break
+                            if not placed:
+                                clusters.append({"vals":[v], "idxs":[int(ix)], "level": v})
+                        if side == "high":
+                            cand = [c for c in clusters if float(c["level"]) >= _price * (1.0 + _min_sep)]
+                        else:
+                            cand = [c for c in clusters if float(c["level"]) <= _price * (1.0 - _min_sep)]
+                        if not cand:
+                            return None
+                        cand.sort(key=lambda c: (len(c["vals"]), max(c["idxs"])), reverse=True)
+                        c = cand[0]
+                        level = float(c["level"])
+                        touches = int(len(c["vals"]))
+                        last_touch = int(max(c["idxs"]))
+                        spread = float(max(c["vals"]) - min(c["vals"])) if touches >= 2 else 0.0
+                        strength = min(5, max(1, touches))
+                        try:
+                            age = (len(_df) - 1) - last_touch
+                            if age <= int(os.getenv("LIQ_EQ_RECENT_BONUS_BARS", "60") or 60):
+                                strength = min(5, strength + 1)
+                        except Exception:
+                            pass
+                        if spread > _tol * float(os.getenv("LIQ_EQ_SPREAD_PENALTY", "0.8") or 0.8):
+                            strength = max(1, strength - 1)
+                        dist = abs(level - _price)
+                        dist_pct = (dist / _price * 100.0) if _price > 0 else None
+                        dist_atr = (dist / _atr) if _atr and _atr > 0 else None
+                        return (level, touches, strength, dist_pct, dist_atr)
+
+                    hi = _cluster(_sh, "high")
+                    lo = _cluster(_sl, "low")
+
+                    def _fmt_side(name: str, res):
+                        if not res:
+                            return f"{name}: —"
+                        lvl, t, st, dp, da = res
+                        dp_s = f"{dp:.2f}%" if dp is not None and dp == dp else "n/a"
+                        da_s = f"{da:.2f} ATR" if da is not None and da == da else "n/a"
+                        return f"{name}: {_fmt_int_space(lvl)} | dist: {dp_s} ({da_s}) | str: {int(st)}/5 | t: {int(t)}"
+
+                    line_hi = _fmt_side(f"{_label} EQH", hi)
+                    line_lo = _fmt_side(f"{_label} EQL", lo)
+
+                    return (hi, line_hi), (lo, line_lo)
+                except Exception:
+                    return None, None
+
+            sh5, sl5 = _swing_points(df5, left=3, right=3)
+            sh1_, sl1_ = _swing_points(df1, left=3, right=3) if df1 is not None else ([], [])
+            sh4_, sl4_ = _swing_points(df4, left=3, right=3) if df4 is not None else ([], [])
+
+            for _df, _sh_, _sl_, _lab in ((df5, sh5, sl5, "5m"), (df1, sh1_, sl1_, "1h"), (df4, sh4_, sl4_, "4h")):
+                hi_pack, lo_pack = _best_eq_mtf(_df, _sh_, _sl_, _lab)
+                for pack, side in ((hi_pack, "high"), (lo_pack, "low")):
+                    if pack:
+                        res, line_txt = pack
+                        mtf_liq_lines.append(line_txt)
+                        if res:
+                            lvl = float(res[0])
+                            d = abs(lvl - float(price))
+                            if magnet_level is None or d < abs(float(magnet_level) - float(price)):
+                                magnet_level = lvl
+                                magnet_side = side
+
+        except Exception:
+            pass
+
+        magnet_txt = "Magnet: —"
+        try:
+            if magnet_level is not None:
+                arrow = "↑" if magnet_side == "high" else "↓"
+                magnet_txt = f"Magnet: {_fmt_int_space(float(magnet_level))} {arrow}"
+        except Exception:
+            pass
+
+        # ---- Anchored VWAP (1h) от swing low/high (proxy BOS anchor) ----
+        avb = None
+        try:
+            _dfv = df1 if (df1 is not None and not getattr(df1, "empty", True)) else None
+            if _dfv is not None and "volume" in _dfv.columns and len(_dfv) > 30:
+                # Anchor selection: по приоритету (bias) -> последний swing low/high на 1h
+                shA, slA = _swing_points(_dfv, left=3, right=3)
+                use_long = True
+                try:
+                    use_long = bool(long_p >= short_p)
+                except Exception:
+                    pass
+                anchor_idx = None
+                anchor_name = None
+                if use_long and slA:
+                    anchor_idx = int(slA[-1][0])
+                    anchor_name = "swing low (1h)"
+                elif (not use_long) and shA:
+                    anchor_idx = int(shA[-1][0])
+                    anchor_name = "swing high (1h)"
+                elif slA:
+                    anchor_idx = int(slA[-1][0]); anchor_name = "swing low (1h)"
+                elif shA:
+                    anchor_idx = int(shA[-1][0]); anchor_name = "swing high (1h)"
+
+                if anchor_idx is not None and anchor_idx < (len(_dfv) - 5):
+                    seg = _dfv.iloc[anchor_idx:].copy()
+                    tp = (seg["high"].astype(float) + seg["low"].astype(float) + seg["close"].astype(float)) / 3.0
+                    vol = seg["volume"].astype(float).clip(lower=0.0)
+                    v_sum = float(vol.sum())
+                    if v_sum > 0:
+                        vwap = float((tp * vol).sum() / v_sum)
+                        # volume-weighted stdev
+                        mu = vwap
+                        var = float(((tp - mu) ** 2 * vol).sum() / v_sum)
+                        sd = math.sqrt(var) if var >= 0 else 0.0
+                        avb = {
+                            "vwap": vwap,
+                            "sd": sd,
+                            "anchor": anchor_name,
+                            "bands": {
+                                "-1.0": vwap - 1.0 * sd,
+                                "+1.0": vwap + 1.0 * sd,
+                                "-2.0": vwap - 2.0 * sd,
+                                "+2.0": vwap + 2.0 * sd,
+                            },
+                            "bars": int(len(seg)),
+                        }
+        except Exception:
+            avb = None
+
         # Order block parsing: "OB Спрос [lo–hi]" -> lo/hi
         ob_side = "—"
         ob_lo = None
@@ -21241,21 +21627,147 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         entry_quality_txt = f"Качество зоны (confluence): {entry_confluence}/5"
         entry_kind_txt = f"Тип зоны: {entry_kind}" if entry_kind and entry_kind != "—" else "Тип зоны: —"
         entry_notes_txt = ("Основание: " + ", ".join(entry_notes)) if entry_notes else "Основание: —"
-# RR to TP1/TP2
+        # RR to TP1/TP2 (institutional: from entry midpoint when available)
         rr1 = None
         rr2 = None
         try:
-            risk = max(1e-9, abs(price - sl))
-            rr1 = abs(tp1 - price) / risk
-            rr2 = abs(tp2 - price) / risk
+            entry_mid = None
+            if entry_lo is not None and entry_hi is not None:
+                entry_mid = (float(entry_lo) + float(entry_hi)) / 2.0
+            base_entry = entry_mid if entry_mid is not None else float(price)
+            risk = max(1e-9, abs(base_entry - float(sl)))
+            rr1 = abs(float(tp1) - base_entry) / risk
+            rr2 = abs(float(tp2) - base_entry) / risk
         except Exception:
             pass
-        rr1_txt = _fmt_float(rr1, 1) if rr1 is not None else "—"
-        rr2_txt = _fmt_float(rr2, 1) if rr2 is not None else _fmt_float(rr, 1)
+        rr1_txt = _fmt_float(rr1, 2) if rr1 is not None else "—"
+        rr2_txt = _fmt_float(rr2, 2) if rr2 is not None else (_fmt_float(rr, 2) if rr is not None else "—")
+
+        # Institutional metrics (OHLCV-only)
+        conf_inst_txt = None
+        risk_flags_inst = []
+        trade_status_inst = None
+        try:
+            df_vp = df1.tail(240) if (df1 is not None and not df1.empty) else (df4.tail(180) if (df4 is not None and not df4.empty) else None)
+            vp = volume_profile(df_vp, bins=int(os.getenv('ANALYSIS_VP_BINS','72') or 72), value_area=float(os.getenv('ANALYSIS_VP_VALUE_AREA','0.7') or 0.7)) if df_vp is not None else None
+            vb = calc_vwap_bands(df1.tail(240) if (df1 is not None and not df1.empty) else df5.tail(120), stdev_mults=(1.0,2.0))
+            ofp = orderflow_pressure(df5, lookback=int(os.getenv('ANALYSIS_OF_LOOKBACK','36') or 36))
+            whale = whale_activity(df5, lookback=int(os.getenv('ANALYSIS_WHALE_LOOKBACK','180') or 180), z_thr=float(os.getenv('ANALYSIS_WHALE_Z','2.5') or 2.5))
+            liqcls = liquidation_clusters(df5, lookback=int(os.getenv('ANALYSIS_LIQCL_LOOKBACK','180') or 180), topk=int(os.getenv('ANALYSIS_LIQCL_TOPK','2') or 2))
+
+            score = 50
+            if regime in ('TRENDING','TREND','EXPANSION'):
+                score += 10
+            if trend_strength == 'Высокая':
+                score += 8
+            if struct_lbl == 'HH/HL' and bias == 'LONG':
+                score += 8
+            if struct_lbl == 'LH/LL' and bias == 'SHORT':
+                score += 8
+            try:
+                if float(vol_rel) >= 1.2: score += 8
+                elif float(vol_rel) < 0.6: score -= 10
+            except Exception:
+                pass
+            if ofp:
+                if (bias=='LONG' and ofp['mood']=='BUY') or (bias=='SHORT' and ofp['mood']=='SELL'): score += 6
+                elif ofp['mood']!='NEUTRAL': score -= 6
+            if isinstance(div_txt, str) and 'Медв' in div_txt and bias=='LONG': score -= 8
+            if isinstance(div_txt, str) and 'Быч' in div_txt and bias=='SHORT': score -= 8
+            try:
+                if float(adx_reg_i) >= 35 and isinstance(div_txt, str) and ('диверг' in div_txt.lower()): score -= 4
+            except Exception:
+                pass
+            try:
+                rrq = float(rr2) if rr2 is not None else None
+                if rrq is not None:
+                    if rrq >= 2.0: score += 8
+                    elif rrq >= 1.5: score += 4
+                    elif rrq < 1.0: score -= 10
+            except Exception:
+                pass
+            try:
+                if eq_hi is not None and eq_hi_dist_atr is not None and eq_hi_dist_atr < 2.0: score += 3
+                if eq_lo is not None and eq_lo_dist_atr is not None and eq_lo_dist_atr < 2.0: score += 3
+            except Exception:
+                pass
+            if whale and whale.get('spike'): score -= 3
+
+            score = max(0, min(100, int(round(score))))
+
+            # --- Institutional validation flags (used to align probability/confidence) ---
+            try:
+                MIN_RR = float(os.getenv("ANALYSIS_MIN_RR", "1.5") or 1.5)
+            except Exception:
+                MIN_RR = 1.5
+            try:
+                MIN_VOL_REL = float(os.getenv("ANALYSIS_MIN_VOL_REL", "0.6") or 0.6)
+            except Exception:
+                MIN_VOL_REL = 0.6
+
+            risk_flags_inst = []
+            try:
+                if rr2 is not None and float(rr2) < float(MIN_RR):
+                    risk_flags_inst.append("rr_too_low")
+            except Exception:
+                pass
+            try:
+                if float(vol_rel) < float(MIN_VOL_REL):
+                    risk_flags_inst.append("weak_volume")
+            except Exception:
+                pass
+            try:
+                # Trend exhaustion: high ADX + RSI divergence
+                if float(adx_reg_i) >= 35 and isinstance(div_txt, str) and ("диверг" in div_txt.lower() or "diverg" in div_txt.lower()):
+                    risk_flags_inst.append("trend_exhaustion")
+            except Exception:
+                pass
+
+            # Trade status: skip when key institutional constraints fail
+            trade_status_inst = "NO TRADE" if ("rr_too_low" in risk_flags_inst or "weak_volume" in risk_flags_inst) else "OK"
+
+            # Confidence is driven by institutional score (not by long/short diff)
+            conf_inst_txt = "Высокая" if score >= 75 else ("Средняя" if score >= 60 else "Низкая")
+
+            if bias == 'LONG':
+                long_p = max(5, min(95, int(round(50 + (score-50)*0.9))))
+                short_p = 100 - long_p
+            else:
+                short_p = max(5, min(95, int(round(50 + (score-50)*0.9))))
+                long_p = 100 - short_p
+
+
+            # Probability correction when volume is weak (prevents high % with low confirmation)
+            try:
+                if "weak_volume" in risk_flags_inst:
+                    if bias == "LONG":
+                        long_p = int(round(float(long_p) * 0.70))
+                        short_p = 100 - long_p
+                    else:
+                        short_p = int(round(float(short_p) * 0.70))
+                        long_p = 100 - short_p
+                    long_p = max(1, min(99, int(long_p)))
+                    short_p = 100 - long_p
+            except Exception:
+                pass
+
+            phase = '—'
+            try:
+                adxv = float(adx_reg_i)
+                if adxv < 18: phase = 'ACCUMULATION' if float(vol_rel) < 1.0 else 'RANGE'
+                elif adxv < 28: phase = 'MARKUP' if bias=='LONG' else 'MARKDOWN'
+                else: phase = 'EXPANSION'
+                if isinstance(div_txt, str) and ('диверг' in div_txt.lower()) and adxv >= 30: phase = 'LATE_TREND'
+            except Exception:
+                phase = '—'
+        except Exception:
+            vp = vb = ofp = whale = liqcls = None
+            score = None
+            phase = '—'
 
         # Bias text
         bias_txt = "LONG 📈" if bias == "LONG" else "SHORT 📉"
-        conf_txt = "Высокая" if confidence in ("HIGH", "Высокая") else ("Средняя" if confidence in ("MED", "Средняя") else "Низкая")
+        conf_txt = conf_inst_txt if (score is not None and conf_inst_txt) else ("Высокая" if confidence in ("HIGH", "Высокая") else ("Средняя" if confidence in ("MED", "Средняя") else "Низкая"))
 
         # Conclusion
         concl = []
@@ -21367,7 +21879,39 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             (f"{fvg_side} FVG: {_fmt_int_space(fvg_lo)} – {_fmt_int_space(fvg_hi)} ({'активен' if fvg_active else 'заполнен'})" if (fvg_side and fvg_lo is not None and fvg_hi is not None and fvg_active is not None) else (f"{fvg_txt}" if fvg_txt not in ("—", "-") else "—")),
             "",
             line,
-            "📊 Вероятностный анализ",
+                        line,
+            "🔥 Institutional Analysis Engine",
+            "",
+            f"Market phase: {phase}",
+            (f"Institutional score: {score}/100" if score is not None else "Institutional score: —"),
+            "",
+            "🗺️ Liquidity map (resting targets)",
+            eq_hi_line,
+            eq_lo_line,
+            magnet_txt,
+            "Multi-TF liquidity (5m/1h/4h):",
+            ("
+".join(mtf_liq_lines) if mtf_liq_lines else "—"),
+            "",
+            "⚖️ Orderflow pressure (proxy)",
+            (f"Pressure: {ofp['mood']} | index: {ofp['index']}/100" if ofp else "Pressure: —"),
+            "",
+            "📊 Volume profile (POC/VA)",
+            (f"POC: {_fmt_int_space(vp['poc'])} | VAH: {_fmt_int_space(vp['vah'])} | VAL: {_fmt_int_space(vp['val'])}" if vp else "POC/VA: —"),
+            "",
+            "📈 VWAP bands (1h)",
+            (f"VWAP: {_fmt_int_space(vb['vwap'])} | ±1σ: {_fmt_int_space(vb['bands']['-1.0'])} – {_fmt_int_space(vb['bands']['+1.0'])} | ±2σ: {_fmt_int_space(vb['bands']['-2.0'])} – {_fmt_int_space(vb['bands']['+2.0'])}" if vb else "VWAP: —"),
+            "",
+            "📍 Anchored VWAP (1h)",
+            (f"AVWAP: {_fmt_int_space(avb['vwap'])} | anchor: {avb['anchor']} | ±1σ: {_fmt_int_space(avb['bands']['-1.0'])} – {_fmt_int_space(avb['bands']['+1.0'])} | ±2σ: {_fmt_int_space(avb['bands']['-2.0'])} – {_fmt_int_space(avb['bands']['+2.0'])}" if avb else "AVWAP: —"),
+            "",
+            "🐋 Whale activity (proxy)",
+            (f"Whale score: {whale['score']}/5 | vol z: {_fmt_float(whale['z'],2)}" if whale else "Whale score: —"),
+            "",
+            "💥 Liquidation clusters (proxy)",
+            ("; ".join([f"{_fmt_int_space(x['level'])} ({'up-wick' if x['side']=='UP' else 'down-wick'})" for x in liqcls]) if liqcls else "—"),
+            "",
+"📊 Вероятностный анализ",
             "",
             f"Вероятность роста (LONG): {long_p}%",
             f"Вероятность падения (SHORT): {short_p}%",
@@ -21387,6 +21931,9 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             "",
             line,
             "📍 Торговый план (Institutional)",
+            "",
+            f"Статус сделки: {trade_status_inst if trade_status_inst else '—'}",
+            f"Риск-флаги: {(', '.join(risk_flags_inst) if risk_flags_inst else '—')}",
             "",
             f"{entry_status_line}",
             f"Зона входа: {entry_zone_txt}",
