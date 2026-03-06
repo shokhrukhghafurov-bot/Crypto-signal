@@ -16158,9 +16158,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
                         try:
-                            # Liquidity sweep requirement
+                            # Legacy global liquidity-sweep gate.
+                            # In smart-trigger mode this MUST NOT short-circuit before the final
+                            # threshold gate, otherwise enabled=0 / passed_n=0 cases still end up
+                            # blocked by liq_sweep_missing. So in smart mode we only record the
+                            # check result and let the final trigger gate decide.
                             req = os.getenv("MID_REQUIRE_LIQ_SWEEP", "0").strip().lower() in ("1","true","yes","on")
-                            if req:
+                            smart_liq_gate = os.getenv("MID_SMART_TRIGGER", "0").strip().lower() in ("1","true","yes","on")
+                            if req and (not smart_liq_gate):
                                 if str(direction).upper() == "LONG" and not bool(ta.get("sweep_long", False)):
                                     keep_it, outc = _pending_apply_fail(it, "liq_sweep_missing", now)
                                     _pending_log_trigger(sym, market, direction, outc, "liq_sweep_missing", it, float(price))
