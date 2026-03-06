@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncpg
 import datetime as dt
 import logging
+import hashlib
 import os
 from typing import Any, Dict, List, Optional, Tuple
 def utcnow():
@@ -513,6 +514,7 @@ ON CONFLICT (id) DO NOTHING;
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_tracks_market_status ON signal_tracks(market, status);")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_tracks_closed_at ON signal_tracks(closed_at);")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_tracks_tp1_hit_at ON signal_tracks(tp1_hit_at);")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_tracks_market_symbol_opened_at ON signal_tracks(market, symbol, opened_at DESC);")
         except Exception:
             pass
 
@@ -1250,7 +1252,129 @@ async def count_signal_tracks_for_symbol(*, market: str, symbol: str, since: dt.
             return 0
 
 
+async def get_last_signal_track_opened_at(*, market: str, symbol: str) -> Optional[dt.datetime]:
+    """Return the latest bot-level broadcast time for a (market, symbol).
 
+    Used for rolling per-symbol cooldowns such as "only one signal per 12 hours".
+    Returns UTC-aware datetime or None.
+    """
+    market = str(market or '').upper().strip()
+    symbol = str(symbol or '').upper().strip()
+    if market not in ('SPOT', 'FUTURES') or not symbol:
+        return None
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT MAX(opened_at) AS last_opened_at
+                FROM signal_tracks
+                WHERE market=$1 AND symbol=$2;
+                """,
+                market, symbol,
+            )
+            last_opened_at = row.get('last_opened_at') if row else None
+            if last_opened_at is None:
+                return None
+            if isinstance(last_opened_at, dt.datetime) and last_opened_at.tzinfo is None:
+                return last_opened_at.replace(tzinfo=dt.timezone.utc)
+            return last_opened_at
+        except Exception:
+            logger.exception('get_last_signal_track_opened_at failed')
+            return None
+
+
+
+def _symbol_cooldown_lock_key(*, market: str, symbol: str) -> int:
+    raw = f"{str(market or '').upper().strip()}|{str(symbol or '').upper().strip()}".encode('utf-8')
+    return int.from_bytes(hashlib.sha1(raw).digest()[:8], "big", signed=False) & 0x7FFFFFFFFFFFFFFF
+
+
+async def reserve_signal_track_with_symbol_cooldown(
+    *,
+    signal_id: int,
+    sig_key: str,
+    market: str,
+    symbol: str,
+    side: str,
+    entry: float,
+    tp1: float | None,
+    tp2: float | None,
+    sl: float | None,
+    cooldown_hours: float,
+) -> Tuple[bool, Optional[int]]:
+    # Atomically reserve a signal_track row under rolling per-symbol cooldown.
+    # Returns (reserved, remaining_seconds). Uses a transaction-scoped advisory
+    # lock per (market, symbol) to avoid duplicate sends across concurrent workers.
+    if not signal_id:
+        return False, None
+    market = str(market or "").upper().strip()
+    symbol = str(symbol or "").upper().strip()
+    side = str(side or "").upper().strip()
+    if market not in ("SPOT", "FUTURES") or not symbol:
+        return False, None
+    if side not in ("LONG", "SHORT"):
+        side = "LONG"
+    try:
+        cooldown_hours = float(cooldown_hours or 0.0)
+    except Exception:
+        cooldown_hours = 0.0
+    if cooldown_hours <= 0:
+        return False, None
+    cooldown_sec = max(0.0, cooldown_hours * 3600.0)
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        try:
+            async with conn.transaction():
+                await conn.execute('SELECT pg_advisory_xact_lock($1::bigint);', _symbol_cooldown_lock_key(market=market, symbol=symbol))
+                row = await conn.fetchrow(
+                    """
+                    SELECT opened_at
+                    FROM signal_tracks
+                    WHERE market=$1 AND symbol=$2
+                    ORDER BY opened_at DESC
+                    LIMIT 1;
+                    """,
+                    market, symbol,
+                )
+                last_opened_at = row.get('opened_at') if row else None
+                if last_opened_at is not None:
+                    if isinstance(last_opened_at, dt.datetime) and last_opened_at.tzinfo is None:
+                        last_opened_at = last_opened_at.replace(tzinfo=dt.timezone.utc)
+                    elapsed_sec = max(0.0, (utcnow() - last_opened_at).total_seconds())
+                    if elapsed_sec < cooldown_sec:
+                        remaining_sec = max(0, int(round(cooldown_sec - elapsed_sec)))
+                        return False, remaining_sec
+                await conn.execute(
+                    """
+                    INSERT INTO signal_tracks (signal_id, sig_key, market, symbol, side, entry, tp1, tp2, sl, status, opened_at, updated_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'ACTIVE', NOW(), NOW())
+                    ON CONFLICT (signal_id)
+                    DO UPDATE SET
+                      sig_key=EXCLUDED.sig_key,
+                      market=EXCLUDED.market,
+                      symbol=EXCLUDED.symbol,
+                      side=EXCLUDED.side,
+                      entry=EXCLUDED.entry,
+                      tp1=EXCLUDED.tp1,
+                      tp2=EXCLUDED.tp2,
+                      sl=EXCLUDED.sl,
+                      updated_at=NOW();
+                    """,
+                    int(signal_id),
+                    str(sig_key or ""),
+                    market,
+                    symbol,
+                    side,
+                    float(entry or 0.0),
+                    (float(tp1) if tp1 is not None else None),
+                    (float(tp2) if tp2 is not None else None),
+                    (float(sl) if sl is not None else None),
+                )
+                return True, None
+        except Exception:
+            logger.exception('reserve_signal_track_with_symbol_cooldown failed')
+            return False, None
 
 async def count_signal_tracks_opened_by_market(*, since: dt.datetime, until: dt.datetime) -> Dict[str, int]:
     """Count bot-level signal tracks opened in [since, until) grouped by market.
