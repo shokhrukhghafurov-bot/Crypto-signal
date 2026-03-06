@@ -14503,23 +14503,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         lo_f, hi_f = None, None
                         use_zone = False
                     if price is None:
-                        # Emergency fallback: when WS/REST price is unavailable, try latest 5m candle close.
-                        # This reduces px=NA/src_px=MISS stalls for pending checks.
-                        try:
-                            _df_px = await self.load_candles(sym_candles, "5m", market)
-                            if _df_px is not None and not getattr(_df_px, "empty", True) and "close" in _df_px.columns:
-                                _px_last = float(_df_px["close"].astype(float).iloc[-1])
-                                if _px_last > 0:
-                                    price = _px_last
-                                    try:
-                                        _px_cache[f"{market}:{sym_trade}"] = (float(now), float(_px_last))
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            pass
-
-                    if price is None:
-                        # Price not available (WS/REST + candle-close miss) -> keep pending and surface a sample so the operator can debug.
+                        # Price not available (WS/REST miss) -> keep pending and surface a sample so the operator can debug.
                         try:
                             px_missing_n += 1
                         except Exception:
@@ -21970,15 +21954,6 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
                 magnet_txt = f"Magnet: {_fmt_int_space(float(magnet_level))} {arrow}"
         except Exception:
             pass
-        # Backward-compatible aliases for older compact/unified templates that still reference `magnet`.
-        try:
-            magnet = magnet_level
-            magnet_val = _fmt_int_space(float(magnet_level)) if magnet_level is not None else "—"
-            magnet_arrow = ("↑" if magnet_side == "high" else "↓") if magnet_level is not None else ""
-        except Exception:
-            magnet = None
-            magnet_val = "—"
-            magnet_arrow = ""
 
         # ---- Anchored VWAP (1h) от swing low/high (proxy BOS anchor) ----
         avb = None
@@ -22550,292 +22525,160 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             phase = '—'
 
         # Bias text
-        bias_txt = "LONG 📈" if bias == "LONG" else "SHORT 📉"
+        bias_txt = _tr_i18n(lang, "analysis_bias_long") if bias == "LONG" else _tr_i18n(lang, "analysis_bias_short")
         conf_txt = conf_inst_txt if (score is not None and conf_inst_txt) else ("Высокая" if confidence in ("HIGH", "Высокая") else ("Средняя" if confidence in ("MED", "Средняя") else "Низкая"))
 
-        # Conclusion
-        concl = []
-        concl.append(f"Рынок находится в фазе {regime} с {('сильным' if trend_strength=='Высокая' else 'умеренным')} трендом.")
-        if struct_lbl in ("HH/HL", "LH/LL"):
-            concl.append(f"Структура {struct_lbl} подтверждает текущий приоритет: {bias}.")
-        if isinstance(smz, str) and smz not in ("—", "-"):
-            concl.append("Order Block подтверждает интерес крупного участника.")
-        if isinstance(fvg_txt, str) and "FVG" in fvg_txt and ("актив" in fvg_txt.lower() or "active" in fvg_txt.lower()):
-            concl.append("Активный FVG усиливает сценарий продолжения.")
-        if float(vol_rel) >= 1.2:
-            concl.append("Объём выше среднего поддерживает движение.")
+        def _loc_conf(v: str) -> str:
+            vv = str(v or "").strip().lower()
+            if vv in ("высокая", "high"):
+                return _tr_i18n(lang, "analysis_conf_high")
+            if vv in ("средняя", "medium", "med"):
+                return _tr_i18n(lang, "analysis_conf_medium")
+            return _tr_i18n(lang, "analysis_conf_low")
 
-        report_lines = [
-            f"📊 {sym} ({mkt_ru})",
-            f"💰 Цена: {price_s} USDT",
-            "",
-            line,
-            "🧭 Структура рынка (разные таймфреймы)",
-            "",
-            f"Глобальный тренд (4ч): {trend4}",
-            f"Среднесрочный тренд (1ч): {trend1}",
-            f"Локальный тренд (5м): {trend5}",
-            "",
-            f"🧩 Рыночная структура: {struct_lbl} (бычья структура)" if struct_lbl == "HH/HL" else f"🧩 Рыночная структура: {struct_lbl}",
-            "",
-            line,
-            "🧬 Рыночный режим",
-            "",
-            f"Режим: {regime} 🚀 (фаза расширения)" if regime == "EXPANSION" else f"Режим: {regime}",
-            f"Сила тренда: {trend_strength} (ADX: {adx_reg_i})",
-            "",
-            "🌪️ Анализ волатильности",
-            "",
-            f"Волатильность: {vola_txt}",
-            f"Риск пробоя: {risk_txt}",
-            f"Сжатие: {compression_txt}",
-            "",
-            line,
-            "⚡ Анализ импульса",
-            "",
-            f"RSI: {rsi_i} ({rsi_mood})",
-            f"MACD: {macd_mood}",
-            f"Наклон EMA20: {slope_txt}",
-            f"Дивергенция RSI: {div_txt}",
-            "",
-            line,
-            "📦 Анализ объёма",
-            "",
-            f"Относительный объём: {vol_rel_txt} (выше среднего)" if float(vol_rel) >= 1.2 else f"Относительный объём: {vol_rel_txt}",
-            f"Тренд объёма: {vol_tr_txt}",
-            f"Всплеск объёма: {spike_txt}",
-            f"Фаза объёма: {vol_phase}",
-            "",
-            line,
-            "🎯 Ключевые уровни",
-            "",
-            "🔴 Сопротивление:",
-            f"• {r1_s}",
-            f"• {r2_s}",
-            "",
-            "🟢 Поддержка:",
-            f"• {s1_s}",
-            f"• {s2_s}",
-            "",
-            f"Pivot (центр диапазона): {piv_s}",
-            "",
-            "Pivot Points (24ч):",
-            f"Pivot: {P_s}",
-            f"R1: {R1_s}",
-            f"R2: {R2_s}",
-            f"S1: {S1_s}",
-            f"S2: {S2_s}",
-            "",
-            line,
-            "📐 Трендовые линии и канал",
-            "",
-            f"Тип канала: {chan_type_txt} 📈" if "восход" in str(chan_type_txt).lower() else f"Тип канала: {chan_type_txt}",
-            "",
-            f"Поддержка канала: {chan_s_s}",
-            f"Средняя линия канала: {chan_m_s}",
-            f"Сопротивление канала: {chan_r_s}",
-            "",
-            "Трендовые линии:",
-            f"Линия поддержки: {tl_s_txt}",
-            f"Линия сопротивления: {tl_r_txt}",
-            "",
-            line,
-            "🚦 Пробой и ликвидность",
-            "",
-            f"Статус: {status_txt}",
-            "",
-            "💧 Зоны ликвидности:",
-                        eq_hi_line,
-                        eq_lo_line,
-            entry_sweep_txt,
-            "",
-            line,
-            "🏦 Smart Money анализ (SMC)",
-            "",
-            (f"Order Block (зона {ob_side}): {_fmt_int_space(ob_lo)} – {_fmt_int_space(ob_hi)}" if (ob_lo is not None and ob_hi is not None) else ("Order Block: —" if smz in ("—", "-") else f"Order Block: {smz}")),
-            "",
-            "События структуры:",
-            ("BOS: Бычий пробой структуры ↑" if (isinstance(smc_event, str) and "bos" in smc_event.lower() and ("вверх" in smc_event.lower() or "↑" in smc_event)) else
-             "BOS: Медвежий пробой структуры ↓" if (isinstance(smc_event, str) and "bos" in smc_event.lower()) else "BOS: —"),
-            ("CHOCH: Обнаружен" if (isinstance(smc_event, str) and "choch" in smc_event.lower()) else "CHOCH: Не обнаружен"),
-            "",
-            "FVG (Fair Value Gap):",
-            (f"{fvg_side} FVG: {_fmt_int_space(fvg_lo)} – {_fmt_int_space(fvg_hi)} ({'активен' if fvg_active else 'заполнен'})" if (fvg_side and fvg_lo is not None and fvg_hi is not None and fvg_active is not None) else (f"{fvg_txt}" if fvg_txt not in ("—", "-") else "—")),
-            "",
-            line,
-                        line,
-            "🔥 Institutional Analysis Engine",
-            "",
-            f"Market phase: {phase}",
-            (f"Institutional score: {score}/100" if score is not None else "Institutional score: —"),
-            "",
-            "🗺️ Liquidity map (resting targets)",
-            eq_hi_line,
-            eq_lo_line,
-            magnet_txt,
-            "Multi-TF liquidity (5m/1h/4h):",
-            ("\n".join(mtf_liq_lines) if mtf_liq_lines else "—"),
-            "",
-            "⚖️ Orderflow pressure (proxy)",
-            (f"Pressure: {ofp['mood']} | index: {ofp['index']}/100" if ofp else "Pressure: —"),
-            "",
-            "📊 Volume profile (POC/VA)",
-            (f"POC: {_fmt_int_space(vp['poc'])} | VAH: {_fmt_int_space(vp['vah'])} | VAL: {_fmt_int_space(vp['val'])}" if vp else "POC/VA: —"),
-            "",
-            "📈 VWAP bands (1h)",
-            (f"VWAP: {_fmt_int_space(vb['vwap'])} | ±1σ: {_fmt_int_space(vb['bands']['-1.0'])} – {_fmt_int_space(vb['bands']['+1.0'])} | ±2σ: {_fmt_int_space(vb['bands']['-2.0'])} – {_fmt_int_space(vb['bands']['+2.0'])}" if vb else "VWAP: —"),
-            "",
-            "📍 Anchored VWAP (1h)",
-            (f"AVWAP: {_fmt_int_space(avb['vwap'])} | anchor: {avb['anchor']} | ±1σ: {_fmt_int_space(avb['bands']['-1.0'])} – {_fmt_int_space(avb['bands']['+1.0'])} | ±2σ: {_fmt_int_space(avb['bands']['-2.0'])} – {_fmt_int_space(avb['bands']['+2.0'])}" if avb else "AVWAP: —"),
-            "",
-            "📊 Volume Profile — session/24h (HVN/LVN)",
-            (f"Session POC: {_fmt_int_space(vp_sess['poc'])} | VAH: {_fmt_int_space(vp_sess['vah'])} | VAL: {_fmt_int_space(vp_sess['val'])} | HVN: {'/'.join([_fmt_int_space(x) for x in vp_sess.get('hvn',[])])} | LVN: {'/'.join([_fmt_int_space(x) for x in vp_sess.get('lvn',[])])}" if vp_sess else "Session VP: —"),
-            (f"24h POC: {_fmt_int_space(vp_24h['poc'])} | VAH: {_fmt_int_space(vp_24h['vah'])} | VAL: {_fmt_int_space(vp_24h['val'])} | HVN: {'/'.join([_fmt_int_space(x) for x in vp_24h.get('hvn',[])])} | LVN: {'/'.join([_fmt_int_space(x) for x in vp_24h.get('lvn',[])])}" if vp_24h else "24h VP: —"),
-            "",
-            "🕳️ Liquidity void / imbalance zones (OHLCV)",
-            ("5m: " + "; ".join([f"{z['side']} {_fmt_int_space(z['lo'])}–{_fmt_int_space(z['hi'])}" for z in voids_5m]) if voids_5m else "5m: —"),
-            ("1h: " + "; ".join([f"{z['side']} {_fmt_int_space(z['lo'])}–{_fmt_int_space(z['hi'])}" for z in voids_1h]) if voids_1h else "1h: —"),
-            "",
-            "🪤 Sweep / Stop-hunt / Trap (desk)",
-            (f"Sweep: " + ("BUY-side" if sweep_5m.get("buy_sweep") else "") + ("SELL-side" if sweep_5m.get("sell_sweep") else "") if sweep_5m and (sweep_5m.get("buy_sweep") or sweep_5m.get("sell_sweep")) else "Sweep: —"),
-            (f"Stop-hunt probability: {stop_hunt_p}/100" if stop_hunt_p is not None else "Stop-hunt probability: —"),
-            (f"Trap score: {trap_score}/5" if trap_score is not None else "Trap score: —"),
-            "",
-            "🐋 Whale activity (proxy)",
-            (f"Whale score: {whale['score']}/5 | vol z: {_fmt_float(whale['z'],2)}" if whale else "Whale score: —"),
-            "",
-            "💥 Liquidation clusters (proxy)",
-            ("; ".join([f"{_fmt_int_space(x['level'])} ({'up-wick' if x['side']=='UP' else 'down-wick'})" for x in liqcls]) if liqcls else "—"),
-            "",
-            "📊 Вероятностный анализ",
-            "",
-            f"Вероятность роста (LONG): {long_p}%",
-            f"Вероятность падения (SHORT): {short_p}%",
-            "",
-            f"Приоритет: {bias_txt}",
-            f"Уверенность: {conf_txt}",
-            "",
-            line,
-            "🧠 Сценарии движения",
-            "",
-            "📈 Bullish сценарий:",
-            f"Если цена удержит {s1_s} → движение к {r1_s}",
-            f"Пробой {r1_s} → продолжение к {r2_s}",
-            "",
-            "📉 Bearish сценарий:",
-            f"Если цена потеряет {s1_s} → снижение к {s2_s}",
-            "",
-            line,
-            "📍 Торговый план (Institutional)",
-            "",
-            f"Статус сделки: {trade_status_inst if trade_status_inst else '—'}",
-            f"Риск-флаги: {(', '.join(risk_flags_inst) if risk_flags_inst else '—')}",
-            "",
-            f"{entry_status_line}",
-            f"Зона входа: {entry_zone_txt}",
-            f"{entry_kind_txt}",
-            f"{entry_quality_txt}",
-            f"{entry_notes_txt}",
-            f"{entry_trigger_txt}",
-            f"{entry_inval_txt}",
-            "",
-            "Stop Loss (на основе ATR + структуры):",
-            f"SL: {sl_s}",
-            "",
-            "Take Profit цели:",
-            f"TP1: {tp1_s}",
-            f"TP2: {tp2_s}",
-            "",
-            "Risk/Reward:",
-            f"TP1 RR: {rr1_txt}",
-            f"TP2 RR: {rr2_txt}",
-            "",
-            line,
-            "🧠 Итоговый институциональный вывод",
-            "",
-            "\n".join(concl) if concl else "—",
-            "",
-            f"Основной сценарий: {'продолжение роста 📈' if bias=='LONG' else 'снижение 📉'}",
-            f"Предпочтение: {bias}",
-            "",
-            f"🛡️ SL рассчитан по ATR ({atr_tf})",
-        ]
-    else:
-        # ---------- report (legacy EN/other) ----------
-        report_lines = [
-            f"📊 **{sym} ({mkt})**",
-            _tr_i18n(lang, "analysis_price_label", price=price_s) if "analysis_price_label" in I18N.get(lang, {}) else f"💰 **Цена:** {price_s} USDT",
-            "",
-            line,
-            "",
-            _tr_i18n(lang, "analysis_market_structure_title") if "analysis_market_structure_title" in I18N.get(lang, {}) else "## 🧭 Market structure",
-            "",
-            _tr_i18n(lang, "analysis_global_trend", t=trend4) if "analysis_global_trend" in I18N.get(lang, {}) else f"**Trend (4h):** {trend4}",
-            _tr_i18n(lang, "analysis_mid_trend", t=trend1) if "analysis_mid_trend" in I18N.get(lang, {}) else f"**Trend (1h):** {trend1}",
-            _tr_i18n(lang, "analysis_local_trend", t=trend5) if "analysis_local_trend" in I18N.get(lang, {}) else f"**Trend (5m):** {trend5}",
-            "",
-            f"Regime: **{regime}** | Structure: **{struct_lbl}**",
-            f"Volatility: **{vola_state}** | {vola_risk}",
-            f"Volume phase: **{vol_phase}**",
-            "",
-            line,
-            "",
-            "## 📐 Channel",
-            "",
-            f"Type: **{chan_type_txt}**",
-            f"Support: **{chan_s_s}**",
-            f"Mid: **{chan_m_s}**",
-            f"Resistance: **{chan_r_s}**",
-            f"Status: {chan_pos}",
-            "",
-            f"Trendlines: S={tl_s_txt} | R={tl_r_txt}",
-            f"Breakout/Retest: {brk} | Liquidity: {liq}",
-            f"SMC: {smz} | {smc_event}",
-            f"FVG: {fvg_txt}",
-            "",
-            line,
-            "",
-            "## 🎯 Levels",
-            "",
-            f"R1: {r1_s}",
-            f"R2: {r2_s}",
-            f"S1: {s1_s}",
-            f"S2: {s2_s}",
-            f"Pivot: {piv_s}",
-            f"Pivot points: P={P_s} R1={R1_s} R2={R2_s} S1={S1_s} S2={S2_s}",
-            "",
-            line,
-            "",
-            "## ⚡ Momentum",
-            "",
-            f"RSI: {rsi_i} | MACD: {macd_label} | ADX: {adx_i}",
-            f"Divergence: {div} | EMA20 slope: {slope_ema}",
-            f"ATR%: {atr_s}% | SL ATR TF: {atr_tf}",
-            f"Volume ratio: {vol_s} ({vol_status}) | Volume trend: {vol_trend} | {vol_spike}",
-            "",
-            line,
-            "",
-            "## 📊 Probability",
-            "",
-            f"LONG: {long_p}% | SHORT: {short_p}%",
-            f"Bias: **{bias}** | Confidence: **{confidence}**",
-            "",
-            line,
-            "",
-            "## 🧾 Trading Plan",
-            "",
-            f"{entry_status_line}",
-            f"Side: {bias}",
-            f"Entry: {entry_s}",
-            f"SL: {sl_s}",
-            f"TP1: {tp1_s}",
-            f"TP2: {tp2_s}",
-            f"RR (to TP2): {_fmt_float(rr,1)}",
-            "",
-            line,
-            "⚠️ Not financial advice.",
+        def _loc_trade_status(v: str) -> str:
+            vv = str(v or "").strip().upper()
+            return _tr_i18n(lang, "analysis_trade_status_no_trade") if vv == "NO TRADE" else _tr_i18n(lang, "analysis_trade_status_ok")
+
+        def _clean_key(v: str) -> str:
+            return re.sub(r"\s+", " ", str(v or "").replace("_", " ")).strip()
+
+        def _join_nonempty(items):
+            return ", ".join([str(x) for x in items if str(x or "").strip() and str(x).strip() not in ("—", "-")]) or "—"
+
+        if bias == "LONG":
+            bullish_lines = [
+                _tr_i18n(lang, "analysis_bullish_hold", support=s1_s, target=r1_s),
+                _tr_i18n(lang, "analysis_bullish_break", level=r1_s, target=r2_s),
+            ]
+            bearish_lines = [
+                _tr_i18n(lang, "analysis_bearish_loss", support=s1_s, target=s2_s),
+            ]
+            primary_scenario = _tr_i18n(lang, "analysis_primary_long")
+        else:
+            bullish_lines = [
+                _tr_i18n(lang, "analysis_bullish_hold", support=s1_s, target=r1_s),
+                _tr_i18n(lang, "analysis_bullish_break", level=r1_s, target=r2_s),
+            ]
+            bearish_lines = [
+                _tr_i18n(lang, "analysis_bearish_loss", support=s1_s, target=s2_s),
+            ]
+            primary_scenario = _tr_i18n(lang, "analysis_primary_short")
+
+        resistance_txt = f"{r1_s} / {r2_s}"
+        support_txt = f"{s1_s} / {s2_s}"
+        channel_txt = f"{chan_s_s} — {chan_r_s}" if chan_s_s not in ("—", "-") and chan_r_s not in ("—", "-") else "—"
+        liq_eqh_txt = eq_hi_line.replace("Equal Highs: ", "").replace("EQH: ", "") if isinstance(eq_hi_line, str) else "—"
+        liq_magnet_txt = magnet_txt.replace("Magnet: ", "") if isinstance(magnet_txt, str) else "—"
+        ob_txt = (f"{_fmt_int_space(ob_lo)} – {_fmt_int_space(ob_hi)}" if (ob_lo is not None and ob_hi is not None) else "—")
+        bos_txt = _tr_i18n(lang, "analysis_bos_bull") if (isinstance(smc_event, str) and "bos" in smc_event.lower() and ("вверх" in smc_event.lower() or "↑" in smc_event)) else (_tr_i18n(lang, "analysis_bos_bear") if (isinstance(smc_event, str) and "bos" in smc_event.lower()) else "—")
+        fvg_short_txt = (f"{_fmt_int_space(fvg_lo)} – {_fmt_int_space(fvg_hi)}" + (f" ({_tr_i18n(lang, 'analysis_active')})" if fvg_active else "")) if (fvg_lo is not None and fvg_hi is not None) else "—"
+
+        risk_flags_txt = _join_nonempty([_tr_i18n(lang, f"analysis_risk_flag_{_clean_key(x).replace(' ', '_')}") if _clean_key(x).replace(' ', '_') in {
+            'rr_too_low','weak_volume','trend_exhaustion'
+        } else _clean_key(x) for x in (risk_flags_inst or [])])
+
+        ob_state = _tr_i18n(lang, "analysis_conclusion_ob_present") if ob_txt not in ("—", "-") else _tr_i18n(lang, "analysis_conclusion_ob_absent")
+        fvg_state = _tr_i18n(lang, "analysis_conclusion_fvg_active") if (fvg_lo is not None and fvg_hi is not None and fvg_active) else (_tr_i18n(lang, "analysis_conclusion_fvg_present") if (fvg_lo is not None and fvg_hi is not None) else _tr_i18n(lang, "analysis_conclusion_fvg_absent"))
+        concl = [
+            _tr_i18n(lang, "analysis_conclusion_market_phase", phase=str(phase or "—"), regime=str(regime or "—")),
+            _tr_i18n(lang, "analysis_conclusion_structure", structure=str(struct_lbl or "—"), bias=str(bias_txt or "—")),
+            _tr_i18n(lang, "analysis_conclusion_ob", status=ob_state),
+            _tr_i18n(lang, "analysis_conclusion_fvg", status=fvg_state),
         ]
 
+        report_lines = [
+            _tr_i18n(lang, "analysis_header", symbol=sym, market=(mkt_ru if lang.startswith('ru') else mkt)),
+            _tr_i18n(lang, "analysis_price_line", price=price_s),
+            "",
+            line,
+            _tr_i18n(lang, "analysis_section_structure"),
+            "",
+            _tr_i18n(lang, "analysis_tf_4h", value=trend4),
+            _tr_i18n(lang, "analysis_tf_1h", value=trend1),
+            _tr_i18n(lang, "analysis_tf_5m", value=trend5),
+            _tr_i18n(lang, "analysis_structure_line", value=struct_lbl),
+            _tr_i18n(lang, "analysis_regime_line", regime=regime, adx=adx_reg_i),
+            "",
+            line,
+            _tr_i18n(lang, "analysis_section_momentum_volume"),
+            "",
+            _tr_i18n(lang, "analysis_rsi_line", value=rsi_i, mood=rsi_mood),
+            _tr_i18n(lang, "analysis_macd_line", value=macd_mood),
+            _tr_i18n(lang, "analysis_ema20_line", value=slope_txt),
+            _tr_i18n(lang, "analysis_volume_line", value=vol_rel_txt),
+            "",
+            line,
+            _tr_i18n(lang, "analysis_section_levels"),
+            "",
+            _tr_i18n(lang, "analysis_resistance_line", value=resistance_txt),
+            _tr_i18n(lang, "analysis_support_line", value=support_txt),
+            _tr_i18n(lang, "analysis_pivot_line", value=piv_s),
+            _tr_i18n(lang, "analysis_channel_line", value=channel_txt),
+            "",
+            line,
+            _tr_i18n(lang, "analysis_section_liquidity"),
+            "",
+            _tr_i18n(lang, "analysis_eqh_line", value=liq_eqh_txt),
+            _tr_i18n(lang, "analysis_magnet_line", value=liq_magnet_txt),
+            _tr_i18n(lang, "analysis_sweep_line", value=("да" if lang.startswith('ru') else "yes") if (sweep_long or sweep_short) else ("нет" if lang.startswith('ru') else "no")),
+            "",
+            line,
+            _tr_i18n(lang, "analysis_section_smc"),
+            "",
+            _tr_i18n(lang, "analysis_ob_line", value=ob_txt),
+            _tr_i18n(lang, "analysis_bos_line", value=bos_txt),
+            _tr_i18n(lang, "analysis_fvg_line", value=fvg_short_txt),
+            "",
+            line,
+            _tr_i18n(lang, "analysis_section_institutional"),
+            "",
+            _tr_i18n(lang, "analysis_market_phase_line", value=phase),
+            _tr_i18n(lang, "analysis_inst_score_line", value=(f"{score}/100" if score is not None else "—")),
+            _tr_i18n(lang, "analysis_orderflow_line", value=(f"{ofp['mood']} | {ofp['index']}/100" if ofp else "—")),
+            _tr_i18n(lang, "analysis_vwap_line", value=(f"{_fmt_int_space(vb['vwap'])} | ±1σ: {_fmt_int_space(vb['bands']['-1.0'])} – {_fmt_int_space(vb['bands']['+1.0'])}" if vb else "—")),
+            _tr_i18n(lang, "analysis_session_vp_line", value=(f"POC { _fmt_int_space(vp_sess['poc']) } | VAH { _fmt_int_space(vp_sess['vah']) } | VAL { _fmt_int_space(vp_sess['val']) }" if vp_sess else "—")),
+            _tr_i18n(lang, "analysis_voids_line", value=(("5m: " + "; ".join([f"{z['side']} {_fmt_int_space(z['lo'])}–{_fmt_int_space(z['hi'])}" for z in voids_5m])) if voids_5m else "—")),
+            "",
+            line,
+            _tr_i18n(lang, "analysis_section_probability"),
+            "",
+            _tr_i18n(lang, "analysis_long_prob_line", value=f"{long_p}%"),
+            _tr_i18n(lang, "analysis_short_prob_line", value=f"{short_p}%"),
+            _tr_i18n(lang, "analysis_priority_line", value=bias_txt),
+            _tr_i18n(lang, "analysis_confidence_line", value=_loc_conf(conf_txt)),
+            "",
+            line,
+            _tr_i18n(lang, "analysis_section_scenarios"),
+            "",
+            _tr_i18n(lang, "analysis_bullish_title"),
+            *bullish_lines,
+            "",
+            _tr_i18n(lang, "analysis_bearish_title"),
+            *bearish_lines,
+            "",
+            line,
+            _tr_i18n(lang, "analysis_section_trade_plan"),
+            "",
+            _tr_i18n(lang, "analysis_trade_status_line", value=_loc_trade_status(trade_status_inst if trade_status_inst else '—')),
+            _tr_i18n(lang, "analysis_entry_line", value=entry_zone_txt),
+            _tr_i18n(lang, "analysis_trigger_title"),
+            str(entry_trigger_txt),
+            _tr_i18n(lang, "analysis_invalidation_title"),
+            str(entry_inval_txt),
+            "",
+            _tr_i18n(lang, "analysis_sl_line", value=sl_s),
+            _tr_i18n(lang, "analysis_tp1_line", value=f"{tp1_s} ({_tr_i18n(lang, 'analysis_rr_short', value=rr1_txt)})"),
+            _tr_i18n(lang, "analysis_tp2_line", value=f"{tp2_s} ({_tr_i18n(lang, 'analysis_rr_short', value=rr2_txt)})"),
+            "",
+            line,
+            _tr_i18n(lang, "analysis_section_conclusion"),
+            "",
+            *concl,
+            "",
+            _tr_i18n(lang, "analysis_primary_line", value=primary_scenario),
+            _tr_i18n(lang, "analysis_preference_line", value=bias),
+        ]
     report = "\n".join([x for x in report_lines if x is not None])
     return report
 
