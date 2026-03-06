@@ -311,6 +311,36 @@ async def safe_edit_text(chat_id: int, message_id: int, text: str, *, ctx: str =
     return await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, **kwargs)
 
 
+async def safe_callback_answer(call: types.CallbackQuery, *args, **kwargs) -> bool:
+    """Answer callback queries without crashing on stale/expired Telegram query ids.
+
+    Telegram callback queries must be answered quickly. When webhook processing runs
+    in background, the query may already be expired by the time we answer it.
+    In that case Telegram returns:
+      - query is too old and response timeout expired
+      - query ID is invalid
+    These are harmless for UX and must not crash handlers or create asyncio noise.
+    """
+    try:
+        await safe_callback_answer(call, *args, **kwargs)
+        return True
+    except TelegramBadRequest as e:
+        msg = str(e).lower()
+        if (
+            "query is too old" in msg
+            or "response timeout expired" in msg
+            or "query id is invalid" in msg
+        ):
+            try:
+                logger.info("Skip expired callback answer uid=%s data=%s err=%s",
+                            getattr(getattr(call, 'from_user', None), 'id', None),
+                            getattr(call, 'data', None), e)
+            except Exception:
+                pass
+            return False
+        raise
+
+
 # -----------------------------------------------
 
 
@@ -2730,7 +2760,7 @@ async def cmd_autotrade_stress(message: types.Message):
 
 @dp.callback_query(lambda c: (c.data or "").startswith("lang:"))
 async def lang_choose(call: types.CallbackQuery) -> None:
-    await call.answer()
+    await safe_callback_answer(call, )
     uid = call.from_user.id if call.from_user else 0
     lang = (call.data or "lang:ru").split(":", 1)[1]
     if uid:
@@ -3094,7 +3124,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
     if action == "back":
         action = _nav_back(uid, "status")
 
-    await call.answer()
+    await safe_callback_answer(call, )
 
     # Shared access control (Postgres)
     access = await get_access_status(uid) if uid else "no_user"
@@ -3258,7 +3288,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
 @dp.callback_query(lambda c: (c.data or "").startswith("notify:"))
 async def notify_handler(call: types.CallbackQuery) -> None:
     """Handle inline buttons inside Notifications screen."""
-    await call.answer()
+    await safe_callback_answer(call, )
     uid = call.from_user.id if call.from_user else 0
     if not uid:
         return
@@ -3392,7 +3422,7 @@ def _trades_page_kb(uid: int, trades: list[dict], offset: int) -> types.InlineKe
 # ---------------- auto-trade callbacks ----------------
 @dp.callback_query(lambda c: (c.data or "").startswith("at:"))
 async def autotrade_callback(call: types.CallbackQuery) -> None:
-    await call.answer()
+    await safe_callback_answer(call, )
     uid = call.from_user.id if call.from_user else 0
     if not uid:
         return
@@ -3535,7 +3565,7 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
 
 @dp.callback_query(lambda c: (c.data or "").startswith("atmenu:"))
 async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
-    await call.answer()
+    await safe_callback_answer(call, )
     uid = call.from_user.id if call.from_user else 0
     if not uid:
         return
@@ -3634,7 +3664,7 @@ def _render_autotrade_stats_text(uid: int, market_type: str, period: str, stats:
 
 @dp.callback_query(lambda c: (c.data or "").startswith("atstats:"))
 async def autotrade_stats_callback(call: types.CallbackQuery) -> None:
-    await call.answer()
+    await safe_callback_answer(call, )
     uid = call.from_user.id if call.from_user else 0
     if not uid:
         return
@@ -4104,7 +4134,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trades:page:"))
 async def trades_page(call: types.CallbackQuery) -> None:
-    await call.answer()
+    await safe_callback_answer(call, )
     try:
         offset = int((call.data or "").split(":")[-1])
     except Exception:
@@ -4325,7 +4355,7 @@ def _trade_card_kb(uid: int, trade_id: int, back_offset: int = 0) -> types.Inlin
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:view:"))
 async def trade_view(call: types.CallbackQuery) -> None:
-    await call.answer()
+    await safe_callback_answer(call, )
     parts = (call.data or "").split(":")
     try:
         trade_id = int(parts[2])
@@ -4345,7 +4375,7 @@ async def trade_view(call: types.CallbackQuery) -> None:
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:refresh:"))
 async def trade_refresh(call: types.CallbackQuery) -> None:
-    await call.answer()
+    await safe_callback_answer(call, )
     parts = (call.data or "").split(":")
     try:
         trade_id = int(parts[2])
@@ -4363,7 +4393,7 @@ async def trade_refresh(call: types.CallbackQuery) -> None:
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:close:"))
 async def trade_close(call: types.CallbackQuery) -> None:
-    await call.answer()
+    await safe_callback_answer(call, )
     parts = (call.data or "").split(":")
     try:
         trade_id = int(parts[2])
@@ -4382,7 +4412,7 @@ async def trade_close(call: types.CallbackQuery) -> None:
 
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:orig:"))
 async def trade_orig(call: types.CallbackQuery) -> None:
-    await call.answer()
+    await safe_callback_answer(call, )
     parts = (call.data or "").split(":")
     try:
         trade_id = int(parts[2])
@@ -4413,12 +4443,12 @@ async def opened(call: types.CallbackQuery) -> None:
     try:
         signal_id = int((call.data or "").split(":", 1)[1])
     except Exception:
-        await call.answer("Error", show_alert=True)
+        await safe_callback_answer(call, "Error", show_alert=True)
         return
 
     sig = SIGNALS.get(signal_id)
     if not sig:
-        await call.answer("Signal not available", show_alert=True)
+        await safe_callback_answer(call, "Signal not available", show_alert=True)
         return
 
     allowed, reason, price = await backend.check_signal_openable(sig)
@@ -4426,7 +4456,7 @@ async def opened(call: types.CallbackQuery) -> None:
         # If we couldn't fetch current price (temporary exchange/API issue),
         # do NOT expire the signal. Just warn and let the user retry.
         if (reason or "").upper() == "ERROR":
-            await call.answer(_price_unavailable_notice(call.from_user.id, sig), show_alert=True)
+            await safe_callback_answer(call, _price_unavailable_notice(call.from_user.id, sig), show_alert=True)
             # Send a small helper message with the OPEN button (so user can tap again).
             kb = InlineKeyboardBuilder()
             kb.button(text=tr(call.from_user.id, "btn_opened"), callback_data=f"open:{sig.signal_id}")
@@ -4442,7 +4472,7 @@ async def opened(call: types.CallbackQuery) -> None:
         if LAST_SIGNAL_BY_MARKET.get(mkt) and LAST_SIGNAL_BY_MARKET[mkt].signal_id == sig.signal_id:
             LAST_SIGNAL_BY_MARKET[mkt] = None
         await _expire_signal_message(call, sig, reason, price)
-        await call.answer(tr(call.from_user.id, "sig_too_late_toast"), show_alert=True)
+        await safe_callback_answer(call, tr(call.from_user.id, "sig_too_late_toast"), show_alert=True)
         await safe_send(call.from_user.id, _too_late_text(call.from_user.id, sig, reason, price), reply_markup=menu_kb(call.from_user.id))
         return
 
@@ -4470,7 +4500,7 @@ async def opened(call: types.CallbackQuery) -> None:
                     await safe_edit_markup(call.from_user.id, call.message.message_id, None)
             except Exception:
                 pass
-            await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
+            await safe_callback_answer(call, tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
             await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
             return
         # If we found an ACTIVE trade for this signal_id but it belongs to another signal (symbol/market mismatch),
@@ -4514,7 +4544,7 @@ async def opened(call: types.CallbackQuery) -> None:
                     await safe_edit_markup(call.from_user.id, call.message.message_id, None)
             except Exception:
                 pass
-            await call.answer(tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
+            await safe_callback_answer(call, tr(call.from_user.id, "sig_already_opened_toast"), show_alert=True)
             await safe_send(call.from_user.id, tr(call.from_user.id, "sig_already_opened_msg"), reply_markup=menu_kb(call.from_user.id))
             return
 
@@ -4525,7 +4555,7 @@ async def opened(call: types.CallbackQuery) -> None:
     except Exception:
         pass
 
-    await call.answer(tr(call.from_user.id, "trade_opened_toast"))
+    await safe_callback_answer(call, tr(call.from_user.id, "trade_opened_toast"))
     # IMPORTANT: send OPEN card only after user pressed ✅ ОТКРЫЛ СДЕЛКУ
     await safe_send(
         call.from_user.id,
