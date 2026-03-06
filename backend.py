@@ -14287,6 +14287,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             # --- per-poll diagnostics counters ---
             total_n = int(len(items) if isinstance(items, list) else 0)
             trig_checked_n = 0
+            trig_inzone_checked_n = 0
             in_zone_n = 0
             near_n = 0
             far_n = 0
@@ -14917,15 +14918,34 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         pass
 
+                    _in_zone_for_trigger = bool(it.get("_in_zone") or it.get("_in_zone_tol") or False)
+                    _entered_zone_for_trigger = bool(it.get("_entered_zone_now") or False)
+                    _recheck_in_zone_for_trigger = bool(_in_zone_for_trigger and (not _entered_zone_for_trigger))
                     try:
-                        if bool(it.get("_entered_zone_now") or False):
+                        if _entered_zone_for_trigger:
                             logger.info("[mid][pending][zone] %s %s %s entered_zone=1 px=%.6g", sym, market, direction, float(price))
-                        elif bool(it.get("_in_zone") or it.get("_in_zone_tol") or False):
+                        elif _recheck_in_zone_for_trigger:
                             logger.info("[mid][pending][zone] %s %s %s recheck_in_zone=1 px=%.6g", sym, market, direction, float(price))
                     except Exception:
                         pass
 
                     trig_checked_n += 1
+                    if _in_zone_for_trigger:
+                        trig_inzone_checked_n += 1
+                    try:
+                        logger.info(
+                            "[mid][pending][trigger_eval] %s %s %s entered_zone=%s recheck_in_zone=%s attempts=%s fails=%s px=%.6g",
+                            sym,
+                            market,
+                            direction,
+                            1 if _entered_zone_for_trigger else 0,
+                            1 if _recheck_in_zone_for_trigger else 0,
+                            int(it.get("trigger_attempts") or 0),
+                            int(it.get("fail_count") or 0),
+                            float(price),
+                        )
+                    except Exception:
+                        pass
 
                     # If enabled, emit immediately as soon as price reaches the entry zone.
                     # NOTE: this bypasses *all* safety checks. Intended for temporary debugging only.
@@ -16210,7 +16230,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         pass
                     # emitted: do not keep
-                except Exception:
+                except Exception as e:
+                    try:
+                        logger.warning("[mid][pending][trigger] %s %s %s outcome=error reason=trigger_exception:%s px=%.6g", sym, market, direction, type(e).__name__, float(price))
+                    except Exception:
+                        pass
                     keep.append(it)
                     any_wait = True
 
@@ -16260,7 +16284,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 globals()["_MID_TRIG_POLL_LAST"] = {
                     "ts": float(now),
                     "checked": int(trig_checked_n),
-                    "in_zone_chk": int(in_zone_n),
+                    "in_zone_chk": int(trig_inzone_checked_n),
                     "keep": int(len(keep) if isinstance(keep, list) else 0),
                     "removed_now": int(removed_n),
                     "expired_now": int(expired_n),
