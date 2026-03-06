@@ -15236,20 +15236,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         _ph_tok = None
                     try:
-                        # Compat-safe call: some merged deployments may expose an older
-                        # evaluate_on_exchange_mid_v2 signature without the `symbol` kwarg.
-                        # Retry positionally so trigger re-check does not die with TypeError.
-                        try:
-                            ta = evaluate_on_exchange_mid_v2(df5, df30, df1h, symbol=sym)
-                        except TypeError:
-                            ta = evaluate_on_exchange_mid_v2(df5, df30, df1h, sym)
-                        if ta is None:
-                            ta = {}
-                        elif not isinstance(ta, dict):
-                            try:
-                                ta = dict(ta)
-                            except Exception:
-                                ta = {}
+                        ta = evaluate_on_exchange_mid_v2(df5, df30, df1h, symbol=sym)
                     finally:
                         try:
                             if _ph_tok is not None:
@@ -16184,12 +16171,27 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         pass
 
 # Emit final signal
-                    entry = float(ta.get("entry") or entry0)
-                    sl = float(ta.get("sl") or it.get("sl") or 0.0)
-                    tp1 = float(ta.get("tp1") or it.get("tp1") or 0.0)
-                    tp2 = float(ta.get("tp2") or it.get("tp2") or 0.0)
-                    rr = float(ta.get("rr") or it.get("rr") or 0.0)
-                    conf = int(float(ta.get("confidence") or it.get("confidence") or 0))
+                    def _mid_pick_scalar(*vals, default=0.0):
+                        for _v in vals:
+                            if _v is None or _v == "":
+                                continue
+                            if isinstance(_v, (list, tuple)):
+                                for _item in _v:
+                                    _fv = _safe_float(_item, None)
+                                    if _fv is not None:
+                                        return _fv
+                                continue
+                            _fv = _safe_float(_v, None)
+                            if _fv is not None:
+                                return _fv
+                        return default
+
+                    entry = _mid_pick_scalar(ta.get("entry"), entry0, it.get("entry"), default=0.0)
+                    sl = _mid_pick_scalar(ta.get("sl"), it.get("sl"), default=0.0)
+                    tp1 = _mid_pick_scalar(ta.get("tp1"), it.get("tp1"), default=0.0)
+                    tp2 = _mid_pick_scalar(ta.get("tp2"), it.get("tp2"), default=0.0)
+                    rr = _mid_pick_scalar(ta.get("rr"), it.get("rr"), default=0.0)
+                    conf = int(_mid_pick_scalar(ta.get("confidence"), it.get("confidence"), default=0.0))
 
                     conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "")
                     if not conf_names:
@@ -16245,19 +16247,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # emitted: do not keep
                 except Exception as e:
                     try:
-                        logger.warning(
-                            "[mid][pending][trigger] %s %s %s outcome=error reason=trigger_exception:%s:%s px=%.6g",
-                            sym,
-                            market,
-                            direction,
-                            type(e).__name__,
-                            str(e)[:220],
-                            float(price),
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        logger.exception("[mid][pending][trigger][trace] %s %s %s", sym, market, direction)
+                        logger.warning("[mid][pending][trigger] %s %s %s outcome=error reason=trigger_exception:%s px=%.6g", sym, market, direction, type(e).__name__, float(price))
                     except Exception:
                         pass
                     keep.append(it)
