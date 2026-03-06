@@ -14726,7 +14726,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         if float(_z_mid) > 0 and float(_ratio) > 0 and (float(_ratio) >= float(_scale_max) or float(_ratio) <= (1.0 / float(_scale_max))):
                             # mark fail reason for observability and remove
                             try:
-                                _pending_fail(it, "scale_mismatch", now)
+                                _pending_apply_fail(it, "scale_mismatch", now)
                             except Exception:
                                 pass
                             try:
@@ -15759,6 +15759,33 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     # Trigger-time confidence filter (env-driven).
                     # Count it in smart-trigger only when an actual threshold is configured.
+                    # Safe init: these vars are referenced below even when confidence gate is enabled.
+                    try:
+                        _conf_raw = ta.get("confidence")
+                    except Exception:
+                        _conf_raw = None
+                    if _conf_raw in (None, ""):
+                        try:
+                            _conf_raw = it.get("confidence")
+                        except Exception:
+                            _conf_raw = None
+                    if _conf_raw in (None, ""):
+                        try:
+                            _conf_raw = it.get("min_confidence")
+                        except Exception:
+                            _conf_raw = None
+                    _conf_missing = (_conf_raw in (None, ""))
+                    try:
+                        _conf_chk = float(_conf_raw or 0.0)
+                    except Exception:
+                        _conf_chk = 0.0
+                    try:
+                        it["_trig_conf_chk"] = float(_conf_chk)
+                        it["_trig_conf"] = float(_conf_chk)
+                        it["_trig_conf_src"] = "ta" if (ta.get("confidence") not in (None, "")) else ("item" if not _conf_missing else "missing")
+                    except Exception:
+                        pass
+
                     min_conf = 0
                     try:
                         if str(market).upper() == "FUTURES":
