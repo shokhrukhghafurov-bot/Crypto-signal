@@ -14160,7 +14160,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 checks_kv = ""
 
             logger.info(
-                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s term=%s trap_reason=%s in_zone=%s attempts=%s fails=%s px=%.6g pass=%s fail=%s skip=%s ne=%s checks=%s",
+                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s term=%s trap_reason=%s in_zone=%s attempts=%s fails=%s px=%.6g enabled=%s passed_n=%s need_passed=%s pass=%s fail=%s skip=%s ne=%s checks=%s",
                 str(sym), str(market), str(direction),
                 str(outcome), str(reason or ""), term_reason,
                 str(it.get("_trig_trap_reason") if (it.get("_trig_trap_reason") is not None) else (it.get("trap_reason") or "")),
@@ -14168,6 +14168,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 int(it.get("trigger_attempts") or 0),
                 int(it.get("fail_count") or 0),
                 float(price),
+                int(it.get("_trig_enabled_count") or 0),
+                int(it.get("_trig_passed_count") or 0),
+                int(it.get("_trig_need_passed") or 0),
                 _fmt_klist(passed),
                 _fmt_klist(fail_details) if fail_details else _fmt_klist(failed),
                 _fmt_klist(skipped),
@@ -15750,13 +15753,38 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
 
-                    # Trigger-time confidence filter REMOVED permanently (per user request).
-                    # We keep diagnostics key but never block/skip based on confidence.
+                    # Trigger-time confidence filter (env-driven).
+                    # Count it in smart-trigger only when an actual threshold is configured.
                     min_conf = 0
                     try:
-                        it["_trig_conf_min_src"] = "disabled"
+                        if str(market).upper() == "FUTURES":
+                            _mc_raw = os.getenv("MID_TRIGGER_MIN_CONFIDENCE_FUT", "").strip()
+                        else:
+                            _mc_raw = os.getenv("MID_TRIGGER_MIN_CONFIDENCE_SPOT", "").strip()
+                        if _mc_raw == "":
+                            _mc_raw = os.getenv("MID_TRIGGER_MIN_CONFIDENCE", "").strip()
+                        if _mc_raw == "":
+                            _mc_raw = os.getenv("MID_MIN_CONFIDENCE", "0").strip()
+                        min_conf = int(float(_mc_raw or 0))
+                        it["_trig_conf_min"] = int(min_conf)
+                        it["_trig_conf_min_src"] = "env"
+                        if isinstance(it.get("_trig_reqs"), dict):
+                            it["_trig_reqs"]["confidence"] = bool(min_conf > 0)
+                        if min_conf <= 0:
+                            try:
+                                it["_trig_checks"]["confidence"] = "skip"
+                            except Exception:
+                                pass
                     except Exception:
-                        pass
+                        min_conf = 0
+                        try:
+                            it["_trig_conf_min"] = 0
+                            it["_trig_conf_min_src"] = "error"
+                            if isinstance(it.get("_trig_reqs"), dict):
+                                it["_trig_reqs"]["confidence"] = False
+                            it["_trig_checks"]["confidence"] = "skip"
+                        except Exception:
+                            pass
 
                     if int(min_conf) > 0 and (not _conf_missing) and int(float(_conf_chk or 0.0)) < int(min_conf):
                         try:
@@ -15797,7 +15825,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         # Rationale: some users want score to be enforced only at scan/setup stage,
                         # while trigger should rely on confidence + checklist only.
                         trig_require_score = os.getenv("MID_TRIGGER_REQUIRE_SCORE", "1").strip().lower() not in ("0", "false", "no", "off")
-                        trig_require_score = False  # disabled: score filter removed from trigger
                         # Score/quality threshold (same logic as scan stage)
                         try:
                             use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
@@ -15824,7 +15851,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     it["_trig_checks"]["score"] = "skip"
                                 except Exception:
                                     pass
-                            elif False and need and score < need:  # score filter removed permanently
+                            elif need and score < need:
                                 try:
                                     it["_trig_checks"]["score"] = "fail"
                                 except Exception:
@@ -15933,12 +15960,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 trig_min_vol_x = float(mid_min_vol_x) * 0.75 if mid_min_vol_x else 0.0
 
-                            # NOTE: trigger volume filter disabled (user requested).
-                            trig_min_vol_x = 0.0
+                            # Volume filter is fully env-driven.
                             try:
                                 if isinstance(it.get("_trig_reqs"), dict):
                                     it["_trig_reqs"]["vol_x"] = bool(trig_min_vol_x and trig_min_vol_x > 0)
-                                it["_trig_checks"]["vol_x"] = "skip"
+                                it["_trig_checks"]["vol_x"] = "skip" if not (trig_min_vol_x and trig_min_vol_x > 0) else "ne"
                             except Exception:
                                 pass
                             # If no trigger threshold configured/effective, do not block.
@@ -16131,8 +16157,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
 
-                    # Final required-filter gate: only explicitly enabled trigger filters may decide emit.
-                    # Non-required diagnostic failures must never block.
+                    # Final trigger gate.
+                    #
+                    # Default mode:
+                    #   any required failed filter => block / soft_fail
+                    #
+                    # Smart mode (MID_SMART_TRIGGER=1):
+                    #   count enabled required filters, and emit when passed_required >= MID_TRIGGER_MIN_PASSED.
+                    #   In this mode failed required filters are tolerated as long as the pass-count threshold is met.
                     try:
                         checks = it.get("_trig_checks") if isinstance(it.get("_trig_checks"), dict) else {}
                         reqs = it.get("_trig_reqs") if isinstance(it.get("_trig_reqs"), dict) else {}
@@ -16150,40 +16182,98 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             "score": ("score_low", "score_low"),
                             "vol_x": ("vol_low", "vol_low"),
                         }
+                        smart_trigger = str(os.getenv("MID_SMART_TRIGGER", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+                        try:
+                            need_passed = int(float(os.getenv("MID_TRIGGER_MIN_PASSED", "0") or 0))
+                        except Exception:
+                            need_passed = 0
+                        enabled_required = []
+                        required_passed = []
                         required_failed = []
                         for _k, _v in checks.items():
                             if not bool(reqs.get(_k, False)):
                                 continue
-                            if str(_v or "").strip().lower().startswith("fail"):
+                            enabled_required.append(_k)
+                            _sv = str(_v or "").strip().lower()
+                            if _sv.startswith("pass"):
+                                required_passed.append(_k)
+                            elif _sv.startswith("fail"):
                                 required_failed.append(_k)
-                        if required_failed:
-                            first_key = str(required_failed[0])
-                            log_reason, apply_reason = _reason_map.get(first_key, (first_key, first_key))
-                            try:
-                                it["_trig_fail_reasons"] = [(_reason_map.get(k, (k, k))[0]) for k in required_failed]
-                                it["_trig_primary_reason"] = str(log_reason)
-                            except Exception:
-                                pass
-                            keep_it, outc = _pending_apply_fail(it, apply_reason, now)
-                            _pending_log_trigger(sym, market, direction, outc, log_reason, it, float(price))
-                            if keep_it:
-                                keep.append(it)
-                                any_wait = True
-                            else:
+                        try:
+                            it["_trig_enabled_count"] = int(len(enabled_required))
+                            it["_trig_passed_count"] = int(len(required_passed))
+                            it["_trig_need_passed"] = int(need_passed)
+                        except Exception:
+                            pass
+
+                        if smart_trigger:
+                            # Smart mode counts only enabled trigger filters.
+                            # If the user disabled all trigger filters, do not block the signal.
+                            if len(enabled_required) <= 0:
                                 try:
-                                    removed_n += 1
+                                    it.pop("_trig_fail_reasons", None)
+                                    it["_trig_primary_reason"] = "smart_threshold_pass"
+                                    it["_trig_term_reason"] = "smart_threshold_pass"
                                 except Exception:
                                     pass
-                            continue
+                            elif need_passed > 0:
+                                if len(required_passed) < need_passed:
+                                    first_key = str(required_failed[0] if required_failed else "smart_threshold_fail")
+                                    _log_reason, apply_reason = _reason_map.get(first_key, ("smart_threshold_fail", "smart_threshold_fail"))
+                                    try:
+                                        it["_trig_fail_reasons"] = [(_reason_map.get(k, (k, k))[0]) for k in required_failed] if required_failed else ["smart_threshold_fail"]
+                                        it["_trig_primary_reason"] = str("smart_threshold_fail")
+                                        it["_trig_term_reason"] = str("smart_threshold_fail")
+                                    except Exception:
+                                        pass
+                                    keep_it, outc = _pending_apply_fail(it, apply_reason, now)
+                                    _pending_log_trigger(sym, market, direction, outc, "smart_threshold_fail", it, float(price))
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
+                                else:
+                                    try:
+                                        it.pop("_trig_fail_reasons", None)
+                                        it["_trig_primary_reason"] = "smart_threshold_pass"
+                                        it["_trig_term_reason"] = "smart_threshold_pass"
+                                    except Exception:
+                                        pass
+                        else:
+                            if required_failed:
+                                first_key = str(required_failed[0])
+                                log_reason, apply_reason = _reason_map.get(first_key, (first_key, first_key))
+                                try:
+                                    it["_trig_fail_reasons"] = [(_reason_map.get(k, (k, k))[0]) for k in required_failed]
+                                    it["_trig_primary_reason"] = str(log_reason)
+                                except Exception:
+                                    pass
+                                keep_it, outc = _pending_apply_fail(it, apply_reason, now)
+                                _pending_log_trigger(sym, market, direction, outc, log_reason, it, float(price))
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
                     except Exception:
                         pass
 
                     # FULL_DIAGNOSTIC: after evaluating all trigger-time filters,
                     # if anything failed, apply the primary fail now (but keep all reasons for logs/status).
-                    # IMPORTANT: we log `reason=` as the *human* first-fail key (e.g. reclaim_missing),
-                    # but we apply the canonical reason (e.g. liq_sweep_missing) to preserve hard/soft policies.
+                    # IMPORTANT: in smart-trigger mode we do not hard-block on these reasons here;
+                    # pass-count threshold above is the deciding gate.
                     try:
-                        if full_diag and isinstance(trig_state, dict) and trig_state.get("reasons"):
+                        _smart_trigger_enabled = str(os.getenv("MID_SMART_TRIGGER", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+                        if (not _smart_trigger_enabled) and full_diag and isinstance(trig_state, dict) and trig_state.get("reasons"):
                             reasons = list(trig_state.get("reasons") or [])
                             try:
                                 it["_trig_fail_reasons"] = reasons
@@ -16296,7 +16386,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     await emit_signal_cb(sig)
                     _pending_clear_cooldown(it)
-                    _pending_log_trigger(sym, market, direction, "pass", "emit", it, float(price))
+                    try:
+                        emit_reason = str(it.get("_trig_primary_reason") or "emit")
+                    except Exception:
+                        emit_reason = "emit"
+                    _pending_log_trigger(sym, market, direction, "emit", emit_reason, it, float(price))
                     logger.info("[mid][pending] EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, entry, float(price), tol)
                     try:
                         _mid_metrics_inc("pending_triggered", 1)
