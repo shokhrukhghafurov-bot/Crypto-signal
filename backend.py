@@ -14788,12 +14788,20 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             _in_zone_now = False
                         try:
+                            _prev_in_zone = bool(it.get("_in_zone") or it.get("_in_zone_tol") or False)
+                        except Exception:
+                            _prev_in_zone = False
+                        try:
                             it["_in_zone"] = bool(_in_zone_now)
                         except Exception:
                             pass
                         try:
                             # backward compat: some digests used _in_zone_tol
                             it["_in_zone_tol"] = bool(_in_zone_now)
+                        except Exception:
+                            pass
+                        try:
+                            it["_entered_zone_now"] = bool(_in_zone_now and (not _prev_in_zone))
                         except Exception:
                             pass
                         if _in_zone_now:
@@ -14889,13 +14897,31 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # to "never reach trigger" (no [mid][pending][trigger] logs) while sitting in-zone.
                     try:
                         last_try = float(it.get("last_attempt_ts") or 0.0)
-                        # If MID_PENDING_INSTANT_EMIT=1, the expected behavior is:
-                        #   when price enters the entry zone -> emit immediately.
-                        # Debounce/attempt gap must NOT suppress that.
-                        if (not instant_emit_due_to_nofilters) and (not pending_instant_emit) and attempt_gap_sec > 0 and last_try > 0 and (now - last_try) < attempt_gap_sec:
-                            keep.append(it)
-                            any_wait = True
-                            continue
+                        entered_zone_now = bool(it.get("_entered_zone_now") or False)
+                        # Re-check trigger while price remains inside the zone.
+                        # This fixes the case where a symbol entered the zone once, stayed in-zone,
+                        # and never got another trigger pass because the code only effectively acted
+                        # like an edge-trigger. By default we allow re-check on every poll while
+                        # in-zone; users can throttle it with MID_PENDING_RECHECK_IN_ZONE_SEC.
+                        recheck_in_zone_sec = float(os.getenv("MID_PENDING_RECHECK_IN_ZONE_SEC", "0") or 0)
+                        if (not instant_emit_due_to_nofilters) and (not pending_instant_emit) and last_try > 0:
+                            if bool(it.get("_in_zone") or it.get("_in_zone_tol") or False):
+                                if (not entered_zone_now) and recheck_in_zone_sec > 0 and (now - last_try) < recheck_in_zone_sec:
+                                    keep.append(it)
+                                    any_wait = True
+                                    continue
+                            elif attempt_gap_sec > 0 and (now - last_try) < attempt_gap_sec:
+                                keep.append(it)
+                                any_wait = True
+                                continue
+                    except Exception:
+                        pass
+
+                    try:
+                        if bool(it.get("_entered_zone_now") or False):
+                            logger.info("[mid][pending][zone] %s %s %s entered_zone=1 px=%.6g", sym, market, direction, float(price))
+                        elif bool(it.get("_in_zone") or it.get("_in_zone_tol") or False):
+                            logger.info("[mid][pending][zone] %s %s %s recheck_in_zone=1 px=%.6g", sym, market, direction, float(price))
                     except Exception:
                         pass
 
