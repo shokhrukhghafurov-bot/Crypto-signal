@@ -3801,18 +3801,17 @@ async def autotrade_input_handler(message: types.Message) -> None:
                     pass
 
 
-            # Prefer a single Telegram message for token analysis.
+            # Send report safely: handle Telegram length limits + Markdown parse errors.
             kb = menu_kb(uid)
             chat_id = message.chat.id
-            text_out = str(report)
             try:
-                if len(text_out) <= 3900:
-                    await bot.send_message(chat_id, text_out, reply_markup=kb)
-                else:
-                    await _send_long(chat_id, text_out, reply_markup=kb)
+                # NOTE: report can be very long and contains a lot of symbols.
+                # Sending as plain text is the most reliable option (no entity parsing).
+                await _send_long(chat_id, str(report), reply_markup=kb)
             except Exception:
+                # Never crash the webhook task because of Telegram formatting/length issues
                 try:
-                    await _send_long(chat_id, text_out, reply_markup=kb)
+                    await _send_long(chat_id, str(report), reply_markup=kb)
                 except Exception:
                     pass
             return
