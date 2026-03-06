@@ -22578,6 +22578,15 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             'rr_too_low','weak_volume','trend_exhaustion'
         } else _clean_key(x) for x in (risk_flags_inst or [])])
 
+        ob_state = _tr_i18n(lang, "analysis_conclusion_ob_present") if ob_txt not in ("—", "-") else _tr_i18n(lang, "analysis_conclusion_ob_absent")
+        fvg_state = _tr_i18n(lang, "analysis_conclusion_fvg_active") if (fvg_lo is not None and fvg_hi is not None and fvg_active) else (_tr_i18n(lang, "analysis_conclusion_fvg_present") if (fvg_lo is not None and fvg_hi is not None) else _tr_i18n(lang, "analysis_conclusion_fvg_absent"))
+        concl = [
+            _tr_i18n(lang, "analysis_conclusion_market_phase", phase=str(phase or "—"), regime=str(regime or "—")),
+            _tr_i18n(lang, "analysis_conclusion_structure", structure=str(struct_lbl or "—"), bias=str(bias_txt or "—")),
+            _tr_i18n(lang, "analysis_conclusion_ob", status=ob_state),
+            _tr_i18n(lang, "analysis_conclusion_fvg", status=fvg_state),
+        ]
+
         report_lines = [
             _tr_i18n(lang, "analysis_header", symbol=sym, market=(mkt_ru if lang.startswith('ru') else mkt)),
             _tr_i18n(lang, "analysis_price_line", price=price_s),
