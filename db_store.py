@@ -1019,7 +1019,7 @@ async def perf_bucket(user_id: int, market: str, *, since: dt.datetime, until: d
               SUM(CASE WHEN event_type='LOSS' THEN 1 ELSE 0 END)::int AS losses,
               SUM(CASE WHEN event_type='BE' THEN 1 ELSE 0 END)::int AS be,
               (SELECT tp1_hits FROM tp1)::int AS tp1_hits,
-              COALESCE(SUM(pnl_pct), 0)::float AS sum_pnl_pct
+              COALESCE(SUM(CASE WHEN event_type='WIN' THEN ABS(COALESCE(pnl_pct,0)) WHEN event_type='LOSS' THEN -ABS(COALESCE(pnl_pct,0)) WHEN event_type='BE' THEN 0 ELSE COALESCE(pnl_pct,0) END), 0)::float AS sum_pnl_pct
             FROM last_outcome;
             """,
             int(user_id),
@@ -1080,7 +1080,7 @@ async def perf_bucket_global(market: str, *, since: dt.datetime, until: dt.datet
               SUM(CASE WHEN event_type='BE' THEN 1 ELSE 0 END)::int AS be,
               SUM(CASE WHEN event_type='CLOSE' THEN 1 ELSE 0 END)::int AS closes,
               (SELECT tp1_hits FROM tp1)::int AS tp1_hits,
-              COALESCE(SUM(pnl_pct), 0)::float AS sum_pnl_pct
+              COALESCE(SUM(CASE WHEN event_type='WIN' THEN ABS(COALESCE(pnl_pct,0)) WHEN event_type='LOSS' THEN -ABS(COALESCE(pnl_pct,0)) WHEN event_type='BE' THEN 0 ELSE COALESCE(pnl_pct,0) END), 0)::float AS sum_pnl_pct
             FROM last_outcome;
             """,
             market,
@@ -1118,7 +1118,7 @@ async def daily_report(user_id: int, market: str, *, days: int, tz: str = "UTC")
               SUM(CASE WHEN e.event_type='LOSS' THEN 1 ELSE 0 END)::int AS losses,
               SUM(CASE WHEN e.event_type='BE' THEN 1 ELSE 0 END)::int AS be,
               COUNT(DISTINCT CASE WHEN e.event_type='TP1' THEN e.trade_id END)::int AS tp1_hits,
-              COALESCE(SUM(CASE WHEN e.event_type IN ('WIN','LOSS','BE','CLOSE') THEN COALESCE(e.pnl_pct,0) ELSE 0 END), 0)::float AS sum_pnl_pct
+              COALESCE(SUM(CASE WHEN e.event_type='WIN' THEN ABS(COALESCE(e.pnl_pct,0)) WHEN e.event_type='LOSS' THEN -ABS(COALESCE(e.pnl_pct,0)) WHEN e.event_type='BE' THEN 0 WHEN e.event_type='CLOSE' THEN COALESCE(e.pnl_pct,0) ELSE 0 END), 0)::float AS sum_pnl_pct
             FROM trade_events e
             JOIN trades t ON t.id = e.trade_id
             WHERE t.user_id=$1 AND t.market=$2
@@ -1150,7 +1150,7 @@ async def weekly_report(user_id: int, market: str, *, weeks: int, tz: str = "UTC
               SUM(CASE WHEN e.event_type='LOSS' THEN 1 ELSE 0 END)::int AS losses,
               SUM(CASE WHEN e.event_type='BE' THEN 1 ELSE 0 END)::int AS be,
               COUNT(DISTINCT CASE WHEN e.event_type='TP1' THEN e.trade_id END)::int AS tp1_hits,
-              COALESCE(SUM(CASE WHEN e.event_type IN ('WIN','LOSS','BE','CLOSE') THEN COALESCE(e.pnl_pct,0) ELSE 0 END), 0)::float AS sum_pnl_pct
+              COALESCE(SUM(CASE WHEN e.event_type='WIN' THEN ABS(COALESCE(e.pnl_pct,0)) WHEN e.event_type='LOSS' THEN -ABS(COALESCE(e.pnl_pct,0)) WHEN e.event_type='BE' THEN 0 WHEN e.event_type='CLOSE' THEN COALESCE(e.pnl_pct,0) ELSE 0 END), 0)::float AS sum_pnl_pct
             FROM trade_events e
             JOIN trades t ON t.id = e.trade_id
             WHERE t.user_id=$1 AND t.market=$2
@@ -1364,6 +1364,14 @@ async def list_open_signal_tracks(*, limit: int = 500) -> List[dict]:
 
 async def mark_signal_tp1(*, signal_id: int, be_price: float | None = None, tp1_pnl_pct: float | None = None) -> None:
     pool = get_pool()
+    # TP1 is always a favorable partial outcome. Normalize to non-negative so
+    # old/bad calculations do not poison dashboard PnL.
+    norm_tp1_pnl = None
+    if tp1_pnl_pct is not None:
+        try:
+            norm_tp1_pnl = abs(float(tp1_pnl_pct))
+        except Exception:
+            norm_tp1_pnl = None
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
             """
@@ -1379,7 +1387,7 @@ async def mark_signal_tp1(*, signal_id: int, be_price: float | None = None, tp1_
             """,
             int(signal_id),
             (float(be_price) if be_price is not None else None),
-            (float(tp1_pnl_pct) if tp1_pnl_pct is not None else None),
+            norm_tp1_pnl,
         )
 
 
@@ -1412,10 +1420,33 @@ async def clear_signal_be_crossed(*, signal_id: int) -> None:
 
 
 async def close_signal_track(*, signal_id: int, status: str, pnl_total_pct: float | None = None) -> None:
-    """Close a signal track with final status WIN/LOSS/BE/CLOSED and store pnl."""
+    """Close a signal track with final status WIN/LOSS/BE/CLOSED and store pnl.
+
+    Normalization matters for the admin dashboard:
+      - WIN must never contribute negative PnL
+      - LOSS must never contribute positive PnL
+      - BE should be 0
+    This also self-heals if an upstream calculator produced the wrong sign.
+    """
     st = str(status or "").upper()
     if st not in ("WIN", "LOSS", "BE", "CLOSED"):
         st = "CLOSED"
+
+    norm_pnl = None
+    if pnl_total_pct is not None:
+        try:
+            raw = float(pnl_total_pct)
+            if st == "WIN":
+                norm_pnl = abs(raw)
+            elif st == "LOSS":
+                norm_pnl = -abs(raw)
+            elif st == "BE":
+                norm_pnl = 0.0
+            else:
+                norm_pnl = raw
+        except Exception:
+            norm_pnl = None
+
     pool = get_pool()
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
@@ -1429,7 +1460,7 @@ async def close_signal_track(*, signal_id: int, status: str, pnl_total_pct: floa
             """,
             int(signal_id),
             st,
-            (float(pnl_total_pct) if pnl_total_pct is not None else None),
+            norm_pnl,
         )
 
 
@@ -1499,11 +1530,13 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
               COUNT(*) FILTER (WHERE {where_tp1})::int AS tp1_hits,
               (
                 COALESCE(SUM(CASE
-                    WHEN {where_outcome} THEN (COALESCE(pnl_total_pct,0) - COALESCE(tp1_pnl_pct,0))
+                    WHEN {where_outcome} AND status='WIN' THEN GREATEST(0, ABS(COALESCE(pnl_total_pct,0)) - ABS(COALESCE(tp1_pnl_pct,0)))
+                    WHEN {where_outcome} AND status='LOSS' THEN -GREATEST(0, ABS(COALESCE(pnl_total_pct,0)) - ABS(COALESCE(tp1_pnl_pct,0)))
+                    WHEN {where_outcome} AND status='BE' THEN 0
                     ELSE 0
                   END),0)
                 + COALESCE(SUM(CASE
-                    WHEN {where_tp1} THEN COALESCE(tp1_pnl_pct,0)
+                    WHEN {where_tp1} THEN ABS(COALESCE(tp1_pnl_pct,0))
                     ELSE 0
                   END),0)
               )::float AS sum_pnl_pct
@@ -1586,7 +1619,7 @@ async def trade_perf_bucket_global(market: str, *, since: dt.datetime, until: dt
               SUM(CASE WHEN event_type='BE'   THEN 1 ELSE 0 END)::int AS be,
               SUM(CASE WHEN event_type='CLOSE' THEN 1 ELSE 0 END)::int AS closes,
               (SELECT tp1_hits FROM tp1)::int AS tp1_hits,
-              COALESCE(SUM(COALESCE(pnl_pct, 0)), 0)::float AS sum_pnl_pct
+              COALESCE(SUM(CASE WHEN event_type='WIN' THEN ABS(COALESCE(pnl_pct,0)) WHEN event_type='LOSS' THEN -ABS(COALESCE(pnl_pct,0)) WHEN event_type='BE' THEN 0 ELSE COALESCE(pnl_pct,0) END), 0)::float AS sum_pnl_pct
             FROM last_outcome;
             """,
             market,
