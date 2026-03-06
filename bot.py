@@ -3766,7 +3766,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
             # Then delete it once the report is ready (clean UX).
             processing_msg = None
             try:
-                processing_msg = await message.answer(tr(uid, "analysis_processing", symbol=symbol))
+                processing_msg = await message.answer(f"⏳ Анализирую {symbol} ...")
             except Exception:
                 # If Telegram rejects the send (rare), continue with analysis anyway.
                 processing_msg = None
