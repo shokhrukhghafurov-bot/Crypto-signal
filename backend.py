@@ -6339,6 +6339,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         return "mid_filter_error" if MID_FAIL_CLOSED else None
     return None
 @dataclass(frozen=True)
+@dataclass
 class Signal:
     # NOTE: All fields have defaults to avoid dataclass ordering issues
     # (non-default argument follows default argument) if earlier fields
