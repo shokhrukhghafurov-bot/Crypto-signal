@@ -14081,24 +14081,41 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
             passed, failed, skipped, not_eval = [], [], [], []
             try:
+                def _is_required(_k: str) -> bool:
+                    try:
+                        rv = reqs.get(_k, None)
+                        if rv is None:
+                            return False
+                        if isinstance(rv, bool):
+                            return rv
+                        return str(rv).strip().lower() in ("1", "true", "yes", "on")
+                    except Exception:
+                        return False
+
                 for k, v in checks.items():
                     sv = str(v or "").strip()
                     sl = sv.lower()
+                    req = _is_required(k)
                     if sl.startswith("pass"):
-                        passed.append(k)
-                    elif sl.startswith("fail"):
-                        failed.append(k)
-                    elif sl in ("ne", "not_eval", "not-eval", "not evaluated", "skip"):
-                        # default/placeholder -> not evaluated
-                        not_eval.append(k)
-                    elif sl.startswith("skip"):
-                        # show only real/meaningful skips (missing data / explicit skip reason)
-                        if sl.startswith("skip_missing") or sl.startswith("skip(") or sl == "skip_missing":
-                            skipped.append(k)
+                        # show PASS only for filters that are actually enabled / required
+                        if req or k == "zone":
+                            passed.append(k)
                         else:
-                            not_eval.append(k)
+                            skipped.append(k)
+                    elif sl.startswith("fail"):
+                        # CRITICAL: fail= must only contain enabled / required trigger filters.
+                        # Disabled filters may still be evaluated for diagnostics, but must be shown as skip.
+                        if req:
+                            failed.append(k)
+                        else:
+                            skipped.append(k)
+                    elif sl in ("ne", "not_eval", "not-eval", "not evaluated"):
+                        not_eval.append(k)
+                    elif sl == "skip":
+                        skipped.append(k)
+                    elif sl.startswith("skip"):
+                        skipped.append(k)
                     elif sl:
-                        # any other non-empty marker -> treat as not evaluated (keeps logs honest)
                         not_eval.append(k)
             except Exception:
                 pass
@@ -15044,7 +15061,21 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             "score": "ne",
                             "vol_x": "ne",
                         }
-                        it["_trig_reqs"] = {}
+                        it["_trig_reqs"] = {
+                            "zone": True,
+                            "structure_30m": False,
+                            "structure_1h": False,
+                            "direction": False,
+                            "trap": False,
+                            "bos_block": False,
+                            "reclaim": False,
+                            "bos_5m": False,
+                            "sweep": False,
+                            "displacement": False,
+                            "confidence": False,
+                            "score": False,
+                            "vol_x": False,
+                        }
                     except Exception:
                         pass
 
@@ -15067,6 +15098,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # So we default it to OFF, and users can explicitly enable it via env.
                     req_struct_30m = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_30M", False)
                     req_struct_1h = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_1H", False)
+                    try:
+                        it["_trig_reqs"]["structure_30m"] = bool(req_struct_30m)
+                        it["_trig_reqs"]["structure_1h"] = bool(req_struct_1h)
+                    except Exception:
+                        pass
                     
                     # Trap: by default, follow global trap switches if they are set; otherwise enabled.
                     try:
@@ -15084,6 +15120,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         _tov = os.getenv("MID_TRIGGER_REQUIRE_TRAP", "").strip()
                         if _tov != "":
                             req_trap = _env_true("MID_TRIGGER_REQUIRE_TRAP", req_trap)
+                    except Exception:
+                        pass
+                    try:
+                        it["_trig_reqs"]["trap"] = bool(req_trap)
                     except Exception:
                         pass
 
@@ -15359,54 +15399,34 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         req_dir = True
 
                     ta_dir = str(ta.get("direction") or "").upper()
+                    try:
+                        it["_trig_reqs"]["direction"] = bool(req_dir)
+                    except Exception:
+                        pass
                     if not req_dir:
                         try:
                             it["_trig_checks"]["direction"] = "skip"
                         except Exception:
                             pass
                     elif ta_dir and ta_dir != direction:
-                        # Strong reversal heuristic:
-                        # - mstruct is TREND (not RANGE/CHOPPY)
-                        # - ADX(1h) >= MID_TRIGGER_DIR_REVERSAL_ADX_MIN
                         try:
-                            adx_rev_min = float(os.getenv("MID_TRIGGER_DIR_REVERSAL_ADX_MIN", "28") or 28)
+                            it["_trig_checks"]["direction"] = "fail"
                         except Exception:
-                            adx_rev_min = 28.0
-                        try:
-                            adx1h_rev = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
-                        except Exception:
-                            adx1h_rev = 0.0
-                        try:
-                            mstruct_rev = str(ta.get("mstruct") or "")
-                        except Exception:
-                            mstruct_rev = ""
-                        strong_rev = ("TREND" in mstruct_rev.upper()) and (adx1h_rev >= adx_rev_min)
-
-                        if strong_rev:
-                            try:
-                                it["_trig_checks"]["direction"] = "fail"
-                            except Exception:
-                                pass
-                            if full_diag:
-                                _trig_add("direction_mismatch", "direction_mismatch")
-                            else:
-                                keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
-                                _pending_log_trigger(sym, market, direction, outc, "direction_mismatch", it, float(price))
-                                if keep_it:
-                                    keep.append(it)
-                                    any_wait = True
-                                else:
-                                    try:
-                                        removed_n += 1
-                                    except Exception:
-                                        pass
-                                continue
+                            pass
+                        if full_diag:
+                            _trig_add("direction_mismatch", "direction_mismatch")
                         else:
-                            # minor flip -> ignore and allow emit
-                            try:
-                                it["_trig_checks"]["direction"] = "skip"
-                            except Exception:
-                                pass
+                            keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
+                            _pending_log_trigger(sym, market, direction, outc, "direction_mismatch", it, float(price))
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
+                            else:
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                            continue
                     else:
                         # Only mark as pass when it really passed.
                         try:
@@ -15455,6 +15475,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         req_block_short = _env_true("MID_BLOCK_SHORT_BOS_UP", True)
                     except Exception:
                         req_block_short = True
+                    try:
+                        it["_trig_reqs"]["bos_block"] = bool(req_block_long or req_block_short)
+                    except Exception:
+                        pass
                     try:
                         if (not req_block_long) and (not req_block_short):
                             it["_trig_checks"]["bos_block"] = "skip"
@@ -15743,6 +15767,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # We keep diagnostics key but never block/skip based on confidence.
                     min_conf = 0
                     try:
+                        it["_trig_reqs"]["confidence"] = False
+                    except Exception:
+                        pass
+                    try:
                         it["_trig_conf_min_src"] = "disabled"
                     except Exception:
                         pass
@@ -15787,6 +15815,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         # while trigger should rely on confidence + checklist only.
                         trig_require_score = os.getenv("MID_TRIGGER_REQUIRE_SCORE", "1").strip().lower() not in ("0", "false", "no", "off")
                         trig_require_score = False  # disabled: score filter removed from trigger
+                        try:
+                            it["_trig_reqs"]["score"] = bool(trig_require_score)
+                        except Exception:
+                            pass
                         # Score/quality threshold (same logic as scan stage)
                         try:
                             use_main = os.getenv("MID_USE_MAIN_THRESHOLDS","1").strip().lower() not in ("0","false","no")
@@ -15909,6 +15941,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     except Exception:
                                         pass
                                 continue
+                        except Exception:
+                            pass
+                        try:
+                            it["_trig_reqs"]["vol_x"] = False
                         except Exception:
                             pass
                         try:
