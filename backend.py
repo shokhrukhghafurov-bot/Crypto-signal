@@ -15054,7 +15054,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     # FULL_DIAGNOSTIC: always evaluate full checklist in-zone (no short-circuit),
                     # so logs show every failed/passed filter in one line.
-                    full_diag = os.getenv("MID_TRIGGER_FULL_CHECKLIST", "1").strip().lower() in ("1","true","yes","on")
+                    # IMPORTANT: smart trigger must also force full evaluation, otherwise an early
+                    # failing filter (score/confidence/structure/...) can short-circuit before the
+                    # final pass-threshold gate is reached.
+                    smart_trigger = os.getenv("MID_SMART_TRIGGER", "0").strip().lower() in ("1","true","yes","on")
+                    full_diag = (os.getenv("MID_TRIGGER_FULL_CHECKLIST", "1").strip().lower() in ("1","true","yes","on")) or bool(smart_trigger)
                     # Trigger filter switches (so "filters off" via env truly means no blocking)
                     def _env_true(name: str, default: bool = True) -> bool:
                         try:
@@ -16182,7 +16186,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             "score": ("score_low", "score_low"),
                             "vol_x": ("vol_low", "vol_low"),
                         }
-                        smart_trigger = str(os.getenv("MID_SMART_TRIGGER", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+                        # Reuse the already-resolved smart trigger flag from the current trigger pass.
+                        try:
+                            smart_trigger = bool(smart_trigger)
+                        except Exception:
+                            smart_trigger = str(os.getenv("MID_SMART_TRIGGER", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
                         try:
                             need_passed = int(float(os.getenv("MID_TRIGGER_MIN_PASSED", "0") or 0))
                         except Exception:
@@ -17192,13 +17200,18 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                 trig_require_score = str(os.getenv("MID_TRIGGER_REQUIRE_SCORE", "1") or "1").strip().lower() not in ("0","false","no","off")
                 # Trigger-time filter visibility (these often cause "all signals blocked")
                 trig_full = str(os.getenv("MID_TRIGGER_FULL_CHECKLIST", "1") or "1").strip().lower() not in ("0","false","no","off")
+                trig_smart = str(os.getenv("MID_SMART_TRIGGER", "0") or "0").strip().lower() not in ("0","false","no","off")
+                try:
+                    trig_need_passed = int(float(os.getenv("MID_TRIGGER_MIN_PASSED", "0") or 0))
+                except Exception:
+                    trig_need_passed = 0
                 trig_req_struct30 = str(os.getenv("MID_TRIGGER_REQUIRE_STRUCTURE_30M", "0") or "0").strip().lower() not in ("0","false","no","off")
                 trig_req_struct1h = str(os.getenv("MID_TRIGGER_REQUIRE_STRUCTURE_1H", "0") or "0").strip().lower() not in ("0","false","no","off")
                 trig_mode = str(os.getenv("MID_TRIGGER_MODE", os.getenv("MID_MODE", "")) or "").strip()
                 logger.info(
-                    "[mid][cfg] pending_enabled=%s postsetup_only=%s require_trigger=%s trig_require_score=%s trig_struct30=%s trig_struct1h=%s trig_full=%s mode=%s min_score_fut=%s min_score_spot=%s min_conf=%s top_n=%s ttl_min=%s",
+                    "[mid][cfg] pending_enabled=%s postsetup_only=%s require_trigger=%s trig_require_score=%s trig_struct30=%s trig_struct1h=%s trig_full=%s trig_smart=%s trig_need_passed=%s mode=%s min_score_fut=%s min_score_spot=%s min_conf=%s top_n=%s ttl_min=%s",
                     int(pending_enabled), int(postsetup_only), int(require_trigger), int(trig_require_score),
-                    int(trig_req_struct30), int(trig_req_struct1h), int(trig_full),
+                    int(trig_req_struct30), int(trig_req_struct1h), int(trig_full), int(trig_smart), int(trig_need_passed),
                     (trig_mode or "-"),
                     int(min_score_fut), int(min_score_spot), int(min_conf),
                     int(top_n), float(ttl_min)
