@@ -2476,28 +2476,82 @@ async def broadcast_signal(sig: Signal) -> None:
     if sig_key in _SENT_SIG_CACHE:
         logger.info("Skip duplicate signal %s %s %s (within ttl)", sig.market, sig.symbol, sig.direction)
         return
-    # Daily cap per symbol: e.g. allow only 2 broadcasts per (market, symbol) per day.
-    # This is stronger than TTL dedup and prevents the same pair from spamming multiple times a day.
+    # Per-symbol rolling cooldown has priority over daily cap.
+    # Example: SIGNAL_SYMBOL_COOLDOWN_HOURS=12 means one signal per (market, symbol)
+    # every 12 hours, regardless of calendar day boundaries.
     try:
-        cap = int(float((os.getenv("SIGNAL_DAILY_CAP_PER_SYMBOL", "2") or "2").strip()))
+        symbol_cooldown_hours = float((os.getenv("SIGNAL_SYMBOL_COOLDOWN_HOURS", "0") or "0").strip())
     except Exception:
-        cap = 2
-    if cap > 0:
+        symbol_cooldown_hours = 0.0
+    mk = str(getattr(sig, 'market', '') or '').upper().strip() or 'FUTURES'
+    sym = str(getattr(sig, 'symbol', '') or '').upper().strip()
+    cooldown_reserved = False
+    if symbol_cooldown_hours > 0 and sym:
         try:
-            mk = str(getattr(sig, 'market', '') or '').upper().strip() or 'FUTURES'
-            sym = str(getattr(sig, 'symbol', '') or '').upper().strip()
-            now_local = dt.datetime.now(TZ)
-            day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-            day_end = day_start + dt.timedelta(days=1)
-            since_utc = day_start.astimezone(dt.timezone.utc)
-            until_utc = day_end.astimezone(dt.timezone.utc)
-            already = await db_store.count_signal_tracks_for_symbol(market=mk, symbol=sym, since=since_utc, until=until_utc)
-            if int(already) >= int(cap):
-                logger.info("Skip signal by daily cap: market=%s symbol=%s already=%s cap=%s", mk, sym, already, cap)
-                return
+            # Allocate signal_id before broadcast so reservation is atomic across concurrent workers.
+            sid = await db_store.next_signal_id()
+            sig = replace(sig, signal_id=sid)
+            side_stats = _normalize_side_for_stats(getattr(sig, 'direction', ''))
+            cooldown_reserved, remaining_sec = await db_store.reserve_signal_track_with_symbol_cooldown(
+                signal_id=int(sig.signal_id or 0),
+                sig_key=sig_key,
+                market=mk,
+                symbol=sym,
+                side=side_stats,
+                entry=float(sig.entry or 0.0),
+                tp1=(float(sig.tp1) if sig.tp1 is not None else None),
+                tp2=(float(sig.tp2) if sig.tp2 is not None else None),
+                sl=(float(sig.sl) if sig.sl is not None else None),
+                cooldown_hours=float(symbol_cooldown_hours),
+            )
+            if not cooldown_reserved:
+                if remaining_sec is not None:
+                    rem_h, rem_rest = divmod(int(remaining_sec), 3600)
+                    rem_m, rem_s = divmod(rem_rest, 60)
+                    logger.info(
+                        "Skip signal by symbol cooldown: market=%s symbol=%s cooldown_h=%.2f remaining=%02dh%02dm%02ds",
+                        mk, sym, symbol_cooldown_hours, rem_h, rem_m, rem_s,
+                    )
+                    return
+                # fail-open fallback: if reservation path could not decide, use read-check path
+                last_opened_at = await db_store.get_last_signal_track_opened_at(market=mk, symbol=sym)
+                if last_opened_at is not None:
+                    now_utc = dt.datetime.now(dt.timezone.utc)
+                    elapsed_sec = max(0.0, (now_utc - last_opened_at).total_seconds())
+                    cooldown_sec = float(symbol_cooldown_hours) * 3600.0
+                    if elapsed_sec < cooldown_sec:
+                        remaining_sec = max(0, int(round(cooldown_sec - elapsed_sec)))
+                        rem_h, rem_rest = divmod(remaining_sec, 3600)
+                        rem_m, rem_s = divmod(rem_rest, 60)
+                        logger.info(
+                            "Skip signal by symbol cooldown: market=%s symbol=%s cooldown_h=%.2f remaining=%02dh%02dm%02ds",
+                            mk, sym, symbol_cooldown_hours, rem_h, rem_m, rem_s,
+                        )
+                        return
         except Exception:
             # fail-open: do not block signals if DB is temporarily unavailable
             pass
+    else:
+        # Daily cap per symbol: e.g. allow only 2 broadcasts per (market, symbol) per day.
+        # This is stronger than TTL dedup and prevents the same pair from spamming multiple times a day.
+        try:
+            cap = int(float((os.getenv("SIGNAL_DAILY_CAP_PER_SYMBOL", "2") or "2").strip()))
+        except Exception:
+            cap = 2
+        if cap > 0 and sym:
+            try:
+                now_local = dt.datetime.now(TZ)
+                day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+                day_end = day_start + dt.timedelta(days=1)
+                since_utc = day_start.astimezone(dt.timezone.utc)
+                until_utc = day_end.astimezone(dt.timezone.utc)
+                already = await db_store.count_signal_tracks_for_symbol(market=mk, symbol=sym, since=since_utc, until=until_utc)
+                if int(already) >= int(cap):
+                    logger.info("Skip signal by daily cap: market=%s symbol=%s already=%s cap=%s", mk, sym, already, cap)
+                    return
+            except Exception:
+                # fail-open: do not block signals if DB is temporarily unavailable
+                pass
 
     _SENT_SIG_CACHE[sig_key] = now
 
@@ -2537,6 +2591,7 @@ async def broadcast_signal(sig: Signal) -> None:
         pass
 
     # Persist bot-level signal tracker (independent from users) for outcomes (TP/SL/BE) statistics.
+    # If cooldown reservation already inserted the row, this UPSERT only refreshes fields.
     try:
         side_stats = _normalize_side_for_stats(getattr(sig, 'direction', ''))
         await db_store.upsert_signal_track(
