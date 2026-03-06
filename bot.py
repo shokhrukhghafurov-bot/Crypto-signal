@@ -322,7 +322,7 @@ async def safe_callback_answer(call: types.CallbackQuery, *args, **kwargs) -> bo
     These are harmless for UX and must not crash handlers or create asyncio noise.
     """
     try:
-        await safe_callback_answer(call, *args, **kwargs)
+        await call.answer(*args, **kwargs)
         return True
     except TelegramBadRequest as e:
         msg = str(e).lower()
@@ -332,9 +332,12 @@ async def safe_callback_answer(call: types.CallbackQuery, *args, **kwargs) -> bo
             or "query id is invalid" in msg
         ):
             try:
-                logger.info("Skip expired callback answer uid=%s data=%s err=%s",
-                            getattr(getattr(call, 'from_user', None), 'id', None),
-                            getattr(call, 'data', None), e)
+                logger.info(
+                    "Skip expired callback answer uid=%s data=%s err=%s",
+                    getattr(getattr(call, "from_user", None), "id", None),
+                    getattr(call, "data", None),
+                    e,
+                )
             except Exception:
                 pass
             return False
