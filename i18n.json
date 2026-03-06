@@ -407,7 +407,16 @@
     "analysis_active": "active",
     "analysis_risk_flag_rr_too_low": "RR too low",
     "analysis_risk_flag_weak_volume": "weak volume",
-    "analysis_risk_flag_trend_exhaustion": "trend exhaustion"
+    "analysis_risk_flag_trend_exhaustion": "trend exhaustion",
+    "analysis_conclusion_market_phase": "Market is in {phase} phase | regime: {regime}.",
+    "analysis_conclusion_structure": "Structure {structure} supports the current bias: {bias}.",
+    "analysis_conclusion_ob": "Order Block: {status}.",
+    "analysis_conclusion_fvg": "FVG: {status}.",
+    "analysis_conclusion_ob_present": "zone is present",
+    "analysis_conclusion_ob_absent": "zone is not detected",
+    "analysis_conclusion_fvg_active": "active imbalance remains in play",
+    "analysis_conclusion_fvg_present": "imbalance exists but is not confirmed as active",
+    "analysis_conclusion_fvg_absent": "no active imbalance detected"
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -817,6 +826,15 @@
     "analysis_active": "активен",
     "analysis_risk_flag_rr_too_low": "RR низкий",
     "analysis_risk_flag_weak_volume": "слабый объём",
-    "analysis_risk_flag_trend_exhaustion": "истощение тренда"
+    "analysis_risk_flag_trend_exhaustion": "истощение тренда",
+    "analysis_conclusion_market_phase": "Рынок в фазе {phase} | режим: {regime}.",
+    "analysis_conclusion_structure": "Структура {structure} поддерживает текущий приоритет: {bias}.",
+    "analysis_conclusion_ob": "Order Block: {status}.",
+    "analysis_conclusion_fvg": "FVG: {status}.",
+    "analysis_conclusion_ob_present": "зона присутствует",
+    "analysis_conclusion_ob_absent": "зона не обнаружена",
+    "analysis_conclusion_fvg_active": "активный дисбаланс сохраняется",
+    "analysis_conclusion_fvg_present": "дисбаланс найден, но без активного подтверждения",
+    "analysis_conclusion_fvg_absent": "активный дисбаланс не обнаружен"
   }
 }
