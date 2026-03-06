@@ -340,7 +340,15 @@
     "entry_status_ready": "READY (in zone)  ⚠️ wait for confirmation",
     "entry_status_wait": "WAIT (out of zone)",
     "entry_status_confirmed": "CONFIRMED ✅ confirmed",
-    "entry_status_invalid": "INVALID ❌ invalidated"
+    "entry_status_invalid": "INVALID ❌ invalidated",
+    "analysis_unified_report": "📊 {symbol} ({market})\n💰 Price: {price}\n\n━━━━━━━━━━━━━━━━━━━\n🧭 MARKET STRUCTURE\n\n4H: {trend_4h}\n1H: {trend_1h}\n5M: {trend_5m}\nStructure: {structure}\nRegime: {regime} | ADX: {adx}\n\n━━━━━━━━━━━━━━━━━━━\n⚡ MOMENTUM & VOLUME\n\nRSI: {rsi}\nMACD: {macd}\nEMA20: {ema}\nVolume: {volume}\n\n━━━━━━━━━━━━━━━━━━━\n🎯 KEY LEVELS\n\nResistance: {res1} / {res2}\nSupport: {sup1} / {sup2}\nPivot: {pivot}\n\nDescending channel:\n{channel_low} — {channel_high}\n\n━━━━━━━━━━━━━━━━━━━\n💧 LIQUIDITY\n\nEQH: {eqh}\nMagnet: {magnet}\nLiquidity sweep (5m): {sweep}\n\n━━━━━━━━━━━━━━━━━━━\n🏦 SMART MONEY (SMC)\n\nOrder Block: {ob}\nBOS: {bos}\nFVG: {fvg}\n\n━━━━━━━━━━━━━━━━━━━\n\n🔥 Institutional Analysis Engine\n\nMarket phase: {phase}\nInstitutional score: {score}/100\nOrderflow: {orderflow}\n\nPOC (24h): {poc}\nVWAP (1h): {vwap}\n\nImbalance:\n5m: {imb_5m}\n1h: {imb_1h}\n\nLiquidation clusters:\n{liq_clusters}\n\n━━━━━━━━━━━━━━━━━━━\n📊 PROBABILITY\n\nLONG: {long_prob}%\nSHORT: {short_prob}\n\nPriority: {priority}\nConfidence: {confidence}\n\n━━━━━━━━━━━━━━━━━━━\n🧠 SCENARIOS\n\n📈 Bullish:\nHold {bull_hold} → {bull_tp1}\nBreak {bull_tp1} → {bull_tp2}\n\n📉 Bearish:\nLose {bear_break} → {bear_tp}\n\n━━━━━━━━━━━━━━━━━━━\n📍 TRADE PLAN\n\nStatus: {trade_status}\nEntry: {entry}\n\nTrigger:\n{trigger}\n\nInvalidation:\n{invalidation}\n\nSL: {sl}\nTP1: {tp1}\nTP2: {tp2}",
+    "analysis_market_spot": "SPOT",
+    "analysis_market_futures": "FUTURES",
+    "analysis_conf_high": "High",
+    "analysis_conf_medium": "Medium",
+    "analysis_conf_low": "Low",
+    "analysis_trimmed": "⚠️ Report trimmed (Telegram limit)",
+    "analysis_processing": "⏳ Analyzing {symbol} ..."
   },
   "ru": {
     "access_blocked": "⛔️ Доступ заблокирован. Обратитесь в поддержку @{support}.",
@@ -683,6 +691,14 @@
     "entry_status_ready": "READY (в зоне)  ⚠️ ждать подтверждение",
     "entry_status_wait": "WAIT (вне зоны)",
     "entry_status_confirmed": "CONFIRMED ✅ подтверждено",
-    "entry_status_invalid": "INVALID ❌ отмена"
+    "entry_status_invalid": "INVALID ❌ отмена",
+    "analysis_unified_report": "📊 {symbol} ({market})\n💰 Цена: {price}\n\n━━━━━━━━━━━━━━━━━━━\n🧭 СТРУКТУРА РЫНКА\n\n4H: {trend_4h}\n1H: {trend_1h}\n5M: {trend_5m}\nСтруктура: {structure}\nРежим: {regime} | ADX: {adx}\n\n━━━━━━━━━━━━━━━━━━━\n⚡ ИМПУЛЬС И ОБЪЁМ\n\nRSI: {rsi}\nMACD: {macd}\nEMA20: {ema}\nОбъём: {volume}\n\n━━━━━━━━━━━━━━━━━━━\n🎯 КЛЮЧЕВЫЕ УРОВНИ\n\nСопротивление: {res1} / {res2}\nПоддержка: {sup1} / {sup2}\nPivot: {pivot}\n\nНисходящий канал:\n{channel_low} — {channel_high}\n\n━━━━━━━━━━━━━━━━━━━\n💧 ЛИКВИДНОСТЬ\n\nEQH: {eqh}\nMagnet: {magnet}\nLiquidity sweep (5m): {sweep}\n\n━━━━━━━━━━━━━━━━━━━\n🏦 SMART MONEY (SMC)\n\nOrder Block: {ob}\nBOS: {bos}\nFVG: {fvg}\n\n━━━━━━━━━━━━━━━━━━━\n\n🔥 Institutional Analysis Engine\n\nMarket phase: {phase}\nInstitutional score: {score}/100\nOrderflow: {orderflow}\n\nPOC (24h): {poc}\nVWAP (1h): {vwap}\n\nImbalance:\n5m: {imb_5m}\n1h: {imb_1h}\n\nLiquidation clusters:\n{liq_clusters}\n\n━━━━━━━━━━━━━━━━━━━\n📊 ВЕРОЯТНОСТЬ\n\nLONG: {long_prob}%\nSHORT: {short_prob}\n\nПриоритет: {priority}\nУверенность: {confidence}\n\n━━━━━━━━━━━━━━━━━━━\n🧠 СЦЕНАРИИ\n\n📈 Bullish:\nУдержание {bull_hold} → {bull_tp1}\nПробой {bull_tp1} → {bull_tp2}\n\n📉 Bearish:\nПотеря {bear_break} → {bear_tp}\n\n━━━━━━━━━━━━━━━━━━━\n📍 ТОРГОВЫЙ ПЛАН\n\nСтатус: {trade_status}\nВход: {entry}\n\nТриггер:\n{trigger}\n\nИнвалидация:\n{invalidation}\n\nSL: {sl}\nTP1: {tp1}\nTP2: {tp2}",
+    "analysis_market_spot": "СПОТ",
+    "analysis_market_futures": "ФЬЮЧЕРСЫ",
+    "analysis_conf_high": "Высокая",
+    "analysis_conf_medium": "Средняя",
+    "analysis_conf_low": "Низкая",
+    "analysis_trimmed": "⚠️ Отчёт сокращён (лимит Telegram)",
+    "analysis_processing": "⏳ Анализирую {symbol} ..."
   }
 }
