@@ -6338,6 +6338,84 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         # if filter computation fails, respect fail-closed flag
         return "mid_filter_error" if MID_FAIL_CLOSED else None
     return None
+def _normalize_signal_levels_inplace(sig) -> None:
+    """Make signal levels direction-consistent.
+
+    Guards against malformed SHORT/LONG layouts where SL/TP are on the wrong
+    side of entry (for example after market conversion or partial overrides).
+    The function preserves absolute distances from entry and only flips the
+    level orientation to match the signal direction.
+    """
+    try:
+        direction = str(getattr(sig, "direction", "") or getattr(sig, "side", "") or "").upper()
+        entry = float(getattr(sig, "entry", 0.0) or 0.0)
+        sl = float(getattr(sig, "sl", 0.0) or 0.0)
+        tp1 = float(getattr(sig, "tp1", 0.0) or 0.0)
+        tp2 = float(getattr(sig, "tp2", 0.0) or 0.0)
+        if entry <= 0:
+            return
+
+        is_short = ("SHORT" in direction)
+        eps = max(1e-12, abs(entry) * 1e-9)
+
+        def _is_bad_layout() -> bool:
+            if is_short:
+                return ((sl > 0 and sl <= entry + eps) or
+                        (tp1 > 0 and tp1 >= entry - eps) or
+                        (tp2 > 0 and tp2 >= entry - eps))
+            return ((sl > 0 and sl >= entry - eps) or
+                    (tp1 > 0 and tp1 <= entry + eps) or
+                    (tp2 > 0 and tp2 <= entry + eps))
+
+        if not _is_bad_layout():
+            # Still enforce TP ordering if both targets exist.
+            if tp1 > 0 and tp2 > 0:
+                if is_short and tp2 > tp1:
+                    sig.tp1, sig.tp2 = tp2, tp1
+                elif (not is_short) and tp2 < tp1:
+                    sig.tp1, sig.tp2 = tp2, tp1
+            target = float(getattr(sig, "tp2", 0.0) or getattr(sig, "tp1", 0.0) or 0.0)
+            risk = abs(entry - sl)
+            if target > 0 and risk > eps:
+                sig.rr = abs(target - entry) / risk
+            return
+
+        risk = abs(entry - sl) if sl > 0 else 0.0
+        tp1_dist = abs(tp1 - entry) if tp1 > 0 else 0.0
+        tp2_dist = abs(tp2 - entry) if tp2 > 0 else 0.0
+
+        if risk <= eps:
+            # fall back to any available target distance, otherwise leave as-is
+            risk = tp1_dist or tp2_dist
+        if risk <= eps:
+            return
+
+        if tp1_dist <= eps and tp2_dist > eps:
+            tp1_dist = tp2_dist
+        if tp2_dist <= eps and tp1_dist > eps:
+            tp2_dist = tp1_dist
+        if tp1_dist > eps and tp2_dist > eps:
+            near_dist = min(tp1_dist, tp2_dist)
+            far_dist = max(tp1_dist, tp2_dist)
+        else:
+            near_dist = tp1_dist or risk
+            far_dist = tp2_dist or near_dist
+
+        if is_short:
+            sig.sl = entry + risk
+            sig.tp1 = entry - near_dist if near_dist > eps else 0.0
+            sig.tp2 = entry - far_dist if far_dist > eps else 0.0
+        else:
+            sig.sl = entry - risk
+            sig.tp1 = entry + near_dist if near_dist > eps else 0.0
+            sig.tp2 = entry + far_dist if far_dist > eps else 0.0
+
+        target = float(getattr(sig, "tp2", 0.0) or getattr(sig, "tp1", 0.0) or 0.0)
+        if target > 0 and risk > eps:
+            sig.rr = abs(target - entry) / risk
+    except Exception:
+        return
+
 @dataclass
 class Signal:
     # NOTE: All fields have defaults to avoid dataclass ordering issues
@@ -6360,6 +6438,9 @@ class Signal:
     available_exchanges: str = ""
     risk_note: str = ""
     ts: float = 0.0
+
+    def __post_init__(self):
+        _normalize_signal_levels_inplace(self)
 
 @dataclass
 
