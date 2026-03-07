@@ -2556,26 +2556,31 @@ async def broadcast_signal(sig: Signal) -> None:
     _SENT_SIG_CACHE[sig_key] = now
 
     # Assign a globally unique signal_id from DB sequence (survives restarts).
-    # This prevents collisions that cause "already opened" for unrelated signals after container restart.
-    try:
-        sid = await db_store.next_signal_id()
-        sig = replace(sig, signal_id=sid)
-    except Exception as e:
-        # Fallback: derive a stable non-zero signal_id from sig_key so:
-        # - tracking rows (signal_tracks) still exist
-        # - open/close callbacks still work across restarts
-        # This keeps "Signals closed (outcomes)" dashboard functional even if DB sequence is unavailable.
-        logger.error("Failed to allocate signal_id from DB sequence: %s", e)
+    # IMPORTANT:
+    # If rolling symbol cooldown already reserved/inserted signal_tracks,
+    # `sig.signal_id` is already allocated and MUST be kept unchanged.
+    # Re-allocating here would create a *new* signal_id for the same sig_key,
+    # and the later upsert_signal_track(...) would fail on UNIQUE(sig_key).
+    if not int(getattr(sig, "signal_id", 0) or 0):
         try:
-            if not getattr(sig, "signal_id", 0):
-                # Take first 8 bytes of SHA1(sig_raw) -> uint64 -> fit into BIGINT safely.
-                _h = bytes.fromhex(sig_key)[:8]
-                sid2 = int.from_bytes(_h, "big", signed=False)
-                if sid2 == 0:
-                    sid2 = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
-                sig = replace(sig, signal_id=sid2)
-        except Exception:
-            pass
+            sid = await db_store.next_signal_id()
+            sig = replace(sig, signal_id=sid)
+        except Exception as e:
+            # Fallback: derive a stable non-zero signal_id from sig_key so:
+            # - tracking rows (signal_tracks) still exist
+            # - open/close callbacks still work across restarts
+            # This keeps "Signals closed (outcomes)" dashboard functional even if DB sequence is unavailable.
+            logger.error("Failed to allocate signal_id from DB sequence: %s", e)
+            try:
+                if not getattr(sig, "signal_id", 0):
+                    # Take first 8 bytes of SHA1(sig_raw) -> uint64 -> fit into BIGINT safely.
+                    _h = bytes.fromhex(sig_key)[:8]
+                    sid2 = int.from_bytes(_h, "big", signed=False)
+                    if sid2 == 0:
+                        sid2 = int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)
+                    sig = replace(sig, signal_id=sid2)
+            except Exception:
+                pass
     # Save as last live signal for menu buttons
     try:
         LAST_SIGNAL_BY_MARKET["SPOT" if sig.market == "SPOT" else "FUTURES"] = sig
