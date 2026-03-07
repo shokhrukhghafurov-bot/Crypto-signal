@@ -1345,32 +1345,23 @@ async def reserve_signal_track_with_symbol_cooldown(
                     if elapsed_sec < cooldown_sec:
                         remaining_sec = max(0, int(round(cooldown_sec - elapsed_sec)))
                         return False, remaining_sec
-                await conn.execute(
-                    """
-                    INSERT INTO signal_tracks (signal_id, sig_key, market, symbol, side, entry, tp1, tp2, sl, status, opened_at, updated_at)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'ACTIVE', NOW(), NOW())
-                    ON CONFLICT (signal_id)
-                    DO UPDATE SET
-                      sig_key=EXCLUDED.sig_key,
-                      market=EXCLUDED.market,
-                      symbol=EXCLUDED.symbol,
-                      side=EXCLUDED.side,
-                      entry=EXCLUDED.entry,
-                      tp1=EXCLUDED.tp1,
-                      tp2=EXCLUDED.tp2,
-                      sl=EXCLUDED.sl,
-                      updated_at=NOW();
-                    """,
-                    int(signal_id),
-                    str(sig_key or ""),
-                    market,
-                    symbol,
-                    side,
-                    float(entry or 0.0),
-                    (float(tp1) if tp1 is not None else None),
-                    (float(tp2) if tp2 is not None else None),
-                    (float(sl) if sl is not None else None),
+                inserted = await _upsert_signal_track_conn(
+                    conn,
+                    signal_id=int(signal_id),
+                    sig_key=str(sig_key or ""),
+                    market=market,
+                    symbol=symbol,
+                    side=side,
+                    entry=float(entry or 0.0),
+                    tp1=(float(tp1) if tp1 is not None else None),
+                    tp2=(float(tp2) if tp2 is not None else None),
+                    sl=(float(sl) if sl is not None else None),
                 )
+                if not inserted:
+                    logger.info(
+                        "reserve_signal_track_with_symbol_cooldown dedup by sig_key: market=%s symbol=%s signal_id=%s",
+                        market, symbol, int(signal_id),
+                    )
                 return True, None
         except Exception:
             logger.exception('reserve_signal_track_with_symbol_cooldown failed')
@@ -1441,6 +1432,44 @@ async def upsert_signal_track(
         side = "LONG"
     pool = get_pool()
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        inserted = await _upsert_signal_track_conn(
+            conn,
+            signal_id=int(signal_id),
+            sig_key=str(sig_key or ""),
+            market=market,
+            symbol=str(symbol or "").upper(),
+            side=side,
+            entry=float(entry or 0.0),
+            tp1=(float(tp1) if tp1 is not None else None),
+            tp2=(float(tp2) if tp2 is not None else None),
+            sl=(float(sl) if sl is not None else None),
+        )
+        if not inserted:
+            logger.info(
+                "upsert_signal_track dedup by sig_key: market=%s symbol=%s signal_id=%s",
+                market, str(symbol or "").upper(), int(signal_id),
+            )
+
+
+async def _upsert_signal_track_conn(
+    conn,
+    *,
+    signal_id: int,
+    sig_key: str,
+    market: str,
+    symbol: str,
+    side: str,
+    entry: float,
+    tp1: float | None,
+    tp2: float | None,
+    sl: float | None,
+) -> bool:
+    """Insert/update signal_tracks safely.
+
+    Returns True on normal insert/update.
+    Returns False when an existing UNIQUE(sig_key) row was reused as dedup.
+    """
+    try:
         await conn.execute(
             """
             INSERT INTO signal_tracks (signal_id, sig_key, market, symbol, side, entry, tp1, tp2, sl, status, opened_at, updated_at)
@@ -1460,13 +1489,41 @@ async def upsert_signal_track(
             int(signal_id),
             str(sig_key or ""),
             market,
-            str(symbol or "").upper(),
+            symbol,
             side,
             float(entry or 0.0),
             (float(tp1) if tp1 is not None else None),
             (float(tp2) if tp2 is not None else None),
             (float(sl) if sl is not None else None),
         )
+        return True
+    except asyncpg.UniqueViolationError:
+        # Existing row with the same sig_key: treat it as dedup instead of crashing.
+        # Keep opened_at / status history intact; refresh only market fields.
+        await conn.execute(
+            """
+            UPDATE signal_tracks
+            SET market=$3,
+                symbol=$4,
+                side=$5,
+                entry=$6,
+                tp1=$7,
+                tp2=$8,
+                sl=$9,
+                updated_at=NOW()
+            WHERE sig_key=$2;
+            """,
+            int(signal_id),
+            str(sig_key or ""),
+            market,
+            symbol,
+            side,
+            float(entry or 0.0),
+            (float(tp1) if tp1 is not None else None),
+            (float(tp2) if tp2 is not None else None),
+            (float(sl) if sl is not None else None),
+        )
+        return False
 
 
 async def list_open_signal_tracks(*, limit: int = 500) -> List[dict]:
