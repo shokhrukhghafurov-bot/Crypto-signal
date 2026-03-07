@@ -6324,6 +6324,27 @@ async def main() -> None:
                     pass
             return web.json_response({"ok": True, "sent": sent, "total": total})
 
+        async def signal_send_text(request: web.Request) -> web.Response:
+            if not _check_basic(request):
+                return _unauthorized()
+            telegram_id_raw = str(request.match_info.get("telegram_id") or "").strip()
+            try:
+                telegram_id = int(telegram_id_raw)
+            except Exception:
+                return web.json_response({"ok": False, "error": "invalid telegram_id"}, status=400)
+
+            data = await request.json()
+            text = str(data.get("text") or "").strip()
+            if not text:
+                return web.json_response({"ok": False, "error": "text required"}, status=400)
+
+            try:
+                await safe_send(telegram_id, text, ctx="signal-admin-send")
+                return web.json_response({"ok": True, "telegram_id": telegram_id})
+            except Exception as e:
+                logger.exception("signal_send_text failed telegram_id=%s", telegram_id)
+                return web.json_response({"ok": False, "error": str(e)}, status=500)
+
         async def payments_create(request: web.Request) -> web.Response:
             data = await request.json()
             tid = int(data.get('telegram_id') or 0)
