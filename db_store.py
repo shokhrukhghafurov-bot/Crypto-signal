@@ -175,7 +175,63 @@ async def ensure_schema() -> None:
         except Exception:
             pass
 
-# --- Auto-trade global settings (single row) ---
+
+
+        # --- Subscription payments (NOWPayments) ---
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS subscription_orders (
+          order_id TEXT PRIMARY KEY,
+          telegram_id BIGINT NOT NULL,
+          plan TEXT NOT NULL,
+          amount NUMERIC(18,8) NOT NULL,
+          currency TEXT NOT NULL DEFAULT 'USD',
+          provider TEXT NOT NULL DEFAULT 'nowpayments',
+          status TEXT NOT NULL DEFAULT 'pending',
+          provider_payment_id TEXT,
+          pay_currency TEXT,
+          pay_amount NUMERIC(18,8),
+          pay_address TEXT,
+          pay_url TEXT,
+          payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+          txid TEXT,
+          paid_at TIMESTAMPTZ,
+          processed_at TIMESTAMPTZ,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS subscription_payments (
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          order_id TEXT NOT NULL REFERENCES subscription_orders(order_id) ON DELETE CASCADE,
+          telegram_id BIGINT NOT NULL,
+          plan TEXT NOT NULL,
+          amount NUMERIC(18,8) NOT NULL,
+          currency TEXT NOT NULL DEFAULT 'USD',
+          pay_currency TEXT,
+          pay_amount NUMERIC(18,8),
+          provider TEXT NOT NULL DEFAULT 'nowpayments',
+          provider_payment_id TEXT,
+          txid TEXT,
+          status TEXT NOT NULL,
+          payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          paid_at TIMESTAMPTZ
+        );
+        """)
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_subscription_orders_tid ON subscription_orders(telegram_id, created_at DESC);")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_subscription_orders_status ON subscription_orders(status, created_at DESC);")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_subscription_payments_tid ON subscription_payments(telegram_id, created_at DESC);")
+        except Exception:
+            pass
+        try:
+            await conn.execute("CREATE OR REPLACE VIEW orders AS SELECT * FROM subscription_orders;")
+            await conn.execute("CREATE OR REPLACE VIEW payments AS SELECT * FROM subscription_payments;")
+        except Exception:
+            pass
+
+        # --- Auto-trade global settings (single row) ---
         await conn.execute("""
 CREATE TABLE IF NOT EXISTS autotrade_bot_settings (
   id INT PRIMARY KEY CHECK (id = 1),
@@ -3187,3 +3243,160 @@ async def candles_cache_purge(max_age_sec: int) -> int:
         return int(str(res).split()[-1])
     except Exception:
         return 0
+
+
+# ========================
+# Subscription payments
+# ========================
+async def create_subscription_order(*, order_id: str, telegram_id: int, plan: str, amount: float, currency: str = 'USD', provider: str = 'nowpayments') -> None:
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        await conn.execute(
+            """
+            INSERT INTO subscription_orders(order_id, telegram_id, plan, amount, currency, provider, status)
+            VALUES ($1,$2,$3,$4,$5,$6,'pending')
+            ON CONFLICT (order_id) DO UPDATE
+              SET telegram_id=EXCLUDED.telegram_id,
+                  plan=EXCLUDED.plan,
+                  amount=EXCLUDED.amount,
+                  currency=EXCLUDED.currency,
+                  provider=EXCLUDED.provider,
+                  updated_at=NOW();
+            """,
+            str(order_id), int(telegram_id), str(plan), float(amount), str(currency), str(provider),
+        )
+
+async def attach_subscription_invoice(*, order_id: str, provider_payment_id: str | None = None, pay_currency: str | None = None, pay_amount: float | None = None, pay_address: str | None = None, pay_url: str | None = None, payload: dict | None = None) -> None:
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        await conn.execute(
+            """
+            UPDATE subscription_orders
+               SET provider_payment_id=COALESCE($2, provider_payment_id),
+                   pay_currency=COALESCE($3, pay_currency),
+                   pay_amount=COALESCE($4, pay_amount),
+                   pay_address=COALESCE($5, pay_address),
+                   pay_url=COALESCE($6, pay_url),
+                   payload=COALESCE($7::jsonb, payload),
+                   updated_at=NOW()
+             WHERE order_id=$1
+            """,
+            str(order_id),
+            (str(provider_payment_id) if provider_payment_id else None),
+            (str(pay_currency) if pay_currency else None),
+            (float(pay_amount) if pay_amount is not None else None),
+            (str(pay_address) if pay_address else None),
+            (str(pay_url) if pay_url else None),
+            (json.dumps(payload or {}, ensure_ascii=False) if payload is not None else None),
+        )
+
+async def get_subscription_order(order_id: str) -> Optional[Dict[str, Any]]:
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        row = await conn.fetchrow("SELECT * FROM subscription_orders WHERE order_id=$1", str(order_id))
+        return dict(row) if row else None
+
+async def get_subscription_order_by_provider_payment_id(provider_payment_id: str) -> Optional[Dict[str, Any]]:
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        row = await conn.fetchrow("SELECT * FROM subscription_orders WHERE provider_payment_id=$1", str(provider_payment_id))
+        return dict(row) if row else None
+
+async def mark_subscription_order_paid(*, order_id: str, provider_payment_id: str | None = None, status: str = 'finished', txid: str | None = None, pay_currency: str | None = None, pay_amount: float | None = None, payload: dict | None = None) -> bool:
+    """Returns True if this order was processed now, False if already processed or missing."""
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow("SELECT * FROM subscription_orders WHERE order_id=$1 FOR UPDATE", str(order_id))
+            if not row:
+                return False
+            if row.get('processed_at') is not None:
+                return False
+            await conn.execute(
+                """
+                UPDATE subscription_orders
+                   SET provider_payment_id=COALESCE($2, provider_payment_id),
+                       status=$3,
+                       txid=COALESCE($4, txid),
+                       pay_currency=COALESCE($5, pay_currency),
+                       pay_amount=COALESCE($6, pay_amount),
+                       payload=COALESCE($7::jsonb, payload),
+                       paid_at=NOW(),
+                       processed_at=NOW(),
+                       updated_at=NOW()
+                 WHERE order_id=$1
+                """,
+                str(order_id),
+                (str(provider_payment_id) if provider_payment_id else None),
+                str(status),
+                (str(txid) if txid else None),
+                (str(pay_currency) if pay_currency else None),
+                (float(pay_amount) if pay_amount is not None else None),
+                (json.dumps(payload or {}, ensure_ascii=False) if payload is not None else None),
+            )
+            rr = await conn.fetchrow("SELECT telegram_id, plan, amount, currency FROM subscription_orders WHERE order_id=$1", str(order_id))
+            if rr:
+                await conn.execute(
+                    """
+                    INSERT INTO subscription_payments(order_id, telegram_id, plan, amount, currency, pay_currency, pay_amount, provider, provider_payment_id, txid, status, payload, paid_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,'nowpayments',$8,$9,$10,$11::jsonb,NOW())
+                    """,
+                    str(order_id), int(rr['telegram_id']), str(rr['plan']), float(rr['amount']), str(rr['currency']),
+                    (str(pay_currency) if pay_currency else None), (float(pay_amount) if pay_amount is not None else None),
+                    (str(provider_payment_id) if provider_payment_id else None), (str(txid) if txid else None), str(status),
+                    json.dumps(payload or {}, ensure_ascii=False),
+                )
+            return True
+
+async def grant_subscription_plan(telegram_id: int, plan: str, days: int = 30) -> Dict[str, Any]:
+    """Grant SIGNAL PRO / AUTO PRO access. Returns resulting flags."""
+    plan_norm = (plan or '').strip().lower()
+    signal_days = int(days or 30)
+    autotrade_days = int(days or 30)
+    enable_autotrade = plan_norm == 'auto_pro'
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO users(telegram_id, notify_signals, signal_enabled, autotrade_enabled, created_at, updated_at)
+                VALUES ($1, TRUE, FALSE, FALSE, NOW(), NOW())
+                ON CONFLICT (telegram_id) DO NOTHING
+                """,
+                int(telegram_id),
+            )
+            await conn.execute(
+                """
+                UPDATE users
+                   SET signal_enabled=TRUE,
+                       signal_expires_at=GREATEST(COALESCE(signal_expires_at, NOW()), NOW()) + make_interval(days => $2),
+                       autotrade_enabled=CASE WHEN $3 THEN TRUE ELSE FALSE END,
+                       autotrade_stop_after_close=FALSE,
+                       autotrade_expires_at=CASE WHEN $3 THEN GREATEST(COALESCE(autotrade_expires_at, NOW()), NOW()) + make_interval(days => $4) ELSE NULL END,
+                       is_blocked=FALSE,
+                       updated_at=NOW()
+                 WHERE telegram_id=$1
+                """,
+                int(telegram_id), signal_days, bool(enable_autotrade), autotrade_days,
+            )
+            row = await conn.fetchrow("SELECT telegram_id, signal_enabled, signal_expires_at, autotrade_enabled, autotrade_expires_at FROM users WHERE telegram_id=$1", int(telegram_id))
+            return dict(row) if row else {"telegram_id": int(telegram_id)}
+
+async def grant_access(telegram_id: int, plan: str, days: int = 30) -> Dict[str, Any]:
+    """Compatibility alias for the subscription spec."""
+    return await grant_subscription_plan(telegram_id=telegram_id, plan=plan, days=days)
+
+async def list_subscription_payments(*, date_from: Optional[str] = None, date_to: Optional[str] = None) -> List[Dict[str, Any]]:
+    pool = get_pool()
+    where=[]; args=[]
+    if date_from:
+        args.append(date_from)
+        where.append(f"created_at >= ${len(args)}::timestamptz")
+    if date_to:
+        args.append(date_to)
+        where.append(f"created_at < ${len(args)}::timestamptz")
+    where_sql = ('WHERE ' + ' AND '.join(where)) if where else ''
+    q = f"SELECT * FROM subscription_payments {where_sql} ORDER BY created_at DESC"
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        rows = await conn.fetch(q, *args)
+    return [dict(r) for r in rows]
