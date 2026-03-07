@@ -935,6 +935,8 @@ NOWPAYMENTS_API_KEY = (os.getenv("NOWPAYMENTS_API_KEY") or "").strip()
 NOWPAYMENTS_IPN_SECRET = (os.getenv("NOWPAYMENTS_IPN_SECRET") or "").strip()
 NOWPAYMENTS_API_BASE = (os.getenv("NOWPAYMENTS_API_BASE") or "https://api.nowpayments.io/v1").rstrip("/")
 NOWPAYMENTS_PAY_CURRENCY = (os.getenv("NOWPAYMENTS_PAY_CURRENCY") or "usdttrc20").strip().lower()
+NOWPAYMENTS_PRICE_CURRENCY = (os.getenv("NOWPAYMENTS_PRICE_CURRENCY") or NOWPAYMENTS_PAY_CURRENCY or "usdttrc20").strip().lower()
+NOWPAYMENTS_FIXED_RATE = (os.getenv("NOWPAYMENTS_FIXED_RATE") or "true").strip().lower() not in ("0", "false", "no", "off", "")
 APP_BASE_URL = (os.getenv("APP_BASE_URL") or os.getenv("PUBLIC_BASE_URL") or os.getenv("RAILWAY_PUBLIC_DOMAIN") or "").strip()
 if APP_BASE_URL and not APP_BASE_URL.startswith('http'):
     APP_BASE_URL = f"https://{APP_BASE_URL}"
@@ -1390,12 +1392,12 @@ async def _create_nowpayments_invoice(*, telegram_id: int, plan_code: str) -> di
     await db_store.create_subscription_order(order_id=order_id, telegram_id=int(telegram_id), plan=plan_code, amount=float(plan['amount']))
     payload = {
         "price_amount": float(plan['amount']),
-        "price_currency": "usd",
+        "price_currency": NOWPAYMENTS_PRICE_CURRENCY,
         "pay_currency": NOWPAYMENTS_PAY_CURRENCY,
         "order_id": order_id,
         "order_description": f"{plan['slug']} subscription",
         "ipn_callback_url": PAYMENT_WEBHOOK_URL,
-        "is_fixed_rate": False,
+        "is_fixed_rate": NOWPAYMENTS_FIXED_RATE,
         "is_fee_paid_by_user": False,
     }
     headers = {"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"}
@@ -1450,25 +1452,30 @@ def _to_decimal(value) -> Decimal | None:
 
 
 def _webhook_amount_matches(order: dict, event: dict) -> bool:
-    """Accept the payment only when the paid fiat amount is >= expected order amount.
+    """Accept the payment only when the paid amount is >= expected order amount.
 
-    The product spec allows access for exact payment or overpayment (49+ / 69+).
-    Prefer fiat-denominated webhook fields; only consider pay_amount when the pay
-    currency itself is fiat/USD-like to avoid comparing crypto coin amounts to USD.
+    Supports two modes:
+    - USD pricing: compare fiat-denominated values.
+    - Fixed stablecoin pricing (e.g. 49 USDTTRC20): compare coin-denominated values too.
     """
     expected = _to_decimal(order.get('amount'))
     if expected is None:
         return False
 
-    candidates = [
-        event.get('price_amount'),
-        event.get('actually_paid_at_fiat'),
-    ]
-
+    price_currency = str(event.get('price_currency') or '').strip().lower()
     pay_currency = str(event.get('pay_currency') or event.get('actually_paid_currency') or '').strip().lower()
-    if pay_currency in {'usd', 'usdt', 'usdc', 'busd', 'tusd', 'fdusd', 'usdp'}:
-        candidates.append(event.get('pay_amount'))
-        candidates.append(event.get('actually_paid'))
+
+    fiat_like = {'usd', 'usdt', 'usdc', 'busd', 'tusd', 'fdusd', 'usdp'}
+    stable_like_prefixes = ('usdt', 'usdc', 'busd', 'tusd', 'fdusd', 'usdp')
+
+    candidates = [event.get('price_amount'), event.get('actually_paid_at_fiat')]
+
+    # If invoice price itself is exact stablecoin amount (e.g. USDTTRC20), comparing
+    # price_amount/pay_amount to the stored plan amount is valid.
+    if any(price_currency.startswith(x) for x in stable_like_prefixes):
+        candidates.extend([event.get('pay_amount'), event.get('actually_paid')])
+    elif pay_currency in fiat_like or any(pay_currency.startswith(x) for x in stable_like_prefixes):
+        candidates.extend([event.get('pay_amount'), event.get('actually_paid')])
 
     for candidate in candidates:
         current = _to_decimal(candidate)
