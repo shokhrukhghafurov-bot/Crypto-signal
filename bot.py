@@ -26,12 +26,17 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import datetime as dt
 
 import asyncpg
-from aiohttp import web
+from aiohttp import web, ClientSession
 
 import db_store
 
 from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test, mid_summary_heartbeat_loop
 import time
+import hashlib
+import hmac
+import io
+from decimal import Decimal, InvalidOperation
+from openpyxl import Workbook
 
 load_dotenv()
 
@@ -926,6 +931,24 @@ I18N = load_i18n()
 SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', 'cryptoarb_web_bot_admin').lstrip('@')
 
 
+NOWPAYMENTS_API_KEY = (os.getenv("NOWPAYMENTS_API_KEY") or "").strip()
+NOWPAYMENTS_IPN_SECRET = (os.getenv("NOWPAYMENTS_IPN_SECRET") or "").strip()
+NOWPAYMENTS_API_BASE = (os.getenv("NOWPAYMENTS_API_BASE") or "https://api.nowpayments.io/v1").rstrip("/")
+NOWPAYMENTS_PAY_CURRENCY = (os.getenv("NOWPAYMENTS_PAY_CURRENCY") or "usdttrc20").strip().lower()
+APP_BASE_URL = (os.getenv("APP_BASE_URL") or os.getenv("PUBLIC_BASE_URL") or os.getenv("RAILWAY_PUBLIC_DOMAIN") or "").strip()
+if APP_BASE_URL and not APP_BASE_URL.startswith('http'):
+    APP_BASE_URL = f"https://{APP_BASE_URL}"
+if APP_BASE_URL:
+    APP_BASE_URL = APP_BASE_URL.rstrip('/')
+PAYMENT_WEBHOOK_PATH = "/api/payments/webhook"
+PAYMENT_WEBHOOK_URL = (APP_BASE_URL + PAYMENT_WEBHOOK_PATH) if APP_BASE_URL else ""
+SUBSCRIPTION_PLANS = {
+    "signal_pro": {"amount": 49.0, "days": 30, "signal": True, "autotrade": False, "name_key": "plan_signal_pro", "slug": "SIGNAL PRO"},
+    "auto_pro": {"amount": 69.0, "days": 30, "signal": True, "autotrade": True, "name_key": "plan_auto_pro", "slug": "AUTO PRO"},
+}
+
+
+
 
 def tr(uid: int, key: str, **kwargs) -> str:
     """Translate key for user's language.
@@ -1316,6 +1339,160 @@ async def init_db() -> None:
     await db_store.ensure_schema()
     # Users table migrations (signal access columns) live in db_store
     await db_store.ensure_users_columns()
+
+
+
+def subscription_gate_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "btn_buy_sub"), callback_data="sub:buy")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def subscription_plans_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "plan_signal_pro"), callback_data="sub:plan:signal_pro")
+    kb.button(text=tr(uid, "plan_auto_pro"), callback_data="sub:plan:auto_pro")
+    kb.button(text=tr(uid, "btn_back"), callback_data="menu:status")
+    kb.adjust(1, 1, 1)
+    return kb.as_markup()
+
+
+def subscription_pay_kb(uid: int, plan_code: str, pay_url: str) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "btn_open_payment"), url=pay_url)
+    kb.button(text=tr(uid, "btn_back"), callback_data="sub:buy")
+    kb.adjust(1, 1)
+    return kb.as_markup()
+
+
+def _plan_data(plan_code: str):
+    return SUBSCRIPTION_PLANS.get((plan_code or '').strip().lower())
+
+
+def _plan_name(uid: int, plan_code: str) -> str:
+    p = _plan_data(plan_code)
+    if not p:
+        return str(plan_code or '').strip()
+    # Use clean commercial names in user/admin notifications, without emoji/price.
+    return str(p.get('slug') or plan_code).strip()
+
+
+async def _create_nowpayments_invoice(*, telegram_id: int, plan_code: str) -> dict:
+    plan = _plan_data(plan_code)
+    if not plan:
+        raise ValueError('bad_plan')
+    if not NOWPAYMENTS_API_KEY:
+        raise RuntimeError('NOWPAYMENTS_API_KEY not configured')
+    if not PAYMENT_WEBHOOK_URL:
+        raise RuntimeError('APP_BASE_URL / PAYMENT_WEBHOOK_URL not configured')
+    order_id = f"sub_{telegram_id}_{plan_code}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    await db_store.create_subscription_order(order_id=order_id, telegram_id=int(telegram_id), plan=plan_code, amount=float(plan['amount']))
+    payload = {
+        "price_amount": float(plan['amount']),
+        "price_currency": "usd",
+        "pay_currency": NOWPAYMENTS_PAY_CURRENCY,
+        "order_id": order_id,
+        "order_description": f"{plan['slug']} subscription",
+        "ipn_callback_url": PAYMENT_WEBHOOK_URL,
+        "is_fixed_rate": False,
+        "is_fee_paid_by_user": False,
+    }
+    headers = {"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"}
+    data = None
+    async with ClientSession() as session:
+        # Prefer hosted invoice page when available
+        async with session.post(f"{NOWPAYMENTS_API_BASE}/invoice", json=payload, headers=headers, timeout=30) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status >= 400 or not (data.get('invoice_url') or data.get('pay_url') or data.get('payment_url')):
+                # Fallback to payment API
+                async with session.post(f"{NOWPAYMENTS_API_BASE}/payment", json=payload, headers=headers, timeout=30) as resp2:
+                    data = await resp2.json(content_type=None)
+                    if resp2.status >= 400:
+                        raise RuntimeError(f"nowpayments_create_failed:{resp2.status}:{data}")
+    await db_store.attach_subscription_invoice(
+        order_id=order_id,
+        provider_payment_id=str(data.get('payment_id') or ''),
+        pay_currency=data.get('pay_currency'),
+        pay_amount=float(data['pay_amount']) if data.get('pay_amount') is not None else None,
+        pay_address=data.get('pay_address'),
+        pay_url=data.get('invoice_url') or data.get('pay_url') or data.get('payment_url'),
+        payload=data,
+    )
+    data['order_id'] = order_id
+    return data
+
+
+def _verify_nowpayments_signature(raw_body: str, signature: str | None) -> bool:
+    if not NOWPAYMENTS_IPN_SECRET or not signature:
+        return False
+    candidates = []
+    # raw body
+    candidates.append(hmac.new(NOWPAYMENTS_IPN_SECRET.encode(), raw_body.encode(), hashlib.sha512).hexdigest())
+    # canonical json
+    try:
+        obj = json.loads(raw_body)
+        canonical = json.dumps(obj, separators=(",", ":"), sort_keys=True)
+        candidates.append(hmac.new(NOWPAYMENTS_IPN_SECRET.encode(), canonical.encode(), hashlib.sha512).hexdigest())
+    except Exception:
+        pass
+    sig = str(signature).strip().lower()
+    return any(hmac.compare_digest(c.lower(), sig) for c in candidates)
+
+
+def _to_decimal(value) -> Decimal | None:
+    if value in (None, ''):
+        return None
+    try:
+        return Decimal(str(value)).quantize(Decimal('0.01'))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+
+
+def _webhook_amount_matches(order: dict, event: dict) -> bool:
+    """Accept the payment only when the paid fiat amount is >= expected order amount.
+
+    The product spec allows access for exact payment or overpayment (49+ / 69+).
+    Prefer fiat-denominated webhook fields; only consider pay_amount when the pay
+    currency itself is fiat/USD-like to avoid comparing crypto coin amounts to USD.
+    """
+    expected = _to_decimal(order.get('amount'))
+    if expected is None:
+        return False
+
+    candidates = [
+        event.get('price_amount'),
+        event.get('actually_paid_at_fiat'),
+    ]
+
+    pay_currency = str(event.get('pay_currency') or event.get('actually_paid_currency') or '').strip().lower()
+    if pay_currency in {'usd', 'usdt', 'usdc', 'busd', 'tusd', 'fdusd', 'usdp'}:
+        candidates.append(event.get('pay_amount'))
+        candidates.append(event.get('actually_paid'))
+
+    for candidate in candidates:
+        current = _to_decimal(candidate)
+        if current is not None and current >= expected:
+            return True
+    return False
+
+
+async def _grant_paid_plan_and_notify(order: dict, event: dict) -> None:
+    telegram_id = int(order['telegram_id'])
+    plan_code = str(order['plan'])
+    plan = _plan_data(plan_code) or {"days": 30, "amount": order.get('amount') or 0}
+    res = await db_store.grant_subscription_plan(telegram_id, plan_code, int(plan.get('days') or 30))
+    plan_name_ru = _plan_name(telegram_id, plan_code)
+    try:
+        await safe_send(telegram_id, trf(telegram_id, 'payment_paid_user', plan_name=plan_name_ru, amount=int(plan.get('amount') or 0)), reply_markup=menu_kb(telegram_id))
+    except Exception:
+        logger.exception('payment: failed to notify user %s', telegram_id)
+    try:
+        txid = event.get('payin_hash') or event.get('tx_hash') or event.get('payment_id') or '-'
+        admin_text = f"💰 Paid\n\nTelegram ID: {telegram_id}\nPlan: {_plan_name(telegram_id, plan_code)}\nAmount: {order.get('amount')}$\nTXID: {txid}"
+        await safe_send(ADMIN_ALERT_CHAT_ID, admin_text)
+    except Exception:
+        logger.exception('payment: failed to notify admin')
 
 async def ensure_user(user_id: int) -> None:
     if not pool or not user_id:
@@ -2757,13 +2934,43 @@ async def start(message: types.Message) -> None:
     # Shared access control (Postgres)
     access = await get_access_status(uid) if uid else "no_user"
     if access != "ok":
-        await message.answer(tr(uid, f"access_{access}"), reply_markup=menu_kb(uid))
+        await message.answer(tr(uid, f"access_{access}"), reply_markup=subscription_gate_kb(uid))
         return
 
     await message.answer(await status_text(uid, include_subscribed=True, include_hint=True), reply_markup=menu_kb(uid))
 
 
 # ---------------- language selection ----------------
+
+
+@dp.callback_query(lambda c: (c.data or "").startswith("sub:"))
+async def subscription_handler(call: types.CallbackQuery) -> None:
+    await safe_callback_answer(call)
+    uid = call.from_user.id if call.from_user else 0
+    action = (call.data or '').split(':')
+    if len(action) < 2:
+        return
+    subact = action[1]
+    if subact == 'buy':
+        await safe_edit(call.message, tr(uid, 'pricing_text'), subscription_plans_kb(uid))
+        return
+    if subact == 'plan' and len(action) >= 3:
+        plan_code = action[2]
+        plan = _plan_data(plan_code)
+        if not plan:
+            await safe_edit(call.message, tr(uid, 'plan_not_available'), subscription_plans_kb(uid))
+            return
+        try:
+            invoice = await _create_nowpayments_invoice(telegram_id=uid, plan_code=plan_code)
+            pay_url = invoice.get('invoice_url') or invoice.get('pay_url') or invoice.get('payment_url')
+            if not pay_url:
+                raise RuntimeError('missing_pay_url')
+            txt = trf(uid, 'payment_created', plan_name=_plan_name(uid, plan_code), amount=int(plan['amount']))
+            await safe_edit(call.message, txt, subscription_pay_kb(uid, plan_code, pay_url))
+        except Exception:
+            logger.exception('subscription: create payment failed uid=%s plan=%s', uid, plan_code)
+            await safe_edit(call.message, tr(uid, 'payment_error'), subscription_plans_kb(uid))
+        return
 
 @dp.message(Command("autotrade_health"))
 async def cmd_autotrade_health(message: types.Message):
@@ -3192,7 +3399,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
     # Shared access control (Postgres)
     access = await get_access_status(uid) if uid else "no_user"
     if action not in ("status", "notify") and access != "ok":
-        await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+        await safe_edit(call.message, tr(uid, f"access_{access}"), subscription_gate_kb(uid))
         return
 
     # ---- STATUS (main screen) ----
@@ -3208,7 +3415,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         # NOTE: do not auto-unblock user on status view
 
         txt = await status_text(uid, include_subscribed=False, include_hint=False)
-        await safe_edit(call.message, txt, menu_kb(uid))
+        await safe_edit(call.message, txt, menu_kb(uid) if access == "ok" else subscription_gate_kb(uid))
         return
 
 
@@ -5300,6 +5507,9 @@ async def main() -> None:
             else:
                 try:
                     resp = await handler(request)
+                except web.HTTPException as exc:
+                    # Expected HTTP errors (404/405/etc.) should not pollute logs as tracebacks.
+                    resp = exc
                 except Exception:
                     logger.exception("HTTP handler error: %s %s", request.method, request.path_qs)
                     raise
@@ -6114,24 +6324,110 @@ async def main() -> None:
                     pass
             return web.json_response({"ok": True, "sent": sent, "total": total})
 
-        async def signal_send_text(request: web.Request) -> web.Response:
+        async def payments_create(request: web.Request) -> web.Response:
+            data = await request.json()
+            tid = int(data.get('telegram_id') or 0)
+            plan_code = str(data.get('plan') or '').strip().lower()
+            if not tid or plan_code not in SUBSCRIPTION_PLANS:
+                return web.json_response({'ok': False, 'error': 'telegram_id/plan required'}, status=400)
+            try:
+                invoice = await _create_nowpayments_invoice(telegram_id=tid, plan_code=plan_code)
+                return web.json_response({'ok': True, 'invoice': invoice})
+            except Exception as e:
+                logger.exception('payments_create failed')
+                return web.json_response({'ok': False, 'error': str(e)}, status=500)
+
+        async def payments_webhook(request: web.Request) -> web.Response:
+            raw = await request.text()
+            signature = request.headers.get('x-nowpayments-sig') or request.headers.get('X-Nowpayments-Sig')
+            if not _verify_nowpayments_signature(raw, signature):
+                return web.json_response({'ok': False, 'error': 'bad signature'}, status=403)
+            try:
+                data = json.loads(raw or '{}')
+            except Exception:
+                return web.json_response({'ok': False, 'error': 'bad json'}, status=400)
+            status = str(data.get('payment_status') or '').lower()
+            order_id = str(data.get('order_id') or '').strip()
+            provider_payment_id = str(data.get('payment_id') or '').strip() or None
+            if not order_id:
+                return web.json_response({'ok': False, 'error': 'order_id required'}, status=400)
+            if status != 'finished':
+                return web.json_response({'ok': True, 'ignored': True, 'status': status})
+            order = await db_store.get_subscription_order(order_id)
+            if not order and provider_payment_id:
+                order = await db_store.get_subscription_order_by_provider_payment_id(provider_payment_id)
+            if not order:
+                return web.json_response({'ok': False, 'error': 'order not found'}, status=404)
+            if not _webhook_amount_matches(order, data):
+                logger.warning('payments_webhook: amount mismatch for order=%s expected=%s payload_price=%s payload_pay=%s', order.get('order_id'), order.get('amount'), data.get('price_amount'), data.get('pay_amount'))
+                return web.json_response({'ok': False, 'error': 'amount mismatch'}, status=400)
+            processed = await db_store.mark_subscription_order_paid(
+                order_id=str(order['order_id']),
+                provider_payment_id=provider_payment_id,
+                status=status,
+                txid=(data.get('payin_hash') or data.get('tx_hash') or None),
+                pay_currency=(data.get('pay_currency') or data.get('actually_paid_currency') or None),
+                pay_amount=(float(data['pay_amount']) if data.get('pay_amount') not in (None, '') else None),
+                payload=data,
+            )
+            if processed:
+                await _grant_paid_plan_and_notify(order, data)
+            return web.json_response({'ok': True, 'processed': bool(processed)})
+
+        async def payments_export_xlsx(request: web.Request) -> web.StreamResponse:
             if not _check_basic(request):
                 return _unauthorized()
-            tid = int(request.match_info.get("telegram_id") or 0)
-            if not tid:
-                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-            data = await request.json()
-            text = str(data.get("text") or "").strip()
-            if not text:
-                return web.json_response({"ok": False, "error": "text required"}, status=400)
-            try:
-                await safe_send(tid, text)
-            except Exception as e:
-                return web.json_response({"ok": False, "error": str(e)}, status=500)
-            return web.json_response({"ok": True})
-
+            rows = await db_store.list_subscription_payments()
+            wb = Workbook()
+            ws = wb.active
+            ws.title = 'Payments'
+            ws.append(['Date','Telegram ID','Plan','Amount','Currency','Pay Currency','Status','TXID','Order ID'])
+            revenue = 0.0
+            users = set()
+            signal_users = set()
+            auto_users = set()
+            for r in rows:
+                paid_at = r.get('paid_at') or r.get('created_at')
+                dtv = paid_at.isoformat() if hasattr(paid_at,'isoformat') else str(paid_at or '')
+                ws.append([
+                    dtv,
+                    int(r.get('telegram_id') or 0),
+                    r.get('plan') or '',
+                    float(r.get('amount') or 0),
+                    r.get('currency') or '',
+                    r.get('pay_currency') or '',
+                    r.get('status') or '',
+                    r.get('txid') or '',
+                    r.get('order_id') or '',
+                ])
+                revenue += float(r.get('amount') or 0)
+                tid = int(r.get('telegram_id') or 0)
+                if tid:
+                    users.add(tid)
+                    if str(r.get('plan')) == 'signal_pro':
+                        signal_users.add(tid)
+                    if str(r.get('plan')) == 'auto_pro':
+                        auto_users.add(tid)
+            ws2 = wb.create_sheet('Statistics')
+            ws2.append(['Metric','Value'])
+            ws2.append(['TOTAL REVENUE', revenue])
+            ws2.append(['TOTAL USERS', len(users)])
+            ws2.append(['SIGNAL PRO USERS', len(signal_users)])
+            ws2.append(['AUTO PRO USERS', len(auto_users)])
+            buf = io.BytesIO()
+            wb.save(buf)
+            buf.seek(0)
+            return web.Response(
+                body=buf.getvalue(),
+                headers={
+                    'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    'Content-Disposition': 'attachment; filename="payments.xlsx"',
+                },
+            )
 
         # Routes
+        # Root endpoints for reverse-proxy / uptime checks.
+        app.router.add_route("GET", "/", health)
         app.router.add_route("GET", "/health", health)
         app.router.add_route("GET", "/api/infra/admin/bot/users", bot_list_users)
         app.router.add_route("POST", "/api/infra/admin/bot/users", bot_create_user)
@@ -6143,6 +6439,9 @@ async def main() -> None:
         app.router.add_route("POST", "/api/infra/admin/autotrade/settings", autotrade_save_settings)
         app.router.add_route("POST", "/api/infra/admin/signal/broadcast", signal_broadcast_text)
         app.router.add_route("POST", "/api/infra/admin/signal/send/{telegram_id}", signal_send_text)
+        app.router.add_route("POST", "/api/payments/create", payments_create)
+        app.router.add_route("POST", PAYMENT_WEBHOOK_PATH, payments_webhook)
+        app.router.add_route("GET", "/api/infra/admin/signal/payments/export.xlsx", payments_export_xlsx)
         app.router.add_route("GET", "/api/infra/admin/signal/stats", signal_stats)
         app.router.add_route("GET", "/api/infra/admin/signal/users", list_users)
         app.router.add_route("POST", "/api/infra/admin/signal/users", save_user)
@@ -6163,6 +6462,7 @@ async def main() -> None:
                 pass
 
         for _m, _p, _h in [
+            ("GET", "/", health),
             ("GET", "/health", health),
 
             ("GET", "/api/infra/admin/bot/users", bot_list_users),
@@ -6183,6 +6483,7 @@ async def main() -> None:
 
             ("POST", "/api/infra/admin/signal/broadcast", signal_broadcast_text),
             ("POST", "/api/infra/admin/signal/send/{telegram_id}", signal_send_text),
+            ("GET", "/api/infra/admin/signal/payments/export.xlsx", payments_export_xlsx),
         ]:
             _alias(_m, _p, _h)
 
