@@ -311,6 +311,13 @@ async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
                     raise
         raise
 
+
+async def safe_send_nonempty(chat_id: int, text: str, *, ctx: str = "", **kwargs):
+    text = (text or "").strip()
+    if not text:
+        return None
+    return await safe_send(chat_id, text, ctx=ctx, **kwargs)
+
 async def safe_edit_text(chat_id: int, message_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
     return await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, **kwargs)
@@ -3663,7 +3670,7 @@ async def notify_handler(call: types.CallbackQuery) -> None:
     # shared access check (same as menu)
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}"), menu_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
         return
 
     if action == "back":
@@ -3791,7 +3798,7 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
         # Shared access control
         access = await get_access_status(uid)
         if access != "ok":
-            await safe_edit(call.message, tr_sub(uid, f"access_{access}"), menu_kb(uid))
+            await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
             return
 
         gt = _autotrade_gate_text(uid)
@@ -3932,7 +3939,7 @@ async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
 
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}"), menu_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
         return
 
     gt = _autotrade_gate_text(uid)
@@ -4031,7 +4038,7 @@ async def autotrade_stats_callback(call: types.CallbackQuery) -> None:
 
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}"), menu_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
         return
 
     state = AUTOTRADE_STATS_STATE.setdefault(uid, {"market_type": "all", "period": "today"})
@@ -4068,7 +4075,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
             # Access check
             access = await get_access_status(uid)
             if access != "ok":
-                await message.answer(tr_sub(uid, f"access_{access}"), reply_markup=menu_kb(uid))
+                await safe_send_nonempty(uid, tr_sub(uid, f"access_{access}"), reply_markup=menu_kb(uid))
                 return
 
             text = (message.text or "").strip()
@@ -4181,7 +4188,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
         access = await get_access_status(uid)
         if access != "ok":
             AUTOTRADE_INPUT.pop(uid, None)
-            await message.answer(tr_sub(uid, f"access_{access}"), reply_markup=menu_kb(uid))
+            await safe_send_nonempty(uid, tr_sub(uid, f"access_{access}"), reply_markup=menu_kb(uid))
             return
 
         text = (message.text or "").strip()
