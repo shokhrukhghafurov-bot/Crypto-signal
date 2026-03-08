@@ -743,6 +743,7 @@ import logging
 import db_store
 
 from cryptography.fernet import Fernet
+from autotrade_master_key import get_autotrade_master_key
 
 logger = logging.getLogger("crypto-signal")
 
@@ -2370,10 +2371,7 @@ async def validate_autotrade_keys(
 
 
 def _autotrade_fernet() -> Fernet:
-    k = (os.getenv("AUTOTRADE_MASTER_KEY") or "").strip()
-    if not k:
-        raise RuntimeError("AUTOTRADE_MASTER_KEY env is missing")
-    return Fernet(k.encode("utf-8"))
+    return Fernet(get_autotrade_master_key().encode("utf-8"))
 
 
 def _decrypt_token(token: str | None) -> str:
