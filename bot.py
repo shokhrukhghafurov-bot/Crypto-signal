@@ -261,6 +261,9 @@ def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
 
 async def safe_send(chat_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
+    if not (text or "").strip():
+        logger.warning("safe_send: skip empty text chat_id=%s ctx=%s", chat_id, ctx)
+        return None
     # Never recurse. Send via bot API.
     try:
         return await bot.send_message(chat_id, text, **kwargs)
@@ -320,6 +323,9 @@ async def safe_send_nonempty(chat_id: int, text: str, *, ctx: str = "", **kwargs
 
 async def safe_send_payment_alert(chat_id: int, text: str, *, ctx: str = "payment_alert", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
+    if not (text or "").strip():
+        logger.warning("[payment-alert] skip empty text ctx=%s chat_id=%s", ctx, chat_id)
+        return None
     if _payment_bot is None:
         logger.error("[payment-alert] PAYMENT_BOT_TOKEN is missing or invalid; skip sending ctx=%s chat_id=%s", ctx, chat_id)
         return None
@@ -331,6 +337,9 @@ async def safe_send_payment_alert(chat_id: int, text: str, *, ctx: str = "paymen
 
 async def safe_edit_text(chat_id: int, message_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
+    if not (text or "").strip():
+        logger.warning("safe_edit_text: skip empty text chat_id=%s message_id=%s ctx=%s", chat_id, message_id, ctx)
+        return None
     return await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, **kwargs)
 
 
@@ -1220,6 +1229,11 @@ async def _send_long(chat_id: int, text: str, reply_markup=None, *, parse_mode: 
     """
     max_len = 3800
 
+    text = _sanitize_template_text(chat_id, text, ctx="send_long")
+    if not (text or "").strip():
+        logger.warning("_send_long: skip empty text chat_id=%s", chat_id)
+        return
+
     # Keep parse_mode only for short messages; long messages go as plain text chunks.
     use_parse_mode = parse_mode if (parse_mode and len(text) <= max_len) else None
 
@@ -1258,6 +1272,10 @@ async def _send_long(chat_id: int, text: str, reply_markup=None, *, parse_mode: 
 
 async def safe_edit_old(message: types.Message | None, txt: str, kb: types.InlineKeyboardMarkup) -> None:
     """Edit message text if possible; otherwise send a new message."""
+    txt = _sanitize_template_text(message.chat.id if message else 0, txt, ctx="safe_edit_old")
+    if not (txt or "").strip():
+        logger.warning("safe_edit_old: skip empty text chat_id=%s", message.chat.id if message else None)
+        return
     try:
         if message:
             await bot.edit_message_text(
@@ -1280,6 +1298,10 @@ async def safe_edit_old(message: types.Message | None, txt: str, kb: types.Inlin
 
 async def _render_in_place(call: types.CallbackQuery, txt: str, kb: types.InlineKeyboardMarkup) -> types.Message:
     """Prefer editing the message that contains the pressed button."""
+    txt = _sanitize_template_text(call.from_user.id if getattr(call, "from_user", None) else 0, txt, ctx="render_in_place")
+    if not (txt or "").strip():
+        logger.warning("_render_in_place: skip empty text uid=%s", call.from_user.id if getattr(call, "from_user", None) else None)
+        return call.message
     try:
         if call.message:
             await bot.edit_message_text(chat_id=call.from_user.id, message_id=call.message.message_id, text=txt, reply_markup=kb)
@@ -1304,11 +1326,15 @@ async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKe
 
     chat_id = message.chat.id
     msg_id = message.message_id
+    text = _sanitize_template_text(chat_id, text, ctx="safe_edit")
+    if not (text or "").strip():
+        logger.warning("safe_edit: skip empty text chat_id=%s message_id=%s", chat_id, msg_id)
+        return
 
     def _split_text(s: str, limit: int = 3900) -> list[str]:
         s = s or ""
         if len(s) <= limit:
-            return [s]
+            return [s] if s.strip() else []
         out: list[str] = []
         buf: list[str] = []
         cur = 0
