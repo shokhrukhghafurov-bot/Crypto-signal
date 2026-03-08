@@ -1461,21 +1461,10 @@ async def init_db() -> None:
 
 
 def subscription_gate_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
-    """Keyboard for expired users: ONLY buy subscription button."""
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(uid, "btn_buy_sub"), callback_data="sub:buy")
     kb.adjust(1)
     return kb.as_markup()
-
-
-def subscription_gate_text(uid: int) -> str:
-    txt = tr_sub(uid, "access_expired")
-    return txt or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить."
-
-
-
-async def render_subscription_gate(message: types.Message | None, uid: int) -> None:
-    await safe_edit(message, subscription_gate_text(uid), subscription_gate_kb(uid))
 
 
 def subscription_plans_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
@@ -3558,8 +3547,8 @@ async def menu_handler(call: types.CallbackQuery) -> None:
 
     # Shared access control (Postgres)
     access = await get_access_status(uid) if uid else "no_user"
-    if access != "ok":
-        await render_subscription_gate(call.message, uid)
+    if action not in ("status", "notify") and access != "ok":
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}"), subscription_gate_kb(uid))
         return
 
     # ---- STATUS (main screen) ----
@@ -3574,7 +3563,8 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         await ensure_user(uid)
         # NOTE: do not auto-unblock user on status view
 
-        await render_subscription_gate(call.message, uid)
+        txt = await status_text(uid, include_subscribed=False, include_hint=False)
+        await safe_edit(call.message, txt, menu_kb(uid) if access == "ok" else subscription_gate_kb(uid))
         return
 
 
@@ -4137,7 +4127,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
             # Access check
             access = await get_access_status(uid)
             if access != "ok":
-                await safe_send_nonempty(uid, subscription_gate_text(uid), reply_markup=subscription_gate_kb(uid))
+                await safe_send_nonempty(uid, tr_sub(uid, f"access_{access}"), reply_markup=menu_kb(uid))
                 return
 
             text = (message.text or "").strip()
@@ -4250,7 +4240,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
         access = await get_access_status(uid)
         if access != "ok":
             AUTOTRADE_INPUT.pop(uid, None)
-            await safe_send_nonempty(uid, subscription_gate_text(uid), reply_markup=subscription_gate_kb(uid))
+            await safe_send_nonempty(uid, tr_sub(uid, f"access_{access}"), reply_markup=menu_kb(uid))
             return
 
         text = (message.text or "").strip()
@@ -4564,11 +4554,6 @@ async def autotrade_input_handler(message: types.Message) -> None:
 @dp.callback_query(lambda c: (c.data or "").startswith("trades:page:"))
 async def trades_page(call: types.CallbackQuery) -> None:
     await safe_callback_answer(call, )
-    uid = call.from_user.id if call.from_user else 0
-    access = await get_access_status(uid) if uid else "no_user"
-    if access != "ok":
-        await render_subscription_gate(call.message, uid)
-        return
     try:
         offset = int((call.data or "").split(":")[-1])
     except Exception:
