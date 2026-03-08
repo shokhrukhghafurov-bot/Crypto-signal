@@ -3547,8 +3547,14 @@ async def menu_handler(call: types.CallbackQuery) -> None:
 
     # Shared access control (Postgres)
     access = await get_access_status(uid) if uid else "no_user"
-    if action not in ("status", "notify") and access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}"), subscription_gate_kb(uid))
+    if access != "ok":
+        await safe_edit(
+            call.message,
+            tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.
+
+Купите подписку, чтобы продолжить.",
+            subscription_gate_kb(uid)
+        )
         return
 
     # ---- STATUS (main screen) ----
@@ -3722,7 +3728,7 @@ async def notify_handler(call: types.CallbackQuery) -> None:
     # shared access check (same as menu)
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
         return
 
     if action == "back":
@@ -3850,7 +3856,7 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
         # Shared access control
         access = await get_access_status(uid)
         if access != "ok":
-            await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
+            await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
             return
 
         gt = _autotrade_gate_text(uid)
@@ -3991,7 +3997,7 @@ async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
 
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
         return
 
     gt = _autotrade_gate_text(uid)
@@ -4090,7 +4096,7 @@ async def autotrade_stats_callback(call: types.CallbackQuery) -> None:
 
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
         return
 
     state = AUTOTRADE_STATS_STATE.setdefault(uid, {"market_type": "all", "period": "today"})
@@ -4127,7 +4133,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
             # Access check
             access = await get_access_status(uid)
             if access != "ok":
-                await safe_send_nonempty(uid, tr_sub(uid, f"access_{access}"), reply_markup=subscription_gate_kb(uid))
+                await safe_send_nonempty(uid, tr_sub(uid, f"access_{access}"), reply_markup=menu_kb(uid))
                 return
 
             text = (message.text or "").strip()
@@ -4240,7 +4246,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
         access = await get_access_status(uid)
         if access != "ok":
             AUTOTRADE_INPUT.pop(uid, None)
-            await safe_send_nonempty(uid, tr_sub(uid, f"access_{access}"), reply_markup=subscription_gate_kb(uid))
+            await safe_send_nonempty(uid, tr_sub(uid, f"access_{access}"), reply_markup=menu_kb(uid))
             return
 
         text = (message.text or "").strip()
@@ -4775,6 +4781,18 @@ def _trade_card_kb(uid: int, trade_id: int, back_offset: int = 0) -> types.Inlin
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:view:"))
 async def trade_view(call: types.CallbackQuery) -> None:
     await safe_callback_answer(call, )
+    uid = call.from_user.id if call.from_user else 0
+    if not uid:
+        return
+
+    access = await get_access_status(uid)
+    if access != "ok":
+        await safe_send(
+            uid,
+            tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.",
+            reply_markup=subscription_gate_kb(uid)
+        )
+        return
     parts = (call.data or "").split(":")
     try:
         trade_id = int(parts[2])
@@ -4795,6 +4813,18 @@ async def trade_view(call: types.CallbackQuery) -> None:
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:refresh:"))
 async def trade_refresh(call: types.CallbackQuery) -> None:
     await safe_callback_answer(call, )
+    uid = call.from_user.id if call.from_user else 0
+    if not uid:
+        return
+
+    access = await get_access_status(uid)
+    if access != "ok":
+        await safe_send(
+            uid,
+            tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.",
+            reply_markup=subscription_gate_kb(uid)
+        )
+        return
     parts = (call.data or "").split(":")
     try:
         trade_id = int(parts[2])
@@ -4813,6 +4843,18 @@ async def trade_refresh(call: types.CallbackQuery) -> None:
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:close:"))
 async def trade_close(call: types.CallbackQuery) -> None:
     await safe_callback_answer(call, )
+    uid = call.from_user.id if call.from_user else 0
+    if not uid:
+        return
+
+    access = await get_access_status(uid)
+    if access != "ok":
+        await safe_send(
+            uid,
+            tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.",
+            reply_markup=subscription_gate_kb(uid)
+        )
+        return
     parts = (call.data or "").split(":")
     try:
         trade_id = int(parts[2])
@@ -4832,6 +4874,18 @@ async def trade_close(call: types.CallbackQuery) -> None:
 @dp.callback_query(lambda c: (c.data or "").startswith("trade:orig:"))
 async def trade_orig(call: types.CallbackQuery) -> None:
     await safe_callback_answer(call, )
+    uid = call.from_user.id if call.from_user else 0
+    if not uid:
+        return
+
+    access = await get_access_status(uid)
+    if access != "ok":
+        await safe_send(
+            uid,
+            tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.",
+            reply_markup=subscription_gate_kb(uid)
+        )
+        return
     parts = (call.data or "").split(":")
     try:
         trade_id = int(parts[2])
