@@ -791,32 +791,18 @@ def _read_autotrade_master_key_raw() -> str:
 
 
 
-
-def _coerce_fernet_key(raw_key: str) -> str:
-    """Accept either a real Fernet key or any non-empty secret string.
-
-    Railway / users often set AUTOTRADE_MASTER_KEY to a plain secret instead of a
-    Fernet-compatible base64 key. To avoid false "missing" errors, we deterministically
-    derive a valid Fernet key from arbitrary secret material.
-    """
-    key = (raw_key or "").strip()
-    if not key:
-        return ""
-    try:
-        Fernet(key.encode("utf-8"))
-        return key
-    except Exception:
-        digest = hashlib.sha256(key.encode("utf-8")).digest()
-        return base64.urlsafe_b64encode(digest).decode("utf-8")
-
 def get_autotrade_master_key() -> str:
-    """Read AUTOTRADE_MASTER_KEY from environment/.env and normalize it for Fernet."""
-    raw_key = (_read_autotrade_master_key_raw() or "").strip()
-    if not raw_key:
+    """Read and validate AUTOTRADE_MASTER_KEY from environment/.env only."""
+    key = (_read_autotrade_master_key_raw() or "").strip()
+    if not key:
         raise RuntimeError(
             "AUTOTRADE_MASTER_KEY is missing. Add AUTOTRADE_MASTER_KEY=... to your .env file."
         )
-    return _coerce_fernet_key(raw_key)
+    try:
+        Fernet(key.encode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"AUTOTRADE_MASTER_KEY is invalid: {e}") from e
+    return key
 
 logger = logging.getLogger("crypto-signal")
 
@@ -2444,7 +2430,10 @@ async def validate_autotrade_keys(
 
 
 def _autotrade_fernet() -> Fernet:
-    k = get_autotrade_master_key()
+    try:
+        k = get_autotrade_master_key()
+    except Exception as e:
+        raise RuntimeError(f"AUTOTRADE_MASTER_KEY invalid: {e}") from e
     return Fernet(k.encode("utf-8"))
 
 
