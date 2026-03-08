@@ -10,6 +10,9 @@ import os
 import re
 import time
 import contextvars
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # =======================
 # Trap log toggle
