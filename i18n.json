@@ -1,6 +1,6 @@
 {
   "en": {
-    "access_blocked": "⛔️ Access blocked.\n\nPlease buy a subscription to continue.",
+    "access_blocked": "",
     "access_disabled": "🚫 Access is disabled. Please contact support @{support}.",
     "access_expired": "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.",
     "access_maintenance": "🚧 Maintenance in progress. Bot is temporarily unavailable.",
