@@ -22,6 +22,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from dotenv import load_dotenv
+load_dotenv()
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import datetime as dt
 
@@ -37,8 +38,6 @@ import hmac
 import io
 from decimal import Decimal, InvalidOperation
 from openpyxl import Workbook
-
-load_dotenv()
 
 # --- time parsing helpers ---
 def _parse_iso_dt(v):
