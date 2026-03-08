@@ -1461,6 +1461,7 @@ async def init_db() -> None:
 
 
 def subscription_gate_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
+    """Keyboard for expired/blocked users: keep menu visible, but all buttons stay inside the gate."""
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(uid, "btn_buy_sub"), callback_data="sub:buy")
     kb.button(text=tr(uid, "m_status"), callback_data="menu:status")
@@ -1474,6 +1475,17 @@ def subscription_gate_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     kb.button(text=tr(uid, "m_notify"), callback_data="menu:notify")
     kb.adjust(1, 2, 2, 2, 1)
     return kb.as_markup()
+
+
+def subscription_gate_text(uid: int) -> str:
+    txt = tr_sub(uid, "access_expired")
+    return txt or "⏰ Срок доступа истёк.
+
+Купите подписку, чтобы продолжить."
+
+
+async def render_subscription_gate(message: types.Message | None, uid: int) -> None:
+    await safe_edit(message, subscription_gate_text(uid), subscription_gate_kb(uid))
 
 
 def subscription_plans_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
@@ -3557,7 +3569,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
     # Shared access control (Postgres)
     access = await get_access_status(uid) if uid else "no_user"
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}"), subscription_gate_kb(uid))
+        await render_subscription_gate(call.message, uid)
         return
 
     # ---- STATUS (main screen) ----
@@ -3572,8 +3584,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
         await ensure_user(uid)
         # NOTE: do not auto-unblock user on status view
 
-        txt = await status_text(uid, include_subscribed=False, include_hint=False)
-        await safe_edit(call.message, txt, menu_kb(uid) if access == "ok" else subscription_gate_kb(uid))
+        await render_subscription_gate(call.message, uid)
         return
 
 
@@ -3731,12 +3742,12 @@ async def notify_handler(call: types.CallbackQuery) -> None:
     # shared access check (same as menu)
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
         return
 
     if action == "back":
         # Return to main menu (do not delete messages)
-        await safe_edit(call.message, await status_text(uid, include_subscribed=True, include_hint=True), subscription_gate_kb(uid))
+        await safe_edit(call.message, await status_text(uid, include_subscribed=True, include_hint=True), menu_kb(uid))
         return
 
     if action == "set":
@@ -3800,7 +3811,7 @@ async def notify_handler(call: types.CallbackQuery) -> None:
             txt = tr(uid, "stats_error") if ("stats_error" in I18N.get(get_lang(uid), {})) else ("Ошибка статистики. Попробуй позже.")
             if _is_admin(uid):
                 txt += f"\n\nERR: {type(e).__name__}: {e}"
-        await safe_edit(call.message, txt, subscription_gate_kb(uid))
+        await safe_edit(call.message, txt, menu_kb(uid))
         return
 
     if action == "back":
@@ -4000,7 +4011,7 @@ async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
 
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
         return
 
     gt = _autotrade_gate_text(uid)
@@ -4099,7 +4110,7 @@ async def autotrade_stats_callback(call: types.CallbackQuery) -> None:
 
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
         return
 
     state = AUTOTRADE_STATS_STATE.setdefault(uid, {"market_type": "all", "period": "today"})
@@ -4136,7 +4147,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
             # Access check
             access = await get_access_status(uid)
             if access != "ok":
-                await safe_send_nonempty(uid, tr_sub(uid, f"access_{access}"), reply_markup=menu_kb(uid))
+                await safe_send_nonempty(uid, subscription_gate_text(uid), reply_markup=subscription_gate_kb(uid))
                 return
 
             text = (message.text or "").strip()
@@ -4249,7 +4260,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
         access = await get_access_status(uid)
         if access != "ok":
             AUTOTRADE_INPUT.pop(uid, None)
-            await safe_send_nonempty(uid, tr_sub(uid, f"access_{access}"), reply_markup=menu_kb(uid))
+            await safe_send_nonempty(uid, subscription_gate_text(uid), reply_markup=subscription_gate_kb(uid))
             return
 
         text = (message.text or "").strip()
@@ -4563,6 +4574,11 @@ async def autotrade_input_handler(message: types.Message) -> None:
 @dp.callback_query(lambda c: (c.data or "").startswith("trades:page:"))
 async def trades_page(call: types.CallbackQuery) -> None:
     await safe_callback_answer(call, )
+    uid = call.from_user.id if call.from_user else 0
+    access = await get_access_status(uid) if uid else "no_user"
+    if access != "ok":
+        await render_subscription_gate(call.message, uid)
+        return
     try:
         offset = int((call.data or "").split(":")[-1])
     except Exception:
