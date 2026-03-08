@@ -944,9 +944,27 @@ if APP_BASE_URL:
     APP_BASE_URL = APP_BASE_URL.rstrip('/')
 PAYMENT_WEBHOOK_PATH = "/api/payments/webhook"
 PAYMENT_WEBHOOK_URL = (APP_BASE_URL + PAYMENT_WEBHOOK_PATH) if APP_BASE_URL else ""
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(str(os.getenv(name, default)).replace(",", ".").strip())
+    except Exception:
+        return float(default)
+
+
+def _fmt_money(v: float | int | str) -> str:
+    try:
+        n = float(v)
+    except Exception:
+        return str(v)
+    return str(int(n)) if n.is_integer() else (f"{n:.2f}".rstrip("0").rstrip("."))
+
+
+SUBSCRIPTION_DURATION_DAYS = max(1, int(_env_float("SUBSCRIPTION_DURATION_DAYS", 30)))
+SIGNAL_PRO_PRICE = _env_float("SIGNAL_PRO_PRICE", _env_float("PRICE_SIGNAL_PRO_USDT", 49.0))
+AUTO_PRO_PRICE = _env_float("AUTO_PRO_PRICE", _env_float("PRICE_AUTO_PRO_USDT", 69.0))
 SUBSCRIPTION_PLANS = {
-    "signal_pro": {"amount": 49.0, "days": 30, "signal": True, "autotrade": False, "name_key": "plan_signal_pro", "slug": "SIGNAL PRO"},
-    "auto_pro": {"amount": 69.0, "days": 30, "signal": True, "autotrade": True, "name_key": "plan_auto_pro", "slug": "AUTO PRO"},
+    "signal_pro": {"amount": SIGNAL_PRO_PRICE, "days": SUBSCRIPTION_DURATION_DAYS, "signal": True, "autotrade": False, "name_key": "plan_signal_pro", "slug": "SIGNAL PRO"},
+    "auto_pro": {"amount": AUTO_PRO_PRICE, "days": SUBSCRIPTION_DURATION_DAYS, "signal": True, "autotrade": True, "name_key": "plan_auto_pro", "slug": "AUTO PRO"},
 }
 
 
@@ -1353,8 +1371,8 @@ def subscription_gate_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
 
 def subscription_plans_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text=tr(uid, "plan_signal_pro"), callback_data="sub:plan:signal_pro")
-    kb.button(text=tr(uid, "plan_auto_pro"), callback_data="sub:plan:auto_pro")
+    kb.button(text=tr_sub(uid, "plan_signal_pro"), callback_data="sub:plan:signal_pro")
+    kb.button(text=tr_sub(uid, "plan_auto_pro"), callback_data="sub:plan:auto_pro")
     kb.button(text=tr(uid, "btn_back"), callback_data="menu:status")
     kb.adjust(1, 1, 1)
     return kb.as_markup()
@@ -1378,6 +1396,23 @@ def _plan_name(uid: int, plan_code: str) -> str:
         return str(plan_code or '').strip()
     # Use clean commercial names in user/admin notifications, without emoji/price.
     return str(p.get('slug') or plan_code).strip()
+
+
+def _subscription_i18n_ctx() -> dict:
+    signal_plan = _plan_data("signal_pro") or {}
+    auto_plan = _plan_data("auto_pro") or {}
+    return {
+        "signal_price": _fmt_money(signal_plan.get("amount", 0)),
+        "auto_price": _fmt_money(auto_plan.get("amount", 0)),
+        "signal_days": int(signal_plan.get("days") or SUBSCRIPTION_DURATION_DAYS),
+        "auto_days": int(auto_plan.get("days") or SUBSCRIPTION_DURATION_DAYS),
+    }
+
+
+def tr_sub(uid: int, key: str, **kwargs) -> str:
+    ctx = _subscription_i18n_ctx()
+    ctx.update(kwargs)
+    return trf(uid, key, **ctx)
 
 
 async def _create_nowpayments_invoice(*, telegram_id: int, plan_code: str) -> dict:
@@ -1491,12 +1526,12 @@ async def _grant_paid_plan_and_notify(order: dict, event: dict) -> None:
     res = await db_store.grant_subscription_plan(telegram_id, plan_code, int(plan.get('days') or 30))
     plan_name_ru = _plan_name(telegram_id, plan_code)
     try:
-        await safe_send(telegram_id, trf(telegram_id, 'payment_paid_user', plan_name=plan_name_ru, amount=int(plan.get('amount') or 0)), reply_markup=menu_kb(telegram_id))
+        await safe_send(telegram_id, tr_sub(telegram_id, 'payment_paid_user', plan_name=plan_name_ru, amount=_fmt_money(plan.get('amount') or 0), days=int(plan.get('days') or SUBSCRIPTION_DURATION_DAYS)), reply_markup=menu_kb(telegram_id))
     except Exception:
         logger.exception('payment: failed to notify user %s', telegram_id)
     try:
         txid = event.get('payin_hash') or event.get('tx_hash') or event.get('payment_id') or '-'
-        admin_text = f"💰 Paid\n\nTelegram ID: {telegram_id}\nPlan: {_plan_name(telegram_id, plan_code)}\nAmount: {order.get('amount')}$\nTXID: {txid}"
+        admin_text = f"💰 Paid\n\nTelegram ID: {telegram_id}\nPlan: {_plan_name(telegram_id, plan_code)}\nAmount: {_fmt_money(order.get('amount') or 0)} {NOWPAYMENTS_PRICE_CURRENCY.upper()}\nTXID: {txid}"
         await safe_send(ADMIN_ALERT_CHAT_ID, admin_text)
     except Exception:
         logger.exception('payment: failed to notify admin')
@@ -1879,9 +1914,9 @@ async def _autotrade_unavailable_text(uid: int) -> str:
     if st == "ok":
         return ""
     if st == "blocked":
-        return tr(uid, "access_blocked")
+        return tr_sub(uid, "access_blocked")
     if st == "expired":
-        return tr(uid, "at_unavailable_expired")
+        return tr_sub(uid, "at_unavailable_expired")
     return tr(uid, "at_unavailable")
 
 async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str, error_text: str) -> None:
@@ -2941,7 +2976,7 @@ async def start(message: types.Message) -> None:
     # Shared access control (Postgres)
     access = await get_access_status(uid) if uid else "no_user"
     if access != "ok":
-        await message.answer(tr(uid, f"access_{access}"), reply_markup=subscription_gate_kb(uid))
+        await message.answer(tr_sub(uid, f"access_{access}"), reply_markup=subscription_gate_kb(uid))
         return
 
     await message.answer(await status_text(uid, include_subscribed=True, include_hint=True), reply_markup=menu_kb(uid))
@@ -2959,13 +2994,13 @@ async def subscription_handler(call: types.CallbackQuery) -> None:
         return
     subact = action[1]
     if subact == 'buy':
-        await safe_edit(call.message, tr(uid, 'pricing_text'), subscription_plans_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, 'pricing_text'), subscription_plans_kb(uid))
         return
     if subact == 'plan' and len(action) >= 3:
         plan_code = action[2]
         plan = _plan_data(plan_code)
         if not plan:
-            await safe_edit(call.message, tr(uid, 'plan_not_available'), subscription_plans_kb(uid))
+            await safe_edit(call.message, tr_sub(uid, 'plan_not_available'), subscription_plans_kb(uid))
             return
         try:
             invoice = await _create_nowpayments_invoice(telegram_id=uid, plan_code=plan_code)
@@ -2976,7 +3011,7 @@ async def subscription_handler(call: types.CallbackQuery) -> None:
             await safe_edit(call.message, txt, subscription_pay_kb(uid, plan_code, pay_url))
         except Exception:
             logger.exception('subscription: create payment failed uid=%s plan=%s', uid, plan_code)
-            await safe_edit(call.message, tr(uid, 'payment_error'), subscription_plans_kb(uid))
+            await safe_edit(call.message, tr_sub(uid, 'payment_error'), subscription_plans_kb(uid))
         return
 
 @dp.message(Command("autotrade_health"))
@@ -3406,7 +3441,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
     # Shared access control (Postgres)
     access = await get_access_status(uid) if uid else "no_user"
     if action not in ("status", "notify") and access != "ok":
-        await safe_edit(call.message, tr(uid, f"access_{access}"), subscription_gate_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}"), subscription_gate_kb(uid))
         return
 
     # ---- STATUS (main screen) ----
@@ -3580,7 +3615,7 @@ async def notify_handler(call: types.CallbackQuery) -> None:
     # shared access check (same as menu)
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}"), menu_kb(uid))
         return
 
     if action == "back":
@@ -3708,7 +3743,7 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
         # Shared access control
         access = await get_access_status(uid)
         if access != "ok":
-            await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+            await safe_edit(call.message, tr_sub(uid, f"access_{access}"), menu_kb(uid))
             return
 
         gt = _autotrade_gate_text(uid)
@@ -3849,7 +3884,7 @@ async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
 
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}"), menu_kb(uid))
         return
 
     gt = _autotrade_gate_text(uid)
@@ -3948,7 +3983,7 @@ async def autotrade_stats_callback(call: types.CallbackQuery) -> None:
 
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr(uid, f"access_{access}"), menu_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}"), menu_kb(uid))
         return
 
     state = AUTOTRADE_STATS_STATE.setdefault(uid, {"market_type": "all", "period": "today"})
@@ -3985,7 +4020,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
             # Access check
             access = await get_access_status(uid)
             if access != "ok":
-                await message.answer(tr(uid, f"access_{access}"), reply_markup=menu_kb(uid))
+                await message.answer(tr_sub(uid, f"access_{access}"), reply_markup=menu_kb(uid))
                 return
 
             text = (message.text or "").strip()
@@ -4098,7 +4133,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
         access = await get_access_status(uid)
         if access != "ok":
             AUTOTRADE_INPUT.pop(uid, None)
-            await message.answer(tr(uid, f"access_{access}"), reply_markup=menu_kb(uid))
+            await message.answer(tr_sub(uid, f"access_{access}"), reply_markup=menu_kb(uid))
             return
 
         text = (message.text or "").strip()
