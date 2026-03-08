@@ -38,7 +38,7 @@ def _load_env_early() -> None:
     for name in ("AUTOTRADE_MASTER_KEY",):
         if os.getenv(name):
             continue
-        m = re.search(rf'(?m)^\s*{name}\s*=\s*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^#\r\n]*))\s*$', raw)
+        m = re.search(rf"""(?m)^\s*{name}\s*=\s*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^#\r\n]*))\s*$""", raw)
         if not m:
             continue
         value = next((g for g in m.groups() if g is not None), "").strip()
