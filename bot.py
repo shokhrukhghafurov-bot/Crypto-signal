@@ -934,8 +934,47 @@ SUPPORT_USERNAME = os.getenv('SUPPORT_USERNAME', 'cryptoarb_web_bot_admin').lstr
 NOWPAYMENTS_API_KEY = (os.getenv("NOWPAYMENTS_API_KEY") or "").strip()
 NOWPAYMENTS_IPN_SECRET = (os.getenv("NOWPAYMENTS_IPN_SECRET") or "").strip()
 NOWPAYMENTS_API_BASE = (os.getenv("NOWPAYMENTS_API_BASE") or "https://api.nowpayments.io/v1").rstrip("/")
-NOWPAYMENTS_PAY_CURRENCY = (os.getenv("NOWPAYMENTS_PAY_CURRENCY") or "usdttrc20").strip().lower()
-NOWPAYMENTS_PRICE_CURRENCY = (os.getenv("NOWPAYMENTS_PRICE_CURRENCY") or NOWPAYMENTS_PAY_CURRENCY or "usdttrc20").strip().lower()
+
+
+def _normalize_nowpayments_network(value: str | None) -> str:
+    raw = str(value or "").strip().upper().replace("-", "").replace("_", "")
+    aliases = {
+        "BEP20": "BEP20",
+        "BSC": "BEP20",
+        "BNBBSC": "BEP20",
+        "TRX": "TRC20",
+        "TRC20": "TRC20",
+        "TRON": "TRC20",
+        "ETH": "ERC20",
+        "ERC20": "ERC20",
+        "ETHEREUM": "ERC20",
+    }
+    return aliases.get(raw, raw)
+
+
+def _network_to_nowpayments_currency(network: str | None) -> str | None:
+    net = _normalize_nowpayments_network(network)
+    mapping = {
+        "BEP20": "usdtbsc",
+        "TRC20": "usdttrc20",
+        "ERC20": "usdteth",
+    }
+    return mapping.get(net)
+
+
+def _resolve_nowpayments_pay_currency() -> str:
+    direct = (os.getenv("NOWPAYMENTS_PAY_CURRENCY") or "").strip().lower()
+    if direct:
+        return direct
+    by_network = _network_to_nowpayments_currency(os.getenv("NOWPAYMENTS_NETWORK"))
+    if by_network:
+        return by_network
+    # New default: BEP20/BSC instead of legacy TRC20.
+    return "usdtbsc"
+
+
+NOWPAYMENTS_PAY_CURRENCY = _resolve_nowpayments_pay_currency()
+NOWPAYMENTS_PRICE_CURRENCY = (os.getenv("NOWPAYMENTS_PRICE_CURRENCY") or NOWPAYMENTS_PAY_CURRENCY or "usdtbsc").strip().lower()
 NOWPAYMENTS_FIXED_RATE = (os.getenv("NOWPAYMENTS_FIXED_RATE") or "true").strip().lower() not in ("0", "false", "no", "off", "")
 APP_BASE_URL = (os.getenv("APP_BASE_URL") or os.getenv("PUBLIC_BASE_URL") or os.getenv("RAILWAY_PUBLIC_DOMAIN") or "").strip()
 if APP_BASE_URL and not APP_BASE_URL.startswith('http'):
@@ -1435,6 +1474,15 @@ async def _create_nowpayments_invoice(*, telegram_id: int, plan_code: str) -> di
         "is_fixed_rate": NOWPAYMENTS_FIXED_RATE,
         "is_fee_paid_by_user": False,
     }
+    logger.info(
+        "nowpayments:create invoice order_id=%s plan=%s price_amount=%s price_currency=%s pay_currency=%s network_env=%s",
+        order_id,
+        plan_code,
+        payload.get("price_amount"),
+        payload.get("price_currency"),
+        payload.get("pay_currency"),
+        (os.getenv("NOWPAYMENTS_NETWORK") or "").strip(),
+    )
     headers = {"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"}
     data = None
     async with ClientSession() as session:
