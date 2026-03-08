@@ -2,7 +2,7 @@
   "en": {
     "access_blocked": "",
     "access_disabled": "🚫 Access is disabled. Please contact support @{support}.",
-    "access_expired": "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.",
+    "access_expired": "⏰ Access expired.\n\nPlease buy a subscription to continue.",
     "access_maintenance": "🚧 Maintenance in progress. Bot is temporarily unavailable.",
     "access_no_user": "⏳ No access. Press /start.",
     "access_unknown": "⏳ No access.",
@@ -431,9 +431,9 @@
     "btn_open_payment": "💳 Open payment"
   },
   "ru": {
-    "access_blocked": "⛔️ Доступ заблокирован.\n\nКупите подписку, чтобы продолжить.",
+    "access_blocked": "",
     "access_disabled": "🚫 Доступ отключён. Обратитесь в поддержку @{support}.",
-    "access_expired": "⏰ Срок доступа истёк.\n\n⛔️ Доступ заблокирован.",
+    "access_expired": "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.",
     "access_maintenance": "🚧 Идут технические работы. Бот временно недоступен.",
     "access_no_user": "⏳ Нет доступа. Нажми /start.",
     "access_unknown": "⏳ Нет доступа.",
