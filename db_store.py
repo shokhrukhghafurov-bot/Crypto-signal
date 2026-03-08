@@ -8,6 +8,7 @@ import hashlib
 import os
 import json
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 def utcnow():
     return dt.datetime.now(dt.timezone.utc)
 
@@ -29,6 +30,30 @@ def _db_acquire_timeout() -> float:
         return float(os.getenv("DB_POOL_ACQUIRE_TIMEOUT_SEC", "25"))
     except Exception:
         return 25.0
+
+
+def _autotrade_period_start(period: str) -> dt.datetime:
+    """Return UTC start timestamp for the requested auto-trade stats bucket.
+
+    Use the bot/app timezone first (TZ_NAME), then legacy TZ, then UTC.
+    This keeps the stats card aligned with the UI labels like "Сегодня" / "Неделя".
+    """
+    pr = (period or "today").lower().strip()
+    if pr not in ("today", "week", "month"):
+        pr = "today"
+    tz_name = (os.getenv("TZ_NAME") or os.getenv("TZ") or "UTC").strip() or "UTC"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = dt.timezone.utc
+    now_local = dt.datetime.now(tz)
+    if pr == "today":
+        start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif pr == "week":
+        start_local = (now_local - dt.timedelta(days=now_local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start_local = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return start_local.astimezone(dt.timezone.utc)
 
 
 async def ensure_users_table() -> None:
@@ -2930,12 +2955,15 @@ async def get_autotrade_stats(
 ) -> Dict[str, Any]:
     """Return Auto-trade stats for the period.
 
-    Counting rules:
-    - opened: positions opened within the period
-    - closed (+/-): positions CLOSED within the period based on pnl_usdt sign
-    - active: current OPEN positions (not period-bound)
-    - pnl: sum of pnl_usdt for CLOSED positions within the period
-    - roi_percent: (sum pnl) / (sum allocated_usdt of closed) * 100
+    Robustness notes:
+    - period boundaries are computed in the bot/app timezone and converted to UTC;
+      this keeps "Сегодня/Неделя/Месяц" aligned with the Telegram UI.
+    - some exchanges/managers may persist only ``roi_percent`` on close (or ``pnl_usdt``
+      may be temporarily unavailable). For summary counts we derive the sign from either
+      ``pnl_usdt`` or ``roi_percent`` so LOSS/WIN closes are not silently skipped.
+    - ``active`` prefers the real current OPEN count, but if a short-lived sync lag makes
+      it zero while the cohort math clearly shows still-open trades, we fall back to the
+      residual ``opened - closed_total`` for the selected period.
     """
     pool = get_pool()
     uid = int(user_id)
@@ -2945,66 +2973,98 @@ async def get_autotrade_stats(
     pr = (period or "today").lower().strip()
     if pr not in ("today", "week", "month"):
         pr = "today"
-    start_expr = {
-        "today": "date_trunc('day', NOW())",
-        "week": "date_trunc('week', NOW())",
-        "month": "date_trunc('month', NOW())",
-    }[pr]
 
-    mt_where = "" if mt == "all" else "AND market_type=$2"
+    since = _autotrade_period_start(pr)
 
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
-        # opened
+        # positions opened in the selected period
         if mt == "all":
             opened = await conn.fetchval(
-                f"""
+                """
                 SELECT COUNT(*)
                 FROM autotrade_positions
-                WHERE user_id=$1 AND opened_at >= {start_expr}
+                WHERE user_id=$1 AND opened_at >= $2
                 """,
-                uid,
+                uid, since,
             )
         else:
             opened = await conn.fetchval(
-                f"""
+                """
                 SELECT COUNT(*)
                 FROM autotrade_positions
-                WHERE user_id=$1 {mt_where} AND opened_at >= {start_expr}
+                WHERE user_id=$1 AND market_type=$2 AND opened_at >= $3
                 """,
-                uid,
-                mt,
+                uid, mt, since,
             )
 
-        # closed + / - and pnl + invested for ROI
+        # closed stats in the selected period
+        # derived_pnl_usdt: use pnl_usdt when present, otherwise reconstruct from roi_percent
+        # and allocated_usdt. This keeps loss/win counters correct for Smart Manager closes too.
         if mt == "all":
             row = await conn.fetchrow(
-                f"""
+                """
+                WITH closed_rows AS (
+                    SELECT
+                        allocated_usdt,
+                        COALESCE(
+                            pnl_usdt,
+                            CASE
+                                WHEN roi_percent IS NOT NULL AND allocated_usdt IS NOT NULL
+                                    THEN allocated_usdt * roi_percent / 100.0
+                                ELSE NULL
+                            END
+                        ) AS derived_pnl_usdt,
+                        roi_percent
+                    FROM autotrade_positions
+                    WHERE user_id=$1
+                      AND status='CLOSED'
+                      AND closed_at IS NOT NULL
+                      AND closed_at >= $2
+                )
                 SELECT
-                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} AND COALESCE(pnl_usdt,0) > 0 THEN 1 ELSE 0 END),0) AS closed_plus,
-                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} AND COALESCE(pnl_usdt,0) < 0 THEN 1 ELSE 0 END),0) AS closed_minus,
-                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} THEN COALESCE(pnl_usdt,0) ELSE 0 END),0) AS pnl_total,
-                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} THEN COALESCE(allocated_usdt,0) ELSE 0 END),0) AS invested_closed
-                FROM autotrade_positions
-                WHERE user_id=$1;
+                  COUNT(*)::int AS closed_total,
+                  COUNT(*) FILTER (WHERE COALESCE(derived_pnl_usdt, roi_percent, 0) > 0)::int AS closed_plus,
+                  COUNT(*) FILTER (WHERE COALESCE(derived_pnl_usdt, roi_percent, 0) < 0)::int AS closed_minus,
+                  COALESCE(SUM(COALESCE(derived_pnl_usdt, 0)), 0)::float AS pnl_total,
+                  COALESCE(SUM(COALESCE(allocated_usdt, 0)), 0)::float AS invested_closed
+                FROM closed_rows;
                 """,
-                uid,
+                uid, since,
             )
         else:
             row = await conn.fetchrow(
-                f"""
+                """
+                WITH closed_rows AS (
+                    SELECT
+                        allocated_usdt,
+                        COALESCE(
+                            pnl_usdt,
+                            CASE
+                                WHEN roi_percent IS NOT NULL AND allocated_usdt IS NOT NULL
+                                    THEN allocated_usdt * roi_percent / 100.0
+                                ELSE NULL
+                            END
+                        ) AS derived_pnl_usdt,
+                        roi_percent
+                    FROM autotrade_positions
+                    WHERE user_id=$1
+                      AND market_type=$2
+                      AND status='CLOSED'
+                      AND closed_at IS NOT NULL
+                      AND closed_at >= $3
+                )
                 SELECT
-                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} AND COALESCE(pnl_usdt,0) > 0 THEN 1 ELSE 0 END),0) AS closed_plus,
-                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} AND COALESCE(pnl_usdt,0) < 0 THEN 1 ELSE 0 END),0) AS closed_minus,
-                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} THEN COALESCE(pnl_usdt,0) ELSE 0 END),0) AS pnl_total,
-                  COALESCE(SUM(CASE WHEN status='CLOSED' AND closed_at >= {start_expr} THEN COALESCE(allocated_usdt,0) ELSE 0 END),0) AS invested_closed
-                FROM autotrade_positions
-                WHERE user_id=$1 AND market_type=$2;
+                  COUNT(*)::int AS closed_total,
+                  COUNT(*) FILTER (WHERE COALESCE(derived_pnl_usdt, roi_percent, 0) > 0)::int AS closed_plus,
+                  COUNT(*) FILTER (WHERE COALESCE(derived_pnl_usdt, roi_percent, 0) < 0)::int AS closed_minus,
+                  COALESCE(SUM(COALESCE(derived_pnl_usdt, 0)), 0)::float AS pnl_total,
+                  COALESCE(SUM(COALESCE(allocated_usdt, 0)), 0)::float AS invested_closed
+                FROM closed_rows;
                 """,
-                uid,
-                mt,
+                uid, mt, since,
             )
 
-        # active (current)
+        # current OPEN positions (not period-bound)
         if mt == "all":
             active = await conn.fetchval(
                 """
@@ -3021,24 +3081,35 @@ async def get_autotrade_stats(
                 FROM autotrade_positions
                 WHERE user_id=$1 AND market_type=$2 AND status='OPEN'
                 """,
-                uid,
-                mt,
+                uid, mt,
             )
 
-    closed_plus = int(row["closed_plus"] or 0)
-    closed_minus = int(row["closed_minus"] or 0)
-    pnl_total = float(row["pnl_total"] or 0.0)
-    invested_closed = float(row["invested_closed"] or 0.0)
+    closed_total = int((row or {}).get("closed_total") or 0)
+    closed_plus = int((row or {}).get("closed_plus") or 0)
+    closed_minus = int((row or {}).get("closed_minus") or 0)
+    pnl_total = float((row or {}).get("pnl_total") or 0.0)
+    invested_closed = float((row or {}).get("invested_closed") or 0.0)
+    opened_i = int(opened or 0)
+    active_i = int(active or 0)
+
+    # Safety net for transient DB/exchange reconciliation lag: if the UI cohort already shows
+    # opened trades and some of them closed in the selected bucket, but the OPEN snapshot is 0,
+    # keep the visible summary coherent.
+    if active_i <= 0 and opened_i > closed_total:
+        active_i = max(opened_i - closed_total, 0)
+
     roi = (pnl_total / invested_closed * 100.0) if invested_closed > 0 else 0.0
 
     return {
-        "opened": int(opened or 0),
+        "opened": opened_i,
         "closed_plus": closed_plus,
         "closed_minus": closed_minus,
-        "active": int(active or 0),
+        "active": active_i,
         "pnl_total": pnl_total,
         "roi_percent": roi,
         "invested_closed": invested_closed,
+        "closed_total": closed_total,
+        "period_since": since,
     }
 
 
