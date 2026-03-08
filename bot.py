@@ -1461,7 +1461,7 @@ async def init_db() -> None:
 
 
 def subscription_gate_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
-    """Keyboard for expired/blocked users: show only the buy-subscription button."""
+    """Keyboard for expired users: ONLY buy subscription button."""
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(uid, "btn_buy_sub"), callback_data="sub:buy")
     kb.adjust(1)
