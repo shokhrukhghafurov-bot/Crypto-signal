@@ -3722,7 +3722,7 @@ async def notify_handler(call: types.CallbackQuery) -> None:
     # shared access check (same as menu)
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
         return
 
     if action == "back":
@@ -3850,7 +3850,7 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
         # Shared access control
         access = await get_access_status(uid)
         if access != "ok":
-            await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
+            await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
             return
 
         gt = _autotrade_gate_text(uid)
@@ -3991,7 +3991,7 @@ async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
 
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
         return
 
     gt = _autotrade_gate_text(uid)
@@ -4090,7 +4090,7 @@ async def autotrade_stats_callback(call: types.CallbackQuery) -> None:
 
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
         return
 
     state = AUTOTRADE_STATS_STATE.setdefault(uid, {"market_type": "all", "period": "today"})
@@ -4127,7 +4127,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
             # Access check
             access = await get_access_status(uid)
             if access != "ok":
-                await safe_send_nonempty(uid, tr_sub(uid, f"access_{access}"), reply_markup=menu_kb(uid))
+                await safe_send_nonempty(uid, tr_sub(uid, f"access_{access}"), reply_markup=subscription_gate_kb(uid))
                 return
 
             text = (message.text or "").strip()
@@ -4240,7 +4240,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
         access = await get_access_status(uid)
         if access != "ok":
             AUTOTRADE_INPUT.pop(uid, None)
-            await safe_send_nonempty(uid, tr_sub(uid, f"access_{access}"), reply_markup=menu_kb(uid))
+            await safe_send_nonempty(uid, tr_sub(uid, f"access_{access}"), reply_markup=subscription_gate_kb(uid))
             return
 
         text = (message.text or "").strip()
