@@ -2,7 +2,7 @@
   "en": {
     "access_blocked": "⛔️ Access blocked.\n\nPlease buy a subscription to continue.",
     "access_disabled": "🚫 Access is disabled. Please contact support @{support}.",
-    "access_expired": "⏰ Access expired.\n\n⛔️ Access blocked.",
+    "access_expired": "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.",
     "access_maintenance": "🚧 Maintenance in progress. Bot is temporarily unavailable.",
     "access_no_user": "⏳ No access. Press /start.",
     "access_unknown": "⏳ No access.",
