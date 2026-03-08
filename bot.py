@@ -318,6 +318,17 @@ async def safe_send_nonempty(chat_id: int, text: str, *, ctx: str = "", **kwargs
         return None
     return await safe_send(chat_id, text, ctx=ctx, **kwargs)
 
+async def safe_send_payment_alert(chat_id: int, text: str, *, ctx: str = "payment_alert", **kwargs):
+    text = _sanitize_template_text(chat_id, text, ctx=ctx)
+    if _payment_bot is None:
+        logger.error("[payment-alert] PAYMENT_BOT_TOKEN is missing or invalid; skip sending ctx=%s chat_id=%s", ctx, chat_id)
+        return None
+    try:
+        return await _payment_bot.send_message(chat_id, text, **kwargs)
+    except Exception:
+        logger.exception("[payment-alert] send failed ctx=%s chat_id=%s", ctx, chat_id)
+        return None
+
 async def safe_edit_text(chat_id: int, message_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
     return await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, **kwargs)
@@ -409,6 +420,21 @@ except (ZoneInfoNotFoundError, FileNotFoundError):
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 backend = Backend()
+
+# Dedicated bot for payment/admin notifications.
+# IMPORTANT: there is intentionally NO fallback to the main bot.
+# If PAYMENT_BOT_TOKEN is missing/invalid, payment alerts are skipped and logged.
+PAYMENT_BOT_TOKEN = (os.getenv("PAYMENT_BOT_TOKEN") or "").strip()
+_payment_bot: Bot | None = None
+if PAYMENT_BOT_TOKEN:
+    try:
+        _payment_bot = Bot(PAYMENT_BOT_TOKEN)
+        logger.info("[payment-alert] dedicated payment bot enabled")
+    except Exception:
+        _payment_bot = None
+        logger.exception("[payment-alert] failed to initialize payment bot")
+else:
+    logger.warning("[payment-alert] PAYMENT_BOT_TOKEN is not set; payment alerts will NOT be sent")
 
 
 
@@ -1587,7 +1613,7 @@ async def _grant_paid_plan_and_notify(order: dict, event: dict) -> None:
     try:
         txid = event.get('payin_hash') or event.get('tx_hash') or event.get('payment_id') or '-'
         admin_text = f"💰 Paid\n\nTelegram ID: {telegram_id}\nPlan: {_plan_name(telegram_id, plan_code)}\nAmount: {_fmt_money(order.get('amount') or 0)} {NOWPAYMENTS_PRICE_CURRENCY.upper()}\nTXID: {txid}"
-        await safe_send(ADMIN_ALERT_CHAT_ID, admin_text)
+        await safe_send_payment_alert(ADMIN_ALERT_CHAT_ID, admin_text)
     except Exception:
         logger.exception('payment: failed to notify admin')
 
