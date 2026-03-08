@@ -1834,6 +1834,7 @@ def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
 # ---------------- Auto-trade UI + input state ----------------
 
 from cryptography.fernet import Fernet, InvalidToken
+from autotrade_master_key import get_autotrade_master_key
 
 AUTOTRADE_INPUT: Dict[int, Dict[str, str]] = {}
 
@@ -2053,10 +2054,7 @@ async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str,
         pass
 
 def _fernet() -> Fernet:
-    k = (os.getenv("AUTOTRADE_MASTER_KEY") or "").strip()
-    if not k:
-        raise RuntimeError("AUTOTRADE_MASTER_KEY env is missing")
-    return Fernet(k.encode("utf-8"))
+    return Fernet(get_autotrade_master_key().encode("utf-8"))
 
 def _key_status_map(keys: List[Dict[str, any]]) -> Dict[str, Dict[str, any]]:
     out: Dict[str, Dict[str, any]] = {}
