@@ -3007,7 +3007,7 @@ async def subscription_handler(call: types.CallbackQuery) -> None:
             pay_url = invoice.get('invoice_url') or invoice.get('pay_url') or invoice.get('payment_url')
             if not pay_url:
                 raise RuntimeError('missing_pay_url')
-            txt = trf(uid, 'payment_created', plan_name=_plan_name(uid, plan_code), amount=int(plan['amount']))
+            txt = trf(uid, 'payment_created', plan_name=_plan_name(uid, plan_code), amount=_fmt_money(plan['amount']))
             await safe_edit(call.message, txt, subscription_pay_kb(uid, plan_code, pay_url))
         except Exception:
             logger.exception('subscription: create payment failed uid=%s plan=%s', uid, plan_code)
