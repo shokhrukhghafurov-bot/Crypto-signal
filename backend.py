@@ -3427,7 +3427,9 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
         for ex in candidates:
             if not (await _has_fut_keys(ex)):
                 continue
-            if not (await _fut_contract_exists(ex, symbol)):
+            # Use the normalized signal symbol captured above. Using `symbol` here can
+            # raise UnboundLocalError because `symbol` is assigned later in this function.
+            if not (await _fut_contract_exists(ex, sym)):
                 continue
             chosen = ex
             break
