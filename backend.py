@@ -743,7 +743,20 @@ import logging
 import db_store
 
 from cryptography.fernet import Fernet
-from autotrade_master_key import get_autotrade_master_key
+
+
+def get_autotrade_master_key() -> str:
+    """Read and validate AUTOTRADE_MASTER_KEY from environment/.env only."""
+    key = (os.getenv("AUTOTRADE_MASTER_KEY") or "").strip()
+    if not key:
+        raise RuntimeError(
+            "AUTOTRADE_MASTER_KEY is missing. Add AUTOTRADE_MASTER_KEY=... to your .env file."
+        )
+    try:
+        Fernet(key.encode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"AUTOTRADE_MASTER_KEY is invalid: {e}") from e
+    return key
 
 logger = logging.getLogger("crypto-signal")
 
@@ -2371,7 +2384,10 @@ async def validate_autotrade_keys(
 
 
 def _autotrade_fernet() -> Fernet:
-    return Fernet(get_autotrade_master_key().encode("utf-8"))
+    k = (os.getenv("AUTOTRADE_MASTER_KEY") or "").strip()
+    if not k:
+        raise RuntimeError("AUTOTRADE_MASTER_KEY env is missing")
+    return Fernet(k.encode("utf-8"))
 
 
 def _decrypt_token(token: str | None) -> str:
