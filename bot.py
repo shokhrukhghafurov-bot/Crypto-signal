@@ -22,7 +22,31 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from dotenv import load_dotenv
-load_dotenv()
+
+
+def _load_env_early() -> None:
+    """Load .env before importing backend, with a resilient fallback for key vars."""
+    load_dotenv()
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        raw = env_path.read_text(encoding="utf-8")
+    except Exception:
+        return
+    # Fallback for cases where a broken/multiline value in .env prevents normal parsing.
+    for name in ("AUTOTRADE_MASTER_KEY",):
+        if os.getenv(name):
+            continue
+        m = re.search(rf'(?m)^\s*{name}\s*=\s*(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^#\r\n]*))\s*$', raw)
+        if not m:
+            continue
+        value = next((g for g in m.groups() if g is not None), "").strip()
+        if value:
+            os.environ[name] = value
+
+
+_load_env_early()
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import datetime as dt
 
@@ -1835,10 +1859,34 @@ def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
 
 from cryptography.fernet import Fernet, InvalidToken
 
+def _read_autotrade_master_key_raw() -> str:
+    key = (os.getenv("AUTOTRADE_MASTER_KEY") or "").strip()
+    if key:
+        return key
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return ""
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or not s.startswith("AUTOTRADE_MASTER_KEY="):
+                continue
+            value = s.split("=", 1)[1].strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
+            value = value.strip()
+            if value:
+                os.environ["AUTOTRADE_MASTER_KEY"] = value
+                return value
+    except Exception:
+        return ""
+    return ""
+
+
 
 def get_autotrade_master_key() -> str:
     """Read and validate AUTOTRADE_MASTER_KEY from environment/.env only."""
-    key = (os.getenv("AUTOTRADE_MASTER_KEY") or "").strip()
+    key = (_read_autotrade_master_key_raw() or "").strip()
     if not key:
         raise RuntimeError(
             "AUTOTRADE_MASTER_KEY is missing. Add AUTOTRADE_MASTER_KEY=... to your .env file."
@@ -2067,7 +2115,7 @@ async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str,
         pass
 
 def _fernet() -> Fernet:
-    k = (os.getenv("AUTOTRADE_MASTER_KEY") or "").strip()
+    k = (_read_autotrade_master_key_raw() or "").strip()
     if not k:
         raise RuntimeError("AUTOTRADE_MASTER_KEY env is missing")
     return Fernet(k.encode("utf-8"))
