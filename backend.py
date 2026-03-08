@@ -3554,7 +3554,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             except Exception:
                 entry_range_pct = 0.0050
             try:
-                if mt == "futures" and float(entry or 0.0) > 0 and float(entry_range_pct) > 0:
+                if float(entry or 0.0) > 0 and float(entry_range_pct) > 0:
                     entry_ref = float(entry)
                     entry_diff_pct = abs(float(px) - entry_ref) / entry_ref
                     if entry_diff_pct > float(entry_range_pct):
