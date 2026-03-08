@@ -3546,6 +3546,30 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             if px <= 0:
                 raise ExchangeAPIError("Bybit price=0")
 
+            # Entry-range guard: allow market entry only when current price stays close enough
+            # to the signal entry. This reduces missed fills from overly strict exact-entry logic,
+            # while still preventing very late market chases.
+            try:
+                entry_range_pct = float(os.getenv("AUTOTRADE_ENTRY_RANGE_PCT", "0.0050") or 0.0050)
+            except Exception:
+                entry_range_pct = 0.0050
+            try:
+                if mt == "futures" and float(entry or 0.0) > 0 and float(entry_range_pct) > 0:
+                    entry_ref = float(entry)
+                    entry_diff_pct = abs(float(px) - entry_ref) / entry_ref
+                    if entry_diff_pct > float(entry_range_pct):
+                        return _skip(
+                            "outside_entry_range",
+                            entry_price=float(entry_ref),
+                            market_price=float(px),
+                            diff_pct=float(entry_diff_pct),
+                            allowed_pct=float(entry_range_pct),
+                            exchange=exchange,
+                            market=market,
+                        )
+            except Exception:
+                pass
+
             qty_step, min_qty, tick = await _bybit_instrument_filters(category=category, symbol=symbol)
 
             # Spot qty in base; Futures qty in contracts (approx via notional/price)
@@ -14015,7 +14039,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
     poll = float(os.getenv("MID_PENDING_POLL_SEC", "5") or 5.0)
     ttl_min = float(os.getenv("MID_PENDING_TTL_MIN", "60") or 60.0)
     tol_atr = float(os.getenv("MID_PENDING_ENTRY_TOL_ATR", "0.15") or 0.15)
-    tol_pct = float(os.getenv("MID_PENDING_ENTRY_TOL_PCT", "0.0018") or 0.0018)
+    tol_pct = float(os.getenv("MID_PENDING_ENTRY_TOL_PCT", "0.0050") or 0.0050)
 
     pending_instant_emit = int(os.getenv("MID_PENDING_INSTANT_EMIT", "0") or 0) == 1
     # If instant emit is enabled, default to ignoring the zone unless explicitly disabled
