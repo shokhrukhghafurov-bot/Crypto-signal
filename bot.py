@@ -1461,19 +1461,10 @@ async def init_db() -> None:
 
 
 def subscription_gate_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
-    """Keyboard for expired/blocked users: keep menu visible, but all buttons stay inside the gate."""
+    """Keyboard for expired/blocked users: show only the buy-subscription button."""
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(uid, "btn_buy_sub"), callback_data="sub:buy")
-    kb.button(text=tr(uid, "m_status"), callback_data="menu:status")
-    kb.button(text=tr(uid, "m_stats"), callback_data="menu:stats")
-    kb.button(text=tr(uid, "m_spot"), callback_data="menu:spot")
-    kb.button(text=tr(uid, "m_fut"), callback_data="menu:futures")
-    kb.button(text=tr(uid, "sig_btn_analyze"), callback_data="menu:analysis")
-    if not bool(AUTOTRADE_BOT_GLOBAL.get("pause_autotrade")):
-        kb.button(text=tr(uid, "m_autotrade"), callback_data="menu:autotrade")
-    kb.button(text=tr(uid, "m_trades"), callback_data="trades:page:0")
-    kb.button(text=tr(uid, "m_notify"), callback_data="menu:notify")
-    kb.adjust(1, 2, 2, 2, 1)
+    kb.adjust(1)
     return kb.as_markup()
 
 
