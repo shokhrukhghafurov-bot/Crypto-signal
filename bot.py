@@ -3550,9 +3550,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
     if access != "ok":
         await safe_edit(
             call.message,
-            tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.
-
-Купите подписку, чтобы продолжить.",
+            tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.",
             subscription_gate_kb(uid)
         )
         return
@@ -3728,7 +3726,7 @@ async def notify_handler(call: types.CallbackQuery) -> None:
     # shared access check (same as menu)
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
         return
 
     if action == "back":
@@ -3856,7 +3854,7 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
         # Shared access control
         access = await get_access_status(uid)
         if access != "ok":
-            await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
+            await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
             return
 
         gt = _autotrade_gate_text(uid)
@@ -3997,7 +3995,7 @@ async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
 
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
         return
 
     gt = _autotrade_gate_text(uid)
@@ -4096,7 +4094,7 @@ async def autotrade_stats_callback(call: types.CallbackQuery) -> None:
 
     access = await get_access_status(uid)
     if access != "ok":
-        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", menu_kb(uid))
+        await safe_edit(call.message, tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.", subscription_gate_kb(uid))
         return
 
     state = AUTOTRADE_STATS_STATE.setdefault(uid, {"market_type": "all", "period": "today"})
@@ -4560,19 +4558,32 @@ async def autotrade_input_handler(message: types.Message) -> None:
 @dp.callback_query(lambda c: (c.data or "").startswith("trades:page:"))
 async def trades_page(call: types.CallbackQuery) -> None:
     await safe_callback_answer(call, )
+    uid = call.from_user.id if call.from_user else 0
+    if not uid:
+        return
+
+    access = await get_access_status(uid)
+    if access != "ok":
+        await safe_send(
+            uid,
+            tr_sub(uid, f"access_{access}") or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить.",
+            reply_markup=subscription_gate_kb(uid)
+        )
+        return
+
     try:
         offset = int((call.data or "").split(":")[-1])
     except Exception:
         offset = 0
 
-    all_trades = await _get_user_trades_fallback(call.from_user.id)
+    all_trades = await _get_user_trades_fallback(uid)
     if not all_trades:
-        await safe_send(call.from_user.id, tr(call.from_user.id, "my_trades_empty"), reply_markup=menu_kb(call.from_user.id))
+        await safe_send(uid, tr(uid, "my_trades_empty"), reply_markup=menu_kb(uid))
         return
 
     page = all_trades[offset:offset+PAGE_SIZE]
-    txt = tr(call.from_user.id, "my_trades_title").format(a=offset+1, b=min(offset+PAGE_SIZE, len(all_trades)), n=len(all_trades))
-    await safe_send(call.from_user.id, txt, reply_markup=_trades_page_kb(call.from_user.id, page, offset))
+    txt = tr(uid, "my_trades_title").format(a=offset+1, b=min(offset+PAGE_SIZE, len(all_trades)), n=len(all_trades))
+    await safe_send(uid, txt, reply_markup=_trades_page_kb(uid, page, offset))
 
 # ---------------- trade card ----------------
 
