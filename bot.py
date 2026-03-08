@@ -1884,32 +1884,18 @@ def _read_autotrade_master_key_raw() -> str:
 
 
 
-
-def _coerce_fernet_key(raw_key: str) -> str:
-    """Accept either a real Fernet key or any non-empty secret string.
-
-    Railway / users often set AUTOTRADE_MASTER_KEY to a plain secret instead of a
-    Fernet-compatible base64 key. To avoid false "missing" errors, we deterministically
-    derive a valid Fernet key from arbitrary secret material.
-    """
-    key = (raw_key or "").strip()
-    if not key:
-        return ""
-    try:
-        Fernet(key.encode("utf-8"))
-        return key
-    except Exception:
-        digest = hashlib.sha256(key.encode("utf-8")).digest()
-        return base64.urlsafe_b64encode(digest).decode("utf-8")
-
 def get_autotrade_master_key() -> str:
-    """Read AUTOTRADE_MASTER_KEY from environment/.env and normalize it for Fernet."""
-    raw_key = (_read_autotrade_master_key_raw() or "").strip()
-    if not raw_key:
+    """Read and validate AUTOTRADE_MASTER_KEY from environment/.env only."""
+    key = (_read_autotrade_master_key_raw() or "").strip()
+    if not key:
         raise RuntimeError(
             "AUTOTRADE_MASTER_KEY is missing. Add AUTOTRADE_MASTER_KEY=... to your .env file."
         )
-    return _coerce_fernet_key(raw_key)
+    try:
+        Fernet(key.encode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"AUTOTRADE_MASTER_KEY is invalid: {e}") from e
+    return key
 
 AUTOTRADE_INPUT: Dict[int, Dict[str, str]] = {}
 
@@ -2129,7 +2115,9 @@ async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str,
         pass
 
 def _fernet() -> Fernet:
-    k = get_autotrade_master_key()
+    k = (_read_autotrade_master_key_raw() or "").strip()
+    if not k:
+        raise RuntimeError("AUTOTRADE_MASTER_KEY env is missing")
     return Fernet(k.encode("utf-8"))
 
 def _key_status_map(keys: List[Dict[str, any]]) -> Dict[str, Dict[str, any]]:
@@ -4403,8 +4391,11 @@ async def autotrade_input_handler(message: types.Message) -> None:
                     # Encrypt + store active
                     try:
                         f = _fernet()
-                    except Exception:
+                    except RuntimeError:
                         await message.answer(tr(uid, "at_master_key_missing"))
+                    except Exception as e:
+                        logger.exception("Autotrade encryption init failed while saving keys uid=%s ex=%s mt=%s", uid, ex, mt)
+                        await message.answer(f"⚠️ Ошибка шифрования API-ключей: {type(e).__name__}: {e}")
                     else:
                         api_key_enc = f.encrypt(api_key.encode("utf-8")).decode("utf-8")
                         api_secret_enc = f.encrypt(api_secret.encode("utf-8")).decode("utf-8")
@@ -4573,8 +4564,11 @@ async def autotrade_input_handler(message: types.Message) -> None:
                     # Encrypt + store active
                     try:
                         f = _fernet()
-                    except Exception:
+                    except RuntimeError:
                         await message.answer(tr(uid, "at_master_key_missing"))
+                    except Exception as e:
+                        logger.exception("Autotrade encryption init failed while saving keys uid=%s ex=%s mt=%s", uid, ex, mt)
+                        await message.answer(f"⚠️ Ошибка шифрования API-ключей: {type(e).__name__}: {e}")
                     else:
                         api_key_enc = f.encrypt(api_key.encode("utf-8")).decode("utf-8")
                         api_secret_enc = f.encrypt(api_secret.encode("utf-8")).decode("utf-8")
