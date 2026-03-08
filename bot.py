@@ -1479,9 +1479,8 @@ def subscription_gate_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
 
 def subscription_gate_text(uid: int) -> str:
     txt = tr_sub(uid, "access_expired")
-    return txt or "⏰ Срок доступа истёк.
+    return txt or "⏰ Срок доступа истёк.\n\nКупите подписку, чтобы продолжить."
 
-Купите подписку, чтобы продолжить."
 
 
 async def render_subscription_gate(message: types.Message | None, uid: int) -> None:
