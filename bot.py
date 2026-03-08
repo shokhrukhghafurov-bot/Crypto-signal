@@ -2115,9 +2115,10 @@ async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str,
         pass
 
 def _fernet() -> Fernet:
-    k = (_read_autotrade_master_key_raw() or "").strip()
-    if not k:
-        raise RuntimeError("AUTOTRADE_MASTER_KEY env is missing")
+    try:
+        k = get_autotrade_master_key()
+    except Exception as e:
+        raise RuntimeError(f"AUTOTRADE_MASTER_KEY invalid: {e}") from e
     return Fernet(k.encode("utf-8"))
 
 def _key_status_map(keys: List[Dict[str, any]]) -> Dict[str, Dict[str, any]]:
@@ -5720,6 +5721,12 @@ async def main() -> None:
     import time
     
     logger.info("Bot starting; TZ=%s", TZ_NAME)
+    try:
+        get_autotrade_master_key()
+        logger.info("AUTOTRADE_MASTER_KEY validated successfully")
+    except Exception as e:
+        logger.critical("Invalid AUTOTRADE_MASTER_KEY: %s", e)
+        raise
     await init_db()
     load_langs()
 
