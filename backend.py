@@ -9209,9 +9209,9 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                     base_r.setdefault("risk_flags", [])
                     base_r["risk_flags"].append("regime_range_no_breakout")
                 except Exception:
-                    pass        # Require at least one execution trigger for MID (institutional quality)
-        # NOTE: In pending model (MID_PENDING_ENABLED=1 + MID_FILTERS_AFTER_SETUP=1),
-        # we do NOT block setup creation here; we only flag it and let TRIGGER-stage confirm.
+                    pass        # Require-trigger now works as a score component, not as a hard setup gate.
+        # If there is no execution trigger yet, we keep only a soft risk flag and let
+        # the score layer apply a small penalty instead of killing the setup.
         if require_trigger:
             trig_ok = False
             if str(dir_trend).upper() == "LONG":
@@ -9219,8 +9219,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             else:
                 trig_ok = bool(sweep_short) or bool(bo_rt_trigger) or bool(ob_retest)
             if not trig_ok:
-                # Soft flag only: allow strong TA setups to become pending and let
-                # the final pending/entry trigger stage confirm execution later.
                 try:
                     base_r.setdefault("risk_flags", [])
                     if "no_trigger" not in base_r["risk_flags"]:
@@ -9765,6 +9763,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             mid_bonus_parts["structure"] = mid_bonus_parts.get("structure", 0.0) + _v
 
         # Execution triggers are score contributors, not a hard setup gate.
+        # sweep=+8, breakout_retest=+6, order_block_retest=+6,
+        # and if none fired we apply only a small no-trigger penalty.
         trigger_score = 0.0
         if (str(dir_trend).upper() == "LONG" and sweep_long) or (str(dir_trend).upper() == "SHORT" and sweep_short):
             trigger_score += 8.0
@@ -9776,7 +9776,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             trigger_score += 6.0
             mid_bonus_parts["order_block"] = mid_bonus_parts.get("order_block", 0.0) + 6.0
         if trigger_score <= 0.0:
-            _no_trigger_penalty = abs(float(os.getenv("MID_PENALTY_NO_TRIGGER", "5") or 5))
+            _no_trigger_penalty = abs(float(os.getenv("MID_PENALTY_NO_TRIGGER", "4") or 4))
             trigger_score -= _no_trigger_penalty
             mid_bonus_parts["no_trigger_penalty"] = mid_bonus_parts.get("no_trigger_penalty", 0.0) - _no_trigger_penalty
         mid_bonus += trigger_score
