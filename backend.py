@@ -6081,11 +6081,12 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         except Exception:
             _phase = "scan"
         _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
-        if _pending_enabled and _postsetup_only and _phase == "scan":
+        _quality_first = _mid_quality_first_enabled()
+        if (not _quality_first) and _pending_enabled and _postsetup_only and _phase == "scan":
             return None
 
         # Skip only late-entry/vwap-distance blocks during SCAN when pending mode is enabled.
-        _skip_late_vwap_blocks = bool((_phase == "scan") and _pending_enabled and _pending_skip_hb)
+        _skip_late_vwap_blocks = bool((_phase == "scan") and _pending_enabled and _pending_skip_hb and (not _quality_first))
 
         # ULTRA SAFE: tighten filters dynamically for near-zero SL preference
         late_entry_max = MID_ULTRA_LATE_ENTRY_ATR_MAX if MID_ULTRA_SAFE else MID_LATE_ENTRY_ATR_MAX
@@ -9130,9 +9131,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                     _phase = str(_MID_EVAL_PHASE.get() or "scan")
                 except Exception:
                     _phase = "scan"
-                if not (pending_enabled and postsetup_only and _phase == "scan"):
+                if _mid_quality_first_enabled() or not (pending_enabled and postsetup_only and _phase == "scan"):
                     _fail("structure", "regime_range_no_breakout")
-                if not (pending_enabled and postsetup_only):
                     return None
                 try:
                     base_r.setdefault("risk_flags", [])
@@ -9152,9 +9152,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                     _phase = str(_MID_EVAL_PHASE.get() or "scan")
                 except Exception:
                     _phase = "scan"
-                if not (pending_enabled and postsetup_only and _phase == "scan"):
+                if _mid_quality_first_enabled() or not (pending_enabled and postsetup_only and _phase == "scan"):
                     _fail("other", "no_trigger")
-                if not (pending_enabled and postsetup_only):
                     return None
                 try:
                     base_r.setdefault("risk_flags", [])
@@ -9773,7 +9772,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 _phase = str(_MID_EVAL_PHASE.get() or "scan")
             except Exception:
                 _phase = "scan"
-            if not (_pending_enabled and _postsetup_only and _phase == "scan"):
+            if _mid_quality_first_enabled() or not (_pending_enabled and _postsetup_only and _phase == "scan"):
                 _fail("other", f"score_low score={int(confidence)} min={int(min_score)}")
                 return None
     except Exception:
@@ -9799,6 +9798,9 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "tp2": tp2,
         "rr": rr,
         "confidence": confidence,
+        "atr30": float(atr30),
+        "atr_abs": float(atr30),
+        "tp2_r": float(tp2_r),
 
         # trap flag (setup risk) - enforced at TRIGGER
         "trap_ok": bool(ok_trap),
@@ -10949,6 +10951,9 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "tp2": tp2,
         "rr": rr,
         "confidence": confidence,
+        "atr30": float(atr30),
+        "atr_abs": float(atr30),
+        "tp2_r": float(tp2_r),
         "trap_ok": bool(trap_ok),
         "trap_reason": str(trap_reason or ""),
         # Hard blocks (late_entry_atr / near_extremes / bb_bounce / regime_block / etc.)
@@ -13727,6 +13732,119 @@ def _linreg_channel_bounds(df: pd.DataFrame, *, window: int = 120, k: float = 2.
     except Exception:
         return (float("nan"), float("nan"))
 
+def _mid_quality_first_enabled() -> bool:
+    """Quality-first mode: scan must keep only strong setups; trigger must be strict."""
+    try:
+        v = os.getenv("MID_QUALITY_FIRST", "1")
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return True
+
+
+def _mid_trigger_min_passed() -> int:
+    """Smart-trigger threshold. In quality-first mode never allow a lax threshold below 9."""
+    try:
+        raw = int(float(os.getenv("MID_TRIGGER_MIN_PASSED", "0") or 0))
+    except Exception:
+        raw = 0
+    if _mid_quality_first_enabled():
+        return max(9, raw)
+    return max(0, raw)
+
+
+def _mid_pending_quality_ok(rec: dict) -> tuple[bool, str]:
+    """Reject weak/almost-good pending setups before they are stored."""
+    try:
+        flags = {str(x).strip().lower() for x in (rec.get("risk_flags") or []) if str(x).strip()}
+    except Exception:
+        flags = set()
+    hard_bad = {"far_zone", "vol_low", "no_trigger", "regime_range_no_breakout", "structure_mismatch", "blocked"}
+    if _mid_quality_first_enabled() and (flags & hard_bad):
+        return (False, f"risk_flags:{','.join(sorted(flags & hard_bad))}")
+    try:
+        conf = int(float(rec.get("confidence") or 0))
+        min_conf = int(float(rec.get("min_confidence") or 0))
+        if min_conf > 0 and conf < min_conf:
+            return (False, f"confidence<{min_conf}")
+    except Exception:
+        pass
+    try:
+        rr = float(rec.get("rr") or 0.0)
+        if rr <= 0:
+            return (False, "rr_invalid")
+    except Exception:
+        return (False, "rr_invalid")
+    try:
+        lo = float(rec.get("entry_low")) if rec.get("entry_low") is not None else None
+        hi = float(rec.get("entry_high")) if rec.get("entry_high") is not None else None
+        if lo is not None and hi is not None:
+            if lo <= 0 or hi <= 0 or hi < lo:
+                return (False, "zone_invalid")
+            atr0 = float(rec.get("atr_at_create") or 0.0)
+            if atr0 > 0:
+                width_atr = (hi - lo) / atr0
+                max_w = float(os.getenv("MID_ZONE_MAX_WIDTH_ATR_STRICT", os.getenv("MID_PENDING_ZONE_MAX_ATR", "0.60")) or 0.60)
+                if width_atr > max_w:
+                    return (False, f"zone_too_wide:{width_atr:.2f}atr")
+    except Exception:
+        pass
+    return (True, "")
+
+
+def _mid_recalc_levels_from_trigger(direction: str, trigger_price: float, ta: dict | None, it: dict | None) -> tuple[float,float,float,float,float]:
+    """Recompute entry/SL/TP from the actual trigger price instead of reusing stale setup levels."""
+    direction = str(direction or "").upper().strip()
+    entry_emit = float(trigger_price or 0.0)
+    ta = ta or {}
+    it = it or {}
+    atr_use = None
+    for cand in (ta.get("atr30"), ta.get("atr_abs"), it.get("atr_at_create")):
+        try:
+            v = float(cand or 0.0)
+            if v > 0:
+                atr_use = v
+                break
+        except Exception:
+            pass
+    if not atr_use or atr_use <= 0:
+        atr_use = max(abs(entry_emit) * 0.001, 1e-9)
+    tp2_r_use = None
+    for cand in (ta.get("tp2_r"), it.get("tp2_r")):
+        try:
+            v = float(cand or 0.0)
+            if v > 0:
+                tp2_r_use = v
+                break
+        except Exception:
+            pass
+    sl_emit, tp1_emit, tp2_emit, rr_emit = _build_levels(direction, float(entry_emit), float(atr_use), tp2_r=tp2_r_use)
+    try:
+        sl_old = float(ta.get("sl") or it.get("sl") or 0.0)
+        if sl_old > 0:
+            if direction == "LONG":
+                sl_emit = max(sl_emit, sl_old)
+            elif direction == "SHORT":
+                sl_emit = min(sl_emit, sl_old)
+    except Exception:
+        pass
+    try:
+        max_tp2_atr = float(os.getenv("MID_MAX_TP2_ATR", "0") or 0.0)
+        if max_tp2_atr > 0 and atr_use > 0:
+            max_dist = float(max_tp2_atr) * float(atr_use)
+            if direction == "LONG":
+                tp2_emit = min(float(tp2_emit), float(entry_emit) + max_dist)
+            elif direction == "SHORT":
+                tp2_emit = max(float(tp2_emit), float(entry_emit) - max_dist)
+    except Exception:
+        pass
+    try:
+        risk = abs(float(entry_emit) - float(sl_emit))
+        rr_emit = (abs(float(tp2_emit) - float(entry_emit)) / risk) if risk > 0 else 0.0
+    except Exception:
+        rr_emit = 0.0
+    return float(entry_emit), float(sl_emit), float(tp1_emit), float(tp2_emit), float(rr_emit)
+
+
 def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame, *, direction: str, entry: float) -> Tuple[Optional[Tuple[float, float]], str]:
     """Build an 'entry zone' using OB/FVG/channel and guard against zones that are too wide.
 
@@ -13880,21 +13998,66 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
     async def _mid_pending_load(self) -> list[dict]:
         if not hasattr(self, "_mid_pending_mem"):
             self._mid_pending_mem = []
+
+        def _filter_pending_items(items: list[dict]) -> tuple[list[dict], int]:
+            now_ts = time.time()
+            out: list[dict] = []
+            removed = 0
+            for it in (items or []):
+                if not isinstance(it, dict):
+                    removed += 1
+                    continue
+                try:
+                    ttl_min = float(it.get("ttl_min") or os.getenv("MID_PENDING_TTL_MIN", os.getenv("MID_PENDING_TTL_MINUTES", "150")) or 150.0)
+                except Exception:
+                    ttl_min = 150.0
+                try:
+                    created_ts = float(it.get("created_ts") or 0.0)
+                except Exception:
+                    created_ts = 0.0
+                if created_ts > 0 and ttl_min > 0 and (now_ts - created_ts) > (ttl_min * 60.0):
+                    removed += 1
+                    continue
+                ok_q, _ = _mid_pending_quality_ok(it)
+                if not ok_q:
+                    removed += 1
+                    continue
+                out.append(it)
+            return out, removed
+
         if getattr(self, "_mid_pending_db_disabled", False):
-            return list(self._mid_pending_mem)
+            filtered, removed = _filter_pending_items(list(self._mid_pending_mem))
+            if removed:
+                self._mid_pending_mem = list(filtered)
+            return filtered
 
         timeout_sec = float(os.getenv("MID_PENDING_KV_TIMEOUT_SEC", "3.0") or 3.0)
         try:
             st = await asyncio.wait_for(db_store.kv_get_json("mid_pending"), timeout=timeout_sec) or {}
             items = st.get("items", [])
-            return items if isinstance(items, list) else []
+            items = items if isinstance(items, list) else []
+            filtered, removed = _filter_pending_items(items)
+            try:
+                self._mid_pending_mem = list(filtered)
+            except Exception:
+                pass
+            if removed:
+                try:
+                    await asyncio.wait_for(db_store.kv_set_json("mid_pending", {"items": filtered}), timeout=timeout_sec)
+                    logger.info("[mid][pending] pruned stale/weak pending records removed=%s kept=%s", int(removed), int(len(filtered)))
+                except Exception:
+                    pass
+            return filtered
         except Exception as e:
             try:
                 logger.warning("[mid][pending] kv_store load failed/timeout; switching to in-memory pending (err=%s)", str(e)[:200])
             except Exception:
                 pass
             self._mid_pending_db_disabled = True
-            return list(self._mid_pending_mem)
+            filtered, removed = _filter_pending_items(list(self._mid_pending_mem))
+            if removed:
+                self._mid_pending_mem = list(filtered)
+            return filtered
 
 
     async def _mid_pending_save(self, items: list[dict]) -> None:
@@ -15135,70 +15298,74 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     pending_emit_on_zone = (os.getenv("MID_PENDING_INSTANT_EMIT_ON_ZONE", "1").strip().lower() in ("1","true","yes","on"))
                     pending_skip_checks = (os.getenv("MID_PENDING_INSTANT_EMIT_SKIP_CHECKS", "0").strip().lower() in ("1","true","yes","on"))
                     if pending_instant_emit and (instant_ignore_zone or pending_emit_on_zone or instant_emit_due_to_nofilters or pending_skip_checks):
-                        try:
-                            _pending_mark_attempt(it, now)
-                        except Exception:
-                            pass
-                        try:
-                            entry_emit = float(it.get("entry") or entry0)
-                            sl_emit = float(it.get("sl") or 0.0)
-                            tp1_emit = float(it.get("tp1") or 0.0)
-                            tp2_emit = float(it.get("tp2") or 0.0)
-                            rr_emit = float(it.get("rr") or 0.0)
-                            conf_emit = int(float(it.get("confidence") or it.get("min_confidence") or 0))
-                            conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "") or str(src_ex)
-
-                            sig = Signal(
-                                signal_id=self.next_signal_id(),
-                                market=market,
-                                symbol=sym,
-                                direction=direction,
-                                timeframe=str(it.get("timeframe") or "5m/30m/1h"),
-                                entry=entry_emit,
-                                sl=sl_emit,
-                                tp1=tp1_emit,
-                                tp2=tp2_emit,
-                                rr=rr_emit,
-                                confidence=conf_emit,
-                                confirmations=conf_names,
-                                source_exchange=src_ex,
-                                available_exchanges=conf_names,
-                                risk_note=str(it.get("risk_note") or "INSTANT_EMIT (filters bypassed)"),
-                                ts=time.time(),
-                            )
-
+                        if _mid_quality_first_enabled():
                             try:
-                                self.mark_emitted_mid(sym, sig.direction, sig.market)
-                            except TypeError:
-                                # compat shim may expose mark_emitted_mid(symbol) only
+                                logger.info("[mid][pending] instant_emit bypass suppressed by quality_first sym=%s market=%s dir=%s", sym, market, direction)
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                _pending_mark_attempt(it, now)
+                            except Exception:
+                                pass
+                            try:
                                 try:
-                                    self.mark_emitted_mid(sym)
+                                    entry_ref = float(price) if (price is not None and float(price) > 0) else float(it.get("entry") or entry0)
+                                except Exception:
+                                    entry_ref = float(it.get("entry") or entry0)
+                                entry_emit, sl_emit, tp1_emit, tp2_emit, rr_emit = _mid_recalc_levels_from_trigger(direction, entry_ref, None, it)
+                                conf_emit = int(float(it.get("confidence") or it.get("min_confidence") or 0))
+                                conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "") or str(src_ex)
+
+                                sig = Signal(
+                                    signal_id=self.next_signal_id(),
+                                    market=market,
+                                    symbol=sym,
+                                    direction=direction,
+                                    timeframe=str(it.get("timeframe") or "5m/30m/1h"),
+                                    entry=entry_emit,
+                                    sl=sl_emit,
+                                    tp1=tp1_emit,
+                                    tp2=tp2_emit,
+                                    rr=rr_emit,
+                                    confidence=conf_emit,
+                                    confirmations=conf_names,
+                                    source_exchange=src_ex,
+                                    available_exchanges=conf_names,
+                                    risk_note=str(it.get("risk_note") or "INSTANT_EMIT (filters bypassed)") + " | levels_recalc=1",
+                                    ts=time.time(),
+                                )
+
+                                try:
+                                    self.mark_emitted_mid(sym, sig.direction, sig.market)
+                                except TypeError:
+                                    try:
+                                        self.mark_emitted_mid(sym)
+                                    except Exception:
+                                        pass
                                 except Exception:
                                     pass
-                            except Exception:
-                                pass
-                            self.last_signal = sig
-                            if sig.market == "SPOT":
-                                self.last_spot_signal = sig
-                            else:
-                                self.last_futures_signal = sig
+                                self.last_signal = sig
+                                if sig.market == "SPOT":
+                                    self.last_spot_signal = sig
+                                else:
+                                    self.last_futures_signal = sig
 
-                            await emit_signal_cb(sig)
-                            _pending_log_trigger(sym, market, direction, "pass", "instant_emit", it, float(price))
-                            logger.info("[mid][pending] INSTANT_EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, float(entry_emit), float(price), tol)
-                            try:
-                                _mid_metrics_inc("pending_triggered", 1)
+                                await emit_signal_cb(sig)
+                                _pending_log_trigger(sym, market, direction, "pass", "instant_emit", it, float(price))
+                                logger.info("[mid][pending] INSTANT_EMIT %s %s %s entry=%.6g px=%.6g tol=%.6g", sym, market, direction, float(entry_emit), float(price), tol)
+                                try:
+                                    _mid_metrics_inc("pending_triggered", 1)
+                                except Exception:
+                                    pass
+                                try:
+                                    _mid_stage_add("triggered", 1)
+                                except Exception:
+                                    pass
+                                continue
                             except Exception:
+                                # If instant emit fails for any reason, fall back to normal path.
                                 pass
-                            try:
-                                _mid_stage_add("triggered", 1)
-                            except Exception:
-                                pass
-                            # emitted: do not keep
-                            continue
-                        except Exception:
-                            # If instant emit fails for any reason, fall back to normal path.
-                            pass
 
                     # We reached entry/zone: count this as a trigger attempt (persisted in DB kv_store).
                     _pending_mark_attempt(it, now)
@@ -15244,8 +15411,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # Structure alignment at trigger-time is a *strong* filter.
                     # If enabled by default it can block nearly all signals during pullbacks / ranges.
                     # So we default it to OFF, and users can explicitly enable it via env.
-                    req_struct_30m = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_30M", False)
-                    req_struct_1h = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_1H", False)
+                    req_struct_30m = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_30M", True)
+                    req_struct_1h = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_1H", True)
                     
                     # Trap: by default, follow global trap switches if they are set; otherwise enabled.
                     try:
@@ -16395,9 +16562,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             smart_trigger = str(os.getenv("MID_SMART_TRIGGER", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
                         try:
-                            need_passed = int(float(os.getenv("MID_TRIGGER_MIN_PASSED", "0") or 0))
+                            need_passed = _mid_trigger_min_passed()
                         except Exception:
-                            need_passed = 0
+                            need_passed = 9 if _mid_quality_first_enabled() else 0
+                        try:
+                            strict_required = str(os.getenv("MID_TRIGGER_STRICT_REQUIRED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+                        except Exception:
+                            strict_required = True
                         enabled_required = []
                         required_passed = []
                         required_failed = []
@@ -16418,6 +16589,27 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             pass
 
                         if smart_trigger:
+                            # Quality-first: even in smart mode we do not allow failed required checks.
+                            if strict_required and required_failed:
+                                first_key = str(required_failed[0])
+                                log_reason, apply_reason = _reason_map.get(first_key, (first_key, first_key))
+                                try:
+                                    it["_trig_fail_reasons"] = [(_reason_map.get(k, (k, k))[0]) for k in required_failed]
+                                    it["_trig_primary_reason"] = str(log_reason)
+                                    it["_trig_term_reason"] = str(log_reason)
+                                except Exception:
+                                    pass
+                                keep_it, outc = _pending_apply_fail(it, apply_reason, now)
+                                _pending_log_trigger(sym, market, direction, outc, log_reason, it, float(price))
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
                             # Smart mode counts only enabled trigger filters.
                             # If the user disabled all trigger filters, do not block the signal.
                             if len(enabled_required) <= 0:
@@ -16549,11 +16741,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 return _fv
                         return default
 
-                    entry = _mid_pick_scalar(ta.get("entry"), entry0, it.get("entry"), default=0.0)
-                    sl = _mid_pick_scalar(ta.get("sl"), it.get("sl"), default=0.0)
-                    tp1 = _mid_pick_scalar(ta.get("tp1"), it.get("tp1"), default=0.0)
-                    tp2 = _mid_pick_scalar(ta.get("tp2"), it.get("tp2"), default=0.0)
-                    rr = _mid_pick_scalar(ta.get("rr"), it.get("rr"), default=0.0)
+                    try:
+                        entry_ref = float(price) if (price is not None and float(price) > 0) else _mid_pick_scalar(ta.get("entry"), entry0, it.get("entry"), default=0.0)
+                    except Exception:
+                        entry_ref = _mid_pick_scalar(ta.get("entry"), entry0, it.get("entry"), default=0.0)
+                    entry, sl, tp1, tp2, rr = _mid_recalc_levels_from_trigger(direction, entry_ref, ta, it)
                     conf = int(_mid_pick_scalar(ta.get("confidence"), it.get("confidence"), default=0.0))
 
                     conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "")
@@ -16575,7 +16767,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         confirmations=conf_names,
                         source_exchange=src_ex,
                         available_exchanges=conf_names,
-                        risk_note=str(it.get("risk_note") or "ENTRY CONFIRMED"),
+                        risk_note=str(it.get("risk_note") or "ENTRY CONFIRMED") + " | trigger_revalidated=1 | levels_recalc=1",
                         ts=time.time(),
                     )
 
@@ -17405,9 +17597,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                 trig_full = str(os.getenv("MID_TRIGGER_FULL_CHECKLIST", "1") or "1").strip().lower() not in ("0","false","no","off")
                 trig_smart = str(os.getenv("MID_SMART_TRIGGER", "0") or "0").strip().lower() not in ("0","false","no","off")
                 try:
-                    trig_need_passed = int(float(os.getenv("MID_TRIGGER_MIN_PASSED", "0") or 0))
+                    trig_need_passed = _mid_trigger_min_passed()
                 except Exception:
-                    trig_need_passed = 0
+                    trig_need_passed = 9 if _mid_quality_first_enabled() else 0
                 trig_req_struct30 = str(os.getenv("MID_TRIGGER_REQUIRE_STRUCTURE_30M", "0") or "0").strip().lower() not in ("0","false","no","off")
                 trig_req_struct1h = str(os.getenv("MID_TRIGGER_REQUIRE_STRUCTURE_1H", "0") or "0").strip().lower() not in ("0","false","no","off")
                 trig_mode = str(os.getenv("MID_TRIGGER_MODE", os.getenv("MID_MODE", "")) or "").strip()
@@ -20093,6 +20285,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "tp1": float(tp1),
                                         "tp2": float(tp2),
                                         "rr": float(tp2_r if tp_policy=="R" else rr),
+                                        "tp2_r": float(tp2_r),
                                         "confidence": int(round(conf)),
                                         "confirmations": conf_names,
                                         "source_exchange": best_name,
@@ -20120,6 +20313,16 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 rec["reverse_dist_atr"] = float(_reverse_dist_atr)
                                         except Exception:
                                             pass
+                                    _ok_pending, _pending_bad_reason = _mid_pending_quality_ok(rec)
+                                    if not _ok_pending:
+                                        try:
+                                            _pending_skip(sym, f"quality_gate:{_pending_bad_reason}")
+                                        except Exception:
+                                            pass
+                                        _mid_f_rejected += 1
+                                        _rej_add(sym, f"pending_quality:{_pending_bad_reason}")
+                                        continue
+
                                     await self.add_mid_pending(rec)
                                     self.mark_mid_pending(sym, direction=diru, market=marketu)
                                     _mid_stage_add("passed_ta", 1)
