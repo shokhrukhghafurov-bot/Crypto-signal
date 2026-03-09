@@ -3254,11 +3254,11 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     try:
         acc = await db_store.get_autotrade_access(uid)
         if bool(acc.get("is_blocked")):
-            return _skip("skipped")
+            return _skip("access_blocked")
         if not bool(acc.get("autotrade_enabled")):
-            return _skip("skipped")
+            return _skip("access_disabled")
         if bool(acc.get("autotrade_stop_after_close")):
-            return _skip("skipped")
+            return _skip("stop_after_close")
         exp = acc.get("autotrade_expires_at")
         if exp is not None:
             import datetime as _dt
@@ -3267,16 +3267,16 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 if exp.tzinfo is None:
                     exp = exp.replace(tzinfo=_dt.timezone.utc)
                 if exp <= now:
-                    return _skip("skipped")
+                    return _skip("access_expired")
             except Exception:
-                return _skip("skipped")
+                return _skip("access_expiry_check_failed")
     except Exception:
         # best-effort: if access columns not ready, default to allow
         pass
 
     enabled = bool(st.get("spot_enabled")) if mt == "spot" else bool(st.get("futures_enabled"))
     if not enabled:
-        return _skip("skipped")
+        return _skip("market_disabled", market=market)
 
     
     exchange = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "binance").lower().strip()
@@ -3455,16 +3455,16 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
     # Hard minimums (validated in bot UI and DB, but re-checked here for safety)
     if mt == "spot" and 0 < need_usdt < 15:
-        return _skip("skipped")
+        return _skip("amount_below_minimum", minimum=15, requested=float(need_usdt), market=market)
     if mt == "futures" and 0 < need_usdt < 10:
-        return _skip("skipped")
+        return _skip("amount_below_minimum", minimum=10, requested=float(need_usdt), market=market)
     if need_usdt <= 0:
-        return _skip("skipped")
+        return _skip("amount_not_set", requested=float(need_usdt), market=market)
 
     # fetch keys
     row = await db_store.get_autotrade_keys_row(user_id=uid, exchange=exchange, market_type=mt)
     if not row or not bool(row.get("is_active")):
-        return _skip("skipped")
+        return _skip("keys_inactive", exchange=exchange, market=market)
     try:
         api_key = _decrypt_token(row.get("api_key_enc"))
         api_secret = _decrypt_token(row.get("api_secret_enc"))
@@ -3480,7 +3480,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
     symbol = str(getattr(sig, "symbol", "") or "").upper().replace("/", "")
     if not symbol:
-        return _skip("skipped")
+        return _skip("missing_symbol")
 
     direction = str(getattr(sig, "direction", "LONG") or "LONG").upper()
     entry = float(getattr(sig, "entry", 0.0) or 0.0)
@@ -3774,7 +3774,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
         # -------- OKX / MEXC / Gate.io (SPOT) --------
         if exchange in ("okx", "mexc", "gateio"):
             if mt != "spot":
-                return _skip("skipped")
+                return _skip("unsupported_market_type_for_exchange", exchange=exchange, market=market)
 
             # Futures cap is irrelevant for SPOT; spot cap is wallet balance.
             symbol = _normalize_symbol(getattr(sig, "symbol", "") or "")
@@ -3799,7 +3799,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             # Execute market entry
             if direction == "SHORT":
                 # Spot short is not supported in this bot (requires margin). Skip safely.
-                return _skip("skipped")
+                return _skip("spot_short_not_supported", exchange=exchange, market=market)
 
             if exchange == "okx":
                 passphrase = _decrypt_token(row.get("passphrase_enc"))
@@ -3847,7 +3847,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
         # Safety guard: never fall through into Binance execution for other exchanges
         if exchange != "binance":
-            return _skip("skipped")
+            return _skip("unsupported_exchange", exchange=exchange, market=market)
 
 # -------- Binance --------
         if mt == "spot":
@@ -4007,11 +4007,11 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
         # futures
         used = await db_store.get_autotrade_used_usdt(uid, "futures")
         if fut_cap > 0 and used + need_usdt > fut_cap:
-            return _skip("skipped")
+            return _skip("futures_cap_reached", used_usdt=float(used), need_usdt=float(need_usdt), cap_usdt=float(fut_cap), exchange=exchange, market=market)
 
         avail = await _binance_futures_available_margin(api_key, api_secret)
         if avail < need_usdt:
-            return _skip("skipped")
+            return _skip("insufficient_balance", free_usdt=float(avail), need_usdt=float(need_usdt), exchange=exchange, market=market)
 
         await _binance_futures_set_leverage(api_key=api_key, api_secret=api_secret, symbol=symbol, leverage=fut_lev)
 
