@@ -2189,6 +2189,14 @@ def _user_lock(uid: int) -> asyncio.Lock:
     return lock
 
 
+# Global Signal bot settings cache (admin panel)
+SIGNAL_BOT_GLOBAL: Dict[str, object] = {
+    "pause_signals": False,
+    "maintenance_mode": False,
+    "referral_enabled": False,
+    "updated_at": None,
+}
+
 # Auto-trade stats UI state
 AUTOTRADE_STATS_STATE: Dict[int, Dict[str, str]] = {}
 
