@@ -452,6 +452,7 @@ except (ZoneInfoNotFoundError, FileNotFoundError):
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 backend = Backend()
+BOT_PUBLIC_USERNAME = (os.getenv("BOT_USERNAME") or "").strip().lstrip("@")
 
 # Dedicated bot for payment/admin notifications.
 # IMPORTANT: there is intentionally NO fallback to the main bot.
@@ -1937,8 +1938,25 @@ def referral_admin_request_kb(user_id: int, request_id: int) -> types.InlineKeyb
     return kb.as_markup()
 
 
+async def _ensure_public_bot_username() -> str:
+    global BOT_PUBLIC_USERNAME
+    uname = (BOT_PUBLIC_USERNAME or "").strip().lstrip("@")
+    if uname:
+        return uname
+    try:
+        me = await bot.get_me()
+        uname = (getattr(me, 'username', None) or "").strip().lstrip("@")
+        if uname:
+            BOT_PUBLIC_USERNAME = uname
+            logger.info("referral: resolved public bot username @%s", uname)
+            return uname
+    except Exception:
+        logger.exception("referral: failed to resolve public bot username")
+    return ""
+
+
 def _ref_link(uid: int) -> str:
-    uname = (os.getenv("BOT_USERNAME") or "").strip().lstrip("@")
+    uname = (BOT_PUBLIC_USERNAME or "").strip().lstrip("@")
     if uname:
         return f"https://t.me/{uname}?start={int(uid)}"
     return f"/start {int(uid)}"
@@ -3354,6 +3372,7 @@ async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, f
 # ---------------- commands ----------------
 @dp.message(Command("start"))
 async def start(message: types.Message) -> None:
+    await _ensure_public_bot_username()
     uid = message.from_user.id if message.from_user else 0
     referrer_id = None
     try:
