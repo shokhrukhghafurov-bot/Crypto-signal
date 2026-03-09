@@ -485,6 +485,8 @@ REFERRAL_ADMIN_BOT_USERNAME = (os.getenv("REFERRAL_ADMIN_BOT_USERNAME") or "Payr
 REFERRAL_MIN_WITHDRAW_USDT = float(os.getenv("REFERRAL_MIN_WITHDRAW_USDT", "10") or 10)
 REFERRAL_REWARD_PERCENT = float(os.getenv("REFERRAL_REWARD_PERCENT", "10") or 10)
 REFERRAL_NETWORK = (os.getenv("REFERRAL_NETWORK") or "BSC (BEP20)").strip() or "BSC (BEP20)"
+# Runtime flag: users currently entering a referral withdrawal wallet.
+REFERRAL_WITHDRAW_INPUT: Dict[int, bool] = {}
 
 # ---------------- MID digest sender (USES ERROR BOT via ERROR_BOT_TOKEN) ----------------
 # Digest is diagnostics; it should go to @errorrrrrrg_bot (ERROR_BOT_TOKEN), not the main bot.
