@@ -13742,13 +13742,22 @@ def _mid_quality_first_enabled() -> bool:
 
 
 def _mid_trigger_min_passed() -> int:
-    """Smart-trigger threshold. In quality-first mode never allow a lax threshold below 9."""
+    """Smart-trigger threshold.
+
+    Quality-first keeps a strict default (9) only when MID_TRIGGER_MIN_PASSED is not set.
+    If MID_TRIGGER_MIN_PASSED is provided via env, use that exact threshold.
+    """
     try:
-        raw = int(float(os.getenv("MID_TRIGGER_MIN_PASSED", "0") or 0))
+        raw_env = os.getenv("MID_TRIGGER_MIN_PASSED", None)
+        raw_txt = "" if raw_env is None else str(raw_env).strip()
+        raw = int(float(raw_txt or 0))
     except Exception:
+        raw_txt = ""
         raw = 0
     if _mid_quality_first_enabled():
-        return max(9, raw)
+        if raw_txt == "":
+            return 9
+        return max(0, raw)
     return max(0, raw)
 
 
