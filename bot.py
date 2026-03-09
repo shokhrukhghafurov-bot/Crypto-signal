@@ -1695,7 +1695,7 @@ async def _grant_paid_plan_and_notify(order: dict, event: dict) -> None:
                 order_id=str(order.get('order_id') or ''),
                 payment_amount=float(order.get('amount') or plan.get('amount') or 0),
                 currency='USDT',
-                reward_percent=10.0,
+                reward_percent=REFERRAL_REWARD_PERCENT,
             )
             if referral_reward:
                 await _notify_referrer_bonus(referral_reward)
@@ -4145,7 +4145,7 @@ async def referral_withdraw_wallet_input(message: types.Message) -> None:
         await message.answer(trf(uid, 'ref_withdraw_not_enough', min_withdraw=_fmt_money(REFERRAL_MIN_WITHDRAW_USDT), available_balance=_fmt_money(amount)), reply_markup=referral_balance_kb(uid))
         return
     try:
-        req = await db_store.create_referral_withdrawal_request(user_id=uid, wallet_address=wallet, amount=amount, currency='USDT', network='BSC')
+        req = await db_store.create_referral_withdrawal_request(user_id=uid, wallet_address=wallet, amount=amount, currency='USDT', network=REFERRAL_NETWORK)
     except ValueError as e:
         code = str(e)
         if code == 'pending_request_exists':
