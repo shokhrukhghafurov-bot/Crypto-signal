@@ -13856,10 +13856,35 @@ def _mid_trigger_min_passed() -> int:
     return max(0, raw)
 
 
+def _mid_gate_listify(value) -> list:
+    """Normalize gate inputs that may arrive as list/tuple/set/string/scalar."""
+    try:
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return [x for x in value]
+        if isinstance(value, str):
+            txt = value.strip()
+            if not txt:
+                return []
+            if txt.startswith("[") and txt.endswith("]"):
+                try:
+                    parsed = json.loads(txt)
+                    if isinstance(parsed, list):
+                        return [x for x in parsed]
+                except Exception:
+                    pass
+            parts = [p.strip() for p in re.split(r"[;,|]", txt) if str(p).strip()]
+            return parts if parts else [txt]
+        return [value]
+    except Exception:
+        return []
+
+
 def _mid_pending_quality_ok(rec: dict) -> tuple[bool, str]:
     """Reject weak/almost-good pending setups before they are stored."""
     try:
-        flags = {str(x).strip().lower() for x in (rec.get("risk_flags") or []) if str(x).strip()}
+        flags = {str(x).strip().lower() for x in _mid_gate_listify(rec.get("risk_flags")) if str(x).strip()}
     except Exception:
         flags = set()
     hard_bad = {"far_zone", "vol_low", "regime_range_no_breakout", "structure_mismatch", "blocked"}
@@ -13893,6 +13918,195 @@ def _mid_pending_quality_ok(rec: dict) -> tuple[bool, str]:
     except Exception:
         pass
     return (True, "")
+
+
+def _mid_ta_gate_enabled() -> bool:
+    """Feature-flag for pending-stage MID TA gate.
+
+    When enabled, we count how many pre-pending filters passed/blocked and only
+    create a pending if passed >= MID_TA_GATE_MIN_PASS.
+    When disabled, the legacy flow stays unchanged.
+    """
+    return _mid_bool_env("MID_TA_GATE_ENABLED", "0")
+
+
+def _mid_ta_gate_min_pass() -> int:
+    try:
+        return max(0, int(float(os.getenv("MID_TA_GATE_MIN_PASS", "5") or 5)))
+    except Exception:
+        return 5
+
+
+def _mid_ta_gate_debug() -> bool:
+    return _mid_bool_env("MID_TA_GATE_DEBUG", "0")
+
+
+def _mid_ta_gate_eval(rec: dict) -> dict:
+    """Evaluate a count-based TA gate right before pending creation.
+
+    Result shape:
+      {enabled, passed, blocked, skipped, min_pass, allow, checks, blocked_reasons}
+
+    Notes:
+    - Only uses fields already available in the pending record, so it is safe to
+      plug into the existing flow without changing scanner internals.
+    - If MID_TA_GATE_ENABLED=0, caller should skip this function and preserve the
+      legacy score/confidence → pending behavior.
+    """
+    checks: dict[str, str] = {}
+    blocked_reasons: list[str] = []
+
+    def add(name: str, status: str) -> None:
+        s = str(status or "skip").strip().lower()
+        if s not in ("pass", "block", "skip"):
+            s = "skip"
+        checks[str(name)] = s
+        if s == "block":
+            blocked_reasons.append(str(name))
+
+    try:
+        # 1) Legacy pending-quality gate as one counted filter.
+        ok_q, bad_q = _mid_pending_quality_ok(rec)
+        add("pending_quality", "pass" if ok_q else "block")
+        if (not ok_q) and bad_q:
+            blocked_reasons[-1] = f"pending_quality:{bad_q}"
+
+        # 2) Confidence threshold.
+        try:
+            conf = int(float(rec.get("confidence") or 0))
+            min_conf = int(float(rec.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0))
+            add("confidence", "pass" if (min_conf <= 0 or conf >= min_conf) else "block")
+        except Exception:
+            add("confidence", "skip")
+
+        # 3) RR threshold.
+        try:
+            rr = float(rec.get("rr") or 0.0)
+            min_rr = float(os.getenv("MID_MIN_RR", "0") or 0.0)
+            add("rr", "pass" if (rr > 0 and (min_rr <= 0 or rr >= min_rr)) else "block")
+        except Exception:
+            add("rr", "block")
+
+        # 4) Entry zone source validity.
+        zsrc = str(rec.get("entry_zone_src") or rec.get("zone_source") or "").strip().lower()
+        if not zsrc:
+            add("zone_source", "skip")
+        elif zsrc in ("none", "too_wide", "far", "error"):
+            add("zone_source", "block")
+        else:
+            add("zone_source", "pass")
+
+        # 5) Entry zone bounds integrity.
+        try:
+            lo = rec.get("entry_low")
+            hi = rec.get("entry_high")
+            if lo is None or hi is None:
+                add("zone_bounds", "skip")
+            else:
+                lo_f = float(lo); hi_f = float(hi)
+                add("zone_bounds", "pass" if (lo_f > 0 and hi_f > 0 and hi_f >= lo_f) else "block")
+        except Exception:
+            add("zone_bounds", "block")
+
+        # 6) Zone width vs ATR (strict pending width).
+        try:
+            width_atr = rec.get("zone_width_atr")
+            atr0 = float(rec.get("atr_at_create") or 0.0)
+            if width_atr is None:
+                lo = rec.get("entry_low")
+                hi = rec.get("entry_high")
+                if lo is not None and hi is not None and atr0 > 0:
+                    width_atr = (float(hi) - float(lo)) / atr0
+            if width_atr is None:
+                add("zone_width", "skip")
+            else:
+                max_w = float(os.getenv("MID_ZONE_MAX_WIDTH_ATR_STRICT", os.getenv("MID_PENDING_ZONE_MAX_ATR", "0.60")) or 0.60)
+                add("zone_width", "pass" if float(width_atr) <= max_w else "block")
+        except Exception:
+            add("zone_width", "skip")
+
+        # 7) Distance to zone at create time.
+        try:
+            dist0 = rec.get("dist_to_zone_at_create_atr")
+            if dist0 is None:
+                add("zone_distance", "skip")
+            else:
+                max_dist = float(os.getenv("MID_TA_GATE_MAX_DIST_ATR", "2.5") or 2.5)
+                add("zone_distance", "pass" if float(dist0) <= max_dist else "block")
+        except Exception:
+            add("zone_distance", "skip")
+
+        # 8) Risk flags hard blockers.
+        try:
+            flags = {str(x).strip().lower() for x in _mid_gate_listify(rec.get("risk_flags")) if str(x).strip()}
+        except Exception:
+            flags = set()
+        hard_bad = {"far_zone", "vol_low", "regime_range_no_breakout", "structure_mismatch", "blocked"}
+        bad_hit = sorted(flags & hard_bad)
+        add("risk_flags", "pass" if not bad_hit else "block")
+        if bad_hit and blocked_reasons:
+            blocked_reasons[-1] = f"risk_flags:{','.join(bad_hit)}"
+
+        # 9) Confirmation count.
+        try:
+            confs_raw = rec.get("confirmations")
+            if isinstance(confs_raw, (int, float)) and not isinstance(confs_raw, bool):
+                conf_n = max(0, int(float(confs_raw)))
+            else:
+                conf_n = len([x for x in _mid_gate_listify(confs_raw) if str(x).strip()])
+            min_n = max(0, int(float(os.getenv("MID_TA_GATE_MIN_CONFIRMATIONS", "1") or 1)))
+            if min_n <= 0:
+                add("confirmations", "skip")
+            else:
+                add("confirmations", "pass" if conf_n >= min_n else "block")
+        except Exception:
+            add("confirmations", "skip")
+
+        # 10) ATR presence.
+        try:
+            atr0 = float(rec.get("atr_at_create") or 0.0)
+            add("atr", "pass" if atr0 > 0 else "block")
+        except Exception:
+            add("atr", "block")
+
+        # 11) TTL sanity.
+        try:
+            ttl_min = float(rec.get("ttl_min") or 0.0)
+            add("ttl", "pass" if ttl_min > 0 else "block")
+        except Exception:
+            add("ttl", "skip")
+
+    except Exception as e:
+        fail_open = _mid_bool_env("MID_TA_GATE_FAIL_OPEN", "0")
+        min_pass = _mid_ta_gate_min_pass()
+        return {
+            "enabled": 0,
+            "passed": 0,
+            "blocked": 0,
+            "skipped": 0,
+            "min_pass": min_pass,
+            "allow": bool(fail_open),
+            "checks": {},
+            "blocked_reasons": [f"gate_exception:{e}"],
+        }
+
+    enabled = sum(1 for v in checks.values() if v in ("pass", "block"))
+    passed = sum(1 for v in checks.values() if v == "pass")
+    blocked = sum(1 for v in checks.values() if v == "block")
+    skipped = sum(1 for v in checks.values() if v == "skip")
+    min_pass = _mid_ta_gate_min_pass()
+    allow = passed >= min_pass
+
+    return {
+        "enabled": int(enabled),
+        "passed": int(passed),
+        "blocked": int(blocked),
+        "skipped": int(skipped),
+        "min_pass": int(min_pass),
+        "allow": bool(allow),
+        "checks": checks,
+        "blocked_reasons": blocked_reasons,
+    }
 
 
 def _mid_recalc_levels_from_trigger(direction: str, trigger_price: float, ta: dict | None, it: dict | None) -> tuple[float,float,float,float,float]:
@@ -20418,15 +20632,54 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 rec["reverse_dist_atr"] = float(_reverse_dist_atr)
                                         except Exception:
                                             pass
-                                    _ok_pending, _pending_bad_reason = _mid_pending_quality_ok(rec)
-                                    if not _ok_pending:
+                                    if _mid_ta_gate_enabled():
+                                        gate = _mid_ta_gate_eval(rec)
                                         try:
-                                            _pending_skip(sym, f"quality_gate:{_pending_bad_reason}")
+                                            rec["ta_gate_enabled"] = True
+                                            rec["ta_gate"] = gate
+                                            rec["ta_gate_enabled_n"] = int(gate.get("enabled", 0) or 0)
+                                            rec["ta_gate_passed"] = int(gate.get("passed", 0) or 0)
+                                            rec["ta_gate_blocked"] = int(gate.get("blocked", 0) or 0)
+                                            rec["ta_gate_skipped"] = int(gate.get("skipped", 0) or 0)
+                                            rec["ta_gate_min_pass"] = int(gate.get("min_pass", 0) or 0)
+                                            rec["ta_gate_allow"] = bool(gate.get("allow", False))
                                         except Exception:
                                             pass
-                                        _mid_f_rejected += 1
-                                        _rej_add(sym, f"pending_quality:{_pending_bad_reason}")
-                                        continue
+                                        if _mid_ta_gate_debug():
+                                            try:
+                                                logger.info(
+                                                    "[mid][ta-gate] sym=%s market=%s dir=%s allow=%s passed=%s blocked=%s enabled=%s skipped=%s min_pass=%s reasons=%s",
+                                                    sym,
+                                                    marketu,
+                                                    diru,
+                                                    bool(gate.get("allow", False)),
+                                                    int(gate.get("passed", 0) or 0),
+                                                    int(gate.get("blocked", 0) or 0),
+                                                    int(gate.get("enabled", 0) or 0),
+                                                    int(gate.get("skipped", 0) or 0),
+                                                    int(gate.get("min_pass", 0) or 0),
+                                                    ",".join([str(x) for x in (gate.get("blocked_reasons") or [])]),
+                                                )
+                                            except Exception:
+                                                pass
+                                        if not bool(gate.get("allow", False)):
+                                            try:
+                                                _pending_skip(sym, f"ta_gate_block passed={int(gate.get('passed', 0) or 0)}/{int(gate.get('min_pass', 0) or 0)} blocked={int(gate.get('blocked', 0) or 0)}")
+                                            except Exception:
+                                                pass
+                                            _mid_f_rejected += 1
+                                            _rej_add(sym, f"ta_gate:{','.join([str(x) for x in (gate.get('blocked_reasons') or [])[:3]]) or 'min_pass'}")
+                                            continue
+                                    else:
+                                        _ok_pending, _pending_bad_reason = _mid_pending_quality_ok(rec)
+                                        if not _ok_pending:
+                                            try:
+                                                _pending_skip(sym, f"quality_gate:{_pending_bad_reason}")
+                                            except Exception:
+                                                pass
+                                            _mid_f_rejected += 1
+                                            _rej_add(sym, f"pending_quality:{_pending_bad_reason}")
+                                            continue
 
                                     await self.add_mid_pending(rec)
                                     self.mark_mid_pending(sym, direction=diru, market=marketu)
