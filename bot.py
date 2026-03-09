@@ -55,7 +55,7 @@ from aiohttp import web, ClientSession
 
 import db_store
 
-from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test, mid_summary_heartbeat_loop
+from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test, mid_summary_heartbeat_loop, autotrade_anomaly_watchdog_loop
 import time
 import hashlib
 import hmac
@@ -7025,6 +7025,13 @@ async def main() -> None:
             name="autotrade-manager-heartbeat",
         )
 
+        TASKS["autotrade-anomaly-watchdog"] = asyncio.create_task(
+            autotrade_anomaly_watchdog_loop(notify_api_error=_notify_autotrade_api_error),
+            name="autotrade-anomaly-watchdog",
+        )
+        _health_mark_ok("autotrade-anomaly-watchdog")
+        _attach_task_monitor("autotrade-anomaly-watchdog", TASKS["autotrade-anomaly-watchdog"])
+
         TASKS["health-status"] = asyncio.create_task(_health_status_loop(), name="health-status")
         _attach_task_monitor("health-status", TASKS["health-status"])
 
@@ -7041,6 +7048,8 @@ async def main() -> None:
         try:
             TASKS["autotrade-manager"] = asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error), name="autotrade-manager")
             _health_mark_ok("autotrade-manager")
+            TASKS["autotrade-anomaly-watchdog"] = asyncio.create_task(autotrade_anomaly_watchdog_loop(notify_api_error=_notify_autotrade_api_error), name="autotrade-anomaly-watchdog")
+            _health_mark_ok("autotrade-anomaly-watchdog")
         except Exception:
             pass
         await asyncio.Event().wait()
@@ -7061,6 +7070,7 @@ async def main() -> None:
 
     # Auto-trade manager (SL/TP/BE) - runs in background.
     asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error))
+    asyncio.create_task(autotrade_anomaly_watchdog_loop(notify_api_error=_notify_autotrade_api_error))
     await dp.start_polling(bot)
 
 
