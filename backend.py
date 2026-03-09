@@ -1475,6 +1475,76 @@ def _mid_hardblock_dump(max_keys: int = 6) -> str:
     except Exception:
         return ""
 
+
+def _mid_soft_blocks_enabled() -> bool:
+    try:
+        return (os.getenv("MID_SOFT_BLOCKS_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return True
+
+
+def _mid_soft_block_penalty_for_reason(reason: str):
+    """Return (bucket, penalty) when a former hard-block should become a score penalty.
+
+    None means the reason must remain a hard block. We keep truly bad entries blocked
+    (deep late entries / extreme-near-level entries), while borderline cases become
+    score penalties so strong setups can still pass.
+    """
+    try:
+        if not _mid_soft_blocks_enabled():
+            return None
+        r = str(reason or "").strip()
+        if not r:
+            return None
+
+        def _pen(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, str(default)) or default)
+            except Exception:
+                return float(default)
+
+        if r.startswith("bb_bounce_zone="):
+            return ("bb_bounce_zone_penalty", -abs(_pen("MID_PENALTY_BB_BOUNCE_ZONE", 8.0)))
+
+        if r.startswith("vwap_side_short"):
+            return ("vwap_side_short_penalty", -abs(_pen("MID_PENALTY_VWAP_SIDE_SHORT", 6.0)))
+
+        if r.startswith("late_entry_atr="):
+            m = re.search(r"late_entry_atr=([0-9.]+)\s*>\s*([0-9.]+)", r)
+            if not m:
+                return None
+            move = float(m.group(1))
+            limit = max(1e-9, float(m.group(2)))
+            hard_mult = _pen("MID_HARD_LATE_ENTRY_MULT", 1.50)
+            if move > (limit * hard_mult):
+                return None
+            return ("late_entry_penalty", -abs(_pen("MID_PENALTY_LATE_ENTRY_ATR", 10.0)))
+
+        if r.startswith("near_recent_low"):
+            m = re.search(r"dist_atr=([0-9.]+)\s*<\s*([0-9.]+)", r)
+            if not m:
+                return None
+            dist = float(m.group(1))
+            thr = max(1e-9, float(m.group(2)))
+            hard_frac = _pen("MID_HARD_NEAR_EXTREME_FRAC", 0.70)
+            if dist < (thr * hard_frac):
+                return None
+            return ("near_recent_low_penalty", -abs(_pen("MID_PENALTY_NEAR_RECENT_LOW", 6.0)))
+
+        if r.startswith("near_recent_high"):
+            m = re.search(r"dist_atr=([0-9.]+)\s*<\s*([0-9.]+)", r)
+            if not m:
+                return None
+            dist = float(m.group(1))
+            thr = max(1e-9, float(m.group(2)))
+            hard_frac = _pen("MID_HARD_NEAR_EXTREME_FRAC", 0.70)
+            if dist < (thr * hard_frac):
+                return None
+            return ("near_recent_high_penalty", -abs(_pen("MID_PENALTY_NEAR_RECENT_HIGH", 6.0)))
+    except Exception:
+        return None
+    return None
+
 # --- MID trap digest sink (aggregates "MID blocked (trap)" into a periodic digest) ---
 
 # Trap log dedup (avoid spamming the same message every second)
@@ -9328,6 +9398,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     except Exception:
         pass
 
+    mid_soft_penalties: Dict[str, float] = {}
+
     # ------------------ MID hard filters (reduce SL hits) ------------------
     # NOTE: We keep the thresholds centralized in globals (MID_*), and produce
     # a human-readable reason for logs / error-bot digest.
@@ -9478,37 +9550,48 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             adx_30m=float(adx30) if not np.isnan(adx30) else None,
         )
         if reason:
-            try:
-                _mid_inc_hard_block(1)
-                _mid_hardblock_track(str(reason), symbol)
-                _k = f"block|{symbol}|{dir_trend}|{_mid_trap_reason_key(str(reason))}"
-                _ctx = _MID_TICK_CTX.get()
-                _tick_key = f"{symbol}|{dir_trend}|block"
-                if _ctx is not None and _tick_key in _ctx.get('block', set()):
-                    _ctx['suppress_block'] = int(_ctx.get('suppress_block', 0)) + 1
-                else:
-                    if _ctx is not None:
-                        _ctx.setdefault('block', set()).add(_tick_key)
+            _soft_pen = _mid_soft_block_penalty_for_reason(str(reason))
+            if _soft_pen is not None:
+                try:
+                    _sp_key, _sp_val = _soft_pen
+                    mid_soft_penalties[_sp_key] = mid_soft_penalties.get(_sp_key, 0.0) + float(_sp_val)
+                    _k = f"soft|{symbol}|{dir_trend}|{_mid_trap_reason_key(str(reason))}"
                     if _mid_trap_should_log(_k):
-                        logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, reason, float(entry))
-                # Reuse MID trap sink/digest to show why MID hard-filters blocked entries
-                _emit_mid_trap_event({
-                    "dir": str(dir_trend),
-                    # Keep the raw reason so the digest can bucket by the *actual* filter
-                    # (anti_bounce_short / rsi_short / bb_bounce_zone / etc.)
-                    "reason": str(reason),
-                    "reason_key": _mid_trap_reason_key(str(reason)),
-                    "entry": float(entry),
-                })
-            except Exception:
-                pass
-            # IMPORTANT: surface the concrete block reason in MID no-signal summary.
-            # Without this, the caller sees stage==other but reason missing -> other{unknown=...}.
-            try:
-                _fail("other", str(reason))
-            except Exception:
-                pass
-            return None
+                        logger.info("[mid][soft] %s dir=%s reason=%s penalty=%+.1f entry=%.6g", symbol, dir_trend, reason, float(_sp_val), float(entry))
+                except Exception:
+                    pass
+            else:
+                try:
+                    _mid_inc_hard_block(1)
+                    _mid_hardblock_track(str(reason), symbol)
+                    _k = f"block|{symbol}|{dir_trend}|{_mid_trap_reason_key(str(reason))}"
+                    _ctx = _MID_TICK_CTX.get()
+                    _tick_key = f"{symbol}|{dir_trend}|block"
+                    if _ctx is not None and _tick_key in _ctx.get('block', set()):
+                        _ctx['suppress_block'] = int(_ctx.get('suppress_block', 0)) + 1
+                    else:
+                        if _ctx is not None:
+                            _ctx.setdefault('block', set()).add(_tick_key)
+                        if _mid_trap_should_log(_k):
+                            logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, reason, float(entry))
+                    # Reuse MID trap sink/digest to show why MID hard-filters blocked entries
+                    _emit_mid_trap_event({
+                        "dir": str(dir_trend),
+                        # Keep the raw reason so the digest can bucket by the *actual* filter
+                        # (anti_bounce_short / rsi_short / bb_bounce_zone / etc.)
+                        "reason": str(reason),
+                        "reason_key": _mid_trap_reason_key(str(reason)),
+                        "entry": float(entry),
+                    })
+                except Exception:
+                    pass
+                # IMPORTANT: surface the concrete block reason in MID no-signal summary.
+                # Without this, the caller sees stage==other but reason missing -> other{unknown=...}.
+                try:
+                    _fail("other", str(reason))
+                except Exception:
+                    pass
+                return None
     except Exception:
         # If filters fail, do not block signal.
         pass
@@ -9693,8 +9776,9 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             trigger_score += 6.0
             mid_bonus_parts["order_block"] = mid_bonus_parts.get("order_block", 0.0) + 6.0
         if trigger_score <= 0.0:
-            trigger_score -= 4.0
-            mid_bonus_parts["no_trigger_penalty"] = mid_bonus_parts.get("no_trigger_penalty", 0.0) - 4.0
+            _no_trigger_penalty = abs(float(os.getenv("MID_PENALTY_NO_TRIGGER", "5") or 5))
+            trigger_score -= _no_trigger_penalty
+            mid_bonus_parts["no_trigger_penalty"] = mid_bonus_parts.get("no_trigger_penalty", 0.0) - _no_trigger_penalty
         mid_bonus += trigger_score
 
         # VWAP bias on 30m
@@ -9743,6 +9827,15 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         mid_bonus_parts = {}
         fvg_kind = "—"
         fvg_active = False
+
+    # Apply converted former hard-blocks as score penalties.
+    try:
+        if mid_soft_penalties:
+            for _k, _v in mid_soft_penalties.items():
+                mid_bonus += float(_v)
+                mid_bonus_parts[_k] = mid_bonus_parts.get(_k, 0.0) + float(_v)
+    except Exception:
+        pass
 
     # Total score (base + bonus). Optionally allow >100 for internal tuning.
     try:
@@ -18996,6 +19089,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     _mid_f_adx = 0
                     _mid_f_atr = 0
                     _mid_f_futoff = 0
+                    _mid_f_rejected = 0
                     _mid_candles_net_fail = 0
                     _mid_no_signal = 0
                     _mid_no_signal_reasons = {"trap":0,"structure":0,"trend":0,"extreme":0,"impulse":0,"other":0}
