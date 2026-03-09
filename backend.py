@@ -13958,24 +13958,42 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
       plug into the existing flow without changing scanner internals.
     - If MID_TA_GATE_ENABLED=0, caller should skip this function and preserve the
       legacy score/confidence → pending behavior.
+    - Hard blockers must never be allowed through only because min_pass is low.
+    - Legacy pending_quality is kept only for unique reasons that are not already
+      evaluated by dedicated atomic checks below, to avoid double counting.
     """
     checks: dict[str, str] = {}
     blocked_reasons: list[str] = []
+    hard_blocked_reasons: list[str] = []
 
-    def add(name: str, status: str) -> None:
+    def add(name: str, status: str, *, reason: str = "", hard: bool = False) -> None:
         s = str(status or "skip").strip().lower()
         if s not in ("pass", "block", "skip"):
             s = "skip"
-        checks[str(name)] = s
+        key = str(name)
+        checks[key] = s
         if s == "block":
-            blocked_reasons.append(str(name))
+            msg = str(reason or key)
+            blocked_reasons.append(msg)
+            if hard:
+                hard_blocked_reasons.append(msg)
 
     try:
-        # 1) Legacy pending-quality gate as one counted filter.
+        # 1) Legacy pending-quality gate only for UNIQUE reasons.
         ok_q, bad_q = _mid_pending_quality_ok(rec, include_confidence=False)
-        add("pending_quality", "pass" if ok_q else "block")
-        if (not ok_q) and bad_q:
-            blocked_reasons[-1] = f"pending_quality:{bad_q}"
+        bad_q_s = str(bad_q or "").strip().lower()
+        duplicate_prefixes = (
+            "risk_flags:",
+            "zone_too_wide:",
+            "zone_invalid",
+            "rr_invalid",
+        )
+        if ok_q:
+            add("pending_quality", "pass")
+        elif any(bad_q_s.startswith(p) for p in duplicate_prefixes):
+            add("pending_quality", "skip")
+        else:
+            add("pending_quality", "block", reason=f"pending_quality:{bad_q}", hard=True)
 
         # 2) Confidence threshold is enforced before TA gate, so do not count it here.
         add("confidence", "skip")
@@ -13984,16 +14002,17 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
         try:
             rr = float(rec.get("rr") or 0.0)
             min_rr = float(os.getenv("MID_MIN_RR", "0") or 0.0)
-            add("rr", "pass" if (rr > 0 and (min_rr <= 0 or rr >= min_rr)) else "block")
+            rr_ok = (rr > 0 and (min_rr <= 0 or rr >= min_rr))
+            add("rr", "pass" if rr_ok else "block", reason=("rr" if rr_ok else f"rr<{min_rr:g}"), hard=not rr_ok)
         except Exception:
-            add("rr", "block")
+            add("rr", "block", reason="rr_invalid", hard=True)
 
         # 4) Entry zone source validity.
         zsrc = str(rec.get("entry_zone_src") or rec.get("zone_source") or "").strip().lower()
         if not zsrc:
             add("zone_source", "skip")
         elif zsrc in ("none", "too_wide", "far", "error"):
-            add("zone_source", "block")
+            add("zone_source", "block", reason=f"zone_source:{zsrc}", hard=True)
         else:
             add("zone_source", "pass")
 
@@ -14005,9 +14024,10 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
                 add("zone_bounds", "skip")
             else:
                 lo_f = float(lo); hi_f = float(hi)
-                add("zone_bounds", "pass" if (lo_f > 0 and hi_f > 0 and hi_f >= lo_f) else "block")
+                ok_bounds = (lo_f > 0 and hi_f > 0 and hi_f >= lo_f)
+                add("zone_bounds", "pass" if ok_bounds else "block", reason="zone_invalid", hard=not ok_bounds)
         except Exception:
-            add("zone_bounds", "block")
+            add("zone_bounds", "block", reason="zone_invalid", hard=True)
 
         # 6) Zone width vs ATR (strict pending width).
         try:
@@ -14021,8 +14041,10 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
             if width_atr is None:
                 add("zone_width", "skip")
             else:
+                width_atr_f = float(width_atr)
                 max_w = float(os.getenv("MID_ZONE_MAX_WIDTH_ATR_STRICT", os.getenv("MID_PENDING_ZONE_MAX_ATR", "0.60")) or 0.60)
-                add("zone_width", "pass" if float(width_atr) <= max_w else "block")
+                ok_w = width_atr_f <= max_w
+                add("zone_width", "pass" if ok_w else "block", reason=("zone_width" if ok_w else f"zone_width:{width_atr_f:.2f}atr"), hard=not ok_w)
         except Exception:
             add("zone_width", "skip")
 
@@ -14032,8 +14054,10 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
             if dist0 is None:
                 add("zone_distance", "skip")
             else:
+                dist0_f = float(dist0)
                 max_dist = float(os.getenv("MID_TA_GATE_MAX_DIST_ATR", "2.5") or 2.5)
-                add("zone_distance", "pass" if float(dist0) <= max_dist else "block")
+                ok_d = dist0_f <= max_dist
+                add("zone_distance", "pass" if ok_d else "block", reason=("zone_distance" if ok_d else f"zone_distance:{dist0_f:.2f}atr"), hard=False)
         except Exception:
             add("zone_distance", "skip")
 
@@ -14044,9 +14068,7 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
             flags = set()
         hard_bad = {"far_zone", "vol_low", "regime_range_no_breakout", "structure_mismatch", "blocked"}
         bad_hit = sorted(flags & hard_bad)
-        add("risk_flags", "pass" if not bad_hit else "block")
-        if bad_hit and blocked_reasons:
-            blocked_reasons[-1] = f"risk_flags:{','.join(bad_hit)}"
+        add("risk_flags", "pass" if not bad_hit else "block", reason=("risk_flags" if not bad_hit else f"risk_flags:{','.join(bad_hit)}"), hard=bool(bad_hit))
 
         # 9) Confirmation count.
         try:
@@ -14059,21 +14081,23 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
             if min_n <= 0:
                 add("confirmations", "skip")
             else:
-                add("confirmations", "pass" if conf_n >= min_n else "block")
+                ok_conf = conf_n >= min_n
+                add("confirmations", "pass" if ok_conf else "block", reason=("confirmations" if ok_conf else f"confirmations<{min_n}"), hard=False)
         except Exception:
             add("confirmations", "skip")
 
         # 10) ATR presence.
         try:
             atr0 = float(rec.get("atr_at_create") or 0.0)
-            add("atr", "pass" if atr0 > 0 else "block")
+            ok_atr = atr0 > 0
+            add("atr", "pass" if ok_atr else "block", reason=("atr" if ok_atr else "atr_missing"), hard=not ok_atr)
         except Exception:
-            add("atr", "block")
+            add("atr", "block", reason="atr_missing", hard=True)
 
         # 11) TTL sanity.
         try:
             ttl_min = float(rec.get("ttl_min") or 0.0)
-            add("ttl", "pass" if ttl_min > 0 else "block")
+            add("ttl", "pass" if ttl_min > 0 else "block", reason=("ttl" if ttl_min > 0 else "ttl<=0"), hard=False)
         except Exception:
             add("ttl", "skip")
 
@@ -14089,6 +14113,7 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
             "allow": bool(fail_open),
             "checks": {},
             "blocked_reasons": [f"gate_exception:{e}"],
+            "hard_blocked_reasons": [f"gate_exception:{e}"] if not fail_open else [],
         }
 
     enabled = sum(1 for v in checks.values() if v in ("pass", "block"))
@@ -14096,7 +14121,7 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
     blocked = sum(1 for v in checks.values() if v == "block")
     skipped = sum(1 for v in checks.values() if v == "skip")
     min_pass = _mid_ta_gate_min_pass()
-    allow = passed >= min_pass
+    allow = (passed >= min_pass) and (not hard_blocked_reasons)
 
     return {
         "enabled": int(enabled),
@@ -14107,6 +14132,7 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
         "allow": bool(allow),
         "checks": checks,
         "blocked_reasons": blocked_reasons,
+        "hard_blocked_reasons": hard_blocked_reasons,
     }
 
 
