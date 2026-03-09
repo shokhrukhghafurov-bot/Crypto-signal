@@ -13881,8 +13881,13 @@ def _mid_gate_listify(value) -> list:
         return []
 
 
-def _mid_pending_quality_ok(rec: dict) -> tuple[bool, str]:
-    """Reject weak/almost-good pending setups before they are stored."""
+def _mid_pending_quality_ok(rec: dict, *, include_confidence: bool = True) -> tuple[bool, str]:
+    """Reject weak/almost-good pending setups before they are stored.
+
+    include_confidence=True keeps the legacy confidence gate. Set False when
+    confidence is enforced earlier (before TA gate) and should not be counted
+    twice inside the count-based gate.
+    """
     try:
         flags = {str(x).strip().lower() for x in _mid_gate_listify(rec.get("risk_flags")) if str(x).strip()}
     except Exception:
@@ -13891,10 +13896,11 @@ def _mid_pending_quality_ok(rec: dict) -> tuple[bool, str]:
     if _mid_quality_first_enabled() and (flags & hard_bad):
         return (False, f"risk_flags:{','.join(sorted(flags & hard_bad))}")
     try:
-        conf = int(float(rec.get("confidence") or 0))
-        min_conf = int(float(rec.get("min_confidence") or 0))
-        if min_conf > 0 and conf < min_conf:
-            return (False, f"confidence<{min_conf}")
+        if include_confidence:
+            conf = int(float(rec.get("confidence") or 0))
+            min_conf = int(float(rec.get("min_confidence") or 0))
+            if min_conf > 0 and conf < min_conf:
+                return (False, f"confidence<{min_conf}")
     except Exception:
         pass
     try:
@@ -13966,18 +13972,13 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
 
     try:
         # 1) Legacy pending-quality gate as one counted filter.
-        ok_q, bad_q = _mid_pending_quality_ok(rec)
+        ok_q, bad_q = _mid_pending_quality_ok(rec, include_confidence=False)
         add("pending_quality", "pass" if ok_q else "block")
         if (not ok_q) and bad_q:
             blocked_reasons[-1] = f"pending_quality:{bad_q}"
 
-        # 2) Confidence threshold.
-        try:
-            conf = int(float(rec.get("confidence") or 0))
-            min_conf = int(float(rec.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0))
-            add("confidence", "pass" if (min_conf <= 0 or conf >= min_conf) else "block")
-        except Exception:
-            add("confidence", "skip")
+        # 2) Confidence threshold is enforced before TA gate, so do not count it here.
+        add("confidence", "skip")
 
         # 3) RR threshold.
         try:
@@ -20632,6 +20633,32 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 rec["reverse_dist_atr"] = float(_reverse_dist_atr)
                                         except Exception:
                                             pass
+                                    _pre_conf_ok = True
+                                    _pre_conf_bad = ""
+                                    try:
+                                        _conf_now = int(float(rec.get("confidence") or 0))
+                                        _min_conf_now = int(float(rec.get("min_confidence") or os.getenv("MID_MIN_CONFIDENCE", "0") or 0))
+                                        if _min_conf_now > 0 and _conf_now < _min_conf_now:
+                                            _pre_conf_ok = False
+                                            _pre_conf_bad = f"confidence<{_min_conf_now}"
+                                    except Exception:
+                                        pass
+                                    if not _pre_conf_ok:
+                                        try:
+                                            logger.info(
+                                                "[mid][pre-ta-filter] sym=%s market=%s dir=%s reject=True reason=%s conf=%s",
+                                                sym, marketu, diru, _pre_conf_bad, int(rec.get("confidence") or 0)
+                                            )
+                                        except Exception:
+                                            pass
+                                        try:
+                                            _pending_skip(sym, f"pre_ta_filter:{_pre_conf_bad}")
+                                        except Exception:
+                                            pass
+                                        _mid_f_rejected += 1
+                                        _rej_add(sym, f"pre_ta_filter:{_pre_conf_bad}")
+                                        continue
+
                                     if _mid_ta_gate_enabled():
                                         gate = _mid_ta_gate_eval(rec)
                                         try:
