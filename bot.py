@@ -551,6 +551,17 @@ async def _error_bot_send(text: str) -> None:
             except Exception:
                 return
 
+async def _error_bot_send_autotrade_event(kind: str, **data) -> None:
+    try:
+        lines = [f"🤖 {str(kind or '').upper()}"]
+        for k, v in data.items():
+            if v is None or v == "":
+                continue
+            lines.append(f"{k}={v}")
+        await _error_bot_send("\n".join(lines))
+    except Exception:
+        pass
+
 def _should_forward_to_error_bot(levelno: int, msg: str) -> bool:
     """
     Production rules:
@@ -3080,6 +3091,19 @@ async def broadcast_signal(sig: Signal) -> None:
                     st = await db_store.get_autotrade_settings(_uid)
                     mt = "spot" if _sig.market == "SPOT" else "futures"
                     ex = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "").lower()
+                    sig_id = int(getattr(_sig, "signal_id", 0) or 0)
+                    logger.exception("[autotrade] unexpected_error uid=%s signal_id=%s exchange=%s market_type=%s symbol=%s", _uid, sig_id, ex, mt, getattr(_sig,'symbol',None))
+                    await _error_bot_send_autotrade_event(
+                        "AUTO_TRADE_ERROR",
+                        user_id=_uid,
+                        signal_id=sig_id,
+                        exchange=ex,
+                        market_type=mt,
+                        market=getattr(_sig, 'market', None),
+                        symbol=getattr(_sig, 'symbol', None),
+                        side=getattr(_sig, 'direction', None),
+                        error=f"{type(e).__name__}: {e}"[:1000],
+                    )
                     await _notify_autotrade_api_error(_uid, ex, mt, f"{getattr(_sig,'symbol','')} {getattr(_sig,'market','')}: {type(e).__name__}: {e}"[:500])
 
             asyncio.create_task(_run_autotrade(uid, sig))
