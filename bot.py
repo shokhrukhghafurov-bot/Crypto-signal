@@ -480,6 +480,11 @@ logger.info("[mid][dbg] methods can_add_mid_pending=%s add_mid_pending=%s mid_pe
 # Send important errors / blocks to a dedicated Telegram bot to avoid polluting the main bot chat.
 ERROR_BOT_TOKEN = (os.getenv("ERROR_BOT_TOKEN") or "").strip()
 ADMIN_ALERT_CHAT_ID = int(os.getenv("ADMIN_ALERT_CHAT_ID", "5090106525") or 5090106525)
+REFERRAL_ADMIN_CHAT_ID = int(os.getenv("REFERRAL_ADMIN_CHAT_ID", str(ADMIN_ALERT_CHAT_ID)) or ADMIN_ALERT_CHAT_ID)
+REFERRAL_ADMIN_BOT_USERNAME = (os.getenv("REFERRAL_ADMIN_BOT_USERNAME") or "Payreferralbot").lstrip('@')
+REFERRAL_MIN_WITHDRAW_USDT = float(os.getenv("REFERRAL_MIN_WITHDRAW_USDT", "10") or 10)
+REFERRAL_REWARD_PERCENT = float(os.getenv("REFERRAL_REWARD_PERCENT", "10") or 10)
+REFERRAL_NETWORK = (os.getenv("REFERRAL_NETWORK") or "BSC (BEP20)").strip() or "BSC (BEP20)"
 
 # ---------------- MID digest sender (USES ERROR BOT via ERROR_BOT_TOKEN) ----------------
 # Digest is diagnostics; it should go to @errorrrrrrg_bot (ERROR_BOT_TOKEN), not the main bot.
@@ -1491,6 +1496,13 @@ async def init_db() -> None:
     await db_store.ensure_schema()
     # Users table migrations (signal access columns) live in db_store
     await db_store.ensure_users_columns()
+    try:
+        sb = await db_store.get_signal_bot_settings()
+        SIGNAL_BOT_GLOBAL["pause_signals"] = bool(sb.get("pause_signals"))
+        SIGNAL_BOT_GLOBAL["maintenance_mode"] = bool(sb.get("maintenance_mode"))
+        SIGNAL_BOT_GLOBAL["referral_enabled"] = bool(sb.get("referral_enabled"))
+    except Exception:
+        logger.exception("startup: failed to load signal bot settings")
 
 
 
@@ -1664,26 +1676,54 @@ async def _grant_paid_plan_and_notify(order: dict, event: dict) -> None:
     telegram_id = int(order['telegram_id'])
     plan_code = str(order['plan'])
     plan = _plan_data(plan_code) or {"days": 30, "amount": order.get('amount') or 0}
-    res = await db_store.grant_subscription_plan(telegram_id, plan_code, int(plan.get('days') or 30))
+    await db_store.grant_subscription_plan(telegram_id, plan_code, int(plan.get('days') or 30))
     plan_name_ru = _plan_name(telegram_id, plan_code)
     try:
         await safe_send(telegram_id, tr_sub(telegram_id, 'payment_paid_user', plan_name=plan_name_ru, amount=_fmt_money(plan.get('amount') or 0), days=int(plan.get('days') or SUBSCRIPTION_DURATION_DAYS)), reply_markup=menu_kb(telegram_id))
     except Exception:
         logger.exception('payment: failed to notify user %s', telegram_id)
+    referral_reward = None
+    try:
+        sb = await db_store.get_signal_bot_settings()
+        referral_enabled = bool(sb.get('referral_enabled'))
+    except Exception:
+        referral_enabled = bool(SIGNAL_BOT_GLOBAL.get('referral_enabled'))
+    try:
+        if referral_enabled:
+            referral_reward = await db_store.award_referral_bonus_for_first_payment(
+                referral_user_id=telegram_id,
+                order_id=str(order.get('order_id') or ''),
+                payment_amount=float(order.get('amount') or plan.get('amount') or 0),
+                currency='USDT',
+                reward_percent=10.0,
+            )
+            if referral_reward:
+                await _notify_referrer_bonus(referral_reward)
+    except Exception:
+        logger.exception('payment: failed to apply referral reward for user %s', telegram_id)
+
     try:
         txid = event.get('payin_hash') or event.get('tx_hash') or event.get('payment_id') or '-'
-        admin_text = f"💰 Paid\n\nTelegram ID: {telegram_id}\nPlan: {_plan_name(telegram_id, plan_code)}\nAmount: {_fmt_money(order.get('amount') or 0)} {NOWPAYMENTS_PRICE_CURRENCY.upper()}\nTXID: {txid}"
+        admin_text = (
+            f"💰 Paid\n\n"
+            f"Telegram ID: {telegram_id}\n"
+            f"Plan: {_plan_name(telegram_id, plan_code)}\n"
+            f"Amount: {_fmt_money(order.get('amount') or 0)} {NOWPAYMENTS_PRICE_CURRENCY.upper()}\n"
+            f"TXID: {txid}"
+        )
+        if referral_reward:
+            admin_text += f"\nReferral bonus: {_fmt_money(referral_reward.get('reward_amount') or 0)} USDT"
         await safe_send_payment_alert(ADMIN_ALERT_CHAT_ID, admin_text)
     except Exception:
         logger.exception('payment: failed to notify admin')
 
-async def ensure_user(user_id: int) -> None:
+async def ensure_user(user_id: int, referrer_id: int | None = None) -> None:
     if not pool or not user_id:
         return
     # Create user row if missing and grant 24h Signal trial ONCE.
     # IMPORTANT: does NOT touch Arbitrage access.
     try:
-        await db_store.ensure_user_signal_trial(int(user_id))
+        await db_store.ensure_user_signal_trial(int(user_id), referrer_id=int(referrer_id) if referrer_id else None)
     except Exception:
         logger.exception("ensure_user: failed")
 
@@ -1847,10 +1887,162 @@ def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     # Hide Auto-trade button globally when auto-trade is paused (admin)
     if not bool(AUTOTRADE_BOT_GLOBAL.get("pause_autotrade")):
         kb.button(text=tr(uid, "m_autotrade"), callback_data="menu:autotrade")
+    try:
+        sb = SIGNAL_BOT_GLOBAL if isinstance(globals().get('SIGNAL_BOT_GLOBAL'), dict) else {}
+        if bool(sb.get("referral_enabled")):
+            kb.button(text=tr(uid, "m_referral"), callback_data="menu:referral")
+    except Exception:
+        pass
     kb.button(text=tr(uid, "m_trades"), callback_data="trades:page:0")
     kb.button(text=tr(uid, "m_notify"), callback_data="menu:notify")
-    kb.adjust(2, 2, 2, 2)
+    kb.adjust(2, 2, 2, 2, 1)
     return kb.as_markup()
+
+
+def referral_main_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "ref_get_link"), callback_data="ref:link")
+    kb.button(text=tr(uid, "ref_stats_btn"), callback_data="ref:stats")
+    kb.button(text=tr(uid, "ref_balance_btn"), callback_data="ref:balance")
+    kb.button(text=tr(uid, "ref_withdraw_btn"), callback_data="ref:withdraw")
+    kb.button(text=tr(uid, "btn_back"), callback_data="menu:status")
+    kb.adjust(1, 2, 1, 1)
+    return kb.as_markup()
+
+
+def referral_balance_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "ref_withdraw_btn"), callback_data="ref:withdraw")
+    kb.button(text=tr(uid, "btn_back"), callback_data="menu:referral")
+    kb.adjust(1, 1)
+    return kb.as_markup()
+
+
+def referral_withdraw_prompt_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=tr(uid, "btn_back"), callback_data="menu:referral")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def referral_admin_request_kb(user_id: int, request_id: int) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Выплачено", callback_data=f"refadm:paid:{int(request_id)}:{int(user_id)}")
+    kb.button(text="❌ Отклонить", callback_data=f"refadm:reject:{int(request_id)}:{int(user_id)}")
+    kb.button(text="👤 Профиль пользователя", callback_data=f"refadm:profile:{int(user_id)}")
+    kb.button(text="📊 Реферальная статистика", callback_data=f"refadm:stats:{int(user_id)}")
+    kb.adjust(2, 2)
+    return kb.as_markup()
+
+
+def _ref_link(uid: int) -> str:
+    uname = (os.getenv("BOT_USERNAME") or "").strip().lstrip("@")
+    if uname:
+        return f"https://t.me/{uname}?start={int(uid)}"
+    return f"/start {int(uid)}"
+
+
+def _is_valid_bsc_address(value: str) -> bool:
+    return bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", (value or "").strip()))
+
+
+async def referral_main_text(uid: int) -> str:
+    ov = await db_store.get_referral_overview(uid)
+    return trf(uid, "ref_main_text",
+        link=_ref_link(uid),
+        total_refs=int(ov.get("total_refs") or 0),
+        paid_refs=int(ov.get("paid_refs") or 0),
+        available_balance=_fmt_money(ov.get("available_balance") or 0),
+        hold_balance=_fmt_money(ov.get("hold_balance") or 0),
+        withdrawn_balance=_fmt_money(ov.get("withdrawn_balance") or 0),
+    )
+
+
+async def referral_stats_text(uid: int) -> str:
+    ov = await db_store.get_referral_overview(uid)
+    return trf(uid, "ref_stats_text",
+        total_refs=int(ov.get("total_refs") or 0),
+        paid_refs=int(ov.get("paid_refs") or 0),
+        total_earned=_fmt_money(ov.get("total_earned") or 0),
+    )
+
+
+async def referral_balance_text(uid: int) -> str:
+    ov = await db_store.get_referral_overview(uid)
+    return trf(uid, "ref_balance_text",
+        available_balance=_fmt_money(ov.get("available_balance") or 0),
+        hold_balance=_fmt_money(ov.get("hold_balance") or 0),
+        withdrawn_balance=_fmt_money(ov.get("withdrawn_balance") or 0),
+        total_earned=_fmt_money(ov.get("total_earned") or 0),
+    )
+
+
+async def referral_withdraw_prompt_text(uid: int) -> str:
+    ov = await db_store.get_referral_overview(uid)
+    return trf(uid, "ref_withdraw_prompt",
+        available_balance=_fmt_money(ov.get("available_balance") or 0),
+        min_withdraw=_fmt_money(REFERRAL_MIN_WITHDRAW_USDT),
+        network=REFERRAL_NETWORK,
+        example_wallet="0x1234abcd5678ef901234abcd5678ef901234abcd",
+    )
+
+
+async def _notify_referral_admin_new_request(req: dict) -> None:
+    uid = int(req.get("telegram_id") or 0)
+    username = "-"
+    try:
+        ch = await bot.get_chat(uid)
+        username = ("@" + ch.username) if getattr(ch, 'username', None) else (getattr(ch, 'full_name', None) or "-")
+    except Exception:
+        pass
+    created_at = req.get('created_at')
+    created_at_text = created_at.strftime('%d.%m.%Y') if hasattr(created_at, 'strftime') else '-'
+    txt = (
+        f"💸 Новая заявка на вывод\n\n"
+        f"👤 Пользователь: {username}\n"
+        f"🆔 ID: {uid}\n\n"
+        f"💰 Сумма: {_fmt_money(req.get('amount') or 0)} USDT\n"
+        f"🌐 Сеть: {REFERRAL_NETWORK}\n\n"
+        f"🏦 Адрес:\n{req.get('wallet_address') or '-'}\n\n"
+        f"Дата:\n{created_at_text}"
+    )
+    msg = await safe_send_payment_alert(
+        REFERRAL_ADMIN_CHAT_ID,
+        txt,
+        reply_markup=referral_admin_request_kb(uid, int(req.get('id') or 0)),
+    )
+    if msg is not None:
+        try:
+            await db_store.set_referral_withdrawal_admin_message(
+                request_id=int(req.get('id') or 0),
+                admin_chat_id=int(REFERRAL_ADMIN_CHAT_ID),
+                admin_message_id=int(msg.message_id),
+            )
+        except Exception:
+            logger.exception("referral: failed to save admin message ids")
+
+
+async def _notify_referrer_bonus(referral_reward: dict) -> None:
+    if not referral_reward:
+        return
+    referrer_id = int(referral_reward.get('referrer_id') or 0)
+    if not referrer_id:
+        return
+    try:
+        ov = await db_store.get_referral_overview(referrer_id)
+        await safe_send(
+            referrer_id,
+            trf(referrer_id, 'ref_bonus_notification',
+                reward_amount=_fmt_money(referral_reward.get('reward_amount') or 0),
+                available_balance=_fmt_money(ov.get('available_balance') or 0),
+            ),
+        )
+    except Exception:
+        logger.exception('referral: failed to notify referrer bonus')
+
+
+async def _referral_disabled_text(uid: int) -> str:
+    return tr(uid, 'ref_disabled')
 
 
 def notify_kb(uid: int, enabled: bool) -> types.InlineKeyboardMarkup:
@@ -3153,8 +3345,17 @@ async def broadcast_macro_alert(action: str, ev: MacroEvent, win: Tuple[float, f
 @dp.message(Command("start"))
 async def start(message: types.Message) -> None:
     uid = message.from_user.id if message.from_user else 0
+    referrer_id = None
+    try:
+        parts = (message.text or '').strip().split(maxsplit=1)
+        if len(parts) > 1:
+            cand = int(str(parts[1]).strip())
+            if cand > 0 and cand != uid:
+                referrer_id = cand
+    except Exception:
+        referrer_id = None
     if uid:
-        await ensure_user(uid)
+        await ensure_user(uid, referrer_id=referrer_id)
         # NOTE: do not auto-unblock user on status view
 
     # If language not chosen yet, ask first
@@ -3745,6 +3946,19 @@ async def menu_handler(call: types.CallbackQuery) -> None:
             await safe_send(uid, txt, reply_markup=notify_kb(uid, enabled))
         return
 
+    # ---- REFERRAL ----
+    if action == "referral":
+        try:
+            sb = await db_store.get_signal_bot_settings()
+            SIGNAL_BOT_GLOBAL["referral_enabled"] = bool(sb.get("referral_enabled"))
+        except Exception:
+            pass
+        if not bool(SIGNAL_BOT_GLOBAL.get("referral_enabled")):
+            await safe_edit(call.message, await _referral_disabled_text(uid), menu_kb(uid))
+            return
+        await safe_edit(call.message, await referral_main_text(uid), referral_main_kb(uid))
+        return
+
     # ---- AUTO-TRADE ----
     if action == "autotrade":
         # Global auto-trade pause/maintenance (admin)
@@ -3791,6 +4005,163 @@ async def menu_handler(call: types.CallbackQuery) -> None:
 
     # fallback
     await safe_edit(call.message, await status_text(uid, include_subscribed=True, include_hint=True), menu_kb(uid))
+
+
+@dp.callback_query(lambda c: (c.data or "").startswith("ref:"))
+async def referral_handler(call: types.CallbackQuery) -> None:
+    await safe_callback_answer(call)
+    uid = call.from_user.id if call.from_user else 0
+    if not uid:
+        return
+    try:
+        sb = await db_store.get_signal_bot_settings()
+        SIGNAL_BOT_GLOBAL["referral_enabled"] = bool(sb.get("referral_enabled"))
+    except Exception:
+        pass
+    if not bool(SIGNAL_BOT_GLOBAL.get("referral_enabled")):
+        await safe_edit(call.message, await _referral_disabled_text(uid), menu_kb(uid))
+        return
+    parts = (call.data or '').split(':')
+    action = parts[1] if len(parts) > 1 else ''
+    if action == 'link':
+        await safe_edit(call.message, trf(uid, 'ref_link_text', link=_ref_link(uid)), referral_main_kb(uid))
+        return
+    if action == 'stats':
+        await safe_edit(call.message, await referral_stats_text(uid), referral_main_kb(uid))
+        return
+    if action == 'balance':
+        await safe_edit(call.message, await referral_balance_text(uid), referral_balance_kb(uid))
+        return
+    if action == 'withdraw':
+        ov = await db_store.get_referral_overview(uid)
+        existing = await db_store.get_open_referral_withdrawal_request(uid)
+        if existing:
+            await safe_edit(call.message, trf(uid, 'ref_withdraw_pending', amount=_fmt_money(existing.get('amount') or 0), wallet=existing.get('wallet_address') or '-'), referral_balance_kb(uid))
+            return
+        if float(ov.get('available_balance') or 0) + 1e-9 < float(REFERRAL_MIN_WITHDRAW_USDT):
+            await safe_edit(call.message, trf(uid, 'ref_withdraw_not_enough', min_withdraw=_fmt_money(REFERRAL_MIN_WITHDRAW_USDT), available_balance=_fmt_money(ov.get('available_balance') or 0)), referral_balance_kb(uid))
+            return
+        REFERRAL_WITHDRAW_INPUT[uid] = True
+        await safe_edit(call.message, await referral_withdraw_prompt_text(uid), referral_withdraw_prompt_kb(uid))
+        return
+
+
+@dp.callback_query(lambda c: (c.data or '').startswith('refadm:'))
+async def referral_admin_handler(call: types.CallbackQuery) -> None:
+    await safe_callback_answer(call)
+    uid = call.from_user.id if call.from_user else 0
+    if not is_admin(uid):
+        return
+    parts = (call.data or '').split(':')
+    action = parts[1] if len(parts) > 1 else ''
+    if action == 'profile' and len(parts) >= 3:
+        target_uid = int(parts[2])
+        prof = await db_store.get_referral_user_profile(target_uid)
+        username = '-'
+        try:
+            ch = await bot.get_chat(target_uid)
+            username = ('@' + ch.username) if getattr(ch, 'username', None) else '-'
+        except Exception:
+            pass
+        created_at = prof.get('created_at')
+        signal_expires_at = prof.get('signal_expires_at')
+        created_at_text = created_at.strftime('%d.%m.%Y') if hasattr(created_at, 'strftime') else '-'
+        signal_expires_text = signal_expires_at.strftime('%d.%m.%Y') if hasattr(signal_expires_at, 'strftime') else '-'
+        txt = (
+            f"👤 Профиль пользователя\n\n"
+            f"Username: {username}\n"
+            f"ID: {target_uid}\n\n"
+            f"Дата регистрации:\n{created_at_text}\n\n"
+            f"Подписка активна до:\n{signal_expires_text}\n\n"
+            f"Приглашено:\n{int(prof.get('total_refs') or 0)}\n\n"
+            f"Оплатили:\n{int(prof.get('paid_refs') or 0)}"
+        )
+        await safe_send_payment_alert(REFERRAL_ADMIN_CHAT_ID, txt)
+        return
+    if action == 'stats' and len(parts) >= 3:
+        target_uid = int(parts[2])
+        ov = await db_store.get_referral_overview(target_uid)
+        txt = (
+            f"📊 Реферальная статистика\n\n"
+            f"ID: {target_uid}\n\n"
+            f"Всего приглашено: {int(ov.get('total_refs') or 0)}\n"
+            f"Оплатили: {int(ov.get('paid_refs') or 0)}\n\n"
+            f"Всего начислено: {_fmt_money(ov.get('total_earned') or 0)} USDT\n"
+            f"Доступно: {_fmt_money(ov.get('available_balance') or 0)} USDT\n"
+            f"В обработке: {_fmt_money(ov.get('hold_balance') or 0)} USDT\n"
+            f"Выплачено: {_fmt_money(ov.get('withdrawn_balance') or 0)} USDT"
+        )
+        await safe_send_payment_alert(REFERRAL_ADMIN_CHAT_ID, txt)
+        return
+    if len(parts) < 4:
+        return
+    request_id = int(parts[2])
+    target_uid = int(parts[3])
+    if action == 'paid':
+        req = await db_store.mark_referral_withdrawal_paid(request_id=request_id, processed_by=uid, admin_comment='paid')
+        if req:
+            await safe_send(target_uid, trf(target_uid, 'ref_withdraw_paid_user', amount=_fmt_money(req.get('amount') or 0), network=REFERRAL_NETWORK))
+            if call.message:
+                try:
+                    await safe_edit(call.message, f"✅ Выплата подтверждена\n\nRequest ID: {request_id}")
+                except Exception:
+                    pass
+        return
+    if action == 'reject':
+        req = await db_store.reject_referral_withdrawal_request(request_id=request_id, processed_by=uid, admin_comment='rejected')
+        if req:
+            await safe_send(target_uid, trf(target_uid, 'ref_withdraw_rejected_user', amount=_fmt_money(req.get('amount') or 0)))
+            if call.message:
+                try:
+                    await safe_edit(call.message, f"❌ Заявка отклонена\n\nRequest ID: {request_id}")
+                except Exception:
+                    pass
+        return
+
+
+@dp.message(lambda m: REFERRAL_WITHDRAW_INPUT.get(m.from_user.id if m.from_user else 0, False))
+async def referral_withdraw_wallet_input(message: types.Message) -> None:
+    uid = message.from_user.id if message.from_user else 0
+    if not uid or not REFERRAL_WITHDRAW_INPUT.get(uid):
+        return
+    try:
+        sb = await db_store.get_signal_bot_settings()
+        SIGNAL_BOT_GLOBAL["referral_enabled"] = bool(sb.get("referral_enabled"))
+    except Exception:
+        pass
+    if not bool(SIGNAL_BOT_GLOBAL.get("referral_enabled")):
+        REFERRAL_WITHDRAW_INPUT.pop(uid, None)
+        await message.answer(await _referral_disabled_text(uid), reply_markup=menu_kb(uid))
+        return
+    wallet = (message.text or '').strip()
+    if not _is_valid_bsc_address(wallet):
+        REFERRAL_WITHDRAW_INPUT[uid] = True
+        await message.answer(tr(uid, 'ref_wallet_invalid'), reply_markup=referral_withdraw_prompt_kb(uid))
+        return
+    REFERRAL_WITHDRAW_INPUT.pop(uid, None)
+    ov = await db_store.get_referral_overview(uid)
+    amount = float(ov.get('available_balance') or 0)
+    if amount + 1e-9 < float(REFERRAL_MIN_WITHDRAW_USDT):
+        await message.answer(trf(uid, 'ref_withdraw_not_enough', min_withdraw=_fmt_money(REFERRAL_MIN_WITHDRAW_USDT), available_balance=_fmt_money(amount)), reply_markup=referral_balance_kb(uid))
+        return
+    try:
+        req = await db_store.create_referral_withdrawal_request(user_id=uid, wallet_address=wallet, amount=amount, currency='USDT', network='BSC')
+    except ValueError as e:
+        code = str(e)
+        if code == 'pending_request_exists':
+            await message.answer(tr(uid, 'ref_pending_exists'), reply_markup=referral_balance_kb(uid))
+            return
+        await message.answer(tr(uid, 'ref_withdraw_create_error'), reply_markup=referral_balance_kb(uid))
+        return
+    except Exception:
+        logger.exception('referral: create withdrawal request failed uid=%s', uid)
+        await message.answer(tr(uid, 'ref_withdraw_create_error'), reply_markup=referral_balance_kb(uid))
+        return
+    await message.answer(trf(uid, 'ref_withdraw_created', amount=_fmt_money(req.get('amount') or 0), network=REFERRAL_NETWORK, wallet=wallet, admin_bot='@'+REFERRAL_ADMIN_BOT_USERNAME), reply_markup=referral_balance_kb(uid))
+    try:
+        await _notify_referral_admin_new_request(req)
+    except Exception:
+        logger.exception('referral: notify admin failed request_id=%s', req.get('id'))
 
 
 # ---------------- notifications callbacks ----------------
@@ -6569,6 +6940,7 @@ async def main() -> None:
                 "ok": True,
                 "pause_signals": bool(st.get("pause_signals")),
                 "maintenance_mode": bool(st.get("maintenance_mode")),
+                "referral_enabled": bool(st.get("referral_enabled")),
                 "updated_at": _iso(st.get("updated_at")),
                 # Auto-trade global toggles (admin)
                 "pause_autotrade": bool(at.get("pause_autotrade")),
@@ -6582,6 +6954,7 @@ async def main() -> None:
             data = await request.json()
             pause_signals = bool(data.get("pause_signals"))
             maintenance_mode = bool(data.get("maintenance_mode"))
+            referral_enabled = bool(data.get("referral_enabled"))
             # Support username (admin contact). Accept several key variants from UI.
             support_username = (
                 data.get("support_username")
@@ -6606,11 +6979,15 @@ async def main() -> None:
                 pause_signals=pause_signals,
                 maintenance_mode=maintenance_mode,
                 support_username=support_username,
+                referral_enabled=referral_enabled,
             )
             # Apply immediately without restart
             if support_username is not None:
                 global SUPPORT_USERNAME
                 SUPPORT_USERNAME = str(support_username).lstrip("@").strip()
+            SIGNAL_BOT_GLOBAL["pause_signals"] = pause_signals
+            SIGNAL_BOT_GLOBAL["maintenance_mode"] = maintenance_mode
+            SIGNAL_BOT_GLOBAL["referral_enabled"] = referral_enabled
 
             await db_store.set_autotrade_bot_settings(
                 pause_autotrade=pause_autotrade,
