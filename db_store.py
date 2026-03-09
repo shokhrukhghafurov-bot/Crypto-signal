@@ -135,6 +135,7 @@ async def ensure_schema() -> None:
           id INT PRIMARY KEY CHECK (id = 1),
           pause_signals BOOLEAN NOT NULL DEFAULT FALSE,
           maintenance_mode BOOLEAN NOT NULL DEFAULT FALSE,
+          referral_enabled BOOLEAN NOT NULL DEFAULT FALSE,
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         """)
@@ -146,6 +147,11 @@ async def ensure_schema() -> None:
         await conn.execute("""
         ALTER TABLE signal_bot_settings
         ADD COLUMN IF NOT EXISTS support_username TEXT;
+        """)
+
+        await conn.execute("""
+        ALTER TABLE signal_bot_settings
+        ADD COLUMN IF NOT EXISTS referral_enabled BOOLEAN NOT NULL DEFAULT FALSE;
         """)
 
         # --- Generic KV store for small persistent JSON state (e.g., MID autotune) ---
@@ -202,6 +208,47 @@ async def ensure_schema() -> None:
             pass
 
 
+
+        # --- Referral system ---
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS referral_rewards (
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          referrer_id BIGINT NOT NULL,
+          referral_user_id BIGINT NOT NULL UNIQUE,
+          order_id TEXT,
+          payment_amount NUMERIC(18,8) NOT NULL DEFAULT 0,
+          reward_percent NUMERIC(8,4) NOT NULL DEFAULT 10.0,
+          reward_amount NUMERIC(18,8) NOT NULL DEFAULT 0,
+          currency TEXT NOT NULL DEFAULT 'USDT',
+          status TEXT NOT NULL DEFAULT 'available',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          paid_at TIMESTAMPTZ
+        );
+        """)
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS referral_withdrawal_requests (
+          id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+          telegram_id BIGINT NOT NULL,
+          amount NUMERIC(18,8) NOT NULL,
+          currency TEXT NOT NULL DEFAULT 'USDT',
+          network TEXT NOT NULL DEFAULT 'BSC',
+          wallet_address TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          admin_chat_id BIGINT,
+          admin_message_id BIGINT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          processed_at TIMESTAMPTZ,
+          processed_by BIGINT,
+          admin_comment TEXT
+        );
+        """)
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_referral_rewards_referrer ON referral_rewards(referrer_id, created_at DESC);")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_referral_withdrawals_user ON referral_withdrawal_requests(telegram_id, created_at DESC);")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_referral_withdrawals_status ON referral_withdrawal_requests(status, created_at DESC);")
+        except Exception:
+            pass
 
         # --- Subscription payments (NOWPayments) ---
         await conn.execute("""
@@ -677,6 +724,56 @@ async def ensure_users_columns() -> None:
         except Exception:
             logger.exception("ensure_users_columns: failed to add autotrade_stop_after_close")
 
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS referrer_id BIGINT;
+                """
+            )
+        except Exception:
+            logger.exception("ensure_users_columns: failed to add referrer_id")
+
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS ref_available_balance NUMERIC(18,8) NOT NULL DEFAULT 0;
+                """
+            )
+        except Exception:
+            logger.exception("ensure_users_columns: failed to add ref_available_balance")
+
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS ref_hold_balance NUMERIC(18,8) NOT NULL DEFAULT 0;
+                """
+            )
+        except Exception:
+            logger.exception("ensure_users_columns: failed to add ref_hold_balance")
+
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS ref_withdrawn_balance NUMERIC(18,8) NOT NULL DEFAULT 0;
+                """
+            )
+        except Exception:
+            logger.exception("ensure_users_columns: failed to add ref_withdrawn_balance")
+
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS ref_total_earned NUMERIC(18,8) NOT NULL DEFAULT 0;
+                """
+            )
+        except Exception:
+            logger.exception("ensure_users_columns: failed to add ref_total_earned")
+
         # Helpful index; ignore failure on managed DBs.
         try:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
@@ -753,7 +850,7 @@ async def finalize_autotrade_disable(user_id: int) -> None:
         )
 
 
-async def ensure_user_signal_trial(user_id: int) -> None:
+async def ensure_user_signal_trial(user_id: int, referrer_id: int | None = None) -> None:
     """Create user row if missing and grant 24h Signal trial ONCE.
 
     IMPORTANT: does NOT touch Arbitrage access.
@@ -770,7 +867,8 @@ async def ensure_user_signal_trial(user_id: int) -> None:
                 signal_enabled,
                 signal_expires_at,
                 autotrade_enabled,
-                autotrade_expires_at
+                autotrade_expires_at,
+                referrer_id
             )
             VALUES (
                 $1,
@@ -778,11 +876,12 @@ async def ensure_user_signal_trial(user_id: int) -> None:
                 TRUE,
                 (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours',
                 TRUE,
-                (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours'
+                (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours',
+                CASE WHEN $2 IS NOT NULL AND $2 <> $1 THEN $2 ELSE NULL END
             )
             ON CONFLICT (telegram_id) DO NOTHING;
             """,
-            int(user_id),
+            int(user_id), int(referrer_id) if referrer_id else None,
         )
 
 async def next_signal_id() -> int:
@@ -1911,39 +2010,43 @@ async def get_signal_bot_settings() -> Dict[str, Any]:
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         try:
             row = await conn.fetchrow(
-                "SELECT pause_signals, maintenance_mode, updated_at, support_username FROM signal_bot_settings WHERE id=1"
+                "SELECT pause_signals, maintenance_mode, referral_enabled, updated_at, support_username FROM signal_bot_settings WHERE id=1"
             )
             if not row:
-                return {"pause_signals": False, "maintenance_mode": False, "updated_at": None}
+                return {"pause_signals": False, "maintenance_mode": False, "referral_enabled": False, "updated_at": None, "support_username": None}
             return {
                 "pause_signals": bool(row.get("pause_signals")),
                 "maintenance_mode": bool(row.get("maintenance_mode")),
+                "referral_enabled": bool(row.get("referral_enabled")),
                 "updated_at": row.get("updated_at"),
+                "support_username": row.get("support_username"),
             }
         except Exception:
             logger.exception("get_signal_bot_settings failed")
-            return {"pause_signals": False, "maintenance_mode": False, "updated_at": None}
+            return {"pause_signals": False, "maintenance_mode": False, "referral_enabled": False, "updated_at": None, "support_username": None}
 
 
-async def set_signal_bot_settings(*, pause_signals: bool, maintenance_mode: bool, support_username: str | None = None) -> None:
+async def set_signal_bot_settings(*, pause_signals: bool, maintenance_mode: bool, support_username: str | None = None, referral_enabled: bool = False) -> None:
     """Persist signal bot settings."""
     pool = get_pool()
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         try:
             await conn.execute(
                 """
-                INSERT INTO signal_bot_settings(id, pause_signals, maintenance_mode, support_username, updated_at)
-                VALUES (1, $1, $2, $3, NOW())
+                INSERT INTO signal_bot_settings(id, pause_signals, maintenance_mode, support_username, referral_enabled, updated_at)
+                VALUES (1, $1, $2, $3, $4, NOW())
                 ON CONFLICT (id)
                 DO UPDATE SET
                     pause_signals = EXCLUDED.pause_signals,
                     maintenance_mode = EXCLUDED.maintenance_mode,
                     support_username = EXCLUDED.support_username,
+                    referral_enabled = EXCLUDED.referral_enabled,
                     updated_at = NOW();
                 """,
                 bool(pause_signals),
                 bool(maintenance_mode),
                 support_username,
+                bool(referral_enabled),
             )
         except Exception:
             logger.exception(
@@ -1967,6 +2070,7 @@ async def get_autotrade_bot_settings() -> Dict[str, Any]:
             return {
                 "pause_autotrade": bool(row.get("pause_autotrade")),
                 "maintenance_mode": bool(row.get("maintenance_mode")),
+                "referral_enabled": bool(row.get("referral_enabled")),
                 "updated_at": row.get("updated_at"),
             }
         except Exception:
@@ -3472,3 +3576,221 @@ async def list_subscription_payments(*, date_from: Optional[str] = None, date_to
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         rows = await conn.fetch(q, *args)
     return [dict(r) for r in rows]
+
+
+# ---------------- Referral system ----------------
+
+async def get_referral_overview(user_id: int) -> Dict[str, Any]:
+    pool = get_pool()
+    uid = int(user_id)
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        user = await conn.fetchrow(
+            """
+            SELECT telegram_id, referrer_id,
+                   COALESCE(ref_available_balance, 0) AS ref_available_balance,
+                   COALESCE(ref_hold_balance, 0) AS ref_hold_balance,
+                   COALESCE(ref_withdrawn_balance, 0) AS ref_withdrawn_balance,
+                   COALESCE(ref_total_earned, 0) AS ref_total_earned
+            FROM users
+            WHERE telegram_id=$1
+            """,
+            uid,
+        )
+        invited = await conn.fetchval("SELECT COUNT(1) FROM users WHERE referrer_id=$1", uid)
+        paid = await conn.fetchval("SELECT COUNT(1) FROM referral_rewards WHERE referrer_id=$1", uid)
+        return {
+            "user_id": uid,
+            "referrer_id": int(user.get("referrer_id")) if user and user.get("referrer_id") is not None else None,
+            "total_refs": int(invited or 0),
+            "paid_refs": int(paid or 0),
+            "available_balance": float((user.get("ref_available_balance") if user else 0) or 0),
+            "hold_balance": float((user.get("ref_hold_balance") if user else 0) or 0),
+            "withdrawn_balance": float((user.get("ref_withdrawn_balance") if user else 0) or 0),
+            "total_earned": float((user.get("ref_total_earned") if user else 0) or 0),
+        }
+
+
+async def get_referral_user_profile(user_id: int) -> Dict[str, Any]:
+    pool = get_pool()
+    uid = int(user_id)
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT telegram_id, created_at, signal_expires_at, referrer_id
+            FROM users WHERE telegram_id=$1
+            """, uid
+        )
+        ov = await get_referral_overview(uid)
+        out = dict(ov)
+        out.update({
+            "created_at": row.get("created_at") if row else None,
+            "signal_expires_at": row.get("signal_expires_at") if row else None,
+        })
+        return out
+
+
+async def award_referral_bonus_for_first_payment(*, referral_user_id: int, order_id: str | None, payment_amount: float, currency: str = 'USDT', reward_percent: float = 10.0) -> Optional[Dict[str, Any]]:
+    pool = get_pool()
+    uid = int(referral_user_id)
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        async with conn.transaction():
+            user = await conn.fetchrow("SELECT telegram_id, referrer_id FROM users WHERE telegram_id=$1 FOR UPDATE", uid)
+            if not user:
+                return None
+            referrer_id = user.get('referrer_id')
+            if referrer_id is None:
+                return None
+            existing = await conn.fetchrow("SELECT id, reward_amount FROM referral_rewards WHERE referral_user_id=$1", uid)
+            if existing:
+                return None
+            reward_amount = round(float(payment_amount or 0) * (float(reward_percent or 10.0) / 100.0), 8)
+            if reward_amount <= 0:
+                return None
+            rec = await conn.fetchrow(
+                """
+                INSERT INTO referral_rewards(referrer_id, referral_user_id, order_id, payment_amount, reward_percent, reward_amount, currency, status, created_at, available_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,'available',NOW(),NOW())
+                RETURNING id, referrer_id, referral_user_id, reward_amount, payment_amount, currency, created_at
+                """,
+                int(referrer_id), uid, str(order_id) if order_id else None, float(payment_amount or 0), float(reward_percent or 10.0), reward_amount, str(currency or 'USDT').upper(),
+            )
+            await conn.execute(
+                """
+                UPDATE users
+                SET ref_available_balance = COALESCE(ref_available_balance,0) + $2,
+                    ref_total_earned = COALESCE(ref_total_earned,0) + $2,
+                    updated_at = NOW()
+                WHERE telegram_id=$1
+                """,
+                int(referrer_id), reward_amount,
+            )
+            return dict(rec) if rec else None
+
+
+async def get_open_referral_withdrawal_request(user_id: int) -> Optional[Dict[str, Any]]:
+    pool = get_pool()
+    uid = int(user_id)
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM referral_withdrawal_requests
+            WHERE telegram_id=$1 AND status='pending'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """, uid
+        )
+        return dict(row) if row else None
+
+
+async def create_referral_withdrawal_request(*, user_id: int, wallet_address: str, amount: float, currency: str = 'USDT', network: str = 'BSC') -> Dict[str, Any]:
+    pool = get_pool()
+    uid = int(user_id)
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        async with conn.transaction():
+            existing = await conn.fetchrow(
+                "SELECT id FROM referral_withdrawal_requests WHERE telegram_id=$1 AND status='pending' ORDER BY created_at DESC LIMIT 1 FOR UPDATE", uid
+            )
+            if existing:
+                raise ValueError('pending_request_exists')
+            row = await conn.fetchrow(
+                "SELECT COALESCE(ref_available_balance,0) AS available, COALESCE(ref_hold_balance,0) AS hold FROM users WHERE telegram_id=$1 FOR UPDATE", uid
+            )
+            if not row:
+                raise ValueError('user_not_found')
+            available = float(row.get('available') or 0)
+            amt = round(float(amount or 0), 8)
+            if amt <= 0 or available + 1e-9 < amt:
+                raise ValueError('insufficient_balance')
+            await conn.execute(
+                """
+                UPDATE users
+                SET ref_available_balance = COALESCE(ref_available_balance,0) - $2,
+                    ref_hold_balance = COALESCE(ref_hold_balance,0) + $2,
+                    updated_at = NOW()
+                WHERE telegram_id=$1
+                """, uid, amt
+            )
+            req = await conn.fetchrow(
+                """
+                INSERT INTO referral_withdrawal_requests(telegram_id, amount, currency, network, wallet_address, status, created_at)
+                VALUES ($1,$2,$3,$4,$5,'pending',NOW())
+                RETURNING *
+                """, uid, amt, str(currency or 'USDT').upper(), str(network or 'BSC').upper(), str(wallet_address).strip()
+            )
+            return dict(req)
+
+
+async def set_referral_withdrawal_admin_message(*, request_id: int, admin_chat_id: int, admin_message_id: int) -> None:
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        await conn.execute(
+            "UPDATE referral_withdrawal_requests SET admin_chat_id=$2, admin_message_id=$3 WHERE id=$1",
+            int(request_id), int(admin_chat_id), int(admin_message_id),
+        )
+
+
+async def get_referral_withdrawal_request(request_id: int) -> Optional[Dict[str, Any]]:
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        row = await conn.fetchrow("SELECT * FROM referral_withdrawal_requests WHERE id=$1", int(request_id))
+        return dict(row) if row else None
+
+
+async def mark_referral_withdrawal_paid(*, request_id: int, processed_by: int | None = None, admin_comment: str | None = None) -> Optional[Dict[str, Any]]:
+    pool = get_pool()
+    rid = int(request_id)
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        async with conn.transaction():
+            req = await conn.fetchrow("SELECT * FROM referral_withdrawal_requests WHERE id=$1 FOR UPDATE", rid)
+            if not req or str(req.get('status')) != 'pending':
+                return dict(req) if req else None
+            amt = float(req.get('amount') or 0)
+            uid = int(req.get('telegram_id'))
+            await conn.execute(
+                """
+                UPDATE users
+                SET ref_hold_balance = GREATEST(COALESCE(ref_hold_balance,0) - $2, 0),
+                    ref_withdrawn_balance = COALESCE(ref_withdrawn_balance,0) + $2,
+                    updated_at = NOW()
+                WHERE telegram_id=$1
+                """, uid, amt
+            )
+            row = await conn.fetchrow(
+                """
+                UPDATE referral_withdrawal_requests
+                SET status='paid', processed_at=NOW(), processed_by=$2, admin_comment=$3
+                WHERE id=$1
+                RETURNING *
+                """, rid, int(processed_by) if processed_by else None, admin_comment
+            )
+            return dict(row) if row else None
+
+
+async def reject_referral_withdrawal_request(*, request_id: int, processed_by: int | None = None, admin_comment: str | None = None) -> Optional[Dict[str, Any]]:
+    pool = get_pool()
+    rid = int(request_id)
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        async with conn.transaction():
+            req = await conn.fetchrow("SELECT * FROM referral_withdrawal_requests WHERE id=$1 FOR UPDATE", rid)
+            if not req or str(req.get('status')) != 'pending':
+                return dict(req) if req else None
+            amt = float(req.get('amount') or 0)
+            uid = int(req.get('telegram_id'))
+            await conn.execute(
+                """
+                UPDATE users
+                SET ref_hold_balance = GREATEST(COALESCE(ref_hold_balance,0) - $2, 0),
+                    ref_available_balance = COALESCE(ref_available_balance,0) + $2,
+                    updated_at = NOW()
+                WHERE telegram_id=$1
+                """, uid, amt
+            )
+            row = await conn.fetchrow(
+                """
+                UPDATE referral_withdrawal_requests
+                SET status='rejected', processed_at=NOW(), processed_by=$2, admin_comment=$3
+                WHERE id=$1
+                RETURNING *
+                """, rid, int(processed_by) if processed_by else None, admin_comment
+            )
+            return dict(row) if row else None
