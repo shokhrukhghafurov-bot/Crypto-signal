@@ -9149,16 +9149,12 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             else:
                 trig_ok = bool(sweep_short) or bool(bo_rt_trigger) or bool(ob_retest)
             if not trig_ok:
-                try:
-                    _phase = str(_MID_EVAL_PHASE.get() or "scan")
-                except Exception:
-                    _phase = "scan"
-                if _mid_quality_first_enabled() or not (pending_enabled and postsetup_only and _phase == "scan"):
-                    _fail("other", "no_trigger")
-                    return None
+                # Soft flag only: allow strong TA setups to become pending and let
+                # the final pending/entry trigger stage confirm execution later.
                 try:
                     base_r.setdefault("risk_flags", [])
-                    base_r["risk_flags"].append("no_trigger")
+                    if "no_trigger" not in base_r["risk_flags"]:
+                        base_r["risk_flags"].append("no_trigger")
                 except Exception:
                     pass
     except Exception:
@@ -9685,16 +9681,21 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             mid_bonus += _v
             mid_bonus_parts["structure"] = mid_bonus_parts.get("structure", 0.0) + _v
 
-        # Execution triggers
+        # Execution triggers are score contributors, not a hard setup gate.
+        trigger_score = 0.0
         if (str(dir_trend).upper() == "LONG" and sweep_long) or (str(dir_trend).upper() == "SHORT" and sweep_short):
-            mid_bonus += 7.0
-            mid_bonus_parts["liquidity_sweep"] = mid_bonus_parts.get("liquidity_sweep", 0.0) + 7.0
+            trigger_score += 8.0
+            mid_bonus_parts["liquidity_sweep"] = mid_bonus_parts.get("liquidity_sweep", 0.0) + 8.0
         if bo_rt_trigger:
-            mid_bonus += 5.0
-            mid_bonus_parts["breakout_retest"] = mid_bonus_parts.get("breakout_retest", 0.0) + 5.0
+            trigger_score += 6.0
+            mid_bonus_parts["breakout_retest"] = mid_bonus_parts.get("breakout_retest", 0.0) + 6.0
         if ob_retest:
-            mid_bonus += 6.0
+            trigger_score += 6.0
             mid_bonus_parts["order_block"] = mid_bonus_parts.get("order_block", 0.0) + 6.0
+        if trigger_score <= 0.0:
+            trigger_score -= 4.0
+            mid_bonus_parts["no_trigger_penalty"] = mid_bonus_parts.get("no_trigger_penalty", 0.0) - 4.0
+        mid_bonus += trigger_score
 
         # VWAP bias on 30m
         if (not np.isnan(vwap_val)) and float(vwap_val) > 0:
@@ -13768,7 +13769,7 @@ def _mid_pending_quality_ok(rec: dict) -> tuple[bool, str]:
         flags = {str(x).strip().lower() for x in (rec.get("risk_flags") or []) if str(x).strip()}
     except Exception:
         flags = set()
-    hard_bad = {"far_zone", "vol_low", "no_trigger", "regime_range_no_breakout", "structure_mismatch", "blocked"}
+    hard_bad = {"far_zone", "vol_low", "regime_range_no_breakout", "structure_mismatch", "blocked"}
     if _mid_quality_first_enabled() and (flags & hard_bad):
         return (False, f"risk_flags:{','.join(sorted(flags & hard_bad))}")
     try:
@@ -15692,13 +15693,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 min_score_spot = int(globals().get("TA_MIN_SCORE_SPOT", 78))
                                 min_score_fut = int(globals().get("TA_MIN_SCORE_FUTURES", 74))
                             else:
-                                min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76") or 76)
+                                min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","88") or 88)
                                  # Prefer MID_MIN_SCORE_FUT if set; fallback to MID_MIN_SCORE_FUTURES
                                 _msf = os.getenv("MID_MIN_SCORE_FUT")
                                 if _msf is not None and str(_msf).strip() != "":
                                     min_score_fut = int(_msf)
                                 else:
-                                    min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
+                                    min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","86") or 86)
                             need_v = float(min_score_fut if market == "FUTURES" else min_score_spot)
                         except Exception:
                             need_v = 0.0
