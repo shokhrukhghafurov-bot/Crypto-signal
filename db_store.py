@@ -3630,6 +3630,15 @@ async def get_referral_user_profile(user_id: int) -> Dict[str, Any]:
 
 
 async def award_referral_bonus_for_first_payment(*, referral_user_id: int, order_id: str | None, payment_amount: float, currency: str = 'USDT', reward_percent: float = 10.0) -> Optional[Dict[str, Any]]:
+    """Award a referral bonus only for the invited user's first successful payment.
+
+    We guard this in two ways:
+    1) only one reward row can exist per invited user;
+    2) the invited user must have exactly one successful subscription payment recorded.
+
+    The second check keeps the behavior aligned with the product spec even if this
+    function is called from a later payment flow or retried after historical data changes.
+    """
     pool = get_pool()
     uid = int(referral_user_id)
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
@@ -3638,11 +3647,25 @@ async def award_referral_bonus_for_first_payment(*, referral_user_id: int, order
             if not user:
                 return None
             referrer_id = user.get('referrer_id')
-            if referrer_id is None:
+            if referrer_id is None or int(referrer_id) == uid:
                 return None
+
             existing = await conn.fetchrow("SELECT id, reward_amount FROM referral_rewards WHERE referral_user_id=$1", uid)
             if existing:
                 return None
+
+            paid_count = await conn.fetchval(
+                """
+                SELECT COUNT(1)
+                FROM subscription_payments
+                WHERE telegram_id=$1
+                  AND COALESCE(status, 'finished') = 'finished'
+                """,
+                uid,
+            )
+            if int(paid_count or 0) != 1:
+                return None
+
             reward_amount = round(float(payment_amount or 0) * (float(reward_percent or 10.0) / 100.0), 8)
             if reward_amount <= 0:
                 return None
@@ -3682,7 +3705,7 @@ async def get_open_referral_withdrawal_request(user_id: int) -> Optional[Dict[st
         return dict(row) if row else None
 
 
-async def create_referral_withdrawal_request(*, user_id: int, wallet_address: str, amount: float, currency: str = 'USDT', network: str = 'BSC') -> Dict[str, Any]:
+async def create_referral_withdrawal_request(*, user_id: int, wallet_address: str, amount: float, currency: str = 'USDT', network: str = 'BSC (BEP20)') -> Dict[str, Any]:
     pool = get_pool()
     uid = int(user_id)
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
@@ -3710,12 +3733,13 @@ async def create_referral_withdrawal_request(*, user_id: int, wallet_address: st
                 WHERE telegram_id=$1
                 """, uid, amt
             )
+            network_value = str(network or 'BSC (BEP20)').strip() or 'BSC (BEP20)'
             req = await conn.fetchrow(
                 """
                 INSERT INTO referral_withdrawal_requests(telegram_id, amount, currency, network, wallet_address, status, created_at)
                 VALUES ($1,$2,$3,$4,$5,'pending',NOW())
                 RETURNING *
-                """, uid, amt, str(currency or 'USDT').upper(), str(network or 'BSC').upper(), str(wallet_address).strip()
+                """, uid, amt, str(currency or 'USDT').upper(), network_value, str(wallet_address).strip()
             )
             return dict(req)
 
