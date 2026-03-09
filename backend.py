@@ -23558,3 +23558,221 @@ try:
             setattr(Backend, 'scanner_loop_mid', _fn)
 except Exception:
     pass
+
+
+# --- AUTOTRADE ANOMALY WATCHDOG PATCH ---
+_AUTOTRADE_DIAG_LAST_SENT = {}
+
+async def _autotrade_diag_send(text: str) -> None:
+    try:
+        token = (os.getenv("ERROR_BOT_TOKEN") or "").strip()
+        chat_id = (os.getenv("ADMIN_ALERT_CHAT_ID") or "").strip()
+        enabled = (os.getenv("ERROR_BOT_ENABLED", "1") or "1").strip().lower() not in ("0","false","no","off")
+        if not token or not chat_id or not enabled:
+            return
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        timeout = aiohttp.ClientTimeout(total=12)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            await s.post(url, data={"chat_id": chat_id, "text": str(text or "")[:3900]})
+    except Exception:
+        pass
+
+async def _autotrade_diag_emit(kind: str, *, cooldown_sec: float = 600.0, **data) -> None:
+    try:
+        key = (
+            str(kind or "").upper(),
+            int(data.get("user_id") or 0),
+            int(data.get("signal_id") or 0),
+            str(data.get("exchange") or "").lower(),
+            str(data.get("market_type") or "").lower(),
+            str(data.get("symbol") or "").upper(),
+        )
+        now = time.time()
+        last = float(_AUTOTRADE_DIAG_LAST_SENT.get(key, 0.0) or 0.0)
+        if cooldown_sec > 0 and (now - last) < cooldown_sec:
+            return
+        _AUTOTRADE_DIAG_LAST_SENT[key] = now
+        payload = {k: v for k, v in data.items() if v is not None and v != ""}
+        logger.error("[%s] %s", kind, " ".join(f"{k}={v}" for k, v in payload.items()))
+        msg = "\n".join([f"🤖 {kind}"] + [f"{k}={payload[k]}" for k in payload])
+        await _autotrade_diag_send(msg)
+    except Exception:
+        pass
+
+async def autotrade_anomaly_watchdog_loop(*, notify_api_error=None) -> None:
+    """Detect hidden autotrade failures and forward them to log + error bot."""
+    poll_sec = float(os.getenv("AUTOTRADE_DIAG_POLL_SEC", "20") or 20)
+    grace_no_order = float(os.getenv("AUTOTRADE_DIAG_NO_ORDER_GRACE_SEC", "45") or 45)
+    grace_no_position = float(os.getenv("AUTOTRADE_DIAG_NO_POSITION_GRACE_SEC", "75") or 75)
+    grace_manager_blind = float(os.getenv("AUTOTRADE_DIAG_MANAGER_BLIND_SEC", "180") or 180)
+    grace_tp_sl = float(os.getenv("AUTOTRADE_DIAG_TPSL_GRACE_SEC", "20") or 20)
+    logger.info("[AUTOTRADE_DIAG] watchdog started poll=%s", poll_sec)
+    while True:
+        try:
+            rows = await db_store.list_open_autotrade_positions(limit=500)
+            for r in rows or []:
+                try:
+                    uid = int(r.get("user_id") or 0)
+                    sig_id = int(r.get("signal_id") or 0)
+                    ex = str(r.get("exchange") or "").lower()
+                    mt = str(r.get("market_type") or "").lower()
+                    symbol = str(r.get("symbol") or "").upper()
+                    age_sec = 0.0
+                    try:
+                        opened_at = r.get("opened_at")
+                        if opened_at is not None:
+                            age_sec = max(0.0, (_dt.datetime.now(_dt.timezone.utc) - opened_at).total_seconds())
+                    except Exception:
+                        age_sec = 0.0
+                    try:
+                        ref_raw = r.get("api_order_ref")
+                        ref = json.loads(ref_raw or "{}") if isinstance(ref_raw, str) else (ref_raw or {})
+                    except Exception:
+                        ref = {}
+                    try:
+                        meta_raw = r.get("meta")
+                        meta = json.loads(meta_raw or "{}") if isinstance(meta_raw, str) else (meta_raw or {})
+                        if not isinstance(meta, dict):
+                            meta = {}
+                    except Exception:
+                        meta = {}
+
+                    virtual = bool(ref.get("virtual"))
+                    entry_order_id = ref.get("entry_order_id")
+                    tp1 = float(ref.get("tp1") or 0.0)
+                    tp2 = float(ref.get("tp2") or 0.0)
+                    sl = float(ref.get("sl") or 0.0)
+                    side = str(ref.get("side") or r.get("side") or "BUY").upper()
+
+                    if (not virtual) and age_sec >= grace_no_order and (not entry_order_id):
+                        await _autotrade_diag_emit(
+                            "AUTO_TRADE_SIGNAL_NO_ORDER_SENT",
+                            user_id=uid, signal_id=sig_id, exchange=ex, market_type=mt, symbol=symbol,
+                            age_sec=round(age_sec, 1), reason="missing_entry_order_id",
+                        )
+                        continue
+
+                    row_keys = await db_store.get_autotrade_keys_row(user_id=uid, exchange=ex, market_type=mt)
+                    if not row_keys or not bool(row_keys.get("is_active")):
+                        continue
+                    try:
+                        api_key = _decrypt_token(row_keys.get("api_key_enc"))
+                        api_secret = _decrypt_token(row_keys.get("api_secret_enc"))
+                    except Exception as e:
+                        await _autotrade_diag_emit(
+                            "AUTO_TRADE_KEYS_DECRYPT_ERROR",
+                            user_id=uid, signal_id=sig_id, exchange=ex, market_type=mt, symbol=symbol,
+                            reason=f"decrypt_error:{e}",
+                        )
+                        continue
+                    passphrase = None
+                    try:
+                        if row_keys.get("passphrase_enc"):
+                            passphrase = _decrypt_token(row_keys.get("passphrase_enc"))
+                    except Exception:
+                        passphrase = None
+
+                    actual_size = 0.0
+                    try:
+                        if mt == "spot":
+                            actual_size = await _spot_base_balance(ex=ex, api_key=api_key, api_secret=api_secret, passphrase=passphrase, symbol=symbol)
+                        else:
+                            category = str(ref.get("category") or ("linear" if mt == "futures" else "spot"))
+                            actual_size = await _futures_position_size(ex=ex, api_key=api_key, api_secret=api_secret, symbol=symbol, category=category)
+                    except Exception as e:
+                        if notify_api_error:
+                            try:
+                                await notify_api_error(uid, ex, mt, f"diag_position_check_error: {e}")
+                            except Exception:
+                                pass
+
+                    if (not virtual) and entry_order_id and age_sec >= grace_no_position and float(actual_size or 0.0) <= 0.0:
+                        order_state = "unknown"
+                        try:
+                            if ex == "binance":
+                                osr = await _binance_order_status(api_key=api_key, api_secret=api_secret, symbol=symbol, order_id=int(entry_order_id), futures=(mt == "futures"))
+                                order_state = str(osr.get("status") or "unknown")
+                            elif ex == "bybit":
+                                osr = await _bybit_order_status(api_key=api_key, api_secret=api_secret, category=str(ref.get("category") or ("linear" if mt == "futures" else "spot")), symbol=symbol, order_id=str(entry_order_id))
+                                lst = ((osr.get("result") or {}).get("list") or [])
+                                od = lst[0] if (lst and isinstance(lst[0], dict)) else {}
+                                order_state = str(od.get("orderStatus") or od.get("orderStatusName") or "unknown")
+                        except Exception as e:
+                            order_state = f"status_error:{e}"
+                        await _autotrade_diag_emit(
+                            "AUTO_TRADE_ORDER_NO_POSITION",
+                            user_id=uid, signal_id=sig_id, exchange=ex, market_type=mt, symbol=symbol,
+                            age_sec=round(age_sec, 1), order_id=entry_order_id, order_status=order_state,
+                            reason="entry_order_exists_but_position_size_zero",
+                        )
+                        continue
+
+                    if float(actual_size or 0.0) > 0.0 and age_sec >= grace_manager_blind:
+                        ref_qty = 0.0
+                        try:
+                            ref_qty = float(ref.get("qty") or 0.0)
+                        except Exception:
+                            ref_qty = 0.0
+                        last_touch = meta.get("last_manager_touch") or meta.get("last_seen_by_manager") or meta.get("last_check_at")
+                        if ref_qty <= 0.0 or not last_touch:
+                            await _autotrade_diag_emit(
+                                "SMART_MANAGER_POSITION_NOT_VISIBLE",
+                                user_id=uid, signal_id=sig_id, exchange=ex, market_type=mt, symbol=symbol,
+                                age_sec=round(age_sec, 1), actual_size=actual_size, ref_qty=ref_qty,
+                                reason=("position_exists_but_ref_qty_missing" if ref_qty <= 0.0 else "position_exists_but_no_manager_touch_meta"),
+                                cooldown_sec=300.0,
+                            )
+
+                    if float(actual_size or 0.0) > 0.0 and age_sec >= grace_tp_sl:
+                        px = 0.0
+                        try:
+                            if ex == "binance":
+                                px = await _binance_price(symbol, futures=(mt == "futures"))
+                            elif ex == "bybit":
+                                px = await _bybit_price(symbol, category=str(ref.get("category") or ("linear" if mt == "futures" else "spot")))
+                            elif ex == "okx":
+                                px = await _okx_public_price(symbol)
+                            elif ex == "mexc":
+                                px = await _mexc_public_price(symbol)
+                            elif ex == "gateio":
+                                px = await _gateio_public_price(symbol)
+                        except Exception:
+                            px = 0.0
+                        if px > 0:
+                            if side in ("BUY", "LONG"):
+                                if sl > 0 and px <= sl:
+                                    await _autotrade_diag_emit(
+                                        "AUTO_TRADE_SL_NOT_TRIGGERED",
+                                        user_id=uid, signal_id=sig_id, exchange=ex, market_type=mt, symbol=symbol,
+                                        current_price=px, sl=sl, actual_size=actual_size,
+                                        reason="price_below_sl_but_position_still_open", cooldown_sec=180.0,
+                                    )
+                                elif ((tp2 > 0 and px >= tp2) or (tp1 > 0 and px >= tp1)):
+                                    await _autotrade_diag_emit(
+                                        "AUTO_TRADE_TP_NOT_TRIGGERED",
+                                        user_id=uid, signal_id=sig_id, exchange=ex, market_type=mt, symbol=symbol,
+                                        current_price=px, tp1=tp1, tp2=tp2, actual_size=actual_size,
+                                        reason="price_above_tp_but_position_still_open", cooldown_sec=180.0,
+                                    )
+                            else:
+                                if sl > 0 and px >= sl:
+                                    await _autotrade_diag_emit(
+                                        "AUTO_TRADE_SL_NOT_TRIGGERED",
+                                        user_id=uid, signal_id=sig_id, exchange=ex, market_type=mt, symbol=symbol,
+                                        current_price=px, sl=sl, actual_size=actual_size,
+                                        reason="price_above_sl_but_short_position_still_open", cooldown_sec=180.0,
+                                    )
+                                elif ((tp2 > 0 and px <= tp2) or (tp1 > 0 and px <= tp1)):
+                                    await _autotrade_diag_emit(
+                                        "AUTO_TRADE_TP_NOT_TRIGGERED",
+                                        user_id=uid, signal_id=sig_id, exchange=ex, market_type=mt, symbol=symbol,
+                                        current_price=px, tp1=tp1, tp2=tp2, actual_size=actual_size,
+                                        reason="price_below_tp_but_short_position_still_open", cooldown_sec=180.0,
+                                    )
+                except Exception as e:
+                    logger.error("[AUTOTRADE_DIAG_ROW_ERROR] %s\n%s", e, traceback.format_exc())
+            await asyncio.sleep(max(5.0, poll_sec))
+        except Exception as e:
+            logger.error("[AUTOTRADE_DIAG_LOOP_ERROR] %s\n%s", e, traceback.format_exc())
+            await asyncio.sleep(10.0)
+# --- END AUTOTRADE ANOMALY WATCHDOG PATCH ---
