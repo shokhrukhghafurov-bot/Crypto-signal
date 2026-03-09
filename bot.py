@@ -1959,7 +1959,9 @@ def _ref_link(uid: int) -> str:
     uname = (BOT_PUBLIC_USERNAME or "").strip().lstrip("@")
     if uname:
         return f"https://t.me/{uname}?start={int(uid)}"
-    return f"/start {int(uid)}"
+    # Fallback to a Telegram deep-link instead of plain /start text.
+    # This keeps the referral value clickable even before username resolution warms up.
+    return f"tg://resolve?domain={bot.id}&start={int(uid)}"
 
 
 def _is_valid_bsc_address(value: str) -> bool:
@@ -1967,6 +1969,7 @@ def _is_valid_bsc_address(value: str) -> bool:
 
 
 async def referral_main_text(uid: int) -> str:
+    await _ensure_public_bot_username()
     ov = await db_store.get_referral_overview(uid)
     return trf(uid, "ref_main_text",
         link=_ref_link(uid),
@@ -4053,6 +4056,7 @@ async def referral_handler(call: types.CallbackQuery) -> None:
     parts = (call.data or '').split(':')
     action = parts[1] if len(parts) > 1 else ''
     if action == 'link':
+        await _ensure_public_bot_username()
         await safe_edit(call.message, trf(uid, 'ref_link_text', link=_ref_link(uid)), referral_main_kb(uid))
         return
     if action == 'stats':
