@@ -857,6 +857,12 @@ async def ensure_user_signal_trial(user_id: int, referrer_id: int | None = None)
     """
     if not user_id:
         return
+
+    uid = int(user_id)
+    clean_referrer_id = int(referrer_id) if referrer_id else None
+    if clean_referrer_id == uid:
+        clean_referrer_id = None
+
     pool = get_pool()
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         await conn.execute(
@@ -877,11 +883,11 @@ async def ensure_user_signal_trial(user_id: int, referrer_id: int | None = None)
                 (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours',
                 TRUE,
                 (NOW() AT TIME ZONE 'UTC') + INTERVAL '24 hours',
-                CASE WHEN $2 IS NOT NULL AND $2 <> $1 THEN $2 ELSE NULL END
+                $2
             )
             ON CONFLICT (telegram_id) DO NOTHING;
             """,
-            int(user_id), int(referrer_id) if referrer_id else None,
+            uid, clean_referrer_id,
         )
 
 async def next_signal_id() -> int:
