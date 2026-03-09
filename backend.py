@@ -10,6 +10,7 @@ import os
 import re
 import time
 import contextvars
+import traceback
 from dotenv import load_dotenv
 
 
