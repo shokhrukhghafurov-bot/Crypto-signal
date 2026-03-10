@@ -2523,10 +2523,14 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
         return ks(ex, mt) != "❌"
 
     def _pick_spot_exchange() -> str | None:
-        if not spot_conf:
-            return None
+        # Match backend routing: prefer confirmed exchanges, but if confirmations are
+        # empty/incomplete then fall back to the first eligible exchange from user priority.
+        if spot_conf:
+            for ex in prio:
+                if ex in spot_conf and _eligible(ex, "spot"):
+                    return ex
         for ex in prio:
-            if ex in spot_conf and _eligible(ex, "spot"):
+            if _eligible(ex, "spot"):
                 return ex
         return None
 
@@ -2552,7 +2556,7 @@ def autotrade_text(uid: int, s: Dict[str, any], keys: List[Dict[str, any]]) -> s
         if chosen and bool(s.get("spot_enabled")):
             parts.append(("SPOT будет открыт на: " if lang == "ru" else "SPOT will open on: ") + chosen.upper())
         elif bool(s.get("spot_enabled")):
-            parts.append(("SPOT: пропуск (нет ключей по confirmations)" if lang == "ru" else "SPOT: skipped (no keys for confirmations)"))
+            parts.append(("SPOT: пропуск (нет активных ключей/подходящей биржи)" if lang == "ru" else "SPOT: skipped (no active keys / no suitable exchange)"))
     else:
         items_txt = " | ".join([f"{ex.upper()}: {ks(ex,'spot')}" for ex in allowed_spot])
         parts.append(("SPOT ключи: " if lang == "ru" else "SPOT keys: ") + items_txt)
