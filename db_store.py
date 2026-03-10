@@ -3037,12 +3037,37 @@ async def disable_autotrade_key(*, user_id: int, exchange: str, market_type: str
             mt,
         )
 
-async def get_autotrade_used_usdt(user_id: int, market_type: str) -> float:
+def _autotrade_cap_lock_key(*, user_id: int, market_type: str) -> int:
+    raw = f"autotrade_cap|{int(user_id)}|{str(market_type or '').lower().strip()}".encode("utf-8")
+    return int.from_bytes(hashlib.sha1(raw).digest()[:8], "big", signed=False) & 0x7FFFFFFFFFFFFFFF
+
+
+async def acquire_autotrade_cap_lock(conn: asyncpg.Connection, *, user_id: int, market_type: str) -> int:
+    """Acquire a session-level advisory lock for per-user auto-trade cap checks.
+
+    This serializes concurrent futures opens across replicas so cap/position checks
+    see fresh DB state before the next order is sent.
+    Returns the lock key for later release.
+    """
+    key = _autotrade_cap_lock_key(user_id=int(user_id), market_type=str(market_type or "spot"))
+    await conn.execute("SELECT pg_advisory_lock($1::bigint);", key)
+    return key
+
+
+async def release_autotrade_cap_lock(conn: asyncpg.Connection, lock_key: int) -> None:
+    try:
+        await conn.execute("SELECT pg_advisory_unlock($1::bigint);", int(lock_key))
+    except Exception:
+        pass
+
+
+async def get_autotrade_used_usdt(user_id: int, market_type: str, *, conn: asyncpg.Connection | None = None) -> float:
     pool = get_pool()
     uid = int(user_id)
     mt = (market_type or "spot").lower().strip()
-    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
-        v = await conn.fetchval(
+
+    async def _fetch(_conn: asyncpg.Connection) -> float:
+        v = await _conn.fetchval(
             """
             SELECT COALESCE(SUM(allocated_usdt), 0)
             FROM autotrade_positions
@@ -3055,6 +3080,37 @@ async def get_autotrade_used_usdt(user_id: int, market_type: str) -> float:
             return float(v or 0.0)
         except Exception:
             return 0.0
+
+    if conn is not None:
+        return await _fetch(conn)
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn2:
+        return await _fetch(conn2)
+
+
+async def get_autotrade_open_positions_count(user_id: int, market_type: str, *, conn: asyncpg.Connection | None = None) -> int:
+    pool = get_pool()
+    uid = int(user_id)
+    mt = (market_type or "spot").lower().strip()
+
+    async def _fetch(_conn: asyncpg.Connection) -> int:
+        v = await _conn.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM autotrade_positions
+            WHERE user_id=$1 AND market_type=$2 AND status='OPEN'
+            """,
+            uid,
+            mt,
+        )
+        try:
+            return int(v or 0)
+        except Exception:
+            return 0
+
+    if conn is not None:
+        return await _fetch(conn)
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn2:
+        return await _fetch(conn2)
 
 
 async def get_autotrade_stats(
