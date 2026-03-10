@@ -2743,8 +2743,13 @@ async def _gate_symbol_filters(symbol: str) -> tuple[float, float, float, float]
     return qty_step, min_qty, tick, min_notional
 
 
-async def _normalize_close_qty(*, ex: str, mt: str, symbol: str, qty: float, px: float) -> float:
-    """Best-effort: round down by step, and ensure >= min qty and >= min notional floor (spot 15 USDT, futures 10 USDT)."""
+async def _normalize_close_qty(*, ex: str, mt: str, symbol: str, qty: float, px: float, is_reduce_close: bool = False) -> float:
+    """Best-effort close qty normalization.
+
+    For real reduce-only / position-closing orders we only round by exchange step and do
+    not reject due to min_qty / min_notional floors. Otherwise tiny live futures positions
+    can stay open on the exchange while the bot marks them closed locally.
+    """
     q = max(0.0, float(qty))
     if q <= 0 or float(px or 0.0) <= 0:
         return 0.0
@@ -2775,6 +2780,9 @@ async def _normalize_close_qty(*, ex: str, mt: str, symbol: str, qty: float, px:
 
     if qty_step and qty_step > 0:
         q = _round_step(q, qty_step)
+
+    if is_reduce_close:
+        return float(max(0.0, q))
 
     if min_qty and min_qty > 0 and q < min_qty:
         return 0.0
@@ -5099,35 +5107,20 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         )
                         continue
 
-                    async def _close_market(q: float) -> None:
+                    async def _close_market(q: float) -> bool:
                         q2 = max(0.0, float(q))
                         if q2 <= 0:
-                            return
-                        # Normalize qty for exchange filters + minimal notional floor (spot 15 USDT, futures 10 USDT).
-                        q2 = await _normalize_close_qty(ex=ex, mt=mt, symbol=symbol, qty=q2, px=px)
+                            return False
+                        # For real reduce-only close orders do not reject by minNotional/minQty.
+                        q2 = await _normalize_close_qty(ex=ex, mt=mt, symbol=symbol, qty=q2, px=px, is_reduce_close=True)
                         if q2 <= 0:
                             _log_rate_limited(
                                 f"smart_skip_small:{uid}:{ex}:{mt}:{symbol}",
-                                f"[SMART] skip close: qty too small for min notional/filters {ex}/{mt} {symbol} px={px}",
+                                f"[SMART] skip close: normalized qty is zero {ex}/{mt} {symbol} px={px}",
                                 every_s=120,
                                 level="debug",
                             )
-                            # Emergency fallback: try close-all stop-market for Binance Futures (closePosition=true)
-                            # using a trigger slightly beyond current px so it fires immediately.
-                            try:
-                                if mt == "futures" and ex == "binance":
-                                    sp = float(px) * (0.999 if direction == "LONG" else 1.001)
-                                    await _binance_futures_stop_market_close_all(
-                                        api_key=api_key,
-                                        api_secret=api_secret,
-                                        symbol=symbol,
-                                        side=("SELL" if direction == "LONG" else "BUY"),
-                                        stop_price=sp,
-                                        reduce_only=True,
-                                    )
-                            except Exception:
-                                pass
-                            return
+                            return False
                         # Spot short is not supported in this bot; virtual logic assumes LONG for spot.
                         if mt == "spot":
                             if ex == "binance":
@@ -5148,7 +5141,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 await _mexc_spot_market_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, base_qty=q2)
                             else:
                                 await _gateio_spot_market_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, base_qty=q2)
-                            return
+                            return True
 
                         # Futures
                         close_side = "SELL" if direction == "LONG" else "BUY"
@@ -5168,6 +5161,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         else:
                             # Other futures exchanges aren't supported in this bot; close silently
                             raise ExchangeAPIError("unsupported futures exchange in virtual mode")
+                        return True
 
                     def _hit_sl() -> bool:
                         if sl <= 0:
@@ -5279,10 +5273,16 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                     dirty = True
                                 elif (now_ts - t_first) >= TRAIL_CONFIRM_SEC:
                                     # close remaining qty (market reduce-only)
+                                    trail_closed = False
                                     try:
-                                        await _close_market(qty)
+                                        trail_closed = await _close_market(qty)
                                     except Exception as e:
                                         _log_rate_limited(f"smart_trail_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] trail close failed {ex}/{mt} {symbol}: {e}", every_s=30, level="warning")
+                                    if trail_closed:
+                                        await db_store.close_autotrade_position(
+                                            user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                                        )
+                                        continue
                                     ref["sm_state"] = "TRAIL_EXIT"
                                     dirty = True
                             else:
@@ -5312,26 +5312,30 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             gain_pct = (best_px / entry_p - 1.0) * 100.0
                             retr_pct = (1.0 - (px / best_px)) * 100.0 if best_px > 0 else 0.0
                             if gain_pct >= PEAK_MIN_GAIN_PCT and retr_pct >= REV_EXIT_PCT:
+                                close_ok = False
                                 try:
-                                    await _close_market(qty)
+                                    close_ok = await _close_market(qty)
                                 except Exception as e:
                                     _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                                await db_store.close_autotrade_position(
-                                    user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
-                                )
-                                continue
+                                if close_ok:
+                                    await db_store.close_autotrade_position(
+                                        user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                                    )
+                                    continue
                         else:
                             gain_pct = (1.0 - (best_px / entry_p)) * 100.0
                             retr_pct = ((px / best_px) - 1.0) * 100.0 if best_px > 0 else 0.0
                             if gain_pct >= PEAK_MIN_GAIN_PCT and retr_pct >= REV_EXIT_PCT:
+                                close_ok = False
                                 try:
-                                    await _close_market(qty)
+                                    close_ok = await _close_market(qty)
                                 except Exception as e:
                                     _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                                await db_store.close_autotrade_position(
-                                    user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
-                                )
-                                continue
+                                if close_ok:
+                                    await db_store.close_autotrade_position(
+                                        user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                                    )
+                                    continue
 
                     # Effective SL: before arming -> HARD SL only; after arming -> original SL (fallback to HARD if missing)
 
@@ -5362,14 +5366,16 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             gain_now_pct = (1.0 - (px / entry_p)) * 100.0
 
                     if neg_count >= max(1, int(EARLY_EXIT_CONSEC)) and gain_now_pct >= float(EARLY_EXIT_MIN_GAIN):
+                        close_ok = False
                         try:
-                            await _close_market(qty)
+                            close_ok = await _close_market(qty)
                         except Exception as e:
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] early-exit close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                        await db_store.close_autotrade_position(
-                            user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
-                        )
-                        continue
+                        if close_ok:
+                            await db_store.close_autotrade_position(
+                                user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                            )
+                            continue
                     # --- SMART STRUCTURAL SL ---
                     # Goals:
                     # 1) If structure SL is broken -> close (decisive)
@@ -5513,25 +5519,29 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     # --- SL (smart structural) ---
                     if sl_close:
 
+                        close_ok = False
                         try:
-                            await _close_market(qty)
+                            close_ok = await _close_market(qty)
                         except Exception as e:
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                        await db_store.close_autotrade_position(
-                            user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
-                        )
-                        continue
+                        if close_ok:
+                            await db_store.close_autotrade_position(
+                                user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                            )
+                            continue
 
                     # --- TP2: if reached, close 100% ---
                     if tp2 > 0 and _hit_tp(tp2):
+                        close_ok = False
                         try:
-                            await _close_market(qty)
+                            close_ok = await _close_market(qty)
                         except Exception as e:
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                        await db_store.close_autotrade_position(
-                            user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
-                        )
-                        continue
+                        if close_ok:
+                            await db_store.close_autotrade_position(
+                                user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                            )
+                            continue
 
                     # --- TP1: probability engine (TP2 vs take profit now) ---
                     if (tp1 > 0) and (not tp1_seen) and _hit_tp(tp1):
@@ -5589,27 +5599,31 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             q_close = max(0.0, qty * max(0.05, min(0.95, TP1_PARTIAL_PCT)))
                             q_rem = max(0.0, qty - q_close)
                             if q_close > 0:
+                                partial_ok = False
                                 try:
-                                    await _close_market(q_close)
+                                    partial_ok = await _close_market(q_close)
                                 except Exception as e:
                                     _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                            ref["qty"] = float(q_rem)
-                            qty = float(q_rem)
-                            ref["tp1_hit"] = True
-                            ref["tp1_partial"] = True
-                            ref["tp1_ts"] = float(now_ts)
-                            ref["be_pending"] = True
-                            dirty = True
+                                if partial_ok:
+                                    ref["qty"] = float(q_rem)
+                                    qty = float(q_rem)
+                                    ref["tp1_hit"] = True
+                                    ref["tp1_partial"] = True
+                                    ref["tp1_ts"] = float(now_ts)
+                                    ref["be_pending"] = True
+                                    dirty = True
                         else:
                             # FULL_TP1 / FULL_TP1_NO_TP2
+                            close_ok = False
                             try:
-                                await _close_market(qty)
+                                close_ok = await _close_market(qty)
                             except Exception as e:
                                 _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                            await db_store.close_autotrade_position(
-                                user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
-                            )
-                            continue
+                            if close_ok:
+                                await db_store.close_autotrade_position(
+                                    user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                                )
+                                continue
 # --- Arm BE only AFTER partial TP1 and after a short delay + confirmation
                     if bool(ref.get("tp1_partial")) and bool(ref.get("be_pending")) and (not be_moved) and entry_p > 0:
                         if (now_ts - float(ref.get("tp1_ts") or 0.0)) >= max(0.0, BE_DELAY_SEC):
@@ -5648,14 +5662,16 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
 
                     # --- BE hit: close remaining ---
                     if bool(ref.get("be_moved")) and _hit_be():
+                        close_ok = False
                         try:
-                            await _close_market(qty)
+                            close_ok = await _close_market(qty)
                         except Exception as e:
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                        await db_store.close_autotrade_position(
-                            user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
-                        )
-                        continue
+                        if close_ok:
+                            await db_store.close_autotrade_position(
+                                user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                            )
+                            continue
 
                     # Persist updated ref if changed
                     if dirty:
