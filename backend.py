@@ -14006,6 +14006,38 @@ def _mid_ta_gate_debug() -> bool:
     return _mid_bool_env("MID_TA_GATE_DEBUG", "0")
 
 
+def _mid_ta_gate_debug_checks(gate: dict) -> str:
+    """Compact per-check status string for TA-gate debug logs."""
+    try:
+        checks = dict(gate.get("checks") or {})
+        blocked_reasons = [str(x) for x in (gate.get("blocked_reasons") or [])]
+        pass_names: list[str] = []
+        block_parts: list[str] = []
+        skip_names: list[str] = []
+        reason_idx = 0
+        for name, status in checks.items():
+            n = str(name)
+            s = str(status or "skip").strip().lower()
+            if s == "pass":
+                pass_names.append(n)
+            elif s == "block":
+                reason = blocked_reasons[reason_idx] if reason_idx < len(blocked_reasons) else n
+                reason_idx += 1
+                block_parts.append(f"{n}:{reason}")
+            else:
+                skip_names.append(n)
+        parts: list[str] = []
+        if pass_names:
+            parts.append("pass=" + "|".join(pass_names))
+        if block_parts:
+            parts.append("block=" + "|".join(block_parts))
+        if skip_names:
+            parts.append("skip=" + "|".join(skip_names))
+        return " ; ".join(parts)
+    except Exception:
+        return ""
+
+
 def _mid_ta_gate_eval(rec: dict) -> dict:
     """Evaluate a count-based TA gate right before pending creation.
 
@@ -20762,7 +20794,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         if _mid_ta_gate_debug():
                                             try:
                                                 logger.info(
-                                                    "[mid][ta-gate] sym=%s market=%s dir=%s allow=%s passed=%s blocked=%s enabled=%s skipped=%s min_pass=%s reasons=%s",
+                                                    "[mid][ta-gate] sym=%s market=%s dir=%s allow=%s passed=%s blocked=%s enabled=%s skipped=%s min_pass=%s reasons=%s checks=%s",
                                                     sym,
                                                     marketu,
                                                     diru,
@@ -20773,6 +20805,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     int(gate.get("skipped", 0) or 0),
                                                     int(gate.get("min_pass", 0) or 0),
                                                     ",".join([str(x) for x in (gate.get("blocked_reasons") or [])]),
+                                                    _mid_ta_gate_debug_checks(gate),
                                                 )
                                             except Exception:
                                                 pass
