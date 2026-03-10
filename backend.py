@@ -13918,7 +13918,7 @@ def _mid_pending_quality_ok(rec: dict, *, include_confidence: bool = True) -> tu
             atr0 = float(rec.get("atr_at_create") or 0.0)
             if atr0 > 0:
                 width_atr = (hi - lo) / atr0
-                max_w = float(os.getenv("MID_ZONE_MAX_WIDTH_ATR_STRICT", os.getenv("MID_PENDING_ZONE_MAX_ATR", "0.60")) or 0.60)
+                max_w = float(os.getenv("MID_TA_GATE_MAX_ZONE_WIDTH_ATR", os.getenv("MID_ZONE_MAX_WIDTH_ATR_STRICT", os.getenv("MID_PENDING_ZONE_MAX_ATR", "4.5"))) or 4.5)
                 if width_atr > max_w:
                     return (False, f"zone_too_wide:{width_atr:.2f}atr")
     except Exception:
