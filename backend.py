@@ -3319,6 +3319,68 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     atr5_sig = _sig_ta_float("atr5")
     atr5_pct_sig = _sig_ta_float("atr5_pct")
     atr_pct_sig = _sig_ta_float("atr_pct")
+    fut_lock_conn = None
+    fut_lock_key = None
+
+    def _safe_floor_div_positions(cap_usdt: float, margin_usdt: float) -> int:
+        try:
+            cap_v = float(cap_usdt or 0.0)
+            margin_v = float(margin_usdt or 0.0)
+            if cap_v <= 0 or margin_v <= 0:
+                return 0
+            return max(0, int(math.floor((cap_v + 1e-9) / margin_v)))
+        except Exception:
+            return 0
+
+    async def _guard_futures_capacity(*, cap_limit_usdt: float, exchange_name: str, free_usdt: float | None = None):
+        """Serialize futures cap checks across replicas and enforce both USDT cap and max positions."""
+        lock_conn = await db_store.get_pool().acquire(timeout=30.0)
+        lock_key = None
+        try:
+            lock_key = await db_store.acquire_autotrade_cap_lock(lock_conn, user_id=uid, market_type="futures")
+            used_locked = await db_store.get_autotrade_used_usdt(uid, "futures", conn=lock_conn)
+            active_locked = await db_store.get_autotrade_open_positions_count(uid, "futures", conn=lock_conn)
+            eff_locked = float(cap_limit_usdt or 0.0)
+            max_pos_locked = _safe_floor_div_positions(eff_locked, need_usdt)
+
+            if max_pos_locked > 0 and active_locked >= max_pos_locked:
+                await db_store.release_autotrade_cap_lock(lock_conn, lock_key)
+                await db_store.get_pool().release(lock_conn)
+                return _skip(
+                    "futures_cap_positions_reached",
+                    active_positions=int(active_locked),
+                    max_positions=int(max_pos_locked),
+                    used_usdt=float(used_locked),
+                    need_usdt=float(need_usdt),
+                    cap_usdt=float(eff_locked),
+                    free_usdt=(float(free_usdt) if free_usdt is not None else None),
+                    exchange=exchange_name,
+                    market=market,
+                )
+
+            if eff_locked > 0 and used_locked + need_usdt > eff_locked:
+                await db_store.release_autotrade_cap_lock(lock_conn, lock_key)
+                await db_store.get_pool().release(lock_conn)
+                return _skip(
+                    "futures_cap_reached",
+                    active_positions=int(active_locked),
+                    max_positions=int(max_pos_locked),
+                    used_usdt=float(used_locked),
+                    need_usdt=float(need_usdt),
+                    cap_usdt=float(eff_locked),
+                    free_usdt=(float(free_usdt) if free_usdt is not None else None),
+                    exchange=exchange_name,
+                    market=market,
+                )
+
+            return lock_conn, lock_key, eff_locked, used_locked, active_locked, max_pos_locked
+        except Exception:
+            try:
+                if lock_key is not None:
+                    await db_store.release_autotrade_cap_lock(lock_conn, lock_key)
+            finally:
+                await db_store.get_pool().release(lock_conn)
+            raise
     # --- Admin gate (like SIGNAL): global per-user Auto-trade allow/deny + expiry ---
     # This is independent from per-market toggles in autotrade_settings.
     # If disabled/expired/blocked -> skip silently.
@@ -3540,6 +3602,14 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
         api_key = _decrypt_token(row.get("api_key_enc"))
         api_secret = _decrypt_token(row.get("api_secret_enc"))
     except Exception as e:
+        try:
+            if mt == "futures" and fut_lock_conn is not None and fut_lock_key is not None:
+                await db_store.release_autotrade_cap_lock(fut_lock_conn, fut_lock_key)
+                await db_store.get_pool().release(fut_lock_conn)
+                fut_lock_conn = None
+                fut_lock_key = None
+        except Exception:
+            pass
         await db_store.mark_autotrade_key_error(
             user_id=uid,
             exchange=exchange,
@@ -3573,8 +3643,6 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             eff_cap = float(fut_cap or 0.0)
 
             if mt == "futures":
-                used = await db_store.get_autotrade_used_usdt(uid, "futures")
-
                 # Smart effective cap uses CURRENT available balance + winrate.
                 try:
                     w = await db_store.get_autotrade_winrate(uid, market_type="futures", limit=20)
@@ -3597,13 +3665,21 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                             cap_decreased = True
                             _LAST_EFFECTIVE_FUT_CAP_NOTIFY_AT[uid] = now_ts
 
-                if eff_cap > 0 and used + need_usdt > eff_cap:
-                    return {
-                        "ok": False, "skipped": True, "api_error": None,
-                        "cap_ui": float(fut_cap), "cap_effective": float(eff_cap),
-                        "cap_decreased": cap_decreased, "cap_prev_effective": prev_eff_val,
+                cap_guard = await _guard_futures_capacity(
+                    cap_limit_usdt=float(eff_cap),
+                    exchange_name=exchange,
+                    free_usdt=float(free),
+                )
+                if isinstance(cap_guard, dict):
+                    cap_guard.update({
+                        "cap_ui": float(fut_cap),
+                        "cap_effective": float(eff_cap),
+                        "cap_decreased": cap_decreased,
+                        "cap_prev_effective": prev_eff_val,
                         "winrate": (float(winrate) if winrate is not None else None),
-                    }
+                    })
+                    return cap_guard
+                fut_lock_conn, fut_lock_key, _eff_cap_locked, _used_locked, _active_locked, _max_pos_locked = cap_guard
 
             direction_local = direction
             if mt == "spot":
@@ -4076,11 +4152,26 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             return {"ok": True, "skipped": False, "api_error": None}
 
         # futures
-        used = await db_store.get_autotrade_used_usdt(uid, "futures")
-        if fut_cap > 0 and used + need_usdt > fut_cap:
-            return _skip("futures_cap_reached", used_usdt=float(used), need_usdt=float(need_usdt), cap_usdt=float(fut_cap), exchange=exchange, market=market)
-
         avail = await _binance_futures_available_margin(api_key, api_secret)
+        eff_cap = float(st.get("effective_futures_cap") or 0.0)
+        if eff_cap <= 0:
+            eff_cap = float(fut_cap or 0.0)
+        cap_guard = await _guard_futures_capacity(
+            cap_limit_usdt=float(eff_cap),
+            exchange_name=exchange,
+            free_usdt=float(avail),
+        )
+        if isinstance(cap_guard, dict):
+            return cap_guard
+        fut_lock_conn, fut_lock_key, _eff_cap_locked, _used_locked, _active_locked, _max_pos_locked = cap_guard
+
+        if avail < need_usdt:
+            await db_store.release_autotrade_cap_lock(fut_lock_conn, fut_lock_key)
+            await db_store.get_pool().release(fut_lock_conn)
+            fut_lock_conn = None
+            fut_lock_key = None
+            return _skip("insufficient_balance", free_usdt=float(avail), need_usdt=float(need_usdt), exchange=exchange, market=market)
+
         if avail < need_usdt:
             return _skip("insufficient_balance", free_usdt=float(avail), need_usdt=float(need_usdt), exchange=exchange, market=market)
 
@@ -4127,16 +4218,22 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             sig_id = _extract_signal_id(sig)
             if sig_id <= 0:
                 raise ExchangeAPIError("missing signal_id")
-            await db_store.create_autotrade_position(
-                user_id=uid,
-                signal_id=sig_id,
-                exchange="binance",
-                market_type="futures",
-                symbol=symbol,
-                side=side,
-                allocated_usdt=need_usdt,
-                api_order_ref=json.dumps(ref),
-            )
+            try:
+                await db_store.create_autotrade_position(
+                    user_id=uid,
+                    signal_id=sig_id,
+                    exchange="binance",
+                    market_type="futures",
+                    symbol=symbol,
+                    side=side,
+                    allocated_usdt=need_usdt,
+                    api_order_ref=json.dumps(ref),
+                )
+            finally:
+                await db_store.release_autotrade_cap_lock(fut_lock_conn, fut_lock_key)
+                await db_store.get_pool().release(fut_lock_conn)
+                fut_lock_conn = None
+                fut_lock_key = None
             return {"ok": True, "skipped": False, "api_error": None}
 
 
@@ -4219,19 +4316,33 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
         sig_id = _extract_signal_id(sig)
         if sig_id <= 0:
             raise ExchangeAPIError("missing signal_id")
-        await db_store.create_autotrade_position(
-            user_id=uid,
-            signal_id=sig_id,
-            exchange="binance",
-            market_type="futures",
-            symbol=symbol,
-            side=side,
-            allocated_usdt=need_usdt,
-            api_order_ref=json.dumps(ref),
-        )
+        try:
+            await db_store.create_autotrade_position(
+                user_id=uid,
+                signal_id=sig_id,
+                exchange="binance",
+                market_type="futures",
+                symbol=symbol,
+                side=side,
+                allocated_usdt=need_usdt,
+                api_order_ref=json.dumps(ref),
+            )
+        finally:
+            await db_store.release_autotrade_cap_lock(fut_lock_conn, fut_lock_key)
+            await db_store.get_pool().release(fut_lock_conn)
+            fut_lock_conn = None
+            fut_lock_key = None
         return {"ok": True, "skipped": False, "api_error": None}
 
     except ExchangeAPIError as e:
+        try:
+            if mt == "futures" and fut_lock_conn is not None and fut_lock_key is not None:
+                await db_store.release_autotrade_cap_lock(fut_lock_conn, fut_lock_key)
+                await db_store.get_pool().release(fut_lock_conn)
+                fut_lock_conn = None
+                fut_lock_key = None
+        except Exception:
+            pass
         err = str(e)
         await db_store.mark_autotrade_key_error(
             user_id=uid,
