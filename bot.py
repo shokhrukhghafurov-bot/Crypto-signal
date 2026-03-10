@@ -3448,7 +3448,7 @@ async def subscription_handler(call: types.CallbackQuery) -> None:
 @dp.message(Command("autotrade_health"))
 async def cmd_autotrade_health(message: types.Message):
     uid = int(message.from_user.id) if message.from_user else 0
-    if not is_admin(uid):
+    if not _is_admin(uid):
         return
     snap = await autotrade_healthcheck()
     open_cnt = int(snap.get("open_positions") or 0)
@@ -3470,7 +3470,7 @@ async def cmd_autotrade_health(message: types.Message):
 @dp.message(Command("autotrade_stress"))
 async def cmd_autotrade_stress(message: types.Message):
     uid = int(message.from_user.id) if message.from_user else 0
-    if not is_admin(uid):
+    if not _is_admin(uid):
         return
 
     # Usage: /autotrade_stress [SYMBOL] [spot|futures] [N]
@@ -4088,7 +4088,7 @@ async def referral_handler(call: types.CallbackQuery) -> None:
 async def referral_admin_handler(call: types.CallbackQuery) -> None:
     await safe_callback_answer(call)
     uid = call.from_user.id if call.from_user else 0
-    if not is_admin(uid):
+    if not _is_admin(uid):
         return
     parts = (call.data or '').split(':')
     action = parts[1] if len(parts) > 1 else ''
