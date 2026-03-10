@@ -13881,6 +13881,65 @@ def _mid_gate_listify(value) -> list:
         return []
 
 
+def _mid_ta_gate_describe_risk_flags(rec: dict, flags: set[str]) -> str:
+    """Return detailed risk_flags reason text for TA-gate logs.
+
+    Keeps legacy tokens (e.g. vol_low) but expands them with concrete values,
+    similar to zone_width:6.39atr.
+    """
+    try:
+        out: list[str] = []
+        for flag in sorted({str(x).strip().lower() for x in (flags or set()) if str(x).strip()}):
+            if flag == "vol_low":
+                parts: list[str] = []
+                try:
+                    rel_vol = rec.get("rel_vol_at_create")
+                    min_vol = float(os.getenv("MID_MIN_VOL_X", "0") or 0.0)
+                    if rel_vol is not None:
+                        rel_vol_f = float(rel_vol)
+                        if min_vol > 0 and rel_vol_f < min_vol:
+                            parts.append(f"vol_x={rel_vol_f:.2f}<{min_vol:.2f}")
+                        else:
+                            parts.append(f"vol_x={rel_vol_f:.2f}")
+                except Exception:
+                    pass
+                try:
+                    atr_abs = rec.get("atr_at_create")
+                    min_atr_abs = float(os.getenv("MID_PENDING_MIN_ATR_ABS", "0") or 0.0)
+                    if atr_abs is not None:
+                        atr_abs_f = float(atr_abs)
+                        if min_atr_abs > 0 and atr_abs_f < min_atr_abs:
+                            parts.append(f"atr_abs={atr_abs_f:.6g}<{min_atr_abs:.6g}")
+                        elif min_atr_abs > 0:
+                            parts.append(f"atr_abs={atr_abs_f:.6g}")
+                except Exception:
+                    pass
+                try:
+                    atr_pct_now = rec.get("atr_pct_at_create")
+                    if atr_pct_now is None:
+                        entry = float(rec.get("entry") or 0.0)
+                        atr_abs = float(rec.get("atr_at_create") or 0.0)
+                        atr_pct_now = ((atr_abs / entry) * 100.0) if entry > 0 and atr_abs > 0 else None
+                    min_atr_pct = float(os.getenv("MID_PENDING_MIN_ATR_PCT", os.getenv("MID_MIN_ATR_PCT", "0")) or 0.0)
+                    if atr_pct_now is not None:
+                        atr_pct_f = float(atr_pct_now)
+                        if min_atr_pct > 0 and atr_pct_f < min_atr_pct:
+                            parts.append(f"atr_pct={atr_pct_f:.3f}%<{min_atr_pct:.3f}%")
+                        elif min_atr_pct > 0:
+                            parts.append(f"atr_pct={atr_pct_f:.3f}%")
+                except Exception:
+                    pass
+                out.append(f"risk_flags:vol_low[{';'.join(parts)}]" if parts else "risk_flags:vol_low")
+            else:
+                out.append(f"risk_flags:{flag}")
+        return ",".join(out)
+    except Exception:
+        try:
+            return f"risk_flags:{','.join(sorted(flags))}"
+        except Exception:
+            return "risk_flags"
+
+
 def _mid_pending_quality_ok(rec: dict, *, include_confidence: bool = True) -> tuple[bool, str]:
     """Reject weak/almost-good pending setups before they are stored.
 
@@ -14068,7 +14127,7 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
             flags = set()
         hard_bad = {"far_zone", "vol_low", "regime_range_no_breakout", "structure_mismatch", "blocked"}
         bad_hit = sorted(flags & hard_bad)
-        add("risk_flags", "pass" if not bad_hit else "block", reason=("risk_flags" if not bad_hit else f"risk_flags:{','.join(bad_hit)}"), hard=bool(bad_hit))
+        add("risk_flags", "pass" if not bad_hit else "block", reason=("risk_flags" if not bad_hit else _mid_ta_gate_describe_risk_flags(rec, set(bad_hit))), hard=bool(bad_hit))
 
         # 9) Confirmation count.
         try:
