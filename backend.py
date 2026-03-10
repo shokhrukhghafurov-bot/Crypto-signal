@@ -20682,6 +20682,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "entry_high": entry_high,
                                         "entry_zone_src": str(z_src),
                                         "atr_at_create": float(_atr0) if ("_atr0" in locals() and _atr0) else float(entry) * 0.001,
+                                        "atr_pct_at_create": float((base_r.get("atr_pct") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
+                                        "rel_vol_at_create": float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
                                         "zone_width_atr": (float(_zone_w_atr) if (_zone_w_atr is not None) else None) if ("_zone_w_atr" in locals()) else None,
                                         "zone_width_pct": float(_zone_w_pct) if ("_zone_w_pct" in locals()) else 0.0,
                                         "dist_to_zone_at_create_atr": (float(_dist0_atr) if (_dist0_atr is not None) else None) if ("_dist0_atr" in locals()) else None,
