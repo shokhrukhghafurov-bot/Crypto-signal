@@ -13884,52 +13884,62 @@ def _mid_gate_listify(value) -> list:
 def _mid_ta_gate_describe_risk_flags(rec: dict, flags: set[str]) -> str:
     """Return detailed risk_flags reason text for TA-gate logs.
 
-    Keeps legacy tokens (e.g. vol_low) but expands them with concrete values,
-    similar to zone_width:6.39atr.
+    Keep legacy tokens stable, but make the human-facing reason text truthful.
+    In particular, distinguish real low relative volume (vol_low) from low
+    volatility / tiny ATR (atrpct_low), otherwise debug logs become misleading.
     """
     try:
+        def _fmt_vol_low() -> str:
+            parts: list[str] = []
+            try:
+                rel_vol = rec.get("rel_vol_at_create")
+                min_vol = float(os.getenv("MID_MIN_VOL_X", "0") or 0.0)
+                if rel_vol is not None:
+                    rel_vol_f = float(rel_vol)
+                    if min_vol > 0 and rel_vol_f < min_vol:
+                        parts.append(f"vol_x={rel_vol_f:.2f}<{min_vol:.2f}")
+                    else:
+                        parts.append(f"vol_x={rel_vol_f:.2f}")
+            except Exception:
+                pass
+            return f"risk_flags:vol_low[{';'.join(parts)}]" if parts else "risk_flags:vol_low"
+
+        def _fmt_atr_low() -> str:
+            parts: list[str] = []
+            try:
+                atr_abs = rec.get("atr_at_create")
+                min_atr_abs = float(os.getenv("MID_PENDING_MIN_ATR_ABS", "0") or 0.0)
+                if atr_abs is not None:
+                    atr_abs_f = float(atr_abs)
+                    if min_atr_abs > 0 and atr_abs_f < min_atr_abs:
+                        parts.append(f"atr_abs={atr_abs_f:.6g}<{min_atr_abs:.6g}")
+                    elif min_atr_abs > 0:
+                        parts.append(f"atr_abs={atr_abs_f:.6g}")
+            except Exception:
+                pass
+            try:
+                atr_pct_now = rec.get("atr_pct_at_create")
+                if atr_pct_now is None:
+                    entry = float(rec.get("entry") or 0.0)
+                    atr_abs = float(rec.get("atr_at_create") or 0.0)
+                    atr_pct_now = ((atr_abs / entry) * 100.0) if entry > 0 and atr_abs > 0 else None
+                min_atr_pct = float(os.getenv("MID_PENDING_MIN_ATR_PCT", os.getenv("MID_MIN_ATR_PCT", "0")) or 0.0)
+                if atr_pct_now is not None:
+                    atr_pct_f = float(atr_pct_now)
+                    if min_atr_pct > 0 and atr_pct_f < min_atr_pct:
+                        parts.append(f"atr_pct={atr_pct_f:.3f}%<{min_atr_pct:.3f}%")
+                    elif min_atr_pct > 0:
+                        parts.append(f"atr_pct={atr_pct_f:.3f}%")
+            except Exception:
+                pass
+            return f"risk_flags:atrpct_low[{';'.join(parts)}]" if parts else "risk_flags:atrpct_low"
+
         out: list[str] = []
         for flag in sorted({str(x).strip().lower() for x in (flags or set()) if str(x).strip()}):
             if flag == "vol_low":
-                parts: list[str] = []
-                try:
-                    rel_vol = rec.get("rel_vol_at_create")
-                    min_vol = float(os.getenv("MID_MIN_VOL_X", "0") or 0.0)
-                    if rel_vol is not None:
-                        rel_vol_f = float(rel_vol)
-                        if min_vol > 0 and rel_vol_f < min_vol:
-                            parts.append(f"vol_x={rel_vol_f:.2f}<{min_vol:.2f}")
-                        else:
-                            parts.append(f"vol_x={rel_vol_f:.2f}")
-                except Exception:
-                    pass
-                try:
-                    atr_abs = rec.get("atr_at_create")
-                    min_atr_abs = float(os.getenv("MID_PENDING_MIN_ATR_ABS", "0") or 0.0)
-                    if atr_abs is not None:
-                        atr_abs_f = float(atr_abs)
-                        if min_atr_abs > 0 and atr_abs_f < min_atr_abs:
-                            parts.append(f"atr_abs={atr_abs_f:.6g}<{min_atr_abs:.6g}")
-                        elif min_atr_abs > 0:
-                            parts.append(f"atr_abs={atr_abs_f:.6g}")
-                except Exception:
-                    pass
-                try:
-                    atr_pct_now = rec.get("atr_pct_at_create")
-                    if atr_pct_now is None:
-                        entry = float(rec.get("entry") or 0.0)
-                        atr_abs = float(rec.get("atr_at_create") or 0.0)
-                        atr_pct_now = ((atr_abs / entry) * 100.0) if entry > 0 and atr_abs > 0 else None
-                    min_atr_pct = float(os.getenv("MID_PENDING_MIN_ATR_PCT", os.getenv("MID_MIN_ATR_PCT", "0")) or 0.0)
-                    if atr_pct_now is not None:
-                        atr_pct_f = float(atr_pct_now)
-                        if min_atr_pct > 0 and atr_pct_f < min_atr_pct:
-                            parts.append(f"atr_pct={atr_pct_f:.3f}%<{min_atr_pct:.3f}%")
-                        elif min_atr_pct > 0:
-                            parts.append(f"atr_pct={atr_pct_f:.3f}%")
-                except Exception:
-                    pass
-                out.append(f"risk_flags:vol_low[{';'.join(parts)}]" if parts else "risk_flags:vol_low")
+                out.append(_fmt_vol_low())
+            elif flag in ("atrpct_low", "atr_low", "volatility_low"):
+                out.append(_fmt_atr_low())
             else:
                 out.append(f"risk_flags:{flag}")
         return ",".join(out)
@@ -13951,7 +13961,7 @@ def _mid_pending_quality_ok(rec: dict, *, include_confidence: bool = True) -> tu
         flags = {str(x).strip().lower() for x in _mid_gate_listify(rec.get("risk_flags")) if str(x).strip()}
     except Exception:
         flags = set()
-    hard_bad = {"far_zone", "vol_low", "regime_range_no_breakout", "structure_mismatch", "blocked"}
+    hard_bad = {"far_zone", "vol_low", "atrpct_low", "regime_range_no_breakout", "structure_mismatch", "blocked"}
     if _mid_quality_first_enabled() and (flags & hard_bad):
         return (False, f"risk_flags:{','.join(sorted(flags & hard_bad))}")
     try:
@@ -14157,7 +14167,7 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
             flags = {str(x).strip().lower() for x in _mid_gate_listify(rec.get("risk_flags")) if str(x).strip()}
         except Exception:
             flags = set()
-        hard_bad = {"far_zone", "vol_low", "regime_range_no_breakout", "structure_mismatch", "blocked"}
+        hard_bad = {"far_zone", "vol_low", "atrpct_low", "regime_range_no_breakout", "structure_mismatch", "blocked"}
         bad_hit = sorted(flags & hard_bad)
         add("risk_flags", "pass" if not bad_hit else "block", reason=("risk_flags" if not bad_hit else _mid_ta_gate_describe_risk_flags(rec, set(bad_hit))), hard=bool(bad_hit))
 
@@ -14669,7 +14679,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         far_atr = float(os.getenv("MID_PENDING_FAR_ATR", "1.50") or 1.50)
     except Exception:
         far_atr = 1.50
-    # When ATR is too small (vol_low), classify distances by % instead of ATR.
+    # When ATR is too small (atrpct_low/vol_low), classify distances by % instead of ATR.
     try:
         near_pct = float(os.getenv("MID_PENDING_NEAR_PCT", "0.003") or 0.003)
     except Exception:
@@ -14790,7 +14800,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
         # SOFT reasons: allow waiting (do not count as fail), but still record reason/ts
         try:
-            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,liq_sweep_missing").strip()
+            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,atrpct_low,liq_sweep_missing").strip()
             soft_set = {s.strip().lower() for s in _soft.split(",") if s.strip()}
             if r0 in soft_set:
                 it["last_fail_reason"] = str(reason or "fail")
@@ -15526,7 +15536,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                         _dist_pct = float(_dist) / float(price) if float(price) > 0 else 0.0
 
-                        # vol_low guard: if ATR is too small, ATR-based metrics explode and become meaningless
+                        # ATR-low guard: if ATR is too small, ATR-based metrics explode and become meaningless
                         try:
                             _min_atr_abs = float(os.getenv("MID_PENDING_MIN_ATR_ABS", "0") or 0.0)
                         except Exception:
@@ -15546,9 +15556,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             _vol_low = False
 
-                        # If TA/scan already flagged vol_low, treat it as vol_low here too (prevents dist_atr=999 spam)
+                        # If TA/scan already flagged vol_low/atrpct_low, treat it as ATR-low here too (prevents dist_atr=999 spam)
                         try:
-                            if "vol_low" in risk_flags:
+                            if ("vol_low" in risk_flags) or ("atrpct_low" in risk_flags):
                                 _vol_low = True
                         except Exception:
                             pass
@@ -20655,8 +20665,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 _dist0_atr = None
                                                 _zone_w_atr = None
                                                 try:
-                                                    if "vol_low" not in risk_flags:
-                                                        risk_flags.append("vol_low")
+                                                    if "atrpct_low" not in risk_flags:
+                                                        risk_flags.append("atrpct_low")
                                                 except Exception:
                                                     pass
                                         except Exception:
