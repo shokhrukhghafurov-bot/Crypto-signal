@@ -3414,45 +3414,41 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     
     exchange = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "binance").lower().strip()
 
-    # SPOT: choose exchange based on user's priority intersecting with signal confirmations.
-    # Fallback order is user-defined (1->2->3...), and we ONLY trade on exchanges that confirmed the signal.
+    # SPOT: choose exchange using the user's priority, but do not hard-fail when
+    # confirmations/available_exchanges are empty or incomplete. Some signals arrive
+    # with only source_exchange/binance in confirmations even though the pair exists
+    # on Bybit/OKX/MEXC/Gate and the user expects the first eligible exchange from
+    # their priority list to be used.
     if mt == "spot":
-        # Parse confirmations like "BYBIT+OKX" to {"bybit","okx"}
+        allowed = ["binance", "bybit", "okx", "mexc", "gateio"]
+
+        def _norm_spot_venues(raw: str) -> set[str]:
+            out: set[str] = set()
+            for part in re.split(r"[+ ,;/|•·]+", str(raw or "").strip()):
+                p = part.strip().lower()
+                if not p:
+                    continue
+                if p in ("binance", "bnb"):
+                    out.add("binance")
+                elif p in ("bybit", "byb"):
+                    out.add("bybit")
+                elif p in ("okx",):
+                    out.add("okx")
+                elif p in ("mexc",):
+                    out.add("mexc")
+                elif p in ("gateio", "gate", "gate.io", "gateio.ws"):
+                    out.add("gateio")
+            return out
+
         conf_raw = str((getattr(sig, "available_exchanges", "") or getattr(sig, "confirmations", "") or "")).strip()
-        conf_set: set[str] = set()
-        # confirmations may arrive in UI formats like "Binance • Bybit • OKX".
-        # include common separators (bullets, middle dot) to avoid false empty conf_set.
-        for part in re.split(r"[+ ,;/|•·]+", conf_raw.strip()):
-            p = part.strip().lower()
-            if not p:
-                continue
-            # normalize common labels
-            if p in ("binance", "bnb"):
-                conf_set.add("binance")
-            elif p in ("bybit", "byb"):
-                conf_set.add("bybit")
-            elif p in ("okx",):
-                conf_set.add("okx")
-            elif p in ("mexc",):
-                conf_set.add("mexc")
-            elif p in ("gateio", "gate", "gate.io", "gateio.ws"):
-                conf_set.add("gateio")
-
-        # Require at least one confirmation exchange; otherwise skip auto-trade
-        if not conf_set:
-            return {
-                "ok": False,
-                "skipped": True,
-                "skip_reason": "no_confirmations",
-                "details": {"confirmations_raw": conf_raw},
-                "api_error": None,
-            }
-
+        conf_set: set[str] = _norm_spot_venues(conf_raw)
+        src_ex = str(getattr(sig, "source_exchange", "") or "").strip().lower()
+        if src_ex in allowed:
+            conf_set.add(src_ex)
 
         # Priority list from DB (comma-separated)
         pr_csv = str(st.get("spot_exchange_priority") or "binance,bybit,okx,mexc,gateio")
         pr = [x.strip().lower() for x in pr_csv.split(",") if x.strip()]
-        allowed = ["binance", "bybit", "okx", "mexc", "gateio"]
         pr2: list[str] = []
         for x in pr:
             if x in allowed and x not in pr2:
@@ -3461,26 +3457,106 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             if x not in pr2:
                 pr2.append(x)
 
-        chosen = None
-        # iterate user priority, but only those that confirmed signal
-        for ex in pr2:
-            if conf_set and ex not in conf_set:
-                continue
+        async def _get_spot_keys_row(ex: str):
             row = await db_store.get_autotrade_keys_row(user_id=uid, exchange=ex, market_type="spot")
             if not row or not bool(row.get("is_active")):
-                continue
-            # require both key and secret
+                return None
             if not (row.get("api_key_enc") and row.get("api_secret_enc")):
-                continue
+                return None
             if ex == "okx" and not row.get("passphrase_enc"):
-                # okx needs passphrase
-                continue
-            chosen = ex
-            break
+                return None
+            return row
+
+        async def _spot_symbol_exists(ex: str, sym: str) -> bool:
+            ex = (ex or "").lower().strip()
+            sym = (sym or "").upper().replace("/", "")
+            try:
+                if ex == "binance":
+                    info = await _binance_exchange_info(futures=False)
+                    for s in (info.get("symbols", []) or []):
+                        if str(s.get("symbol") or "").upper() == sym:
+                            stt = str(s.get("status") or "").upper()
+                            return (stt in ("TRADING", "1")) or (stt == "")
+                    return False
+                if ex == "bybit":
+                    data = await _http_json(
+                        "GET",
+                        "https://api.bybit.com/v5/market/instruments-info",
+                        params={"category": "spot", "symbol": sym},
+                        timeout_s=10,
+                    )
+                    lst = ((data.get("result") or {}).get("list") or [])
+                    return bool(lst)
+                if ex == "okx":
+                    await _okx_instrument_filters(inst_type="SPOT", symbol=sym)
+                    return True
+                if ex == "mexc":
+                    data = await _http_json("GET", "https://api.mexc.com/api/v3/exchangeInfo", params={"symbol": sym}, timeout_s=10)
+                    lst = (data.get("symbols") or [])
+                    return any(str(x.get("symbol") or "").upper() == sym for x in lst)
+                if ex == "gateio":
+                    pair = _gate_pair(sym)
+                    data = await _http_json("GET", "https://api.gateio.ws/api/v4/spot/currency_pairs", params={"id": pair}, timeout_s=10)
+                    if isinstance(data, list):
+                        return any(str(x.get("id") or "").upper() == pair.upper() for x in data)
+                    if isinstance(data, dict):
+                        return str(data.get("id") or "").upper() == pair.upper()
+            except Exception:
+                return False
+            return False
+
+        chosen = None
+        chosen_reason = ""
+
+        # 1) Best case: first exchange from user priority that is both confirmed and usable.
+        if conf_set:
+            for ex in pr2:
+                if ex not in conf_set:
+                    continue
+                row = await _get_spot_keys_row(ex)
+                if not row:
+                    continue
+                if not (await _spot_symbol_exists(ex, sym)):
+                    continue
+                chosen = ex
+                chosen_reason = "confirmed+priority"
+                break
+
+        # 2) Fallback: confirmations are often incomplete. Use first user-priority
+        # exchange with valid keys where the symbol actually exists.
+        if not chosen:
+            for ex in pr2:
+                row = await _get_spot_keys_row(ex)
+                if not row:
+                    continue
+                if not (await _spot_symbol_exists(ex, sym)):
+                    continue
+                chosen = ex
+                chosen_reason = "priority_fallback"
+                break
 
         if not chosen:
-            return _skip("no_exchange_available", market=market)
+            return {
+                "ok": False,
+                "skipped": True,
+                "skip_reason": "no_exchange_available",
+                "details": {
+                    "confirmations_raw": conf_raw,
+                    "confirmations": sorted(conf_set),
+                    "priority": pr2,
+                    "symbol": sym,
+                },
+                "api_error": None,
+            }
+
         exchange = chosen
+        try:
+            logger.info(
+                "[autotrade][route][spot] uid=%s sym=%s chosen=%s reason=%s conf_raw=%s conf=%s priority=%s",
+                uid, sym, exchange, chosen_reason, conf_raw or "-", ",".join(sorted(conf_set)) or "-", ",".join(pr2),
+            )
+        except Exception:
+            pass
 
     # FUTURES: choose exchange based on where the futures contract actually exists
     # (BINANCE/BYBIT/OKX). If the signal provides a list of executable futures venues
