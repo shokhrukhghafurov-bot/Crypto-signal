@@ -2029,9 +2029,10 @@ async def _notify_referral_admin_new_request(req: dict) -> None:
         f"🏦 Адрес:\n{req.get('wallet_address') or '-'}\n\n"
         f"Дата:\n{created_at_text}"
     )
-    msg = await safe_send_payment_alert(
+    msg = await safe_send(
         REFERRAL_ADMIN_CHAT_ID,
         txt,
+        ctx="referral_admin_new_request",
         reply_markup=referral_admin_request_kb(uid, int(req.get('id') or 0)),
     )
     if msg is not None:
