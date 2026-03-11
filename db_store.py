@@ -83,6 +83,9 @@ async def ensure_users_table() -> None:
           autotrade_expires_at TIMESTAMPTZ,
           autotrade_stop_after_close BOOLEAN NOT NULL DEFAULT FALSE,
 
+          -- Referral access (manual override when global flag is OFF)
+          referral_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
@@ -738,6 +741,16 @@ async def ensure_users_columns() -> None:
             await conn.execute(
                 """
                 ALTER TABLE users
+                  ADD COLUMN IF NOT EXISTS referral_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+                """
+            )
+        except Exception:
+            logger.exception("ensure_users_columns: failed to add referral_enabled")
+
+        try:
+            await conn.execute(
+                """
+                ALTER TABLE users
                   ADD COLUMN IF NOT EXISTS ref_available_balance NUMERIC(18,8) NOT NULL DEFAULT 0;
                 """
             )
@@ -774,11 +787,15 @@ async def ensure_users_columns() -> None:
         except Exception:
             logger.exception("ensure_users_columns: failed to add ref_total_earned")
 
-        # Helpful index; ignore failure on managed DBs.
+        # Helpful indexes; ignore failure on managed DBs.
         try:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);")
         except Exception:
             logger.exception("ensure_users_columns: failed to create idx_users_telegram_id")
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_referral_enabled ON users(referral_enabled) WHERE referral_enabled = TRUE;")
+        except Exception:
+            logger.exception("ensure_users_columns: failed to create idx_users_referral_enabled")
 
 
 async def get_autotrade_access(user_id: int) -> Dict[str, Any]:
@@ -3649,6 +3666,7 @@ async def get_referral_overview(user_id: int) -> Dict[str, Any]:
         user = await conn.fetchrow(
             """
             SELECT telegram_id, referrer_id,
+                   COALESCE(referral_enabled, FALSE) AS referral_enabled,
                    COALESCE(ref_available_balance, 0) AS ref_available_balance,
                    COALESCE(ref_hold_balance, 0) AS ref_hold_balance,
                    COALESCE(ref_withdrawn_balance, 0) AS ref_withdrawn_balance,
@@ -3658,11 +3676,18 @@ async def get_referral_overview(user_id: int) -> Dict[str, Any]:
             """,
             uid,
         )
+        global_referral_enabled = await conn.fetchval(
+            "SELECT COALESCE(referral_enabled, FALSE) FROM signal_bot_settings WHERE id=1"
+        )
         invited = await conn.fetchval("SELECT COUNT(1) FROM users WHERE referrer_id=$1", uid)
         paid = await conn.fetchval("SELECT COUNT(1) FROM referral_rewards WHERE referrer_id=$1", uid)
+        manual_referral_enabled = bool((user.get("referral_enabled") if user else False) or False)
         return {
             "user_id": uid,
             "referrer_id": int(user.get("referrer_id")) if user and user.get("referrer_id") is not None else None,
+            "referral_enabled": manual_referral_enabled,
+            "global_referral_enabled": bool(global_referral_enabled or False),
+            "effective_referral_enabled": bool(bool(global_referral_enabled or False) or manual_referral_enabled),
             "total_refs": int(invited or 0),
             "paid_refs": int(paid or 0),
             "available_balance": float((user.get("ref_available_balance") if user else 0) or 0),
@@ -3678,7 +3703,8 @@ async def get_referral_user_profile(user_id: int) -> Dict[str, Any]:
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         row = await conn.fetchrow(
             """
-            SELECT telegram_id, created_at, signal_expires_at, referrer_id
+            SELECT telegram_id, created_at, signal_expires_at, referrer_id,
+                   COALESCE(referral_enabled, FALSE) AS referral_enabled
             FROM users WHERE telegram_id=$1
             """, uid
         )
@@ -3687,8 +3713,64 @@ async def get_referral_user_profile(user_id: int) -> Dict[str, Any]:
         out.update({
             "created_at": row.get("created_at") if row else None,
             "signal_expires_at": row.get("signal_expires_at") if row else None,
+            "referral_enabled": bool(row.get("referral_enabled") if row else False),
         })
         return out
+
+
+async def list_referral_enabled_user_ids() -> List[int]:
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT telegram_id
+            FROM users
+            WHERE COALESCE(referral_enabled, FALSE) = TRUE
+            ORDER BY telegram_id
+            """
+        )
+    return [int(r.get("telegram_id")) for r in rows if r and r.get("telegram_id") is not None]
+
+
+async def get_user_referral_access_state(user_id: int) -> Dict[str, Any]:
+    pool = get_pool()
+    uid = int(user_id)
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                COALESCE((SELECT referral_enabled FROM signal_bot_settings WHERE id = 1), FALSE) AS global_referral_enabled,
+                COALESCE((SELECT referral_enabled FROM users WHERE telegram_id = $1), FALSE) AS referral_enabled
+            """,
+            uid,
+        )
+    global_enabled = bool((row.get("global_referral_enabled") if row else False) or False)
+    user_enabled = bool((row.get("referral_enabled") if row else False) or False)
+    return {
+        "user_id": uid,
+        "global_referral_enabled": global_enabled,
+        "referral_enabled": user_enabled,
+        "effective_referral_enabled": bool(global_enabled or user_enabled),
+    }
+
+
+async def set_user_referral_enabled(user_id: int, enabled: bool) -> Dict[str, Any]:
+    pool = get_pool()
+    uid = int(user_id)
+    flag = bool(enabled)
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (telegram_id, referral_enabled)
+            VALUES ($1, $2)
+            ON CONFLICT (telegram_id) DO UPDATE
+            SET referral_enabled = EXCLUDED.referral_enabled,
+                updated_at = NOW()
+            """,
+            uid,
+            flag,
+        )
+    return await get_user_referral_access_state(uid)
 
 
 async def award_referral_bonus_for_first_payment(*, referral_user_id: int, order_id: str | None, payment_amount: float, currency: str = 'USDT', reward_percent: float = 10.0) -> Optional[Dict[str, Any]]:
@@ -3705,11 +3787,24 @@ async def award_referral_bonus_for_first_payment(*, referral_user_id: int, order
     uid = int(referral_user_id)
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         async with conn.transaction():
-            user = await conn.fetchrow("SELECT telegram_id, referrer_id FROM users WHERE telegram_id=$1 FOR UPDATE", uid)
+            user = await conn.fetchrow(
+                """
+                SELECT u.telegram_id,
+                       u.referrer_id,
+                       COALESCE((SELECT referral_enabled FROM users WHERE telegram_id = u.referrer_id), FALSE) AS referrer_referral_enabled,
+                       COALESCE((SELECT referral_enabled FROM signal_bot_settings WHERE id = 1), FALSE) AS global_referral_enabled
+                FROM users u
+                WHERE u.telegram_id=$1
+                FOR UPDATE OF u
+                """,
+                uid,
+            )
             if not user:
                 return None
             referrer_id = user.get('referrer_id')
             if referrer_id is None or int(referrer_id) == uid:
+                return None
+            if not (bool(user.get('global_referral_enabled')) or bool(user.get('referrer_referral_enabled'))):
                 return None
 
             existing = await conn.fetchrow("SELECT id, reward_amount FROM referral_rewards WHERE referral_user_id=$1", uid)
