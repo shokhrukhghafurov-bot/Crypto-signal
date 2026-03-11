@@ -2130,6 +2130,10 @@ def _okx_inst(symbol: str) -> str:
         return f"{s[:-4]}-USDT"
     return s
 
+def _okx_swap_inst(symbol: str) -> str:
+    inst = _okx_inst(symbol)
+    return inst if inst.endswith("-SWAP") else (inst + "-SWAP")
+
 def _gate_pair(symbol: str) -> str:
     s = symbol.upper()
     if s.endswith("USDT"):
@@ -2269,6 +2273,54 @@ async def _okx_spot_market_sell(*, api_key: str, api_secret: str, passphrase: st
         return await _okx_signed_request(s, base_url="https://www.okx.com", path="/api/v5/trade/order", method="POST",
                                          api_key=api_key, api_secret=api_secret, passphrase=passphrase, json_body=body)
 
+async def _okx_futures_set_leverage(*, api_key: str, api_secret: str, passphrase: str, symbol: str, leverage: int) -> dict:
+    inst = _okx_swap_inst(symbol)
+    body = {"instId": inst, "lever": str(int(leverage or 1)), "mgnMode": "cross"}
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        return await _okx_signed_request(
+            s,
+            base_url="https://www.okx.com",
+            path="/api/v5/account/set-leverage",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            passphrase=passphrase,
+            json_body=body,
+        )
+
+async def _okx_futures_market_open(*, api_key: str, api_secret: str, passphrase: str, symbol: str, side: str, qty: float) -> dict:
+    inst = _okx_swap_inst(symbol)
+    body = {"instId": inst, "tdMode": "cross", "side": str(side or "buy").lower(), "ordType": "market", "sz": str(float(qty))}
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        return await _okx_signed_request(
+            s,
+            base_url="https://www.okx.com",
+            path="/api/v5/trade/order",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            passphrase=passphrase,
+            json_body=body,
+        )
+
+async def _okx_futures_reduce_market(*, api_key: str, api_secret: str, passphrase: str, symbol: str, side: str, qty: float) -> dict:
+    inst = _okx_swap_inst(symbol)
+    body = {"instId": inst, "tdMode": "cross", "side": str(side or "sell").lower(), "ordType": "market", "sz": str(float(qty)), "reduceOnly": True}
+    timeout = aiohttp.ClientTimeout(total=12)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        return await _okx_signed_request(
+            s,
+            base_url="https://www.okx.com",
+            path="/api/v5/trade/order",
+            method="POST",
+            api_key=api_key,
+            api_secret=api_secret,
+            passphrase=passphrase,
+            json_body=body,
+        )
+
 async def _mexc_spot_market_buy(*, api_key: str, api_secret: str, symbol: str, quote_usdt: float) -> dict:
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as s:
@@ -2300,8 +2352,8 @@ async def _gateio_spot_market_sell(*, api_key: str, api_secret: str, symbol: str
         return await _gateio_signed_request(s, base_url="https://api.gateio.ws", path="/api/v4/spot/orders", method="POST",
                                             api_key=api_key, api_secret=api_secret, json_body=body)
 
-async def _okx_public_price(symbol: str) -> float:
-    inst = _okx_inst(symbol)
+async def _okx_public_price(symbol: str, *, market_type: str = "spot") -> float:
+    inst = _okx_swap_inst(symbol) if str(market_type or "spot").lower() == "futures" else _okx_inst(symbol)
     data = await _http_json("GET", "https://www.okx.com/api/v5/market/ticker", params={"instId": inst}, timeout_s=8)
     lst = (data.get("data") or [])
     if lst and isinstance(lst, list) and isinstance(lst[0], dict):
@@ -2320,6 +2372,79 @@ async def _gateio_public_price(symbol: str) -> float:
     return 0.0
 
 
+
+async def _mexc_spot_free_usdt(api_key: str, api_secret: str) -> float:
+    timeout = aiohttp.ClientTimeout(total=8)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _mexc_signed_request(
+            s,
+            base_url="https://api.mexc.com",
+            path="/api/v3/account",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={},
+        )
+        for b in data.get("balances", []) or []:
+            if str(b.get("asset") or "").upper() == "USDT":
+                try:
+                    return float(b.get("free") or 0.0)
+                except Exception:
+                    return 0.0
+    return 0.0
+
+async def _gateio_spot_free_usdt(api_key: str, api_secret: str) -> float:
+    timeout = aiohttp.ClientTimeout(total=8)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _gateio_signed_request(
+            s,
+            base_url="https://api.gateio.ws",
+            path="/api/v4/spot/accounts",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={},
+        )
+        if isinstance(data, list):
+            for a in data:
+                if str((a or {}).get("currency") or "").upper() == "USDT":
+                    try:
+                        return float(a.get("available") or 0.0)
+                    except Exception:
+                        return 0.0
+    return 0.0
+
+async def _okx_available_usdt(api_key: str, api_secret: str, passphrase: str, *, market_type: str = "spot") -> float:
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _okx_signed_request(
+            s,
+            base_url="https://www.okx.com",
+            path="/api/v5/account/balance",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            passphrase=passphrase,
+            params={"ccy": "USDT"},
+        )
+        dl = (data.get("data") or [])
+        if not (isinstance(dl, list) and dl):
+            return 0.0
+        d0 = dl[0] if isinstance(dl[0], dict) else {}
+        details = (d0.get("details") or [])
+        coin = details[0] if isinstance(details, list) and details and isinstance(details[0], dict) else {}
+        keys = ("availBal", "availEq", "eqUsd", "eq", "cashBal") if str(market_type or "spot").lower() == "futures" else ("availBal", "cashBal", "availEq", "eq", "eqUsd")
+        for src in (coin, d0):
+            if not isinstance(src, dict):
+                continue
+            for k in keys:
+                v = src.get(k)
+                if v not in (None, ""):
+                    try:
+                        return float(v or 0.0)
+                    except Exception:
+                        pass
+        return 0.0
 
 def _mexc_contract_symbol(symbol: str) -> str:
     s = (symbol or "").upper().strip()
@@ -2645,7 +2770,7 @@ async def _okx_instrument_filters(*, inst_type: str, symbol: str) -> tuple[float
     if cached and cached.get("_ts", 0) > time.time() - 3600:
         return float(cached.get("qty_step") or 0.0), float(cached.get("min_qty") or 0.0), float(cached.get("tick") or 0.0)
 
-    inst = _okx_inst(symbol)
+    inst = _okx_swap_inst(symbol) if str(inst_type or "SPOT").upper() == "SWAP" else _okx_inst(symbol)
     url = "https://www.okx.com/api/v5/public/instruments"
     data = await _http_json("GET", url, params={"instType": inst_type, "instId": inst}, timeout_s=10)
     lst = ((data.get("data") or []) if isinstance(data, dict) else [])
@@ -2874,7 +2999,7 @@ async def _bybit_instrument_filters(*, category: str, symbol: str) -> tuple[floa
     return qty_step, min_qty, tick
 
 
-async def _bybit_available_usdt(api_key: str, api_secret: str) -> float:
+async def _bybit_available_usdt(api_key: str, api_secret: str, *, market_type: str = "spot") -> float:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         data = await _bybit_v5_request(
@@ -2889,24 +3014,68 @@ async def _bybit_available_usdt(api_key: str, api_secret: str) -> float:
         lst = res.get("list") or []
         if not lst:
             return 0.0
+
+        row = lst[0] if isinstance(lst[0], dict) else {}
         coin = None
-        # bybit nests coin list
-        cl = lst[0].get("coin") if isinstance(lst[0], dict) else None
+        cl = row.get("coin") if isinstance(row, dict) else None
         if isinstance(cl, list) and cl:
-            coin = cl[0]
-        if isinstance(coin, dict):
-            for k in ("availableToWithdraw", "walletBalance", "equity"):
-                if coin.get(k) is not None:
-                    try:
-                        return float(coin.get(k) or 0.0)
-                    except Exception:
-                        pass
-        # fallback total
-        try:
-            return float(lst[0].get("totalAvailableBalance") or 0.0)
-        except Exception:
+            for item in cl:
+                if isinstance(item, dict) and str(item.get("coin") or "USDT").upper() == "USDT":
+                    coin = item
+                    break
+            if coin is None and isinstance(cl[0], dict):
+                coin = cl[0]
+
+        def _first_positive(*values) -> float:
+            for v in values:
+                if v in (None, ""):
+                    continue
+                try:
+                    f = float(v or 0.0)
+                except Exception:
+                    continue
+                if f > 0:
+                    return f
             return 0.0
 
+        if str(market_type or "spot").lower() == "futures":
+            if isinstance(row, dict):
+                v = _first_positive(
+                    row.get("totalAvailableBalance"),
+                    row.get("totalWalletBalance"),
+                    row.get("totalMarginBalance"),
+                )
+                if v > 0:
+                    return v
+            if isinstance(coin, dict):
+                v = _first_positive(
+                    coin.get("availableToWithdraw"),
+                    coin.get("transferBalance"),
+                    coin.get("walletBalance"),
+                    coin.get("equity"),
+                )
+                if v > 0:
+                    return v
+            return 0.0
+
+        if isinstance(coin, dict):
+            v = _first_positive(
+                coin.get("walletBalance"),
+                coin.get("equity"),
+                coin.get("availableToWithdraw"),
+                coin.get("transferBalance"),
+            )
+            if v > 0:
+                return v
+        if isinstance(row, dict):
+            v = _first_positive(
+                row.get("totalWalletBalance"),
+                row.get("totalAvailableBalance"),
+                row.get("totalEquity"),
+            )
+            if v > 0:
+                return v
+        return 0.0
 
 async def _bybit_order_create(
     *,
@@ -3676,8 +3845,15 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                     lst = ((data.get("result") or {}).get("list") or [])
                     return bool(lst)
                 if ex == "okx":
-                    await _okx_instrument_filters(inst_type="SWAP", symbol=sym)
-                    return True
+                    inst = _okx_swap_inst(sym)
+                    data = await _http_json(
+                        "GET",
+                        "https://www.okx.com/api/v5/public/instruments",
+                        params={"instType": "SWAP", "instId": inst},
+                        timeout_s=10,
+                    )
+                    lst = ((data.get("data") or []) if isinstance(data, dict) else [])
+                    return bool(lst)
             except Exception:
                 return False
             return False
@@ -3724,6 +3900,98 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     if need_usdt <= 0:
         return _skip("amount_not_set", requested=float(need_usdt), market=market)
 
+    async def _spot_free_usdt_for_exchange(ex_name: str) -> float:
+        row_keys = await db_store.get_autotrade_keys_row(user_id=uid, exchange=ex_name, market_type="spot")
+        if not row_keys or not bool(row_keys.get("is_active")):
+            return 0.0
+        try:
+            k = _decrypt_token(row_keys.get("api_key_enc"))
+            s = _decrypt_token(row_keys.get("api_secret_enc"))
+            if ex_name == "binance":
+                return float(await _binance_spot_free_usdt(k, s))
+            if ex_name == "bybit":
+                return float(await _bybit_available_usdt(k, s, market_type="spot"))
+            if ex_name == "okx":
+                p = _decrypt_token(row_keys.get("passphrase_enc")) if row_keys.get("passphrase_enc") else ""
+                if not p:
+                    return 0.0
+                return float(await _okx_available_usdt(k, s, p, market_type="spot"))
+            if ex_name == "mexc":
+                return float(await _mexc_spot_free_usdt(k, s))
+            if ex_name == "gateio":
+                return float(await _gateio_spot_free_usdt(k, s))
+        except Exception:
+            return 0.0
+        return 0.0
+
+    async def _futures_free_usdt_for_exchange(ex_name: str) -> float:
+        row_keys = await db_store.get_autotrade_keys_row(user_id=uid, exchange=ex_name, market_type="futures")
+        if not row_keys or not bool(row_keys.get("is_active")):
+            return 0.0
+        try:
+            k = _decrypt_token(row_keys.get("api_key_enc"))
+            s = _decrypt_token(row_keys.get("api_secret_enc"))
+            if ex_name == "binance":
+                return float(await _binance_futures_available_margin(k, s))
+            if ex_name == "bybit":
+                return float(await _bybit_available_usdt(k, s, market_type="futures"))
+            if ex_name == "okx":
+                p = _decrypt_token(row_keys.get("passphrase_enc")) if row_keys.get("passphrase_enc") else ""
+                if not p:
+                    return 0.0
+                return float(await _okx_available_usdt(k, s, p, market_type="futures"))
+        except Exception:
+            return 0.0
+        return 0.0
+
+    if mt == "spot":
+        spot_candidates = [x for x in (pr2 if 'pr2' in locals() else [exchange]) if x in ("binance", "bybit", "okx", "mexc", "gateio")]
+        if conf_set:
+            tmp = [x for x in spot_candidates if x in conf_set]
+            if tmp:
+                spot_candidates = tmp
+        if exchange in spot_candidates:
+            spot_candidates = [exchange] + [x for x in spot_candidates if x != exchange]
+        best_ex = None
+        best_free = -1.0
+        for ex_name in spot_candidates:
+            free = await _spot_free_usdt_for_exchange(ex_name)
+            if free >= need_usdt:
+                best_ex = ex_name
+                break
+            if free > best_free:
+                best_free = free
+                best_ex = ex_name
+        if best_ex and best_ex != exchange:
+            try:
+                logger.info("[autotrade][route][spot][balance] uid=%s sym=%s reroute=%s->%s need=%.8f best_free=%.8f", uid, sym, exchange, best_ex, float(need_usdt), float(best_free))
+            except Exception:
+                pass
+            exchange = best_ex
+
+    if mt == "futures":
+        fut_candidates = [x for x in ([exchange] + [x for x in ("binance", "bybit", "okx") if x != exchange]) if x in ("binance", "bybit", "okx")]
+        if conf_set:
+            tmp = [x for x in fut_candidates if x in conf_set]
+            if tmp:
+                fut_candidates = tmp
+        best_ex = None
+        best_free = -1.0
+        for ex_name in fut_candidates:
+            free = await _futures_free_usdt_for_exchange(ex_name)
+            if free >= need_usdt:
+                best_ex = ex_name
+                break
+            if free > best_free:
+                best_free = free
+                best_ex = ex_name
+        if best_ex and best_ex != exchange:
+            try:
+                logger.info("[autotrade][route][futures][balance] uid=%s sym=%s reroute=%s->%s need=%.8f best_free=%.8f", uid, sym, exchange, best_ex, float(need_usdt), float(best_free))
+            except Exception:
+                pass
+            exchange = best_ex
+
     # fetch keys
     row = await db_store.get_autotrade_keys_row(user_id=uid, exchange=exchange, market_type=mt)
     if not row or not bool(row.get("is_active")):
@@ -3763,7 +4031,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
         if exchange == "bybit":
             category = "spot" if mt == "spot" else "linear"
             # Futures cap is user-defined (by margin). Spot cap is implicit (wallet balance).
-            free = await _bybit_available_usdt(api_key, api_secret)
+            free = await _bybit_available_usdt(api_key, api_secret, market_type=mt)
             if free < need_usdt:
                 return _skip("insufficient_balance", free_usdt=float(free), need_usdt=float(need_usdt), exchange=exchange, market=market)
 
@@ -4048,78 +4316,169 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                     }
 
         
-        # -------- OKX / MEXC / Gate.io (SPOT) --------
+        # -------- OKX / MEXC / Gate.io --------
         if exchange in ("okx", "mexc", "gateio"):
-            if mt != "spot":
-                return _skip("unsupported_market_type_for_exchange", exchange=exchange, market=market)
-
-            # Futures cap is irrelevant for SPOT; spot cap is wallet balance.
             symbol = _normalize_symbol(getattr(sig, "symbol", "") or "")
             if not symbol:
                 raise ExchangeAPIError("missing symbol")
 
-            # Use public price to estimate base quantity for virtual SL/TP tracking
-            if exchange == "okx":
-                px = await _okx_public_price(symbol)
-            elif exchange == "mexc":
-                px = await _mexc_public_price(symbol)
-            else:
-                px = await _gateio_public_price(symbol)
+            if mt == "spot":
+                if exchange == "okx":
+                    passphrase = _decrypt_token(row.get("passphrase_enc"))
+                    free = await _okx_available_usdt(api_key, api_secret, passphrase, market_type="spot")
+                elif exchange == "mexc":
+                    free = await _mexc_spot_free_usdt(api_key, api_secret)
+                else:
+                    free = await _gateio_spot_free_usdt(api_key, api_secret)
+                if free < need_usdt:
+                    return _skip("insufficient_balance", free_usdt=float(free), need_usdt=float(need_usdt), exchange=exchange, market=market)
 
-            if not px or px <= 0:
-                raise ExchangeAPIError("price_unavailable")
+                if exchange == "okx":
+                    px = await _okx_public_price(symbol)
+                elif exchange == "mexc":
+                    px = await _mexc_public_price(symbol)
+                else:
+                    px = await _gateio_public_price(symbol)
 
-            est_qty = (need_usdt / float(px)) if need_usdt > 0 else 0.0
-            if est_qty <= 0:
-                raise ExchangeAPIError("qty_estimate_zero")
+                if not px or px <= 0:
+                    raise ExchangeAPIError("price_unavailable")
 
-            # Execute market entry
-            if direction == "SHORT":
-                # Spot short is not supported in this bot (requires margin). Skip safely.
-                return _skip("spot_short_not_supported", exchange=exchange, market=market)
+                est_qty = (need_usdt / float(px)) if need_usdt > 0 else 0.0
+                if est_qty <= 0:
+                    raise ExchangeAPIError("qty_estimate_zero")
 
-            if exchange == "okx":
-                passphrase = _decrypt_token(row.get("passphrase_enc"))
-                entry_order = await _okx_spot_market_buy(api_key=api_key, api_secret=api_secret, passphrase=passphrase, symbol=symbol, quote_usdt=need_usdt)
-            elif exchange == "mexc":
-                entry_order = await _mexc_spot_market_buy(api_key=api_key, api_secret=api_secret, symbol=symbol, quote_usdt=need_usdt)
-            else:
-                entry_order = await _gateio_spot_market_buy(api_key=api_key, api_secret=api_secret, symbol=symbol, quote_usdt=need_usdt)
+                if direction == "SHORT":
+                    return _skip("spot_short_not_supported", exchange=exchange, market=market)
 
-            # Store a virtual manager ref (virtual SL/TP + BE after TP1)
+                if exchange == "okx":
+                    entry_order = await _okx_spot_market_buy(api_key=api_key, api_secret=api_secret, passphrase=passphrase, symbol=symbol, quote_usdt=need_usdt)
+                elif exchange == "mexc":
+                    entry_order = await _mexc_spot_market_buy(api_key=api_key, api_secret=api_secret, symbol=symbol, quote_usdt=need_usdt)
+                else:
+                    entry_order = await _gateio_spot_market_buy(api_key=api_key, api_secret=api_secret, symbol=symbol, quote_usdt=need_usdt)
+
+                ref = {
+                    "exchange": exchange,
+                    "market_type": "spot",
+                    "symbol": symbol,
+                    "atr_pct": float(atr_pct_sig) if mt == "futures" else 0.0,
+                    "atr5": float(atr5_sig) if mt == "futures" else 0.0,
+                    "atr5_pct": float(atr5_pct_sig) if mt == "futures" else 0.0,
+                    "side": "BUY",
+                    "close_side": "SELL",
+                    "virtual": True,
+                    "entry_price": float(px),
+                    "be_price": float(px),
+                    "be_moved": False,
+                    "tp1_hit": False,
+                    "qty": float(est_qty),
+                    "tp1": float(tp1 or 0.0),
+                    "tp2": float(tp2 or 0.0),
+                    "sl": float(sl or 0.0),
+                }
+
+                sig_id = _extract_signal_id(sig)
+                if sig_id <= 0:
+                    raise ExchangeAPIError("missing signal_id")
+                await db_store.create_autotrade_position(
+                    user_id=uid,
+                    signal_id=sig_id,
+                    exchange=exchange,
+                    market_type="spot",
+                    symbol=symbol,
+                    side="BUY",
+                    allocated_usdt=need_usdt,
+                    api_order_ref=json.dumps(ref),
+                )
+                return {"ok": True, "skipped": False, "api_error": None, "exchange": exchange}
+
+            if exchange != "okx":
+                return _skip("unsupported_market_type_for_exchange", exchange=exchange, market=market)
+
+            passphrase = _decrypt_token(row.get("passphrase_enc"))
+            free = await _okx_available_usdt(api_key, api_secret, passphrase, market_type="futures")
+            eff_cap = float(st.get("effective_futures_cap") or 0.0)
+            if eff_cap <= 0:
+                eff_cap = float(fut_cap or 0.0)
+            cap_guard = await _guard_futures_capacity(
+                cap_limit_usdt=float(eff_cap),
+                exchange_name=exchange,
+                free_usdt=float(free),
+            )
+            if isinstance(cap_guard, dict):
+                return cap_guard
+            fut_lock_conn, fut_lock_key, _eff_cap_locked, _used_locked, _active_locked, _max_pos_locked = cap_guard
+
+            if free < need_usdt:
+                await db_store.release_autotrade_cap_lock(fut_lock_conn, fut_lock_key)
+                await db_store.get_pool().release(fut_lock_conn)
+                fut_lock_conn = None
+                fut_lock_key = None
+                return _skip("insufficient_balance", free_usdt=float(free), need_usdt=float(need_usdt), exchange=exchange, market=market)
+
+            await _okx_futures_set_leverage(api_key=api_key, api_secret=api_secret, passphrase=passphrase, symbol=symbol, leverage=fut_lev)
+
+            px = await _okx_public_price(symbol, market_type="futures")
+            if px <= 0:
+                raise ExchangeAPIError("OKX futures price=0")
+
+            raw_qty = (need_usdt * float(fut_lev)) / px
+            step, min_qty, _tick = await _okx_instrument_filters(inst_type="SWAP", symbol=symbol)
+            qty = _round_step(raw_qty, step) if step > 0 else raw_qty
+            if min_qty > 0 and qty < min_qty:
+                qty = min_qty
+
+            side = "BUY" if direction == "LONG" else "SELL"
+            entry_res = await _okx_futures_market_open(
+                api_key=api_key,
+                api_secret=api_secret,
+                passphrase=passphrase,
+                symbol=symbol,
+                side=side,
+                qty=qty,
+            )
+
+            entry_p = float(entry or 0.0)
             ref = {
-                "exchange": exchange,
-                "market_type": "spot",
+                "virtual": True,
+                "exchange": "okx",
+                "market_type": "futures",
                 "symbol": symbol,
                 "atr_pct": float(atr_pct_sig) if mt == "futures" else 0.0,
                 "atr5": float(atr5_sig) if mt == "futures" else 0.0,
                 "atr5_pct": float(atr5_pct_sig) if mt == "futures" else 0.0,
-                "side": "BUY",
-                "close_side": "SELL",
-                "virtual": True,
-                "entry_price": float(px),
-                "be_price": float(px),
-                "be_moved": False,
-                "tp1_hit": False,
-                "qty": float(est_qty),
+                "direction": direction,
+                "side": side.upper(),
+                "close_side": ("SELL" if side.upper() == "BUY" else "BUY"),
+                "entry_order_id": ((entry_res.get("data") or [{}])[0].get("ordId") if isinstance(entry_res.get("data"), list) and entry_res.get("data") else None),
+                "entry_price": entry_p,
+                "qty": float(qty),
                 "tp1": float(tp1 or 0.0),
                 "tp2": float(tp2 or 0.0),
                 "sl": float(sl or 0.0),
+                "tp1_hit": False,
+                "be_moved": False,
+                "be_price": 0.0,
             }
-
             sig_id = _extract_signal_id(sig)
             if sig_id <= 0:
                 raise ExchangeAPIError("missing signal_id")
-            await db_store.create_autotrade_position(
-                user_id=uid,
-                signal_id=sig_id,
-                exchange=exchange,
-                market_type="spot",
-                symbol=symbol,
-                side="BUY",
-                allocated_usdt=need_usdt,
-                api_order_ref=json.dumps(ref),
-            )
+            try:
+                await db_store.create_autotrade_position(
+                    user_id=uid,
+                    signal_id=sig_id,
+                    exchange="okx",
+                    market_type="futures",
+                    symbol=symbol,
+                    side=side,
+                    allocated_usdt=need_usdt,
+                    api_order_ref=json.dumps(ref),
+                )
+            finally:
+                await db_store.release_autotrade_cap_lock(fut_lock_conn, fut_lock_key)
+                await db_store.get_pool().release(fut_lock_conn)
+                fut_lock_conn = None
+                fut_lock_key = None
             return {"ok": True, "skipped": False, "api_error": None, "exchange": exchange}
 
         # Safety guard: never fall through into Binance execution for other exchanges
@@ -4595,7 +4954,7 @@ async def _spot_base_balance(*, ex: str, api_key: str, api_secret: str, passphra
 
     return 0.0
 
-async def _futures_position_size(*, ex: str, api_key: str, api_secret: str, symbol: str, category: str = "linear") -> float:
+async def _futures_position_size(*, ex: str, api_key: str, api_secret: str, symbol: str, category: str = "linear", passphrase: str | None = None) -> float:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         ex = (ex or "").lower().strip()
@@ -4629,6 +4988,28 @@ async def _futures_position_size(*, ex: str, api_key: str, api_secret: str, symb
                 d0 = lst[0]
                 if isinstance(d0, dict):
                     return float(d0.get("size") or 0.0)
+            return 0.0
+
+        if ex == "okx":
+            inst = _okx_swap_inst(symbol)
+            data = await _okx_signed_request(
+                s,
+                base_url="https://www.okx.com",
+                path="/api/v5/account/positions",
+                method="GET",
+                api_key=api_key,
+                api_secret=api_secret,
+                passphrase=(passphrase or ""),
+                params={"instId": inst},
+            )
+            lst = (data.get("data") or [])
+            if isinstance(lst, list):
+                for d in lst:
+                    if isinstance(d, dict) and str(d.get("instId") or "").upper() == inst.upper():
+                        try:
+                            return abs(float(d.get("pos") or 0.0))
+                        except Exception:
+                            return 0.0
             return 0.0
     return 0.0
 
@@ -4918,7 +5299,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         else:
                             # futures (Binance/Bybit only in this codebase)
                             size = await _futures_position_size(ex=ex, api_key=api_key, api_secret=api_secret, symbol=symbol,
-                                                                category=str(ref.get("category") or "linear"))
+                                                                category=str(ref.get("category") or "linear"), passphrase=(passphrase or None))
                             if abs(float(size or 0.0)) <= _DUST_MIN:
                                 is_closed = True
 
@@ -4976,7 +5357,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 elif ex == "bybit":
                                     px = await _bybit_price(symbol, category=("linear" if mt == "futures" else "spot"))
                                 elif ex == "okx":
-                                    px = await _okx_public_price(symbol)
+                                    px = await _okx_public_price(symbol, market_type="futures")
                                 elif ex == "mexc":
                                     px = await _mexc_public_price(symbol)
                                 else:
@@ -5091,7 +5472,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 pass
                             try:
                                 # OKX public last (best-effort)
-                                px_o = await _okx_public_price(symbol)
+                                px_o = await _okx_public_price(symbol, market_type="futures")
                                 if float(px_o or 0.0) > 0:
                                     srcs.append(float(px_o))
                             except Exception:
@@ -5203,6 +5584,15 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 order_type="Market",
                                 qty=q2,
                                 reduce_only=True,
+                            )
+                        elif ex == "okx":
+                            await _okx_futures_reduce_market(
+                                api_key=api_key,
+                                api_secret=api_secret,
+                                passphrase=passphrase or "",
+                                symbol=symbol,
+                                side=("sell" if close_side == "SELL" else "buy"),
+                                qty=q2,
                             )
                         else:
                             # Other futures exchanges aren't supported in this bot; close silently
@@ -24647,7 +25037,7 @@ async def autotrade_anomaly_watchdog_loop(*, notify_api_error=None) -> None:
                             actual_size = await _spot_base_balance(ex=ex, api_key=api_key, api_secret=api_secret, passphrase=passphrase, symbol=symbol)
                         else:
                             category = str(ref.get("category") or ("linear" if mt == "futures" else "spot"))
-                            actual_size = await _futures_position_size(ex=ex, api_key=api_key, api_secret=api_secret, symbol=symbol, category=category)
+                            actual_size = await _futures_position_size(ex=ex, api_key=api_key, api_secret=api_secret, symbol=symbol, category=category, passphrase=passphrase)
                     except Exception as e:
                         if notify_api_error:
                             try:
