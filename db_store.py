@@ -2279,8 +2279,8 @@ async def set_autotrade_exchange(user_id: int, market_type: str, exchange: str) 
     m = (market_type or "").lower().strip()
     ex = (exchange or "binance").lower().strip()
     if m == "futures":
-        # Futures keys are supported only for Binance/Bybit
-        if ex not in ("binance", "bybit"):
+        # Futures keys are supported for Binance/Bybit/OKX
+        if ex not in ("binance", "bybit", "okx"):
             ex = "binance"
     else:
         # Spot keys can be stored for multiple exchanges
@@ -2462,7 +2462,7 @@ async def get_autotrade_keys_row(*, user_id: int, exchange: str, market_type: st
     ex = (exchange or "binance").lower().strip()
     mt = (market_type or "spot").lower().strip()
     if mt == "futures":
-        if ex not in ("binance", "bybit"):
+        if ex not in ("binance", "bybit", "okx"):
             ex = "binance"
     else:
         if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
@@ -2503,7 +2503,7 @@ async def create_autotrade_position(
     sym = str(symbol or "").upper().strip()
     side = str(side or "").upper().strip()
     if mt == "futures":
-        if ex not in ("binance", "bybit"):
+        if ex not in ("binance", "bybit", "okx"):
             ex = "binance"
     else:
         if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
@@ -2935,8 +2935,8 @@ async def upsert_autotrade_keys(
     ex = (exchange or "binance").lower().strip()
     mt = (market_type or "spot").lower().strip()
     if mt == "futures":
-        # Futures keys are supported only for Binance/Bybit
-        if ex not in ("binance", "bybit"):
+        # Futures keys are supported for Binance/Bybit/OKX
+        if ex not in ("binance", "bybit", "okx"):
             ex = "binance"
     else:
         # Spot keys can be stored for multiple exchanges
@@ -3020,7 +3020,7 @@ async def disable_autotrade_key(*, user_id: int, exchange: str, market_type: str
     uid = int(user_id)
     ex = (exchange or "binance").lower().strip()
     mt = (market_type or "spot").lower().strip()
-    if mt == "futures" and ex not in ("binance", "bybit"):
+    if mt == "futures" and ex not in ("binance", "bybit", "okx"):
         ex = "binance"
     if mt == "spot" and ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
         ex = "binance"
