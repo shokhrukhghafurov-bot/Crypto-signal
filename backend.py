@@ -12,6 +12,7 @@ import time
 import contextvars
 import traceback
 from dotenv import load_dotenv
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
 
 
 def _load_env_early() -> None:
@@ -2259,7 +2260,7 @@ async def _gateio_signed_request(
 
 async def _okx_spot_market_buy(*, api_key: str, api_secret: str, passphrase: str, symbol: str, quote_usdt: float) -> dict:
     inst = _okx_inst(symbol)
-    body = {"instId": inst, "tdMode": "cash", "side": "buy", "ordType": "market", "sz": str(float(quote_usdt))}
+    body = {"instId": inst, "tdMode": "cash", "side": "buy", "ordType": "market", "sz": _decimal_to_api_str(quote_usdt)}
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _okx_signed_request(s, base_url="https://www.okx.com", path="/api/v5/trade/order", method="POST",
@@ -2267,7 +2268,7 @@ async def _okx_spot_market_buy(*, api_key: str, api_secret: str, passphrase: str
 
 async def _okx_spot_market_sell(*, api_key: str, api_secret: str, passphrase: str, symbol: str, base_qty: float) -> dict:
     inst = _okx_inst(symbol)
-    body = {"instId": inst, "tdMode": "cash", "side": "sell", "ordType": "market", "sz": str(float(base_qty))}
+    body = {"instId": inst, "tdMode": "cash", "side": "sell", "ordType": "market", "sz": _decimal_to_api_str(base_qty)}
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _okx_signed_request(s, base_url="https://www.okx.com", path="/api/v5/trade/order", method="POST",
@@ -2291,7 +2292,7 @@ async def _okx_futures_set_leverage(*, api_key: str, api_secret: str, passphrase
 
 async def _okx_futures_market_open(*, api_key: str, api_secret: str, passphrase: str, symbol: str, side: str, qty: float) -> dict:
     inst = _okx_swap_inst(symbol)
-    body = {"instId": inst, "tdMode": "cross", "side": str(side or "buy").lower(), "ordType": "market", "sz": str(float(qty))}
+    body = {"instId": inst, "tdMode": "cross", "side": str(side or "buy").lower(), "ordType": "market", "sz": _decimal_to_api_str(qty)}
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _okx_signed_request(
@@ -2307,7 +2308,7 @@ async def _okx_futures_market_open(*, api_key: str, api_secret: str, passphrase:
 
 async def _okx_futures_reduce_market(*, api_key: str, api_secret: str, passphrase: str, symbol: str, side: str, qty: float) -> dict:
     inst = _okx_swap_inst(symbol)
-    body = {"instId": inst, "tdMode": "cross", "side": str(side or "sell").lower(), "ordType": "market", "sz": str(float(qty)), "reduceOnly": True}
+    body = {"instId": inst, "tdMode": "cross", "side": str(side or "sell").lower(), "ordType": "market", "sz": _decimal_to_api_str(qty), "reduceOnly": True}
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _okx_signed_request(
@@ -2326,19 +2327,19 @@ async def _mexc_spot_market_buy(*, api_key: str, api_secret: str, symbol: str, q
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _mexc_signed_request(s, base_url="https://api.mexc.com", path="/api/v3/order", method="POST",
                                           api_key=api_key, api_secret=api_secret,
-                                          params={"symbol": symbol.upper(), "side": "BUY", "type": "MARKET", "quoteOrderQty": str(float(quote_usdt))})
+                                          params={"symbol": symbol.upper(), "side": "BUY", "type": "MARKET", "quoteOrderQty": _decimal_to_api_str(quote_usdt)})
 
 async def _mexc_spot_market_sell(*, api_key: str, api_secret: str, symbol: str, base_qty: float) -> dict:
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _mexc_signed_request(s, base_url="https://api.mexc.com", path="/api/v3/order", method="POST",
                                           api_key=api_key, api_secret=api_secret,
-                                          params={"symbol": symbol.upper(), "side": "SELL", "type": "MARKET", "quantity": str(float(base_qty))})
+                                          params={"symbol": symbol.upper(), "side": "SELL", "type": "MARKET", "quantity": _decimal_to_api_str(base_qty)})
 
 async def _gateio_spot_market_buy(*, api_key: str, api_secret: str, symbol: str, quote_usdt: float) -> dict:
     pair = _gate_pair(symbol)
     # Gate.io market buy uses amount in quote currency in some accounts; we attempt quote-based "amount" with "account": "spot"
-    body = {"currency_pair": pair, "type": "market", "side": "buy", "account": "spot", "amount": str(float(quote_usdt))}
+    body = {"currency_pair": pair, "type": "market", "side": "buy", "account": "spot", "amount": _decimal_to_api_str(quote_usdt)}
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _gateio_signed_request(s, base_url="https://api.gateio.ws", path="/api/v4/spot/orders", method="POST",
@@ -2346,7 +2347,7 @@ async def _gateio_spot_market_buy(*, api_key: str, api_secret: str, symbol: str,
 
 async def _gateio_spot_market_sell(*, api_key: str, api_secret: str, symbol: str, base_qty: float) -> dict:
     pair = _gate_pair(symbol)
-    body = {"currency_pair": pair, "type": "market", "side": "sell", "account": "spot", "amount": str(float(base_qty))}
+    body = {"currency_pair": pair, "type": "market", "side": "sell", "account": "spot", "amount": _decimal_to_api_str(base_qty)}
     timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _gateio_signed_request(s, base_url="https://api.gateio.ws", path="/api/v4/spot/orders", method="POST",
@@ -2673,18 +2674,47 @@ async def _http_json(method: str, url: str, *, params: dict | None = None, json_
             return data if isinstance(data, dict) else {"data": data}
 
 
+def _decimal_value(value: float | int | str | Decimal, default: str = "0") -> Decimal:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal(default)
+
+
+def _decimal_step(step: float | int | str | Decimal) -> Decimal | None:
+    d = _decimal_value(step)
+    if d <= 0:
+        return None
+    return d.copy_abs()
+
+
+def _decimal_to_api_str(value: float | int | str | Decimal) -> str:
+    d = _decimal_value(value)
+    s = format(d, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def _round_down_decimal(value: float | int | str | Decimal, step: float | int | str | Decimal) -> Decimal:
+    d_val = _decimal_value(value)
+    d_step = _decimal_step(step)
+    if d_step is None:
+        return d_val
+    if d_val <= 0:
+        return Decimal("0")
+    units = (d_val / d_step).to_integral_value(rounding=ROUND_DOWN)
+    return (units * d_step).quantize(d_step, rounding=ROUND_DOWN)
+
+
 def _round_step(qty: float, step: float) -> float:
-    """Round quantity down to the nearest step."""
-    if step <= 0:
-        return float(qty)
-    return math.floor(float(qty) / float(step)) * float(step)
+    """Round quantity down to the nearest step using decimal-safe arithmetic."""
+    return float(_round_down_decimal(qty, step))
 
 
 def _round_tick(price: float, tick: float) -> float:
-    """Round price down to the nearest tick."""
-    if tick <= 0:
-        return float(price)
-    return math.floor(float(price) / float(tick)) * float(tick)
+    """Round price down to the nearest tick using decimal-safe arithmetic."""
+    return float(_round_down_decimal(price, tick))
 
 
 _BINANCE_INFO_CACHE: dict[str, dict] = {}
@@ -3090,23 +3120,26 @@ async def _bybit_order_create(
     reduce_only: bool | None = None,
     trigger_price: float | None = None,
     close_on_trigger: bool | None = None,
+    market_unit: str | None = None,
 ) -> dict:
     body: dict[str, Any] = {
         "category": category,
         "symbol": symbol.upper(),
         "side": "Buy" if side.upper() in ("BUY", "LONG") else "Sell",
         "orderType": order_type,
-        "qty": str(float(qty)),
+        "qty": _decimal_to_api_str(qty),
         "timeInForce": "GTC",
     }
     if price is not None:
-        body["price"] = str(float(price))
+        body["price"] = _decimal_to_api_str(price)
     if reduce_only is not None:
         body["reduceOnly"] = bool(reduce_only)
     if trigger_price is not None:
-        body["triggerPrice"] = str(float(trigger_price))
+        body["triggerPrice"] = _decimal_to_api_str(trigger_price)
     if close_on_trigger is not None:
         body["closeOnTrigger"] = bool(close_on_trigger)
+    if str(category or "").lower() == "spot" and str(order_type or "").lower() == "market" and market_unit:
+        body["marketUnit"] = str(market_unit)
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _bybit_v5_request(
@@ -4127,6 +4160,15 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             if min_qty > 0 and qty < min_qty:
                 raise ExchangeAPIError(f"Bybit qty<minQty after rounding: {qty} < {min_qty}")
 
+            entry_order_qty = qty
+            entry_market_unit = None
+            if mt == "spot":
+                # Bybit SPOT market BUY interprets qty as quote value by default.
+                # Send the user-configured USDT amount explicitly to avoid wrong units
+                # and decimal-length rejections (retCode 170148).
+                entry_order_qty = max(0.0, float(need_usdt))
+                entry_market_unit = "quoteCoin"
+
             entry_res = await _bybit_order_create(
                 api_key=api_key,
                 api_secret=api_secret,
@@ -4134,8 +4176,9 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 symbol=symbol,
                 side=side,
                 order_type="Market",
-                qty=qty,
+                qty=entry_order_qty,
                 reduce_only=False if mt == "futures" else None,
+                market_unit=entry_market_unit,
             )
             order_id = ((entry_res.get("result") or {}).get("orderId") or (entry_res.get("result") or {}).get("orderId"))
 
