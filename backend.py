@@ -2187,14 +2187,37 @@ async def _mexc_signed_request(
     api_secret: str,
     params: dict | None = None,
 ) -> dict:
+    """Signed MEXC Spot request.
+
+    MEXC accepts signed POST/PUT/DELETE params either in the query string
+    (with form content type) or in the request body. The current API examples
+    use form-encoded bodies for POST order placement, and MEXC validates the
+    request content type for these methods.
+    """
     params = dict(params or {})
     params.setdefault("timestamp", str(int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)))
-    query = urllib.parse.urlencode(params, doseq=True)
-    sig = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
-    url = f"{base_url}{path}?{query}&signature={sig}"
+    params.setdefault("recvWindow", "5000")
+
+    method_u = str(method or "GET").upper()
+    payload = urllib.parse.urlencode(params, doseq=True)
+    sig = hmac.new(api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    url = f"{base_url}{path}"
     headers = {"X-MEXC-APIKEY": api_key}
-    async with session.request(method.upper(), url, headers=headers) as r:
-        data = await r.json(content_type=None)
+    req_kwargs: dict = {}
+
+    if method_u == "GET":
+        url = f"{url}?{payload}&signature={sig}"
+    else:
+        body = f"{payload}&signature={sig}"
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        req_kwargs["data"] = body
+
+    async with session.request(method_u, url, headers=headers, **req_kwargs) as r:
+        try:
+            data = await r.json(content_type=None)
+        except Exception:
+            data = await r.text()
         if r.status != 200:
             raise ExchangeAPIError(f"MEXC API HTTP {r.status}: {data}")
         return data if isinstance(data, dict) else {"data": data}
@@ -3494,21 +3517,44 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                         timeout_s=10,
                     )
                     lst = ((data.get("result") or {}).get("list") or [])
-                    return bool(lst)
+                    if lst:
+                        return True
+                    # Some spot symbols are still queryable via ticker even when
+                    # instruments-info is temporarily empty / rate-limited.
+                    try:
+                        px = await _bybit_price(sym, category="spot")
+                        return bool(px and px > 0)
+                    except Exception:
+                        return False
                 if ex == "okx":
-                    await _okx_instrument_filters(inst_type="SPOT", symbol=sym)
-                    return True
+                    try:
+                        await _okx_instrument_filters(inst_type="SPOT", symbol=sym)
+                        return True
+                    except Exception:
+                        try:
+                            return bool(await _okx_public_price(sym))
+                        except Exception:
+                            return False
                 if ex == "mexc":
                     data = await _http_json("GET", "https://api.mexc.com/api/v3/exchangeInfo", params={"symbol": sym}, timeout_s=10)
                     lst = (data.get("symbols") or [])
-                    return any(str(x.get("symbol") or "").upper() == sym for x in lst)
+                    if any(str(x.get("symbol") or "").upper() == sym for x in lst):
+                        return True
+                    try:
+                        return bool(await _mexc_public_price(sym))
+                    except Exception:
+                        return False
                 if ex == "gateio":
                     pair = _gate_pair(sym)
                     data = await _http_json("GET", "https://api.gateio.ws/api/v4/spot/currency_pairs", params={"id": pair}, timeout_s=10)
-                    if isinstance(data, list):
-                        return any(str(x.get("id") or "").upper() == pair.upper() for x in data)
-                    if isinstance(data, dict):
-                        return str(data.get("id") or "").upper() == pair.upper()
+                    if isinstance(data, list) and any(str(x.get("id") or "").upper() == pair.upper() for x in data):
+                        return True
+                    if isinstance(data, dict) and str(data.get("id") or "").upper() == pair.upper():
+                        return True
+                    try:
+                        return bool(await _gateio_public_price(sym))
+                    except Exception:
+                        return False
             except Exception:
                 return False
             return False
@@ -3873,7 +3919,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                     allocated_usdt=need_usdt,
                     api_order_ref=json.dumps(ref),
                 )
-                return {"ok": True, "skipped": False, "api_error": None}
+                return {"ok": True, "skipped": False, "api_error": None, "exchange": exchange}
 
 
             # Place SL first; if SL fails, immediately close to avoid unprotected exposure.
@@ -3997,7 +4043,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 allocated_usdt=need_usdt,
                 api_order_ref=json.dumps(ref),
             )
-            return {"ok": True, "skipped": False, "api_error": None,
+            return {"ok": True, "skipped": False, "api_error": None, "exchange": exchange,
                     **({"cap_ui": float(fut_cap), "cap_effective": float(eff_cap), "cap_decreased": bool(cap_decreased), "cap_prev_effective": prev_eff_val, "winrate": (float(winrate) if winrate is not None else None)} if mt == "futures" else {})
                     }
 
@@ -4074,7 +4120,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 allocated_usdt=need_usdt,
                 api_order_ref=json.dumps(ref),
             )
-            return {"ok": True, "skipped": False, "api_error": None}
+            return {"ok": True, "skipped": False, "api_error": None, "exchange": exchange}
 
         # Safety guard: never fall through into Binance execution for other exchanges
         if exchange != "binance":
@@ -4162,7 +4208,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                     allocated_usdt=need_usdt,
                     api_order_ref=json.dumps(ref),
                 )
-                return {"ok": True, "skipped": False, "api_error": None}
+                return {"ok": True, "skipped": False, "api_error": None, "exchange": exchange}
 
 
             # Place SL first; if SL fails, immediately close (sell) to avoid an unprotected position.
@@ -4233,7 +4279,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 allocated_usdt=need_usdt,
                 api_order_ref=json.dumps(ref),
             )
-            return {"ok": True, "skipped": False, "api_error": None}
+            return {"ok": True, "skipped": False, "api_error": None, "exchange": exchange}
 
         # futures
         avail = await _binance_futures_available_margin(api_key, api_secret)
@@ -4318,7 +4364,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 await db_store.get_pool().release(fut_lock_conn)
                 fut_lock_conn = None
                 fut_lock_key = None
-            return {"ok": True, "skipped": False, "api_error": None}
+            return {"ok": True, "skipped": False, "api_error": None, "exchange": exchange}
 
 
         # Place SL first; if SL fails, immediately close position to avoid unprotected exposure.
@@ -4416,7 +4462,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             await db_store.get_pool().release(fut_lock_conn)
             fut_lock_conn = None
             fut_lock_key = None
-        return {"ok": True, "skipped": False, "api_error": None}
+        return {"ok": True, "skipped": False, "api_error": None, "exchange": exchange}
 
     except ExchangeAPIError as e:
         try:
@@ -4435,7 +4481,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             error=err,
             deactivate=_should_deactivate_key(err),
         )
-        return _fail(err, exchange=exchange, market=market)
+        return _fail(err, exchange=exchange, market=market, market_type=mt)
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
         await db_store.mark_autotrade_key_error(
@@ -4445,7 +4491,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             error=err,
             deactivate=_should_deactivate_key(err),
         )
-        return {"ok": False, "skipped": False, "api_error": err}
+        return {"ok": False, "skipped": False, "api_error": err, "details": {"exchange": exchange, "market": market, "market_type": mt}}
 
 
 # ------------------ Auto-trade soft reconcile (manual close sync) ------------------
