@@ -2753,9 +2753,10 @@ def autotrade_keys_kb(uid: int) -> types.InlineKeyboardMarkup:
     for ex in ("binance", "bybit", "okx", "mexc", "gateio"):
         kb.button(text=f"{ex.upper()} SPOT", callback_data=f"at:keys:set:{ex}:spot")
         kb.adjust(1)
-    # FUTURES only Binance / Bybit
+    # FUTURES supports Binance / Bybit / OKX
     kb.button(text="BINANCE FUTURES", callback_data="at:keys:set:binance:futures")
     kb.button(text="BYBIT FUTURES", callback_data="at:keys:set:bybit:futures")
+    kb.button(text="OKX FUTURES", callback_data="at:keys:set:okx:futures")
     kb.adjust(2)
     kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
     kb.adjust(1)
@@ -4422,10 +4423,11 @@ async def autotrade_callback(call: types.CallbackQuery) -> None:
                 keys2 = await db_store.get_autotrade_keys_status(uid)
                 await safe_edit(call.message, spot_priority_text(uid, pr, keys2), spot_priority_kb(uid, pr, keys2))
                 return
-            # futures exchange choices (only Binance/Bybit)
+            # futures exchange choices (Binance/Bybit/OKX)
             kb = InlineKeyboardBuilder()
             kb.button(text="Binance", callback_data=f"at:exset:{mt}:binance")
             kb.button(text="Bybit", callback_data=f"at:exset:{mt}:bybit")
+            kb.button(text="OKX", callback_data=f"at:exset:{mt}:okx")
             kb.adjust(2)
             kb.button(text=tr(uid, "btn_back"), callback_data="menu:autotrade")
             kb.adjust(1)
