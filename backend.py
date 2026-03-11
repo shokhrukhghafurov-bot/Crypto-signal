@@ -22951,1011 +22951,1013 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
     vol_status = _tr_i18n(lang, "analysis_volume_status_acc") if float(vol_rel) >= 1.2 else _tr_i18n(lang, "analysis_volume_status_neu")
 
     # ---------- report (RU template) ----------
-    if lang.startswith("ru"):
-        # Better labels for market
-        mkt_ru = "ФЬЮЧЕРСЫ" if mkt == "FUTURES" else "СПОТ"
+    # ---------- localized report context (RU/EN) ----------
+    is_ru = lang.startswith("ru")
+    # Better labels for market
+    mkt_label = (("ФЬЮЧЕРСЫ" if mkt == "FUTURES" else "СПОТ") if is_ru else mkt)
 
-        # Regime strength (use structure TF ADX when possible)
-        try:
-            adx_reg = float(df_struct_w["adx"].iloc[-1]) if "adx" in df_struct_w.columns else adx5
-        except Exception:
-            adx_reg = adx5
-        adx_reg_i = int(round(float(adx_reg))) if adx_reg == adx_reg else adx_i
-        trend_strength = "Высокая" if adx_reg_i >= 30 else ("Средняя" if adx_reg_i >= 22 else "Низкая")
+    # Regime strength (use structure TF ADX when possible)
+    try:
+        adx_reg = float(df_struct_w["adx"].iloc[-1]) if "adx" in df_struct_w.columns else adx5
+    except Exception:
+        adx_reg = adx5
+    adx_reg_i = int(round(float(adx_reg))) if adx_reg == adx_reg else adx_i
+    trend_strength = "high" if adx_reg_i >= 30 else ("medium" if adx_reg_i >= 22 else "low")
 
-        # Volatility text mapping
-        vola_txt = "Стабильна"
-        if isinstance(vola_state, str):
-            vs = vola_state.lower()
-            if "раст" in vs or "rising" in vs:
-                vola_txt = "Растёт"
-            elif "пад" in vs or "fall" in vs:
-                vola_txt = "Падает"
-        risk_txt = "Нормальный"
-        if isinstance(vola_risk, str):
-            vr = vola_risk.lower()
-            if "breakout" in vr or "проб" in vr or "нестабил" in vr:
-                risk_txt = "Высокий"
-            elif "сжат" in vr or "compression" in vr:
-                risk_txt = "Низкий"
-        compression_txt = "Да" if (isinstance(vola_risk, str) and ("сжат" in vola_risk.lower() or "compression" in vola_risk.lower())) else "Нет"
+    # Volatility text mapping
+    vola_txt = "Стабильна"
+    if isinstance(vola_state, str):
+        vs = vola_state.lower()
+        if "раст" in vs or "rising" in vs:
+            vola_txt = "Растёт"
+        elif "пад" in vs or "fall" in vs:
+            vola_txt = "Падает"
+    risk_txt = "Нормальный"
+    if isinstance(vola_risk, str):
+        vr = vola_risk.lower()
+        if "breakout" in vr or "проб" in vr or "нестабил" in vr:
+            risk_txt = "Высокий"
+        elif "сжат" in vr or "compression" in vr:
+            risk_txt = "Низкий"
+    compression_txt = "Да" if (isinstance(vola_risk, str) and ("сжат" in vola_risk.lower() or "compression" in vola_risk.lower())) else "Нет"
 
-        # Momentum text mapping
-        rsi_mood = "бычий импульс" if rsi >= 55 else ("медвежий импульс" if rsi <= 45 else "нейтрально")
-        macd_mood = "Бычий импульс ↑" if macd > 0 else "Медвежий импульс ↓"
-        slope_txt = "Вверх ↗" if slope_ema == "up" else ("Вниз ↘" if slope_ema == "down" else "Флет →")
-        div_txt = div if div not in ("—", "-", None) else "Не обнаружена"
+    # Momentum text mapping
+    rsi_mood = (("бычий импульс" if rsi >= 55 else ("медвежий импульс" if rsi <= 45 else "нейтрально")) if is_ru else ("bullish momentum" if rsi >= 55 else ("bearish momentum" if rsi <= 45 else "neutral")))
+    macd_mood = (("Бычий импульс ↑" if macd > 0 else "Медвежий импульс ↓") if is_ru else ("Bullish momentum ↑" if macd > 0 else "Bearish momentum ↓"))
+    slope_txt = (("Вверх ↗" if slope_ema == "up" else ("Вниз ↘" if slope_ema == "down" else "Флет →")) if is_ru else ("Up ↗" if slope_ema == "up" else ("Down ↘" if slope_ema == "down" else "Flat →")))
+    div_txt = div if div not in ("—", "-", None) else ("Не обнаружена" if is_ru else "Not detected")
 
-        # Volume text mapping
-        vol_rel_txt = f"{_fmt_float(vol_rel,2)}x" if vol_rel == vol_rel else "—"
-        vol_tr_txt = "Растёт ↑" if vol_trend == "up" else ("Падает ↓" if vol_trend == "down" else "Флет →")
-        spike_txt = "Да" if (isinstance(vol_spike, str) and ("spike" in vol_spike.lower() or "всплеск" in vol_spike.lower() or "⚡" in vol_spike)) else "Нет"
+    # Volume text mapping
+    vol_rel_txt = f"{_fmt_float(vol_rel,2)}x" if vol_rel == vol_rel else "—"
+    vol_tr_txt = (("Растёт ↑" if vol_trend == "up" else ("Падает ↓" if vol_trend == "down" else "Флет →")) if is_ru else ("Rising ↑" if vol_trend == "up" else ("Falling ↓" if vol_trend == "down" else "Flat →")))
+    spike_txt = (("Да" if (isinstance(vol_spike, str) and ("spike" in vol_spike.lower() or "всплеск" in vol_spike.lower() or "⚡" in vol_spike)) else "Нет") if is_ru else ("Yes" if (isinstance(vol_spike, str) and ("spike" in vol_spike.lower() or "всплеск" in vol_spike.lower() or "⚡" in vol_spike)) else "No"))
 
-        # Breakout/retest status for the header line
-        status_txt = "—"
-        try:
-            b = (brk or "").lower()
-            if "ретест" in b or "retest" in b:
-                if "s1" in b or "support" in b or "поддерж" in b:
-                    status_txt = "Retest поддержки (бычий сигнал)"
-                elif "r1" in b or "resist" in b or "сопрот" in b:
-                    status_txt = "Retest сопротивления (медвежий сигнал)"
-                else:
-                    status_txt = "Retest уровня"
-            elif "пробой" in b or "breakout" in b:
-                status_txt = "Пробой (импульс)"
-        except Exception:
-            pass
+    # Breakout/retest status for the header line
+    status_txt = "—"
+    try:
+        b = (brk or "").lower()
+        if "ретест" in b or "retest" in b:
+            if "s1" in b or "support" in b or "поддерж" in b:
+                status_txt = "Retest поддержки (бычий сигнал)" if is_ru else "Support retest (bullish signal)"
+            elif "r1" in b or "resist" in b or "сопрот" in b:
+                status_txt = "Retest сопротивления (медвежий сигнал)" if is_ru else "Resistance retest (bearish signal)"
+            else:
+                status_txt = "Retest уровня" if is_ru else "Level retest"
+        elif "пробой" in b or "breakout" in b:
+            status_txt = "Пробой (импульс)" if is_ru else "Breakout (impulse)"
+    except Exception:
+        pass
 
-        # Liquidity zones: try to output both Equal Highs and Equal Lows
+    # Liquidity zones: try to output both Equal Highs and Equal Lows
 
-        # Liquidity zones: detect Equal Highs/Lows as clusters of swing points (not only last 2)
-        eq_hi = None
-        eq_lo = None
-        eq_hi_touches = 0
-        eq_lo_touches = 0
-        eq_hi_strength = 0
-        eq_lo_strength = 0
-        eq_hi_dist_pct = None
-        eq_lo_dist_pct = None
-        eq_hi_dist_atr = None
-        eq_lo_dist_atr = None
-        try:
-            atr_abs_s = float(df_struct_w["atr"].iloc[-1]) if "atr" in df_struct_w.columns and df_struct_w["atr"].iloc[-1] == df_struct_w["atr"].iloc[-1] else atr_abs
-            tol_atr = float(os.getenv("LIQ_EQ_TOL_ATR_MULT", "0.35") or 0.35)
-            tol_pct = float(os.getenv("LIQ_EQ_TOL_PCT", "0.0010") or 0.0010)  # 0.10%
-            tol2 = max(atr_abs_s * tol_atr, price * tol_pct)
+    # Liquidity zones: detect Equal Highs/Lows as clusters of swing points (not only last 2)
+    eq_hi = None
+    eq_lo = None
+    eq_hi_touches = 0
+    eq_lo_touches = 0
+    eq_hi_strength = 0
+    eq_lo_strength = 0
+    eq_hi_dist_pct = None
+    eq_lo_dist_pct = None
+    eq_hi_dist_atr = None
+    eq_lo_dist_atr = None
+    try:
+        atr_abs_s = float(df_struct_w["atr"].iloc[-1]) if "atr" in df_struct_w.columns and df_struct_w["atr"].iloc[-1] == df_struct_w["atr"].iloc[-1] else atr_abs
+        tol_atr = float(os.getenv("LIQ_EQ_TOL_ATR_MULT", "0.35") or 0.35)
+        tol_pct = float(os.getenv("LIQ_EQ_TOL_PCT", "0.0010") or 0.0010)  # 0.10%
+        tol2 = max(atr_abs_s * tol_atr, price * tol_pct)
 
-            max_swings = int(os.getenv("LIQ_EQ_MAX_SWINGS", "12") or 12)
-            min_sep_pct = float(os.getenv("LIQ_EQ_MIN_SEP_PCT", "0.0002") or 0.0002)  # avoid classifying "near price" as liquidity
+        max_swings = int(os.getenv("LIQ_EQ_MAX_SWINGS", "12") or 12)
+        min_sep_pct = float(os.getenv("LIQ_EQ_MIN_SEP_PCT", "0.0002") or 0.0002)  # avoid classifying "near price" as liquidity
 
-            def _median(vals: list[float]) -> float:
-                s = sorted(vals)
-                return float(s[len(s)//2])
+        def _median(vals: list[float]) -> float:
+            s = sorted(vals)
+            return float(s[len(s)//2])
 
-            def _best_eq(swings: list[tuple[int, float]] | None, side: str):
-                # side: "high" (liquidity above) or "low" (liquidity below)
-                if not swings:
-                    return None
-                pts = swings[-max_swings:]
-                clusters: list[dict] = []
-                for ix, v in pts:
-                    v = float(v)
-                    placed = False
-                    for c in clusters:
-                        if abs(v - float(c["level"])) <= tol2:
-                            c["vals"].append(v)
-                            c["idxs"].append(int(ix))
-                            c["level"] = _median(c["vals"])
-                            placed = True
-                            break
-                    if not placed:
-                        clusters.append({"vals": [v], "idxs": [int(ix)], "level": v})
+        def _best_eq(swings: list[tuple[int, float]] | None, side: str):
+            # side: "high" (liquidity above) or "low" (liquidity below)
+            if not swings:
+                return None
+            pts = swings[-max_swings:]
+            clusters: list[dict] = []
+            for ix, v in pts:
+                v = float(v)
+                placed = False
+                for c in clusters:
+                    if abs(v - float(c["level"])) <= tol2:
+                        c["vals"].append(v)
+                        c["idxs"].append(int(ix))
+                        c["level"] = _median(c["vals"])
+                        placed = True
+                        break
+                if not placed:
+                    clusters.append({"vals": [v], "idxs": [int(ix)], "level": v})
 
-                # filter by side relative to current price (we care about resting liquidity away from price)
-                if side == "high":
-                    cand = [c for c in clusters if float(c["level"]) >= price * (1.0 + min_sep_pct)]
-                else:
-                    cand = [c for c in clusters if float(c["level"]) <= price * (1.0 - min_sep_pct)]
+            # filter by side relative to current price (we care about resting liquidity away from price)
+            if side == "high":
+                cand = [c for c in clusters if float(c["level"]) >= price * (1.0 + min_sep_pct)]
+            else:
+                cand = [c for c in clusters if float(c["level"]) <= price * (1.0 - min_sep_pct)]
 
-                if not cand:
-                    return None
+            if not cand:
+                return None
 
-                # best = most touches, then most recent touch
-                cand.sort(key=lambda c: (len(c["vals"]), max(c["idxs"])), reverse=True)
-                c = cand[0]
-                level = float(c["level"])
-                touches = int(len(c["vals"]))
-                last_touch = int(max(c["idxs"]))
-                spread = float(max(c["vals"]) - min(c["vals"])) if touches >= 2 else 0.0
+            # best = most touches, then most recent touch
+            cand.sort(key=lambda c: (len(c["vals"]), max(c["idxs"])), reverse=True)
+            c = cand[0]
+            level = float(c["level"])
+            touches = int(len(c["vals"]))
+            last_touch = int(max(c["idxs"]))
+            spread = float(max(c["vals"]) - min(c["vals"])) if touches >= 2 else 0.0
 
-                # strength (1..5): touches + recency - dispersion
-                strength = min(5, max(1, touches))
-                try:
-                    age = (len(df_struct_w) - 1) - last_touch
-                    if age <= int(os.getenv("LIQ_EQ_RECENT_BONUS_BARS", "60") or 60):
-                        strength = min(5, strength + 1)
-                except Exception:
-                    pass
-                if spread > tol2 * float(os.getenv("LIQ_EQ_SPREAD_PENALTY", "0.8") or 0.8):
-                    strength = max(1, strength - 1)
-
-                dist = abs(level - price)
-                dist_pct = (dist / price * 100.0) if price > 0 else None
-                dist_atr = (dist / atr_abs_s) if atr_abs_s and atr_abs_s > 0 else None
-                return (level, touches, strength, dist_pct, dist_atr)
-
-            hi = _best_eq(sh, "high")
-            if hi:
-                eq_hi, eq_hi_touches, eq_hi_strength, eq_hi_dist_pct, eq_hi_dist_atr = hi
-
-            lo = _best_eq(sl, "low")
-            if lo:
-                eq_lo, eq_lo_touches, eq_lo_strength, eq_lo_dist_pct, eq_lo_dist_atr = lo
-
-        except Exception:
-            pass
-
-        def _liq_line(prefix: str, level: float | None, dist_pct: float | None, dist_atr: float | None, strength: int, touches: int, side: str) -> str:
-            if level is None:
-                return f"{prefix}: Не обнаружены"
+            # strength (1..5): touches + recency - dispersion
+            strength = min(5, max(1, touches))
             try:
-                dp = f"{dist_pct:.2f}%" if dist_pct is not None and dist_pct == dist_pct else "n/a"
+                age = (len(df_struct_w) - 1) - last_touch
+                if age <= int(os.getenv("LIQ_EQ_RECENT_BONUS_BARS", "60") or 60):
+                    strength = min(5, strength + 1)
             except Exception:
-                dp = "n/a"
-            try:
-                da = f"{dist_atr:.2f} ATR" if dist_atr is not None and dist_atr == dist_atr else "n/a"
-            except Exception:
-                da = "n/a"
-            arrow = "↑" if side == "high" else "↓"
-            return f"{prefix}: {_fmt_int_space(level)} {arrow} | dist: {dp} ({da}) | strength: {int(strength)}/5 | touches: {int(touches)}"
+                pass
+            if spread > tol2 * float(os.getenv("LIQ_EQ_SPREAD_PENALTY", "0.8") or 0.8):
+                strength = max(1, strength - 1)
 
-        eq_hi_line = _liq_line("Equal Highs (ликвидность сверху)", eq_hi, eq_hi_dist_pct, eq_hi_dist_atr, eq_hi_strength, eq_hi_touches, "high")
-        eq_lo_line = _liq_line("Equal Lows (ликвидность снизу)", eq_lo, eq_lo_dist_pct, eq_lo_dist_atr, eq_lo_strength, eq_lo_touches, "low")
-        # ---- Multi-TF liquidity map (5m/1h/4h) + общий "магнит" ----
-        mtf_liq_lines: list[str] = []
-        magnet_level = None
-        magnet_side = None  # "high" or "low"
+            dist = abs(level - price)
+            dist_pct = (dist / price * 100.0) if price > 0 else None
+            dist_atr = (dist / atr_abs_s) if atr_abs_s and atr_abs_s > 0 else None
+            return (level, touches, strength, dist_pct, dist_atr)
+
+        hi = _best_eq(sh, "high")
+        if hi:
+            eq_hi, eq_hi_touches, eq_hi_strength, eq_hi_dist_pct, eq_hi_dist_atr = hi
+
+        lo = _best_eq(sl, "low")
+        if lo:
+            eq_lo, eq_lo_touches, eq_lo_strength, eq_lo_dist_pct, eq_lo_dist_atr = lo
+
+    except Exception:
+        pass
+
+    def _liq_line(prefix: str, level: float | None, dist_pct: float | None, dist_atr: float | None, strength: int, touches: int, side: str) -> str:
+        if level is None:
+            return f"{prefix}: Не обнаружены" if is_ru else f"{prefix}: Not detected"
         try:
-            def _tf_atr(_df: pd.DataFrame) -> float:
-                try:
-                    if _df is not None and "atr" in _df.columns:
-                        v = float(_df["atr"].astype(float).iloc[-1])
-                        if v == v and v > 0:
-                            return v
-                except Exception:
-                    pass
-                return float(atr_abs_s) if atr_abs_s and atr_abs_s > 0 else float(atr_abs) if atr_abs else 0.0
+            dp = f"{dist_pct:.2f}%" if dist_pct is not None and dist_pct == dist_pct else "n/a"
+        except Exception:
+            dp = "n/a"
+        try:
+            da = f"{dist_atr:.2f} ATR" if dist_atr is not None and dist_atr == dist_atr else "n/a"
+        except Exception:
+            da = "n/a"
+        arrow = "↑" if side == "high" else "↓"
+        return f"{prefix}: {_fmt_int_space(level)} {arrow} | dist: {dp} ({da}) | strength: {int(strength)}/5 | touches: {int(touches)}"
 
-            def _best_eq_mtf(_df: pd.DataFrame, _sh: list[tuple[int, float]], _sl: list[tuple[int, float]], _label: str):
-                try:
-                    if _df is None or getattr(_df, "empty", True) or (not _sh and not _sl):
-                        return None, None
-                    _price = float(price)
-                    _atr = _tf_atr(_df)
-                    _tol_atr = float(os.getenv("LIQ_EQ_TOL_ATR_MULT", "0.35") or 0.35)
-                    _tol_pct = float(os.getenv("LIQ_EQ_TOL_PCT", "0.0010") or 0.0010)
-                    _tol = max(_atr * _tol_atr, _price * _tol_pct)
-                    _max_sw = int(os.getenv("LIQ_EQ_MAX_SWINGS", "12") or 12)
-                    _min_sep = float(os.getenv("LIQ_EQ_MIN_SEP_PCT", "0.0002") or 0.0002)
+    eq_hi_line = _liq_line(("Equal Highs (ликвидность сверху)" if is_ru else "Equal Highs (liquidity above)"), eq_hi, eq_hi_dist_pct, eq_hi_dist_atr, eq_hi_strength, eq_hi_touches, "high")
+    eq_lo_line = _liq_line(("Equal Lows (ликвидность снизу)" if is_ru else "Equal Lows (liquidity below)"), eq_lo, eq_lo_dist_pct, eq_lo_dist_atr, eq_lo_strength, eq_lo_touches, "low")
+    # ---- Multi-TF liquidity map (5m/1h/4h) + общий "магнит" ----
+    mtf_liq_lines: list[str] = []
+    magnet_level = None
+    magnet_side = None  # "high" or "low"
+    try:
+        def _tf_atr(_df: pd.DataFrame) -> float:
+            try:
+                if _df is not None and "atr" in _df.columns:
+                    v = float(_df["atr"].astype(float).iloc[-1])
+                    if v == v and v > 0:
+                        return v
+            except Exception:
+                pass
+            return float(atr_abs_s) if atr_abs_s and atr_abs_s > 0 else float(atr_abs) if atr_abs else 0.0
 
-                    def _median(vals: list[float]) -> float:
-                        s = sorted(vals)
-                        return float(s[len(s)//2])
-
-                    def _cluster(swings: list[tuple[int, float]], side: str):
-                        if not swings:
-                            return None
-                        pts = swings[-_max_sw:]
-                        clusters: list[dict] = []
-                        for ix, v in pts:
-                            v = float(v)
-                            placed = False
-                            for c in clusters:
-                                if abs(v - float(c["level"])) <= _tol:
-                                    c["vals"].append(v)
-                                    c["idxs"].append(int(ix))
-                                    c["level"] = _median(c["vals"])
-                                    placed = True
-                                    break
-                            if not placed:
-                                clusters.append({"vals":[v], "idxs":[int(ix)], "level": v})
-                        if side == "high":
-                            cand = [c for c in clusters if float(c["level"]) >= _price * (1.0 + _min_sep)]
-                        else:
-                            cand = [c for c in clusters if float(c["level"]) <= _price * (1.0 - _min_sep)]
-                        if not cand:
-                            return None
-                        cand.sort(key=lambda c: (len(c["vals"]), max(c["idxs"])), reverse=True)
-                        c = cand[0]
-                        level = float(c["level"])
-                        touches = int(len(c["vals"]))
-                        last_touch = int(max(c["idxs"]))
-                        spread = float(max(c["vals"]) - min(c["vals"])) if touches >= 2 else 0.0
-                        strength = min(5, max(1, touches))
-                        try:
-                            age = (len(_df) - 1) - last_touch
-                            if age <= int(os.getenv("LIQ_EQ_RECENT_BONUS_BARS", "60") or 60):
-                                strength = min(5, strength + 1)
-                        except Exception:
-                            pass
-                        if spread > _tol * float(os.getenv("LIQ_EQ_SPREAD_PENALTY", "0.8") or 0.8):
-                            strength = max(1, strength - 1)
-                        dist = abs(level - _price)
-                        dist_pct = (dist / _price * 100.0) if _price > 0 else None
-                        dist_atr = (dist / _atr) if _atr and _atr > 0 else None
-                        return (level, touches, strength, dist_pct, dist_atr)
-
-                    hi = _cluster(_sh, "high")
-                    lo = _cluster(_sl, "low")
-
-                    def _fmt_side(name: str, res):
-                        if not res:
-                            return f"{name}: —"
-                        lvl, t, st, dp, da = res
-                        dp_s = f"{dp:.2f}%" if dp is not None and dp == dp else "n/a"
-                        da_s = f"{da:.2f} ATR" if da is not None and da == da else "n/a"
-                        return f"{name}: {_fmt_int_space(lvl)} | dist: {dp_s} ({da_s}) | str: {int(st)}/5 | t: {int(t)}"
-
-                    line_hi = _fmt_side(f"{_label} EQH", hi)
-                    line_lo = _fmt_side(f"{_label} EQL", lo)
-
-                    return (hi, line_hi), (lo, line_lo)
-                except Exception:
+        def _best_eq_mtf(_df: pd.DataFrame, _sh: list[tuple[int, float]], _sl: list[tuple[int, float]], _label: str):
+            try:
+                if _df is None or getattr(_df, "empty", True) or (not _sh and not _sl):
                     return None, None
+                _price = float(price)
+                _atr = _tf_atr(_df)
+                _tol_atr = float(os.getenv("LIQ_EQ_TOL_ATR_MULT", "0.35") or 0.35)
+                _tol_pct = float(os.getenv("LIQ_EQ_TOL_PCT", "0.0010") or 0.0010)
+                _tol = max(_atr * _tol_atr, _price * _tol_pct)
+                _max_sw = int(os.getenv("LIQ_EQ_MAX_SWINGS", "12") or 12)
+                _min_sep = float(os.getenv("LIQ_EQ_MIN_SEP_PCT", "0.0002") or 0.0002)
 
-            sh5, sl5 = _swing_points(df5, left=3, right=3)
-            sh1_, sl1_ = _swing_points(df1, left=3, right=3) if df1 is not None else ([], [])
-            sh4_, sl4_ = _swing_points(df4, left=3, right=3) if df4 is not None else ([], [])
+                def _median(vals: list[float]) -> float:
+                    s = sorted(vals)
+                    return float(s[len(s)//2])
 
-            for _df, _sh_, _sl_, _lab in ((df5, sh5, sl5, "5m"), (df1, sh1_, sl1_, "1h"), (df4, sh4_, sl4_, "4h")):
-                hi_pack, lo_pack = _best_eq_mtf(_df, _sh_, _sl_, _lab)
-                for pack, side in ((hi_pack, "high"), (lo_pack, "low")):
-                    if pack:
-                        res, line_txt = pack
-                        mtf_liq_lines.append(line_txt)
-                        if res:
-                            lvl = float(res[0])
-                            d = abs(lvl - float(price))
-                            if magnet_level is None or d < abs(float(magnet_level) - float(price)):
-                                magnet_level = lvl
-                                magnet_side = side
+                def _cluster(swings: list[tuple[int, float]], side: str):
+                    if not swings:
+                        return None
+                    pts = swings[-_max_sw:]
+                    clusters: list[dict] = []
+                    for ix, v in pts:
+                        v = float(v)
+                        placed = False
+                        for c in clusters:
+                            if abs(v - float(c["level"])) <= _tol:
+                                c["vals"].append(v)
+                                c["idxs"].append(int(ix))
+                                c["level"] = _median(c["vals"])
+                                placed = True
+                                break
+                        if not placed:
+                            clusters.append({"vals":[v], "idxs":[int(ix)], "level": v})
+                    if side == "high":
+                        cand = [c for c in clusters if float(c["level"]) >= _price * (1.0 + _min_sep)]
+                    else:
+                        cand = [c for c in clusters if float(c["level"]) <= _price * (1.0 - _min_sep)]
+                    if not cand:
+                        return None
+                    cand.sort(key=lambda c: (len(c["vals"]), max(c["idxs"])), reverse=True)
+                    c = cand[0]
+                    level = float(c["level"])
+                    touches = int(len(c["vals"]))
+                    last_touch = int(max(c["idxs"]))
+                    spread = float(max(c["vals"]) - min(c["vals"])) if touches >= 2 else 0.0
+                    strength = min(5, max(1, touches))
+                    try:
+                        age = (len(_df) - 1) - last_touch
+                        if age <= int(os.getenv("LIQ_EQ_RECENT_BONUS_BARS", "60") or 60):
+                            strength = min(5, strength + 1)
+                    except Exception:
+                        pass
+                    if spread > _tol * float(os.getenv("LIQ_EQ_SPREAD_PENALTY", "0.8") or 0.8):
+                        strength = max(1, strength - 1)
+                    dist = abs(level - _price)
+                    dist_pct = (dist / _price * 100.0) if _price > 0 else None
+                    dist_atr = (dist / _atr) if _atr and _atr > 0 else None
+                    return (level, touches, strength, dist_pct, dist_atr)
 
-        except Exception:
-            pass
+                hi = _cluster(_sh, "high")
+                lo = _cluster(_sl, "low")
 
-        magnet_txt = "Magnet: —"
-        try:
-            if magnet_level is not None:
-                arrow = "↑" if magnet_side == "high" else "↓"
-                magnet_txt = f"Magnet: {_fmt_int_space(float(magnet_level))} {arrow}"
-        except Exception:
-            pass
+                def _fmt_side(name: str, res):
+                    if not res:
+                        return f"{name}: —"
+                    lvl, t, st, dp, da = res
+                    dp_s = f"{dp:.2f}%" if dp is not None and dp == dp else "n/a"
+                    da_s = f"{da:.2f} ATR" if da is not None and da == da else "n/a"
+                    return f"{name}: {_fmt_int_space(lvl)} | dist: {dp_s} ({da_s}) | str: {int(st)}/5 | t: {int(t)}"
 
-        # ---- Anchored VWAP (1h) от swing low/high (proxy BOS anchor) ----
+                line_hi = _fmt_side(f"{_label} EQH", hi)
+                line_lo = _fmt_side(f"{_label} EQL", lo)
+
+                return (hi, line_hi), (lo, line_lo)
+            except Exception:
+                return None, None
+
+        sh5, sl5 = _swing_points(df5, left=3, right=3)
+        sh1_, sl1_ = _swing_points(df1, left=3, right=3) if df1 is not None else ([], [])
+        sh4_, sl4_ = _swing_points(df4, left=3, right=3) if df4 is not None else ([], [])
+
+        for _df, _sh_, _sl_, _lab in ((df5, sh5, sl5, "5m"), (df1, sh1_, sl1_, "1h"), (df4, sh4_, sl4_, "4h")):
+            hi_pack, lo_pack = _best_eq_mtf(_df, _sh_, _sl_, _lab)
+            for pack, side in ((hi_pack, "high"), (lo_pack, "low")):
+                if pack:
+                    res, line_txt = pack
+                    mtf_liq_lines.append(line_txt)
+                    if res:
+                        lvl = float(res[0])
+                        d = abs(lvl - float(price))
+                        if magnet_level is None or d < abs(float(magnet_level) - float(price)):
+                            magnet_level = lvl
+                            magnet_side = side
+
+    except Exception:
+        pass
+
+    magnet_txt = "Magnet: —"
+    try:
+        if magnet_level is not None:
+            arrow = "↑" if magnet_side == "high" else "↓"
+            magnet_txt = f"Magnet: {_fmt_int_space(float(magnet_level))} {arrow}"
+    except Exception:
+        pass
+
+    # ---- Anchored VWAP (1h) от swing low/high (proxy BOS anchor) ----
+    avb = None
+    try:
+        _dfv = df1 if (df1 is not None and not getattr(df1, "empty", True)) else None
+        if _dfv is not None and "volume" in _dfv.columns and len(_dfv) > 30:
+            # Anchor selection: по приоритету (bias) -> последний swing low/high на 1h
+            shA, slA = _swing_points(_dfv, left=3, right=3)
+            use_long = True
+            try:
+                use_long = bool(long_p >= short_p)
+            except Exception:
+                pass
+            # Prefer BOS anchor if detected (desk-level AVWAP)
+            try:
+                bos_idx, bos_label = _inst_detect_bos_anchor(_dfv, "LONG" if use_long else "SHORT", left=3, right=3)
+            except Exception:
+                bos_idx, bos_label = (None, None)
+            anchor_idx = None
+            anchor_name = None
+            # If BOS exists, anchor AVWAP on BOS candle (higher priority than swing)
+            if bos_idx is not None:
+                anchor_idx = int(bos_idx)
+                anchor_name = str(bos_label or "BOS break (1h)")
+            else:
+                if use_long and slA:
+                    anchor_idx = int(slA[-1][0])
+                    anchor_name = "swing low (1h)"
+                elif (not use_long) and shA:
+                    anchor_idx = int(shA[-1][0])
+                    anchor_name = "swing high (1h)"
+                elif slA:
+                    anchor_idx = int(slA[-1][0]); anchor_name = "swing low (1h)"
+                elif shA:
+                    anchor_idx = int(shA[-1][0]); anchor_name = "swing high (1h)"
+
+            if anchor_idx is not None and anchor_idx < (len(_dfv) - 5):
+                seg = _dfv.iloc[anchor_idx:].copy()
+                tp = (seg["high"].astype(float) + seg["low"].astype(float) + seg["close"].astype(float)) / 3.0
+                vol = seg["volume"].astype(float).clip(lower=0.0)
+                v_sum = float(vol.sum())
+                if v_sum > 0:
+                    vwap = float((tp * vol).sum() / v_sum)
+                    # volume-weighted stdev
+                    mu = vwap
+                    var = float(((tp - mu) ** 2 * vol).sum() / v_sum)
+                    sd = math.sqrt(var) if var >= 0 else 0.0
+                    avb = {
+                        "vwap": vwap,
+                        "sd": sd,
+                        "anchor": anchor_name,
+                        "bands": {
+                            "-1.0": vwap - 1.0 * sd,
+                            "+1.0": vwap + 1.0 * sd,
+                            "-2.0": vwap - 2.0 * sd,
+                            "+2.0": vwap + 2.0 * sd,
+                        },
+                        "bars": int(len(seg)),
+                    }
+    except Exception:
         avb = None
-        try:
-            _dfv = df1 if (df1 is not None and not getattr(df1, "empty", True)) else None
-            if _dfv is not None and "volume" in _dfv.columns and len(_dfv) > 30:
-                # Anchor selection: по приоритету (bias) -> последний swing low/high на 1h
-                shA, slA = _swing_points(_dfv, left=3, right=3)
-                use_long = True
-                try:
-                    use_long = bool(long_p >= short_p)
-                except Exception:
-                    pass
-                # Prefer BOS anchor if detected (desk-level AVWAP)
-                try:
-                    bos_idx, bos_label = _inst_detect_bos_anchor(_dfv, "LONG" if use_long else "SHORT", left=3, right=3)
-                except Exception:
-                    bos_idx, bos_label = (None, None)
-                anchor_idx = None
-                anchor_name = None
-                # If BOS exists, anchor AVWAP on BOS candle (higher priority than swing)
-                if bos_idx is not None:
-                    anchor_idx = int(bos_idx)
-                    anchor_name = str(bos_label or "BOS break (1h)")
-                else:
-                    if use_long and slA:
-                        anchor_idx = int(slA[-1][0])
-                        anchor_name = "swing low (1h)"
-                    elif (not use_long) and shA:
-                        anchor_idx = int(shA[-1][0])
-                        anchor_name = "swing high (1h)"
-                    elif slA:
-                        anchor_idx = int(slA[-1][0]); anchor_name = "swing low (1h)"
-                    elif shA:
-                        anchor_idx = int(shA[-1][0]); anchor_name = "swing high (1h)"
 
-                if anchor_idx is not None and anchor_idx < (len(_dfv) - 5):
-                    seg = _dfv.iloc[anchor_idx:].copy()
-                    tp = (seg["high"].astype(float) + seg["low"].astype(float) + seg["close"].astype(float)) / 3.0
-                    vol = seg["volume"].astype(float).clip(lower=0.0)
-                    v_sum = float(vol.sum())
-                    if v_sum > 0:
-                        vwap = float((tp * vol).sum() / v_sum)
-                        # volume-weighted stdev
-                        mu = vwap
-                        var = float(((tp - mu) ** 2 * vol).sum() / v_sum)
-                        sd = math.sqrt(var) if var >= 0 else 0.0
-                        avb = {
-                            "vwap": vwap,
-                            "sd": sd,
-                            "anchor": anchor_name,
-                            "bands": {
-                                "-1.0": vwap - 1.0 * sd,
-                                "+1.0": vwap + 1.0 * sd,
-                                "-2.0": vwap - 2.0 * sd,
-                                "+2.0": vwap + 2.0 * sd,
-                            },
-                            "bars": int(len(seg)),
-                        }
-        except Exception:
-            avb = None
+    # Order block parsing: "OB Спрос [lo–hi]" -> lo/hi
+    ob_side = "—"
+    ob_lo = None
+    ob_hi = None
+    try:
+        if isinstance(smz, str) and "[" in smz and "]" in smz:
+            ob_side = "demand" if ("спрос" in smz.lower() or "demand" in smz.lower()) else "supply"
+            inside = smz.split("[", 1)[1].split("]", 1)[0]
+            inside = inside.replace("–", "-").replace("—", "-")
+            a, b = inside.split("-", 1)
+            ob_lo = float(str(a).replace(" ", ""))
+            ob_hi = float(str(b).replace(" ", ""))
+    except Exception:
+        pass
 
-        # Order block parsing: "OB Спрос [lo–hi]" -> lo/hi
-        ob_side = "—"
-        ob_lo = None
-        ob_hi = None
-        try:
-            if isinstance(smz, str) and "[" in smz and "]" in smz:
-                ob_side = "спроса" if ("спрос" in smz.lower() or "demand" in smz.lower()) else "предложения"
-                inside = smz.split("[", 1)[1].split("]", 1)[0]
-                inside = inside.replace("–", "-").replace("—", "-")
-                a, b = inside.split("-", 1)
-                ob_lo = float(str(a).replace(" ", ""))
-                ob_hi = float(str(b).replace(" ", ""))
-        except Exception:
-            pass
+    # FVG parsing: "Бычья FVG [lo–hi] (активна)" -> lo/hi
+    fvg_side = None
+    fvg_lo = None
+    fvg_hi = None
+    fvg_active = None
+    try:
+        if isinstance(fvg_txt, str) and "FVG" in fvg_txt and "[" in fvg_txt and "]" in fvg_txt:
+            fvg_side = "bullish" if ("быч" in fvg_txt.lower() or "bull" in fvg_txt.lower()) else ("bearish" if ("медв" in fvg_txt.lower() or "bear" in fvg_txt.lower()) else None)
+            inside = fvg_txt.split("[", 1)[1].split("]", 1)[0]
+            inside = inside.replace("–", "-").replace("—", "-")
+            a, b = inside.split("-", 1)
+            fvg_lo = float(str(a).replace(" ", ""))
+            fvg_hi = float(str(b).replace(" ", ""))
+            fvg_active = ("актив" in fvg_txt.lower() or "active" in fvg_txt.lower())
+    except Exception:
+        pass
 
-        # FVG parsing: "Бычья FVG [lo–hi] (активна)" -> lo/hi
-        fvg_side = None
-        fvg_lo = None
-        fvg_hi = None
-        fvg_active = None
+    # Trading plan extras
+    # Entry Zone (идеально для институционального входа) строим НЕ от ATR вокруг цены,
+    # а от зон спроса/предложения: Order Block + FVG + liquidity sweep + channel/support.
+    # После зоны обязательно показываем Trigger (подтверждение) и Invalidation (отмена).
+    try:
+        entry_lo = None
+        entry_hi = None
+        entry_kind = "—"
+        entry_confluence = 0
+        entry_notes = []
+        inv_lvl_out = None  # for entry status
+
+        cs = float(chan_support) if chan_support is not None else None
+        cm = float(chan_mid) if chan_mid is not None else None
+        cr = float(chan_resist) if chan_resist is not None else None
+        s1n = float(support1) if support1 is not None else None
+        s2n = float(support2) if support2 is not None else None
+        r1n = float(resistance1) if resistance1 is not None else None
+        r2n = float(resistance2) if resistance2 is not None else None
+
+        # базовые допуски "рядом" (для confluence)
+        tol = max(atr_abs * 0.6, price * 0.002)
+
+        # fallback ширина зоны, чтобы отчёт никогда не ломался
+        w_fallback = max(atr_abs * 0.25, price * 0.001)
+
+        # liquidity sweep detection (последние ~30 свечей 5м)
+        sweep_long = False
+        sweep_short = False
         try:
-            if isinstance(fvg_txt, str) and "FVG" in fvg_txt and "[" in fvg_txt and "]" in fvg_txt:
-                fvg_side = "Бычий" if "Быч" in fvg_txt else ("Медвежий" if "Медв" in fvg_txt else None)
-                inside = fvg_txt.split("[", 1)[1].split("]", 1)[0]
-                inside = inside.replace("–", "-").replace("—", "-")
-                a, b = inside.split("-", 1)
-                fvg_lo = float(str(a).replace(" ", ""))
-                fvg_hi = float(str(b).replace(" ", ""))
-                fvg_active = ("актив" in fvg_txt.lower() or "active" in fvg_txt.lower())
+            recent = df5.tail(30)
+            if eq_lo is not None and "low" in recent.columns and "close" in recent.columns:
+                low_min = float(recent["low"].astype(float).min())
+                close_last = float(recent["close"].astype(float).iloc[-1])
+                sweep_long = (low_min < float(eq_lo) - tol * 0.15) and (close_last > float(eq_lo) + tol * 0.05)
+            if eq_hi is not None and "high" in recent.columns and "close" in recent.columns:
+                high_max = float(recent["high"].astype(float).max())
+                close_last = float(recent["close"].astype(float).iloc[-1])
+                sweep_short = (high_max > float(eq_hi) + tol * 0.15) and (close_last < float(eq_hi) - tol * 0.05)
         except Exception:
             pass
 
-        # Trading plan extras
-        # Entry Zone (идеально для институционального входа) строим НЕ от ATR вокруг цены,
-        # а от зон спроса/предложения: Order Block + FVG + liquidity sweep + channel/support.
-        # После зоны обязательно показываем Trigger (подтверждение) и Invalidation (отмена).
-        try:
-            entry_lo = None
-            entry_hi = None
-            entry_kind = "—"
-            entry_confluence = 0
-            entry_notes = []
-            inv_lvl_out = None  # for entry status
 
-            cs = float(chan_support) if chan_support is not None else None
-            cm = float(chan_mid) if chan_mid is not None else None
-            cr = float(chan_resist) if chan_resist is not None else None
-            s1n = float(support1) if support1 is not None else None
-            s2n = float(support2) if support2 is not None else None
-            r1n = float(resistance1) if resistance1 is not None else None
-            r2n = float(resistance2) if resistance2 is not None else None
+        def _overlap(a_lo, a_hi, b_lo, b_hi):
+            lo = max(a_lo, b_lo)
+            hi = min(a_hi, b_hi)
+            return (lo, hi) if hi > lo else (None, None)
 
-            # базовые допуски "рядом" (для confluence)
-            tol = max(atr_abs * 0.6, price * 0.002)
+        def _near(x, lo, hi, tol_):
+            if x is None:
+                return False
+            return (lo - tol_) <= x <= (hi + tol_)
 
-            # fallback ширина зоны, чтобы отчёт никогда не ломался
-            w_fallback = max(atr_abs * 0.25, price * 0.001)
+        def _clamp_zone(zlo, zhi):
+            zlo = max(0.0, float(zlo))
+            zhi = max(zlo, float(zhi))
+            return zlo, zhi
 
-            # liquidity sweep detection (последние ~30 свечей 5м)
-            sweep_long = False
-            sweep_short = False
-            try:
-                recent = df5.tail(30)
-                if eq_lo is not None and "low" in recent.columns and "close" in recent.columns:
-                    low_min = float(recent["low"].astype(float).min())
-                    close_last = float(recent["close"].astype(float).iloc[-1])
-                    sweep_long = (low_min < float(eq_lo) - tol * 0.15) and (close_last > float(eq_lo) + tol * 0.05)
-                if eq_hi is not None and "high" in recent.columns and "close" in recent.columns:
-                    high_max = float(recent["high"].astype(float).max())
-                    close_last = float(recent["close"].astype(float).iloc[-1])
-                    sweep_short = (high_max > float(eq_hi) + tol * 0.15) and (close_last < float(eq_hi) - tol * 0.05)
-            except Exception:
-                pass
-
-
-            def _overlap(a_lo, a_hi, b_lo, b_hi):
-                lo = max(a_lo, b_lo)
-                hi = min(a_hi, b_hi)
-                return (lo, hi) if hi > lo else (None, None)
-
-            def _near(x, lo, hi, tol_):
-                if x is None:
-                    return False
-                return (lo - tol_) <= x <= (hi + tol_)
-
-            def _clamp_zone(zlo, zhi):
-                zlo = max(0.0, float(zlo))
-                zhi = max(zlo, float(zhi))
-                return zlo, zhi
-
-            # --- LONG: Demand zones ---
-            if bias == "LONG":
-                ob_ok = (ob_lo is not None and ob_hi is not None and ("спрос" in str(ob_side).lower()))
-                fvg_ok = (fvg_lo is not None and fvg_hi is not None and fvg_active is True and (str(fvg_side).lower().startswith("быч")))
-                ch_ok = (cs is not None and cm is not None and cm > cs)
-
-                # 1) лучший вариант: OB + FVG overlap (узкая зона)
-                if ob_ok and fvg_ok:
-                    o_lo, o_hi = _overlap(float(ob_lo), float(ob_hi), float(fvg_lo), float(fvg_hi))
-                    if o_lo is not None:
-                        entry_lo, entry_hi = _clamp_zone(o_lo, o_hi)
-                        entry_kind = "OB+FVG"
-                        entry_notes.append("Order Block + FVG")
-                    else:
-                        # если не пересекаются — берём OB как базу (он сильнее)
-                        entry_lo, entry_hi = _clamp_zone(float(ob_lo), float(ob_hi))
-                        entry_kind = "OB"
-                        entry_notes.append("Order Block")
-
-                elif ob_ok:
-                    entry_lo, entry_hi = _clamp_zone(float(ob_lo), float(ob_hi))
-                    entry_kind = "OB"
-                    entry_notes.append("Order Block")
-
-                elif fvg_ok:
-                    entry_lo, entry_hi = _clamp_zone(float(fvg_lo), float(fvg_hi))
-                    entry_kind = "FVG"
-                    entry_notes.append("FVG")
-
-                elif ch_ok:
-                    # зона от поддержки канала к середине (консервативно)
-                    base = cs
-                    # если Support1 выше поддержки канала — используем его (лучше)
-                    if s1n is not None:
-                        base = max(base, s1n)
-                    w = max(w_fallback, (cm - base) * 0.35)
-                    entry_lo, entry_hi = _clamp_zone(base, base + w)
-                    entry_kind = "CHANNEL"
-                    entry_notes.append("Support/Channel")
-
-                # fallback: ATR band (если ничего нет)
-                if entry_lo is None or entry_hi is None or not (entry_hi > entry_lo):
-                    entry_lo, entry_hi = _clamp_zone(price - atr_abs * 0.8, price - atr_abs * 0.1)
-                    entry_kind = "ATR"
-                    entry_notes.append("Fallback ATR")
-
-                # --- confluence scoring (0..5) ---
-                # OB присутствует (сильнейший фактор)
-                if ob_ok and _near((float(ob_lo)+float(ob_hi))/2.0, entry_lo, entry_hi, tol):
-                    entry_confluence += 2
-                # FVG рядом/внутри
-                if fvg_ok and _near((float(fvg_lo)+float(fvg_hi))/2.0, entry_lo, entry_hi, tol):
-                    entry_confluence += 1
-                # Support канала рядом с низом зоны
-                if cs is not None and abs(cs - entry_lo) <= tol:
-                    entry_confluence += 1
-                # Liquidity (Equal Lows) рядом
-                if _near(eq_lo, entry_lo, entry_hi, tol):
-                    entry_confluence += 1
-                # Pivot/S1 внутри/рядом
-                try:
-                    if _near(float(S1), entry_lo, entry_hi, tol) or _near(float(pivot), entry_lo, entry_hi, tol):
-                        entry_confluence += 1
-                except Exception:
-                    pass
-                entry_confluence = min(5, max(0, int(entry_confluence)))
-
-                # --- Trigger & Invalidation for LONG ---
-                # Обязательное подтверждение: Liquidity sweep снизу (Equal Lows) + возврат выше уровня
-                entry_sweep_txt = "Liquidity sweep (5м): " + ("Да" if sweep_long else "Нет")
-                trig_parts = []
-                trig_parts.append("Liquidity sweep снизу (Equal Lows) + reclaim")
-                trig_parts.append("BOS 5м вверх (закрытие выше локального swing-high)")
-                trig_parts.append(f"reclaim зоны (закрытие 5м выше {_fmt_int_space(entry_hi)})")
-                trig_parts.append("объём > 1.2x")
-                if not sweep_long:
-                    entry_trigger_txt = "Триггер входа: СНАЧАЛА " + trig_parts[0] + " (сейчас: Нет), затем " + " + ".join(trig_parts[1:])
-                else:
-                    entry_trigger_txt = "Триггер входа: " + " + ".join(trig_parts)
-
-                inv_lvl = max(0.0, entry_lo - max(atr_abs * 0.15, price * 0.0008))
-                inv_lvl_out = float(inv_lvl)
-                entry_inval_txt = f"Инвалидация: закрепление 5м ниже {_fmt_int_space(inv_lvl)}"
-
-                # Подгоняем SL под инвалидацию (SL должен быть ниже инвалидации)
-                try:
-                    sl = min(float(sl), inv_lvl)
-                except Exception:
-                    pass
-
-            # --- SHORT: Supply zones ---
-            else:
-                ob_ok = (ob_lo is not None and ob_hi is not None and ("предлож" in str(ob_side).lower()))
-                fvg_ok = (fvg_lo is not None and fvg_hi is not None and fvg_active is True and (str(fvg_side).lower().startswith("медв")))
-                ch_ok = (cr is not None and cm is not None and cr > cm)
-
-                if ob_ok and fvg_ok:
-                    o_lo, o_hi = _overlap(float(ob_lo), float(ob_hi), float(fvg_lo), float(fvg_hi))
-                    if o_lo is not None:
-                        entry_lo, entry_hi = _clamp_zone(o_lo, o_hi)
-                        entry_kind = "OB+FVG"
-                        entry_notes.append("Order Block + FVG")
-                    else:
-                        entry_lo, entry_hi = _clamp_zone(float(ob_lo), float(ob_hi))
-                        entry_kind = "OB"
-                        entry_notes.append("Order Block")
-
-                elif ob_ok:
-                    entry_lo, entry_hi = _clamp_zone(float(ob_lo), float(ob_hi))
-                    entry_kind = "OB"
-                    entry_notes.append("Order Block")
-
-                elif fvg_ok:
-                    entry_lo, entry_hi = _clamp_zone(float(fvg_lo), float(fvg_hi))
-                    entry_kind = "FVG"
-                    entry_notes.append("FVG")
-
-                elif ch_ok:
-                    top = cr
-                    if r1n is not None:
-                        top = min(top, r1n)
-                    w = max(w_fallback, (top - cm) * 0.35)
-                    entry_lo, entry_hi = _clamp_zone(top - w, top)
-                    entry_kind = "CHANNEL"
-                    entry_notes.append("Resistance/Channel")
-
-                if entry_lo is None or entry_hi is None or not (entry_hi > entry_lo):
-                    entry_lo, entry_hi = _clamp_zone(price + atr_abs * 0.1, price + atr_abs * 0.8)
-                    entry_kind = "ATR"
-                    entry_notes.append("Fallback ATR")
-
-                # confluence scoring
-                if ob_ok and _near((float(ob_lo)+float(ob_hi))/2.0, entry_lo, entry_hi, tol):
-                    entry_confluence += 2
-                if fvg_ok and _near((float(fvg_lo)+float(fvg_hi))/2.0, entry_lo, entry_hi, tol):
-                    entry_confluence += 1
-                if cr is not None and abs(cr - entry_hi) <= tol:
-                    entry_confluence += 1
-                if _near(eq_hi, entry_lo, entry_hi, tol):
-                    entry_confluence += 1
-                try:
-                    if _near(float(R1), entry_lo, entry_hi, tol) or _near(float(pivot), entry_lo, entry_hi, tol):
-                        entry_confluence += 1
-                except Exception:
-                    pass
-                entry_confluence = min(5, max(0, int(entry_confluence)))
-
-                entry_sweep_txt = "Liquidity sweep (5м): " + ("Да" if sweep_short else "Нет")
-                trig_parts = []
-                trig_parts.append("Liquidity sweep сверху (Equal Highs) + reject")
-                trig_parts.append("BOS 5м вниз (закрытие ниже локального swing-low)")
-                trig_parts.append(f"reject зоны (закрытие 5м ниже {_fmt_int_space(entry_lo)})")
-                trig_parts.append("объём > 1.2x")
-                if not sweep_short:
-                    entry_trigger_txt = "Триггер входа: СНАЧАЛА " + trig_parts[0] + " (сейчас: Нет), затем " + " + ".join(trig_parts[1:])
-                else:
-                    entry_trigger_txt = "Триггер входа: " + " + ".join(trig_parts)
-
-                inv_lvl = entry_hi + max(atr_abs * 0.15, price * 0.0008)
-                inv_lvl_out = float(inv_lvl)
-                entry_inval_txt = f"Инвалидация: закрепление 5м выше {_fmt_int_space(inv_lvl)}"
-
-                try:
-                    sl = max(float(sl), inv_lvl)
-                except Exception:
-                    pass
-
-        except Exception:
-            inv_lvl_out = None
-            entry_lo, entry_hi = price, price
-            entry_kind = "—"
-            entry_confluence = 0
-            entry_notes = []
-            entry_sweep_txt = "Liquidity sweep (5м): —"
-            entry_trigger_txt = "Триггер входа: —"
-            entry_inval_txt = "Инвалидация: —"
-
-        # ---- Entry status (READY / WAIT / CONFIRMED / INVALID) ----
-        entry_status = "WAIT"
-        try:
-            p_now = float(price)
-            zlo = float(entry_lo)
-            zhi = float(entry_hi)
-            inv = inv_lvl_out if (inv_lvl_out is not None) else None
-
-            # invalidation check first
-            if inv is not None:
-                if bias == "LONG" and p_now <= float(inv):
-                    entry_status = "INVALID"
-                elif bias == "SHORT" and p_now >= float(inv):
-                    entry_status = "INVALID"
-
-            if entry_status != "INVALID":
-                in_zone = (min(zlo, zhi) <= p_now <= max(zlo, zhi))
-                entry_status = "READY" if in_zone else "WAIT"
-
-                # "CONFIRMED" only when we're in zone AND confirmations are present
-                try:
-                    sweep_ok = bool(sweep_long) if bias == "LONG" else bool(sweep_short)
-                except Exception:
-                    sweep_ok = False
-                try:
-                    vol_ok = float(vol_rel) >= 1.2
-                except Exception:
-                    vol_ok = False
-                try:
-                    dir_ok = (("↑" in str(brk)) if bias == "LONG" else ("↓" in str(brk)))
-                except Exception:
-                    dir_ok = False
-
-                if entry_status == "READY" and sweep_ok and vol_ok and dir_ok:
-                    entry_status = "CONFIRMED"
-        except Exception:
-            entry_status = "WAIT"
-
-        # Human text via i18n (ru/en)
-        entry_status_label = _tr_i18n(lang, "lbl_entry_status")
-        entry_status_txt = _tr_i18n(lang, f"entry_status_{str(entry_status).lower()}")
-        entry_status_line = f"{entry_status_label}: {entry_status_txt}"
-
-        entry_zone_txt = f"{_fmt_int_space(entry_lo)} – {_fmt_int_space(entry_hi)}"
-        entry_quality_txt = f"Качество зоны (confluence): {entry_confluence}/5"
-        entry_kind_txt = f"Тип зоны: {entry_kind}" if entry_kind and entry_kind != "—" else "Тип зоны: —"
-        entry_notes_txt = ("Основание: " + ", ".join(entry_notes)) if entry_notes else "Основание: —"
-        # RR to TP1/TP2 (institutional: from entry midpoint when available)
-        rr1 = None
-        rr2 = None
-        try:
-            entry_mid = None
-            if entry_lo is not None and entry_hi is not None:
-                entry_mid = (float(entry_lo) + float(entry_hi)) / 2.0
-            base_entry = entry_mid if entry_mid is not None else float(price)
-            risk = max(1e-9, abs(base_entry - float(sl)))
-            rr1 = abs(float(tp1) - base_entry) / risk
-            rr2 = abs(float(tp2) - base_entry) / risk
-        except Exception:
-            pass
-        rr1_txt = _fmt_float(rr1, 2) if rr1 is not None else "—"
-        rr2_txt = _fmt_float(rr2, 2) if rr2 is not None else (_fmt_float(rr, 2) if rr is not None else "—")
-
-        # Institutional metrics (OHLCV-only)
-        conf_inst_txt = None
-        risk_flags_inst = []
-        trade_status_inst = None
-        try:
-            df_vp = df1.tail(240) if (df1 is not None and not df1.empty) else (df4.tail(180) if (df4 is not None and not df4.empty) else None)
-            vp = volume_profile(df_vp, bins=int(os.getenv('ANALYSIS_VP_BINS','72') or 72), value_area=float(os.getenv('ANALYSIS_VP_VALUE_AREA','0.7') or 0.7)) if df_vp is not None else None
-            vb = calc_vwap_bands(df1.tail(240) if (df1 is not None and not df1.empty) else df5.tail(120), stdev_mults=(1.0,2.0))
-            ofp = orderflow_pressure(df5, lookback=int(os.getenv('ANALYSIS_OF_LOOKBACK','36') or 36))
-            whale = whale_activity(df5, lookback=int(os.getenv('ANALYSIS_WHALE_LOOKBACK','180') or 180), z_thr=float(os.getenv('ANALYSIS_WHALE_Z','2.5') or 2.5))
-            liqcls = liquidation_clusters(df5, lookback=int(os.getenv('ANALYSIS_LIQCL_LOOKBACK','180') or 180), topk=int(os.getenv('ANALYSIS_LIQCL_TOPK','2') or 2))
-
-            # Ultimate desk-level extras: session/24h VP (HVN/LVN), voids, sweeps, stop-hunt/trap scores
-            vp_sess = vp_24h = None
-            voids_5m = voids_1h = []
-            sweep_5m = None
-            stop_hunt_p = None
-            trap_score = None
-            try:
-                _bins = int(os.getenv('ANALYSIS_VP_BINS','72') or 72)
-                _va = float(os.getenv('ANALYSIS_VP_VALUE_AREA','0.7') or 0.7)
-
-                # Session VP (approx): last 12h on 5m (144 bars)
-                if df5 is not None and not df5.empty and len(df5) >= 150:
-                    vp_sess = _inst_volume_profile_hvn_lvn(df5.tail(144), bins=_bins, value_area=_va)
-
-                # 24h VP: last 24h on 5m (288 bars) if available, else fallback to 1h last 24 bars
-                if df5 is not None and not df5.empty and len(df5) >= 300:
-                    vp_24h = _inst_volume_profile_hvn_lvn(df5.tail(288), bins=_bins, value_area=_va)
-                elif df1 is not None and not df1.empty and len(df1) >= 60:
-                    vp_24h = _inst_volume_profile_hvn_lvn(df1.tail(24), bins=_bins, value_area=_va)
-
-                # Liquidity voids / imbalance zones
-                voids_5m = _inst_detect_liquidity_voids(df5.tail(400) if (df5 is not None and not df5.empty) else df5, topk=int(os.getenv('ANALYSIS_VOID_TOPK','2') or 2))
-                voids_1h = _inst_detect_liquidity_voids(df1.tail(240) if (df1 is not None and not df1.empty) else df1, topk=int(os.getenv('ANALYSIS_VOID_TOPK','2') or 2))
-
-                # Sweep detection (prefer 5m, fallback 1h)
-                sweep_5m = _inst_detect_sweep(df5 if (df5 is not None and not df5.empty) else df1, eq_hi=eq_hi, eq_lo=eq_lo)
-
-                # Stop-hunt probability & trap score
-                late_trend_flag = bool(str(phase).upper() == "LATE_TREND")
-                whale_score = whale.get("score") if isinstance(whale, dict) else None
-                stop_hunt_p = _inst_stop_hunt_probability(sweep_5m, whale_score=whale_score, ofp=ofp, late_trend=late_trend_flag)
-
-                div_flag = False
-                try:
-                    div_flag = "диверг" in str(div_txt).lower() and ("есть" in str(div_txt).lower() or "обнаруж" in str(div_txt).lower())
-                except Exception:
-                    div_flag = False
-
-                min_rr = float(os.getenv("ANALYSIS_MIN_RR", "1.5") or 1.5)
-                rr_ok = True
-                try:
-                    rr_ok = (rr2 is not None and float(rr2) >= float(min_rr))
-                except Exception:
-                    rr_ok = True
-
-                min_vol = float(os.getenv("ANALYSIS_MIN_VOL_REL", "0.6") or 0.6)
-                weak_vol = False
-                try:
-                    weak_vol = float(vol_rel) < float(min_vol)
-                except Exception:
-                    weak_vol = False
-
-                trap_score = _inst_trap_score(divergence=div_flag, sweep_prob=int(stop_hunt_p or 0), ofp=ofp, rr_ok=rr_ok, weak_volume=weak_vol)
-            except Exception:
-                pass
-
-            score = 50
-            if regime in ('TRENDING','TREND','EXPANSION'):
-                score += 10
-            if trend_strength == 'Высокая':
-                score += 8
-            if struct_lbl == 'HH/HL' and bias == 'LONG':
-                score += 8
-            if struct_lbl == 'LH/LL' and bias == 'SHORT':
-                score += 8
-            try:
-                if float(vol_rel) >= 1.2: score += 8
-                elif float(vol_rel) < 0.6: score -= 10
-            except Exception:
-                pass
-            if ofp:
-                if (bias=='LONG' and ofp['mood']=='BUY') or (bias=='SHORT' and ofp['mood']=='SELL'): score += 6
-                elif ofp['mood']!='NEUTRAL': score -= 6
-            if isinstance(div_txt, str) and 'Медв' in div_txt and bias=='LONG': score -= 8
-            if isinstance(div_txt, str) and 'Быч' in div_txt and bias=='SHORT': score -= 8
-            try:
-                if float(adx_reg_i) >= 35 and isinstance(div_txt, str) and ('диверг' in div_txt.lower()): score -= 4
-            except Exception:
-                pass
-            try:
-                rrq = float(rr2) if rr2 is not None else None
-                if rrq is not None:
-                    if rrq >= 2.0: score += 8
-                    elif rrq >= 1.5: score += 4
-                    elif rrq < 1.0: score -= 10
-            except Exception:
-                pass
-            try:
-                if eq_hi is not None and eq_hi_dist_atr is not None and eq_hi_dist_atr < 2.0: score += 3
-                if eq_lo is not None and eq_lo_dist_atr is not None and eq_lo_dist_atr < 2.0: score += 3
-            except Exception:
-                pass
-            if whale and whale.get('spike'): score -= 3
-
-            score = max(0, min(100, int(round(score))))
-
-            # --- Institutional validation flags (used to align probability/confidence) ---
-            try:
-                MIN_RR = float(os.getenv("ANALYSIS_MIN_RR", "1.5") or 1.5)
-            except Exception:
-                MIN_RR = 1.5
-            try:
-                MIN_VOL_REL = float(os.getenv("ANALYSIS_MIN_VOL_REL", "0.6") or 0.6)
-            except Exception:
-                MIN_VOL_REL = 0.6
-
-            risk_flags_inst = []
-            try:
-                if rr2 is not None and float(rr2) < float(MIN_RR):
-                    risk_flags_inst.append("rr_too_low")
-            except Exception:
-                pass
-            try:
-                if float(vol_rel) < float(MIN_VOL_REL):
-                    risk_flags_inst.append("weak_volume")
-            except Exception:
-                pass
-            try:
-                # Trend exhaustion: high ADX + RSI divergence
-                if float(adx_reg_i) >= 35 and isinstance(div_txt, str) and ("диверг" in div_txt.lower() or "diverg" in div_txt.lower()):
-                    risk_flags_inst.append("trend_exhaustion")
-            except Exception:
-                pass
-
-            # Trade status: skip when key institutional constraints fail
-            trade_status_inst = "NO TRADE" if ("rr_too_low" in risk_flags_inst or "weak_volume" in risk_flags_inst) else "OK"
-
-            # Confidence is driven by institutional score (not by long/short diff)
-            conf_inst_txt = "Высокая" if score >= 75 else ("Средняя" if score >= 60 else "Низкая")
-
-            if bias == 'LONG':
-                long_p = max(5, min(95, int(round(50 + (score-50)*0.9))))
-                short_p = 100 - long_p
-            else:
-                short_p = max(5, min(95, int(round(50 + (score-50)*0.9))))
-                long_p = 100 - short_p
-
-
-            # Probability correction when volume is weak (prevents high % with low confirmation)
-            try:
-                if "weak_volume" in risk_flags_inst:
-                    if bias == "LONG":
-                        long_p = int(round(float(long_p) * 0.70))
-                        short_p = 100 - long_p
-                    else:
-                        short_p = int(round(float(short_p) * 0.70))
-                        long_p = 100 - short_p
-                    long_p = max(1, min(99, int(long_p)))
-                    short_p = 100 - long_p
-            except Exception:
-                pass
-
-            phase = '—'
-            try:
-                adxv = float(adx_reg_i)
-                if adxv < 18: phase = 'ACCUMULATION' if float(vol_rel) < 1.0 else 'RANGE'
-                elif adxv < 28: phase = 'MARKUP' if bias=='LONG' else 'MARKDOWN'
-                else: phase = 'EXPANSION'
-                if isinstance(div_txt, str) and ('диверг' in div_txt.lower()) and adxv >= 30: phase = 'LATE_TREND'
-            except Exception:
-                phase = '—'
-        except Exception:
-            vp = vb = ofp = whale = liqcls = None
-            score = None
-            phase = '—'
-
-        # Bias text
-        bias_txt = _tr_i18n(lang, "analysis_bias_long") if bias == "LONG" else _tr_i18n(lang, "analysis_bias_short")
-        conf_txt = conf_inst_txt if (score is not None and conf_inst_txt) else ("Высокая" if confidence in ("HIGH", "Высокая") else ("Средняя" if confidence in ("MED", "Средняя") else "Низкая"))
-
-        def _loc_conf(v: str) -> str:
-            vv = str(v or "").strip().lower()
-            if vv in ("высокая", "high"):
-                return _tr_i18n(lang, "analysis_conf_high")
-            if vv in ("средняя", "medium", "med"):
-                return _tr_i18n(lang, "analysis_conf_medium")
-            return _tr_i18n(lang, "analysis_conf_low")
-
-        def _loc_trade_status(v: str) -> str:
-            vv = str(v or "").strip().upper()
-            return _tr_i18n(lang, "analysis_trade_status_no_trade") if vv == "NO TRADE" else _tr_i18n(lang, "analysis_trade_status_ok")
-
-        def _clean_key(v: str) -> str:
-            return re.sub(r"\s+", " ", str(v or "").replace("_", " ")).strip()
-
-        def _join_nonempty(items):
-            return ", ".join([str(x) for x in items if str(x or "").strip() and str(x).strip() not in ("—", "-")]) or "—"
-
+        # --- LONG: Demand zones ---
         if bias == "LONG":
-            bullish_lines = [
-                _tr_i18n(lang, "analysis_bullish_hold", support=s1_s, target=r1_s),
-                _tr_i18n(lang, "analysis_bullish_break", level=r1_s, target=r2_s),
-            ]
-            bearish_lines = [
-                _tr_i18n(lang, "analysis_bearish_loss", support=s1_s, target=s2_s),
-            ]
-            primary_scenario = _tr_i18n(lang, "analysis_primary_long")
+            ob_ok = (ob_lo is not None and ob_hi is not None and ("demand" in str(ob_side).lower()))
+            fvg_ok = (fvg_lo is not None and fvg_hi is not None and fvg_active is True and (str(fvg_side).lower().startswith("bull")))
+            ch_ok = (cs is not None and cm is not None and cm > cs)
+
+            # 1) лучший вариант: OB + FVG overlap (узкая зона)
+            if ob_ok and fvg_ok:
+                o_lo, o_hi = _overlap(float(ob_lo), float(ob_hi), float(fvg_lo), float(fvg_hi))
+                if o_lo is not None:
+                    entry_lo, entry_hi = _clamp_zone(o_lo, o_hi)
+                    entry_kind = "OB+FVG"
+                    entry_notes.append("Order Block + FVG")
+                else:
+                    # если не пересекаются — берём OB как базу (он сильнее)
+                    entry_lo, entry_hi = _clamp_zone(float(ob_lo), float(ob_hi))
+                    entry_kind = "OB"
+                    entry_notes.append("Order Block")
+
+            elif ob_ok:
+                entry_lo, entry_hi = _clamp_zone(float(ob_lo), float(ob_hi))
+                entry_kind = "OB"
+                entry_notes.append("Order Block")
+
+            elif fvg_ok:
+                entry_lo, entry_hi = _clamp_zone(float(fvg_lo), float(fvg_hi))
+                entry_kind = "FVG"
+                entry_notes.append("FVG")
+
+            elif ch_ok:
+                # зона от поддержки канала к середине (консервативно)
+                base = cs
+                # если Support1 выше поддержки канала — используем его (лучше)
+                if s1n is not None:
+                    base = max(base, s1n)
+                w = max(w_fallback, (cm - base) * 0.35)
+                entry_lo, entry_hi = _clamp_zone(base, base + w)
+                entry_kind = "CHANNEL"
+                entry_notes.append("Support/Channel")
+
+            # fallback: ATR band (если ничего нет)
+            if entry_lo is None or entry_hi is None or not (entry_hi > entry_lo):
+                entry_lo, entry_hi = _clamp_zone(price - atr_abs * 0.8, price - atr_abs * 0.1)
+                entry_kind = "ATR"
+                entry_notes.append("Fallback ATR")
+
+            # --- confluence scoring (0..5) ---
+            # OB присутствует (сильнейший фактор)
+            if ob_ok and _near((float(ob_lo)+float(ob_hi))/2.0, entry_lo, entry_hi, tol):
+                entry_confluence += 2
+            # FVG рядом/внутри
+            if fvg_ok and _near((float(fvg_lo)+float(fvg_hi))/2.0, entry_lo, entry_hi, tol):
+                entry_confluence += 1
+            # Support канала рядом с низом зоны
+            if cs is not None and abs(cs - entry_lo) <= tol:
+                entry_confluence += 1
+            # Liquidity (Equal Lows) рядом
+            if _near(eq_lo, entry_lo, entry_hi, tol):
+                entry_confluence += 1
+            # Pivot/S1 внутри/рядом
+            try:
+                if _near(float(S1), entry_lo, entry_hi, tol) or _near(float(pivot), entry_lo, entry_hi, tol):
+                    entry_confluence += 1
+            except Exception:
+                pass
+            entry_confluence = min(5, max(0, int(entry_confluence)))
+
+            # --- Trigger & Invalidation for LONG ---
+            # Обязательное подтверждение: Liquidity sweep снизу (Equal Lows) + возврат выше уровня
+            entry_sweep_txt = ("Liquidity sweep (5м): " if is_ru else "Liquidity sweep (5m): ") + (("Да" if sweep_long else "Нет") if is_ru else ("Yes" if sweep_long else "No"))
+            trig_parts = []
+            trig_parts.append("Liquidity sweep снизу (Equal Lows) + reclaim" if is_ru else "Liquidity sweep below (Equal Lows) + reclaim")
+            trig_parts.append("BOS 5м вверх (закрытие выше локального swing-high)" if is_ru else "5m BOS up (close above local swing high)")
+            trig_parts.append((f"reclaim зоны (закрытие 5м выше {_fmt_int_space(entry_hi)})" if is_ru else f"zone reclaim (5m close above {_fmt_int_space(entry_hi)})"))
+            trig_parts.append("объём > 1.2x" if is_ru else "volume > 1.2x")
+            if not sweep_long:
+                entry_trigger_txt = (("Триггер входа: СНАЧАЛА " + trig_parts[0] + " (сейчас: Нет), затем " + " + ".join(trig_parts[1:])) if is_ru else ("Entry trigger: FIRST " + trig_parts[0] + " (now: No), then " + " + ".join(trig_parts[1:])))
+            else:
+                entry_trigger_txt = (("Триггер входа: " + " + ".join(trig_parts)) if is_ru else ("Entry trigger: " + " + ".join(trig_parts)))
+
+            inv_lvl = max(0.0, entry_lo - max(atr_abs * 0.15, price * 0.0008))
+            inv_lvl_out = float(inv_lvl)
+            entry_inval_txt = (f"Инвалидация: закрепление 5м ниже {_fmt_int_space(inv_lvl)}" if is_ru else f"Invalidation: 5m close below {_fmt_int_space(inv_lvl)}")
+
+            # Подгоняем SL под инвалидацию (SL должен быть ниже инвалидации)
+            try:
+                sl = min(float(sl), inv_lvl)
+            except Exception:
+                pass
+
+        # --- SHORT: Supply zones ---
         else:
-            bullish_lines = [
-                _tr_i18n(lang, "analysis_bullish_hold", support=s1_s, target=r1_s),
-                _tr_i18n(lang, "analysis_bullish_break", level=r1_s, target=r2_s),
-            ]
-            bearish_lines = [
-                _tr_i18n(lang, "analysis_bearish_loss", support=s1_s, target=s2_s),
-            ]
-            primary_scenario = _tr_i18n(lang, "analysis_primary_short")
+            ob_ok = (ob_lo is not None and ob_hi is not None and ("supply" in str(ob_side).lower()))
+            fvg_ok = (fvg_lo is not None and fvg_hi is not None and fvg_active is True and (str(fvg_side).lower().startswith("bear")))
+            ch_ok = (cr is not None and cm is not None and cr > cm)
 
-        resistance_txt = f"{r1_s} / {r2_s}"
-        support_txt = f"{s1_s} / {s2_s}"
-        channel_txt = f"{chan_s_s} — {chan_r_s}" if chan_s_s not in ("—", "-") and chan_r_s not in ("—", "-") else "—"
-        liq_eqh_txt = eq_hi_line.replace("Equal Highs: ", "").replace("EQH: ", "") if isinstance(eq_hi_line, str) else "—"
-        liq_magnet_txt = magnet_txt.replace("Magnet: ", "") if isinstance(magnet_txt, str) else "—"
-        ob_txt = (f"{_fmt_int_space(ob_lo)} – {_fmt_int_space(ob_hi)}" if (ob_lo is not None and ob_hi is not None) else "—")
-        bos_txt = _tr_i18n(lang, "analysis_bos_bull") if (isinstance(smc_event, str) and "bos" in smc_event.lower() and ("вверх" in smc_event.lower() or "↑" in smc_event)) else (_tr_i18n(lang, "analysis_bos_bear") if (isinstance(smc_event, str) and "bos" in smc_event.lower()) else "—")
-        fvg_short_txt = (f"{_fmt_int_space(fvg_lo)} – {_fmt_int_space(fvg_hi)}" + (f" ({_tr_i18n(lang, 'analysis_active')})" if fvg_active else "")) if (fvg_lo is not None and fvg_hi is not None) else "—"
+            if ob_ok and fvg_ok:
+                o_lo, o_hi = _overlap(float(ob_lo), float(ob_hi), float(fvg_lo), float(fvg_hi))
+                if o_lo is not None:
+                    entry_lo, entry_hi = _clamp_zone(o_lo, o_hi)
+                    entry_kind = "OB+FVG"
+                    entry_notes.append("Order Block + FVG")
+                else:
+                    entry_lo, entry_hi = _clamp_zone(float(ob_lo), float(ob_hi))
+                    entry_kind = "OB"
+                    entry_notes.append("Order Block")
 
-        risk_flags_txt = _join_nonempty([_tr_i18n(lang, f"analysis_risk_flag_{_clean_key(x).replace(' ', '_')}") if _clean_key(x).replace(' ', '_') in {
-            'rr_too_low','weak_volume','trend_exhaustion'
-        } else _clean_key(x) for x in (risk_flags_inst or [])])
+            elif ob_ok:
+                entry_lo, entry_hi = _clamp_zone(float(ob_lo), float(ob_hi))
+                entry_kind = "OB"
+                entry_notes.append("Order Block")
 
-        ob_state = _tr_i18n(lang, "analysis_conclusion_ob_present") if ob_txt not in ("—", "-") else _tr_i18n(lang, "analysis_conclusion_ob_absent")
-        fvg_state = _tr_i18n(lang, "analysis_conclusion_fvg_active") if (fvg_lo is not None and fvg_hi is not None and fvg_active) else (_tr_i18n(lang, "analysis_conclusion_fvg_present") if (fvg_lo is not None and fvg_hi is not None) else _tr_i18n(lang, "analysis_conclusion_fvg_absent"))
-        concl = [
-            _tr_i18n(lang, "analysis_conclusion_market_phase", phase=str(phase or "—"), regime=str(regime or "—")),
-            _tr_i18n(lang, "analysis_conclusion_structure", structure=str(struct_lbl or "—"), bias=str(bias_txt or "—")),
-            _tr_i18n(lang, "analysis_conclusion_ob", status=ob_state),
-            _tr_i18n(lang, "analysis_conclusion_fvg", status=fvg_state),
+            elif fvg_ok:
+                entry_lo, entry_hi = _clamp_zone(float(fvg_lo), float(fvg_hi))
+                entry_kind = "FVG"
+                entry_notes.append("FVG")
+
+            elif ch_ok:
+                top = cr
+                if r1n is not None:
+                    top = min(top, r1n)
+                w = max(w_fallback, (top - cm) * 0.35)
+                entry_lo, entry_hi = _clamp_zone(top - w, top)
+                entry_kind = "CHANNEL"
+                entry_notes.append("Resistance/Channel")
+
+            if entry_lo is None or entry_hi is None or not (entry_hi > entry_lo):
+                entry_lo, entry_hi = _clamp_zone(price + atr_abs * 0.1, price + atr_abs * 0.8)
+                entry_kind = "ATR"
+                entry_notes.append("Fallback ATR")
+
+            # confluence scoring
+            if ob_ok and _near((float(ob_lo)+float(ob_hi))/2.0, entry_lo, entry_hi, tol):
+                entry_confluence += 2
+            if fvg_ok and _near((float(fvg_lo)+float(fvg_hi))/2.0, entry_lo, entry_hi, tol):
+                entry_confluence += 1
+            if cr is not None and abs(cr - entry_hi) <= tol:
+                entry_confluence += 1
+            if _near(eq_hi, entry_lo, entry_hi, tol):
+                entry_confluence += 1
+            try:
+                if _near(float(R1), entry_lo, entry_hi, tol) or _near(float(pivot), entry_lo, entry_hi, tol):
+                    entry_confluence += 1
+            except Exception:
+                pass
+            entry_confluence = min(5, max(0, int(entry_confluence)))
+
+            entry_sweep_txt = ("Liquidity sweep (5м): " if is_ru else "Liquidity sweep (5m): ") + (("Да" if sweep_short else "Нет") if is_ru else ("Yes" if sweep_short else "No"))
+            trig_parts = []
+            trig_parts.append("Liquidity sweep сверху (Equal Highs) + reject" if is_ru else "Liquidity sweep above (Equal Highs) + reject")
+            trig_parts.append("BOS 5м вниз (закрытие ниже локального swing-low)" if is_ru else "5m BOS down (close below local swing low)")
+            trig_parts.append((f"reject зоны (закрытие 5м ниже {_fmt_int_space(entry_lo)})" if is_ru else f"zone reject (5m close below {_fmt_int_space(entry_lo)})"))
+            trig_parts.append("объём > 1.2x" if is_ru else "volume > 1.2x")
+            if not sweep_short:
+                entry_trigger_txt = (("Триггер входа: СНАЧАЛА " + trig_parts[0] + " (сейчас: Нет), затем " + " + ".join(trig_parts[1:])) if is_ru else ("Entry trigger: FIRST " + trig_parts[0] + " (now: No), then " + " + ".join(trig_parts[1:])))
+            else:
+                entry_trigger_txt = (("Триггер входа: " + " + ".join(trig_parts)) if is_ru else ("Entry trigger: " + " + ".join(trig_parts)))
+
+            inv_lvl = entry_hi + max(atr_abs * 0.15, price * 0.0008)
+            inv_lvl_out = float(inv_lvl)
+            entry_inval_txt = (f"Инвалидация: закрепление 5м выше {_fmt_int_space(inv_lvl)}" if is_ru else f"Invalidation: 5m close above {_fmt_int_space(inv_lvl)}")
+
+            try:
+                sl = max(float(sl), inv_lvl)
+            except Exception:
+                pass
+
+    except Exception:
+        inv_lvl_out = None
+        entry_lo, entry_hi = price, price
+        entry_kind = "—"
+        entry_confluence = 0
+        entry_notes = []
+        entry_sweep_txt = "Liquidity sweep (5м): —" if is_ru else "Liquidity sweep (5m): —"
+        entry_trigger_txt = "Триггер входа: —" if is_ru else "Entry trigger: —"
+        entry_inval_txt = "Инвалидация: —" if is_ru else "Invalidation: —"
+
+    # ---- Entry status (READY / WAIT / CONFIRMED / INVALID) ----
+    entry_status = "WAIT"
+    try:
+        p_now = float(price)
+        zlo = float(entry_lo)
+        zhi = float(entry_hi)
+        inv = inv_lvl_out if (inv_lvl_out is not None) else None
+
+        # invalidation check first
+        if inv is not None:
+            if bias == "LONG" and p_now <= float(inv):
+                entry_status = "INVALID"
+            elif bias == "SHORT" and p_now >= float(inv):
+                entry_status = "INVALID"
+
+        if entry_status != "INVALID":
+            in_zone = (min(zlo, zhi) <= p_now <= max(zlo, zhi))
+            entry_status = "READY" if in_zone else "WAIT"
+
+            # "CONFIRMED" only when we're in zone AND confirmations are present
+            try:
+                sweep_ok = bool(sweep_long) if bias == "LONG" else bool(sweep_short)
+            except Exception:
+                sweep_ok = False
+            try:
+                vol_ok = float(vol_rel) >= 1.2
+            except Exception:
+                vol_ok = False
+            try:
+                dir_ok = (("↑" in str(brk)) if bias == "LONG" else ("↓" in str(brk)))
+            except Exception:
+                dir_ok = False
+
+            if entry_status == "READY" and sweep_ok and vol_ok and dir_ok:
+                entry_status = "CONFIRMED"
+    except Exception:
+        entry_status = "WAIT"
+
+    # Human text via i18n (ru/en)
+    entry_status_label = _tr_i18n(lang, "lbl_entry_status")
+    entry_status_txt = _tr_i18n(lang, f"entry_status_{str(entry_status).lower()}")
+    entry_status_line = f"{entry_status_label}: {entry_status_txt}"
+
+    entry_zone_txt = f"{_fmt_int_space(entry_lo)} – {_fmt_int_space(entry_hi)}"
+    entry_quality_txt = f"Качество зоны (confluence): {entry_confluence}/5"
+    entry_kind_txt = f"Тип зоны: {entry_kind}" if entry_kind and entry_kind != "—" else "Тип зоны: —"
+    entry_notes_txt = ("Основание: " + ", ".join(entry_notes)) if entry_notes else "Основание: —"
+    # RR to TP1/TP2 (institutional: from entry midpoint when available)
+    rr1 = None
+    rr2 = None
+    try:
+        entry_mid = None
+        if entry_lo is not None and entry_hi is not None:
+            entry_mid = (float(entry_lo) + float(entry_hi)) / 2.0
+        base_entry = entry_mid if entry_mid is not None else float(price)
+        risk = max(1e-9, abs(base_entry - float(sl)))
+        rr1 = abs(float(tp1) - base_entry) / risk
+        rr2 = abs(float(tp2) - base_entry) / risk
+    except Exception:
+        pass
+    rr1_txt = _fmt_float(rr1, 2) if rr1 is not None else "—"
+    rr2_txt = _fmt_float(rr2, 2) if rr2 is not None else (_fmt_float(rr, 2) if rr is not None else "—")
+
+    # Institutional metrics (OHLCV-only)
+    conf_inst_txt = None
+    risk_flags_inst = []
+    trade_status_inst = None
+    try:
+        df_vp = df1.tail(240) if (df1 is not None and not df1.empty) else (df4.tail(180) if (df4 is not None and not df4.empty) else None)
+        vp = volume_profile(df_vp, bins=int(os.getenv('ANALYSIS_VP_BINS','72') or 72), value_area=float(os.getenv('ANALYSIS_VP_VALUE_AREA','0.7') or 0.7)) if df_vp is not None else None
+        vb = calc_vwap_bands(df1.tail(240) if (df1 is not None and not df1.empty) else df5.tail(120), stdev_mults=(1.0,2.0))
+        ofp = orderflow_pressure(df5, lookback=int(os.getenv('ANALYSIS_OF_LOOKBACK','36') or 36))
+        whale = whale_activity(df5, lookback=int(os.getenv('ANALYSIS_WHALE_LOOKBACK','180') or 180), z_thr=float(os.getenv('ANALYSIS_WHALE_Z','2.5') or 2.5))
+        liqcls = liquidation_clusters(df5, lookback=int(os.getenv('ANALYSIS_LIQCL_LOOKBACK','180') or 180), topk=int(os.getenv('ANALYSIS_LIQCL_TOPK','2') or 2))
+
+        # Ultimate desk-level extras: session/24h VP (HVN/LVN), voids, sweeps, stop-hunt/trap scores
+        vp_sess = vp_24h = None
+        voids_5m = voids_1h = []
+        sweep_5m = None
+        stop_hunt_p = None
+        trap_score = None
+        try:
+            _bins = int(os.getenv('ANALYSIS_VP_BINS','72') or 72)
+            _va = float(os.getenv('ANALYSIS_VP_VALUE_AREA','0.7') or 0.7)
+
+            # Session VP (approx): last 12h on 5m (144 bars)
+            if df5 is not None and not df5.empty and len(df5) >= 150:
+                vp_sess = _inst_volume_profile_hvn_lvn(df5.tail(144), bins=_bins, value_area=_va)
+
+            # 24h VP: last 24h on 5m (288 bars) if available, else fallback to 1h last 24 bars
+            if df5 is not None and not df5.empty and len(df5) >= 300:
+                vp_24h = _inst_volume_profile_hvn_lvn(df5.tail(288), bins=_bins, value_area=_va)
+            elif df1 is not None and not df1.empty and len(df1) >= 60:
+                vp_24h = _inst_volume_profile_hvn_lvn(df1.tail(24), bins=_bins, value_area=_va)
+
+            # Liquidity voids / imbalance zones
+            voids_5m = _inst_detect_liquidity_voids(df5.tail(400) if (df5 is not None and not df5.empty) else df5, topk=int(os.getenv('ANALYSIS_VOID_TOPK','2') or 2))
+            voids_1h = _inst_detect_liquidity_voids(df1.tail(240) if (df1 is not None and not df1.empty) else df1, topk=int(os.getenv('ANALYSIS_VOID_TOPK','2') or 2))
+
+            # Sweep detection (prefer 5m, fallback 1h)
+            sweep_5m = _inst_detect_sweep(df5 if (df5 is not None and not df5.empty) else df1, eq_hi=eq_hi, eq_lo=eq_lo)
+
+            # Stop-hunt probability & trap score
+            late_trend_flag = bool(str(phase).upper() == "LATE_TREND")
+            whale_score = whale.get("score") if isinstance(whale, dict) else None
+            stop_hunt_p = _inst_stop_hunt_probability(sweep_5m, whale_score=whale_score, ofp=ofp, late_trend=late_trend_flag)
+
+            div_flag = False
+            try:
+                _div_l = str(div_txt).lower()
+                div_flag = (("диверг" in _div_l) or ("diverg" in _div_l)) and any(tok in _div_l for tok in ("есть", "обнаруж", "found", "present", "detected"))
+            except Exception:
+                div_flag = False
+
+            min_rr = float(os.getenv("ANALYSIS_MIN_RR", "1.5") or 1.5)
+            rr_ok = True
+            try:
+                rr_ok = (rr2 is not None and float(rr2) >= float(min_rr))
+            except Exception:
+                rr_ok = True
+
+            min_vol = float(os.getenv("ANALYSIS_MIN_VOL_REL", "0.6") or 0.6)
+            weak_vol = False
+            try:
+                weak_vol = float(vol_rel) < float(min_vol)
+            except Exception:
+                weak_vol = False
+
+            trap_score = _inst_trap_score(divergence=div_flag, sweep_prob=int(stop_hunt_p or 0), ofp=ofp, rr_ok=rr_ok, weak_volume=weak_vol)
+        except Exception:
+            pass
+
+        score = 50
+        if regime in ('TRENDING','TREND','EXPANSION'):
+            score += 10
+        if trend_strength == 'high':
+            score += 8
+        if struct_lbl == 'HH/HL' and bias == 'LONG':
+            score += 8
+        if struct_lbl == 'LH/LL' and bias == 'SHORT':
+            score += 8
+        try:
+            if float(vol_rel) >= 1.2: score += 8
+            elif float(vol_rel) < 0.6: score -= 10
+        except Exception:
+            pass
+        if ofp:
+            if (bias=='LONG' and ofp['mood']=='BUY') or (bias=='SHORT' and ofp['mood']=='SELL'): score += 6
+            elif ofp['mood']!='NEUTRAL': score -= 6
+        if isinstance(div_txt, str) and any(tok in div_txt.lower() for tok in ('медв', 'bear')) and bias=='LONG': score -= 8
+        if isinstance(div_txt, str) and any(tok in div_txt.lower() for tok in ('быч', 'bull')) and bias=='SHORT': score -= 8
+        try:
+            if float(adx_reg_i) >= 35 and isinstance(div_txt, str) and any(tok in div_txt.lower() for tok in ('диверг', 'diverg')): score -= 4
+        except Exception:
+            pass
+        try:
+            rrq = float(rr2) if rr2 is not None else None
+            if rrq is not None:
+                if rrq >= 2.0: score += 8
+                elif rrq >= 1.5: score += 4
+                elif rrq < 1.0: score -= 10
+        except Exception:
+            pass
+        try:
+            if eq_hi is not None and eq_hi_dist_atr is not None and eq_hi_dist_atr < 2.0: score += 3
+            if eq_lo is not None and eq_lo_dist_atr is not None and eq_lo_dist_atr < 2.0: score += 3
+        except Exception:
+            pass
+        if whale and whale.get('spike'): score -= 3
+
+        score = max(0, min(100, int(round(score))))
+
+        # --- Institutional validation flags (used to align probability/confidence) ---
+        try:
+            MIN_RR = float(os.getenv("ANALYSIS_MIN_RR", "1.5") or 1.5)
+        except Exception:
+            MIN_RR = 1.5
+        try:
+            MIN_VOL_REL = float(os.getenv("ANALYSIS_MIN_VOL_REL", "0.6") or 0.6)
+        except Exception:
+            MIN_VOL_REL = 0.6
+
+        risk_flags_inst = []
+        try:
+            if rr2 is not None and float(rr2) < float(MIN_RR):
+                risk_flags_inst.append("rr_too_low")
+        except Exception:
+            pass
+        try:
+            if float(vol_rel) < float(MIN_VOL_REL):
+                risk_flags_inst.append("weak_volume")
+        except Exception:
+            pass
+        try:
+            # Trend exhaustion: high ADX + RSI divergence
+            if float(adx_reg_i) >= 35 and isinstance(div_txt, str) and ("диверг" in div_txt.lower() or "diverg" in div_txt.lower()):
+                risk_flags_inst.append("trend_exhaustion")
+        except Exception:
+            pass
+
+        # Trade status: skip when key institutional constraints fail
+        trade_status_inst = "NO TRADE" if ("rr_too_low" in risk_flags_inst or "weak_volume" in risk_flags_inst) else "OK"
+
+        # Confidence is driven by institutional score (not by long/short diff)
+        conf_inst_txt = (("Высокая" if score >= 75 else ("Средняя" if score >= 60 else "Низкая")) if is_ru else ("High" if score >= 75 else ("Medium" if score >= 60 else "Low")))
+
+        if bias == 'LONG':
+            long_p = max(5, min(95, int(round(50 + (score-50)*0.9))))
+            short_p = 100 - long_p
+        else:
+            short_p = max(5, min(95, int(round(50 + (score-50)*0.9))))
+            long_p = 100 - short_p
+
+
+        # Probability correction when volume is weak (prevents high % with low confirmation)
+        try:
+            if "weak_volume" in risk_flags_inst:
+                if bias == "LONG":
+                    long_p = int(round(float(long_p) * 0.70))
+                    short_p = 100 - long_p
+                else:
+                    short_p = int(round(float(short_p) * 0.70))
+                    long_p = 100 - short_p
+                long_p = max(1, min(99, int(long_p)))
+                short_p = 100 - long_p
+        except Exception:
+            pass
+
+        phase = '—'
+        try:
+            adxv = float(adx_reg_i)
+            if adxv < 18: phase = 'ACCUMULATION' if float(vol_rel) < 1.0 else 'RANGE'
+            elif adxv < 28: phase = 'MARKUP' if bias=='LONG' else 'MARKDOWN'
+            else: phase = 'EXPANSION'
+            if isinstance(div_txt, str) and any(tok in div_txt.lower() for tok in ('диверг', 'diverg')) and adxv >= 30: phase = 'LATE_TREND'
+        except Exception:
+            phase = '—'
+    except Exception:
+        vp = vb = ofp = whale = liqcls = None
+        score = None
+        phase = '—'
+
+    # Bias text
+    bias_txt = _tr_i18n(lang, "analysis_bias_long") if bias == "LONG" else _tr_i18n(lang, "analysis_bias_short")
+    conf_txt = conf_inst_txt if (score is not None and conf_inst_txt) else (("Высокая" if confidence in ("HIGH", "Высокая") else ("Средняя" if confidence in ("MED", "Средняя") else "Низкая")) if is_ru else ("High" if confidence in ("HIGH", "Высокая") else ("Medium" if confidence in ("MED", "Средняя") else "Low")))
+
+    def _loc_conf(v: str) -> str:
+        vv = str(v or "").strip().lower()
+        if vv in ("высокая", "high"):
+            return _tr_i18n(lang, "analysis_conf_high")
+        if vv in ("средняя", "medium", "med"):
+            return _tr_i18n(lang, "analysis_conf_medium")
+        return _tr_i18n(lang, "analysis_conf_low")
+
+    def _loc_trade_status(v: str) -> str:
+        vv = str(v or "").strip().upper()
+        return _tr_i18n(lang, "analysis_trade_status_no_trade") if vv == "NO TRADE" else _tr_i18n(lang, "analysis_trade_status_ok")
+
+    def _clean_key(v: str) -> str:
+        return re.sub(r"\s+", " ", str(v or "").replace("_", " ")).strip()
+
+    def _join_nonempty(items):
+        return ", ".join([str(x) for x in items if str(x or "").strip() and str(x).strip() not in ("—", "-")]) or "—"
+
+    if bias == "LONG":
+        bullish_lines = [
+            _tr_i18n(lang, "analysis_bullish_hold", support=s1_s, target=r1_s),
+            _tr_i18n(lang, "analysis_bullish_break", level=r1_s, target=r2_s),
         ]
-
-        report_lines = [
-            _tr_i18n(lang, "analysis_header", symbol=sym, market=(mkt_ru if lang.startswith('ru') else mkt)),
-            _tr_i18n(lang, "analysis_price_line", price=price_s),
-            "",
-            line,
-            _tr_i18n(lang, "analysis_section_structure"),
-            "",
-            _tr_i18n(lang, "analysis_tf_4h", value=trend4),
-            _tr_i18n(lang, "analysis_tf_1h", value=trend1),
-            _tr_i18n(lang, "analysis_tf_5m", value=trend5),
-            _tr_i18n(lang, "analysis_structure_line", value=struct_lbl),
-            _tr_i18n(lang, "analysis_regime_line", regime=regime, adx=adx_reg_i),
-            "",
-            line,
-            _tr_i18n(lang, "analysis_section_momentum_volume"),
-            "",
-            _tr_i18n(lang, "analysis_rsi_line", value=rsi_i, mood=rsi_mood),
-            _tr_i18n(lang, "analysis_macd_line", value=macd_mood),
-            _tr_i18n(lang, "analysis_ema20_line", value=slope_txt),
-            _tr_i18n(lang, "analysis_volume_line", value=vol_rel_txt),
-            "",
-            line,
-            _tr_i18n(lang, "analysis_section_levels"),
-            "",
-            _tr_i18n(lang, "analysis_resistance_line", value=resistance_txt),
-            _tr_i18n(lang, "analysis_support_line", value=support_txt),
-            _tr_i18n(lang, "analysis_pivot_line", value=piv_s),
-            _tr_i18n(lang, "analysis_channel_line", value=channel_txt),
-            "",
-            line,
-            _tr_i18n(lang, "analysis_section_liquidity"),
-            "",
-            _tr_i18n(lang, "analysis_eqh_line", value=liq_eqh_txt),
-            _tr_i18n(lang, "analysis_magnet_line", value=liq_magnet_txt),
-            _tr_i18n(lang, "analysis_sweep_line", value=("да" if lang.startswith('ru') else "yes") if (sweep_long or sweep_short) else ("нет" if lang.startswith('ru') else "no")),
-            "",
-            line,
-            _tr_i18n(lang, "analysis_section_smc"),
-            "",
-            _tr_i18n(lang, "analysis_ob_line", value=ob_txt),
-            _tr_i18n(lang, "analysis_bos_line", value=bos_txt),
-            _tr_i18n(lang, "analysis_fvg_line", value=fvg_short_txt),
-            "",
-            line,
-            _tr_i18n(lang, "analysis_section_institutional"),
-            "",
-            _tr_i18n(lang, "analysis_market_phase_line", value=phase),
-            _tr_i18n(lang, "analysis_inst_score_line", value=(f"{score}/100" if score is not None else "—")),
-            _tr_i18n(lang, "analysis_orderflow_line", value=(f"{ofp['mood']} | {ofp['index']}/100" if ofp else "—")),
-            _tr_i18n(lang, "analysis_vwap_line", value=(f"{_fmt_int_space(vb['vwap'])} | ±1σ: {_fmt_int_space(vb['bands']['-1.0'])} – {_fmt_int_space(vb['bands']['+1.0'])}" if vb else "—")),
-            _tr_i18n(lang, "analysis_session_vp_line", value=(f"POC { _fmt_int_space(vp_sess['poc']) } | VAH { _fmt_int_space(vp_sess['vah']) } | VAL { _fmt_int_space(vp_sess['val']) }" if vp_sess else "—")),
-            _tr_i18n(lang, "analysis_voids_line", value=(("5m: " + "; ".join([f"{z['side']} {_fmt_int_space(z['lo'])}–{_fmt_int_space(z['hi'])}" for z in voids_5m])) if voids_5m else "—")),
-            "",
-            line,
-            _tr_i18n(lang, "analysis_section_probability"),
-            "",
-            _tr_i18n(lang, "analysis_long_prob_line", value=f"{long_p}%"),
-            _tr_i18n(lang, "analysis_short_prob_line", value=f"{short_p}%"),
-            _tr_i18n(lang, "analysis_priority_line", value=bias_txt),
-            _tr_i18n(lang, "analysis_confidence_line", value=_loc_conf(conf_txt)),
-            "",
-            line,
-            _tr_i18n(lang, "analysis_section_scenarios"),
-            "",
-            _tr_i18n(lang, "analysis_bullish_title"),
-            *bullish_lines,
-            "",
-            _tr_i18n(lang, "analysis_bearish_title"),
-            *bearish_lines,
-            "",
-            line,
-            _tr_i18n(lang, "analysis_section_trade_plan"),
-            "",
-            _tr_i18n(lang, "analysis_trade_status_line", value=_loc_trade_status(trade_status_inst if trade_status_inst else '—')),
-            _tr_i18n(lang, "analysis_entry_line", value=entry_zone_txt),
-            _tr_i18n(lang, "analysis_trigger_title"),
-            str(entry_trigger_txt),
-            _tr_i18n(lang, "analysis_invalidation_title"),
-            str(entry_inval_txt),
-            "",
-            _tr_i18n(lang, "analysis_sl_line", value=sl_s),
-            _tr_i18n(lang, "analysis_tp1_line", value=f"{tp1_s} ({_tr_i18n(lang, 'analysis_rr_short', value=rr1_txt)})"),
-            _tr_i18n(lang, "analysis_tp2_line", value=f"{tp2_s} ({_tr_i18n(lang, 'analysis_rr_short', value=rr2_txt)})"),
-            "",
-            line,
-            _tr_i18n(lang, "analysis_section_conclusion"),
-            "",
-            *concl,
-            "",
-            _tr_i18n(lang, "analysis_primary_line", value=primary_scenario),
-            _tr_i18n(lang, "analysis_preference_line", value=bias),
+        bearish_lines = [
+            _tr_i18n(lang, "analysis_bearish_loss", support=s1_s, target=s2_s),
         ]
+        primary_scenario = _tr_i18n(lang, "analysis_primary_long")
+    else:
+        bullish_lines = [
+            _tr_i18n(lang, "analysis_bullish_hold", support=s1_s, target=r1_s),
+            _tr_i18n(lang, "analysis_bullish_break", level=r1_s, target=r2_s),
+        ]
+        bearish_lines = [
+            _tr_i18n(lang, "analysis_bearish_loss", support=s1_s, target=s2_s),
+        ]
+        primary_scenario = _tr_i18n(lang, "analysis_primary_short")
+
+    resistance_txt = f"{r1_s} / {r2_s}"
+    support_txt = f"{s1_s} / {s2_s}"
+    channel_txt = f"{chan_s_s} — {chan_r_s}" if chan_s_s not in ("—", "-") and chan_r_s not in ("—", "-") else "—"
+    liq_eqh_txt = eq_hi_line.replace("Equal Highs: ", "").replace("EQH: ", "") if isinstance(eq_hi_line, str) else "—"
+    liq_magnet_txt = magnet_txt.replace("Magnet: ", "") if isinstance(magnet_txt, str) else "—"
+    ob_txt = (f"{_fmt_int_space(ob_lo)} – {_fmt_int_space(ob_hi)}" if (ob_lo is not None and ob_hi is not None) else "—")
+    bos_txt = _tr_i18n(lang, "analysis_bos_bull") if (isinstance(smc_event, str) and "bos" in smc_event.lower() and ("вверх" in smc_event.lower() or "↑" in smc_event)) else (_tr_i18n(lang, "analysis_bos_bear") if (isinstance(smc_event, str) and "bos" in smc_event.lower()) else "—")
+    fvg_short_txt = (f"{_fmt_int_space(fvg_lo)} – {_fmt_int_space(fvg_hi)}" + (f" ({_tr_i18n(lang, 'analysis_active')})" if fvg_active else "")) if (fvg_lo is not None and fvg_hi is not None) else "—"
+
+    risk_flags_txt = _join_nonempty([_tr_i18n(lang, f"analysis_risk_flag_{_clean_key(x).replace(' ', '_')}") if _clean_key(x).replace(' ', '_') in {
+        'rr_too_low','weak_volume','trend_exhaustion'
+    } else _clean_key(x) for x in (risk_flags_inst or [])])
+
+    ob_state = _tr_i18n(lang, "analysis_conclusion_ob_present") if ob_txt not in ("—", "-") else _tr_i18n(lang, "analysis_conclusion_ob_absent")
+    fvg_state = _tr_i18n(lang, "analysis_conclusion_fvg_active") if (fvg_lo is not None and fvg_hi is not None and fvg_active) else (_tr_i18n(lang, "analysis_conclusion_fvg_present") if (fvg_lo is not None and fvg_hi is not None) else _tr_i18n(lang, "analysis_conclusion_fvg_absent"))
+    concl = [
+        _tr_i18n(lang, "analysis_conclusion_market_phase", phase=str(phase or "—"), regime=str(regime or "—")),
+        _tr_i18n(lang, "analysis_conclusion_structure", structure=str(struct_lbl or "—"), bias=str(bias_txt or "—")),
+        _tr_i18n(lang, "analysis_conclusion_ob", status=ob_state),
+        _tr_i18n(lang, "analysis_conclusion_fvg", status=fvg_state),
+    ]
+
+    report_lines = [
+        _tr_i18n(lang, "analysis_header", symbol=sym, market=mkt_label),
+        _tr_i18n(lang, "analysis_price_line", price=price_s),
+        "",
+        line,
+        _tr_i18n(lang, "analysis_section_structure"),
+        "",
+        _tr_i18n(lang, "analysis_tf_4h", value=trend4),
+        _tr_i18n(lang, "analysis_tf_1h", value=trend1),
+        _tr_i18n(lang, "analysis_tf_5m", value=trend5),
+        _tr_i18n(lang, "analysis_structure_line", value=struct_lbl),
+        _tr_i18n(lang, "analysis_regime_line", regime=regime, adx=adx_reg_i),
+        "",
+        line,
+        _tr_i18n(lang, "analysis_section_momentum_volume"),
+        "",
+        _tr_i18n(lang, "analysis_rsi_line", value=rsi_i, mood=rsi_mood),
+        _tr_i18n(lang, "analysis_macd_line", value=macd_mood),
+        _tr_i18n(lang, "analysis_ema20_line", value=slope_txt),
+        _tr_i18n(lang, "analysis_volume_line", value=vol_rel_txt),
+        "",
+        line,
+        _tr_i18n(lang, "analysis_section_levels"),
+        "",
+        _tr_i18n(lang, "analysis_resistance_line", value=resistance_txt),
+        _tr_i18n(lang, "analysis_support_line", value=support_txt),
+        _tr_i18n(lang, "analysis_pivot_line", value=piv_s),
+        _tr_i18n(lang, "analysis_channel_line", value=channel_txt),
+        "",
+        line,
+        _tr_i18n(lang, "analysis_section_liquidity"),
+        "",
+        _tr_i18n(lang, "analysis_eqh_line", value=liq_eqh_txt),
+        _tr_i18n(lang, "analysis_magnet_line", value=liq_magnet_txt),
+        _tr_i18n(lang, "analysis_sweep_line", value=("да" if lang.startswith('ru') else "yes") if (sweep_long or sweep_short) else ("нет" if lang.startswith('ru') else "no")),
+        "",
+        line,
+        _tr_i18n(lang, "analysis_section_smc"),
+        "",
+        _tr_i18n(lang, "analysis_ob_line", value=ob_txt),
+        _tr_i18n(lang, "analysis_bos_line", value=bos_txt),
+        _tr_i18n(lang, "analysis_fvg_line", value=fvg_short_txt),
+        "",
+        line,
+        _tr_i18n(lang, "analysis_section_institutional"),
+        "",
+        _tr_i18n(lang, "analysis_market_phase_line", value=phase),
+        _tr_i18n(lang, "analysis_inst_score_line", value=(f"{score}/100" if score is not None else "—")),
+        _tr_i18n(lang, "analysis_orderflow_line", value=(f"{ofp['mood']} | {ofp['index']}/100" if ofp else "—")),
+        _tr_i18n(lang, "analysis_vwap_line", value=(f"{_fmt_int_space(vb['vwap'])} | ±1σ: {_fmt_int_space(vb['bands']['-1.0'])} – {_fmt_int_space(vb['bands']['+1.0'])}" if vb else "—")),
+        _tr_i18n(lang, "analysis_session_vp_line", value=(f"POC { _fmt_int_space(vp_sess['poc']) } | VAH { _fmt_int_space(vp_sess['vah']) } | VAL { _fmt_int_space(vp_sess['val']) }" if vp_sess else "—")),
+        _tr_i18n(lang, "analysis_voids_line", value=(("5m: " + "; ".join([f"{z['side']} {_fmt_int_space(z['lo'])}–{_fmt_int_space(z['hi'])}" for z in voids_5m])) if voids_5m else "—")),
+        "",
+        line,
+        _tr_i18n(lang, "analysis_section_probability"),
+        "",
+        _tr_i18n(lang, "analysis_long_prob_line", value=f"{long_p}%"),
+        _tr_i18n(lang, "analysis_short_prob_line", value=f"{short_p}%"),
+        _tr_i18n(lang, "analysis_priority_line", value=bias_txt),
+        _tr_i18n(lang, "analysis_confidence_line", value=_loc_conf(conf_txt)),
+        "",
+        line,
+        _tr_i18n(lang, "analysis_section_scenarios"),
+        "",
+        _tr_i18n(lang, "analysis_bullish_title"),
+        *bullish_lines,
+        "",
+        _tr_i18n(lang, "analysis_bearish_title"),
+        *bearish_lines,
+        "",
+        line,
+        _tr_i18n(lang, "analysis_section_trade_plan"),
+        "",
+        _tr_i18n(lang, "analysis_trade_status_line", value=_loc_trade_status(trade_status_inst if trade_status_inst else '—')),
+        _tr_i18n(lang, "analysis_entry_line", value=entry_zone_txt),
+        _tr_i18n(lang, "analysis_trigger_title"),
+        str(entry_trigger_txt),
+        _tr_i18n(lang, "analysis_invalidation_title"),
+        str(entry_inval_txt),
+        "",
+        _tr_i18n(lang, "analysis_sl_line", value=sl_s),
+        _tr_i18n(lang, "analysis_tp1_line", value=f"{tp1_s} ({_tr_i18n(lang, 'analysis_rr_short', value=rr1_txt)})"),
+        _tr_i18n(lang, "analysis_tp2_line", value=f"{tp2_s} ({_tr_i18n(lang, 'analysis_rr_short', value=rr2_txt)})"),
+        "",
+        line,
+        _tr_i18n(lang, "analysis_section_conclusion"),
+        "",
+        *concl,
+        "",
+        _tr_i18n(lang, "analysis_primary_line", value=primary_scenario),
+        _tr_i18n(lang, "analysis_preference_line", value=bias),
+    ]
     report = "\n".join([x for x in report_lines if x is not None])
     return report
 
