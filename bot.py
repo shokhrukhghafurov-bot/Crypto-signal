@@ -492,6 +492,8 @@ REFERRAL_REWARD_PERCENT = float(os.getenv("REFERRAL_REWARD_PERCENT", "10") or 10
 REFERRAL_NETWORK = (os.getenv("REFERRAL_NETWORK") or "BSC (BEP20)").strip() or "BSC (BEP20)"
 # Runtime flag: users currently entering a referral withdrawal wallet.
 REFERRAL_WITHDRAW_INPUT: Dict[int, bool] = {}
+# Users with manual referral access when the global switch is OFF.
+REFERRAL_ACCESS_USERS: set[int] = set()
 
 # ---------------- MID digest sender (USES ERROR BOT via ERROR_BOT_TOKEN) ----------------
 # Digest is diagnostics; it should go to @errorrrrrrg_bot (ERROR_BOT_TOKEN), not the main bot.
@@ -1510,6 +1512,10 @@ async def init_db() -> None:
         SIGNAL_BOT_GLOBAL["referral_enabled"] = bool(sb.get("referral_enabled"))
     except Exception:
         logger.exception("startup: failed to load signal bot settings")
+    try:
+        await _warm_referral_access_cache()
+    except Exception:
+        logger.exception("startup: failed to warm referral access cache")
 
 
 
@@ -1691,21 +1697,15 @@ async def _grant_paid_plan_and_notify(order: dict, event: dict) -> None:
         logger.exception('payment: failed to notify user %s', telegram_id)
     referral_reward = None
     try:
-        sb = await db_store.get_signal_bot_settings()
-        referral_enabled = bool(sb.get('referral_enabled'))
-    except Exception:
-        referral_enabled = bool(SIGNAL_BOT_GLOBAL.get('referral_enabled'))
-    try:
-        if referral_enabled:
-            referral_reward = await db_store.award_referral_bonus_for_first_payment(
-                referral_user_id=telegram_id,
-                order_id=str(order.get('order_id') or ''),
-                payment_amount=float(order.get('amount') or plan.get('amount') or 0),
-                currency='USDT',
-                reward_percent=REFERRAL_REWARD_PERCENT,
-            )
-            if referral_reward:
-                await _notify_referrer_bonus(referral_reward)
+        referral_reward = await db_store.award_referral_bonus_for_first_payment(
+            referral_user_id=telegram_id,
+            order_id=str(order.get('order_id') or ''),
+            payment_amount=float(order.get('amount') or plan.get('amount') or 0),
+            currency='USDT',
+            reward_percent=REFERRAL_REWARD_PERCENT,
+        )
+        if referral_reward:
+            await _notify_referrer_bonus(referral_reward)
     except Exception:
         logger.exception('payment: failed to apply referral reward for user %s', telegram_id)
 
@@ -1731,6 +1731,7 @@ async def ensure_user(user_id: int, referrer_id: int | None = None) -> None:
     # IMPORTANT: does NOT touch Arbitrage access.
     try:
         await db_store.ensure_user_signal_trial(int(user_id), referrer_id=int(referrer_id) if referrer_id else None)
+        await _refresh_referral_access_cache(int(user_id))
     except Exception:
         logger.exception("ensure_user: failed")
 
@@ -1884,6 +1885,43 @@ async def get_broadcast_user_ids() -> List[int]:
 
 # ---------------- UI helpers ----------------
 
+def _has_referral_access_cached(uid: int = 0) -> bool:
+    try:
+        if bool(SIGNAL_BOT_GLOBAL.get("referral_enabled")):
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(uid and int(uid) in REFERRAL_ACCESS_USERS)
+    except Exception:
+        return False
+
+
+async def _warm_referral_access_cache() -> None:
+    try:
+        ids = await db_store.list_referral_enabled_user_ids()
+        REFERRAL_ACCESS_USERS.clear()
+        REFERRAL_ACCESS_USERS.update(int(x) for x in ids if x)
+    except Exception:
+        logger.exception("referral: failed to warm manual access cache")
+
+
+async def _refresh_referral_access_cache(uid: int) -> bool:
+    if not uid:
+        return _has_referral_access_cached(uid)
+    try:
+        state = await db_store.get_user_referral_access_state(int(uid))
+        SIGNAL_BOT_GLOBAL["referral_enabled"] = bool(state.get("global_referral_enabled"))
+        if bool(state.get("referral_enabled")):
+            REFERRAL_ACCESS_USERS.add(int(uid))
+        else:
+            REFERRAL_ACCESS_USERS.discard(int(uid))
+        return bool(state.get("effective_referral_enabled"))
+    except Exception:
+        logger.exception("referral: failed to refresh access cache for uid=%s", uid)
+        return _has_referral_access_cached(uid)
+
+
 def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text=tr(uid, "m_status"), callback_data="menu:status")
@@ -1895,8 +1933,7 @@ def menu_kb(uid: int = 0) -> types.InlineKeyboardMarkup:
     if not bool(AUTOTRADE_BOT_GLOBAL.get("pause_autotrade")):
         kb.button(text=tr(uid, "m_autotrade"), callback_data="menu:autotrade")
     try:
-        sb = SIGNAL_BOT_GLOBAL if isinstance(globals().get('SIGNAL_BOT_GLOBAL'), dict) else {}
-        if bool(sb.get("referral_enabled")):
+        if _has_referral_access_cached(uid):
             kb.button(text=tr(uid, "m_referral"), callback_data="menu:referral")
     except Exception:
         pass
@@ -1961,11 +1998,10 @@ async def _ensure_public_bot_username() -> str:
 
 def _ref_link(uid: int) -> str:
     uname = (BOT_PUBLIC_USERNAME or "").strip().lstrip("@")
+    token = f"ref_{int(uid)}"
     if uname:
-        return f"https://t.me/{uname}?start={int(uid)}"
-    # Fallback to a Telegram deep-link instead of plain /start text.
-    # This keeps the referral value clickable even before username resolution warms up.
-    return f"tg://resolve?domain={bot.id}&start={int(uid)}"
+        return f"https://t.me/{uname}?start={token}"
+    return f"/start {token}"
 
 
 def _is_valid_bsc_address(value: str) -> bool:
@@ -3392,7 +3428,10 @@ async def start(message: types.Message) -> None:
     try:
         parts = (message.text or '').strip().split(maxsplit=1)
         if len(parts) > 1:
-            cand = int(str(parts[1]).strip())
+            raw_ref = str(parts[1]).strip()
+            if raw_ref.lower().startswith('ref_'):
+                raw_ref = raw_ref[4:]
+            cand = int(raw_ref)
             if cand > 0 and cand != uid:
                 referrer_id = cand
     except Exception:
@@ -3991,12 +4030,7 @@ async def menu_handler(call: types.CallbackQuery) -> None:
 
     # ---- REFERRAL ----
     if action == "referral":
-        try:
-            sb = await db_store.get_signal_bot_settings()
-            SIGNAL_BOT_GLOBAL["referral_enabled"] = bool(sb.get("referral_enabled"))
-        except Exception:
-            pass
-        if not bool(SIGNAL_BOT_GLOBAL.get("referral_enabled")):
+        if not await _refresh_referral_access_cache(uid):
             await safe_edit(call.message, await _referral_disabled_text(uid), menu_kb(uid))
             return
         await safe_edit(call.message, await referral_main_text(uid), referral_main_kb(uid))
@@ -4056,12 +4090,7 @@ async def referral_handler(call: types.CallbackQuery) -> None:
     uid = call.from_user.id if call.from_user else 0
     if not uid:
         return
-    try:
-        sb = await db_store.get_signal_bot_settings()
-        SIGNAL_BOT_GLOBAL["referral_enabled"] = bool(sb.get("referral_enabled"))
-    except Exception:
-        pass
-    if not bool(SIGNAL_BOT_GLOBAL.get("referral_enabled")):
+    if not await _refresh_referral_access_cache(uid):
         await safe_edit(call.message, await _referral_disabled_text(uid), menu_kb(uid))
         return
     parts = (call.data or '').split(':')
@@ -4170,12 +4199,7 @@ async def referral_withdraw_wallet_input(message: types.Message) -> None:
     uid = message.from_user.id if message.from_user else 0
     if not uid or not REFERRAL_WITHDRAW_INPUT.get(uid):
         return
-    try:
-        sb = await db_store.get_signal_bot_settings()
-        SIGNAL_BOT_GLOBAL["referral_enabled"] = bool(sb.get("referral_enabled"))
-    except Exception:
-        pass
-    if not bool(SIGNAL_BOT_GLOBAL.get("referral_enabled")):
+    if not await _refresh_referral_access_cache(uid):
         REFERRAL_WITHDRAW_INPUT.pop(uid, None)
         await message.answer(await _referral_disabled_text(uid), reply_markup=menu_kb(uid))
         return
@@ -6371,8 +6395,15 @@ async def main() -> None:
             notify_basis = bool(data.get("notify_basis", sub_basis))
             notify_dex = bool(data.get("notify_dex_cex", data.get("notify_dexcex", sub_dex)))
 
-            await ensure_user(tid)
             async with pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO users (telegram_id, notify_signals)
+                    VALUES ($1, TRUE)
+                    ON CONFLICT (telegram_id) DO NOTHING
+                    """,
+                    tid,
+                )
                 try:
                     await conn.execute(
                         """
@@ -6483,9 +6514,10 @@ async def main() -> None:
         async def list_users(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
-            q = (request.query.get("q") or "").strip()
+            q = (request.query.get("q") or request.query.get("query") or "").strip()
             flt = (request.query.get("filter") or "all").strip().lower()
             async with pool.acquire() as conn:
+                global_referral_enabled = bool(await conn.fetchval("SELECT COALESCE(referral_enabled, FALSE) FROM signal_bot_settings WHERE id=1") or False)
                 where = []
                 args = []
                 if q:
@@ -6507,7 +6539,8 @@ async def main() -> None:
                     f"""
                     SELECT telegram_id, signal_enabled, signal_expires_at, COALESCE(is_blocked,FALSE) AS is_blocked,
                            COALESCE(autotrade_enabled,FALSE) AS autotrade_enabled, autotrade_expires_at,
-                           COALESCE(autotrade_stop_after_close,FALSE) AS autotrade_stop_after_close
+                           COALESCE(autotrade_stop_after_close,FALSE) AS autotrade_stop_after_close,
+                           COALESCE(referral_enabled,FALSE) AS referral_enabled
                     FROM users
                     {where_sql}
                     ORDER BY telegram_id DESC
@@ -6520,6 +6553,16 @@ async def main() -> None:
                 stop_flag = bool(r.get("autotrade_stop_after_close", False))
                 enabled_flag = bool(r.get("autotrade_enabled", False))
                 at_state = "STOP" if stop_flag else ("ON" if enabled_flag else "OFF")
+                manual_referral_enabled = bool(r.get("referral_enabled", False))
+                effective_referral_enabled = bool(global_referral_enabled or manual_referral_enabled)
+                if global_referral_enabled and manual_referral_enabled:
+                    referral_source = "global+manual"
+                elif global_referral_enabled:
+                    referral_source = "global"
+                elif manual_referral_enabled:
+                    referral_source = "manual"
+                else:
+                    referral_source = "off"
                 out.append({
                     "telegram_id": int(r["telegram_id"]),
                     "signal_enabled": bool(r["signal_enabled"]),
@@ -6529,6 +6572,9 @@ async def main() -> None:
                     "autotrade_stop_after_close": stop_flag,
                     "autotrade_state": at_state,
                     "autotrade_expires_at": (r["autotrade_expires_at"].isoformat() if r.get("autotrade_expires_at") else None),
+                    "referral_enabled": manual_referral_enabled,
+                    "referral_access": effective_referral_enabled,
+                    "referral_access_source": referral_source,
                 })
             return web.json_response({"items": out})
 
@@ -6654,55 +6700,54 @@ async def main() -> None:
                 "perf": perf,
             })
 
-        async def save_user(request: web.Request) -> web.Response:
-            """Create/update Signal + Auto-trade access for a user.
+        async def _apply_signal_user_update(tid: int, data: dict) -> None:
+            data = data or {}
 
-            Expected JSON:
-              telegram_id (required)
-              signal_enabled (optional bool)
-              signal_expires_at (optional ISO)
-              add_days (optional int)  # +days for SIGNAL
-              autotrade_enabled (optional bool)
-              autotrade_expires_at (optional ISO)
-              autotrade_add_days (optional int)  # +days for AUTO-TRADE
-              is_blocked (optional bool)
-            """
-            if not _check_basic(request):
-                return _unauthorized()
-            data = await request.json()
-            tid = int(data.get("telegram_id") or 0)
-            if not tid:
-                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
-
-            signal_enabled = bool(data.get("signal_enabled", True))
-            signal_expires_raw = data.get("signal_expires_at")
-            signal_expires = _parse_iso_dt(signal_expires_raw)
-            if signal_expires_raw and (signal_expires is None):
-                return web.json_response({"ok": False, "error": "bad signal_expires_at"}, status=400)
+            signal_enabled_present = ("signal_enabled" in data)
+            signal_enabled = bool(data.get("signal_enabled")) if signal_enabled_present else False
+            signal_expires_present = ("signal_expires_at" in data)
+            signal_expires_raw = data.get("signal_expires_at") if signal_expires_present else None
+            signal_expires = _parse_iso_dt(signal_expires_raw) if signal_expires_raw not in (None, "") else None
+            if signal_expires_present and signal_expires_raw not in (None, "") and signal_expires is None:
+                raise ValueError("bad signal_expires_at")
             signal_add_days = int(data.get("add_days") or 0)
+            touch_signal = bool(signal_enabled_present or signal_expires_present or signal_add_days)
 
-            autotrade_enabled = bool(data.get("autotrade_enabled", False))
-            autotrade_expires_raw = data.get("autotrade_expires_at")
-            autotrade_expires = _parse_iso_dt(autotrade_expires_raw)
-            if autotrade_expires_raw and (autotrade_expires is None):
-                return web.json_response({"ok": False, "error": "bad autotrade_expires_at"}, status=400)
+            autotrade_enabled_present = ("autotrade_enabled" in data)
+            autotrade_enabled = bool(data.get("autotrade_enabled")) if autotrade_enabled_present else False
+            autotrade_expires_present = ("autotrade_expires_at" in data)
+            autotrade_expires_raw = data.get("autotrade_expires_at") if autotrade_expires_present else None
+            autotrade_expires = _parse_iso_dt(autotrade_expires_raw) if autotrade_expires_raw not in (None, "") else None
+            if autotrade_expires_present and autotrade_expires_raw not in (None, "") and autotrade_expires is None:
+                raise ValueError("bad autotrade_expires_at")
             autotrade_add_days = int(data.get("autotrade_add_days") or 0)
+            touch_autotrade = bool(autotrade_enabled_present or autotrade_expires_present or autotrade_add_days)
 
-            is_blocked = data.get("is_blocked")
+            referral_enabled_present = ("referral_enabled" in data)
+            referral_enabled = bool(data.get("referral_enabled")) if referral_enabled_present else False
 
-            await ensure_user(tid)
+            is_blocked_present = ("is_blocked" in data) or ("blocked" in data)
+            is_blocked = bool(data.get("is_blocked", data.get("blocked"))) if is_blocked_present else None
+
             async with pool.acquire() as conn:
-                # SIGNAL
-                if signal_add_days:
-                    await conn.execute(
-                        """UPDATE users
-                               SET signal_enabled = TRUE,
-                                   signal_expires_at = COALESCE(signal_expires_at, now()) + make_interval(days => $2)
-                             WHERE telegram_id=$1""",
-                        tid, signal_add_days,
-                    )
-                else:
-                    if signal_expires is not None:
+                await conn.execute(
+                    """
+                    INSERT INTO users (telegram_id, notify_signals)
+                    VALUES ($1, TRUE)
+                    ON CONFLICT (telegram_id) DO NOTHING
+                    """,
+                    tid,
+                )
+                if touch_signal:
+                    if signal_add_days:
+                        await conn.execute(
+                            """UPDATE users
+                                   SET signal_enabled = TRUE,
+                                       signal_expires_at = COALESCE(signal_expires_at, now()) + make_interval(days => $2)
+                                 WHERE telegram_id=$1""",
+                            tid, signal_add_days,
+                        )
+                    elif signal_enabled_present and signal_expires_present:
                         await conn.execute(
                             """UPDATE users
                                    SET signal_enabled=$2,
@@ -6710,63 +6755,79 @@ async def main() -> None:
                                  WHERE telegram_id=$1""",
                             tid, signal_enabled, signal_expires,
                         )
-                    else:
+                    elif signal_expires_present:
                         await conn.execute(
-                            """UPDATE users
-                                   SET signal_enabled=$2
-                                 WHERE telegram_id=$1""",
+                            "UPDATE users SET signal_expires_at=$2::timestamptz WHERE telegram_id=$1",
+                            tid, signal_expires,
+                        )
+                    elif signal_enabled_present:
+                        await conn.execute(
+                            "UPDATE users SET signal_enabled=$2 WHERE telegram_id=$1",
                             tid, signal_enabled,
                         )
 
-                # AUTO-TRADE
-                if autotrade_add_days:
-                    await conn.execute(
-                        """UPDATE users
-                               SET autotrade_enabled = TRUE,
-                                   autotrade_stop_after_close = FALSE,
-                                   autotrade_expires_at = COALESCE(autotrade_expires_at, now()) + make_interval(days => $2)
-                             WHERE telegram_id=$1""",
-                        tid, autotrade_add_days,
-                    )
-                else:
-                    # Admin OFF logic:
-                    #  - if no OPEN deals -> OFF immediately
-                    #  - if there are OPEN deals -> STOP (no new positions, wait for closes, then finalize -> OFF)
-                    open_n = 0
-                    try:
-                        open_n = int(await conn.fetchval(
-                            "SELECT COUNT(1) FROM autotrade_positions WHERE user_id=$1 AND status='OPEN'",
-                            tid,
-                        ) or 0)
-                    except Exception:
+                if touch_autotrade:
+                    if autotrade_add_days:
+                        await conn.execute(
+                            """UPDATE users
+                                   SET autotrade_enabled = TRUE,
+                                       autotrade_stop_after_close = FALSE,
+                                       autotrade_expires_at = COALESCE(autotrade_expires_at, now()) + make_interval(days => $2)
+                                 WHERE telegram_id=$1""",
+                            tid, autotrade_add_days,
+                        )
+                    elif autotrade_enabled_present:
                         open_n = 0
+                        try:
+                            open_n = int(await conn.fetchval(
+                                "SELECT COUNT(1) FROM autotrade_positions WHERE user_id=$1 AND status='OPEN'",
+                                tid,
+                            ) or 0)
+                        except Exception:
+                            open_n = 0
 
-                    if not bool(autotrade_enabled):
-                        if open_n > 0:
-                            # STOP
-                            if autotrade_expires is not None:
-                                await conn.execute(
-                                    """UPDATE users
-                                           SET autotrade_enabled=TRUE,
-                                               autotrade_stop_after_close=TRUE,
-                                               autotrade_expires_at=$2::timestamptz
-                                         WHERE telegram_id=$1""",
-                                    tid, autotrade_expires,
-                                )
+                        if not bool(autotrade_enabled):
+                            if open_n > 0:
+                                if autotrade_expires_present:
+                                    await conn.execute(
+                                        """UPDATE users
+                                               SET autotrade_enabled=TRUE,
+                                                   autotrade_stop_after_close=TRUE,
+                                                   autotrade_expires_at=$2::timestamptz
+                                             WHERE telegram_id=$1""",
+                                        tid, autotrade_expires,
+                                    )
+                                else:
+                                    await conn.execute(
+                                        """UPDATE users
+                                               SET autotrade_enabled=TRUE,
+                                                   autotrade_stop_after_close=TRUE
+                                             WHERE telegram_id=$1""",
+                                        tid,
+                                    )
                             else:
+                                if autotrade_expires_present:
+                                    await conn.execute(
+                                        """UPDATE users
+                                               SET autotrade_enabled=FALSE,
+                                                   autotrade_stop_after_close=FALSE,
+                                                   autotrade_expires_at=$2::timestamptz
+                                             WHERE telegram_id=$1""",
+                                        tid, autotrade_expires,
+                                    )
+                                else:
+                                    await conn.execute(
+                                        """UPDATE users
+                                               SET autotrade_enabled=FALSE,
+                                                   autotrade_stop_after_close=FALSE
+                                             WHERE telegram_id=$1""",
+                                        tid,
+                                    )
+                        else:
+                            if autotrade_expires_present:
                                 await conn.execute(
                                     """UPDATE users
                                            SET autotrade_enabled=TRUE,
-                                               autotrade_stop_after_close=TRUE
-                                         WHERE telegram_id=$1""",
-                                    tid,
-                                )
-                        else:
-                            # OFF
-                            if autotrade_expires is not None:
-                                await conn.execute(
-                                    """UPDATE users
-                                           SET autotrade_enabled=FALSE,
                                                autotrade_stop_after_close=FALSE,
                                                autotrade_expires_at=$2::timestamptz
                                          WHERE telegram_id=$1""",
@@ -6775,41 +6836,48 @@ async def main() -> None:
                             else:
                                 await conn.execute(
                                     """UPDATE users
-                                           SET autotrade_enabled=FALSE,
+                                           SET autotrade_enabled=TRUE,
                                                autotrade_stop_after_close=FALSE
                                          WHERE telegram_id=$1""",
                                     tid,
                                 )
-                    else:
-                        # ON
-                        if autotrade_expires is not None:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=TRUE,
-                                           autotrade_stop_after_close=FALSE,
-                                           autotrade_expires_at=$2::timestamptz
-                                     WHERE telegram_id=$1""",
-                                tid, autotrade_expires,
-                            )
-                        else:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=TRUE,
-                                           autotrade_stop_after_close=FALSE
-                                     WHERE telegram_id=$1""",
-                                tid,
-                            )
+                    elif autotrade_expires_present:
+                        await conn.execute(
+                            "UPDATE users SET autotrade_expires_at=$2::timestamptz WHERE telegram_id=$1",
+                            tid, autotrade_expires,
+                        )
 
-                if is_blocked is not None:
+                if referral_enabled_present:
+                    await conn.execute(
+                        "UPDATE users SET referral_enabled=$2, updated_at=NOW() WHERE telegram_id=$1",
+                        tid, referral_enabled,
+                    )
+
+                if is_blocked_present:
                     try:
                         await conn.execute("UPDATE users SET is_blocked=$2 WHERE telegram_id=$1", tid, bool(is_blocked))
                     except Exception:
                         pass
 
+            if referral_enabled_present:
+                await _refresh_referral_access_cache(tid)
+
+        async def save_user(request: web.Request) -> web.Response:
+            """Create/update Signal + Auto-trade + Referral access for a user."""
+            if not _check_basic(request):
+                return _unauthorized()
+            data = await request.json()
+            tid = int(data.get("telegram_id") or 0)
+            if not tid:
+                return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
+            try:
+                await _apply_signal_user_update(tid, data)
+            except ValueError as e:
+                return web.json_response({"ok": False, "error": str(e)}, status=400)
             return web.json_response({"ok": True})
+
         async def patch_user(request: web.Request) -> web.Response:
-            """Compat endpoint: PATCH /api/infra/admin/signal/users/{telegram_id}
-            Supports SIGNAL + AUTO-TRADE fields."""
+            """Compat endpoint: PATCH /api/infra/admin/signal/users/{telegram_id}."""
             if not _check_basic(request):
                 return _unauthorized()
             tid = int(request.match_info.get("telegram_id") or 0)
@@ -6818,132 +6886,12 @@ async def main() -> None:
             data = await request.json()
             data = data or {}
             data["telegram_id"] = tid
-
-            # Reuse the same logic as save_user by performing the updates here
-            signal_enabled = bool(data.get("signal_enabled", True))
-            signal_expires_raw = data.get("signal_expires_at")
-            signal_expires = _parse_iso_dt(signal_expires_raw)
-            if signal_expires_raw and (signal_expires is None):
-                return web.json_response({"ok": False, "error": "bad signal_expires_at"}, status=400)
-            signal_add_days = int(data.get("add_days") or 0)
-
-            autotrade_enabled = bool(data.get("autotrade_enabled", False))
-            autotrade_expires_raw = data.get("autotrade_expires_at")
-            autotrade_expires = _parse_iso_dt(autotrade_expires_raw)
-            if autotrade_expires_raw and (autotrade_expires is None):
-                return web.json_response({"ok": False, "error": "bad autotrade_expires_at"}, status=400)
-            autotrade_add_days = int(data.get("autotrade_add_days") or 0)
-
-            is_blocked = data.get("is_blocked")
-
-            await ensure_user(tid)
-            async with pool.acquire() as conn:
-                if signal_add_days:
-                    await conn.execute(
-                        """UPDATE users
-                               SET signal_enabled = TRUE,
-                                   signal_expires_at = COALESCE(signal_expires_at, now()) + make_interval(days => $2)
-                             WHERE telegram_id=$1""",
-                        tid, signal_add_days,
-                    )
-                else:
-                    if signal_expires is not None:
-                        await conn.execute(
-                            """UPDATE users
-                                   SET signal_enabled=$2,
-                                       signal_expires_at=$3::timestamptz
-                                 WHERE telegram_id=$1""",
-                            tid, signal_enabled, signal_expires,
-                        )
-                    else:
-                        await conn.execute(
-                            "UPDATE users SET signal_enabled=$2 WHERE telegram_id=$1",
-                            tid, signal_enabled,
-                        )
-
-                if autotrade_add_days:
-                    await conn.execute(
-                        """UPDATE users
-                               SET autotrade_enabled = TRUE,
-                                   autotrade_stop_after_close = FALSE,
-                                   autotrade_expires_at = COALESCE(autotrade_expires_at, now()) + make_interval(days => $2)
-                             WHERE telegram_id=$1""",
-                        tid, autotrade_add_days,
-                    )
-                else:
-                    # same STOP/OFF logic as save_user
-                    open_n = 0
-                    try:
-                        open_n = int(await conn.fetchval(
-                            "SELECT COUNT(1) FROM autotrade_positions WHERE user_id=$1 AND status='OPEN'",
-                            tid,
-                        ) or 0)
-                    except Exception:
-                        open_n = 0
-
-                    if not bool(autotrade_enabled):
-                        if open_n > 0:
-                            if autotrade_expires is not None:
-                                await conn.execute(
-                                    """UPDATE users
-                                           SET autotrade_enabled=TRUE,
-                                               autotrade_stop_after_close=TRUE,
-                                               autotrade_expires_at=$2::timestamptz
-                                         WHERE telegram_id=$1""",
-                                    tid, autotrade_expires,
-                                )
-                            else:
-                                await conn.execute(
-                                    """UPDATE users
-                                           SET autotrade_enabled=TRUE,
-                                               autotrade_stop_after_close=TRUE
-                                         WHERE telegram_id=$1""",
-                                    tid,
-                                )
-                        else:
-                            if autotrade_expires is not None:
-                                await conn.execute(
-                                    """UPDATE users
-                                           SET autotrade_enabled=FALSE,
-                                               autotrade_stop_after_close=FALSE,
-                                               autotrade_expires_at=$2::timestamptz
-                                         WHERE telegram_id=$1""",
-                                    tid, autotrade_expires,
-                                )
-                            else:
-                                await conn.execute(
-                                    """UPDATE users
-                                           SET autotrade_enabled=FALSE,
-                                               autotrade_stop_after_close=FALSE
-                                         WHERE telegram_id=$1""",
-                                    tid,
-                                )
-                    else:
-                        if autotrade_expires is not None:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=TRUE,
-                                           autotrade_stop_after_close=FALSE,
-                                           autotrade_expires_at=$2::timestamptz
-                                     WHERE telegram_id=$1""",
-                                tid, autotrade_expires,
-                            )
-                        else:
-                            await conn.execute(
-                                """UPDATE users
-                                       SET autotrade_enabled=TRUE,
-                                           autotrade_stop_after_close=FALSE
-                                     WHERE telegram_id=$1""",
-                                tid,
-                            )
-
-                if is_blocked is not None:
-                    try:
-                        await conn.execute("UPDATE users SET is_blocked=$2 WHERE telegram_id=$1", tid, bool(is_blocked))
-                    except Exception:
-                        pass
-
+            try:
+                await _apply_signal_user_update(tid, data)
+            except ValueError as e:
+                return web.json_response({"ok": False, "error": str(e)}, status=400)
             return web.json_response({"ok": True})
+
         async def block_user(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
@@ -6951,6 +6899,7 @@ async def main() -> None:
             if not tid:
                 return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
             async with pool.acquire() as conn:
+                await conn.execute("INSERT INTO users (telegram_id, notify_signals) VALUES ($1, TRUE) ON CONFLICT (telegram_id) DO NOTHING", tid)
                 await conn.execute("UPDATE users SET is_blocked=TRUE WHERE telegram_id=$1", tid)
             return web.json_response({"ok": True})
 
@@ -6961,6 +6910,7 @@ async def main() -> None:
             if not tid:
                 return web.json_response({"ok": False, "error": "telegram_id required"}, status=400)
             async with pool.acquire() as conn:
+                await conn.execute("INSERT INTO users (telegram_id, notify_signals) VALUES ($1, TRUE) ON CONFLICT (telegram_id) DO NOTHING", tid)
                 await conn.execute("UPDATE users SET is_blocked=FALSE WHERE telegram_id=$1", tid)
             return web.json_response({"ok": True})
 
