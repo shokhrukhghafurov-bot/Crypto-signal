@@ -3313,10 +3313,11 @@ async def broadcast_signal(sig: Signal) -> None:
 
                     err = res.get("api_error") if isinstance(res, dict) else None
                     if err:
-                        # notify ONLY for API errors
+                        # notify ONLY for API errors; prefer the actual routed exchange
                         st = await db_store.get_autotrade_settings(_uid)
                         mt = "spot" if _sig.market == "SPOT" else "futures"
-                        ex = str(st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "").lower()
+                        det = res.get("details") if isinstance(res.get("details"), dict) else {}
+                        ex = str(det.get("exchange") or res.get("exchange") or st.get("spot_exchange" if mt == "spot" else "futures_exchange") or "").lower()
                         await _notify_autotrade_api_error(_uid, ex, mt, f"{getattr(_sig,'symbol','')} {getattr(_sig,'market','')}: {str(err)}"[:500])
                 except Exception as e:
                     # unexpected errors are treated as API errors for visibility
