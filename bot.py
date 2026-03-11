@@ -421,6 +421,10 @@ if _raw_admins:
 def _is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+# Backward-compatible alias for old handlers that still call is_admin(...).
+def is_admin(user_id: int) -> bool:
+    return _is_admin(user_id)
+
 # Timezone
 # NOTE: "MSK" is a common shorthand, but it's not a valid IANA tz database key.
 # Use "Europe/Moscow" (MSK / UTC+3) instead.
@@ -3448,7 +3452,7 @@ async def subscription_handler(call: types.CallbackQuery) -> None:
 @dp.message(Command("autotrade_health"))
 async def cmd_autotrade_health(message: types.Message):
     uid = int(message.from_user.id) if message.from_user else 0
-    if not _is_admin(uid):
+    if not is_admin(uid):
         return
     snap = await autotrade_healthcheck()
     open_cnt = int(snap.get("open_positions") or 0)
@@ -3470,7 +3474,7 @@ async def cmd_autotrade_health(message: types.Message):
 @dp.message(Command("autotrade_stress"))
 async def cmd_autotrade_stress(message: types.Message):
     uid = int(message.from_user.id) if message.from_user else 0
-    if not _is_admin(uid):
+    if not is_admin(uid):
         return
 
     # Usage: /autotrade_stress [SYMBOL] [spot|futures] [N]
@@ -4088,7 +4092,7 @@ async def referral_handler(call: types.CallbackQuery) -> None:
 async def referral_admin_handler(call: types.CallbackQuery) -> None:
     await safe_callback_answer(call)
     uid = call.from_user.id if call.from_user else 0
-    if not _is_admin(uid):
+    if not is_admin(uid):
         return
     parts = (call.data or '').split(':')
     action = parts[1] if len(parts) > 1 else ''
@@ -4114,7 +4118,8 @@ async def referral_admin_handler(call: types.CallbackQuery) -> None:
             f"Приглашено:\n{int(prof.get('total_refs') or 0)}\n\n"
             f"Оплатили:\n{int(prof.get('paid_refs') or 0)}"
         )
-        await safe_send_payment_alert(REFERRAL_ADMIN_CHAT_ID, txt)
+        # Send via the main bot because the admin request message and callbacks live in the main bot chat.
+        await safe_send(REFERRAL_ADMIN_CHAT_ID, txt, ctx='referral_admin_profile')
         return
     if action == 'stats' and len(parts) >= 3:
         target_uid = int(parts[2])
@@ -4129,7 +4134,8 @@ async def referral_admin_handler(call: types.CallbackQuery) -> None:
             f"В обработке: {_fmt_money(ov.get('hold_balance') or 0)} USDT\n"
             f"Выплачено: {_fmt_money(ov.get('withdrawn_balance') or 0)} USDT"
         )
-        await safe_send_payment_alert(REFERRAL_ADMIN_CHAT_ID, txt)
+        # Send via the main bot because the admin request message and callbacks live in the main bot chat.
+        await safe_send(REFERRAL_ADMIN_CHAT_ID, txt, ctx='referral_admin_stats')
         return
     if len(parts) < 4:
         return
