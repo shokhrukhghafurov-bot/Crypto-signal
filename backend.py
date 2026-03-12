@@ -3013,7 +3013,12 @@ async def _bybit_instrument_filters(*, category: str, symbol: str) -> tuple[floa
         lot = it.get("lotSizeFilter") or {}
         pf = it.get("priceFilter") or {}
         try:
-            qty_step = float(lot.get("qtyStep") or 0.0)
+            if str(category or "").lower() == "spot":
+                # Bybit spot instruments do not expose lotSizeFilter.qtyStep.
+                # The quantity increment is provided via basePrecision.
+                qty_step = float(lot.get("basePrecision") or 0.0)
+            else:
+                qty_step = float(lot.get("qtyStep") or 0.0)
         except Exception:
             qty_step = 0.0
         try:
