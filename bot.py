@@ -282,6 +282,39 @@ def _attach_task_monitor(name: str, task: asyncio.Task) -> None:
     except Exception:
         return
 
+async def _db_retention_cleanup_loop() -> None:
+    """Periodically prune old closed Postgres rows to keep tables/indexes compact."""
+    enabled = str(os.getenv("DB_RETENTION_CLEANUP_ENABLED", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+    if not enabled:
+        logger.info("[db-retention] disabled (DB_RETENTION_CLEANUP_ENABLED=0)")
+        return
+
+    every_sec = int(os.getenv("DB_RETENTION_CLEANUP_EVERY_SEC", "21600") or 21600)
+    startup_delay = int(os.getenv("DB_RETENTION_CLEANUP_STARTUP_DELAY_SEC", "180") or 180)
+    batch = int(os.getenv("DB_RETENTION_DELETE_BATCH", "1000") or 1000)
+
+    logger.info("[db-retention] started interval=%ss startup_delay=%ss batch=%s", every_sec, startup_delay, batch)
+    await asyncio.sleep(max(5, startup_delay))
+
+    while True:
+        try:
+            stats = await db_store.cleanup_old_postgres_data(batch_size=batch)
+            total_deleted = int(sum(int(v or 0) for v in (stats or {}).values()))
+            logger.info(
+                "[db-retention] deleted total=%s closed_trades=%s closed_autotrade=%s closed_signal_tracks=%s signal_sent=%s",
+                total_deleted,
+                int((stats or {}).get("closed_trades") or 0),
+                int((stats or {}).get("closed_autotrade_positions") or 0),
+                int((stats or {}).get("closed_signal_tracks") or 0),
+                int((stats or {}).get("signal_sent_events") or 0),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[db-retention] cleanup failed")
+        await asyncio.sleep(max(300, every_sec))
+
+
 # --- i18n template safety guard (prevents leaking {placeholders} to users) ---
 _UNFILLED_RE = re.compile(r'(?<!\{)\{[a-zA-Z0-9_]+\}(?!\})')
 
@@ -7601,6 +7634,9 @@ async def main() -> None:
             if _spawn_smart_manager_task() is None:
                 logger.warning("Backend has no track_loop; skipping")
 
+            TASKS["db-retention"] = asyncio.create_task(_db_retention_cleanup_loop(), name="db-retention")
+            _attach_task_monitor("db-retention", TASKS["db-retention"])
+
             logger.info(
                 "Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s",
                 os.getenv("SCAN_INTERVAL_SECONDS", ""),
@@ -7674,6 +7710,8 @@ async def main() -> None:
     logger.info("Starting track_loop")
     if _spawn_smart_manager_task() is None:
         logger.warning("Backend has no track_loop; skipping")
+    TASKS["db-retention"] = asyncio.create_task(_db_retention_cleanup_loop(), name="db-retention")
+    _attach_task_monitor("db-retention", TASKS["db-retention"])
     logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
 
