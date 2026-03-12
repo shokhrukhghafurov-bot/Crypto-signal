@@ -1223,6 +1223,10 @@ async def find_autotrade_position_for_trade(
     mt = 'futures' if str(market or '').upper() == 'FUTURES' else 'spot'
     ex = str(exchange).lower() if exchange else None
     pos_side = str(side or '').upper().strip() or None
+    if pos_side in ('LONG', 'BUY'):
+        pos_side = 'BUY'
+    elif pos_side in ('SHORT', 'SELL'):
+        pos_side = 'SELL'
     linked_trade_id = int(trade_id) if trade_id is not None else None
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         row = await conn.fetchrow(
@@ -2925,6 +2929,8 @@ async def close_autotrade_position(
     signal_id: Optional[int],
     exchange: str,
     market_type: str,
+    symbol: str | None = None,
+    side: str | None = None,
     status: str = "CLOSED",
     pnl_usdt: Optional[float] = None,
     roi_percent: Optional[float] = None,
@@ -2934,6 +2940,14 @@ async def close_autotrade_position(
     uid = int(user_id)
     ex = (exchange or "binance").lower().strip()
     mt = (market_type or "spot").lower().strip()
+    sym = str(symbol or "").upper().strip() or None
+    pos_side = str(side or "").upper().strip() or None
+    if pos_side in ("LONG", "BUY"):
+        pos_side = "BUY"
+    elif pos_side in ("SHORT", "SELL"):
+        pos_side = "SELL"
+    else:
+        pos_side = None
     st = (status or "CLOSED").upper().strip()
     rid = int(row_id) if row_id is not None else None
     if st not in ("CLOSED", "ERROR"):
@@ -2968,18 +2982,20 @@ async def close_autotrade_position(
                   AND ($2::BIGINT IS NULL OR signal_id=$2)
                   AND exchange=$3
                   AND market_type=$4
+                  AND ($5::TEXT IS NULL OR UPPER(symbol)=UPPER($5))
+                  AND ($6::TEXT IS NULL OR UPPER(side)=UPPER($6))
                   AND status='OPEN'
                 ORDER BY opened_at DESC, id DESC
                 LIMIT 1
             )
             UPDATE autotrade_positions ap
-            SET status=$5,
+            SET status=$7,
                 closed_at=NOW(),
                 mgr_owner=NULL,
                 mgr_lock_until=NULL,
                 mgr_lock_acquired_at=NULL,
-                pnl_usdt=COALESCE($6, ap.pnl_usdt),
-                roi_percent=COALESCE($7, ap.roi_percent)
+                pnl_usdt=COALESCE($8, ap.pnl_usdt),
+                roi_percent=COALESCE($9, ap.roi_percent)
             FROM pick
             WHERE ap.id=pick.id;
             """,
@@ -2987,6 +3003,8 @@ async def close_autotrade_position(
             (int(signal_id) if signal_id is not None else None),
             ex,
             mt,
+            sym,
+            pos_side,
             st,
             pnl_usdt,
             roi_percent,
