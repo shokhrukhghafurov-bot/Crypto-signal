@@ -5276,6 +5276,37 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 # Keep in-memory copy (used later in this loop)
                 r["meta"] = meta
 
+                async def _sync_pos_meta(extra: dict | None = None) -> None:
+                    patch = {
+                        "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit")),
+                        "be_moved": bool(ref.get("be_moved") or meta.get("be_moved")),
+                        "be_price": float(ref.get("be_price") or meta.get("be_price") or 0.0),
+                        "tp1_partial": bool(ref.get("tp1_partial") or meta.get("tp1_partial")),
+                        "be_pending": bool(ref.get("be_pending") or meta.get("be_pending")),
+                        "direction": str(ref.get("direction") or meta.get("direction") or ""),
+                        "entry_price": float(ref.get("entry_price") or meta.get("entry_price") or 0.0),
+                        "tp1": float(ref.get("tp1") or meta.get("tp1") or 0.0),
+                        "tp2": float(ref.get("tp2") or meta.get("tp2") or 0.0),
+                        "sl": float(ref.get("sl") or meta.get("sl") or 0.0),
+                        "qty": float(ref.get("qty") or meta.get("qty") or 0.0),
+                    }
+                    if extra:
+                        patch.update(extra)
+                    try:
+                        await db_store.update_autotrade_position_meta(row_id=int(r.get("id") or 0), meta=patch, replace=False)
+                        try:
+                            meta.update(patch)
+                            r["meta"] = meta
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                try:
+                    await _sync_pos_meta()
+                except Exception:
+                    pass
+
                 ex = str(ref.get("exchange") or r.get("exchange") or "").lower()
                 if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
                     continue
@@ -5435,6 +5466,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 status="CLOSED",
                                 pnl_usdt=pnl_usdt,
                                 roi_percent=roi_percent,
+                                row_id=int(r.get("id") or 0),
                             )
                             # respect stop_after_close flag
                             try:
@@ -5455,7 +5487,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 side_str = 'LONG' if str(ref.get('side','BUY')).upper() in ('BUY','LONG') else 'SHORT'
                 if side_str != 'LONG':
                     # Spot manager supports LONG only (no short spot). Mark as ERROR to avoid wrong closes.
-                    await db_store.close_autotrade_position(user_id=uid, signal_id=r.get('signal_id'), exchange=ex, market_type=mt, status='ERROR')
+                    await _sync_pos_meta({"closed_reason": "ERROR_UNSUPPORTED_SIDE"})
+                    await db_store.close_autotrade_position(user_id=uid, signal_id=r.get('signal_id'), exchange=ex, market_type=mt, status='ERROR', row_id=int(r.get('id') or 0))
                     continue
                 be_price = float(ref.get("be_price") or 0.0)
                 close_side = str(ref.get("close_side") or ("SELL" if str(ref.get("side")) == "BUY" else "BUY")).upper()
@@ -5572,8 +5605,14 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     be_price = float(ref.get("be_price") or 0.0)
 
                     if qty <= 0:
+                        await _sync_pos_meta({"closed_reason": "SYNC_CLOSE", "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit"))})
                         await db_store.close_autotrade_position(
-                            user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                            user_id=uid,
+                            signal_id=r.get("signal_id"),
+                            exchange=ex,
+                            market_type=mt,
+                            status="CLOSED",
+                            row_id=int(r.get("id") or 0),
                         )
                         continue
 
@@ -5758,8 +5797,14 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                     except Exception as e:
                                         _log_rate_limited(f"smart_trail_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] trail close failed {ex}/{mt} {symbol}: {e}", every_s=30, level="warning")
                                     if trail_closed:
+                                        await _sync_pos_meta({"closed_reason": "TRAIL_EXIT", "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit"))})
                                         await db_store.close_autotrade_position(
-                                            user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                                            user_id=uid,
+                                            signal_id=r.get("signal_id"),
+                                            exchange=ex,
+                                            market_type=mt,
+                                            status="CLOSED",
+                                            row_id=int(r.get("id") or 0),
                                         )
                                         continue
                                     ref["sm_state"] = "TRAIL_EXIT"
@@ -5797,8 +5842,14 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 except Exception as e:
                                     _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                                 if close_ok:
+                                    await _sync_pos_meta({"closed_reason": "REVERSAL_EXIT", "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit"))})
                                     await db_store.close_autotrade_position(
-                                        user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                                        user_id=uid,
+                                        signal_id=r.get("signal_id"),
+                                        exchange=ex,
+                                        market_type=mt,
+                                        status="CLOSED",
+                                        row_id=int(r.get("id") or 0),
                                     )
                                     continue
                         else:
@@ -5811,8 +5862,14 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 except Exception as e:
                                     _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                                 if close_ok:
+                                    await _sync_pos_meta({"closed_reason": "REVERSAL_EXIT", "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit"))})
                                     await db_store.close_autotrade_position(
-                                        user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                                        user_id=uid,
+                                        signal_id=r.get("signal_id"),
+                                        exchange=ex,
+                                        market_type=mt,
+                                        status="CLOSED",
+                                        row_id=int(r.get("id") or 0),
                                     )
                                     continue
 
@@ -5851,8 +5908,14 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         except Exception as e:
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] early-exit close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                         if close_ok:
+                            await _sync_pos_meta({"closed_reason": "EARLY_EXIT", "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit"))})
                             await db_store.close_autotrade_position(
-                                user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                                user_id=uid,
+                                signal_id=r.get("signal_id"),
+                                exchange=ex,
+                                market_type=mt,
+                                status="CLOSED",
+                                row_id=int(r.get("id") or 0),
                             )
                             continue
                     # --- SMART STRUCTURAL SL ---
@@ -6004,8 +6067,14 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         except Exception as e:
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                         if close_ok:
+                            await _sync_pos_meta({"closed_reason": "SL", "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit"))})
                             await db_store.close_autotrade_position(
-                                user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                                user_id=uid,
+                                signal_id=r.get("signal_id"),
+                                exchange=ex,
+                                market_type=mt,
+                                status="CLOSED",
+                                row_id=int(r.get("id") or 0),
                             )
                             continue
 
@@ -6017,8 +6086,14 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         except Exception as e:
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                         if close_ok:
+                            await _sync_pos_meta({"closed_reason": "TP2", "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit"))})
                             await db_store.close_autotrade_position(
-                                user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                                user_id=uid,
+                                signal_id=r.get("signal_id"),
+                                exchange=ex,
+                                market_type=mt,
+                                status="CLOSED",
+                                row_id=int(r.get("id") or 0),
                             )
                             continue
 
@@ -6074,6 +6149,10 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             # Strong conditions: skip TP1 close, aim for TP2 (close 100%)
                             ref["tp1_hit"] = True
                             dirty = True
+                            try:
+                                await _sync_pos_meta({"tp1_hit": True})
+                            except Exception:
+                                pass
                         elif mode == "PARTIAL_TP1":
                             q_close = max(0.0, qty * max(0.05, min(0.95, TP1_PARTIAL_PCT)))
                             q_rem = max(0.0, qty - q_close)
@@ -6091,6 +6170,10 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                     ref["tp1_ts"] = float(now_ts)
                                     ref["be_pending"] = True
                                     dirty = True
+                                    try:
+                                        await _sync_pos_meta({"tp1_hit": True, "tp1_partial": True, "be_pending": True})
+                                    except Exception:
+                                        pass
                         else:
                             # FULL_TP1 / FULL_TP1_NO_TP2
                             close_ok = False
@@ -6099,8 +6182,14 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             except Exception as e:
                                 _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                             if close_ok:
+                                await _sync_pos_meta({"closed_reason": str(mode), "tp1_hit": True})
                                 await db_store.close_autotrade_position(
-                                    user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                                    user_id=uid,
+                                    signal_id=r.get("signal_id"),
+                                    exchange=ex,
+                                    market_type=mt,
+                                    status="CLOSED",
+                                    row_id=int(r.get("id") or 0),
                                 )
                                 continue
 # --- Arm BE only AFTER partial TP1 and after a short delay + confirmation
@@ -6138,6 +6227,10 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                     ref["be_pending"] = False
                                     be_moved = True
                                     dirty = True
+                                    try:
+                                        await _sync_pos_meta({"be_moved": True, "be_price": float(be_price), "be_pending": False})
+                                    except Exception:
+                                        pass
 
                     # --- BE hit: close remaining ---
                     if bool(ref.get("be_moved")) and _hit_be():
@@ -6147,8 +6240,14 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         except Exception as e:
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                         if close_ok:
+                            await _sync_pos_meta({"closed_reason": "BE", "tp1_hit": True, "be_moved": True})
                             await db_store.close_autotrade_position(
-                                user_id=uid, signal_id=r.get("signal_id"), exchange=ex, market_type=mt, status="CLOSED"
+                                user_id=uid,
+                                signal_id=r.get("signal_id"),
+                                exchange=ex,
+                                market_type=mt,
+                                status="CLOSED",
+                                row_id=int(r.get("id") or 0),
                             )
                             continue
 
@@ -6156,6 +6255,10 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     if dirty:
                         try:
                             await db_store.update_autotrade_order_ref(row_id=int(r.get("id") or 0), api_order_ref=json.dumps(ref))
+                        except Exception:
+                            pass
+                        try:
+                            await _sync_pos_meta()
                         except Exception:
                             pass
 
@@ -6339,6 +6442,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         except Exception:
                             pnl_usdt = None
                             roi_percent = None
+                        await _sync_pos_meta({"closed_reason": ("BE" if bool(ref.get("be_moved")) else "SL"), "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit")), "be_moved": bool(ref.get("be_moved") or meta.get("be_moved")), "be_price": float(ref.get("be_price") or meta.get("be_price") or 0.0)})
                         await db_store.close_autotrade_position(
                             user_id=uid,
                             signal_id=r.get("signal_id"),
@@ -6347,7 +6451,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             status="CLOSED",
                             pnl_usdt=pnl_usdt,
                             roi_percent=roi_percent,
-)
+                            row_id=int(r.get("id") or 0),
+                        )
                         try:
                             acc2 = await db_store.get_autotrade_access(uid)
                             if bool(acc2.get("autotrade_stop_after_close")):
@@ -6418,6 +6523,9 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         except Exception:
                             pnl_usdt = None
                             roi_percent = None
+                        tp2_cfg = float(ref.get("tp2") or meta.get("tp2") or 0.0)
+                        close_reason = "TP2" if bool(tp2_id) else ("FULL_TP1" if tp2_cfg > 0 else "FULL_TP1_NO_TP2")
+                        await _sync_pos_meta({"closed_reason": close_reason, "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit") or (not bool(tp2_id)))})
                         await db_store.close_autotrade_position(
                             user_id=uid,
                             signal_id=r.get("signal_id"),
@@ -6426,6 +6534,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             status="CLOSED",
                             pnl_usdt=pnl_usdt,
                             roi_percent=roi_percent,
+                            row_id=int(r.get("id") or 0),
                         )
                         try:
                             acc2 = await db_store.get_autotrade_access(uid)
@@ -7491,6 +7600,54 @@ def _lvl_line(label: str, value: float) -> str:
     except Exception:
         pass
     return ""
+
+
+def _safe_json_obj(raw: Any) -> dict:
+    try:
+        if isinstance(raw, dict):
+            return dict(raw)
+        if raw is None:
+            return {}
+        return json.loads(str(raw) or "{}") or {}
+    except Exception:
+        return {}
+
+
+def _normalize_autotrade_close_reason(reason: str | None) -> str:
+    r = str(reason or "").upper().strip()
+    aliases = {
+        "TP1_FULL": "FULL_TP1",
+        "TP1_FULL_NO_TP2": "FULL_TP1_NO_TP2",
+        "TP2_REACHED": "TP2",
+        "USER_CLOSE": "MANUAL_CLOSE",
+    }
+    return aliases.get(r, r)
+
+
+
+def _autotrade_reason_to_trade_status(reason: str, roi_percent: float | None = None, *, tp1_hit: bool = False) -> str:
+    r = _normalize_autotrade_close_reason(reason)
+    if r in ("BE", "MANUAL_BE"):
+        return "BE"
+    if r in ("SL", "HARD_SL", "STRUCTURE_BREAK"):
+        return "LOSS"
+    if r in ("MANUAL_CLOSE", "SYNC_CLOSE"):
+        return "CLOSED"
+    if r.startswith("ERROR") or r in ("API_ERROR", "EXECUTION_ERROR"):
+        return "CLOSED"
+    if r in ("TP2", "FULL_TP1", "FULL_TP1_NO_TP2", "TRAIL_EXIT", "REVERSAL_EXIT", "EARLY_EXIT", "EARLY_EXIT_MOM"):
+        return "WIN"
+    try:
+        roi = float(roi_percent) if roi_percent is not None else 0.0
+    except Exception:
+        roi = 0.0
+    if tp1_hit and abs(roi) <= 0.25:
+        return "BE"
+    if roi > 0.0:
+        return "WIN"
+    if roi < 0.0:
+        return "LOSS"
+    return "CLOSED"
 
 
 
@@ -13589,6 +13746,112 @@ class Backend:
                     except Exception:
                         _tp2v = 0.0
                     tp2_disp = (f"{_tp2v:.6f}" if _tp2v > 0 else "-")
+
+                    linked_position_id = int(row.get("linked_position_id") or 0) if row.get("linked_position_id") is not None else 0
+                    trade_exchange = str(row.get("exchange") or "manual").lower().strip() or "manual"
+                    managed_by = str(row.get("managed_by") or "").lower().strip()
+                    linked_pos = None
+                    if linked_position_id > 0 or managed_by == "autotrade_manager" or trade_exchange not in ("", "manual"):
+                        trade_side = str(row.get("side") or "").upper().strip()
+                        position_side = ("BUY" if trade_side in ("BUY", "LONG") else ("SELL" if trade_side in ("SELL", "SHORT") else None))
+                        try:
+                            if linked_position_id > 0:
+                                linked_pos = await db_store.get_autotrade_position_by_id(linked_position_id)
+                            if not linked_pos and int(row.get("signal_id") or 0) > 0:
+                                linked_pos = await db_store.find_autotrade_position_for_trade(
+                                    user_id=uid,
+                                    signal_id=int(row.get("signal_id") or 0),
+                                    market=market,
+                                    symbol=symbol,
+                                    exchange=(trade_exchange if trade_exchange != "manual" else None),
+                                    side=position_side,
+                                    trade_id=trade_id,
+                                    include_closed=True,
+                                )
+                                if linked_pos:
+                                    try:
+                                        await db_store.update_trade_autotrade_link(
+                                            trade_id=trade_id,
+                                            position_id=int(linked_pos.get("id") or 0),
+                                            exchange=str(linked_pos.get("exchange") or trade_exchange or "manual"),
+                                            managed_by="autotrade_manager",
+                                        )
+                                    except Exception:
+                                        pass
+                                    try:
+                                        await db_store.update_autotrade_trade_link(
+                                            row_id=int(linked_pos.get("id") or 0),
+                                            trade_id=trade_id,
+                                        )
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            linked_pos = None
+                    if linked_pos:
+                        pos_ref = _safe_json_obj(linked_pos.get("api_order_ref"))
+                        pos_meta = _safe_json_obj(linked_pos.get("meta"))
+                        pos_tp1_hit = bool(pos_meta.get("tp1_hit") or pos_ref.get("tp1_hit"))
+                        try:
+                            pos_be_price = float(pos_meta.get("be_price") or pos_ref.get("be_price") or row.get("be_price") or 0.0)
+                        except Exception:
+                            pos_be_price = 0.0
+                        if pos_tp1_hit and not bool(row.get("tp1_hit")):
+                            try:
+                                tp1_sync_pnl = float(linked_pos.get("roi_percent")) if linked_pos.get("roi_percent") is not None else None
+                            except Exception:
+                                tp1_sync_pnl = None
+                            try:
+                                tp1_sync_px = float(getattr(s, "tp1", 0.0) or pos_ref.get("tp1") or 0.0)
+                            except Exception:
+                                tp1_sync_px = 0.0
+                            try:
+                                await db_store.set_tp1(
+                                    trade_id,
+                                    be_price=(float(pos_be_price) if pos_be_price > 0 else float(s.entry or 0.0)),
+                                    price=(float(tp1_sync_px) if tp1_sync_px > 0 else None),
+                                    pnl_pct=tp1_sync_pnl,
+                                )
+                                row["tp1_hit"] = True
+                                row["be_price"] = float(pos_be_price or s.entry or 0.0)
+                            except Exception:
+                                pass
+                        pos_status = str(linked_pos.get("status") or "").upper()
+                        if pos_status in ("CLOSED", "ERROR"):
+                            try:
+                                roi_sync = float(linked_pos.get("roi_percent")) if linked_pos.get("roi_percent") is not None else None
+                            except Exception:
+                                roi_sync = None
+                            close_reason = _normalize_autotrade_close_reason(pos_meta.get("closed_reason") or pos_ref.get("closed_reason") or ("ERROR" if pos_status == "ERROR" else ""))
+                            trade_status = _autotrade_reason_to_trade_status(close_reason, roi_sync, tp1_hit=bool(pos_tp1_hit))
+                            close_px = float(s.entry or 0.0)
+                            try:
+                                if trade_status == "BE":
+                                    close_px = float(pos_be_price or s.entry or 0.0)
+                                elif close_reason in ("TP2", "TP2_REACHED") and float(getattr(s, "tp2", 0.0) or 0.0) > 0:
+                                    close_px = float(getattr(s, "tp2", 0.0) or 0.0)
+                                elif close_reason in ("TP1_FULL", "TP1_FULL_NO_TP2", "FULL_TP1", "FULL_TP1_NO_TP2") and float(getattr(s, "tp1", 0.0) or 0.0) > 0:
+                                    close_px = float(getattr(s, "tp1", 0.0) or 0.0)
+                                elif trade_status == "LOSS" and float(getattr(s, "sl", 0.0) or 0.0) > 0:
+                                    close_px = float(getattr(s, "sl", 0.0) or 0.0)
+                            except Exception:
+                                close_px = float(s.entry or 0.0)
+                            await db_store.close_trade(
+                                trade_id,
+                                status=trade_status,
+                                price=float(close_px),
+                                pnl_total_pct=(float(roi_sync) if roi_sync is not None else (float(row.get("pnl_total_pct") or 0.0) if row.get("pnl_total_pct") is not None else None)),
+                            )
+                            self._sl_breach_since.pop(trade_id, None)
+                            try:
+                                if hasattr(self, "_tp1_peak_px"):
+                                    self._tp1_peak_px.pop(trade_id, None)
+                                if hasattr(self, "_be_skip_until"):
+                                    self._be_skip_until.pop(trade_id, None)
+                            except Exception:
+                                pass
+                        # Real autotrade positions are managed by autotrade_manager_loop.
+                        # Do not let the legacy signal tracker independently close them.
+                        continue
 
                     try:
                         price_f, price_src = await self._get_price_with_source(s)
