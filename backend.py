@@ -4162,12 +4162,17 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
             entry_order_qty = qty
             entry_market_unit = None
+            base_before = 0.0
             if mt == "spot":
                 # Bybit SPOT market BUY interprets qty as quote value by default.
                 # Send the user-configured USDT amount explicitly to avoid wrong units
                 # and decimal-length rejections (retCode 170148).
                 entry_order_qty = max(0.0, float(need_usdt))
                 entry_market_unit = "quoteCoin"
+                try:
+                    base_before = float(await _spot_base_balance(ex="bybit", api_key=api_key, api_secret=api_secret, passphrase=None, symbol=symbol))
+                except Exception:
+                    base_before = 0.0
 
             entry_res = await _bybit_order_create(
                 api_key=api_key,
@@ -4181,6 +4186,36 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 market_unit=entry_market_unit,
             )
             order_id = ((entry_res.get("result") or {}).get("orderId") or (entry_res.get("result") or {}).get("orderId"))
+
+            if mt == "spot":
+                exec_qty = 0.0
+                try:
+                    if order_id:
+                        entry_status = await _bybit_order_status(
+                            api_key=api_key,
+                            api_secret=api_secret,
+                            category=category,
+                            symbol=symbol,
+                            order_id=str(order_id),
+                        )
+                        lst = ((entry_status.get("result") or {}).get("list") or [])
+                        od = lst[0] if (lst and isinstance(lst[0], dict)) else {}
+                        exec_qty = float(od.get("cumExecQty") or 0.0)
+                except Exception:
+                    exec_qty = 0.0
+                if exec_qty <= 0:
+                    try:
+                        base_after = float(await _spot_base_balance(ex="bybit", api_key=api_key, api_secret=api_secret, passphrase=None, symbol=symbol))
+                        exec_qty = max(0.0, base_after - float(base_before or 0.0))
+                    except Exception:
+                        exec_qty = 0.0
+                if exec_qty <= 0:
+                    exec_qty = float(qty)
+                if qty_step > 0:
+                    exec_qty = _round_step(exec_qty, qty_step)
+                if min_qty > 0 and exec_qty < min_qty:
+                    raise ExchangeAPIError(f"Bybit SPOT entry executedQty<minQty after rounding: {exec_qty} < {min_qty}")
+                qty = float(exec_qty)
 
             has_tp2 = tp2 > 0 and abs(tp2 - tp1) > 1e-12
             qty1 = _round_step(qty * (0.5 if has_tp2 else 1.0), qty_step)
@@ -4390,8 +4425,28 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 if est_qty <= 0:
                     raise ExchangeAPIError("qty_estimate_zero")
 
+                qty_step = 0.0
+                min_qty = 0.0
+                try:
+                    if exchange == "okx":
+                        qty_step, min_qty, _tick = await _okx_instrument_filters(inst_type="SPOT", symbol=symbol)
+                    elif exchange == "mexc":
+                        qty_step, min_qty, _tick, _mn = await _mexc_symbol_filters(symbol)
+                    else:
+                        qty_step, min_qty, _tick, _mn = await _gate_symbol_filters(symbol)
+                except Exception:
+                    qty_step = 0.0
+                    min_qty = 0.0
+
                 if direction == "SHORT":
                     return _skip("spot_short_not_supported", exchange=exchange, market=market)
+
+                balance_passphrase = passphrase if exchange == "okx" else None
+                base_before = 0.0
+                try:
+                    base_before = float(await _spot_base_balance(ex=exchange, api_key=api_key, api_secret=api_secret, passphrase=balance_passphrase, symbol=symbol))
+                except Exception:
+                    base_before = 0.0
 
                 if exchange == "okx":
                     entry_order = await _okx_spot_market_buy(api_key=api_key, api_secret=api_secret, passphrase=passphrase, symbol=symbol, quote_usdt=need_usdt)
@@ -4399,6 +4454,23 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                     entry_order = await _mexc_spot_market_buy(api_key=api_key, api_secret=api_secret, symbol=symbol, quote_usdt=need_usdt)
                 else:
                     entry_order = await _gateio_spot_market_buy(api_key=api_key, api_secret=api_secret, symbol=symbol, quote_usdt=need_usdt)
+
+                managed_qty = float(est_qty)
+                try:
+                    base_after = float(await _spot_base_balance(ex=exchange, api_key=api_key, api_secret=api_secret, passphrase=balance_passphrase, symbol=symbol))
+                    delta_qty = max(0.0, base_after - float(base_before or 0.0))
+                    if delta_qty > 0:
+                        managed_qty = float(delta_qty)
+                except Exception:
+                    managed_qty = float(est_qty)
+                if managed_qty <= 0:
+                    managed_qty = float(est_qty)
+                if qty_step > 0:
+                    managed_qty = _round_step(managed_qty, qty_step)
+                if min_qty > 0 and managed_qty < min_qty:
+                    fallback_qty = _round_step(est_qty, qty_step) if qty_step > 0 else float(est_qty)
+                    if fallback_qty >= min_qty:
+                        managed_qty = float(fallback_qty)
 
                 ref = {
                     "exchange": exchange,
@@ -4414,7 +4486,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                     "be_price": float(px),
                     "be_moved": False,
                     "tp1_hit": False,
-                    "qty": float(est_qty),
+                    "qty": float(managed_qty),
                     "tp1": float(tp1 or 0.0),
                     "tp2": float(tp2 or 0.0),
                     "sl": float(sl or 0.0),
@@ -5622,15 +5694,57 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         continue
 
                     async def _close_market(q: float) -> bool:
-                        q2 = max(0.0, float(q))
-                        if q2 <= 0:
+                        requested_qty = max(0.0, float(q))
+                        if requested_qty <= 0:
                             return False
+
+                        tracked_qty = max(0.0, float(qty))
+                        full_close_requested = (tracked_qty <= 0.0) or (requested_qty >= max(tracked_qty * 0.995, tracked_qty - 1e-12))
+                        raw_qty = float(requested_qty)
+                        actual_qty = 0.0
+                        category_close = str(ref.get("category") or ("linear" if mt == "futures" else "spot"))
+
+                        try:
+                            if full_close_requested:
+                                if mt == "spot":
+                                    actual_qty = float(await _spot_base_balance(ex=ex, api_key=api_key, api_secret=api_secret, passphrase=passphrase, symbol=symbol))
+                                elif ex in ("binance", "bybit", "okx"):
+                                    actual_qty = abs(float(await _futures_position_size(ex=ex, api_key=api_key, api_secret=api_secret, symbol=symbol, category=category_close, passphrase=passphrase)))
+                        except Exception as e:
+                            _log_rate_limited(
+                                f"smart_actual_qty_err:{uid}:{ex}:{mt}:{symbol}",
+                                f"[SMART] actual size fetch failed {ex}/{mt} {symbol}: {e}",
+                                every_s=120,
+                                level="debug",
+                            )
+                            actual_qty = 0.0
+
+                        if actual_qty > 0:
+                            raw_qty = float(actual_qty)
+
                         # For real reduce-only close orders do not reject by minNotional/minQty.
-                        q2 = await _normalize_close_qty(ex=ex, mt=mt, symbol=symbol, qty=q2, px=px, is_reduce_close=True)
+                        q2 = await _normalize_close_qty(ex=ex, mt=mt, symbol=symbol, qty=raw_qty, px=px, is_reduce_close=True)
+
+                        if ex == "bybit" and mt == "spot":
+                            qty_step_dbg = 0.0
+                            try:
+                                qty_step_dbg, _min_qty_dbg, _tick_dbg = await _bybit_instrument_filters(category="spot", symbol=symbol)
+                            except Exception:
+                                qty_step_dbg = 0.0
+                            logger.info(
+                                "[SMART] bybit spot close qty symbol=%s category=spot tracked_qty=%s requested_qty=%s actual_qty=%s qty_step=%s normalized_qty=%s",
+                                symbol,
+                                tracked_qty,
+                                requested_qty,
+                                actual_qty,
+                                qty_step_dbg,
+                                q2,
+                            )
+
                         if q2 <= 0:
                             _log_rate_limited(
                                 f"smart_skip_small:{uid}:{ex}:{mt}:{symbol}",
-                                f"[SMART] skip close: normalized qty is zero {ex}/{mt} {symbol} px={px}",
+                                f"[SMART] skip close: normalized qty is zero {ex}/{mt} {symbol} px={px} requested={requested_qty} actual={actual_qty}",
                                 every_s=120,
                                 level="debug",
                             )
@@ -5665,7 +5779,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             await _bybit_order_create(
                                 api_key=api_key,
                                 api_secret=api_secret,
-                                category="linear",
+                                category=category_close,
                                 symbol=symbol,
                                 side=("Sell" if close_side == "SELL" else "Buy"),
                                 order_type="Market",
