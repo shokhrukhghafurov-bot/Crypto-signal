@@ -115,6 +115,7 @@ async def ensure_schema() -> None:
           user_id BIGINT NOT NULL,
           signal_id BIGINT NOT NULL, -- signal id used in bot callbacks (in-memory signal sequence)
           market TEXT NOT NULL CHECK (market IN ('SPOT','FUTURES')),
+          exchange TEXT NOT NULL DEFAULT 'manual',
           symbol TEXT NOT NULL,
           side TEXT NOT NULL,
           entry NUMERIC(18,8) NOT NULL,
@@ -124,6 +125,8 @@ async def ensure_schema() -> None:
           status TEXT NOT NULL CHECK (status IN ('ACTIVE','TP1','BE','WIN','LOSS','CLOSED')),
           tp1_hit BOOLEAN NOT NULL DEFAULT FALSE,
           be_price NUMERIC(18,8),
+          linked_position_id BIGINT,
+          managed_by TEXT,
           opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           closed_at TIMESTAMPTZ,
           pnl_total_pct NUMERIC(10,4),
@@ -131,6 +134,14 @@ async def ensure_schema() -> None:
           orig_text TEXT NOT NULL
         );
         """)
+
+        try:
+            await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS exchange TEXT NOT NULL DEFAULT 'manual';")
+            await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS linked_position_id BIGINT;")
+            await conn.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS managed_by TEXT;")
+            await conn.execute("UPDATE trades SET exchange='manual' WHERE exchange IS NULL OR exchange='';")
+        except Exception:
+            pass
 
         # --- Signal bot global settings (single row) ---
         await conn.execute("""
@@ -357,10 +368,13 @@ ON CONFLICT (id) DO NOTHING;
         await conn.execute("""
         -- Drop legacy full unique index (prevents reopening after close)
         DROP INDEX IF EXISTS uq_trades_user_signal;
+        DROP INDEX IF EXISTS uq_trades_user_signal_active;
 
-        -- Allow history: unique only for ACTIVE states (user can't have 2 active trades for same signal)
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_user_signal_active
-        ON trades (user_id, signal_id)
+        -- Allow one ACTIVE trade per user+signal+exchange. This lets the same signal run
+        -- independently on multiple exchanges while still preventing duplicate active rows
+        -- on the same venue.
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_user_signal_exchange_active
+        ON trades (user_id, signal_id, exchange)
         WHERE status IN ('ACTIVE','TP1');
 """)
 
@@ -546,12 +560,12 @@ ON CONFLICT (id) DO NOTHING;
           status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN','CLOSED','ERROR')),
           api_order_ref TEXT,
           meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+          linked_trade_id BIGINT,
           mgr_owner TEXT,
           mgr_lock_until TIMESTAMPTZ,
           mgr_lock_acquired_at TIMESTAMPTZ,
           opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          closed_at TIMESTAMPTZ,
-          UNIQUE (user_id, signal_id, exchange, market_type)
+          closed_at TIMESTAMPTZ
         );
         """)
 
@@ -559,6 +573,30 @@ ON CONFLICT (id) DO NOTHING;
         try:
             await conn.execute("ALTER TABLE autotrade_positions ADD COLUMN IF NOT EXISTS pnl_usdt NUMERIC(18,8);")
             await conn.execute("ALTER TABLE autotrade_positions ADD COLUMN IF NOT EXISTS roi_percent NUMERIC(18,8);")
+            await conn.execute("ALTER TABLE autotrade_positions ADD COLUMN IF NOT EXISTS linked_trade_id BIGINT;")
+        except Exception:
+            pass
+
+        # Legacy builds used a full UNIQUE(user_id, signal_id, exchange, market_type),
+        # which prevented keeping historical rows and could reopen/update the wrong position.
+        # The manager now relies on OPEN-only uniqueness per concrete venue+symbol+side.
+        try:
+            await conn.execute("""
+            DO $$
+            DECLARE
+              c RECORD;
+            BEGIN
+              FOR c IN
+                SELECT conname
+                FROM pg_constraint
+                WHERE conrelid='autotrade_positions'::regclass
+                  AND contype='u'
+                  AND pg_get_constraintdef(oid) ILIKE '%(user_id, signal_id, exchange, market_type)%'
+              LOOP
+                EXECUTE format('ALTER TABLE autotrade_positions DROP CONSTRAINT IF EXISTS %I;', c.conname);
+              END LOOP;
+            END $$;
+            """)
         except Exception:
             pass
 
@@ -575,9 +613,10 @@ ON CONFLICT (id) DO NOTHING;
 # Prevent duplicate OPEN positions per symbol (race-condition safe)
         # NOTE: partial unique index; Postgres supports this.
         try:
+            await conn.execute("DROP INDEX IF EXISTS idx_autotrade_positions_user_symbol_open;")
             await conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_autotrade_positions_user_symbol_open
-            ON autotrade_positions (user_id, market_type, symbol)
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_autotrade_positions_user_exchange_symbol_side_open
+            ON autotrade_positions (user_id, exchange, market_type, symbol, side)
             WHERE status='OPEN';
             """)
         except Exception:
@@ -926,12 +965,18 @@ async def open_trade_once(
     tp2: float | None,
     sl: float | None,
     orig_text: str,
+    exchange: str | None = None,
+    linked_position_id: int | None = None,
+    managed_by: str | None = None,
 ) -> Tuple[bool, Optional[int]]:
     """
     Inserts a new trade if not already opened (unique user_id+signal_id).
     Returns (inserted, trade_db_id).
     """
     pool = get_pool()
+    ex_name = str(exchange or 'manual').lower().strip() or 'manual'
+    linked_pos = int(linked_position_id) if linked_position_id is not None else None
+    mgr_name = str(managed_by or '').strip() or None
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         try:
             # Prevent duplicate open trades per symbol+market for the same user.
@@ -943,12 +988,14 @@ async def open_trade_once(
                 WHERE user_id=$1
                   AND UPPER(market)=UPPER($2)
                   AND UPPER(symbol)=UPPER($3)
+                  AND LOWER(COALESCE(exchange,'manual'))=LOWER($4)
+                  AND UPPER(side)=UPPER($5)
                   AND status IN ('ACTIVE','TP1')
                   AND closed_at IS NULL
                 ORDER BY opened_at DESC
                 LIMIT 1;
                 """,
-                int(user_id), str(market or ''), str(symbol or '')
+                int(user_id), str(market or ''), str(symbol or ''), ex_name, str(side or '')
             )
             if existing_sym is not None:
                 return False, None
@@ -956,16 +1003,18 @@ async def open_trade_once(
             async def _insert(with_signal_id: int) -> Optional[int]:
                 r = await conn.fetchrow(
                     """
-                    INSERT INTO trades (user_id, signal_id, market, symbol, side, entry, tp1, tp2, sl, status, orig_text)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'ACTIVE',$10)
-                    ON CONFLICT (user_id, signal_id) WHERE status IN ('ACTIVE','TP1') DO NOTHING
+                    INSERT INTO trades (user_id, signal_id, market, exchange, symbol, side, entry, tp1, tp2, sl, status, orig_text, linked_position_id, managed_by)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'ACTIVE',$11,$12,$13)
+                    ON CONFLICT (user_id, signal_id, exchange) WHERE status IN ('ACTIVE','TP1') DO NOTHING
                     RETURNING id;
                     """,
-                    int(user_id), int(with_signal_id), market, symbol, side, float(entry),
+                    int(user_id), int(with_signal_id), market, ex_name, symbol, side, float(entry),
                     (float(tp1) if tp1 is not None else None),
                     (float(tp2) if tp2 is not None else None),
                     (float(sl) if sl is not None else None),
                     orig_text or "",
+                    linked_pos,
+                    mgr_name,
                 )
                 return int(r["id"]) if (r and r.get("id") is not None) else None
 
@@ -982,23 +1031,26 @@ async def open_trade_once(
             # On legacy DBs there may be a FULL UNIQUE(user_id, signal_id) which blocks reopening even after WIN/LOSS.
             existing = await conn.fetchrow(
                 """
-                SELECT id, market, status, closed_at
+                SELECT id, market, exchange, status, closed_at, symbol
                 FROM trades
-                WHERE user_id=$1 AND signal_id=$2
+                WHERE user_id=$1 AND signal_id=$2 AND LOWER(COALESCE(exchange,'manual'))=LOWER($3)
                 ORDER BY opened_at DESC
                 LIMIT 1;
                 """,
-                int(user_id), int(signal_id),
+                int(user_id), int(signal_id), ex_name,
             )
             if existing:
                 ex_market = str(existing.get("market") or "").upper()
+                ex_exchange = str(existing.get("exchange") or "manual").lower()
                 st = str(existing.get("status") or "").upper()
                 closed_at = existing.get("closed_at")
                 ex_symbol = str(existing.get('symbol') or '').upper()
                 # Truly active -> treat as already opened
                 if (
                     ex_market == str(market or "").upper()
+                    and ex_exchange == ex_name
                     and ex_symbol == str(symbol or "").upper()
+                    and str(existing.get("side") or "").upper() == str(side or "").upper()
                     and st in ("ACTIVE", "TP1")
                     and closed_at is None
                 ):
@@ -1029,8 +1081,8 @@ async def list_user_trades(user_id: int, *, include_closed: bool = True, limit: 
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         rows = await conn.fetch(
             f"""
-            SELECT t.id, t.user_id, t.signal_id, t.market, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
-                   t.status, t.tp1_hit, t.be_price, t.opened_at, t.closed_at, t.pnl_total_pct, t.orig_text,
+            SELECT t.id, t.user_id, t.signal_id, t.market, t.exchange, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
+                   t.status, t.tp1_hit, t.be_price, t.linked_position_id, t.managed_by, t.opened_at, t.closed_at, t.pnl_total_pct, t.orig_text,
                    e_tp1.tp1_at
             FROM trades t
             LEFT JOIN LATERAL (
@@ -1048,13 +1100,13 @@ async def list_user_trades(user_id: int, *, include_closed: bool = True, limit: 
         )
         return [dict(r) for r in rows]
 
-async def get_trade_by_user_signal(user_id: int, signal_id: int) -> Optional[Dict[str, Any]]:
+async def get_trade_by_user_signal(user_id: int, signal_id: int, *, exchange: str | None = None) -> Optional[Dict[str, Any]]:
     pool = get_pool()
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         row = await conn.fetchrow(
             """
-            SELECT t.id, t.user_id, t.signal_id, t.market, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
-                   t.status, t.tp1_hit, t.be_price, t.opened_at, t.closed_at, t.pnl_total_pct, t.orig_text,
+            SELECT t.id, t.user_id, t.signal_id, t.market, t.exchange, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
+                   t.status, t.tp1_hit, t.be_price, t.linked_position_id, t.managed_by, t.opened_at, t.closed_at, t.pnl_total_pct, t.orig_text,
                    e_tp1.tp1_at
             FROM trades t
             LEFT JOIN LATERAL (
@@ -1065,8 +1117,11 @@ async def get_trade_by_user_signal(user_id: int, signal_id: int) -> Optional[Dic
               LIMIT 1
             ) e_tp1 ON TRUE
             WHERE t.user_id=$1 AND t.signal_id=$2
+              AND ($3::TEXT IS NULL OR LOWER(COALESCE(t.exchange,'manual'))=LOWER($3))
+            ORDER BY t.opened_at DESC
+            LIMIT 1
             """,
-            int(user_id), int(signal_id)
+            int(user_id), int(signal_id), (str(exchange).lower() if exchange else None)
         )
         return dict(row) if row else None
 
@@ -1077,8 +1132,8 @@ async def get_trade_by_id(user_id: int, trade_id: int) -> Optional[Dict[str, Any
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         row = await conn.fetchrow(
             """
-            SELECT t.id, t.user_id, t.signal_id, t.market, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
-                   t.status, t.tp1_hit, t.be_price, t.opened_at, t.closed_at, t.pnl_total_pct, t.orig_text,
+            SELECT t.id, t.user_id, t.signal_id, t.market, t.exchange, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
+                   t.status, t.tp1_hit, t.be_price, t.linked_position_id, t.managed_by, t.opened_at, t.closed_at, t.pnl_total_pct, t.orig_text,
                    e_tp1.tp1_at
             FROM trades t
             LEFT JOIN LATERAL (
@@ -1099,8 +1154,8 @@ async def list_active_trades(limit: int = 500) -> List[Dict[str, Any]]:
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         rows = await conn.fetch(
             """
-            SELECT t.id, t.user_id, t.signal_id, t.market, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
-                   t.status, t.tp1_hit, t.be_price, t.opened_at, t.closed_at, t.pnl_total_pct, t.orig_text,
+            SELECT t.id, t.user_id, t.signal_id, t.market, t.exchange, t.symbol, t.side, t.entry, t.tp1, t.tp2, t.sl,
+                   t.status, t.tp1_hit, t.be_price, t.linked_position_id, t.managed_by, t.opened_at, t.closed_at, t.pnl_total_pct, t.orig_text,
                    e_tp1.tp1_at
             FROM trades t
             LEFT JOIN LATERAL (
@@ -1117,6 +1172,102 @@ async def list_active_trades(limit: int = 500) -> List[Dict[str, Any]]:
             int(limit),
         )
         return [dict(r) for r in rows]
+
+
+async def update_trade_autotrade_link(*, trade_id: int, position_id: int | None = None, exchange: str | None = None, managed_by: str | None = None) -> None:
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        await conn.execute(
+            """
+            UPDATE trades
+            SET linked_position_id=COALESCE($2, linked_position_id),
+                exchange=COALESCE($3, exchange),
+                managed_by=COALESCE($4, managed_by)
+            WHERE id=$1;
+            """,
+            int(trade_id),
+            (int(position_id) if position_id is not None else None),
+            (str(exchange).lower() if exchange else None),
+            (str(managed_by) if managed_by else None),
+        )
+
+
+async def get_autotrade_position_by_id(row_id: int) -> Optional[Dict[str, Any]]:
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, user_id, signal_id, exchange, market_type, symbol, side, allocated_usdt, pnl_usdt, roi_percent,
+                   status, api_order_ref, meta, linked_trade_id, opened_at, closed_at
+            FROM autotrade_positions
+            WHERE id=$1
+            LIMIT 1;
+            """,
+            int(row_id),
+        )
+        return dict(row) if row else None
+
+
+async def find_autotrade_position_for_trade(
+    *,
+    user_id: int,
+    signal_id: int,
+    market: str,
+    symbol: str,
+    exchange: str | None = None,
+    side: str | None = None,
+    trade_id: int | None = None,
+    include_closed: bool = True,
+) -> Optional[Dict[str, Any]]:
+    pool = get_pool()
+    mt = 'futures' if str(market or '').upper() == 'FUTURES' else 'spot'
+    ex = str(exchange).lower() if exchange else None
+    pos_side = str(side or '').upper().strip() or None
+    linked_trade_id = int(trade_id) if trade_id is not None else None
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, user_id, signal_id, exchange, market_type, symbol, side, allocated_usdt, pnl_usdt, roi_percent,
+                   status, api_order_ref, meta, linked_trade_id, opened_at, closed_at
+            FROM autotrade_positions
+            WHERE user_id=$1
+              AND (
+                    ($6::BIGINT IS NOT NULL AND linked_trade_id=$6)
+                    OR (
+                        signal_id=$2
+                        AND market_type=$3
+                        AND UPPER(symbol)=UPPER($4)
+                        AND ($5::TEXT IS NULL OR LOWER(exchange)=LOWER($5))
+                        AND ($7::TEXT IS NULL OR UPPER(side)=UPPER($7))
+                    )
+                  )
+              AND ($8::BOOL OR status='OPEN')
+            ORDER BY
+              CASE WHEN ($6::BIGINT IS NOT NULL AND linked_trade_id=$6) THEN 0 ELSE 1 END,
+              CASE WHEN status='OPEN' THEN 0 ELSE 1 END,
+              opened_at DESC,
+              id DESC
+            LIMIT 1;
+            """,
+            int(user_id), int(signal_id), mt, str(symbol or ''), ex, linked_trade_id, pos_side, bool(include_closed),
+        )
+        return dict(row) if row else None
+
+
+async def update_autotrade_trade_link(*, row_id: int, trade_id: int | None = None) -> None:
+    pool = get_pool()
+    rid = int(row_id)
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        await conn.execute(
+            """
+            UPDATE autotrade_positions
+            SET linked_trade_id=COALESCE($2, linked_trade_id)
+            WHERE id=$1;
+            """,
+            rid,
+            (int(trade_id) if trade_id is not None else None),
+        )
+
 
 async def set_tp1(trade_id: int, *, be_price: float, price: float | None = None, pnl_pct: float | None = None) -> None:
     pool = get_pool()
@@ -2511,8 +2662,14 @@ async def create_autotrade_position(
     side: str,
     allocated_usdt: float,
     api_order_ref: Optional[str] = None,
-) -> None:
-    """Insert or update autotrade position row as OPEN."""
+    journal_orig_text: Optional[str] = None,
+) -> Optional[int]:
+    """Insert or refresh an OPEN autotrade position row.
+
+    OPEN uniqueness is per concrete venue+market+symbol+side, while closed rows stay
+    in history as separate records. A linked shadow trade is created/updated so the
+    manager controls the real position and track_loop mirrors the journal state.
+    """
     pool = get_pool()
     uid = int(user_id)
     ex = (exchange or "binance").lower().strip()
@@ -2532,47 +2689,173 @@ async def create_autotrade_position(
     if side not in ("BUY", "SELL"):
         side = "BUY"
     alloc = float(allocated_usdt or 0.0)
+    pos_id: Optional[int] = None
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
-        # Prevent duplicates: if there is already an OPEN position for this symbol, do nothing.
         row = await conn.fetchrow(
             """
-            SELECT signal_id, exchange FROM autotrade_positions
-            WHERE user_id=$1 AND market_type=$2 AND symbol=$3 AND status='OPEN'
+            SELECT id, signal_id
+            FROM autotrade_positions
+            WHERE user_id=$1
+              AND exchange=$2
+              AND market_type=$3
+              AND symbol=$4
+              AND side=$5
+              AND status='OPEN'
+            ORDER BY opened_at DESC, id DESC
             LIMIT 1;
             """,
-            uid, mt, sym,
+            uid, ex, mt, sym, side,
         )
         if row:
-            # Allow updating the same reserved/active row (same unique identity),
-            # but skip if another OPEN position already exists for this symbol.
+            pos_id = int(row.get("id") or 0) or None
             try:
-                if int(row.get("signal_id") or 0) != int(signal_id or 0) or str(row.get("exchange") or "").lower() != ex:
-                    return
+                existing_signal_id = int(row.get("signal_id") or 0)
+                incoming_signal_id = int(signal_id or 0)
             except Exception:
-                return
+                existing_signal_id = 0
+                incoming_signal_id = 0
+            if pos_id and existing_signal_id not in (0, incoming_signal_id):
+                return pos_id
+            await conn.execute(
+                """
+                UPDATE autotrade_positions
+                SET signal_id=COALESCE(signal_id, $2),
+                    allocated_usdt=$3,
+                    api_order_ref=COALESCE($4, api_order_ref),
+                    status='OPEN',
+                    closed_at=NULL
+                WHERE id=$1;
+                """,
+                int(pos_id),
+                (int(signal_id) if signal_id is not None else None),
+                alloc,
+                api_order_ref,
+            )
+        else:
+            row2 = await conn.fetchrow(
+                """
+                INSERT INTO autotrade_positions(
+                    user_id, signal_id, exchange, market_type, symbol, side,
+                    allocated_usdt, status, api_order_ref, opened_at
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,'OPEN',$8,NOW())
+                ON CONFLICT (user_id, exchange, market_type, symbol, side) WHERE status='OPEN'
+                DO NOTHING
+                RETURNING id;
+                """,
+                uid,
+                (int(signal_id) if signal_id is not None else None),
+                ex,
+                mt,
+                sym,
+                side,
+                alloc,
+                api_order_ref,
+            )
+            if row2 and row2.get("id") is not None:
+                pos_id = int(row2["id"])
+            else:
+                row3 = await conn.fetchrow(
+                    """
+                    SELECT id, signal_id
+                    FROM autotrade_positions
+                    WHERE user_id=$1
+                      AND exchange=$2
+                      AND market_type=$3
+                      AND symbol=$4
+                      AND side=$5
+                      AND status='OPEN'
+                    ORDER BY opened_at DESC, id DESC
+                    LIMIT 1;
+                    """,
+                    uid, ex, mt, sym, side,
+                )
+                if row3 and row3.get("id") is not None:
+                    pos_id = int(row3["id"])
+                    try:
+                        existing_signal_id = int(row3.get("signal_id") or 0)
+                        incoming_signal_id = int(signal_id or 0)
+                    except Exception:
+                        existing_signal_id = 0
+                        incoming_signal_id = 0
+                    if existing_signal_id in (0, incoming_signal_id):
+                        await conn.execute(
+                            """
+                            UPDATE autotrade_positions
+                            SET signal_id=COALESCE(signal_id, $2),
+                                allocated_usdt=$3,
+                                api_order_ref=COALESCE($4, api_order_ref),
+                                status='OPEN',
+                                closed_at=NULL
+                            WHERE id=$1;
+                            """,
+                            int(pos_id),
+                            (int(signal_id) if signal_id is not None else None),
+                            alloc,
+                            api_order_ref,
+                        )
+                    else:
+                        return pos_id
 
+    if pos_id and signal_id:
+        try:
+            ref = {}
+            if isinstance(api_order_ref, dict):
+                ref = dict(api_order_ref)
+            elif api_order_ref:
+                ref = json.loads(str(api_order_ref) or "{}") or {}
+        except Exception:
+            ref = {}
 
-        await conn.execute(
-            """
-            INSERT INTO autotrade_positions(user_id, signal_id, exchange, market_type, symbol, side, allocated_usdt, status, api_order_ref, opened_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,'OPEN',$8,NOW())
-            ON CONFLICT (user_id, signal_id, exchange, market_type)
-            DO UPDATE SET allocated_usdt=EXCLUDED.allocated_usdt,
-                          status='OPEN',
-                          api_order_ref=EXCLUDED.api_order_ref,
-                          opened_at=NOW(),
-                          closed_at=NULL;
-            """,
-            uid,
-            signal_id,
-            ex,
-            mt,
-            sym,
-            side,
-            alloc,
-            api_order_ref,
-        )
+        def _num(v):
+            try:
+                if v is None or v == "":
+                    return None
+                return float(v)
+            except Exception:
+                return None
 
+        market = "FUTURES" if mt == "futures" else "SPOT"
+        trade_side = "LONG" if side in ("BUY", "LONG") else "SHORT"
+        entry = _num(ref.get("entry_price"))
+        if entry is None:
+            entry = _num(ref.get("entry")) or 0.0
+        tp1 = _num(ref.get("tp1"))
+        tp2 = _num(ref.get("tp2"))
+        sl = _num(ref.get("sl"))
+        orig_text = str(journal_orig_text or f"[AUTOTRADE {ex.upper()} {mt.upper()}]")
+        trade_id = None
+        try:
+            inserted, trade_id = await open_trade_once(
+                user_id=uid,
+                signal_id=int(signal_id),
+                market=market,
+                exchange=ex,
+                symbol=sym,
+                side=trade_side,
+                entry=float(entry or 0.0),
+                tp1=tp1,
+                tp2=tp2,
+                sl=sl,
+                orig_text=orig_text,
+                linked_position_id=int(pos_id),
+                managed_by="autotrade_manager",
+            )
+            if (not inserted) or (trade_id is None):
+                tr = await get_trade_by_user_signal(uid, int(signal_id), exchange=ex)
+                trade_id = int(tr.get("id") or 0) if tr else None
+        except Exception:
+            trade_id = None
+        if trade_id:
+            try:
+                await update_trade_autotrade_link(trade_id=int(trade_id), position_id=int(pos_id), exchange=ex, managed_by="autotrade_manager")
+            except Exception:
+                pass
+            try:
+                await update_autotrade_trade_link(row_id=int(pos_id), trade_id=int(trade_id))
+            except Exception:
+                pass
+    return pos_id
 
 
 async def reserve_autotrade_position(
@@ -2588,8 +2871,8 @@ async def reserve_autotrade_position(
 ) -> bool:
     """Atomically reserve an OPEN position row *before* placing orders.
 
-    Returns True if reservation inserted, False if an OPEN position already exists
-    (by symbol) or the (user_id, signal_id, exchange, market_type) uniqueness would conflict.
+    Returns True if reservation inserted, False if the concrete venue+market+symbol+side
+    is already reserved/open for the user.
     """
     pool = get_pool()
     uid = int(user_id)
@@ -2599,8 +2882,12 @@ async def reserve_autotrade_position(
     side = (side or "BUY").upper().strip()
     alloc = float(allocated_usdt or 0.0)
 
-    if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
-        ex = "binance"
+    if mt == "futures":
+        if ex not in ("binance", "bybit", "okx"):
+            ex = "binance"
+    else:
+        if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
+            ex = "binance"
     if mt not in ("spot", "futures"):
         mt = "spot"
     if not sym:
@@ -2611,26 +2898,25 @@ async def reserve_autotrade_position(
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
         row = await conn.fetchrow(
             """
-            WITH ins AS (
-                INSERT INTO autotrade_positions(
-                    user_id, signal_id, exchange, market_type, symbol, side,
-                    allocated_usdt, status, api_order_ref, opened_at
-                )
-                SELECT $1,$2,$3,$4,$5,$6,$7,'OPEN',$8,NOW()
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM autotrade_positions
-                    WHERE user_id=$1 AND market_type=$4 AND symbol=$5 AND status='OPEN'
-                    LIMIT 1
-                )
-                ON CONFLICT (user_id, signal_id, exchange, market_type)
-                DO NOTHING
-                RETURNING 1
+            INSERT INTO autotrade_positions(
+                user_id, signal_id, exchange, market_type, symbol, side,
+                allocated_usdt, status, api_order_ref, opened_at
             )
-            SELECT 1 AS ok FROM ins;
+            VALUES ($1,$2,$3,$4,$5,$6,$7,'OPEN',$8,NOW())
+            ON CONFLICT (user_id, exchange, market_type, symbol, side) WHERE status='OPEN'
+            DO NOTHING
+            RETURNING id;
             """,
-            uid, signal_id, ex, mt, sym, side, alloc, reservation_ref,
+            uid,
+            (int(signal_id) if signal_id is not None else None),
+            ex,
+            mt,
+            sym,
+            side,
+            alloc,
+            reservation_ref,
         )
-        return bool(row)
+        return bool(row and row.get("id") is not None)
 
 
 async def close_autotrade_position(
@@ -2642,29 +2928,63 @@ async def close_autotrade_position(
     status: str = "CLOSED",
     pnl_usdt: Optional[float] = None,
     roi_percent: Optional[float] = None,
+    row_id: int | None = None,
 ) -> None:
     pool = get_pool()
     uid = int(user_id)
     ex = (exchange or "binance").lower().strip()
     mt = (market_type or "spot").lower().strip()
     st = (status or "CLOSED").upper().strip()
+    rid = int(row_id) if row_id is not None else None
     if st not in ("CLOSED", "ERROR"):
         st = "CLOSED"
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        if rid is not None and rid > 0:
+            await conn.execute(
+                """
+                UPDATE autotrade_positions
+                SET status=$2,
+                    closed_at=NOW(),
+                    mgr_owner=NULL,
+                    mgr_lock_until=NULL,
+                    mgr_lock_acquired_at=NULL,
+                    pnl_usdt=COALESCE($3, pnl_usdt),
+                    roi_percent=COALESCE($4, roi_percent)
+                WHERE id=$1 AND status='OPEN';
+                """,
+                rid,
+                st,
+                pnl_usdt,
+                roi_percent,
+            )
+            return
+
         await conn.execute(
             """
-            UPDATE autotrade_positions
+            WITH pick AS (
+                SELECT id
+                FROM autotrade_positions
+                WHERE user_id=$1
+                  AND ($2::BIGINT IS NULL OR signal_id=$2)
+                  AND exchange=$3
+                  AND market_type=$4
+                  AND status='OPEN'
+                ORDER BY opened_at DESC, id DESC
+                LIMIT 1
+            )
+            UPDATE autotrade_positions ap
             SET status=$5,
                 closed_at=NOW(),
                 mgr_owner=NULL,
                 mgr_lock_until=NULL,
                 mgr_lock_acquired_at=NULL,
-                pnl_usdt=COALESCE($6, pnl_usdt),
-                roi_percent=COALESCE($7, roi_percent)
-            WHERE user_id=$1 AND signal_id=$2 AND exchange=$3 AND market_type=$4;
+                pnl_usdt=COALESCE($6, ap.pnl_usdt),
+                roi_percent=COALESCE($7, ap.roi_percent)
+            FROM pick
+            WHERE ap.id=pick.id;
             """,
             uid,
-            signal_id,
+            (int(signal_id) if signal_id is not None else None),
             ex,
             mt,
             st,
