@@ -3476,12 +3476,12 @@ async def get_autotrade_stats(
 ) -> Dict[str, Any]:
     """Return Auto-trade stats for the period.
 
-    Robustness notes:
+    Notes:
     - period boundaries are computed in the bot/app timezone and converted to UTC;
       this keeps "Сегодня/Неделя/Месяц" aligned with the Telegram UI.
-    - some exchanges/managers may persist only ``roi_percent`` on close (or ``pnl_usdt``
-      may be temporarily unavailable). For summary counts we derive the sign from either
-      ``pnl_usdt`` or ``roi_percent`` so LOSS/WIN closes are not silently skipped.
+    - some closes (especially smart-manager virtual exits) may temporarily miss top-level
+      pnl_usdt/roi_percent in ``autotrade_positions``. We therefore backfill the stats view
+      from linked trades and, when needed, approximate PnL from persisted api_order_ref/meta.
     - ``active`` prefers the real current OPEN count, but if a short-lived sync lag makes
       it zero while the cohort math clearly shows still-open trades, we fall back to the
       residual ``opened - closed_total`` for the selected period.
@@ -3496,126 +3496,279 @@ async def get_autotrade_stats(
         pr = "today"
 
     since = _autotrade_period_start(pr)
+    fee_rate_spot = max(0.0, float(os.getenv("FEE_RATE_SPOT", "0.001") or 0.001))
+    fee_rate_futures = max(0.0, float(os.getenv("FEE_RATE_FUTURES", "0.001") or 0.001))
+
+    def _as_float(v: Any, default: float = 0.0) -> float:
+        try:
+            if v is None or v == "":
+                return float(default)
+            return float(v)
+        except Exception:
+            return float(default)
+
+    def _safe_json_obj(v: Any) -> Dict[str, Any]:
+        try:
+            if isinstance(v, dict):
+                return dict(v)
+            if isinstance(v, str) and v.strip():
+                obj = json.loads(v)
+                return dict(obj) if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+        return {}
+
+    def _boolish(v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        s = str(v or "").strip().lower()
+        return s in ("1", "true", "yes", "y", "on")
+
+    def _approx_from_ref(row: Dict[str, Any]) -> tuple[float | None, float | None]:
+        ref = _safe_json_obj(row.get("api_order_ref"))
+        meta = _safe_json_obj(row.get("meta"))
+
+        entry = _as_float(ref.get("entry_price") or ref.get("entry"), 0.0)
+        qty = _as_float(ref.get("qty"), 0.0)
+        if entry <= 0 or qty <= 0:
+            return None, None
+
+        reason = str(meta.get("closed_reason") or ref.get("closed_reason") or "").upper().strip()
+        tp1 = _as_float(ref.get("tp1"), 0.0)
+        tp2 = _as_float(ref.get("tp2"), 0.0)
+        sl = _as_float(ref.get("sl"), 0.0)
+        be_price = _as_float(meta.get("be_price") or ref.get("be_price"), 0.0)
+        tp1_hit = _boolish(meta.get("tp1_hit") if ("tp1_hit" in meta) else ref.get("tp1_hit"))
+
+        exit_price = 0.0
+        if reason == "TP2":
+            exit_price = tp2
+        elif reason in ("FULL_TP1", "FULL_TP1_NO_TP2"):
+            exit_price = tp1
+        elif reason == "BE":
+            exit_price = be_price if be_price > 0 else entry
+        elif reason == "SL":
+            exit_price = be_price if (tp1_hit and be_price > 0) else sl
+        if exit_price <= 0:
+            return None, None
+
+        side = str(row.get("side") or ref.get("side") or "BUY").upper().strip()
+        if side in ("SELL", "SHORT"):
+            pnl_gross = (entry - exit_price) * qty
+        else:
+            pnl_gross = (exit_price - entry) * qty
+
+        fee_rate = fee_rate_futures if str(row.get("market_type") or "spot").lower() == "futures" else fee_rate_spot
+        fees_est = fee_rate * ((entry * qty) + (exit_price * qty))
+        realized_pnl = _as_float(ref.get("realized_pnl_usdt"), 0.0)
+        realized_fee = _as_float(ref.get("realized_fee_usdt"), 0.0)
+        pnl_net = float(pnl_gross) - float(fees_est) + float(realized_pnl) - float(realized_fee)
+
+        alloc = _as_float(row.get("allocated_usdt"), 0.0)
+        roi = (pnl_net / alloc * 100.0) if alloc > 0 else None
+        return float(pnl_net), (float(roi) if roi is not None else None)
+
+    if mt == "all":
+        opened_q = """
+            SELECT COUNT(*)
+            FROM autotrade_positions
+            WHERE user_id=$1 AND opened_at >= $2
+        """
+        opened_args = (uid, since)
+        active_q = """
+            SELECT COUNT(*)
+            FROM autotrade_positions
+            WHERE user_id=$1 AND status='OPEN'
+        """
+        active_args = (uid,)
+        closed_q = """
+            SELECT
+                ap.id,
+                ap.market_type,
+                ap.side,
+                ap.allocated_usdt,
+                ap.pnl_usdt,
+                ap.roi_percent,
+                ap.api_order_ref,
+                ap.meta,
+                tr.status AS trade_status,
+                tr.pnl_total_pct AS trade_pnl_total_pct
+            FROM autotrade_positions ap
+            LEFT JOIN LATERAL (
+                SELECT t.status, t.pnl_total_pct, t.closed_at, t.id
+                FROM trades t
+                WHERE t.user_id = ap.user_id
+                  AND (
+                        (ap.linked_trade_id IS NOT NULL AND t.id = ap.linked_trade_id)
+                        OR (t.linked_position_id = ap.id)
+                        OR (
+                            ap.signal_id IS NOT NULL
+                            AND t.signal_id = ap.signal_id
+                            AND UPPER(t.market) = CASE WHEN ap.market_type = 'futures' THEN 'FUTURES' ELSE 'SPOT' END
+                            AND UPPER(t.symbol) = UPPER(ap.symbol)
+                            AND (
+                                (UPPER(ap.side) = 'BUY' AND UPPER(t.side) IN ('BUY', 'LONG'))
+                                OR (UPPER(ap.side) = 'SELL' AND UPPER(t.side) IN ('SELL', 'SHORT'))
+                            )
+                            AND t.opened_at BETWEEN (ap.opened_at - INTERVAL '12 hours') AND (COALESCE(ap.closed_at, ap.opened_at) + INTERVAL '12 hours')
+                        )
+                  )
+                ORDER BY
+                    CASE
+                        WHEN ap.linked_trade_id IS NOT NULL AND t.id = ap.linked_trade_id THEN 0
+                        WHEN t.linked_position_id = ap.id THEN 1
+                        ELSE 2
+                    END,
+                    CASE WHEN t.closed_at IS NULL THEN 1 ELSE 0 END,
+                    t.closed_at DESC NULLS LAST,
+                    t.id DESC
+                LIMIT 1
+            ) tr ON TRUE
+            WHERE ap.user_id=$1
+              AND ap.status='CLOSED'
+              AND ap.closed_at IS NOT NULL
+              AND ap.closed_at >= $2
+        """
+        closed_args = (uid, since)
+    else:
+        opened_q = """
+            SELECT COUNT(*)
+            FROM autotrade_positions
+            WHERE user_id=$1 AND market_type=$2 AND opened_at >= $3
+        """
+        opened_args = (uid, mt, since)
+        active_q = """
+            SELECT COUNT(*)
+            FROM autotrade_positions
+            WHERE user_id=$1 AND market_type=$2 AND status='OPEN'
+        """
+        active_args = (uid, mt)
+        closed_q = """
+            SELECT
+                ap.id,
+                ap.market_type,
+                ap.side,
+                ap.allocated_usdt,
+                ap.pnl_usdt,
+                ap.roi_percent,
+                ap.api_order_ref,
+                ap.meta,
+                tr.status AS trade_status,
+                tr.pnl_total_pct AS trade_pnl_total_pct
+            FROM autotrade_positions ap
+            LEFT JOIN LATERAL (
+                SELECT t.status, t.pnl_total_pct, t.closed_at, t.id
+                FROM trades t
+                WHERE t.user_id = ap.user_id
+                  AND (
+                        (ap.linked_trade_id IS NOT NULL AND t.id = ap.linked_trade_id)
+                        OR (t.linked_position_id = ap.id)
+                        OR (
+                            ap.signal_id IS NOT NULL
+                            AND t.signal_id = ap.signal_id
+                            AND UPPER(t.market) = CASE WHEN ap.market_type = 'futures' THEN 'FUTURES' ELSE 'SPOT' END
+                            AND UPPER(t.symbol) = UPPER(ap.symbol)
+                            AND (
+                                (UPPER(ap.side) = 'BUY' AND UPPER(t.side) IN ('BUY', 'LONG'))
+                                OR (UPPER(ap.side) = 'SELL' AND UPPER(t.side) IN ('SELL', 'SHORT'))
+                            )
+                            AND t.opened_at BETWEEN (ap.opened_at - INTERVAL '12 hours') AND (COALESCE(ap.closed_at, ap.opened_at) + INTERVAL '12 hours')
+                        )
+                  )
+                ORDER BY
+                    CASE
+                        WHEN ap.linked_trade_id IS NOT NULL AND t.id = ap.linked_trade_id THEN 0
+                        WHEN t.linked_position_id = ap.id THEN 1
+                        ELSE 2
+                    END,
+                    CASE WHEN t.closed_at IS NULL THEN 1 ELSE 0 END,
+                    t.closed_at DESC NULLS LAST,
+                    t.id DESC
+                LIMIT 1
+            ) tr ON TRUE
+            WHERE ap.user_id=$1
+              AND ap.market_type=$2
+              AND ap.status='CLOSED'
+              AND ap.closed_at IS NOT NULL
+              AND ap.closed_at >= $3
+        """
+        closed_args = (uid, mt, since)
 
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
-        # positions opened in the selected period
-        if mt == "all":
-            opened = await conn.fetchval(
-                """
-                SELECT COUNT(*)
-                FROM autotrade_positions
-                WHERE user_id=$1 AND opened_at >= $2
-                """,
-                uid, since,
-            )
-        else:
-            opened = await conn.fetchval(
-                """
-                SELECT COUNT(*)
-                FROM autotrade_positions
-                WHERE user_id=$1 AND market_type=$2 AND opened_at >= $3
-                """,
-                uid, mt, since,
-            )
+        opened = await conn.fetchval(opened_q, *opened_args)
+        active = await conn.fetchval(active_q, *active_args)
+        closed_rows = await conn.fetch(closed_q, *closed_args)
 
-        # closed stats in the selected period
-        # derived_pnl_usdt: use pnl_usdt when present, otherwise reconstruct from roi_percent
-        # and allocated_usdt. This keeps loss/win counters correct for Smart Manager closes too.
-        if mt == "all":
-            row = await conn.fetchrow(
-                """
-                WITH closed_rows AS (
-                    SELECT
-                        allocated_usdt,
-                        COALESCE(
-                            pnl_usdt,
-                            CASE
-                                WHEN roi_percent IS NOT NULL AND allocated_usdt IS NOT NULL
-                                    THEN allocated_usdt * roi_percent / 100.0
-                                ELSE NULL
-                            END
-                        ) AS derived_pnl_usdt,
-                        roi_percent
-                    FROM autotrade_positions
-                    WHERE user_id=$1
-                      AND status='CLOSED'
-                      AND closed_at IS NOT NULL
-                      AND closed_at >= $2
-                )
-                SELECT
-                  COUNT(*)::int AS closed_total,
-                  COUNT(*) FILTER (WHERE COALESCE(derived_pnl_usdt, roi_percent, 0) > 0)::int AS closed_plus,
-                  COUNT(*) FILTER (WHERE COALESCE(derived_pnl_usdt, roi_percent, 0) < 0)::int AS closed_minus,
-                  COALESCE(SUM(COALESCE(derived_pnl_usdt, 0)), 0)::float AS pnl_total,
-                  COALESCE(SUM(COALESCE(allocated_usdt, 0)), 0)::float AS invested_closed
-                FROM closed_rows;
-                """,
-                uid, since,
-            )
-        else:
-            row = await conn.fetchrow(
-                """
-                WITH closed_rows AS (
-                    SELECT
-                        allocated_usdt,
-                        COALESCE(
-                            pnl_usdt,
-                            CASE
-                                WHEN roi_percent IS NOT NULL AND allocated_usdt IS NOT NULL
-                                    THEN allocated_usdt * roi_percent / 100.0
-                                ELSE NULL
-                            END
-                        ) AS derived_pnl_usdt,
-                        roi_percent
-                    FROM autotrade_positions
-                    WHERE user_id=$1
-                      AND market_type=$2
-                      AND status='CLOSED'
-                      AND closed_at IS NOT NULL
-                      AND closed_at >= $3
-                )
-                SELECT
-                  COUNT(*)::int AS closed_total,
-                  COUNT(*) FILTER (WHERE COALESCE(derived_pnl_usdt, roi_percent, 0) > 0)::int AS closed_plus,
-                  COUNT(*) FILTER (WHERE COALESCE(derived_pnl_usdt, roi_percent, 0) < 0)::int AS closed_minus,
-                  COALESCE(SUM(COALESCE(derived_pnl_usdt, 0)), 0)::float AS pnl_total,
-                  COALESCE(SUM(COALESCE(allocated_usdt, 0)), 0)::float AS invested_closed
-                FROM closed_rows;
-                """,
-                uid, mt, since,
-            )
+    closed_total = 0
+    closed_plus = 0
+    closed_minus = 0
+    pnl_total = 0.0
+    invested_closed = 0.0
 
-        # current OPEN positions (not period-bound)
-        if mt == "all":
-            active = await conn.fetchval(
-                """
-                SELECT COUNT(*)
-                FROM autotrade_positions
-                WHERE user_id=$1 AND status='OPEN'
-                """,
-                uid,
-            )
-        else:
-            active = await conn.fetchval(
-                """
-                SELECT COUNT(*)
-                FROM autotrade_positions
-                WHERE user_id=$1 AND market_type=$2 AND status='OPEN'
-                """,
-                uid, mt,
-            )
+    for rr in closed_rows or []:
+        row = dict(rr)
+        closed_total += 1
+        alloc = _as_float(row.get("allocated_usdt"), 0.0)
+        invested_closed += alloc
 
-    closed_total = int((row or {}).get("closed_total") or 0)
-    closed_plus = int((row or {}).get("closed_plus") or 0)
-    closed_minus = int((row or {}).get("closed_minus") or 0)
-    pnl_total = float((row or {}).get("pnl_total") or 0.0)
-    invested_closed = float((row or {}).get("invested_closed") or 0.0)
+        pnl_val = None
+        roi_val = None
+
+        if row.get("pnl_usdt") is not None:
+            pnl_val = _as_float(row.get("pnl_usdt"), 0.0)
+        if row.get("roi_percent") is not None:
+            roi_val = _as_float(row.get("roi_percent"), 0.0)
+            if pnl_val is None and alloc > 0:
+                pnl_val = alloc * roi_val / 100.0
+
+        if pnl_val is None and row.get("trade_pnl_total_pct") is not None:
+            roi_val = _as_float(row.get("trade_pnl_total_pct"), 0.0)
+            if alloc > 0:
+                pnl_val = alloc * roi_val / 100.0
+
+        if pnl_val is None:
+            approx_pnl, approx_roi = _approx_from_ref(row)
+            if approx_pnl is not None:
+                pnl_val = float(approx_pnl)
+                roi_val = float(approx_roi) if approx_roi is not None else roi_val
+
+        if pnl_val is not None:
+            pnl_total += float(pnl_val)
+
+        trade_status = str(row.get("trade_status") or "").upper().strip()
+        meta = _safe_json_obj(row.get("meta"))
+        ref = _safe_json_obj(row.get("api_order_ref"))
+        close_reason = str(meta.get("closed_reason") or ref.get("closed_reason") or "").upper().strip()
+        tp1_hit = _boolish(meta.get("tp1_hit") if ("tp1_hit" in meta) else ref.get("tp1_hit"))
+
+        sign = 0
+        if pnl_val is not None:
+            if pnl_val > 0:
+                sign = 1
+            elif pnl_val < 0:
+                sign = -1
+        elif roi_val is not None:
+            if roi_val > 0:
+                sign = 1
+            elif roi_val < 0:
+                sign = -1
+        elif trade_status == "WIN":
+            sign = 1
+        elif trade_status == "LOSS":
+            sign = -1
+        elif close_reason in ("TP2", "FULL_TP1", "FULL_TP1_NO_TP2"):
+            sign = 1
+        elif close_reason == "SL" and not tp1_hit:
+            sign = -1
+
+        if sign > 0:
+            closed_plus += 1
+        elif sign < 0:
+            closed_minus += 1
+
     opened_i = int(opened or 0)
     active_i = int(active or 0)
 
-    # Safety net for transient DB/exchange reconciliation lag: if the UI cohort already shows
-    # opened trades and some of them closed in the selected bucket, but the OPEN snapshot is 0,
-    # keep the visible summary coherent.
     if active_i <= 0 and opened_i > closed_total:
         active_i = max(opened_i - closed_total, 0)
 
@@ -3626,10 +3779,10 @@ async def get_autotrade_stats(
         "closed_plus": closed_plus,
         "closed_minus": closed_minus,
         "active": active_i,
-        "pnl_total": pnl_total,
-        "roi_percent": roi,
-        "invested_closed": invested_closed,
-        "closed_total": closed_total,
+        "pnl_total": float(pnl_total),
+        "roi_percent": float(roi),
+        "invested_closed": float(invested_closed),
+        "closed_total": int(closed_total),
         "period_since": since,
     }
 
