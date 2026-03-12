@@ -5290,8 +5290,13 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         "sl": float(ref.get("sl") or meta.get("sl") or 0.0),
                         "qty": float(ref.get("qty") or meta.get("qty") or 0.0),
                     }
+                    existing_reason = patch.get("closed_reason") or meta.get("closed_reason") or ref.get("closed_reason")
+                    if existing_reason:
+                        patch["closed_reason"] = _normalize_autotrade_close_reason(existing_reason)
                     if extra:
                         patch.update(extra)
+                    if patch.get("closed_reason"):
+                        patch["closed_reason"] = _normalize_autotrade_close_reason(patch.get("closed_reason"))
                     try:
                         await db_store.update_autotrade_position_meta(row_id=int(r.get("id") or 0), meta=patch, replace=False)
                         try:
@@ -5487,7 +5492,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 side_str = 'LONG' if str(ref.get('side','BUY')).upper() in ('BUY','LONG') else 'SHORT'
                 if side_str != 'LONG':
                     # Spot manager supports LONG only (no short spot). Mark as ERROR to avoid wrong closes.
-                    await _sync_pos_meta({"closed_reason": "ERROR_UNSUPPORTED_SIDE"})
+                    await _sync_pos_meta({"closed_reason": "EXECUTION_ERROR", "error_detail": "unsupported_side"})
                     await db_store.close_autotrade_position(user_id=uid, signal_id=r.get('signal_id'), exchange=ex, market_type=mt, status='ERROR', row_id=int(r.get('id') or 0))
                     continue
                 be_price = float(ref.get("be_price") or 0.0)
@@ -7565,7 +7570,9 @@ def _human_close_reason(uid: int, code: str | None, **kv: Any) -> str:
     # Map internal codes to i18n keys (keep keys stable)
     key_map = {
         "TP2_REACHED": "reason_tp2_reached",
+        "TP2": "reason_tp2_reached",
         "SL_REACHED": "reason_sl_reached",
+        "SL": "reason_sl_reached",
         "SL_AFTER_TP1": "reason_sl_after_tp1",
         "TP1_PARTIAL": "reason_tp1_partial",
         "TP1_HOLD": "reason_tp1_hold_to_tp2",
@@ -7573,6 +7580,13 @@ def _human_close_reason(uid: int, code: str | None, **kv: Any) -> str:
         "SMART_HARD_SL": "reason_smart_hard_sl",
         "TRAIL_EXIT": "reason_trail_exit",
         "REVERSAL_EXIT": "reason_reversal_exit",
+        "FULL_TP1": "reason_tp2_reached",
+        "FULL_TP1_NO_TP2": "reason_tp2_reached",
+        "BE": "reason_smart_be",
+        "EARLY_EXIT": "reason_early_exit_momentum",
+        "MANUAL_CLOSE": "reason_volume_dropped",
+        "SYNC_CLOSE": "reason_volume_dropped",
+        "EXECUTION_ERROR": "reason_structure_break",
         "EARLY_EXIT_MOM": "reason_early_exit_momentum",
         "STRUCTURE_BREAK": "reason_structure_break",
         "TRAP_DETECTED": "reason_trap_detected",
@@ -7613,41 +7627,77 @@ def _safe_json_obj(raw: Any) -> dict:
         return {}
 
 
+AUTOTRADE_CLOSED_REASON_CANON = {
+    "SL",
+    "FULL_TP1",
+    "FULL_TP1_NO_TP2",
+    "TP2",
+    "BE",
+    "REVERSAL_EXIT",
+    "TRAIL_EXIT",
+    "EARLY_EXIT",
+    "MANUAL_CLOSE",
+    "SYNC_CLOSE",
+    "EXECUTION_ERROR",
+}
+
+
 def _normalize_autotrade_close_reason(reason: str | None) -> str:
     r = str(reason or "").upper().strip()
+    if not r:
+        return ""
     aliases = {
         "TP1_FULL": "FULL_TP1",
         "TP1_FULL_NO_TP2": "FULL_TP1_NO_TP2",
         "TP2_REACHED": "TP2",
         "USER_CLOSE": "MANUAL_CLOSE",
+        "API_ERROR": "EXECUTION_ERROR",
+        "EXEC_ERROR": "EXECUTION_ERROR",
+        "ERROR": "EXECUTION_ERROR",
+        "MANUAL_BE": "BE",
+        "HARD_SL": "SL",
+        "STRUCTURE_BREAK": "SL",
+        "EARLY_EXIT_MOM": "EARLY_EXIT",
+        "ERROR_UNSUPPORTED_SIDE": "EXECUTION_ERROR",
     }
-    return aliases.get(r, r)
+    if r in aliases:
+        return aliases[r]
+    if r.startswith("ERROR"):
+        return "EXECUTION_ERROR"
+    return r if r in AUTOTRADE_CLOSED_REASON_CANON else r
+
+
+
+def map_closed_reason_to_trade_result(reason: str | None, roi: float | None = None):
+    """Single source of truth for autotrade close outcome mapping.
+
+    Important business rule: SYNC_CLOSE is a technical sync close, not a semantic
+    trade outcome. Do not reinterpret it from ROI into WIN/LOSS/BE here.
+    """
+    r = _normalize_autotrade_close_reason(reason)
+    if not r:
+        r = "SYNC_CLOSE"
+    mapping = {
+        "SL": {"trade_status": "LOSS", "trade_result": "LOSS", "card_reason": "SL", "close_price_source": "sl"},
+        "FULL_TP1": {"trade_status": "WIN", "trade_result": "WIN", "card_reason": "FULL_TP1", "close_price_source": "tp1"},
+        "FULL_TP1_NO_TP2": {"trade_status": "WIN", "trade_result": "WIN", "card_reason": "FULL_TP1_NO_TP2", "close_price_source": "tp1"},
+        "TP2": {"trade_status": "WIN", "trade_result": "WIN", "card_reason": "TP2", "close_price_source": "tp2"},
+        "BE": {"trade_status": "BE", "trade_result": "BE", "card_reason": "BE", "close_price_source": "be"},
+        "REVERSAL_EXIT": {"trade_status": "WIN", "trade_result": "WIN", "card_reason": "REVERSAL_EXIT", "close_price_source": "market"},
+        "TRAIL_EXIT": {"trade_status": "WIN", "trade_result": "WIN", "card_reason": "TRAIL_EXIT", "close_price_source": "market"},
+        "EARLY_EXIT": {"trade_status": "WIN", "trade_result": "WIN", "card_reason": "EARLY_EXIT", "close_price_source": "market"},
+        "MANUAL_CLOSE": {"trade_status": "CLOSED", "trade_result": "CLOSED", "card_reason": "MANUAL_CLOSE", "close_price_source": "market"},
+        "SYNC_CLOSE": {"trade_status": "CLOSED", "trade_result": "CLOSED", "card_reason": "SYNC_CLOSE", "close_price_source": "market"},
+        "EXECUTION_ERROR": {"trade_status": "CLOSED", "trade_result": "ERROR", "card_reason": "EXECUTION_ERROR", "close_price_source": "market"},
+    }
+    out = dict(mapping.get(r) or mapping["SYNC_CLOSE"])
+    out["closed_reason"] = r
+    return out
 
 
 
 def _autotrade_reason_to_trade_status(reason: str, roi_percent: float | None = None, *, tp1_hit: bool = False) -> str:
-    r = _normalize_autotrade_close_reason(reason)
-    if r in ("BE", "MANUAL_BE"):
-        return "BE"
-    if r in ("SL", "HARD_SL", "STRUCTURE_BREAK"):
-        return "LOSS"
-    if r in ("MANUAL_CLOSE", "SYNC_CLOSE"):
-        return "CLOSED"
-    if r.startswith("ERROR") or r in ("API_ERROR", "EXECUTION_ERROR"):
-        return "CLOSED"
-    if r in ("TP2", "FULL_TP1", "FULL_TP1_NO_TP2", "TRAIL_EXIT", "REVERSAL_EXIT", "EARLY_EXIT", "EARLY_EXIT_MOM"):
-        return "WIN"
-    try:
-        roi = float(roi_percent) if roi_percent is not None else 0.0
-    except Exception:
-        roi = 0.0
-    if tp1_hit and abs(roi) <= 0.25:
-        return "BE"
-    if roi > 0.0:
-        return "WIN"
-    if roi < 0.0:
-        return "LOSS"
-    return "CLOSED"
+    return str(map_closed_reason_to_trade_result(reason, roi_percent).get("trade_status") or "CLOSED")
 
 
 
@@ -13750,8 +13800,9 @@ class Backend:
                     linked_position_id = int(row.get("linked_position_id") or 0) if row.get("linked_position_id") is not None else 0
                     trade_exchange = str(row.get("exchange") or "manual").lower().strip() or "manual"
                     managed_by = str(row.get("managed_by") or "").lower().strip()
+                    autotrade_shadow_candidate = bool(linked_position_id > 0 or managed_by == "autotrade_manager" or trade_exchange not in ("", "manual"))
                     linked_pos = None
-                    if linked_position_id > 0 or managed_by == "autotrade_manager" or trade_exchange not in ("", "manual"):
+                    if autotrade_shadow_candidate:
                         trade_side = str(row.get("side") or "").upper().strip()
                         position_side = ("BUY" if trade_side in ("BUY", "LONG") else ("SELL" if trade_side in ("SELL", "SHORT") else None))
                         try:
@@ -13821,17 +13872,19 @@ class Backend:
                                 roi_sync = float(linked_pos.get("roi_percent")) if linked_pos.get("roi_percent") is not None else None
                             except Exception:
                                 roi_sync = None
-                            close_reason = _normalize_autotrade_close_reason(pos_meta.get("closed_reason") or pos_ref.get("closed_reason") or ("ERROR" if pos_status == "ERROR" else ""))
-                            trade_status = _autotrade_reason_to_trade_status(close_reason, roi_sync, tp1_hit=bool(pos_tp1_hit))
+                            raw_reason = pos_meta.get("closed_reason") or pos_ref.get("closed_reason") or ("EXECUTION_ERROR" if pos_status == "ERROR" else "SYNC_CLOSE")
+                            mapped_close = map_closed_reason_to_trade_result(raw_reason, roi_sync)
+                            trade_status = str(mapped_close.get("trade_status") or "CLOSED")
                             close_px = float(s.entry or 0.0)
                             try:
-                                if trade_status == "BE":
+                                px_src = str(mapped_close.get("close_price_source") or "market")
+                                if px_src == "be":
                                     close_px = float(pos_be_price or s.entry or 0.0)
-                                elif close_reason in ("TP2", "TP2_REACHED") and float(getattr(s, "tp2", 0.0) or 0.0) > 0:
+                                elif px_src == "tp2" and float(getattr(s, "tp2", 0.0) or 0.0) > 0:
                                     close_px = float(getattr(s, "tp2", 0.0) or 0.0)
-                                elif close_reason in ("TP1_FULL", "TP1_FULL_NO_TP2", "FULL_TP1", "FULL_TP1_NO_TP2") and float(getattr(s, "tp1", 0.0) or 0.0) > 0:
+                                elif px_src == "tp1" and float(getattr(s, "tp1", 0.0) or 0.0) > 0:
                                     close_px = float(getattr(s, "tp1", 0.0) or 0.0)
-                                elif trade_status == "LOSS" and float(getattr(s, "sl", 0.0) or 0.0) > 0:
+                                elif px_src == "sl" and float(getattr(s, "sl", 0.0) or 0.0) > 0:
                                     close_px = float(getattr(s, "sl", 0.0) or 0.0)
                             except Exception:
                                 close_px = float(s.entry or 0.0)
@@ -13851,6 +13904,13 @@ class Backend:
                                 pass
                         # Real autotrade positions are managed by autotrade_manager_loop.
                         # Do not let the legacy signal tracker independently close them.
+                        continue
+
+                    if autotrade_shadow_candidate:
+                        logger.warning(
+                            "track_loop: skip legacy close logic for autotrade shadow trade_id=%s user_id=%s symbol=%s exchange=%s (linked position not found yet)",
+                            trade_id, uid, symbol, trade_exchange,
+                        )
                         continue
 
                     try:
