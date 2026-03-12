@@ -5567,8 +5567,9 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 sl_id = ref.get("sl_order_id")
                 be_moved = bool(ref.get("be_moved"))
                 side_str = 'LONG' if str(ref.get('side','BUY')).upper() in ('BUY','LONG') else 'SHORT'
-                if side_str != 'LONG':
-                    # Spot manager supports LONG only (no short spot). Mark as ERROR to avoid wrong closes.
+                if mt == 'spot' and side_str != 'LONG':
+                    # Spot manager supports LONG only (no short spot).
+                    # Futures SHORT must continue to the virtual management branch below.
                     await _sync_pos_meta({"closed_reason": "EXECUTION_ERROR", "error_detail": "unsupported_side"})
                     await db_store.close_autotrade_position(user_id=uid, signal_id=r.get('signal_id'), exchange=ex, market_type=mt, status='ERROR', row_id=int(r.get('id') or 0))
                     continue
