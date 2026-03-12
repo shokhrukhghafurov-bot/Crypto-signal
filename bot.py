@@ -17,6 +17,7 @@ from typing import Dict, List, Set, Tuple, Optional
 from dataclasses import replace
 
 from aiogram import Bot, Dispatcher, types
+from aiogram.types import BufferedInputFile
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
@@ -6992,23 +6993,193 @@ async def main() -> None:
             )
             return web.json_response({"ok": True})
 
+        async def _read_signal_admin_message_payload(request: web.Request) -> tuple[str, str, str, bytes | None, str | None, str | None, list[str]]:
+            data = {}
+            file_bytes: bytes | None = None
+            file_name: str | None = None
+            file_content_type: str | None = None
+
+            try:
+                content_type = str(request.content_type or '').lower()
+            except Exception:
+                content_type = ''
+
+            if content_type.startswith('multipart/'):
+                reader = await request.multipart()
+                async for part in reader:
+                    name = str(part.name or '').strip()
+                    if not name:
+                        continue
+                    if name == 'file':
+                        file_name = part.filename or 'upload.bin'
+                        file_content_type = part.headers.get('Content-Type') if part.headers else None
+                        file_bytes = await part.read(decode=False)
+                    else:
+                        try:
+                            data[name] = await part.text()
+                        except Exception:
+                            data[name] = ''
+            else:
+                try:
+                    data = await request.json()
+                except Exception:
+                    data = {}
+
+            text = str((data or {}).get('text') or '').strip()
+            url = str((data or {}).get('url') or '').strip()
+            media_type = str((data or {}).get('media_type') or (data or {}).get('type') or 'auto').strip().lower() or 'auto'
+            audience_raw = (data or {}).get('audience') or (data or {}).get('statuses') or ['active', 'expired', 'blocked']
+            if isinstance(audience_raw, (list, tuple, set)):
+                audience = [str(x).strip().lower() for x in audience_raw if str(x).strip()]
+            else:
+                audience = [x.strip().lower() for x in str(audience_raw).split(',') if x.strip()]
+            return text, url, media_type, file_bytes, file_name, file_content_type, audience
+
+        def _infer_signal_admin_media_type(media_type: str, url: str, file_name: str | None, file_content_type: str | None) -> str:
+            media_type = str(media_type or 'auto').strip().lower() or 'auto'
+            if media_type in ('text', 'photo', 'document'):
+                return media_type
+            if str(file_content_type or '').lower().startswith('image/'):
+                return 'photo'
+            probe = str(file_name or url or '').lower()
+            if probe.endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp')):
+                return 'photo'
+            if probe:
+                return 'document'
+            return 'text'
+
+        async def _mark_signal_admin_unreachable(telegram_id: int, exc: Exception) -> None:
+            try:
+                if isinstance(exc, TelegramForbiddenError):
+                    await set_user_blocked(telegram_id, blocked=True)
+                    return
+                if isinstance(exc, TelegramBadRequest):
+                    msg = str(exc).lower()
+                    if 'chat not found' in msg or 'bot was blocked by the user' in msg:
+                        await set_user_blocked(telegram_id, blocked=True)
+            except Exception:
+                pass
+
+        def _classify_signal_admin_status(row, now_utc: dt.datetime) -> str:
+            try:
+                if bool(row.get('is_blocked')):
+                    return 'blocked'
+            except Exception:
+                return 'blocked'
+            try:
+                enabled = bool(row.get('signal_enabled'))
+            except Exception:
+                enabled = False
+            exp = row.get('signal_expires_at')
+            is_active = bool(enabled) and (exp is None or exp > now_utc)
+            return 'active' if is_active else 'expired'
+
+        async def _get_signal_admin_user_ids(audience: list[str]) -> list[int]:
+            wanted = {str(x).strip().lower() for x in (audience or []) if str(x).strip()}
+            wanted &= {'active', 'expired', 'blocked'}
+            if not wanted:
+                wanted = {'active', 'expired', 'blocked'}
+            if not pool:
+                return []
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT telegram_id,
+                           COALESCE(is_blocked, FALSE) AS is_blocked,
+                           COALESCE(signal_enabled, FALSE) AS signal_enabled,
+                           signal_expires_at
+                    FROM users
+                    ORDER BY telegram_id DESC
+                    """
+                )
+            now_utc = dt.datetime.now(dt.timezone.utc)
+            out: list[int] = []
+            for row in rows:
+                status = _classify_signal_admin_status(row, now_utc)
+                if status not in wanted:
+                    continue
+                try:
+                    tid = int(row['telegram_id'])
+                except Exception:
+                    continue
+                out.append(tid)
+            return out
+
+        async def _send_signal_admin_message(
+            telegram_id: int,
+            *,
+            text: str,
+            url: str,
+            media_type: str,
+            file_bytes: bytes | None,
+            file_name: str | None,
+            file_content_type: str | None,
+            ctx: str,
+        ) -> None:
+            text = str(text or '').strip()
+            url = str(url or '').strip()
+            has_media = bool(url or file_bytes)
+            kind = _infer_signal_admin_media_type(media_type, url, file_name, file_content_type)
+
+            if not has_media or kind == 'text':
+                if not text:
+                    raise ValueError('text required')
+                await safe_send(telegram_id, text, ctx=ctx)
+                return
+
+            caption = text or None
+            extra_text = None
+            if caption and len(caption) > 1024:
+                extra_text = caption[1024:].strip() or None
+                caption = caption[:1024]
+
+            if kind == 'photo':
+                photo_payload = BufferedInputFile(file_bytes, filename=(file_name or 'image.jpg')) if file_bytes is not None else url
+                await bot.send_photo(telegram_id, photo=photo_payload, caption=caption)
+            else:
+                document_payload = BufferedInputFile(file_bytes, filename=(file_name or 'file.bin')) if file_bytes is not None else url
+                await bot.send_document(telegram_id, document=document_payload, caption=caption)
+
+            if extra_text:
+                await safe_send(telegram_id, extra_text, ctx=ctx)
+
         async def signal_broadcast_text(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
-            data = await request.json()
-            text = str(data.get("text") or "").strip()
-            if not text:
-                return web.json_response({"ok": False, "error": "text required"}, status=400)
-            uids = await get_broadcast_user_ids()
+            text, url, media_type, file_bytes, file_name, file_content_type, audience = await _read_signal_admin_message_payload(request)
+            if not text and not url and not file_bytes:
+                return web.json_response({"ok": False, "error": "text/url/file required"}, status=400)
+            uids = await _get_signal_admin_user_ids(audience)
             total = len(uids)
             sent = 0
+            failed = 0
+            sample_errors = []
             for uid in uids:
                 try:
-                    await safe_send(int(uid), text)
+                    await _send_signal_admin_message(
+                        int(uid),
+                        text=text,
+                        url=url,
+                        media_type=media_type,
+                        file_bytes=file_bytes,
+                        file_name=file_name,
+                        file_content_type=file_content_type,
+                        ctx='signal-admin-broadcast',
+                    )
                     sent += 1
-                except Exception:
-                    pass
-            return web.json_response({"ok": True, "sent": sent, "total": total})
+                except Exception as e:
+                    failed += 1
+                    await _mark_signal_admin_unreachable(int(uid), e)
+                    if len(sample_errors) < 5:
+                        sample_errors.append({"telegram_id": int(uid), "error": str(e)})
+            return web.json_response({
+                "ok": True,
+                "sent": sent,
+                "failed": failed,
+                "total": total,
+                "audience": audience or ['active', 'expired', 'blocked'],
+                "sample_errors": sample_errors,
+            })
 
         async def signal_send_text(request: web.Request) -> web.Response:
             if not _check_basic(request):
@@ -7019,15 +7190,24 @@ async def main() -> None:
             except Exception:
                 return web.json_response({"ok": False, "error": "invalid telegram_id"}, status=400)
 
-            data = await request.json()
-            text = str(data.get("text") or "").strip()
-            if not text:
-                return web.json_response({"ok": False, "error": "text required"}, status=400)
+            text, url, media_type, file_bytes, file_name, file_content_type, _audience = await _read_signal_admin_message_payload(request)
+            if not text and not url and not file_bytes:
+                return web.json_response({"ok": False, "error": "text/url/file required"}, status=400)
 
             try:
-                await safe_send(telegram_id, text, ctx="signal-admin-send")
+                await _send_signal_admin_message(
+                    telegram_id,
+                    text=text,
+                    url=url,
+                    media_type=media_type,
+                    file_bytes=file_bytes,
+                    file_name=file_name,
+                    file_content_type=file_content_type,
+                    ctx="signal-admin-send",
+                )
                 return web.json_response({"ok": True, "telegram_id": telegram_id})
             except Exception as e:
+                await _mark_signal_admin_unreachable(telegram_id, e)
                 logger.exception("signal_send_text failed telegram_id=%s", telegram_id)
                 return web.json_response({"ok": False, "error": str(e)}, status=500)
 
