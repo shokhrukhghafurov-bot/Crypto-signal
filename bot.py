@@ -162,6 +162,42 @@ def _task_state(t: asyncio.Task | None) -> str:
         return f"done(exc={type(exc).__name__})" if exc else "done(ok)"
     return "running"
 
+
+_TASK_RESTART_INFLIGHT: set[str] = set()
+
+
+def _spawn_smart_manager_task() -> asyncio.Task | None:
+    if not hasattr(backend, "track_loop"):
+        logger.warning("Backend has no track_loop; skipping smart-manager spawn")
+        return None
+    try:
+        backend.health_tick_cb = lambda: _health_mark_ok("smart-manager")
+    except Exception:
+        pass
+    task = asyncio.create_task(backend.track_loop(bot), name="smart-manager")
+    TASKS["smart-manager"] = task
+    _health_mark_ok("smart-manager")
+    _attach_task_monitor("smart-manager", task)
+    return task
+
+
+async def _restart_task_later(name: str, reason: str = "") -> None:
+    if name != "smart-manager":
+        return
+    if name in _TASK_RESTART_INFLIGHT:
+        return
+    _TASK_RESTART_INFLIGHT.add(name)
+    try:
+        delay = max(1.0, float(os.getenv("SMART_MANAGER_RESTART_DELAY_SEC", "5") or 5))
+        await asyncio.sleep(delay)
+        cur = TASKS.get(name)
+        if cur and not cur.done():
+            return
+        logger.warning("[smart-manager] restarting task after %s", reason or "unexpected stop")
+        _spawn_smart_manager_task()
+    finally:
+        _TASK_RESTART_INFLIGHT.discard(name)
+
 async def _health_status_loop() -> None:
     interval = int(os.getenv("HEALTH_STATUS_INTERVAL_SEC", "60") or 60)
     dead_after = float(os.getenv("HEALTH_DEAD_AFTER_SEC", "300") or 300)
@@ -213,6 +249,13 @@ def _attach_task_monitor(name: str, task: asyncio.Task) -> None:
         def _cb(t: asyncio.Task) -> None:
             try:
                 if t.cancelled():
+                    logger.warning("[task] cancelled name=%s", name)
+                    if name == "smart-manager":
+                        _health_mark_err("smart-manager", "task_cancelled")
+                        try:
+                            asyncio.create_task(_restart_task_later("smart-manager", reason="cancelled"))
+                        except Exception:
+                            pass
                     return
                 exc = t.exception()
                 if not exc:
@@ -226,6 +269,10 @@ def _attach_task_monitor(name: str, task: asyncio.Task) -> None:
                 elif name == "smart-manager":
                     logger.error("[smart-manager] task crashed exc=%s", repr(exc), exc_info=exc)
                     _health_mark_err("smart-manager", f"task_crash:{type(exc).__name__}")
+                    try:
+                        asyncio.create_task(_restart_task_later("smart-manager", reason=f"exception:{type(exc).__name__}"))
+                    except Exception:
+                        pass
                 else:
                     logger.error("[task] crashed name=%s exc=%s", name, repr(exc), exc_info=exc)
             except Exception:
@@ -7551,15 +7598,7 @@ async def main() -> None:
             logger.warning("Webhook WORKER replica started: skipping background loops (scanner/track/outcomes).")
         else:
             logger.info("Starting track_loop")
-            if hasattr(backend, "track_loop"):
-                try:
-                    backend.health_tick_cb = lambda: _health_mark_ok("smart-manager")
-                except Exception:
-                    pass
-                TASKS["smart-manager"] = asyncio.create_task(backend.track_loop(bot), name="smart-manager")
-                _health_mark_ok("smart-manager")
-                _attach_task_monitor("smart-manager", TASKS["smart-manager"])
-            else:
+            if _spawn_smart_manager_task() is None:
                 logger.warning("Backend has no track_loop; skipping")
 
             logger.info(
@@ -7633,9 +7672,7 @@ async def main() -> None:
         await asyncio.Event().wait()
 
     logger.info("Starting track_loop")
-    if hasattr(backend, "track_loop"):
-        asyncio.create_task(backend.track_loop(bot))
-    else:
+    if _spawn_smart_manager_task() is None:
         logger.warning("Backend has no track_loop; skipping")
     logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
     asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
