@@ -3838,6 +3838,179 @@ async def candles_cache_purge(max_age_sec: int) -> int:
         return 0
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)) or default)
+    except Exception:
+        return int(default)
+
+
+async def _delete_in_chunks(conn: asyncpg.Connection, *, sql: str, older_than_days: int, batch_size: int) -> int:
+    """Run a chunked DELETE CTE until no more rows match."""
+    total = 0
+    days = int(older_than_days or 0)
+    batch = int(batch_size or 0)
+    if days <= 0 or batch <= 0:
+        return 0
+    while True:
+        n = await conn.fetchval(sql, days, batch)
+        n = int(n or 0)
+        total += n
+        if n < batch:
+            break
+    return total
+
+
+async def cleanup_old_postgres_data(*, batch_size: int | None = None) -> Dict[str, int]:
+    """Delete old closed rows from high-churn Postgres tables.
+
+    Safe defaults keep recent history while pruning rows that only bloat storage/indexes.
+    Financial/audit tables are intentionally NOT touched.
+
+    Env knobs:
+      DB_RETENTION_DELETE_BATCH                (default 1000)
+      DB_RETENTION_CLOSED_TRADES_DAYS          (default 60)
+      DB_RETENTION_CLOSED_AUTOTRADE_DAYS       (default 60)
+      DB_RETENTION_SIGNAL_TRACKS_DAYS          (default 60)
+      DB_RETENTION_SIGNAL_SENT_DAYS            (default 60)
+      DB_RETENTION_ANALYZE_ENABLED             (default 1)
+    """
+    pool = get_pool()
+    batch = int(batch_size or _env_int("DB_RETENTION_DELETE_BATCH", 1000) or 1000)
+    batch = max(50, min(batch, 10000))
+
+    closed_trades_days = max(0, _env_int("DB_RETENTION_CLOSED_TRADES_DAYS", 60))
+    closed_autotrade_days = max(0, _env_int("DB_RETENTION_CLOSED_AUTOTRADE_DAYS", 60))
+    signal_tracks_days = max(0, _env_int("DB_RETENTION_SIGNAL_TRACKS_DAYS", 60))
+    signal_sent_days = max(0, _env_int("DB_RETENTION_SIGNAL_SENT_DAYS", 60))
+    analyze_enabled = str(os.getenv("DB_RETENTION_ANALYZE_ENABLED", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+    totals: Dict[str, int] = {
+        "closed_trades": 0,
+        "closed_autotrade_positions": 0,
+        "closed_signal_tracks": 0,
+        "signal_sent_events": 0,
+    }
+    changed_tables: set[str] = set()
+
+    sql_closed_trades = """
+        WITH victim AS (
+            SELECT id
+            FROM trades
+            WHERE closed_at IS NOT NULL
+              AND status IN ('BE','WIN','LOSS','CLOSED')
+              AND closed_at < (NOW() - ($1::int * INTERVAL '1 day'))
+            ORDER BY closed_at ASC, id ASC
+            LIMIT $2
+        ), del AS (
+            DELETE FROM trades t
+            USING victim v
+            WHERE t.id = v.id
+            RETURNING 1
+        )
+        SELECT COUNT(*)::int FROM del;
+    """
+    sql_closed_autotrade = """
+        WITH victim AS (
+            SELECT id
+            FROM autotrade_positions
+            WHERE status IN ('CLOSED','ERROR')
+              AND closed_at IS NOT NULL
+              AND closed_at < (NOW() - ($1::int * INTERVAL '1 day'))
+            ORDER BY closed_at ASC, id ASC
+            LIMIT $2
+        ), del AS (
+            DELETE FROM autotrade_positions p
+            USING victim v
+            WHERE p.id = v.id
+            RETURNING 1
+        )
+        SELECT COUNT(*)::int FROM del;
+    """
+    sql_closed_signal_tracks = """
+        WITH victim AS (
+            SELECT signal_id
+            FROM signal_tracks
+            WHERE status NOT IN ('ACTIVE','TP1')
+              AND closed_at IS NOT NULL
+              AND closed_at < (NOW() - ($1::int * INTERVAL '1 day'))
+            ORDER BY closed_at ASC, signal_id ASC
+            LIMIT $2
+        ), del AS (
+            DELETE FROM signal_tracks s
+            USING victim v
+            WHERE s.signal_id = v.signal_id
+            RETURNING 1
+        )
+        SELECT COUNT(*)::int FROM del;
+    """
+    sql_signal_sent = """
+        WITH victim AS (
+            SELECT id
+            FROM signal_sent_events
+            WHERE created_at < (NOW() - ($1::int * INTERVAL '1 day'))
+            ORDER BY created_at ASC, id ASC
+            LIMIT $2
+        ), del AS (
+            DELETE FROM signal_sent_events s
+            USING victim v
+            WHERE s.id = v.id
+            RETURNING 1
+        )
+        SELECT COUNT(*)::int FROM del;
+    """
+
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        if closed_trades_days > 0:
+            totals["closed_trades"] = await _delete_in_chunks(
+                conn,
+                sql=sql_closed_trades,
+                older_than_days=closed_trades_days,
+                batch_size=batch,
+            )
+            if totals["closed_trades"] > 0:
+                changed_tables.update({"trades", "trade_events"})
+
+        if closed_autotrade_days > 0:
+            totals["closed_autotrade_positions"] = await _delete_in_chunks(
+                conn,
+                sql=sql_closed_autotrade,
+                older_than_days=closed_autotrade_days,
+                batch_size=batch,
+            )
+            if totals["closed_autotrade_positions"] > 0:
+                changed_tables.add("autotrade_positions")
+
+        if signal_tracks_days > 0:
+            totals["closed_signal_tracks"] = await _delete_in_chunks(
+                conn,
+                sql=sql_closed_signal_tracks,
+                older_than_days=signal_tracks_days,
+                batch_size=batch,
+            )
+            if totals["closed_signal_tracks"] > 0:
+                changed_tables.add("signal_tracks")
+
+        if signal_sent_days > 0:
+            totals["signal_sent_events"] = await _delete_in_chunks(
+                conn,
+                sql=sql_signal_sent,
+                older_than_days=signal_sent_days,
+                batch_size=batch,
+            )
+            if totals["signal_sent_events"] > 0:
+                changed_tables.add("signal_sent_events")
+
+        if analyze_enabled and changed_tables:
+            for table_name in sorted(changed_tables):
+                try:
+                    await conn.execute(f"ANALYZE {table_name};")
+                except Exception:
+                    logger.debug("cleanup_old_postgres_data: ANALYZE failed for %s", table_name, exc_info=True)
+
+    return totals
+
+
 # ========================
 # Subscription payments
 # ========================
