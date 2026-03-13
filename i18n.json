@@ -448,7 +448,9 @@
     "ref_withdraw_create_error": "❌ Failed to create withdrawal request. Try again later.",
     "ref_bonus_notification": "🎉 Referral bonus credited!\n\nBonus amount: {reward_amount} USDT\nAvailable to withdraw: {available_balance} USDT",
     "ref_withdraw_paid_user": "✅ Payout sent\n\nAmount: {amount} USDT\nNetwork: {network}\n\nFunds were sent to your wallet.",
-    "ref_withdraw_rejected_user": "❌ Withdrawal request rejected\n\nAmount {amount} USDT was returned to your available balance."
+    "ref_withdraw_rejected_user": "❌ Withdrawal request rejected\n\nAmount {amount} USDT was returned to your available balance.",
+    "analysis_error": "Analysis error. Please try again later.",
+    "sig_price_unavailable": "⚠️ Price is temporarily unavailable on: {exchanges}. Please try again in a moment."
   },
   "ru": {
     "access_blocked": "",
@@ -899,6 +901,9 @@
     "ref_withdraw_create_error": "❌ Не удалось создать заявку на вывод. Попробуйте позже.",
     "ref_bonus_notification": "🎉 Вам начислен реферальный бонус!\n\nСумма бонуса: {reward_amount} USDT\nДоступно к выводу: {available_balance} USDT",
     "ref_withdraw_paid_user": "✅ Выплата отправлена\n\nСумма: {amount} USDT\nСеть: {network}\n\nСредства отправлены на ваш кошелек.",
-    "ref_withdraw_rejected_user": "❌ Заявка на вывод отклонена\n\nСумма {amount} USDT возвращена на ваш доступный баланс."
+    "ref_withdraw_rejected_user": "❌ Заявка на вывод отклонена\n\nСумма {amount} USDT возвращена на ваш доступный баланс.",
+    "analysis_error": "Ошибка анализа. Попробуй позже.",
+    "sig_price_unavailable": "⚠️ Цена временно недоступна на: {exchanges}. Попробуй ещё раз через минуту."
   }
 }
+
