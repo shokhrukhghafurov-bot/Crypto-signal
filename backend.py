@@ -3387,6 +3387,16 @@ async def _binance_futures_position_context(*, api_key: str, api_secret: str, sy
         if isinstance(d0, dict) and str(d0.get("symbol") or symbol).upper() == symbol.upper():
             rows = [d0]
     hedge_mode = any(str((d or {}).get("positionSide") or "").upper() in ("LONG", "SHORT") for d in rows)
+    if _SMART_BINANCE_DEBUG:
+        try:
+            logger.info(
+                "[BINANCE_POS_CTX] sym=%s hedge=%s rows=%s",
+                symbol.upper(),
+                bool(hedge_mode),
+                json.dumps(_binance_debug_compact_pos_rows(rows), ensure_ascii=False),
+            )
+        except Exception:
+            pass
     return {"rows": rows, "hedge_mode": hedge_mode}
 
 
@@ -4910,6 +4920,39 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             hedge_mode=hedge_mode,
         )
 
+        entry_order_id = 0
+        try:
+            entry_order_id = int(entry_res.get("orderId") or 0)
+        except Exception:
+            entry_order_id = 0
+        entry_status_res = {}
+        if entry_order_id > 0:
+            try:
+                entry_status_res = await _binance_order_status(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    symbol=symbol,
+                    order_id=entry_order_id,
+                    futures=True,
+                )
+            except Exception as e:
+                entry_status_res = {"orderId": entry_order_id, "_error": str(e)}
+        if _SMART_BINANCE_DEBUG:
+            try:
+                logger.info(
+                    "[BINANCE_ENTRY_DEBUG] uid=%s ex=binance market=futures sym=%s side=%s pos_side=%s hedge=%s qty=%s entry_res=%s order_status=%s",
+                    uid,
+                    symbol,
+                    side,
+                    position_side,
+                    bool(hedge_mode),
+                    float(qty),
+                    json.dumps(_binance_debug_compact_order(entry_res), ensure_ascii=False),
+                    json.dumps(_binance_debug_compact_order(entry_status_res), ensure_ascii=False),
+                )
+            except Exception:
+                pass
+
         # --- VIRTUAL mode: do not place SL/TP orders on exchange ---
         if _VIRTUAL_SLTP_ALL:
             entry_p = float(entry or 0.0)
@@ -4934,6 +4977,11 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 "tp1_hit": False,
                 "be_moved": False,
                 "be_price": 0.0,
+                "entry_order_id": int(entry_order_id or 0),
+                "entry_client_order_id": str(entry_res.get("clientOrderId") or ""),
+                "entry_order_status": str((entry_status_res or entry_res).get("status") or entry_res.get("status") or ""),
+                "entry_executed_qty": float((entry_status_res or entry_res).get("executedQty") or entry_res.get("executedQty") or 0.0),
+                "entry_avg_price": float((entry_status_res or entry_res).get("avgPrice") or entry_res.get("avgPrice") or 0.0),
             }
             sig_id = _extract_signal_id(sig)
             if sig_id <= 0:
@@ -5124,6 +5172,40 @@ _SMART_TICK_TS: dict[int, float] = {}  # pos_id -> last log ts
 _RECONCILE_COOLDOWN_SEC = max(10, int(os.getenv("AUTOTRADE_RECONCILE_SEC", "60") or "60"))
 _DUST_PCT = float(os.getenv("AUTOTRADE_DUST_PCT", "0.01") or "0.01")   # 1% of original qty
 _DUST_MIN = float(os.getenv("AUTOTRADE_DUST_MIN", "1e-8") or "1e-8")
+_SMART_BINANCE_DEBUG = _env_bool("SMART_BINANCE_DEBUG", True)
+_SMART_BINANCE_DEBUG_MAX_ROWS = max(1, int(os.getenv("SMART_BINANCE_DEBUG_MAX_ROWS", "5") or "5"))
+_SMART_RECONCILE_GRACE_SEC = max(0.0, float(os.getenv("AUTOTRADE_RECONCILE_GRACE_SEC", "90") or "90"))
+_SMART_RECONCILE_ZERO_HITS = max(1, int(os.getenv("AUTOTRADE_RECONCILE_ZERO_HITS", "3") or "3"))
+
+def _binance_debug_compact_order(order: dict | None) -> dict:
+    if not isinstance(order, dict):
+        return {}
+    out = {}
+    for k in (
+        "symbol", "orderId", "clientOrderId", "status", "side", "positionSide",
+        "type", "origQty", "executedQty", "cumQty", "cumBase", "avgPrice",
+        "price", "stopPrice", "reduceOnly", "closePosition", "workingType",
+        "updateTime", "time", "code", "msg", "_error",
+    ):
+        if k in order and order.get(k) not in (None, ""):
+            out[k] = order.get(k)
+    return out
+
+def _binance_debug_compact_pos_rows(rows: list[dict] | None) -> list[dict]:
+    out: list[dict] = []
+    for d in list(rows or [])[:_SMART_BINANCE_DEBUG_MAX_ROWS]:
+        if not isinstance(d, dict):
+            continue
+        item = {}
+        for k in (
+            "symbol", "positionSide", "positionAmt", "entryPrice", "breakEvenPrice",
+            "markPrice", "unRealizedProfit", "liquidationPrice", "leverage", "marginType",
+            "isolatedMargin", "notional", "updateTime",
+        ):
+            if k in d and d.get(k) not in (None, ""):
+                item[k] = d.get(k)
+        out.append(item)
+    return out
 
 def _base_asset(symbol: str) -> str:
     s = (symbol or "").upper().strip()
@@ -5224,11 +5306,19 @@ async def _futures_position_size(*, ex: str, api_key: str, api_secret: str, symb
             ctx = await _binance_futures_position_context(api_key=api_key, api_secret=api_secret, symbol=symbol)
             rows = list(ctx.get("rows") or [])
             want_side = str(position_side or "").upper().strip()
+            selected_amt = 0.0
+            selected_side = ""
+            selected_reason = "no_rows"
+
             if want_side:
                 for d in rows:
                     if str((d or {}).get("positionSide") or "").upper() == want_side:
-                        return float(d.get("positionAmt") or 0.0)
-            if rows:
+                        selected_amt = float(d.get("positionAmt") or 0.0)
+                        selected_side = want_side
+                        selected_reason = "exact_side"
+                        break
+
+            if selected_reason == "no_rows" and rows:
                 nonzero_rows = []
                 for d in rows:
                     try:
@@ -5238,13 +5328,39 @@ async def _futures_position_size(*, ex: str, api_key: str, api_secret: str, symb
                     if abs(amt) > 0.0:
                         nonzero_rows.append(d)
                 if len(nonzero_rows) == 1:
-                    return float(nonzero_rows[0].get("positionAmt") or 0.0)
-                for pref in ("BOTH", "LONG", "SHORT"):
-                    for d in rows:
-                        if str((d or {}).get("positionSide") or "").upper() == pref:
-                            return float(d.get("positionAmt") or 0.0)
-                return float(rows[0].get("positionAmt") or 0.0)
-            return 0.0
+                    selected_amt = float(nonzero_rows[0].get("positionAmt") or 0.0)
+                    selected_side = str((nonzero_rows[0] or {}).get("positionSide") or "").upper()
+                    selected_reason = "single_nonzero"
+                else:
+                    for pref in ("BOTH", "LONG", "SHORT"):
+                        for d in rows:
+                            if str((d or {}).get("positionSide") or "").upper() == pref:
+                                selected_amt = float(d.get("positionAmt") or 0.0)
+                                selected_side = pref
+                                selected_reason = f"pref_{pref.lower()}"
+                                break
+                        if selected_reason != "no_rows":
+                            break
+                    if selected_reason == "no_rows":
+                        selected_amt = float(rows[0].get("positionAmt") or 0.0)
+                        selected_side = str((rows[0] or {}).get("positionSide") or "").upper()
+                        selected_reason = "first_row"
+
+            if _SMART_BINANCE_DEBUG:
+                try:
+                    logger.info(
+                        "[BINANCE_POS_SIZE] sym=%s want_side=%s hedge=%s reason=%s selected_side=%s size=%s rows=%s",
+                        symbol.upper(),
+                        want_side,
+                        bool(ctx.get("hedge_mode")),
+                        selected_reason,
+                        selected_side,
+                        float(selected_amt or 0.0),
+                        json.dumps(_binance_debug_compact_pos_rows(rows), ensure_ascii=False),
+                    )
+                except Exception:
+                    pass
+            return float(selected_amt or 0.0)
 
         if ex == "bybit":
             data = await _bybit_v5_request(
@@ -5631,7 +5747,8 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     pos_id = int(r.get("id") or 0)
                 except Exception:
                     pos_id = 0
-
+                now_ts = time.time()
+                last_ts = _LAST_RECONCILE_TS.get(pos_id, 0.0)
                 opened_at = r.get("opened_at")
                 open_age_sec = 999999.0
                 try:
@@ -5640,22 +5757,17 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     elif opened_at:
                         open_age_sec = max(
                             0.0,
-                            time.time() - dt.datetime.fromisoformat(
-                                str(opened_at).replace("Z", "+00:00")
-                            ).timestamp(),
+                            time.time() - dt.datetime.fromisoformat(str(opened_at).replace("Z", "+00:00")).timestamp(),
                         )
                 except Exception:
                     open_age_sec = 999999.0
 
-                zero_hits = 0
                 try:
                     zero_hits = int(meta.get("reconcile_zero_hits") or 0)
                 except Exception:
                     zero_hits = 0
 
-                now_ts = time.time()
-                last_ts = _LAST_RECONCILE_TS.get(pos_id, 0.0)
-                if pos_id and open_age_sec >= 90.0 and (now_ts - last_ts) >= _RECONCILE_COOLDOWN_SEC:
+                if pos_id and open_age_sec >= _SMART_RECONCILE_GRACE_SEC and (now_ts - last_ts) >= _RECONCILE_COOLDOWN_SEC:
                     _LAST_RECONCILE_TS[pos_id] = now_ts
                     try:
                         # Determine if position is still open on exchange
@@ -5669,6 +5781,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 is_closed = True
                         else:
                             # futures (Binance/Bybit/OKX in this codebase)
+                            pos_side_dbg = (str(ref.get("position_side") or _binance_futures_position_side_from_direction(direction=ref.get("direction"), side=ref.get("side"))) if ex == "binance" else None)
                             size = await _futures_position_size(
                                 ex=ex,
                                 api_key=api_key,
@@ -5676,7 +5789,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 symbol=symbol,
                                 category=str(ref.get("category") or "linear"),
                                 passphrase=(passphrase or None),
-                                position_side=(str(ref.get("position_side") or _binance_futures_position_side_from_direction(direction=ref.get("direction"), side=ref.get("side"))) if ex == "binance" else None),
+                                position_side=pos_side_dbg,
                             )
                             size_f = abs(float(size or 0.0))
                             logger.info(
@@ -5686,25 +5799,71 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 mt,
                                 symbol,
                                 size_f,
-                                str(ref.get("position_side") or ""),
-                                str(ref.get("hedge_mode")),
+                                str(pos_side_dbg or ""),
+                                bool(ref.get("hedge_mode")),
                                 open_age_sec,
                                 zero_hits,
                             )
                             if size_f <= _DUST_MIN:
                                 zero_hits += 1
-                                await _sync_pos_meta({
+                                extra_meta = {
                                     "reconcile_zero_hits": zero_hits,
                                     "last_seen_size": size_f,
-                                })
-                                is_closed = zero_hits >= 3
+                                    "last_reconcile_age_sec": round(open_age_sec, 1),
+                                    "last_reconcile_pos_side": str(pos_side_dbg or ""),
+                                    "last_reconcile_hedge_mode": bool(ref.get("hedge_mode")),
+                                }
+                                if ex == "binance" and _SMART_BINANCE_DEBUG:
+                                    entry_oid_dbg = 0
+                                    try:
+                                        entry_oid_dbg = int(ref.get("entry_order_id") or 0)
+                                    except Exception:
+                                        entry_oid_dbg = 0
+                                    order_dbg = {}
+                                    if entry_oid_dbg > 0:
+                                        try:
+                                            order_dbg = await _binance_order_status(
+                                                api_key=api_key,
+                                                api_secret=api_secret,
+                                                symbol=symbol,
+                                                order_id=entry_oid_dbg,
+                                                futures=True,
+                                            )
+                                        except Exception as e:
+                                            order_dbg = {"orderId": entry_oid_dbg, "_error": str(e)}
+                                    pos_rows_dbg = []
+                                    try:
+                                        ctx_dbg = await _binance_futures_position_context(api_key=api_key, api_secret=api_secret, symbol=symbol)
+                                        pos_rows_dbg = _binance_debug_compact_pos_rows(ctx_dbg.get("rows") or [])
+                                    except Exception as e:
+                                        pos_rows_dbg = [{"_error": str(e)}]
+                                    extra_meta.update({
+                                        "last_reconcile_entry_order": _binance_debug_compact_order(order_dbg),
+                                        "last_reconcile_position_rows": pos_rows_dbg,
+                                    })
+                                    try:
+                                        logger.info(
+                                            "[SMART_RECONCILE_DEBUG] uid=%s ex=%s market=%s sym=%s order=%s rows=%s",
+                                            uid,
+                                            ex,
+                                            mt,
+                                            symbol,
+                                            json.dumps(_binance_debug_compact_order(order_dbg), ensure_ascii=False),
+                                            json.dumps(pos_rows_dbg, ensure_ascii=False),
+                                        )
+                                    except Exception:
+                                        pass
+                                await _sync_pos_meta(extra_meta)
+                                is_closed = zero_hits >= _SMART_RECONCILE_ZERO_HITS
                             else:
                                 if zero_hits:
                                     await _sync_pos_meta({
                                         "reconcile_zero_hits": 0,
                                         "last_seen_size": size_f,
+                                        "last_reconcile_age_sec": round(open_age_sec, 1),
+                                        "last_reconcile_pos_side": str(pos_side_dbg or ""),
+                                        "last_reconcile_hedge_mode": bool(ref.get("hedge_mode")),
                                     })
-                                    zero_hits = 0
 
                         if is_closed:
                             # Best-effort: cancel any known child orders to avoid stray fills after manual close.
