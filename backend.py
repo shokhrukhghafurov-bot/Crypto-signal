@@ -5615,6 +5615,15 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 except Exception:
                     continue
 
+                # passphrase may be needed by OKX spot/futures helpers; keep it initialized
+                # for all exchanges so reconcile never crashes on non-OKX futures paths.
+                passphrase = ""
+                if ex == "okx":
+                    try:
+                        passphrase = _decrypt_token(row.get("passphrase_enc")) if row.get("passphrase_enc") else ""
+                    except Exception:
+                        passphrase = ""
+
                 # --- Soft reconcile: detect manual close and close stale OPEN rows ---
                 # If user closed manually on exchange, SL/TP may never be FILLED -> DB can remain OPEN forever.
                 # We periodically verify that the position/holding still exists on the exchange.
@@ -5630,12 +5639,6 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         # Determine if position is still open on exchange
                         is_closed = False
                         if mt == "spot":
-                            passphrase = ""
-                            if ex == "okx":
-                                try:
-                                    passphrase = _decrypt_token(row.get("passphrase_enc"))
-                                except Exception:
-                                    passphrase = ""
                             bal = await _spot_base_balance(ex=ex, api_key=api_key, api_secret=api_secret,
                                                            passphrase=(passphrase or None), symbol=symbol)
                             ref_qty = _as_float(ref.get("qty"), 0.0)
