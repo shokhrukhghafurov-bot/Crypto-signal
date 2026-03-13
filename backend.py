@@ -5201,10 +5201,11 @@ _SMART_TICK_TS: dict[int, float] = {}  # pos_id -> last log ts
 _RECONCILE_COOLDOWN_SEC = max(10, int(os.getenv("AUTOTRADE_RECONCILE_SEC", "60") or "60"))
 _DUST_PCT = float(os.getenv("AUTOTRADE_DUST_PCT", "0.01") or "0.01")   # 1% of original qty
 _DUST_MIN = float(os.getenv("AUTOTRADE_DUST_MIN", "1e-8") or "1e-8")
-_SMART_BINANCE_DEBUG = _env_bool("SMART_BINANCE_DEBUG", True)
+_SMART_BINANCE_DEBUG = _env_bool("SMART_BINANCE_DEBUG", False)
 _SMART_BINANCE_DEBUG_MAX_ROWS = max(1, int(os.getenv("SMART_BINANCE_DEBUG_MAX_ROWS", "5") or "5"))
 _SMART_RECONCILE_GRACE_SEC = max(0.0, float(os.getenv("AUTOTRADE_RECONCILE_GRACE_SEC", "90") or "90"))
 _SMART_RECONCILE_ZERO_HITS = max(1, int(os.getenv("AUTOTRADE_RECONCILE_ZERO_HITS", "3") or "3"))
+_SMART_MANAGER_DEBUG_LOGS = _env_bool("SMART_MANAGER_DEBUG_LOGS", False)
 
 def _binance_debug_compact_order(order: dict | None) -> dict:
     if not isinstance(order, dict):
@@ -5734,22 +5735,23 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                 mt = str(ref.get("market_type") or r.get("market_type") or "").lower()
                 futures = (mt == "futures")
 
-                # --- SMART_TICK (Railway visibility): proves manager loop is running ---
-                try:
-                    pos_id_tick = int(r.get("id") or 0)
-                except Exception:
-                    pos_id_tick = 0
-                now_tick = time.time()
-                last_tick = _SMART_TICK_TS.get(pos_id_tick, 0.0) if pos_id_tick else 0.0
-                if (not pos_id_tick) or (now_tick - last_tick >= 60.0):
-                    if pos_id_tick:
-                        _SMART_TICK_TS[pos_id_tick] = now_tick
-                    sym_tick = str(ref.get("symbol") or r.get("symbol") or "")
-                    side_tick = str(ref.get("side") or r.get("side") or "")
-                    logger.info(
-                        "SMART_TICK uid=%s market=%s ex=%s sym=%s side=%s virtual=%s",
-                        uid, mt, ex, sym_tick, side_tick, bool(ref.get("virtual"))
-                    )
+                # Optional heartbeat log for troubleshooting manager loop.
+                if _SMART_MANAGER_DEBUG_LOGS:
+                    try:
+                        pos_id_tick = int(r.get("id") or 0)
+                    except Exception:
+                        pos_id_tick = 0
+                    now_tick = time.time()
+                    last_tick = _SMART_TICK_TS.get(pos_id_tick, 0.0) if pos_id_tick else 0.0
+                    if (not pos_id_tick) or (now_tick - last_tick >= 60.0):
+                        if pos_id_tick:
+                            _SMART_TICK_TS[pos_id_tick] = now_tick
+                        sym_tick = str(ref.get("symbol") or r.get("symbol") or "")
+                        side_tick = str(ref.get("side") or r.get("side") or "")
+                        logger.info(
+                            "SMART_TICK uid=%s market=%s ex=%s sym=%s side=%s virtual=%s",
+                            uid, mt, ex, sym_tick, side_tick, bool(ref.get("virtual"))
+                        )
                 symbol = str(ref.get("symbol") or r.get("symbol") or "").upper()
 
                 # Load keys
@@ -5823,18 +5825,19 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 position_side=pos_side_dbg,
                             )
                             size_f = abs(float(size or 0.0))
-                            logger.info(
-                                "[SMART_RECONCILE] uid=%s ex=%s market=%s sym=%s size=%s pos_side=%s hedge=%s age=%.1fs zero_hits=%s",
-                                uid,
-                                ex,
-                                mt,
-                                symbol,
-                                size_f,
-                                str(pos_side_dbg or ""),
-                                bool(ref.get("hedge_mode")),
-                                open_age_sec,
-                                zero_hits,
-                            )
+                            if _SMART_MANAGER_DEBUG_LOGS:
+                                logger.info(
+                                    "[SMART_RECONCILE] uid=%s ex=%s market=%s sym=%s size=%s pos_side=%s hedge=%s age=%.1fs zero_hits=%s",
+                                    uid,
+                                    ex,
+                                    mt,
+                                    symbol,
+                                    size_f,
+                                    str(pos_side_dbg or ""),
+                                    bool(ref.get("hedge_mode")),
+                                    open_age_sec,
+                                    zero_hits,
+                                )
                             if size_f <= _DUST_MIN:
                                 zero_hits += 1
                                 extra_meta = {
@@ -5844,7 +5847,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                     "last_reconcile_pos_side": str(pos_side_dbg or ""),
                                     "last_reconcile_hedge_mode": bool(ref.get("hedge_mode")),
                                 }
-                                if ex == "binance" and _SMART_BINANCE_DEBUG:
+                                if ex == "binance" and _SMART_BINANCE_DEBUG and _SMART_MANAGER_DEBUG_LOGS:
                                     entry_oid_dbg = 0
                                     try:
                                         entry_oid_dbg = int(ref.get("entry_order_id") or 0)
