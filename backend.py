@@ -2022,6 +2022,10 @@ async def _binance_signed_request(
             data = await r.json(content_type=None)
             if r.status != 200:
                 raise ExchangeAPIError(f"Binance API HTTP {r.status}: {data}")
+            if isinstance(data, dict):
+                raw_code = data.get("code")
+                if raw_code not in (None, 0, "0"):
+                    raise ExchangeAPIError(f"Binance API code {raw_code}: {data.get('msg') or data}")
             return data if isinstance(data, dict) else {"data": data}
     except ExchangeAPIError:
         raise
@@ -3367,9 +3371,18 @@ def _binance_futures_close_position_side_from_order_side(side: str | None) -> st
     return "LONG" if str(side or "").upper().strip() == "SELL" else "SHORT"
 
 
+def _binance_is_position_row(d: dict | None, symbol: str) -> bool:
+    if not isinstance(d, dict):
+        return False
+    if str(d.get("symbol") or "").upper() != str(symbol or "").upper():
+        return False
+    return any(k in d for k in ("positionAmt", "positionSide", "entryPrice", "unRealizedProfit", "notional"))
+
+
 async def _binance_futures_position_context(*, api_key: str, api_secret: str, symbol: str) -> dict:
     timeout = aiohttp.ClientTimeout(total=10)
     rows: list[dict] = []
+    payload_valid = False
     async with aiohttp.ClientSession(timeout=timeout) as s:
         data = await _binance_signed_request(
             s,
@@ -3381,23 +3394,39 @@ async def _binance_futures_position_context(*, api_key: str, api_secret: str, sy
             params={"symbol": symbol.upper(), "recvWindow": "5000"},
         )
     if isinstance(data, list):
-        rows = [d for d in data if isinstance(d, dict) and str(d.get("symbol") or "").upper() == symbol.upper()]
+        payload_valid = True
+        rows = [d for d in data if _binance_is_position_row(d, symbol)]
     elif isinstance(data, dict):
-        d0 = data.get("data") if isinstance(data.get("data"), dict) else data
-        if isinstance(d0, dict) and str(d0.get("symbol") or symbol).upper() == symbol.upper():
-            rows = [d0]
+        payload = data.get("data")
+        if isinstance(payload, list):
+            payload_valid = True
+            rows = [d for d in payload if _binance_is_position_row(d, symbol)]
+        elif isinstance(payload, dict):
+            payload_valid = True
+            if _binance_is_position_row(payload, symbol):
+                rows = [payload]
+        elif _binance_is_position_row(data, symbol):
+            payload_valid = True
+            rows = [data]
     hedge_mode = any(str((d or {}).get("positionSide") or "").upper() in ("LONG", "SHORT") for d in rows)
     if _SMART_BINANCE_DEBUG:
         try:
             logger.info(
-                "[BINANCE_POS_CTX] sym=%s hedge=%s rows=%s",
+                "[BINANCE_POS_CTX] sym=%s hedge=%s valid=%s rows=%s",
                 symbol.upper(),
                 bool(hedge_mode),
+                bool(payload_valid),
                 json.dumps(_binance_debug_compact_pos_rows(rows), ensure_ascii=False),
             )
+            if not payload_valid:
+                logger.warning(
+                    "[BINANCE_POS_CTX_INVALID] sym=%s payload=%s",
+                    symbol.upper(),
+                    json.dumps(data, ensure_ascii=False, default=str)[:1200],
+                )
         except Exception:
             pass
-    return {"rows": rows, "hedge_mode": hedge_mode}
+    return {"rows": rows, "hedge_mode": hedge_mode, "payload_valid": payload_valid}
 
 
 async def _binance_futures_is_hedge_mode(*, api_key: str, api_secret: str, symbol: str | None = None) -> bool:
@@ -5304,6 +5333,8 @@ async def _futures_position_size(*, ex: str, api_key: str, api_secret: str, symb
         ex = (ex or "").lower().strip()
         if ex == "binance":
             ctx = await _binance_futures_position_context(api_key=api_key, api_secret=api_secret, symbol=symbol)
+            if not bool(ctx.get("payload_valid", True)):
+                raise ExchangeAPIError(f"Binance positionRisk invalid payload for {symbol}")
             rows = list(ctx.get("rows") or [])
             want_side = str(position_side or "").upper().strip()
             selected_amt = 0.0
@@ -5965,8 +5996,15 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             except Exception:
                                 pass
                             continue
-                    except Exception:
+                    except Exception as e:
                         # Never crash the manager loop because of reconcile.
+                        try:
+                            await _sync_pos_meta({
+                                "last_reconcile_error": str(e)[:500],
+                                "last_reconcile_error_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                            })
+                        except Exception:
+                            pass
                         logger.exception("Soft reconcile error for pos_id=%s", pos_id)
                 tp1_id = ref.get("tp1_order_id")
                 tp2_id = ref.get("tp2_order_id")
