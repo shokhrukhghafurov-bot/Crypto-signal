@@ -3355,6 +3355,79 @@ async def _binance_futures_set_leverage(*, api_key: str, api_secret: str, symbol
         )
 
 
+_BINANCE_FUTURES_MODE_CACHE: dict[str, tuple[float, bool]] = {}
+
+
+def _binance_futures_position_side_from_direction(*, direction: str | None = None, side: str | None = None) -> str:
+    raw = str(direction or side or "").upper().strip()
+    return "SHORT" if raw in ("SHORT", "SELL") else "LONG"
+
+
+def _binance_futures_close_position_side_from_order_side(side: str | None) -> str:
+    return "LONG" if str(side or "").upper().strip() == "SELL" else "SHORT"
+
+
+async def _binance_futures_position_context(*, api_key: str, api_secret: str, symbol: str) -> dict:
+    timeout = aiohttp.ClientTimeout(total=10)
+    rows: list[dict] = []
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        data = await _binance_signed_request(
+            s,
+            base_url="https://fapi.binance.com",
+            path="/fapi/v2/positionRisk",
+            method="GET",
+            api_key=api_key,
+            api_secret=api_secret,
+            params={"symbol": symbol.upper(), "recvWindow": "5000"},
+        )
+    if isinstance(data, list):
+        rows = [d for d in data if isinstance(d, dict) and str(d.get("symbol") or "").upper() == symbol.upper()]
+    elif isinstance(data, dict):
+        d0 = data.get("data") if isinstance(data.get("data"), dict) else data
+        if isinstance(d0, dict) and str(d0.get("symbol") or symbol).upper() == symbol.upper():
+            rows = [d0]
+    hedge_mode = any(str((d or {}).get("positionSide") or "").upper() in ("LONG", "SHORT") for d in rows)
+    return {"rows": rows, "hedge_mode": hedge_mode}
+
+
+async def _binance_futures_is_hedge_mode(*, api_key: str, api_secret: str, symbol: str | None = None) -> bool:
+    cache_key = hashlib.sha1(f"{api_key}|{(symbol or '*').upper()}".encode("utf-8")).hexdigest()
+    now_ts = time.time()
+    cached = _BINANCE_FUTURES_MODE_CACHE.get(cache_key)
+    if cached and (now_ts - float(cached[0] or 0.0) <= 30.0):
+        return bool(cached[1])
+
+    hedge_mode: bool | None = None
+    if symbol:
+        try:
+            ctx = await _binance_futures_position_context(api_key=api_key, api_secret=api_secret, symbol=symbol)
+            rows = ctx.get("rows") or []
+            if rows:
+                hedge_mode = bool(ctx.get("hedge_mode"))
+        except Exception:
+            hedge_mode = None
+
+    if hedge_mode is None:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            data = await _binance_signed_request(
+                s,
+                base_url="https://fapi.binance.com",
+                path="/fapi/v1/positionSide/dual",
+                method="GET",
+                api_key=api_key,
+                api_secret=api_secret,
+                params={"recvWindow": "5000"},
+            )
+        raw = None
+        if isinstance(data, dict):
+            raw = data.get("dualSidePosition")
+        hedge_mode = str(raw).strip().lower() in ("true", "1", "yes", "on") if raw is not None else False
+
+    _BINANCE_FUTURES_MODE_CACHE[cache_key] = (now_ts, bool(hedge_mode))
+    return bool(hedge_mode)
+
+
 async def _binance_futures_market_open(
     *,
     api_key: str,
@@ -3362,7 +3435,19 @@ async def _binance_futures_market_open(
     symbol: str,
     side: str,
     qty: float,
+    position_side: str | None = None,
+    hedge_mode: bool | None = None,
 ) -> dict:
+    use_hedge = bool(hedge_mode) if hedge_mode is not None else await _binance_futures_is_hedge_mode(api_key=api_key, api_secret=api_secret, symbol=symbol)
+    params = {
+        "symbol": symbol.upper(),
+        "side": side.upper(),
+        "type": "MARKET",
+        "quantity": f"{qty:.8f}",
+        "recvWindow": "5000",
+    }
+    if use_hedge:
+        params["positionSide"] = str(position_side or _binance_futures_position_side_from_direction(side=side)).upper()
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _binance_signed_request(
@@ -3372,13 +3457,7 @@ async def _binance_futures_market_open(
             method="POST",
             api_key=api_key,
             api_secret=api_secret,
-            params={
-                "symbol": symbol.upper(),
-                "side": side.upper(),
-                "type": "MARKET",
-                "quantity": f"{qty:.8f}",
-                "recvWindow": "5000",
-            },
+            params=params,
         )
 
 
@@ -3390,7 +3469,23 @@ async def _binance_futures_reduce_limit(
     side: str,
     qty: float,
     price: float,
+    position_side: str | None = None,
+    hedge_mode: bool | None = None,
 ) -> dict:
+    use_hedge = bool(hedge_mode) if hedge_mode is not None else await _binance_futures_is_hedge_mode(api_key=api_key, api_secret=api_secret, symbol=symbol)
+    params = {
+        "symbol": symbol.upper(),
+        "side": side.upper(),
+        "type": "LIMIT",
+        "timeInForce": "GTC",
+        "quantity": f"{qty:.8f}",
+        "price": f"{price:.8f}",
+        "recvWindow": "5000",
+    }
+    if use_hedge:
+        params["positionSide"] = str(position_side or _binance_futures_close_position_side_from_order_side(side)).upper()
+    else:
+        params["reduceOnly"] = "true"
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _binance_signed_request(
@@ -3400,16 +3495,7 @@ async def _binance_futures_reduce_limit(
             method="POST",
             api_key=api_key,
             api_secret=api_secret,
-            params={
-                "symbol": symbol.upper(),
-                "side": side.upper(),
-                "type": "LIMIT",
-                "timeInForce": "GTC",
-                "reduceOnly": "true",
-                "quantity": f"{qty:.8f}",
-                "price": f"{price:.8f}",
-                "recvWindow": "5000",
-            },
+            params=params,
         )
 
 
@@ -3420,8 +3506,22 @@ async def _binance_futures_reduce_market(
     symbol: str,
     side: str,
     qty: float,
+    position_side: str | None = None,
+    hedge_mode: bool | None = None,
 ) -> dict:
-    """Reduce-only MARKET order (emergency close / partial close)."""
+    """Reduce MARKET order (emergency close / partial close)."""
+    use_hedge = bool(hedge_mode) if hedge_mode is not None else await _binance_futures_is_hedge_mode(api_key=api_key, api_secret=api_secret, symbol=symbol)
+    params = {
+        "symbol": symbol.upper(),
+        "side": side.upper(),
+        "type": "MARKET",
+        "quantity": f"{float(qty):.8f}",
+        "recvWindow": "5000",
+    }
+    if use_hedge:
+        params["positionSide"] = str(position_side or _binance_futures_close_position_side_from_order_side(side)).upper()
+    else:
+        params["reduceOnly"] = "true"
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _binance_signed_request(
@@ -3431,14 +3531,7 @@ async def _binance_futures_reduce_market(
             method="POST",
             api_key=api_key,
             api_secret=api_secret,
-            params={
-                "symbol": symbol.upper(),
-                "side": side.upper(),
-                "type": "MARKET",
-                "reduceOnly": "true",
-                "quantity": f"{float(qty):.8f}",
-                "recvWindow": "5000",
-            },
+            params=params,
         )
 
 
@@ -3449,8 +3542,21 @@ async def _binance_futures_stop_market_close_all(
     symbol: str,
     side: str,
     stop_price: float,
+    position_side: str | None = None,
+    hedge_mode: bool | None = None,
 ) -> dict:
     # side is the close side (opposite to entry): SELL closes long, BUY closes short.
+    use_hedge = bool(hedge_mode) if hedge_mode is not None else await _binance_futures_is_hedge_mode(api_key=api_key, api_secret=api_secret, symbol=symbol)
+    params = {
+        "symbol": symbol.upper(),
+        "side": side.upper(),
+        "type": "STOP_MARKET",
+        "stopPrice": f"{stop_price:.8f}",
+        "closePosition": "true",
+        "recvWindow": "5000",
+    }
+    if use_hedge:
+        params["positionSide"] = str(position_side or _binance_futures_close_position_side_from_order_side(side)).upper()
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         return await _binance_signed_request(
@@ -3460,14 +3566,7 @@ async def _binance_futures_stop_market_close_all(
             method="POST",
             api_key=api_key,
             api_secret=api_secret,
-            params={
-                "symbol": symbol.upper(),
-                "side": side.upper(),
-                "type": "STOP_MARKET",
-                "stopPrice": f"{stop_price:.8f}",
-                "closePosition": "true",
-                "recvWindow": "5000",
-            },
+            params=params,
         )
 
 
@@ -4799,7 +4898,17 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
         side = "BUY" if direction == "LONG" else "SELL"
         close_side = "SELL" if side == "BUY" else "BUY"
-        entry_res = await _binance_futures_market_open(api_key=api_key, api_secret=api_secret, symbol=symbol, side=side, qty=qty)
+        hedge_mode = await _binance_futures_is_hedge_mode(api_key=api_key, api_secret=api_secret, symbol=symbol)
+        position_side = _binance_futures_position_side_from_direction(direction=direction, side=side)
+        entry_res = await _binance_futures_market_open(
+            api_key=api_key,
+            api_secret=api_secret,
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            position_side=position_side,
+            hedge_mode=hedge_mode,
+        )
 
         # --- VIRTUAL mode: do not place SL/TP orders on exchange ---
         if _VIRTUAL_SLTP_ALL:
@@ -4815,6 +4924,8 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 "direction": direction,
                 "side": side.upper(),
                 "close_side": ("SELL" if side.upper() == "BUY" else "BUY"),
+                "position_side": position_side,
+                "hedge_mode": bool(hedge_mode),
                 "entry_price": entry_p,
                 "qty": float(qty),
                 "tp1": float(tp1 or 0.0),
@@ -4854,10 +4965,20 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 symbol=symbol,
                 side=close_side,
                 stop_price=_round_tick(sl, tick),
+                position_side=position_side,
+                hedge_mode=hedge_mode,
             )
         except Exception:
             try:
-                await _binance_futures_reduce_market(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=qty)
+                await _binance_futures_reduce_market(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    symbol=symbol,
+                    side=close_side,
+                    qty=qty,
+                    position_side=position_side,
+                    hedge_mode=hedge_mode,
+                )
             except Exception:
                 pass
             raise
@@ -4881,6 +5002,8 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 side=close_side,
                 qty=qty1,
                 price=_round_tick(tp1, tick),
+                position_side=position_side,
+                hedge_mode=hedge_mode,
             )
         except Exception:
             # Cancel SL and close to avoid half-configured strategy
@@ -4889,14 +5012,31 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
             except Exception:
                 pass
             try:
-                await _binance_futures_reduce_market(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=qty)
+                await _binance_futures_reduce_market(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    symbol=symbol,
+                    side=close_side,
+                    qty=qty,
+                    position_side=position_side,
+                    hedge_mode=hedge_mode,
+                )
             except Exception:
                 pass
             raise
         tp2_res = None
         if has_tp2 and qty2 > 0:
             try:
-                tp2_res = await _binance_futures_reduce_limit(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=qty2, price=_round_tick(tp2, tick))
+                tp2_res = await _binance_futures_reduce_limit(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    symbol=symbol,
+                    side=close_side,
+                    qty=qty2,
+                    price=_round_tick(tp2, tick),
+                    position_side=position_side,
+                    hedge_mode=hedge_mode,
+                )
             except Exception:
                 tp2_res = None
 
@@ -4909,6 +5049,8 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                 "atr5_pct": float(atr5_pct_sig) if mt == "futures" else 0.0,
             "side": side,
             "close_side": close_side,
+            "position_side": position_side,
+            "hedge_mode": bool(hedge_mode),
             "entry_order_id": entry_res.get("orderId"),
             "sl_order_id": sl_res.get("orderId"),
             "tp1_order_id": tp1_res.get("orderId"),
@@ -5074,26 +5216,34 @@ async def _spot_base_balance(*, ex: str, api_key: str, api_secret: str, passphra
 
     return 0.0
 
-async def _futures_position_size(*, ex: str, api_key: str, api_secret: str, symbol: str, category: str = "linear", passphrase: str | None = None) -> float:
+async def _futures_position_size(*, ex: str, api_key: str, api_secret: str, symbol: str, category: str = "linear", passphrase: str | None = None, position_side: str | None = None) -> float:
     timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=timeout) as s:
         ex = (ex or "").lower().strip()
         if ex == "binance":
-            data = await _binance_signed_request(
-                s, base_url="https://fapi.binance.com", path="/fapi/v2/positionRisk", method="GET",
-                api_key=api_key, api_secret=api_secret, params={"symbol": symbol, "recvWindow":"5000"},
-            )
-            # can be list
-            if isinstance(data, list) and data:
-                d0 = data[0]
-            else:
-                d0 = data.get("data") if isinstance(data, dict) else None
-            if isinstance(d0, dict):
-                return float(d0.get("positionAmt") or 0.0)
-            if isinstance(data, list):
-                for d in data:
-                    if isinstance(d, dict) and str(d.get("symbol") or "").upper() == symbol:
+            ctx = await _binance_futures_position_context(api_key=api_key, api_secret=api_secret, symbol=symbol)
+            rows = list(ctx.get("rows") or [])
+            want_side = str(position_side or "").upper().strip()
+            if want_side:
+                for d in rows:
+                    if str((d or {}).get("positionSide") or "").upper() == want_side:
                         return float(d.get("positionAmt") or 0.0)
+            if rows:
+                nonzero_rows = []
+                for d in rows:
+                    try:
+                        amt = float(d.get("positionAmt") or 0.0)
+                    except Exception:
+                        amt = 0.0
+                    if abs(amt) > 0.0:
+                        nonzero_rows.append(d)
+                if len(nonzero_rows) == 1:
+                    return float(nonzero_rows[0].get("positionAmt") or 0.0)
+                for pref in ("BOTH", "LONG", "SHORT"):
+                    for d in rows:
+                        if str((d or {}).get("positionSide") or "").upper() == pref:
+                            return float(d.get("positionAmt") or 0.0)
+                return float(rows[0].get("positionAmt") or 0.0)
             return 0.0
 
         if ex == "bybit":
@@ -5494,8 +5644,15 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 is_closed = True
                         else:
                             # futures (Binance/Bybit only in this codebase)
-                            size = await _futures_position_size(ex=ex, api_key=api_key, api_secret=api_secret, symbol=symbol,
-                                                                category=str(ref.get("category") or "linear"), passphrase=(passphrase or None))
+                            size = await _futures_position_size(
+                                ex=ex,
+                                api_key=api_key,
+                                api_secret=api_secret,
+                                symbol=symbol,
+                                category=str(ref.get("category") or "linear"),
+                                passphrase=(passphrase or None),
+                                position_side=(str(ref.get("position_side") or _binance_futures_position_side_from_direction(direction=ref.get("direction"), side=ref.get("side"))) if ex == "binance" else None),
+                            )
                             if abs(float(size or 0.0)) <= _DUST_MIN:
                                 is_closed = True
 
@@ -5770,7 +5927,15 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 if mt == "spot":
                                     actual_qty = float(await _spot_base_balance(ex=ex, api_key=api_key, api_secret=api_secret, passphrase=passphrase, symbol=symbol))
                                 elif ex in ("binance", "bybit", "okx"):
-                                    actual_qty = abs(float(await _futures_position_size(ex=ex, api_key=api_key, api_secret=api_secret, symbol=symbol, category=category_close, passphrase=passphrase)))
+                                    actual_qty = abs(float(await _futures_position_size(
+                                        ex=ex,
+                                        api_key=api_key,
+                                        api_secret=api_secret,
+                                        symbol=symbol,
+                                        category=category_close,
+                                        passphrase=passphrase,
+                                        position_side=(str(ref.get("position_side") or _binance_futures_position_side_from_direction(direction=direction, side=ref.get("side"))) if ex == "binance" else None),
+                                    )))
                         except Exception as e:
                             _log_rate_limited(
                                 f"smart_actual_qty_err:{uid}:{ex}:{mt}:{symbol}",
@@ -5835,7 +6000,15 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         # Futures
                         close_side = "SELL" if direction == "LONG" else "BUY"
                         if ex == "binance":
-                            await _binance_futures_reduce_market(api_key=api_key, api_secret=api_secret, symbol=symbol, side=close_side, qty=q2)
+                            await _binance_futures_reduce_market(
+                                api_key=api_key,
+                                api_secret=api_secret,
+                                symbol=symbol,
+                                side=close_side,
+                                qty=q2,
+                                position_side=str(ref.get("position_side") or _binance_futures_position_side_from_direction(direction=direction, side=ref.get("side"))),
+                                hedge_mode=(bool(ref.get("hedge_mode")) if ref.get("hedge_mode") is not None else None),
+                            )
                         elif ex == "bybit":
                             await _bybit_order_create(
                                 api_key=api_key,
@@ -25610,7 +25783,15 @@ async def autotrade_anomaly_watchdog_loop(*, notify_api_error=None) -> None:
                             actual_size = await _spot_base_balance(ex=ex, api_key=api_key, api_secret=api_secret, passphrase=passphrase, symbol=symbol)
                         else:
                             category = str(ref.get("category") or ("linear" if mt == "futures" else "spot"))
-                            actual_size = await _futures_position_size(ex=ex, api_key=api_key, api_secret=api_secret, symbol=symbol, category=category, passphrase=passphrase)
+                            actual_size = await _futures_position_size(
+                                ex=ex,
+                                api_key=api_key,
+                                api_secret=api_secret,
+                                symbol=symbol,
+                                category=category,
+                                passphrase=passphrase,
+                                position_side=(str(ref.get("position_side") or _binance_futures_position_side_from_direction(direction=ref.get("direction"), side=ref.get("side"))) if ex == "binance" else None),
+                            )
                     except Exception as e:
                         if notify_api_error:
                             try:
