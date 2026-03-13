@@ -5631,9 +5631,31 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                     pos_id = int(r.get("id") or 0)
                 except Exception:
                     pos_id = 0
+
+                opened_at = r.get("opened_at")
+                open_age_sec = 999999.0
+                try:
+                    if hasattr(opened_at, "timestamp"):
+                        open_age_sec = max(0.0, time.time() - float(opened_at.timestamp()))
+                    elif opened_at:
+                        open_age_sec = max(
+                            0.0,
+                            time.time() - dt.datetime.fromisoformat(
+                                str(opened_at).replace("Z", "+00:00")
+                            ).timestamp(),
+                        )
+                except Exception:
+                    open_age_sec = 999999.0
+
+                zero_hits = 0
+                try:
+                    zero_hits = int(meta.get("reconcile_zero_hits") or 0)
+                except Exception:
+                    zero_hits = 0
+
                 now_ts = time.time()
                 last_ts = _LAST_RECONCILE_TS.get(pos_id, 0.0)
-                if pos_id and (now_ts - last_ts) >= _RECONCILE_COOLDOWN_SEC:
+                if pos_id and open_age_sec >= 90.0 and (now_ts - last_ts) >= _RECONCILE_COOLDOWN_SEC:
                     _LAST_RECONCILE_TS[pos_id] = now_ts
                     try:
                         # Determine if position is still open on exchange
@@ -5646,7 +5668,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             if bal <= eps:
                                 is_closed = True
                         else:
-                            # futures (Binance/Bybit only in this codebase)
+                            # futures (Binance/Bybit/OKX in this codebase)
                             size = await _futures_position_size(
                                 ex=ex,
                                 api_key=api_key,
@@ -5656,8 +5678,33 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 passphrase=(passphrase or None),
                                 position_side=(str(ref.get("position_side") or _binance_futures_position_side_from_direction(direction=ref.get("direction"), side=ref.get("side"))) if ex == "binance" else None),
                             )
-                            if abs(float(size or 0.0)) <= _DUST_MIN:
-                                is_closed = True
+                            size_f = abs(float(size or 0.0))
+                            logger.info(
+                                "[SMART_RECONCILE] uid=%s ex=%s market=%s sym=%s size=%s pos_side=%s hedge=%s age=%.1fs zero_hits=%s",
+                                uid,
+                                ex,
+                                mt,
+                                symbol,
+                                size_f,
+                                str(ref.get("position_side") or ""),
+                                str(ref.get("hedge_mode")),
+                                open_age_sec,
+                                zero_hits,
+                            )
+                            if size_f <= _DUST_MIN:
+                                zero_hits += 1
+                                await _sync_pos_meta({
+                                    "reconcile_zero_hits": zero_hits,
+                                    "last_seen_size": size_f,
+                                })
+                                is_closed = zero_hits >= 3
+                            else:
+                                if zero_hits:
+                                    await _sync_pos_meta({
+                                        "reconcile_zero_hits": 0,
+                                        "last_seen_size": size_f,
+                                    })
+                                    zero_hits = 0
 
                         if is_closed:
                             # Best-effort: cancel any known child orders to avoid stray fills after manual close.
