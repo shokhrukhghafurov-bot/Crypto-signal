@@ -1440,7 +1440,7 @@ async def _render_in_place(call: types.CallbackQuery, txt: str, kb: types.Inline
     return await safe_send(call.from_user.id, txt, reply_markup=kb)
 
 
-async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKeyboardMarkup | None = None) -> None:
+async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKeyboardMarkup | None = None, **kwargs) -> None:
     """Safely update an existing bot message.
 
     Telegram has a 4096 char limit for message text. This helper:
@@ -1489,6 +1489,7 @@ async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKe
             message_id=msg_id,
             text=parts[0],
             reply_markup=kb if len(parts) == 1 else None,
+            **kwargs,
         )
     except Exception as e:
         # If the message content is identical, Telegram returns "message is not modified".
@@ -1497,7 +1498,7 @@ async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKe
             return
         # If we can't edit (old message, etc.) - just send new
         try:
-            await safe_send(chat_id, parts[0], reply_markup=kb if len(parts) == 1 else None)
+            await safe_send(chat_id, parts[0], reply_markup=kb if len(parts) == 1 else None, **kwargs)
         except Exception:
             logger.exception("safe_edit: failed to edit/send first chunk")
 
@@ -1505,7 +1506,7 @@ async def safe_edit(message: types.Message | None, text: str, kb: types.InlineKe
     if len(parts) > 1:
         for i, part in enumerate(parts[1:], start=1):
             try:
-                await safe_send(chat_id, part, reply_markup=kb if i == len(parts) - 1 else None)
+                await safe_send(chat_id, part, reply_markup=kb if i == len(parts) - 1 else None, **kwargs)
             except Exception:
                 logger.exception("safe_edit: failed to send chunk %s/%s", i + 1, len(parts))
 
@@ -4634,7 +4635,7 @@ async def autotrade_menu_subscreens(call: types.CallbackQuery) -> None:
         return
 
     if action == "info":
-        await safe_edit(call.message, tr(uid, "at_info_text"), autotrade_info_kb(uid))
+        await safe_edit(call.message, tr(uid, "at_info_text"), autotrade_info_kb(uid), disable_web_page_preview=True)
         return
 
     if action == "faq":
