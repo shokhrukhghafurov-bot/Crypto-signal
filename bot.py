@@ -17,7 +17,7 @@ from typing import Dict, List, Set, Tuple, Optional
 from dataclasses import replace
 
 from aiogram import Bot, Dispatcher, types
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, InputMediaPhoto
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
@@ -7074,11 +7074,18 @@ async def main() -> None:
             )
             return web.json_response({"ok": True})
 
-        async def _read_signal_admin_message_payload(request: web.Request) -> tuple[str, str, str, bytes | None, str | None, str | None, list[str]]:
+        def _is_signal_admin_photo_file(file_name: str | None, file_content_type: str | None) -> bool:
+            if str(file_content_type or '').lower().startswith('image/'):
+                return True
+            probe = str(file_name or '').lower()
+            return probe.endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp'))
+
+        async def _read_signal_admin_message_payload(request: web.Request) -> tuple[str, str, str, bytes | None, str | None, str | None, list[str], list[dict[str, object]]]:
             data = {}
             file_bytes: bytes | None = None
             file_name: str | None = None
             file_content_type: str | None = None
+            uploaded_files: list[dict[str, object]] = []
 
             try:
                 content_type = str(request.content_type or '').lower()
@@ -7091,10 +7098,21 @@ async def main() -> None:
                     name = str(part.name or '').strip()
                     if not name:
                         continue
-                    if name == 'file':
-                        file_name = part.filename or 'upload.bin'
-                        file_content_type = part.headers.get('Content-Type') if part.headers else None
-                        file_bytes = await part.read(decode=False)
+                    if name in ('file', 'files'):
+                        payload_name = part.filename or f'upload_{len(uploaded_files) + 1}.bin'
+                        payload_content_type = part.headers.get('Content-Type') if part.headers else None
+                        payload_bytes = await part.read(decode=False)
+                        if not payload_bytes:
+                            continue
+                        uploaded_files.append({
+                            'bytes': payload_bytes,
+                            'name': payload_name,
+                            'content_type': payload_content_type,
+                        })
+                        if file_bytes is None:
+                            file_bytes = payload_bytes
+                            file_name = payload_name
+                            file_content_type = payload_content_type
                     else:
                         try:
                             data[name] = await part.text()
@@ -7114,17 +7132,26 @@ async def main() -> None:
                 audience = [str(x).strip().lower() for x in audience_raw if str(x).strip()]
             else:
                 audience = [x.strip().lower() for x in str(audience_raw).split(',') if x.strip()]
-            return text, url, media_type, file_bytes, file_name, file_content_type, audience
+            return text, url, media_type, file_bytes, file_name, file_content_type, audience, uploaded_files
 
-        def _infer_signal_admin_media_type(media_type: str, url: str, file_name: str | None, file_content_type: str | None) -> str:
+        def _infer_signal_admin_media_type(
+            media_type: str,
+            url: str,
+            file_name: str | None,
+            file_content_type: str | None,
+            uploaded_files: list[dict[str, object]] | None = None,
+        ) -> str:
             media_type = str(media_type or 'auto').strip().lower() or 'auto'
             if media_type in ('text', 'photo', 'document'):
                 return media_type
-            if str(file_content_type or '').lower().startswith('image/'):
+            uploaded_files = list(uploaded_files or [])
+            if uploaded_files:
+                if all(_is_signal_admin_photo_file(str(item.get('name') or ''), str(item.get('content_type') or '')) for item in uploaded_files):
+                    return 'photo'
+                return 'document'
+            if _is_signal_admin_photo_file(file_name, file_content_type):
                 return 'photo'
             probe = str(file_name or url or '').lower()
-            if probe.endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp')):
-                return 'photo'
             if probe:
                 return 'document'
             return 'text'
@@ -7195,12 +7222,14 @@ async def main() -> None:
             file_bytes: bytes | None,
             file_name: str | None,
             file_content_type: str | None,
+            uploaded_files: list[dict[str, object]] | None,
             ctx: str,
         ) -> None:
             text = str(text or '').strip()
             url = str(url or '').strip()
-            has_media = bool(url or file_bytes)
-            kind = _infer_signal_admin_media_type(media_type, url, file_name, file_content_type)
+            uploaded_files = list(uploaded_files or [])
+            has_media = bool(url or file_bytes or uploaded_files)
+            kind = _infer_signal_admin_media_type(media_type, url, file_name, file_content_type, uploaded_files)
 
             if not has_media or kind == 'text':
                 if not text:
@@ -7213,6 +7242,28 @@ async def main() -> None:
             if caption and len(caption) > 1024:
                 extra_text = caption[1024:].strip() or None
                 caption = caption[:1024]
+
+            if len(uploaded_files) > 1:
+                if url:
+                    raise ValueError('album cannot be combined with url')
+                if kind != 'photo':
+                    raise ValueError('multiple files are supported only for photo albums')
+                if len(uploaded_files) > 10:
+                    raise ValueError('photo album supports up to 10 files')
+                if not all(_is_signal_admin_photo_file(str(item.get('name') or ''), str(item.get('content_type') or '')) for item in uploaded_files):
+                    raise ValueError('photo album supports image files only')
+
+                media = []
+                for idx, item in enumerate(uploaded_files):
+                    payload = BufferedInputFile(
+                        bytes(item.get('bytes') or b''),
+                        filename=(str(item.get('name') or '') or f'image_{idx + 1}.jpg'),
+                    )
+                    media.append(InputMediaPhoto(media=payload, caption=caption if idx == 0 else None))
+                await bot.send_media_group(telegram_id, media=media)
+                if extra_text:
+                    await safe_send(telegram_id, extra_text, ctx=ctx)
+                return
 
             if kind == 'photo':
                 photo_payload = BufferedInputFile(file_bytes, filename=(file_name or 'image.jpg')) if file_bytes is not None else url
@@ -7227,7 +7278,7 @@ async def main() -> None:
         async def signal_broadcast_text(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
-            text, url, media_type, file_bytes, file_name, file_content_type, audience = await _read_signal_admin_message_payload(request)
+            text, url, media_type, file_bytes, file_name, file_content_type, audience, uploaded_files = await _read_signal_admin_message_payload(request)
             if not text and not url and not file_bytes:
                 return web.json_response({"ok": False, "error": "text/url/file required"}, status=400)
             uids = await _get_signal_admin_user_ids(audience)
@@ -7245,6 +7296,7 @@ async def main() -> None:
                         file_bytes=file_bytes,
                         file_name=file_name,
                         file_content_type=file_content_type,
+                        uploaded_files=uploaded_files,
                         ctx='signal-admin-broadcast',
                     )
                     sent += 1
@@ -7271,7 +7323,7 @@ async def main() -> None:
             except Exception:
                 return web.json_response({"ok": False, "error": "invalid telegram_id"}, status=400)
 
-            text, url, media_type, file_bytes, file_name, file_content_type, _audience = await _read_signal_admin_message_payload(request)
+            text, url, media_type, file_bytes, file_name, file_content_type, _audience, uploaded_files = await _read_signal_admin_message_payload(request)
             if not text and not url and not file_bytes:
                 return web.json_response({"ok": False, "error": "text/url/file required"}, status=400)
 
@@ -7284,6 +7336,7 @@ async def main() -> None:
                     file_bytes=file_bytes,
                     file_name=file_name,
                     file_content_type=file_content_type,
+                    uploaded_files=uploaded_files,
                     ctx="signal-admin-send",
                 )
                 return web.json_response({"ok": True, "telegram_id": telegram_id})
