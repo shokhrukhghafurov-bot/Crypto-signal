@@ -6144,8 +6144,40 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             qty_hint=qty_used,
                         )
 
+                    async def _mark_local_full_close(close_reason: str, *, tp1_hit: bool | None = None, be_moved_value: bool | None = None) -> None:
+                        reason_norm = _normalize_autotrade_close_reason(close_reason or "SYNC_CLOSE")
+                        ref["qty"] = 0.0
+                        ref["closed_reason"] = reason_norm
+                        if tp1_hit is not None:
+                            ref["tp1_hit"] = bool(tp1_hit)
+                        if be_moved_value is not None:
+                            ref["be_moved"] = bool(be_moved_value)
+                        try:
+                            await db_store.update_autotrade_order_ref(
+                                row_id=int(r.get("id") or 0),
+                                api_order_ref=json.dumps(ref),
+                            )
+                        except Exception:
+                            pass
+                        patch = {
+                            "closed_reason": reason_norm,
+                            "qty": 0.0,
+                        }
+                        if tp1_hit is not None:
+                            patch["tp1_hit"] = bool(tp1_hit)
+                        if be_moved_value is not None:
+                            patch["be_moved"] = bool(be_moved_value)
+                        be_px_keep = float(ref.get("be_price") or meta.get("be_price") or 0.0)
+                        if be_px_keep > 0:
+                            patch["be_price"] = be_px_keep
+                        try:
+                            await _sync_pos_meta(patch)
+                        except Exception:
+                            pass
+
                     if qty <= 0:
-                        await _sync_pos_meta({"closed_reason": "SYNC_CLOSE", "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit"))})
+                        existing_reason = _normalize_autotrade_close_reason(ref.get("closed_reason") or meta.get("closed_reason") or "SYNC_CLOSE")
+                        await _sync_pos_meta({"closed_reason": existing_reason, "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit")), "be_moved": bool(ref.get("be_moved") or meta.get("be_moved")), "be_price": float(ref.get("be_price") or meta.get("be_price") or 0.0)})
                         pnl_usdt, roi_percent = _smart_close_snapshot()
 
                         await db_store.close_autotrade_position(
@@ -6399,7 +6431,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                     except Exception as e:
                                         _log_rate_limited(f"smart_trail_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] trail close failed {ex}/{mt} {symbol}: {e}", every_s=30, level="warning")
                                     if trail_closed:
-                                        await _sync_pos_meta({"closed_reason": "TRAIL_EXIT", "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit"))})
+                                        await _mark_local_full_close("TRAIL_EXIT", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
                                         pnl_usdt, roi_percent = _smart_close_snapshot()
 
                                         await db_store.close_autotrade_position(
@@ -6448,7 +6480,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 except Exception as e:
                                     _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                                 if close_ok:
-                                    await _sync_pos_meta({"closed_reason": "REVERSAL_EXIT", "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit"))})
+                                    await _mark_local_full_close("REVERSAL_EXIT", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
                                     pnl_usdt, roi_percent = _smart_close_snapshot()
 
                                     await db_store.close_autotrade_position(
@@ -6472,7 +6504,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                                 except Exception as e:
                                     _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                                 if close_ok:
-                                    await _sync_pos_meta({"closed_reason": "REVERSAL_EXIT", "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit"))})
+                                    await _mark_local_full_close("REVERSAL_EXIT", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
                                     pnl_usdt, roi_percent = _smart_close_snapshot()
 
                                     await db_store.close_autotrade_position(
@@ -6522,7 +6554,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         except Exception as e:
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] early-exit close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                         if close_ok:
-                            await _sync_pos_meta({"closed_reason": "EARLY_EXIT", "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit"))})
+                            await _mark_local_full_close("EARLY_EXIT", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
                             pnl_usdt, roi_percent = _smart_close_snapshot()
 
                             await db_store.close_autotrade_position(
@@ -6685,7 +6717,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         except Exception as e:
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                         if close_ok:
-                            await _sync_pos_meta({"closed_reason": "SL", "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit"))})
+                            await _mark_local_full_close("SL", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")), be_moved_value=bool(ref.get("be_moved") or meta.get("be_moved")))
                             pnl_usdt, roi_percent = _smart_close_snapshot()
 
                             await db_store.close_autotrade_position(
@@ -6708,7 +6740,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         except Exception as e:
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                         if close_ok:
-                            await _sync_pos_meta({"closed_reason": "TP2", "tp1_hit": bool(ref.get("tp1_hit") or meta.get("tp1_hit"))})
+                            await _mark_local_full_close("TP2", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
                             pnl_usdt, roi_percent = _smart_close_snapshot()
 
                             await db_store.close_autotrade_position(
@@ -6808,7 +6840,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             except Exception as e:
                                 _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                             if close_ok:
-                                await _sync_pos_meta({"closed_reason": str(mode), "tp1_hit": True})
+                                await _mark_local_full_close(str(mode), tp1_hit=True)
                                 pnl_usdt, roi_percent = _smart_close_snapshot()
 
                                 await db_store.close_autotrade_position(
@@ -6870,7 +6902,7 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         except Exception as e:
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                         if close_ok:
-                            await _sync_pos_meta({"closed_reason": "BE", "tp1_hit": True, "be_moved": True})
+                            await _mark_local_full_close("BE", tp1_hit=True, be_moved_value=True)
                             pnl_usdt, roi_percent = _smart_close_snapshot()
 
                             await db_store.close_autotrade_position(
@@ -26138,3 +26170,4 @@ async def autotrade_anomaly_watchdog_loop(*, notify_api_error=None) -> None:
             logger.error("[AUTOTRADE_DIAG_LOOP_ERROR] %s\n%s", e, traceback.format_exc())
             await asyncio.sleep(10.0)
 # --- END AUTOTRADE ANOMALY WATCHDOG PATCH ---
+
