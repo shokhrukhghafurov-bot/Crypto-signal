@@ -6312,7 +6312,13 @@ async def main() -> None:
     # NOTE: Railway public domain requires an HTTP server listening on $PORT.
     # We run a tiny aiohttp server alongside the Telegram bot.
     async def _admin_http_app() -> web.Application:
-        app = web.Application()
+        try:
+            signal_admin_max_body_mb = float(os.getenv("SIGNAL_ADMIN_MAX_BODY_MB", "20") or 20)
+        except Exception:
+            signal_admin_max_body_mb = 20.0
+        if signal_admin_max_body_mb <= 0:
+            signal_admin_max_body_mb = 20.0
+        app = web.Application(client_max_size=int(signal_admin_max_body_mb * 1024 * 1024))
 
         # ---- Basic Auth ----
         ADMIN_USER = os.getenv("SIGNAL_ADMIN_USER") or os.getenv("ADMIN_USER") or "admin"
@@ -7278,7 +7284,13 @@ async def main() -> None:
         async def signal_broadcast_text(request: web.Request) -> web.Response:
             if not _check_basic(request):
                 return _unauthorized()
-            text, url, media_type, file_bytes, file_name, file_content_type, audience, uploaded_files = await _read_signal_admin_message_payload(request)
+            try:
+                text, url, media_type, file_bytes, file_name, file_content_type, audience, uploaded_files = await _read_signal_admin_message_payload(request)
+            except web.HTTPRequestEntityTooLarge:
+                return web.json_response({
+                    "ok": False,
+                    "error": "payload too large; reduce total upload size or raise SIGNAL_ADMIN_MAX_BODY_MB",
+                }, status=413)
             if not text and not url and not file_bytes:
                 return web.json_response({"ok": False, "error": "text/url/file required"}, status=400)
             uids = await _get_signal_admin_user_ids(audience)
@@ -7323,7 +7335,13 @@ async def main() -> None:
             except Exception:
                 return web.json_response({"ok": False, "error": "invalid telegram_id"}, status=400)
 
-            text, url, media_type, file_bytes, file_name, file_content_type, _audience, uploaded_files = await _read_signal_admin_message_payload(request)
+            try:
+                text, url, media_type, file_bytes, file_name, file_content_type, _audience, uploaded_files = await _read_signal_admin_message_payload(request)
+            except web.HTTPRequestEntityTooLarge:
+                return web.json_response({
+                    "ok": False,
+                    "error": "payload too large; reduce total upload size or raise SIGNAL_ADMIN_MAX_BODY_MB",
+                }, status=413)
             if not text and not url and not file_bytes:
                 return web.json_response({"ok": False, "error": "text/url/file required"}, status=400)
 
