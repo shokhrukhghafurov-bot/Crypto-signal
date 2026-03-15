@@ -6211,6 +6211,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                         ref["be_moved"] = False
                         ref["pro_real_init"] = True
                         dirty = True
+                    price_diag = "-"
                     try:
                         # --- price (decision) ---
                         # Shared oracle for ALL exchanges / SPOT+FUTURES.
@@ -6232,15 +6233,20 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                                 dirty = True
                         else:
                             px = 0.0
-                    except Exception:
+                    except PriceUnavailableError as e:
                         px = 0.0
                         px_src = "-"
+                        price_diag = str(e)
+                    except Exception as e:
+                        px = 0.0
+                        px_src = "-"
+                        price_diag = f"unexpected:{type(e).__name__}:{str(e)[:300]}"
 
                     if not px or px <= 0:
                         if smart_tick_due:
                             try:
                                 logger.info(
-                                    "SMART_TICK uid=%s market=%s ex=%s sym=%s side=%s virtual=%s px=NA entry=%.10f tp1=%.10f tp2=%.10f sl=%.10f be=%.10f qty=%.10f state=%s mode=%s reason=%s px_src=%s",
+                                    "SMART_TICK uid=%s market=%s ex=%s sym=%s side=%s virtual=%s px=NA entry=%.10f tp1=%.10f tp2=%.10f sl=%.10f be=%.10f qty=%.10f state=%s mode=%s reason=%s px_src=%s diag=%s",
                                     uid,
                                     mt,
                                     ex,
@@ -6257,6 +6263,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                                     str(ref.get("tp1_mode") or "-").upper(),
                                     "PRICE_UNAVAILABLE",
                                     str(px_src or "-"),
+                                    str(price_diag or "-")[:800],
                                 )
                             except Exception:
                                 pass
@@ -14753,6 +14760,8 @@ class Backend:
             return None, f"{n}_REST_MISS"
 
         # --- PHASE A: WS-only (priority order) ---
+        ws_diag: list[str] = []
+        rest_diag: list[str] = []
         if mode == "MEDIAN":
             # MEDIAN over all available WS sources for the market, preferring the trade exchange first.
             # For futures, Gate/MEXC currently have no WS stream in this project, so they naturally miss here
@@ -14765,6 +14774,7 @@ class Backend:
                 except Exception:
                     p, _src = None, f"{exname}_WS_MISS"
                 _pdbg(f"WS {exname} -> p={p} src={_src}")
+                ws_diag.append(f"{exname}:{_src}")
                 if _is_reasonable(p):
                     ws_prices.append((exname, float(p)))
             if len(ws_prices) >= 2:
@@ -14779,8 +14789,12 @@ class Backend:
         else:
             _pdbg(f"PHASE A WS-only order={'+'.join(chain)} mode={mode}")
             for exname in chain:
-                p, src = await _ws_only(exname)
+                try:
+                    p, src = await _ws_only(exname)
+                except Exception:
+                    p, src = None, f"{exname}_WS_MISS"
                 _pdbg(f"WS {exname} -> p={p} src={src}")
+                ws_diag.append(f"{exname}:{src}")
                 if _is_reasonable(p):
                     _pdbg(f"SELECTED WS {exname} src={src} p={p}")
                     return float(p), str(src)
@@ -14795,6 +14809,7 @@ class Backend:
                 except Exception:
                     p, src = None, f"{exname}_REST_MISS"
                 _pdbg(f"REST {exname} -> p={p} src={src}")
+                rest_diag.append(f"{exname}:{src}")
                 if _is_reasonable(p):
                     rest_prices.append((str(src), float(p)))
             if len(rest_prices) >= 2:
@@ -14809,13 +14824,25 @@ class Backend:
         else:
             _pdbg(f"PHASE B REST-only order={'+'.join(chain)} mode={mode}")
             for exname in chain:
-                p, src = await _rest_only(exname)
+                try:
+                    p, src = await _rest_only(exname)
+                except Exception:
+                    p, src = None, f"{exname}_REST_MISS"
                 _pdbg(f"REST {exname} -> p={p} src={src}")
+                rest_diag.append(f"{exname}:{src}")
                 if _is_reasonable(p):
                     _pdbg(f"SELECTED REST {exname} src={src} p={p}")
                     return float(p), str(src)
 
-        raise PriceUnavailableError(f"price unavailable market={market} symbol={signal.symbol} mode={mode}")
+        diag_parts: list[str] = []
+        if ws_diag:
+            diag_parts.append("ws=" + ",".join(ws_diag))
+        if rest_diag:
+            diag_parts.append("rest=" + ",".join(rest_diag))
+        diag_suffix = (" " + "; ".join(diag_parts)) if diag_parts else ""
+        raise PriceUnavailableError(
+            f"price unavailable market={market} symbol={signal.symbol} mode={mode}{diag_suffix}"
+        )
 
 
 
