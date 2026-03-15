@@ -6943,7 +6943,11 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                     if mt == "spot" and crossed:
                         _log_rate_limited(
                             f"smart_spot_sl_diag:{uid}:{ex}:{symbol}",
-                            f"[SMART_SPOT_SL] {symbol} px={px:.10f} sl={sl_struct:.10f} hits={sl_hits} age={((now_ts - sl_first_ts) if sl_first_ts > 0 else 0.0):.2f}s deep={_deep_breach()} hard={_hit_hard()} close={sl_close}",
+                            f"[SMART_SPOT_SL] uid={uid} ex={ex} sym={symbol} side={direction} virtual={bool(ref.get('virtual'))} "
+                            f"px_decision={px:.10f} px_src={str(px_src or '-')} "
+                            f"sl={sl_struct:.10f} crossed={crossed} sl_close={sl_close} "
+                            f"hits={sl_hits} age={((now_ts - sl_first_ts) if sl_first_ts > 0 else 0.0):.2f}s "
+                            f"deep={_deep_breach()} hard={_hit_hard()}",
                             every_s=5,
                             level="info",
                         )
@@ -6980,6 +6984,16 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                         except Exception as e:
                             sl_close_error = str(e)
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+
+                        _log_rate_limited(
+                            f"smart_spot_close_diag:{uid}:{ex}:{symbol}",
+                            f"[SMART_CLOSE] uid={uid} ex={ex} sym={symbol} side={direction} virtual={bool(ref.get('virtual'))} "
+                            f"px_decision={px:.10f} px_src={str(px_src or '-')} "
+                            f"sl={sl_struct:.10f} crossed={crossed} sl_close={sl_close} "
+                            f"close_ok={close_ok} close_err={sl_close_error or '-'}",
+                            every_s=2,
+                            level="info",
+                        )
                         if close_ok:
                             sl_reason = _tr(uid, "sm_reason_hard_sl") if _hit_hard() else (_tr(uid, "sm_reason_deep_breach") if (crossed and _deep_breach()) else _tr(uid, "sm_reason_structure_break"))
                             await _notify_smart_decision("SL", "CLOSED", level_label="SL", level_price=sl_struct if sl_struct > 0 else sl_hard, reason=_sm_join_reason(sl_reason, last_close_explain or _sm_reason_market_close_sent(last_close_norm_qty or qty)), cooldown_sec=5.0)
