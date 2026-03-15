@@ -2087,15 +2087,20 @@ async def _binance_wait_request_slot() -> None:
     global _BINANCE_SIGNED_REQ_LOCK, _BINANCE_SIGNED_NEXT_TS
     if _BINANCE_SIGNED_REQ_LOCK is None:
         _BINANCE_SIGNED_REQ_LOCK = asyncio.Lock()
-    async with _BINANCE_SIGNED_REQ_LOCK:
-        now = time.monotonic()
-        cool_until = float(_BINANCE_SIGNED_RATE_LIMIT_UNTIL or 0.0)
-        if cool_until > now:
-            raise ExchangeAPIError(f"Binance API cooldown active for {cool_until - now:.1f}s after rate limit")
-        wait_sec = float(_BINANCE_SIGNED_NEXT_TS or 0.0) - now
-        if wait_sec > 0:
-            await asyncio.sleep(wait_sec)
-        _BINANCE_SIGNED_NEXT_TS = time.monotonic() + _binance_signed_min_interval_sec()
+
+    while True:
+        wait_sec = 0.0
+        async with _BINANCE_SIGNED_REQ_LOCK:
+            now = time.monotonic()
+            cool_until = float(_BINANCE_SIGNED_RATE_LIMIT_UNTIL or 0.0)
+            if cool_until > now:
+                wait_sec = cool_until - now
+            else:
+                wait_sec = float(_BINANCE_SIGNED_NEXT_TS or 0.0) - now
+                if wait_sec <= 0:
+                    _BINANCE_SIGNED_NEXT_TS = time.monotonic() + _binance_signed_min_interval_sec()
+                    return
+        await asyncio.sleep(wait_sec)
 
 
 async def _binance_sync_server_time(
@@ -3141,16 +3146,58 @@ async def _normalize_close_qty(*, ex: str, mt: str, symbol: str, qty: float, px:
 # ------------------ Bybit trading helpers (V5, unified API) ------------------
 
 async def _bybit_price(symbol: str, *, category: str) -> float:
-    sym = symbol.upper()
-    data = await _http_json(
-        "GET",
-        "https://api.bybit.com/v5/market/tickers",
-        params={"category": category, "symbol": sym},
-        timeout_s=10,
-    )
-    lst = (data.get("result") or {}).get("list") or []
-    if lst and isinstance(lst, list) and isinstance(lst[0], dict):
-        return float(lst[0].get("lastPrice") or 0.0)
+    sym = str(symbol or "").upper().replace("/", "").replace("-", "").replace(":", "").strip()
+    cat = str(category or "spot").lower().strip() or "spot"
+    if not sym:
+        return 0.0
+
+    def _extract_price(data) -> float:
+        if not isinstance(data, dict):
+            return 0.0
+        try:
+            ret_code = int(data.get("retCode", 0) or 0)
+        except Exception:
+            ret_code = 0
+        if ret_code != 0:
+            return 0.0
+        lst = (data.get("result") or {}).get("list") or []
+        if lst and isinstance(lst, list) and isinstance(lst[0], dict):
+            item = lst[0]
+            for key in ("lastPrice", "last_price", "indexPrice", "markPrice"):
+                try:
+                    px = float(item.get(key) or 0.0)
+                    if px > 0:
+                        return px
+                except Exception:
+                    continue
+            try:
+                bid = float(item.get("bid1Price") or 0.0)
+                ask = float(item.get("ask1Price") or 0.0)
+                if bid > 0 and ask > 0:
+                    return (bid + ask) / 2.0
+                if bid > 0:
+                    return bid
+                if ask > 0:
+                    return ask
+            except Exception:
+                pass
+        return 0.0
+
+    for attempt in range(3):
+        try:
+            data = await _http_json(
+                "GET",
+                "https://api.bybit.com/v5/market/tickers",
+                params={"category": cat, "symbol": sym},
+                timeout_s=10,
+            )
+            px = _extract_price(data)
+            if px > 0:
+                return float(px)
+        except Exception:
+            pass
+        if attempt < 2:
+            await asyncio.sleep(0.25 * (attempt + 1))
     return 0.0
 
 
@@ -4427,7 +4474,13 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
 
             px = await _bybit_price(symbol, category=category)
             if px <= 0:
-                raise ExchangeAPIError("Bybit price=0")
+                return _skip(
+                    "market_price_unavailable",
+                    exchange=exchange,
+                    market=market,
+                    symbol=symbol,
+                    price_source="bybit_public_ticker",
+                )
 
             # Entry-range guard: allow market entry only when current price stays close enough
             # to the signal entry. This reduces missed fills from overly strict exact-entry logic,
@@ -6175,14 +6228,19 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             continue
                     except Exception as e:
                         # Never crash the manager loop because of reconcile.
+                        is_binance_rl = (ex == "binance" and _binance_is_rate_limit_error_message(e))
                         try:
                             await _sync_pos_meta({
                                 "last_reconcile_error": str(e)[:500],
                                 "last_reconcile_error_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                                "last_reconcile_rate_limited": bool(is_binance_rl),
                             })
                         except Exception:
                             pass
-                        logger.exception("Soft reconcile error for pos_id=%s", pos_id)
+                        if is_binance_rl:
+                            logger.info("Soft reconcile skipped for pos_id=%s due to Binance rate limit: %s", pos_id, e)
+                        else:
+                            logger.exception("Soft reconcile error for pos_id=%s", pos_id)
                 tp1_id = ref.get("tp1_order_id")
                 tp2_id = ref.get("tp2_order_id")
                 sl_id = ref.get("sl_order_id")
@@ -14329,12 +14387,7 @@ class Backend:
 
 
     async def _fetch_bybit_price(self, market: str, symbol: str) -> float | None:
-        """Bybit public REST price (spot/linear futures).
-
-        Spot: category=spot
-        Futures: category=linear (USDT perpetual)
-        Endpoint: /v5/market/tickers
-        """
+        """Bybit public REST price (spot/linear futures) with light retry/fallback parsing."""
         mkt = (market or "FUTURES").upper()
         sym = (symbol or "").upper().replace('/', '').replace('-', '').replace(':', '')
         if not sym:
@@ -14342,39 +14395,77 @@ class Backend:
         cat = "spot" if mkt == "SPOT" else "linear"
         dbg = str(os.getenv("MID_PENDING_PX_DEBUG", "") or "").strip() in ("1", "true", "TRUE", "yes", "YES")
 
-        async def _do_req():
+        def _extract_price(data):
+            if not isinstance(data, dict):
+                return None
             try:
-                url = "https://api.bybit.com/v5/market/tickers"
-                timeout = aiohttp.ClientTimeout(total=6)
+                ret_code = int(data.get("retCode", 0) or 0)
+            except Exception:
+                ret_code = 0
+            if ret_code != 0:
+                return None
+            res = data.get("result") if isinstance(data, dict) else None
+            lst = res.get("list") if isinstance(res, dict) else None
+            if isinstance(lst, list) and lst:
+                item = lst[0]
+                if isinstance(item, dict):
+                    for key in ("lastPrice", "last_price", "indexPrice", "markPrice"):
+                        try:
+                            px = float(item.get(key) or 0.0)
+                            if px > 0:
+                                return px
+                        except Exception:
+                            continue
+                    try:
+                        bid = float(item.get("bid1Price") or 0.0)
+                        ask = float(item.get("ask1Price") or 0.0)
+                        if bid > 0 and ask > 0:
+                            return (bid + ask) / 2.0
+                        if bid > 0:
+                            return bid
+                        if ask > 0:
+                            return ask
+                    except Exception:
+                        pass
+            return None
+
+        async def _do_req():
+            url = "https://api.bybit.com/v5/market/tickers"
+            timeout = aiohttp.ClientTimeout(total=6)
+            try:
                 async with aiohttp.ClientSession(timeout=timeout) as s:
-                    async with s.get(url, params={"category": cat, "symbol": sym}) as r:
-                        if r.status != 200:
+                    for attempt in range(3):
+                        try:
+                            async with s.get(url, params={"category": cat, "symbol": sym}) as r:
+                                if r.status != 200:
+                                    if dbg:
+                                        try:
+                                            body = await r.text()
+                                        except Exception:
+                                            body = ""
+                                        self.logger.info(f"[mid][px][rest] bybit status={r.status} symbol={sym} body={body[:180]}")
+                                    data = None
+                                else:
+                                    data = await r.json(content_type=None)
+                            px = _extract_price(data)
+                            if px is not None and px > 0:
+                                return float(px)
+                        except Exception as e:
                             if dbg:
-                                try:
-                                    body = await r.text()
-                                except Exception:
-                                    body = ""
-                                self.logger.info(f"[mid][px][rest] bybit status={r.status} symbol={sym} body={body[:180]}")
-                            return None
-                        data = await r.json(content_type=None)
-                # v5 schema: {result:{list:[{lastPrice:...}]}}
-                res = data.get("result") if isinstance(data, dict) else None
-                lst = res.get("list") if isinstance(res, dict) else None
-                if isinstance(lst, list) and lst:
-                    item = lst[0]
-                    if isinstance(item, dict):
-                        p = item.get("lastPrice") or item.get("last_price")
-                        return float(p) if p is not None else None
+                                self.logger.info(f"[mid][px][rest] bybit error symbol={sym} attempt={attempt + 1} err={repr(e)}")
+                        if attempt < 2:
+                            await asyncio.sleep(0.25 * (attempt + 1))
                 return None
             except Exception as e:
                 if dbg:
-                    self.logger.info(f"[mid][px][rest] bybit error symbol={sym} err={repr(e)}")
+                    self.logger.info(f"[mid][px][rest] bybit session_error symbol={sym} err={repr(e)}")
                 return None
 
         try:
             return await self._rest_limiter.run("bybit", _do_req)
         except Exception:
             return None
+
 
     async def _fetch_okx_price(self, market: str, symbol: str) -> float | None:
         """OKX public REST price (spot/swap best-effort).
@@ -14430,92 +14521,7 @@ class Backend:
             return await self._rest_limiter.run("okx", _do_req)
         except Exception:
             return None
-    async def _fetch_bybit_price(self, market: str, symbol: str) -> float | None:
-        """Bybit REST price (spot/futures). Uses V5 tickers.
 
-        market: SPOT -> category=spot
-                FUTURES -> category=linear (USDT perpetual)
-        """
-        mkt = (market or "FUTURES").upper()
-        sym = (symbol or "").upper().replace("/", "")
-        if not sym:
-            return None
-        category = "spot" if mkt == "SPOT" else "linear"
-        url = "https://api.bybit.com/v5/market/tickers"
-
-        async def _do_req():
-            try:
-                timeout = aiohttp.ClientTimeout(total=6)
-                async with aiohttp.ClientSession(timeout=timeout) as s:
-                    async with s.get(url, params={"category": category, "symbol": sym}) as r:
-                        if r.status != 200:
-                            return None
-                        data = await r.json()
-                if not isinstance(data, dict):
-                    return None
-                if int(data.get("retCode", 0) or 0) != 0:
-                    return None
-                res = data.get("result") or {}
-                lst = (res.get("list") or []) if isinstance(res, dict) else []
-                if not lst:
-                    return None
-                item = lst[0] if isinstance(lst, list) else None
-                if not isinstance(item, dict):
-                    return None
-                p = item.get("lastPrice") or item.get("indexPrice") or item.get("markPrice")
-                return float(p) if p is not None else None
-            except Exception:
-                return None
-
-        try:
-            return await self._rest_limiter.run("bybit", _do_req)
-        except Exception:
-            return None
-
-
-    async def _fetch_okx_price(self, market: str, symbol: str) -> float | None:
-        """OKX REST price (spot/futures).
-
-        market: SPOT -> instId=BASE-USDT
-                FUTURES -> instId=BASE-USDT-SWAP (USDT perpetual)
-        """
-        mkt = (market or "FUTURES").upper()
-        sym = (symbol or "").upper().replace("/", "")
-        if not sym:
-            return None
-        try:
-            base = sym[:-4] if sym.endswith("USDT") else sym
-            inst = f"{base}-USDT" if mkt == "SPOT" else f"{base}-USDT-SWAP"
-        except Exception:
-            return None
-
-        url = "https://www.okx.com/api/v5/market/ticker"
-
-        async def _do_req():
-            try:
-                timeout = aiohttp.ClientTimeout(total=6)
-                async with aiohttp.ClientSession(timeout=timeout) as s:
-                    async with s.get(url, params={"instId": inst}) as r:
-                        if r.status != 200:
-                            return None
-                        data = await r.json()
-                if not isinstance(data, dict):
-                    return None
-                arr = data.get("data") or []
-                if not arr or not isinstance(arr, list):
-                    return None
-                item = arr[0] if arr else None
-                if not isinstance(item, dict):
-                    return None
-                p = item.get("last") or item.get("lastPrice")
-                return float(p) if p is not None else None
-            except Exception:
-                return None
-
-        try:
-            return await self._rest_limiter.run("okx", _do_req)
-        except Exception:
-            return None
 
 
     async def _get_price_with_source(self, signal: Signal) -> tuple[float, str]:
