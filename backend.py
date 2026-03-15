@@ -1818,8 +1818,10 @@ _BE_FEE_BUFFER_PCT = float(os.getenv("BE_FEE_BUFFER_PCT", "0.05") or 0.05)
 # Stop-loss confirmation (seconds) and buffer (percent).
 # SL_CONFIRM_SEC: require price to remain beyond SL for N seconds before closing.
 # SL_BUFFER_PCT: extra buffer around SL in percent (0.03 means 0.03%).
-_SL_CONFIRM_SEC = int(float(os.getenv("SL_CONFIRM_SEC", "0") or 0))
-_SL_BUFFER_PCT = float(os.getenv("SL_BUFFER_PCT", "0") or 0.0)
+# Legacy tracker defaults were too aggressive (0 sec / 0.0%), which caused many
+# false SL closes on a single wick/touch. Use safer defaults; env can still override.
+_SL_CONFIRM_SEC = int(float(os.getenv("SL_CONFIRM_SEC", "5") or 5))
+_SL_BUFFER_PCT = float(os.getenv("SL_BUFFER_PCT", "0.05") or 0.05)
 
 
 
@@ -15283,14 +15285,27 @@ class Backend:
                     # 2) Before TP1: SL -> LOSS
                     if not tp1_hit and s.sl:
                         sl_lvl = float(s.sl)
-                        buf = (_SL_BUFFER_PCT / 100.0)
+                        # Detect MID trades from stored row metadata/text because the lightweight
+                        # Signal object built here does not always carry timeframe.
+                        trade_is_mid = False
+                        try:
+                            trade_is_mid = _is_mid_tf(str(row.get("timeframe") or "")) or _mid_autotune_is_mid_trade(str(row.get("orig_text") or ""), str(row.get("timeframe") or ""))
+                        except Exception:
+                            trade_is_mid = False
+                        # Safer tracker defaults for false-wick protection. MID trades get a bit more room.
+                        sl_confirm_sec = _env_int_mid("SL_CONFIRM_SEC", 5, trade_is_mid)
+                        sl_buffer_pct = _env_float_mid("SL_BUFFER_PCT", 0.05, trade_is_mid)
+                        if market == "SPOT":
+                            sl_confirm_sec = max(sl_confirm_sec, int(float(os.getenv("SPOT_SL_CONFIRM_SEC", sl_confirm_sec) or sl_confirm_sec)))
+                            sl_buffer_pct = max(sl_buffer_pct, float(os.getenv("SPOT_SL_BUFFER_PCT", sl_buffer_pct) or sl_buffer_pct))
+                        buf = (float(sl_buffer_pct) / 100.0)
                         breached = (price_f <= sl_lvl * (1 - buf)) if side == "LONG" else (price_f >= sl_lvl * (1 + buf))
-                        if breached and _SL_CONFIRM_SEC > 0:
+                        if breached and sl_confirm_sec > 0:
                             t0 = self._sl_breach_since.get(trade_id)
                             if t0 is None:
                                 self._sl_breach_since[trade_id] = time.time()
                                 continue
-                            if (time.time() - t0) < _SL_CONFIRM_SEC:
+                            if (time.time() - t0) < sl_confirm_sec:
                                 continue
                         else:
                             self._sl_breach_since.pop(trade_id, None)
@@ -17278,7 +17293,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             # when price enters the zone. This keeps the trigger loop/logs active while skipping checks.
             # Enable with MID_TRIGGER_INSTANT_EMIT_NOFILTERS=1 (default: 1).
             try:
-                instant_nofilters = os.getenv("MID_TRIGGER_INSTANT_EMIT_NOFILTERS", "1").strip().lower() in ("1","true","yes","on")
+                # Safe-by-default: do NOT auto-emit just because all trigger filters are off.
+                instant_nofilters = os.getenv("MID_TRIGGER_INSTANT_EMIT_NOFILTERS", "0").strip().lower() in ("1","true","yes","on")
             except Exception:
                 instant_nofilters = True
             if instant_nofilters and require_trigger:
@@ -17990,7 +18006,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # Backward-compat / control:
                     #   MID_PENDING_INSTANT_EMIT_ON_ZONE=0 will restore the old behavior
                     #   where emit required NOFILTERS mode or MID_PENDING_INSTANT_EMIT_SKIP_CHECKS=1.
-                    pending_emit_on_zone = (os.getenv("MID_PENDING_INSTANT_EMIT_ON_ZONE", "1").strip().lower() in ("1","true","yes","on"))
+                    # Safe-by-default: instant emit must be explicitly enabled via env.
+                    # Old default (=1) allowed bypassing trigger checks on zone touch.
+                    pending_emit_on_zone = (os.getenv("MID_PENDING_INSTANT_EMIT_ON_ZONE", "0").strip().lower() in ("1","true","yes","on"))
                     pending_skip_checks = (os.getenv("MID_PENDING_INSTANT_EMIT_SKIP_CHECKS", "0").strip().lower() in ("1","true","yes","on"))
                     if pending_instant_emit and (instant_ignore_zone or pending_emit_on_zone or instant_emit_due_to_nofilters or pending_skip_checks):
                         if _mid_quality_first_enabled():
@@ -19142,7 +19160,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             pass
                         try:
                             # VWAP bias + min distance (avoid chop)
-                            mid_require_vwap_bias = os.getenv("MID_REQUIRE_VWAP_SIDE", "0").strip().lower() in ("1","true","yes","on")
+                            # Require VWAP side by default at trigger time too.
+                            mid_require_vwap_bias = os.getenv("MID_REQUIRE_VWAP_SIDE", "1").strip().lower() in ("1","true","yes","on")
                             mid_min_vwap_dist_atr = float(os.getenv("MID_MIN_VWAP_DIST_ATR", "0") or 0)
                             direction_u = str(direction).upper()
                             entry_check = float(ta.get("entry") or entry0)
