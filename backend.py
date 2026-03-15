@@ -5658,6 +5658,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
     manager_worker_id = f"{_wid_base}:{os.getpid()}"
     manager_batch = int(os.getenv("AUTOTRADE_MANAGER_BATCH", "300") or 300)
     manager_lease_sec = int(os.getenv("AUTOTRADE_MANAGER_LEASE_SEC", "120") or 120)
+    manager_sleep_sec = max(0.5, _parse_seconds_env("AUTOTRADE_MANAGER_SLEEP_SEC", 2.0))
 
     # autotrade_manager_loop is a module-level coroutine, not a Backend method.
     # Use an explicit Backend instance for shared price/diagnostic helpers so SMART_TICK
@@ -7711,7 +7712,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
         except Exception:
             logger.exception("Auto-trade manager loop error")
 
-        await asyncio.sleep(10)
+        await asyncio.sleep(manager_sleep_sec)
 
 
 # --- i18n template safety guard (prevents leaking {placeholders} to users) ---
