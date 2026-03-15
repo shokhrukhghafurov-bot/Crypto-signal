@@ -1928,6 +1928,8 @@ SMART_HARD_SL_PCT = _smartpro_env_float("SMART_HARD_SL_PCT", 2.80)
 # --- Generic loop tick / debounce (if referenced) ---
 SMART_TICK = _smartpro_env_float("SMART_TICK", 1.0)
 
+SMART_PRICE_DIAG_PATCH_ID = "smartdiag_v3_20260315_1718"
+
 # Normalize ranges to avoid accidental misconfig
 if SMART_TP1_PARTIAL_PCT < 0.0:
     SMART_TP1_PARTIAL_PCT = 0.0
@@ -6237,16 +6239,16 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                     except PriceUnavailableError as e:
                         px = 0.0
                         px_src = "-"
-                        price_diag = str(e)[:800]
+                        price_diag = f"{SMART_PRICE_DIAG_PATCH_ID} " + str(e)[:760]
                         if smart_tick_due and sig is not None:
                             try:
                                 price_diag = await self._smart_price_unavailable_diag(sig)
                             except Exception as diag_e:
-                                price_diag = f"diag_err:{type(diag_e).__name__}:{str(diag_e)[:200]}"
+                                price_diag = f"{SMART_PRICE_DIAG_PATCH_ID} diag_err:{type(diag_e).__name__}:{str(diag_e)[:180]}"
                     except Exception as e:
                         px = 0.0
                         px_src = "-"
-                        price_diag = f"unexpected:{type(e).__name__}:{str(e)[:300]}"
+                        price_diag = f"{SMART_PRICE_DIAG_PATCH_ID} unexpected:{type(e).__name__}:{str(e)[:260]}"
                         if smart_tick_due and sig is not None:
                             try:
                                 price_diag = await self._smart_price_unavailable_diag(sig)
@@ -14918,7 +14920,7 @@ class Backend:
             except Exception as e:
                 rest_parts.append(f"{exname}:REST_DIAG_ERR:{type(e).__name__}")
 
-        out = f"market={market} symbol={sym} ws=" + ",".join(ws_parts) + "; rest=" + ",".join(rest_parts)
+        out = f"{SMART_PRICE_DIAG_PATCH_ID} market={market} symbol={sym} ws=" + ",".join(ws_parts) + "; rest=" + ",".join(rest_parts)
         return out[:1200]
 
 
