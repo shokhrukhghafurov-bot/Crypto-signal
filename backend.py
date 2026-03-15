@@ -11343,6 +11343,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
     tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct)
     sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
+    tp1, tp2, rr = _mid_finalize_targets(dir_trend, entry, sl, tp1, tp2, atr30, market=market)
     # --- Adaptive MID SL/TP scaling by ATR%% (optional) ---
     try:
         if os.getenv("MID_ADAPTIVE_SLTP", "0").strip().lower() in ("1","true","yes","on"):
@@ -11382,6 +11383,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
             rr = abs(tp2 - entry) / max(1e-12, abs(entry - sl))
     except Exception:
         pass
+    tp1, tp2, rr = _mid_finalize_targets(dir_trend, entry, sl, tp1, tp2, atr30, market=market)
     # Hard cap: keep TP2 within MID_MAX_TP2_ATR * ATR to improve hit-rate
     try:
         max_tp2_atr = float(_mid_autotune_get_param("MID_MAX_TP2_ATR", float(os.getenv("MID_MAX_TP2_ATR", "2.2") or 2.2), market))
@@ -11394,6 +11396,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 rr = abs(float(tp2) - float(entry)) / max(1e-12, abs(float(entry) - float(sl)))
     except Exception:
         pass
+    tp1, tp2, rr = _mid_finalize_targets(dir_trend, entry, sl, tp1, tp2, atr30, market=market)
 
     # --- TA extras (MAIN-like) ---
     # RSI/MACD on 5m
@@ -12134,6 +12137,73 @@ def _build_levels(direction: str, entry: float, atr: float, *, tp2_r: float | No
     rr = abs(tp2 - entry) / abs(entry - sl)
     return sl, tp1, tp2, rr
 
+
+def _mid_finalize_targets(direction: str,
+                          entry: float,
+                          sl: float,
+                          tp1: float,
+                          tp2: float,
+                          atr: float,
+                          *,
+                          market: str = "FUTURES") -> Tuple[float, float, float]:
+    """Keep MID TP2 meaningful after adaptive discounts / ATR caps.
+
+    If TP2 ends up inside TP1 or too close to it, degrade the setup to a
+    single-target plan (TP2=0) instead of emitting two near-identical targets.
+    """
+    try:
+        side = str(direction or "").upper().strip()
+        entry_f = float(entry or 0.0)
+        sl_f = float(sl or 0.0)
+        tp1_f = float(tp1 or 0.0)
+        tp2_f = float(tp2 or 0.0)
+        atr_f = abs(float(atr or 0.0))
+
+        risk = abs(entry_f - sl_f)
+        if risk <= 1e-12:
+            risk = max(atr_f, abs(tp1_f - entry_f), abs(tp2_f - entry_f), 1e-12)
+
+        gap_r = float(os.getenv("MID_MIN_TP2_GAP_R", "0.35") or 0.35)
+        gap_atr = float(os.getenv("MID_MIN_TP2_GAP_ATR", "0.35") or 0.35)
+        gap_pct = float(os.getenv("MID_MIN_TP2_GAP_PCT", "0.0") or 0.0)
+        try:
+            gap_r = float(_mid_autotune_get_param("MID_MIN_TP2_GAP_R", gap_r, market))
+            gap_atr = float(_mid_autotune_get_param("MID_MIN_TP2_GAP_ATR", gap_atr, market))
+        except Exception:
+            pass
+
+        min_gap = max(
+            (risk * gap_r) if gap_r > 0 else 0.0,
+            (atr_f * gap_atr) if gap_atr > 0 else 0.0,
+            (abs(entry_f) * gap_pct) if gap_pct > 0 else 0.0,
+        )
+        eps = 1e-12
+
+        if side == "LONG":
+            if tp1_f > 0 and tp1_f <= entry_f + eps:
+                tp1_f = 0.0
+            if tp2_f > 0 and tp2_f <= entry_f + eps:
+                tp2_f = 0.0
+            if tp1_f > 0 and tp2_f > 0 and tp2_f <= (tp1_f + max(min_gap, eps)):
+                tp2_f = 0.0
+        elif side == "SHORT":
+            if tp1_f > 0 and tp1_f >= entry_f - eps:
+                tp1_f = 0.0
+            if tp2_f > 0 and tp2_f >= entry_f - eps:
+                tp2_f = 0.0
+            if tp1_f > 0 and tp2_f > 0 and tp2_f >= (tp1_f - max(min_gap, eps)):
+                tp2_f = 0.0
+
+        target = tp2_f if tp2_f > 0 else tp1_f
+        rr_f = (abs(target - entry_f) / risk) if (target > 0 and risk > eps) else 0.0
+        return float(tp1_f), float(tp2_f), float(rr_f)
+    except Exception:
+        risk = abs(float(entry or 0.0) - float(sl or 0.0))
+        target = float(tp2 or 0.0) if float(tp2 or 0.0) > 0 else float(tp1 or 0.0)
+        rr_f = (abs(target - float(entry or 0.0)) / risk) if (target > 0 and risk > 1e-12) else 0.0
+        return float(tp1 or 0.0), float(tp2 or 0.0), float(rr_f)
+
+
 def _candle_pattern(df: pd.DataFrame) -> Tuple[str, int]:
     """
     Very lightweight candlestick pattern detection on the last 2 candles.
@@ -12862,6 +12932,7 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
 
     tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct)
     sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
+    tp1, tp2, rr = _mid_finalize_targets(dir_trend, entry, sl, tp1, tp2, atr30, market=market)
     # --- Trap filters ---
     # Macro trap (SCAN): strict anti-trap on higher TF (structure/extremes)
     # Micro trap (TRIGGER): rare + practical, blocks mainly on immediate opposite aggression.
@@ -16553,9 +16624,11 @@ def _mid_recalc_levels_from_trigger(direction: str, trigger_price: float, ta: di
                 tp2_emit = max(float(tp2_emit), float(entry_emit) - max_dist)
     except Exception:
         pass
+    tp1_emit, tp2_emit, rr_emit = _mid_finalize_targets(direction, entry_emit, sl_emit, tp1_emit, tp2_emit, atr_use, market=str(market or "FUTURES"))
     try:
         risk = abs(float(entry_emit) - float(sl_emit))
-        rr_emit = (abs(float(tp2_emit) - float(entry_emit)) / risk) if risk > 0 else 0.0
+        target_emit = float(tp2_emit) if float(tp2_emit) > 0 else float(tp1_emit)
+        rr_emit = (abs(target_emit - float(entry_emit)) / risk) if (risk > 0 and target_emit > 0) else 0.0
     except Exception:
         rr_emit = 0.0
     return float(entry_emit), float(sl_emit), float(tp1_emit), float(tp2_emit), float(rr_emit)
