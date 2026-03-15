@@ -7769,7 +7769,7 @@ async def main() -> None:
 
         # Auto-trade manager can run on all replicas (cluster-safe via DB lease/locks)
         TASKS["autotrade-manager"] = asyncio.create_task(
-            autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event),
+            autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend),
             name="autotrade-manager",
         )
         _health_mark_ok("autotrade-manager")
@@ -7800,7 +7800,7 @@ async def main() -> None:
             "Another instance holds the Telegram polling lock; this replica will run ONLY autotrade manager + HTTP (no polling/scanner)."
         )
         try:
-            TASKS["autotrade-manager"] = asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event), name="autotrade-manager")
+            TASKS["autotrade-manager"] = asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend), name="autotrade-manager")
             _health_mark_ok("autotrade-manager")
             TASKS["autotrade-anomaly-watchdog"] = asyncio.create_task(autotrade_anomaly_watchdog_loop(notify_api_error=_notify_autotrade_api_error), name="autotrade-anomaly-watchdog")
             _health_mark_ok("autotrade-anomaly-watchdog")
@@ -7823,7 +7823,7 @@ async def main() -> None:
     asyncio.create_task(signal_outcome_loop())
 
     # Auto-trade manager (SL/TP/BE) - runs in background.
-    asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event))
+    asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend))
     asyncio.create_task(autotrade_anomaly_watchdog_loop(notify_api_error=_notify_autotrade_api_error))
     await dp.start_polling(bot)
 
