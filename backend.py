@@ -12834,7 +12834,7 @@ def _mid_micro_trap_ok(*, direction: str, entry: float, df5: pd.DataFrame, atr30
     return (True, "")
 
 
-def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame, symbol: str = "") -> Optional[Dict[str, Any]]:
+def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFrame, symbol: str = "", market: str = "FUTURES") -> Optional[Dict[str, Any]]:
     """MID analysis: 5m (trigger) / 30m (mid) / 1h (trend).
 
     Produces a result dict compatible with scanner_loop_mid and a rich TA block (like MAIN),
@@ -18386,7 +18386,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         _ph_tok = None
                     try:
-                        ta = evaluate_on_exchange_mid_v2(df5, df30, df1h, symbol=sym)
+                        ta = evaluate_on_exchange_mid_v2(df5, df30, df1h, symbol=sym, market=market)
                     finally:
                         try:
                             if _ph_tok is not None:
