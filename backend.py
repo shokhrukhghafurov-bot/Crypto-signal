@@ -6212,6 +6212,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                         ref["pro_real_init"] = True
                         dirty = True
                     price_diag = "-"
+                    sig = None
                     try:
                         # --- price (decision) ---
                         # Shared oracle for ALL exchanges / SPOT+FUTURES.
@@ -6236,11 +6237,21 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                     except PriceUnavailableError as e:
                         px = 0.0
                         px_src = "-"
-                        price_diag = str(e)
+                        price_diag = str(e)[:800]
+                        if smart_tick_due and sig is not None:
+                            try:
+                                price_diag = await self._smart_price_unavailable_diag(sig)
+                            except Exception as diag_e:
+                                price_diag = f"diag_err:{type(diag_e).__name__}:{str(diag_e)[:200]}"
                     except Exception as e:
                         px = 0.0
                         px_src = "-"
                         price_diag = f"unexpected:{type(e).__name__}:{str(e)[:300]}"
+                        if smart_tick_due and sig is not None:
+                            try:
+                                price_diag = await self._smart_price_unavailable_diag(sig)
+                            except Exception:
+                                pass
 
                     if not px or px <= 0:
                         if smart_tick_due:
@@ -6263,7 +6274,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                                     str(ref.get("tp1_mode") or "-").upper(),
                                     "PRICE_UNAVAILABLE",
                                     str(px_src or "-"),
-                                    str(price_diag or "-")[:800],
+                                    str(price_diag or "-")[:1200],
                                 )
                             except Exception:
                                 pass
@@ -14760,8 +14771,6 @@ class Backend:
             return None, f"{n}_REST_MISS"
 
         # --- PHASE A: WS-only (priority order) ---
-        ws_diag: list[str] = []
-        rest_diag: list[str] = []
         if mode == "MEDIAN":
             # MEDIAN over all available WS sources for the market, preferring the trade exchange first.
             # For futures, Gate/MEXC currently have no WS stream in this project, so they naturally miss here
@@ -14774,7 +14783,6 @@ class Backend:
                 except Exception:
                     p, _src = None, f"{exname}_WS_MISS"
                 _pdbg(f"WS {exname} -> p={p} src={_src}")
-                ws_diag.append(f"{exname}:{_src}")
                 if _is_reasonable(p):
                     ws_prices.append((exname, float(p)))
             if len(ws_prices) >= 2:
@@ -14789,12 +14797,8 @@ class Backend:
         else:
             _pdbg(f"PHASE A WS-only order={'+'.join(chain)} mode={mode}")
             for exname in chain:
-                try:
-                    p, src = await _ws_only(exname)
-                except Exception:
-                    p, src = None, f"{exname}_WS_MISS"
+                p, src = await _ws_only(exname)
                 _pdbg(f"WS {exname} -> p={p} src={src}")
-                ws_diag.append(f"{exname}:{src}")
                 if _is_reasonable(p):
                     _pdbg(f"SELECTED WS {exname} src={src} p={p}")
                     return float(p), str(src)
@@ -14809,7 +14813,6 @@ class Backend:
                 except Exception:
                     p, src = None, f"{exname}_REST_MISS"
                 _pdbg(f"REST {exname} -> p={p} src={src}")
-                rest_diag.append(f"{exname}:{src}")
                 if _is_reasonable(p):
                     rest_prices.append((str(src), float(p)))
             if len(rest_prices) >= 2:
@@ -14824,26 +14827,99 @@ class Backend:
         else:
             _pdbg(f"PHASE B REST-only order={'+'.join(chain)} mode={mode}")
             for exname in chain:
-                try:
-                    p, src = await _rest_only(exname)
-                except Exception:
-                    p, src = None, f"{exname}_REST_MISS"
+                p, src = await _rest_only(exname)
                 _pdbg(f"REST {exname} -> p={p} src={src}")
-                rest_diag.append(f"{exname}:{src}")
                 if _is_reasonable(p):
                     _pdbg(f"SELECTED REST {exname} src={src} p={p}")
                     return float(p), str(src)
 
-        diag_parts: list[str] = []
-        if ws_diag:
-            diag_parts.append("ws=" + ",".join(ws_diag))
-        if rest_diag:
-            diag_parts.append("rest=" + ",".join(rest_diag))
-        diag_suffix = (" " + "; ".join(diag_parts)) if diag_parts else ""
-        raise PriceUnavailableError(
-            f"price unavailable market={market} symbol={signal.symbol} mode={mode}{diag_suffix}"
-        )
+        raise PriceUnavailableError(f"price unavailable market={market} symbol={signal.symbol} mode={mode}")
 
+
+    async def _smart_price_unavailable_diag(self, signal: Signal) -> str:
+        """Best-effort per-venue diag for SMART_TICK when decision price is unavailable.
+
+        This helper is intentionally independent from `_get_price_with_source()` so that
+        diagnostic logging does not break the main price oracle or recurse into it.
+        """
+        market = (getattr(signal, "market", "FUTURES") or "FUTURES").upper().strip()
+        sym = str(getattr(signal, "symbol", "") or "").upper().strip()
+        if not sym:
+            return "diag=no_symbol"
+
+        preferred_ex = str(getattr(signal, "source_exchange", "") or "").upper().strip()
+        if preferred_ex == "GATE":
+            preferred_ex = "GATEIO"
+
+        chain = ["BINANCE", "BYBIT", "OKX", "GATEIO", "MEXC"]
+        if preferred_ex in chain:
+            i = chain.index(preferred_ex)
+            chain = chain[i:] + chain[:i]
+
+        def _reasonable(v) -> bool:
+            try:
+                fv = float(v or 0.0)
+                return math.isfinite(fv) and fv > 0.0
+            except Exception:
+                return False
+
+        async def _ws_status(exname: str) -> str:
+            exu = str(exname or "").upper().strip()
+            exl = exu.lower()
+            try:
+                if market == "FUTURES" and exu in ("GATEIO", "MEXC"):
+                    return f"{exu}_WS_UNSUPPORTED"
+                await self.feed.ensure_stream(market, sym, ex=exl)
+                latest = self.feed.get_latest(market, sym, max_age_sec=self._ws_max_age_sec, ex=exl)
+                if _reasonable(latest):
+                    return f"{exu}_WS"
+            except Exception as e:
+                return f"{exu}_WS_ERR:{type(e).__name__}"
+            try:
+                c = self._price_cache.get(exl, market, sym)
+                if c is not None and c[0] is not None and str(c[1]).upper().endswith('_WS') and _reasonable(c[0]):
+                    return str(c[1]).upper()
+            except Exception as e:
+                return f"{exu}_WS_CACHE_ERR:{type(e).__name__}"
+            return f"{exu}_WS_MISS"
+
+        async def _rest_status(exname: str) -> str:
+            exu = str(exname or "").upper().strip()
+            try:
+                if exu == "BINANCE":
+                    p = await self._fetch_rest_price(market, sym)
+                    return "BINANCE_REST" if _reasonable(p) else "BINANCE_REST_MISS"
+                if exu == "BYBIT":
+                    p = await self._fetch_bybit_price(market, sym)
+                    return "BYBIT_REST" if _reasonable(p) else "BYBIT_REST_MISS"
+                if exu == "OKX":
+                    p = await self._fetch_okx_price(market, sym)
+                    return "OKX_REST" if _reasonable(p) else "OKX_REST_MISS"
+                if exu == "GATEIO":
+                    p = await (_gateio_public_price(sym) if market == "SPOT" else _gateio_futures_price(sym))
+                    return ("GATEIO_PUBLIC" if market == "SPOT" else "GATEIO_FUTURES_PUBLIC") if _reasonable(p) else "GATEIO_REST_MISS"
+                if exu == "MEXC":
+                    p = await (_mexc_public_price(sym) if market == "SPOT" else _mexc_futures_price(sym))
+                    return ("MEXC_PUBLIC" if market == "SPOT" else "MEXC_FUTURES_PUBLIC") if _reasonable(p) else "MEXC_REST_MISS"
+            except Exception as e:
+                return f"{exu}_REST_ERR:{type(e).__name__}"
+            return f"{exu}_REST_MISS"
+
+        ws_parts = []
+        rest_parts = []
+        for exname in chain:
+            try:
+                ws_parts.append(f"{exname}:{await _ws_status(exname)}")
+            except Exception as e:
+                ws_parts.append(f"{exname}:WS_DIAG_ERR:{type(e).__name__}")
+        for exname in chain:
+            try:
+                rest_parts.append(f"{exname}:{await _rest_status(exname)}")
+            except Exception as e:
+                rest_parts.append(f"{exname}:REST_DIAG_ERR:{type(e).__name__}")
+
+        out = f"market={market} symbol={sym} ws=" + ",".join(ws_parts) + "; rest=" + ",".join(rest_parts)
+        return out[:1200]
 
 
     async def _get_price(self, signal: Signal) -> float:
