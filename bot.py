@@ -5679,8 +5679,9 @@ _BE_BUFFER_PCT = float(os.getenv("BE_BUFFER_PCT", "0.001") or 0.001)  # 0.1% def
 _BE_CONFIRM_SEC = max(0, int(os.getenv("BE_CONFIRM_SEC", "60") or 60))  # require staying past BE trigger for N seconds
 # SL anti-wick confirmation for SIGNAL outcomes (admin stats)
 # Price must cross SL +/- buffer and stay beyond it for SIG_SL_CONFIRM_SEC seconds.
-_SIG_SL_BUFFER_PCT = float(os.getenv("SIG_SL_BUFFER_PCT", "0.0005") or 0.0005)  # 0.05% default
-_SIG_SL_CONFIRM_SEC = max(0, int(os.getenv("SIG_SL_CONFIRM_SEC", "10") or 10))
+# Signal outcome stats should also ignore single-wick touches; keep defaults slightly safer.
+_SIG_SL_BUFFER_PCT = float(os.getenv("SIG_SL_BUFFER_PCT", "0.0010") or 0.0010)  # 0.10% default
+_SIG_SL_CONFIRM_SEC = max(0, int(os.getenv("SIG_SL_CONFIRM_SEC", "15") or 15))
 _SIG_SL_BREACH_SINCE: dict[int, float] = {}  # signal_id -> unix ts when SL was first breached
 
 _SIG_MAX_TRACK_AGE_HOURS = float(os.getenv("SIG_MAX_TRACK_AGE_HOURS", "72") or 72)  # auto-close stale signals
@@ -6148,7 +6149,14 @@ async def signal_outcome_loop() -> None:
                             # Anti-wick SL confirmation:
                             # - apply a small buffer beyond SL
                             # - require staying beyond trigger for SIG_SL_CONFIRM_SEC seconds
-                            trigger = sl * (1.0 - _SIG_SL_BUFFER_PCT) if side == "LONG" else sl * (1.0 + _SIG_SL_BUFFER_PCT)
+                            sig_is_mid = False
+                            try:
+                                sig_is_mid = (str(t.get("timeframe") or "").lower().startswith("5m/")) or ("5m/30m/1h" in str(t.get("orig_text") or ""))
+                            except Exception:
+                                sig_is_mid = False
+                            sig_sl_buffer_pct = max(float(_SIG_SL_BUFFER_PCT), (float(os.getenv("SIG_SL_BUFFER_PCT_MID", _SIG_SL_BUFFER_PCT if sig_is_mid else _SIG_SL_BUFFER_PCT) or _SIG_SL_BUFFER_PCT) if sig_is_mid else float(_SIG_SL_BUFFER_PCT)))
+                            sig_sl_confirm_sec = int(float(os.getenv("SIG_SL_CONFIRM_SEC_MID", _SIG_SL_CONFIRM_SEC) or _SIG_SL_CONFIRM_SEC)) if sig_is_mid else int(_SIG_SL_CONFIRM_SEC)
+                            trigger = sl * (1.0 - sig_sl_buffer_pct) if side == "LONG" else sl * (1.0 + sig_sl_buffer_pct)
                             crossed = bool(px <= trigger) if side == "LONG" else bool(px >= trigger)
 
                             since = _SIG_SL_BREACH_SINCE.get(sid)
@@ -6159,7 +6167,7 @@ async def signal_outcome_loop() -> None:
                                 _SIG_SL_BREACH_SINCE.pop(sid, None)
                                 # keep tracking
                             if crossed:
-                                if _SIG_SL_CONFIRM_SEC == 0 or (since is not None and (_time.time() - since) >= _SIG_SL_CONFIRM_SEC):
+                                if sig_sl_confirm_sec == 0 or (since is not None and (_time.time() - since) >= sig_sl_confirm_sec):
                                     pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
                                     await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
                                     logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
@@ -6200,7 +6208,14 @@ async def signal_outcome_loop() -> None:
 
                         # LOSS by SL (can happen after TP1; model partial TP1 then SL on remainder)
                         if sl > 0:
-                            trigger = sl * (1.0 - _SIG_SL_BUFFER_PCT) if side == "LONG" else sl * (1.0 + _SIG_SL_BUFFER_PCT)
+                            sig_is_mid = False
+                            try:
+                                sig_is_mid = (str(t.get("timeframe") or "").lower().startswith("5m/")) or ("5m/30m/1h" in str(t.get("orig_text") or ""))
+                            except Exception:
+                                sig_is_mid = False
+                            sig_sl_buffer_pct = max(float(_SIG_SL_BUFFER_PCT), (float(os.getenv("SIG_SL_BUFFER_PCT_MID", _SIG_SL_BUFFER_PCT if sig_is_mid else _SIG_SL_BUFFER_PCT) or _SIG_SL_BUFFER_PCT) if sig_is_mid else float(_SIG_SL_BUFFER_PCT)))
+                            sig_sl_confirm_sec = int(float(os.getenv("SIG_SL_CONFIRM_SEC_MID", _SIG_SL_CONFIRM_SEC) or _SIG_SL_CONFIRM_SEC)) if sig_is_mid else int(_SIG_SL_CONFIRM_SEC)
+                            trigger = sl * (1.0 - sig_sl_buffer_pct) if side == "LONG" else sl * (1.0 + sig_sl_buffer_pct)
                             crossed = bool(px <= trigger) if side == "LONG" else bool(px >= trigger)
 
                             since = _SIG_SL_BREACH_SINCE.get(sid)
@@ -6210,7 +6225,7 @@ async def signal_outcome_loop() -> None:
                             if not crossed and since is not None:
                                 _SIG_SL_BREACH_SINCE.pop(sid, None)
                             if crossed:
-                                if _SIG_SL_CONFIRM_SEC == 0 or (since is not None and (_time.time() - since) >= _SIG_SL_CONFIRM_SEC):
+                                if sig_sl_confirm_sec == 0 or (since is not None and (_time.time() - since) >= sig_sl_confirm_sec):
                                     pnl = _sig_net_pnl_tp1_then_sl(market=market, side=side, entry=entry, tp1=eff_tp1, sl=sl, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
                                     await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
                                     logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
