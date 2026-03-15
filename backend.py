@@ -2000,6 +2000,136 @@ def _calc_effective_futures_cap(*, balance_usdt: float, ui_cap_usdt: float, winr
 
 
 
+_BINANCE_TIME_OFFSET_MS = 0
+_BINANCE_TIME_SYNC_MONO = 0.0
+_BINANCE_TIME_SYNC_LOCK = None
+_BINANCE_SIGNED_REQ_LOCK = None
+_BINANCE_SIGNED_NEXT_TS = 0.0
+_BINANCE_SIGNED_RATE_LIMIT_UNTIL = 0.0
+
+
+def _binance_recv_window_ms() -> int:
+    try:
+        v = int(float(os.getenv("BINANCE_RECV_WINDOW_MS", "10000") or 10000))
+    except Exception:
+        v = 10000
+    return max(5000, min(v, 60000))
+
+
+def _binance_time_sync_ttl_sec() -> float:
+    try:
+        v = float(os.getenv("BINANCE_TIME_SYNC_TTL_SEC", "60") or 60)
+    except Exception:
+        v = 60.0
+    return max(5.0, min(v, 300.0))
+
+
+def _binance_signed_min_interval_sec() -> float:
+    try:
+        v = float(os.getenv("BINANCE_SIGNED_MIN_INTERVAL_MS", "250") or 250)
+    except Exception:
+        v = 250.0
+    return max(0.0, min(v, 5000.0)) / 1000.0
+
+
+def _binance_rate_limit_cooldown_sec() -> float:
+    try:
+        v = float(os.getenv("BINANCE_RATE_LIMIT_COOLDOWN_SEC", "120") or 120)
+    except Exception:
+        v = 120.0
+    return max(5.0, min(v, 900.0))
+
+
+def _binance_is_rate_limit_error_message(err) -> bool:
+    s = str(err or "")
+    sl = s.lower()
+    return (
+        ("http 418" in sl)
+        or ("http 429" in sl)
+        or ("-1003" in sl)
+        or ("too many requests" in sl)
+        or ("rate limit" in sl)
+        or ("way too much request weight" in sl)
+        or ("cooldown active" in sl)
+    )
+
+
+def _binance_is_timestamp_error_message(err) -> bool:
+    s = str(err or "")
+    sl = s.lower()
+    return ("-1021" in sl) or (("timestamp" in sl) and ("recvwindow" in sl))
+
+
+def _binance_normalize_recv_window(params: dict) -> None:
+    want = _binance_recv_window_ms()
+    try:
+        cur = int(str(params.get("recvWindow") or "0"))
+    except Exception:
+        cur = 0
+    if cur < want:
+        params["recvWindow"] = str(want)
+
+
+async def _binance_note_rate_limit(err) -> None:
+    global _BINANCE_SIGNED_RATE_LIMIT_UNTIL
+    if not _binance_is_rate_limit_error_message(err):
+        return
+    until = time.monotonic() + _binance_rate_limit_cooldown_sec()
+    if until > float(_BINANCE_SIGNED_RATE_LIMIT_UNTIL or 0.0):
+        _BINANCE_SIGNED_RATE_LIMIT_UNTIL = until
+
+
+async def _binance_wait_request_slot() -> None:
+    global _BINANCE_SIGNED_REQ_LOCK, _BINANCE_SIGNED_NEXT_TS
+    if _BINANCE_SIGNED_REQ_LOCK is None:
+        _BINANCE_SIGNED_REQ_LOCK = asyncio.Lock()
+    async with _BINANCE_SIGNED_REQ_LOCK:
+        now = time.monotonic()
+        cool_until = float(_BINANCE_SIGNED_RATE_LIMIT_UNTIL or 0.0)
+        if cool_until > now:
+            raise ExchangeAPIError(f"Binance API cooldown active for {cool_until - now:.1f}s after rate limit")
+        wait_sec = float(_BINANCE_SIGNED_NEXT_TS or 0.0) - now
+        if wait_sec > 0:
+            await asyncio.sleep(wait_sec)
+        _BINANCE_SIGNED_NEXT_TS = time.monotonic() + _binance_signed_min_interval_sec()
+
+
+async def _binance_sync_server_time(
+    session: aiohttp.ClientSession,
+    *,
+    base_url: str,
+    force: bool = False,
+) -> None:
+    global _BINANCE_TIME_OFFSET_MS, _BINANCE_TIME_SYNC_MONO, _BINANCE_TIME_SYNC_LOCK
+    if _BINANCE_TIME_SYNC_LOCK is None:
+        _BINANCE_TIME_SYNC_LOCK = asyncio.Lock()
+    now_mono = time.monotonic()
+    if (not force) and _BINANCE_TIME_SYNC_MONO and ((now_mono - float(_BINANCE_TIME_SYNC_MONO or 0.0)) <= _binance_time_sync_ttl_sec()):
+        return
+    async with _BINANCE_TIME_SYNC_LOCK:
+        now_mono = time.monotonic()
+        if (not force) and _BINANCE_TIME_SYNC_MONO and ((now_mono - float(_BINANCE_TIME_SYNC_MONO or 0.0)) <= _binance_time_sync_ttl_sec()):
+            return
+        time_path = "/fapi/v1/time" if "fapi" in str(base_url or "") else "/api/v3/time"
+        try:
+            async with session.get(f"{base_url}{time_path}") as r:
+                data = await r.json(content_type=None)
+                if r.status != 200:
+                    err = ExchangeAPIError(f"Binance time sync HTTP {r.status}: {data}")
+                    await _binance_note_rate_limit(err)
+                    raise err
+                server_ms = int((data or {}).get("serverTime") or 0)
+                if server_ms <= 0:
+                    raise ExchangeAPIError(f"Binance time sync invalid payload: {data}")
+        except ExchangeAPIError:
+            raise
+        except Exception as e:
+            raise ExchangeAPIError(f"Binance time sync error: {e}")
+        local_ms = int(time.time() * 1000)
+        _BINANCE_TIME_OFFSET_MS = int(server_ms - local_ms)
+        _BINANCE_TIME_SYNC_MONO = time.monotonic()
+
+
 async def _binance_signed_request(
     session: aiohttp.ClientSession,
     *,
@@ -2010,27 +2140,55 @@ async def _binance_signed_request(
     api_secret: str,
     params: dict | None = None,
 ) -> dict:
-    """Minimal Binance signed request helper (HMAC SHA256 query signature)."""
+    """Binance signed request helper with server-time sync, retry on -1021 and cooldown on 429/-1003."""
     params = dict(params or {})
-    params.setdefault("timestamp", str(int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)))
-    query = urllib.parse.urlencode(params, doseq=True)
-    sig = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
-    url = f"{base_url}{path}?{query}&signature={sig}"
+    _binance_normalize_recv_window(params)
     headers = {"X-MBX-APIKEY": api_key}
-    try:
-        async with session.request(method.upper(), url, headers=headers) as r:
-            data = await r.json(content_type=None)
-            if r.status != 200:
-                raise ExchangeAPIError(f"Binance API HTTP {r.status}: {data}")
-            if isinstance(data, dict):
-                raw_code = data.get("code")
-                if raw_code not in (None, 0, "0"):
-                    raise ExchangeAPIError(f"Binance API code {raw_code}: {data.get('msg') or data}")
-            return data if isinstance(data, dict) else {"data": data}
-    except ExchangeAPIError:
-        raise
-    except Exception as e:
-        raise ExchangeAPIError(f"Binance API error: {e}")
+
+    for attempt in range(2):
+        await _binance_wait_request_slot()
+        try:
+            await _binance_sync_server_time(session, base_url=base_url, force=(attempt > 0))
+        except ExchangeAPIError as e:
+            if _binance_is_rate_limit_error_message(e):
+                raise
+            # Non-fatal: if time sync endpoint hiccups, try the request with the last known offset.
+            pass
+
+        params["timestamp"] = str(int(time.time() * 1000 + int(_BINANCE_TIME_OFFSET_MS or 0)))
+        query = urllib.parse.urlencode(params, doseq=True)
+        sig = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+        url = f"{base_url}{path}?{query}&signature={sig}"
+
+        try:
+            async with session.request(method.upper(), url, headers=headers) as r:
+                data = await r.json(content_type=None)
+        except ExchangeAPIError:
+            raise
+        except Exception as e:
+            raise ExchangeAPIError(f"Binance API error: {e}")
+
+        if r.status != 200:
+            err = ExchangeAPIError(f"Binance API HTTP {r.status}: {data}")
+            await _binance_note_rate_limit(err)
+            if (attempt == 0) and _binance_is_timestamp_error_message(err):
+                await _binance_sync_server_time(session, base_url=base_url, force=True)
+                continue
+            raise err
+
+        if isinstance(data, dict):
+            raw_code = data.get("code")
+            if raw_code not in (None, 0, "0"):
+                err = ExchangeAPIError(f"Binance API code {raw_code}: {data.get('msg') or data}")
+                await _binance_note_rate_limit(err)
+                if (attempt == 0) and ((str(raw_code) == "-1021") or _binance_is_timestamp_error_message(err)):
+                    await _binance_sync_server_time(session, base_url=base_url, force=True)
+                    continue
+                raise err
+
+        return data if isinstance(data, dict) else {"data": data}
+
+    raise ExchangeAPIError(f"Binance API request failed after retry: {path}")
 
 
 async def _bybit_signed_request(
@@ -25987,7 +26145,7 @@ async def _autotrade_diag_emit(kind: str, *, cooldown_sec: float = 600.0, **data
 
 async def autotrade_anomaly_watchdog_loop(*, notify_api_error=None) -> None:
     """Detect hidden autotrade failures and forward them to log + error bot."""
-    poll_sec = float(os.getenv("AUTOTRADE_DIAG_POLL_SEC", "20") or 20)
+    poll_sec = float(os.getenv("AUTOTRADE_DIAG_POLL_SEC", "60") or 60)
     grace_no_order = float(os.getenv("AUTOTRADE_DIAG_NO_ORDER_GRACE_SEC", "45") or 45)
     grace_no_position = float(os.getenv("AUTOTRADE_DIAG_NO_POSITION_GRACE_SEC", "75") or 75)
     grace_manager_blind = float(os.getenv("AUTOTRADE_DIAG_MANAGER_BLIND_SEC", "180") or 180)
@@ -26074,6 +26232,8 @@ async def autotrade_anomaly_watchdog_loop(*, notify_api_error=None) -> None:
                                 position_side=(str(ref.get("position_side") or _binance_futures_position_side_from_direction(direction=ref.get("direction"), side=ref.get("side"))) if ex == "binance" else None),
                             )
                     except Exception as e:
+                        if ex == "binance" and _binance_is_rate_limit_error_message(e):
+                            continue
                         if notify_api_error:
                             try:
                                 await notify_api_error(uid, ex, mt, f"diag_position_check_error: {e}")
@@ -26092,6 +26252,8 @@ async def autotrade_anomaly_watchdog_loop(*, notify_api_error=None) -> None:
                                 od = lst[0] if (lst and isinstance(lst[0], dict)) else {}
                                 order_state = str(od.get("orderStatus") or od.get("orderStatusName") or "unknown")
                         except Exception as e:
+                            if ex == "binance" and _binance_is_rate_limit_error_message(e):
+                                continue
                             order_state = f"status_error:{e}"
                         await _autotrade_diag_emit(
                             "AUTO_TRADE_ORDER_NO_POSITION",
