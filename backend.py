@@ -5591,7 +5591,7 @@ async def _futures_position_size(*, ex: str, api_key: str, api_secret: str, symb
             return 0.0
     return 0.0
 
-async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -> None:
+async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, backend_instance=None) -> None:
     """Background loop to manage SL/TP/BE for real orders.
 
     notify_api_error(user_id:int, text:str) will be called only on API errors.
@@ -5603,6 +5603,21 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
     manager_worker_id = f"{_wid_base}:{os.getpid()}"
     manager_batch = int(os.getenv("AUTOTRADE_MANAGER_BATCH", "300") or 300)
     manager_lease_sec = int(os.getenv("AUTOTRADE_MANAGER_LEASE_SEC", "120") or 120)
+
+    # autotrade_manager_loop is a module-level coroutine, not a Backend method.
+    # Use an explicit Backend instance for shared price/diagnostic helpers so SMART_TICK
+    # never crashes with NameError: name 'self' is not defined.
+    price_backend = backend_instance
+    if price_backend is None:
+        global _AUTOTRADE_MANAGER_BACKEND_SINGLETON
+        try:
+            price_backend = _AUTOTRADE_MANAGER_BACKEND_SINGLETON
+        except NameError:
+            _AUTOTRADE_MANAGER_BACKEND_SINGLETON = None
+            price_backend = None
+        if price_backend is None:
+            price_backend = Backend()
+            _AUTOTRADE_MANAGER_BACKEND_SINGLETON = price_backend
 
     def _as_float(x, default: float = 0.0) -> float:
         try:
@@ -6113,7 +6128,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                                     entry=float(entry or 0.0),
                                     source_exchange=str(ex or "").upper(),
                                 )
-                                px, _px_src = await self._get_price_with_source(sig)
+                                px, _px_src = await price_backend._get_price_with_source(sig)
                                 px = float(px or 0.0)
                             except Exception:
                                 px = 0.0
@@ -6229,7 +6244,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                             entry=float(ref.get("entry_price") or 0.0),
                             source_exchange=str(ex or "").upper(),
                         )
-                        px, px_src = await self._get_price_with_source(sig)
+                        px, px_src = await price_backend._get_price_with_source(sig)
                         if float(px or 0.0) > 0:
                             if ref.get("px_decision_src") != str(px_src):
                                 ref["px_decision_src"] = str(px_src)
@@ -6242,7 +6257,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                         price_diag = f"{SMART_PRICE_DIAG_PATCH_ID} " + str(e)[:760]
                         if smart_tick_due and sig is not None:
                             try:
-                                price_diag = await self._smart_price_unavailable_diag(sig)
+                                price_diag = await price_backend._smart_price_unavailable_diag(sig)
                             except Exception as diag_e:
                                 price_diag = f"{SMART_PRICE_DIAG_PATCH_ID} diag_err:{type(diag_e).__name__}:{str(diag_e)[:180]}"
                     except Exception as e:
@@ -6251,7 +6266,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                         price_diag = f"{SMART_PRICE_DIAG_PATCH_ID} unexpected:{type(e).__name__}:{str(e)[:260]}"
                         if smart_tick_due and sig is not None:
                             try:
-                                price_diag = await self._smart_price_unavailable_diag(sig)
+                                price_diag = await price_backend._smart_price_unavailable_diag(sig)
                             except Exception:
                                 pass
 
