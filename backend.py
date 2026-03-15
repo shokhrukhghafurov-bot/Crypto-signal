@@ -6105,16 +6105,17 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                             allocated_usdt = _as_float(r.get("allocated_usdt"), 0.0)
                             px = 0.0
                             try:
-                                if ex == "binance":
-                                    px = await _binance_price(symbol, futures=(mt == "futures"))
-                                elif ex == "bybit":
-                                    px = await _bybit_price(symbol, category=("linear" if mt == "futures" else "spot"))
-                                elif ex == "okx":
-                                    px = await _okx_public_price(symbol, market_type="futures")
-                                elif ex == "mexc":
-                                    px = await _mexc_public_price(symbol)
-                                else:
-                                    px = await _gateio_public_price(symbol)
+                                direction_hint = str(ref.get("direction") or ("LONG" if side not in ("SELL", "SHORT") else "SHORT")).upper()
+                                sig = Signal(
+                                    symbol=symbol,
+                                    market=("SPOT" if mt == "spot" else "FUTURES"),
+                                    direction=direction_hint,
+                                    timeframe="5m",
+                                    entry=float(entry or 0.0),
+                                    source_exchange=str(ex or "").upper(),
+                                )
+                                px, _px_src = await self._get_price_with_source(sig)
+                                px = float(px or 0.0)
                             except Exception:
                                 px = 0.0
                             pnl_usdt = None
@@ -6215,65 +6216,25 @@ async def autotrade_manager_loop(*, notify_api_error) -> None:
                         dirty = True
                     try:
                         # --- price (decision) ---
-                        # For futures, prefer a robust decision price to reduce noise:
-                        # median of available sources (Binance Futures + Bybit Linear + optional public OKX),
-                        # falling back to the trade exchange source if only one is available.
-                        if mt == "futures":
-                            srcs = []
-                            try:
-                                data_b = await _http_json("GET", "https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
-                                px_b = float((data_b or {}).get("price") or 0.0)
-                                if px_b > 0:
-                                    srcs.append(px_b)
-                            except Exception:
-                                pass
-                            try:
-                                px_y = await _bybit_price(symbol, category="linear")
-                                if float(px_y or 0.0) > 0:
-                                    srcs.append(float(px_y))
-                            except Exception:
-                                pass
-                            try:
-                                # OKX public last (best-effort)
-                                px_o = await _okx_public_price(symbol, market_type="futures")
-                                if float(px_o or 0.0) > 0:
-                                    srcs.append(float(px_o))
-                            except Exception:
-                                pass
-                            if len(srcs) >= 2:
-                                px = float(statistics.median(srcs))
-                                ref["px_decision_src"] = "MEDIAN"
+                        # Shared oracle for ALL exchanges / SPOT+FUTURES.
+                        # Uses venue WS first when available, then other configured WS sources,
+                        # and only falls back to REST/public when all WS sources miss.
+                        direction_hint = str(ref.get("direction") or ("LONG" if str(ref.get("side")).upper() in ("BUY", "LONG") else "SHORT")).upper()
+                        sig = Signal(
+                            symbol=symbol,
+                            market=("SPOT" if mt == "spot" else "FUTURES"),
+                            direction=direction_hint,
+                            timeframe="5m",
+                            entry=float(ref.get("entry_price") or 0.0),
+                            source_exchange=str(ex or "").upper(),
+                        )
+                        px, px_src = await self._get_price_with_source(sig)
+                        if float(px or 0.0) > 0:
+                            if ref.get("px_decision_src") != str(px_src):
+                                ref["px_decision_src"] = str(px_src)
                                 dirty = True
-                            elif len(srcs) == 1:
-                                px = float(srcs[0])
-                                ref["px_decision_src"] = "SINGLE"
-                                dirty = True
-                            else:
-                                # fall back to per-exchange source
-                                if ex == "binance":
-                                    data = await _http_json("GET", "https://fapi.binance.com/fapi/v1/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
-                                    px = float((data or {}).get("price") or 0.0)
-                                elif ex == "bybit":
-                                    px = await _bybit_price(symbol, category="linear")
-                                elif ex == "okx":
-                                    px = await _okx_public_price(symbol)
-                                elif ex == "mexc":
-                                    px = await _mexc_public_price(symbol)
-                                else:
-                                    px = await _gateio_public_price(symbol)
                         else:
-                            # spot: keep per-exchange source
-                            if ex == "binance":
-                                data = await _http_json("GET", "https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
-                                px = float((data or {}).get("price") or 0.0)
-                            elif ex == "bybit":
-                                px = await _bybit_price(symbol, category="spot")
-                            elif ex == "okx":
-                                px = await _okx_public_price(symbol)
-                            elif ex == "mexc":
-                                px = await _mexc_public_price(symbol)
-                            else:
-                                px = await _gateio_public_price(symbol)
+                            px = 0.0
                     except Exception:
                         px = 0.0
 
@@ -14212,8 +14173,13 @@ class Backend:
             return float(self.feed.mock_price(market, signal.symbol, base=base)), "MOCK"
 
         mode = (SPOT_PRICE_SOURCE if market == "SPOT" else FUTURES_PRICE_SOURCE).upper().strip() or "MEDIAN"
-        if mode not in ("BINANCE", "BYBIT", "MEDIAN"):
+        if mode not in ("BINANCE", "BYBIT", "OKX", "MEXC", "GATEIO", "MEDIAN"):
             mode = "MEDIAN"
+        preferred_ex = str(getattr(signal, "source_exchange", "") or "").upper().strip()
+        if preferred_ex == "GATE":
+            preferred_ex = "GATEIO"
+        if preferred_ex not in ("BINANCE", "BYBIT", "OKX", "MEXC", "GATEIO"):
+            preferred_ex = ""
 
         def _pdbg(msg: str):
             if PRICE_DEBUG:
@@ -14413,7 +14379,7 @@ class Backend:
 
         spot_chain = ["BINANCE", "BYBIT", "OKX", "GATEIO", "MEXC"]
         fut_chain = ["BINANCE", "BYBIT", "OKX", "GATEIO", "MEXC"]
-        chain = spot_chain if market == "SPOT" else fut_chain
+        chain = list(spot_chain if market == "SPOT" else fut_chain)
 
         def _rotate(chain0: list[str], first: str) -> list[str]:
             first = (first or "").upper()
@@ -14422,11 +14388,12 @@ class Backend:
                 return chain0[i:] + chain0[:i]
             return chain0
 
-        # Rotate only for single-source modes; MEDIAN is handled specially.
-        if mode == "BINANCE":
-            chain = _rotate(chain, "BINANCE")
-        elif mode == "BYBIT":
-            chain = _rotate(chain, "BYBIT")
+        # Prefer the trade exchange first for manager/oracle consumers, unless an explicit single-source
+        # mode is configured. This makes SPOT/FUTURES decisions use the venue WS when available.
+        if preferred_ex:
+            chain = _rotate(chain, preferred_ex)
+        if mode in ("BINANCE", "BYBIT", "OKX", "MEXC", "GATEIO"):
+            chain = _rotate(chain, mode)
 
         async def _ws_only(name: str) -> tuple[float | None, str]:
             n = name.upper()
@@ -14458,16 +14425,19 @@ class Backend:
 
         # --- PHASE A: WS-only (priority order) ---
         if mode == "MEDIAN":
-            # MEDIAN over available WS sources (best-effort). Prefer major venues first.
-            _pdbg("mode=MEDIAN; PHASE A WS-only: try BINANCE_WS/BYBIT_WS/OKX_WS for median")
+            # MEDIAN over all available WS sources for the market, preferring the trade exchange first.
+            # For futures, Gate/MEXC currently have no WS stream in this project, so they naturally miss here
+            # and are still covered by REST/public fallback in phase B.
+            _pdbg(f"mode=MEDIAN; PHASE A WS-only median chain={'+'.join(chain)} preferred={preferred_ex or '-'}")
             ws_prices: list[tuple[str, float]] = []
-            for _nm, _fn in (("BINANCE", _binance_ws_only), ("BYBIT", _bybit_ws_only), ("OKX", _okx_ws_only)):
+            for exname in chain:
                 try:
-                    p, _ = await _fn()
+                    p, _src = await _ws_only(exname)
                 except Exception:
-                    p = None
+                    p, _src = None, f"{exname}_WS_MISS"
+                _pdbg(f"WS {exname} -> p={p} src={_src}")
                 if _is_reasonable(p):
-                    ws_prices.append((_nm, float(p)))
+                    ws_prices.append((exname, float(p)))
             if len(ws_prices) >= 2:
                 try:
                     med = float(statistics.median([p for _, p in ws_prices]))
@@ -14477,38 +14447,44 @@ class Backend:
             if ws_prices:
                 nm, p = ws_prices[0]
                 return float(p), f"{nm}_WS"
-
-        _pdbg(f"PHASE A WS-only order={'+'.join(chain)} mode={mode}")
-        for exname in chain:
-            p, src = await _ws_only(exname)
-            _pdbg(f"WS {exname} -> p={p} src={src}")
-            if _is_reasonable(p):
-                _pdbg(f"SELECTED WS {exname} src={src} p={p}")
-                return float(p), str(src)
+        else:
+            _pdbg(f"PHASE A WS-only order={'+'.join(chain)} mode={mode}")
+            for exname in chain:
+                p, src = await _ws_only(exname)
+                _pdbg(f"WS {exname} -> p={p} src={src}")
+                if _is_reasonable(p):
+                    _pdbg(f"SELECTED WS {exname} src={src} p={p}")
+                    return float(p), str(src)
 
         # --- PHASE B: REST/public fallback (only if ALL WS failed) ---
         if mode == "MEDIAN":
-            _pdbg("mode=MEDIAN; PHASE B REST-only: try BINANCE_REST and BYBIT_REST for median")
-            b, _bsrc = await _binance_rest_only()
-            y, _ysrc = await _bybit_rest_only()
-            if _is_reasonable(b) and _is_reasonable(y):
+            _pdbg(f"mode=MEDIAN; PHASE B REST-only median chain={'+'.join(chain)} preferred={preferred_ex or '-'}")
+            rest_prices: list[tuple[str, float]] = []
+            for exname in chain:
                 try:
-                    med = float(statistics.median([float(b), float(y)]))
-                    return med, "MEDIAN(BINANCE_REST+BYBIT_REST)"
+                    p, src = await _rest_only(exname)
+                except Exception:
+                    p, src = None, f"{exname}_REST_MISS"
+                _pdbg(f"REST {exname} -> p={p} src={src}")
+                if _is_reasonable(p):
+                    rest_prices.append((str(src), float(p)))
+            if len(rest_prices) >= 2:
+                try:
+                    med = float(statistics.median([p for _, p in rest_prices]))
+                    return med, "MEDIAN(" + "+".join([src for src, _ in rest_prices]) + ")"
                 except Exception:
                     pass
-            if _is_reasonable(b):
-                return float(b), "BINANCE_REST"
-            if _is_reasonable(y):
-                return float(y), "BYBIT_REST"
-
-        _pdbg(f"PHASE B REST-only order={'+'.join(chain)} mode={mode}")
-        for exname in chain:
-            p, src = await _rest_only(exname)
-            _pdbg(f"REST {exname} -> p={p} src={src}")
-            if _is_reasonable(p):
-                _pdbg(f"SELECTED REST {exname} src={src} p={p}")
+            if rest_prices:
+                src, p = rest_prices[0]
                 return float(p), str(src)
+        else:
+            _pdbg(f"PHASE B REST-only order={'+'.join(chain)} mode={mode}")
+            for exname in chain:
+                p, src = await _rest_only(exname)
+                _pdbg(f"REST {exname} -> p={p} src={src}")
+                if _is_reasonable(p):
+                    _pdbg(f"SELECTED REST {exname} src={src} p={p}")
+                    return float(p), str(src)
 
         raise PriceUnavailableError(f"price unavailable market={market} symbol={signal.symbol} mode={mode}")
 
