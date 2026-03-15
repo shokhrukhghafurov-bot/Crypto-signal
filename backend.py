@@ -6374,7 +6374,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                             )
 
                         if q2 <= 0:
-                            last_close_explain = f"normalized qty is zero (requested={requested_qty:.10f}, actual={actual_qty:.10f})"
+                            last_close_explain = _sm_reason_qty_zero(requested_qty, actual_qty)
                             _log_rate_limited(
                                 f"smart_skip_small:{uid}:{ex}:{mt}:{symbol}",
                                 f"[SMART] skip close: normalized qty is zero {ex}/{mt} {symbol} px={px} requested={requested_qty} actual={actual_qty}",
@@ -6404,7 +6404,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                                 await _mexc_spot_market_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, base_qty=q2)
                             else:
                                 await _gateio_spot_market_sell(api_key=api_key, api_secret=api_secret, symbol=symbol, base_qty=q2)
-                            last_close_explain = f"market close sent qty={q2:.10f}"
+                            last_close_explain = _sm_reason_market_close_sent(q2)
                             return True
 
                         # Futures
@@ -6442,7 +6442,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                         else:
                             # Other futures exchanges aren't supported in this bot; close silently
                             raise ExchangeAPIError("unsupported futures exchange in virtual mode")
-                        last_close_explain = f"market close sent qty={q2:.10f}"
+                        last_close_explain = _sm_reason_market_close_sent(q2)
                         return True
 
                     def _hit_sl() -> bool:
@@ -6531,18 +6531,66 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                         except Exception:
                             pass
 
+                    def _sm_side_text() -> str:
+                        return _tr(uid, "sm_side_short") if direction == "SHORT" else _tr(uid, "sm_side_long")
+
+                    def _sm_decision_text(decision: str) -> str:
+                        key = {
+                            "CLOSED": "sm_decision_closed",
+                            "NOT CLOSED": "sm_decision_not_closed",
+                            "PARTIAL CLOSED": "sm_decision_partial_closed",
+                        }.get(str(decision or "").upper(), "sm_decision_not_closed")
+                        return _tr(uid, key)
+
+                    def _sm_level_text(level_label: str) -> str:
+                        key = {
+                            "SL": "lbl_sl",
+                            "TP1": "lbl_tp1",
+                            "TP2": "lbl_tp2",
+                            "HARD SL": "lbl_hard_sl",
+                        }.get(str(level_label or "").upper())
+                        return _tr(uid, key) if key else str(level_label)
+
+                    def _sm_mode_text(mode: str) -> str:
+                        key = {
+                            "HOLD_TO_TP2": "sm_mode_hold_to_tp2",
+                            "PARTIAL_TP1": "sm_mode_partial_tp1",
+                            "FULL_TP1": "sm_mode_full_tp1",
+                            "FULL_TP1_NO_TP2": "sm_mode_full_tp1_no_tp2",
+                        }.get(str(mode or "").upper())
+                        return _tr(uid, key) if key else str(mode)
+
+                    def _sm_reason_market_close_sent(qty_sent: float) -> str:
+                        return _trf(uid, "sm_reason_market_close_sent", qty=_fmt_sm_price(qty_sent))
+
+                    def _sm_reason_qty_zero(requested_qty: float, actual_qty: float) -> str:
+                        return _trf(uid, "sm_reason_qty_zero", requested=_fmt_sm_price(requested_qty), actual=_fmt_sm_price(actual_qty))
+
+                    def _sm_reason_close_returned_false() -> str:
+                        return _tr(uid, "sm_reason_close_returned_false")
+
+                    def _sm_join_reason(*parts: str) -> str:
+                        out = [str(x).strip() for x in parts if str(x or "").strip()]
+                        return "; ".join(out)
+
                     async def _notify_smart_decision(trigger: str, decision: str, *, level_label: str, level_price: float, reason: str, cooldown_sec: float = 30.0) -> None:
-                        txt = (
-                            "⚙️ Smart Manager\n"
-                            f"{symbol} | {mt.upper()} | {direction}\n"
-                            f"Trigger: {trigger}\n"
-                            f"Decision: {decision}\n"
-                            f"Px(decision): {_fmt_sm_price(px)}\n"
-                            f"{level_label}: {_fmt_sm_price(level_price)}\n"
-                            f"Reason: {reason}\n"
-                            f"Source: {str(px_src or '-') }"
+                        txt = _trf(
+                            uid,
+                            "sm_msg_decision",
+                            title=_tr(uid, "sm_title"),
+                            symbol=symbol,
+                            market=_market_label(uid, mt),
+                            side=_sm_side_text(),
+                            trigger=trigger,
+                            decision=_sm_decision_text(decision),
+                            px_decision=_fmt_sm_price(px),
+                            level_label=_sm_level_text(level_label),
+                            level_price=_fmt_sm_price(level_price),
+                            reason=reason,
+                            source=str(px_src or "-"),
                         )
                         await _notify_smart_once(f"{trigger}:{decision}", txt, cooldown_sec=cooldown_sec)
+
 
                     # Initialize hard emergency SL once (while SL is not armed).
                     if hard_sl <= 0 and entry_p > 0:
@@ -6904,15 +6952,15 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                         age = (now_ts - sl_first_ts) if sl_first_ts > 0 else 0.0
                         sl_wait_reasons: list[str] = []
                         if sl_hits < SL_CONFIRM_HITS:
-                            sl_wait_reasons.append(f"waiting confirmations {sl_hits}/{SL_CONFIRM_HITS}")
+                            sl_wait_reasons.append(_trf(uid, "sm_reason_wait_confirm_hits", hits=sl_hits, need=SL_CONFIRM_HITS))
                         if age < max(0.0, float(SL_CONFIRM_SEC)):
-                            sl_wait_reasons.append(f"waiting time {age:.1f}/{float(SL_CONFIRM_SEC):.1f}s")
+                            sl_wait_reasons.append(_trf(uid, "sm_reason_wait_confirm_time", age=f"{age:.1f}", need=f"{float(SL_CONFIRM_SEC):.1f}"))
                         if SL_GRACE_SEC > 0 and age < float(SL_GRACE_SEC):
-                            sl_wait_reasons.append(f"grace {age:.1f}/{float(SL_GRACE_SEC):.1f}s")
+                            sl_wait_reasons.append(_trf(uid, "sm_reason_wait_grace", age=f"{age:.1f}", need=f"{float(SL_GRACE_SEC):.1f}"))
                         if SL_USE_5M_CLOSE and not _allow_struct_close():
-                            sl_wait_reasons.append("waiting 5m close")
+                            sl_wait_reasons.append(_tr(uid, "sm_reason_wait_5m_close"))
                         if not sl_wait_reasons:
-                            sl_wait_reasons.append("SL touched but close conditions are not satisfied yet")
+                            sl_wait_reasons.append(_tr(uid, "sm_reason_wait_generic"))
                         await _notify_smart_decision(
                             "SL",
                             "NOT CLOSED",
@@ -6933,8 +6981,8 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                             sl_close_error = str(e)
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                         if close_ok:
-                            sl_reason = "hard SL" if _hit_hard() else ("deep breach" if (crossed and _deep_breach()) else "confirmed structure break")
-                            await _notify_smart_decision("SL", "CLOSED", level_label="SL", level_price=sl_struct if sl_struct > 0 else sl_hard, reason=f"{sl_reason}; {last_close_explain or 'market close sent'}", cooldown_sec=5.0)
+                            sl_reason = _tr(uid, "sm_reason_hard_sl") if _hit_hard() else (_tr(uid, "sm_reason_deep_breach") if (crossed and _deep_breach()) else _tr(uid, "sm_reason_structure_break"))
+                            await _notify_smart_decision("SL", "CLOSED", level_label="SL", level_price=sl_struct if sl_struct > 0 else sl_hard, reason=_sm_join_reason(sl_reason, last_close_explain or _sm_reason_market_close_sent(last_close_norm_qty or qty)), cooldown_sec=5.0)
                             await _mark_local_full_close("SL", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")), be_moved_value=bool(ref.get("be_moved") or meta.get("be_moved")))
                             pnl_usdt, roi_percent = _smart_close_snapshot()
 
@@ -6950,7 +6998,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                             )
                             continue
                         else:
-                            fail_reason = sl_close_error or last_close_explain or "close_market returned False"
+                            fail_reason = sl_close_error or last_close_explain or _sm_reason_close_returned_false()
                             await _notify_smart_decision("SL", "NOT CLOSED", level_label="SL", level_price=sl_struct if sl_struct > 0 else sl_hard, reason=fail_reason, cooldown_sec=15.0)
 
                     # --- TP2: if reached, close 100% ---
@@ -6963,7 +7011,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                             tp2_close_error = str(e)
                             _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                         if close_ok:
-                            await _notify_smart_decision("TP2", "CLOSED", level_label="TP2", level_price=tp2, reason=last_close_explain or "TP2 reached, market close sent", cooldown_sec=5.0)
+                            await _notify_smart_decision("TP2", "CLOSED", level_label="TP2", level_price=tp2, reason=_sm_join_reason(_tr(uid, "sm_reason_tp2_reached"), last_close_explain or _sm_reason_market_close_sent(last_close_norm_qty or qty)), cooldown_sec=5.0)
                             await _mark_local_full_close("TP2", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
                             pnl_usdt, roi_percent = _smart_close_snapshot()
 
@@ -6979,7 +7027,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                             )
                             continue
                         else:
-                            fail_reason = tp2_close_error or last_close_explain or "close_market returned False"
+                            fail_reason = tp2_close_error or last_close_explain or _sm_reason_close_returned_false()
                             await _notify_smart_decision("TP2", "NOT CLOSED", level_label="TP2", level_price=tp2, reason=fail_reason, cooldown_sec=15.0)
 
                     # --- TP1: probability engine (TP2 vs take profit now) ---
@@ -7038,7 +7086,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                                 await _sync_pos_meta({"tp1_hit": True})
                             except Exception:
                                 pass
-                            await _notify_smart_decision("TP1", "NOT CLOSED", level_label="TP1", level_price=tp1, reason=f"hold to TP2 (mode={mode}, prob_tp2={prob_tp2:.2f})", cooldown_sec=30.0)
+                            await _notify_smart_decision("TP1", "NOT CLOSED", level_label="TP1", level_price=tp1, reason=_trf(uid, "sm_reason_hold_to_tp2", mode=_sm_mode_text(mode), prob_tp2=f"{prob_tp2:.2f}"), cooldown_sec=30.0)
                         elif mode == "PARTIAL_TP1":
                             q_close = max(0.0, qty * max(0.05, min(0.95, TP1_PARTIAL_PCT)))
                             q_rem = max(0.0, qty - q_close)
@@ -7051,7 +7099,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                                     tp1_partial_error = str(e)
                                     _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                                 if partial_ok:
-                                    await _notify_smart_decision("TP1", "PARTIAL CLOSED", level_label="TP1", level_price=tp1, reason=f"mode={mode}; closed_qty={_fmt_sm_price(q_close)}; remaining_qty={_fmt_sm_price(q_rem)}; {last_close_explain or 'market close sent'}", cooldown_sec=5.0)
+                                    await _notify_smart_decision("TP1", "PARTIAL CLOSED", level_label="TP1", level_price=tp1, reason=_trf(uid, "sm_reason_tp1_partial_closed", mode=_sm_mode_text(mode), closed_qty=_fmt_sm_price(q_close), remaining_qty=_fmt_sm_price(q_rem), detail=(last_close_explain or _sm_reason_market_close_sent(last_close_norm_qty or q_close))), cooldown_sec=5.0)
                                     ref["qty"] = float(q_rem)
                                     qty = float(q_rem)
                                     ref["tp1_hit"] = True
@@ -7064,7 +7112,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                                     except Exception:
                                         pass
                                 else:
-                                    fail_reason = tp1_partial_error or last_close_explain or "close_market returned False"
+                                    fail_reason = tp1_partial_error or last_close_explain or _sm_reason_close_returned_false()
                                     await _notify_smart_decision("TP1", "NOT CLOSED", level_label="TP1", level_price=tp1, reason=fail_reason, cooldown_sec=15.0)
                         else:
                             # FULL_TP1 / FULL_TP1_NO_TP2
@@ -7076,7 +7124,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                                 tp1_close_error = str(e)
                                 _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                             if close_ok:
-                                await _notify_smart_decision("TP1", "CLOSED", level_label="TP1", level_price=tp1, reason=f"mode={mode}; {last_close_explain or 'market close sent'}", cooldown_sec=5.0)
+                                await _notify_smart_decision("TP1", "CLOSED", level_label="TP1", level_price=tp1, reason=_trf(uid, "sm_reason_tp1_full_close", mode=_sm_mode_text(mode), detail=(last_close_explain or _sm_reason_market_close_sent(last_close_norm_qty or qty))), cooldown_sec=5.0)
                                 await _mark_local_full_close(str(mode), tp1_hit=True)
                                 pnl_usdt, roi_percent = _smart_close_snapshot()
 
@@ -7092,7 +7140,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                                 )
                                 continue
                             else:
-                                fail_reason = tp1_close_error or last_close_explain or "close_market returned False"
+                                fail_reason = tp1_close_error or last_close_explain or _sm_reason_close_returned_false()
                                 await _notify_smart_decision("TP1", "NOT CLOSED", level_label="TP1", level_price=tp1, reason=fail_reason, cooldown_sec=15.0)
 # --- Arm BE only AFTER partial TP1 and after a short delay + confirmation
                     if bool(ref.get("tp1_partial")) and bool(ref.get("be_pending")) and (not be_moved) and entry_p > 0:
