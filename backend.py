@@ -5901,15 +5901,11 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                     pos_id_tick = 0
                 now_tick = time.time()
                 last_tick = _SMART_TICK_TS.get(pos_id_tick, 0.0) if pos_id_tick else 0.0
-                if (not pos_id_tick) or (now_tick - last_tick >= 60.0):
-                    if pos_id_tick:
-                        _SMART_TICK_TS[pos_id_tick] = now_tick
-                    sym_tick = str(ref.get("symbol") or r.get("symbol") or "")
-                    side_tick = str(ref.get("side") or r.get("side") or "")
-                    logger.info(
-                        "SMART_TICK uid=%s market=%s ex=%s sym=%s side=%s virtual=%s",
-                        uid, mt, ex, sym_tick, side_tick, bool(ref.get("virtual"))
-                    )
+                smart_tick_due = bool((not pos_id_tick) or (now_tick - last_tick >= 60.0))
+                if smart_tick_due and pos_id_tick:
+                    _SMART_TICK_TS[pos_id_tick] = now_tick
+                sym_tick = str(ref.get("symbol") or r.get("symbol") or "")
+                side_tick = str(ref.get("side") or r.get("side") or "")
                 symbol = str(ref.get("symbol") or r.get("symbol") or "").upper()
 
                 # Load keys
@@ -6238,8 +6234,32 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                             px = 0.0
                     except Exception:
                         px = 0.0
+                        px_src = "-"
 
                     if not px or px <= 0:
+                        if smart_tick_due:
+                            try:
+                                logger.info(
+                                    "SMART_TICK uid=%s market=%s ex=%s sym=%s side=%s virtual=%s px=NA entry=%.10f tp1=%.10f tp2=%.10f sl=%.10f be=%.10f qty=%.10f state=%s mode=%s reason=%s px_src=%s",
+                                    uid,
+                                    mt,
+                                    ex,
+                                    sym_tick,
+                                    side_tick,
+                                    bool(ref.get("virtual")),
+                                    float(ref.get("entry_price") or 0.0),
+                                    float(ref.get("tp1") or 0.0),
+                                    float(ref.get("tp2") or 0.0),
+                                    float(ref.get("sl") or 0.0),
+                                    float(ref.get("be_price") or meta.get("be_price") or 0.0),
+                                    float(ref.get("qty") or meta.get("qty") or 0.0),
+                                    str(ref.get("sm_state") or "INIT").upper(),
+                                    str(ref.get("tp1_mode") or "-").upper(),
+                                    "PRICE_UNAVAILABLE",
+                                    str(px_src or "-"),
+                                )
+                            except Exception:
+                                pass
                         continue
 
                     entry_p = float(ref.get("entry_price") or 0.0)
@@ -6266,6 +6286,27 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
 
                     async def _mark_local_full_close(close_reason: str, *, tp1_hit: bool | None = None, be_moved_value: bool | None = None) -> None:
                         reason_norm = _normalize_autotrade_close_reason(close_reason or "SYNC_CLOSE")
+                        try:
+                            logger.info(
+                                "SMART_CLOSE uid=%s market=%s ex=%s sym=%s side=%s virtual=%s px=%.10f entry=%.10f tp1=%.10f tp2=%.10f sl=%.10f be=%.10f qty=%.10f reason=%s px_src=%s",
+                                uid,
+                                mt,
+                                ex,
+                                symbol,
+                                str(ref.get("side") or side_tick or ""),
+                                bool(ref.get("virtual")),
+                                float(px),
+                                float(entry_p),
+                                float(tp1),
+                                float(tp2),
+                                float(sl),
+                                float(be_price),
+                                float(qty),
+                                reason_norm,
+                                str(px_src or "-"),
+                            )
+                        except Exception:
+                            pass
                         ref["qty"] = 0.0
                         ref["closed_reason"] = reason_norm
                         if tp1_hit is not None:
@@ -6459,6 +6500,63 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None) -
                         if be_price <= 0:
                             return False
                         return (px <= be_price) if direction == "LONG" else (px >= be_price)
+
+                    def _smart_tick_reason() -> str:
+                        try:
+                            closed_reason = _normalize_autotrade_close_reason(
+                                ref.get("closed_reason") or meta.get("closed_reason") or ""
+                            )
+                            if closed_reason:
+                                return f"CLOSED_{closed_reason}"
+                            if qty <= 0:
+                                return "QTY_ZERO_SYNC_CLOSE"
+                            if tp2 > 0 and _hit_tp(tp2):
+                                return "TP2_REACHED_PENDING_CLOSE"
+                            if tp1 > 0 and (not tp1_hit) and _hit_tp(tp1):
+                                return "TP1_REACHED_PENDING_DECISION"
+                            if bool(ref.get("tp1_partial")) and bool(ref.get("be_pending")) and (not be_moved):
+                                ok_confirm = (px >= entry_p) if direction == "LONG" else (px <= entry_p)
+                                return "WAIT_BE_ARM_CONFIRM" if ok_confirm else "WAIT_BE_ARM_PRICE_CONFIRM"
+                            if be_moved and _hit_be():
+                                return "BE_REACHED_PENDING_CLOSE"
+                            if _hit_sl():
+                                return "SL_REACHED_PENDING_CLOSE"
+                            if tp1_hit and str(ref.get("tp1_mode") or "").upper() == "HOLD_TO_TP2":
+                                return "HOLD_TO_TP2"
+                            if bool(ref.get("tp1_partial")) and be_moved:
+                                return "WAIT_TP2_OR_BE"
+                            if tp1_hit:
+                                return "WAIT_MANAGED_EXIT"
+                            if armed_sl:
+                                return "MONITOR_TP_SL"
+                            return "MONITOR_HARD_SL"
+                        except Exception:
+                            return "MONITOR"
+
+                    if smart_tick_due:
+                        try:
+                            logger.info(
+                                "SMART_TICK uid=%s market=%s ex=%s sym=%s side=%s virtual=%s px=%.10f entry=%.10f tp1=%.10f tp2=%.10f sl=%.10f be=%.10f qty=%.10f state=%s mode=%s reason=%s px_src=%s",
+                                uid,
+                                mt,
+                                ex,
+                                sym_tick,
+                                side_tick,
+                                bool(ref.get("virtual")),
+                                float(px),
+                                float(entry_p),
+                                float(tp1),
+                                float(tp2),
+                                float(sl),
+                                float(be_price),
+                                float(qty),
+                                str(ref.get("sm_state") or "INIT").upper(),
+                                str(ref.get("tp1_mode") or "-").upper(),
+                                _smart_tick_reason(),
+                                str(px_src or "-"),
+                            )
+                        except Exception:
+                            pass
 
                     # --- SMART virtual manager (no immediate SL/TP; momentum-aware TP; delayed BE; reversal exit) ---
                     now_ts = time.time()
