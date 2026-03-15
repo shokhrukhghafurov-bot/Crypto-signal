@@ -554,7 +554,33 @@ if PAYMENT_BOT_TOKEN:
 else:
     logger.warning("[payment-alert] PAYMENT_BOT_TOKEN is not set; payment alerts will NOT be sent")
 
+# Dedicated report bot for closed signal cards.
+# It sends formatted outcome cards (WIN / LOSS / BE / CLOSED) to configured chats.
+REPORT_BOT_TOKEN = (os.getenv("REPORT_BOT_TOKEN") or "").strip()
+_REPORT_BOT_CHAT_IDS_RAW = (os.getenv("REPORT_BOT_CHAT_IDS") or "").strip()
+REPORT_BOT_CHAT_IDS: list[int] = []
+if _REPORT_BOT_CHAT_IDS_RAW:
+    for _part in _REPORT_BOT_CHAT_IDS_RAW.split(","):
+        _part = _part.strip()
+        if not _part:
+            continue
+        try:
+            REPORT_BOT_CHAT_IDS.append(int(_part))
+        except Exception:
+            logger.warning("[report-bot] invalid chat id in REPORT_BOT_CHAT_IDS: %r", _part)
+if not REPORT_BOT_CHAT_IDS and ADMIN_IDS:
+    REPORT_BOT_CHAT_IDS = list(ADMIN_IDS)
 
+_report_bot: Bot | None = None
+if REPORT_BOT_TOKEN:
+    try:
+        _report_bot = Bot(REPORT_BOT_TOKEN)
+        logger.info("[report-bot] enabled chats=%s", REPORT_BOT_CHAT_IDS)
+    except Exception:
+        _report_bot = None
+        logger.exception("[report-bot] failed to initialize")
+else:
+    logger.info("[report-bot] REPORT_BOT_TOKEN is not set; closed signal report cards are disabled")
 
 
 logger.info("[mid][dbg] methods can_add_mid_pending=%s add_mid_pending=%s mid_pending_trigger_loop=%s scanner_loop_mid=%s",
@@ -3031,6 +3057,153 @@ def _fmt_dt_msk(v) -> str:
         return d.strftime("%d.%m.%Y %H:%M")
     except Exception:
         return "—"
+
+
+def _report_tz_label() -> str:
+    try:
+        if str(TZ_NAME).strip() in ("Europe/Moscow", "MSK", "UTC+3", "GMT+3"):
+            return "MSK"
+        return str(TZ_NAME or "UTC").strip() or "UTC"
+    except Exception:
+        return "UTC"
+
+
+def _report_close_emoji(final_status: str) -> str:
+    st = str(final_status or "").upper().strip()
+    return {
+        "WIN": "🟢",
+        "LOSS": "🔴",
+        "BE": "⚪️",
+        "CLOSED": "🟡",
+    }.get(st, "⚪️")
+
+
+def _report_close_status(final_status: str, *, after_tp1: bool = False) -> str:
+    st = str(final_status or "").upper().strip() or "CLOSED"
+    if after_tp1 and st in ("WIN", "LOSS", "BE"):
+        return f"{st} (после TP1)"
+    if st == "CLOSED":
+        return "CLOSED"
+    return st
+
+
+def _report_pnl_pct(pnl_total_pct: float | int | None) -> str:
+    try:
+        return f"{float(pnl_total_pct or 0.0):+.1f}%"
+    except Exception:
+        return "+0.0%"
+
+
+def _report_rr_str(entry: float, sl: float, tp1: float, tp2: float) -> str:
+    try:
+        entry = float(entry or 0.0)
+        sl = float(sl or 0.0)
+        tp1 = float(tp1 or 0.0)
+        tp2 = float(tp2 or 0.0)
+        if entry <= 0 or sl <= 0:
+            return "-"
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return "-"
+        target = tp2 if tp2 > 0 and abs(tp2 - tp1) > 1e-12 else tp1
+        if target <= 0:
+            return "-"
+        reward = abs(target - entry)
+        if reward <= 0:
+            return "-"
+        return f"{(reward / risk):.2f}"
+    except Exception:
+        return "-"
+
+
+def _report_close_reason(final_status: str, *, after_tp1: bool = False, has_tp2: bool = True) -> str:
+    st = str(final_status or "").upper().strip()
+    if st == "WIN":
+        if has_tp2:
+            return "Цена дошла до TP2 — фиксируем прибыль."
+        return "Цена дошла до TP1 — фиксируем прибыль."
+    if st == "LOSS":
+        if after_tp1:
+            return "После TP1 цена вернулась к SL — остаток позиции закрыт по риску."
+        return "Цена дошла до SL — сработал лимит риска."
+    if st == "BE":
+        return "После TP1 цена вернулась к BE — закрытие без убытка."
+    if st == "CLOSED":
+        return "Сигнал закрыт по времени — лимит сопровождения истёк."
+    return "Сигнал закрыт Smart Manager."
+
+
+def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pct: float, closed_at: dt.datetime | None = None) -> str:
+    row = dict(t or {})
+    st = str(final_status or "CLOSED").upper().strip() or "CLOSED"
+    symbol = str(row.get("symbol") or "").upper() or "—"
+    market = str(row.get("market") or "SPOT").upper()
+    side = str(row.get("side") or "LONG").upper()
+    entry = float(row.get("entry") or 0.0)
+    sl = float(row.get("sl") or 0.0) if row.get("sl") is not None else 0.0
+    tp1 = float(row.get("tp1") or 0.0) if row.get("tp1") is not None else 0.0
+    tp2 = float(row.get("tp2") or 0.0) if row.get("tp2") is not None else 0.0
+    be_price = float(row.get("be_price") or 0.0) if row.get("be_price") is not None else 0.0
+    pre_status = str(row.get("status") or "ACTIVE").upper()
+    after_tp1 = bool(row.get("tp1_hit")) or pre_status == "TP1"
+    if after_tp1 and be_price <= 0 and entry > 0:
+        be_price = entry
+    has_tp2 = bool(tp2 > 0 and (tp1 <= 0 or abs(tp2 - tp1) > 1e-12))
+    rr = _report_rr_str(entry, sl, tp1, tp2)
+    reason = _report_close_reason(st, after_tp1=after_tp1, has_tp2=has_tp2)
+    opened_time = _fmt_dt_msk(row.get("opened_at"))
+    closed_dt = closed_at or dt.datetime.now(dt.timezone.utc)
+    closed_time = _fmt_dt_msk(closed_dt)
+    tz_label = _report_tz_label()
+
+    price_lines = []
+    if entry > 0:
+        price_lines.append(f"💰 Вход: {entry:.6f}")
+    if sl > 0:
+        price_lines.append(f"🛑 SL: {sl:.6f}")
+    if tp1 > 0:
+        price_lines.append(f"🎯 TP1: {tp1:.6f}")
+    if has_tp2:
+        price_lines.append(f"🚀 TP2: {tp2:.6f}")
+    if after_tp1 and be_price > 0:
+        price_lines.append(f"🛡 BE: {be_price:.6f}")
+    price_block = "\n".join(price_lines).strip() or "—"
+
+    return (
+        f"{_report_close_emoji(st)} {symbol} | {market} | {side}\n\n"
+        f"📌 Статус: {_report_close_status(st, after_tp1=after_tp1)}\n"
+        f"📊 Итог PnL: {_report_pnl_pct(pnl_total_pct)}\n"
+        f"📊 Risk/Reward: 1 : {rr}\n"
+        f"⚡ Закрытие: Smart Manager\n"
+        f"🧠 Причина: {reason}\n\n"
+        f"──────────────\n\n"
+        f"{price_block}\n\n"
+        f"🕒 Открыта: {opened_time} ({tz_label})\n"
+        f"🕒 Закрыта: {closed_time} ({tz_label})"
+    ).strip()
+
+
+
+async def _send_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pct: float, closed_at: dt.datetime | None = None) -> None:
+    if _report_bot is None:
+        return
+    chat_ids = [int(x) for x in (REPORT_BOT_CHAT_IDS or []) if int(x)]
+    if not chat_ids:
+        return
+    try:
+        text = _build_closed_signal_report_card(t, final_status=str(final_status or "CLOSED"), pnl_total_pct=float(pnl_total_pct or 0.0), closed_at=closed_at)
+    except Exception:
+        logger.exception("[report-bot] failed to build closed signal card")
+        return
+    for chat_id in chat_ids:
+        try:
+            await _report_bot.send_message(int(chat_id), text)
+        except TelegramForbiddenError:
+            logger.warning("[report-bot] bot is blocked by chat_id=%s", chat_id)
+        except TelegramBadRequest as e:
+            logger.warning("[report-bot] send failed chat_id=%s err=%s", chat_id, e)
+        except Exception:
+            logger.exception("[report-bot] send failed chat_id=%s", chat_id)
 
 def _fmt_symbol(sym: str) -> str:
     s = (sym or "").strip().upper()
@@ -6152,6 +6325,7 @@ async def signal_outcome_loop() -> None:
                                 px_to = 0.0
                             pnl_to = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=px_to, part_entry_to_close=1.0) if (entry > 0 and px_to > 0) else 0.0
                             await db_store.close_signal_track(signal_id=sid, status="CLOSED", pnl_total_pct=float(pnl_to))
+                            await _send_closed_signal_report_card(t, final_status="CLOSED", pnl_total_pct=float(pnl_to), closed_at=now)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_timeout += 1
                             continue
@@ -6171,6 +6345,7 @@ async def signal_outcome_loop() -> None:
                         if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
                             pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if (eff_tp1 > 0 and eff_tp2 > 0) else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            await _send_closed_signal_report_card(t, final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
                             logger.info("[sig-outcome] WIN sid=%s %s %s px=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_win += 1
@@ -6179,6 +6354,7 @@ async def signal_outcome_loop() -> None:
                             # single-target win at TP1
                             pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp1, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            await _send_closed_signal_report_card(t, final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
                             logger.info("[sig-outcome] WIN sid=%s %s %s px=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_win += 1
@@ -6209,6 +6385,7 @@ async def signal_outcome_loop() -> None:
                                 if sig_sl_confirm_sec == 0 or (since is not None and (_time.time() - since) >= sig_sl_confirm_sec):
                                     pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
                                     await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
+                                    await _send_closed_signal_report_card(t, final_status="LOSS", pnl_total_pct=float(pnl), closed_at=now)
                                     logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                                     logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                                     _SIG_SL_BREACH_SINCE.pop(sid, None)
@@ -6240,6 +6417,7 @@ async def signal_outcome_loop() -> None:
                         if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
                             pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            await _send_closed_signal_report_card(t, final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
                             logger.info("[sig-outcome] WIN sid=%s %s %s px=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_win += 1
@@ -6267,6 +6445,7 @@ async def signal_outcome_loop() -> None:
                                 if sig_sl_confirm_sec == 0 or (since is not None and (_time.time() - since) >= sig_sl_confirm_sec):
                                     pnl = _sig_net_pnl_tp1_then_sl(market=market, side=side, entry=entry, tp1=eff_tp1, sl=sl, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
                                     await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
+                                    await _send_closed_signal_report_card(t, final_status="LOSS", pnl_total_pct=float(pnl), closed_at=now)
                                     logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                                     _SIG_SL_BREACH_SINCE.pop(sid, None)
                                     closed_loss += 1
@@ -6295,6 +6474,7 @@ async def signal_outcome_loop() -> None:
                             if (now - crossed_at_dt).total_seconds() >= _BE_CONFIRM_SEC:
                                 pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
                                 await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
+                                await _send_closed_signal_report_card(t, final_status="BE", pnl_total_pct=float(pnl), closed_at=now)
                                 logger.info("[sig-outcome] BE sid=%s %s %s px=%s be=%s tp1=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(entry), _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
                                 _SIG_SL_BREACH_SINCE.pop(sid, None)
                                 closed_be += 1
@@ -6302,6 +6482,7 @@ async def signal_outcome_loop() -> None:
                         if crossed and crossed_at_dt is not None and _BE_CONFIRM_SEC == 0:
                             pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
+                            await _send_closed_signal_report_card(t, final_status="BE", pnl_total_pct=float(pnl), closed_at=now)
                             logger.info("[sig-outcome] BE sid=%s %s %s px=%s be=%s tp1=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(entry), _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_be += 1
