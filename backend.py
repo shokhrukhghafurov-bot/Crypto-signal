@@ -20252,9 +20252,31 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     # safest fallback
                     return 1800.0
 
+            def _mid_exchange_temporarily_disabled(ex_name: str, market: str = "SPOT") -> bool:
+                ex_u = str(ex_name or "").upper().strip()
+                mkt_u = str(market or "SPOT").upper().strip()
+                if not ex_u:
+                    return False
+                try:
+                    if _top_provider_is_cooled(ex_u):
+                        return True
+                except Exception:
+                    pass
+                try:
+                    _h = _mid_health_get(ex_u, mkt_u)
+                    if float(_h.get("cooldown_until", 0.0) or 0.0) > time.time():
+                        return True
+                except Exception:
+                    pass
+                return False
+
             def _mid_primary_for_symbol(symb: str) -> str:
+                preferred = None
                 if MID_CANDLES_LIGHT_MODE or MID_CANDLES_BINANCE_FIRST:
-                    return "BINANCE"
+                    preferred = "BINANCE"
+                if preferred and preferred in (mid_universe or ["BINANCE"]):
+                    if not _mid_exchange_temporarily_disabled(preferred, "SPOT"):
+                        return preferred
                 # Prefer the exchange that produced the symbol universe (scanner), to avoid routing
                 # a symbol to an exchange where it doesn't exist -> candles_unavailable storms.
                 try:
@@ -20262,13 +20284,18 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     if isinstance(_pref_map, dict):
                         _px = _pref_map.get(symb)
                         if _px:
-                            return str(_px).upper()
+                            _px = str(_px).upper()
+                            if not _mid_exchange_temporarily_disabled(_px, "SPOT"):
+                                return _px
                 except Exception:
                     pass
 
                 # Fallback: stable routing hash(symbol) -> primary exchange from MID_PRIMARY_EXCHANGES
-                if not mid_primary_exchanges:
-                    return "BINANCE"
+                ordered = list(mid_primary_exchanges or [])
+                if not ordered:
+                    ordered = list(mid_universe or ["BINANCE"])
+                if not ordered:
+                    ordered = ["BINANCE"]
                 if mid_primary_mode not in ("hash", "round_robin"):
                     # unknown mode -> hash
                     pass
@@ -20276,7 +20303,12 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     h = int.from_bytes(hashlib.sha1(symb.encode("utf-8")).digest()[:4], "big")
                 except Exception:
                     h = sum(ord(c) for c in symb)
-                return mid_primary_exchanges[h % len(mid_primary_exchanges)]
+                if ordered:
+                    ordered = ordered[h % len(ordered):] + ordered[:h % len(ordered)]
+                for _ex in ordered:
+                    if not _mid_exchange_temporarily_disabled(_ex, "SPOT"):
+                        return _ex
+                return ordered[0] if ordered else "BINANCE"
             # --- MID candles diagnostics (optional) ---
             _mid_candles_log_fail = int(os.getenv("MID_CANDLES_LOG_FAIL", "1") or "1")
             _mid_candles_log_samples = int(os.getenv("MID_CANDLES_LOG_FAIL_SAMPLES", "3") or "3")
@@ -20359,6 +20391,13 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 return None
                         except Exception:
                             _h = None
+
+                        try:
+                            if _mid_exchange_temporarily_disabled(ex_name, mkt):
+                                _mid_diag_add(symb, ex_name, mkt, tf, 'cooldown', 'provider')
+                                return None
+                        except Exception:
+                            pass
 
                         def _mid_rest_is_fresh(df: Optional[pd.DataFrame]) -> bool:
                             """Validate REST candles freshness. Reject stale REST to avoid using old data."""
@@ -20566,6 +20605,22 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             else:
                                 _mid_candles_net_fail += 1
                                 _mid_diag_add(symb, ex_name, (market or 'SPOT'), tf, 'fail', f"{type(e).__name__}: {e}")
+                    except Exception:
+                        pass
+                    try:
+                        ex_u = str(ex_name or '').upper().strip()
+                        if ex_u == 'BINANCE' and _binance_is_rate_limit_error_message(e):
+                            cool_s = int(_top_cooldown_for_error('BINANCE', e) or BINANCE_BAN_COOLDOWN_SEC)
+                            _top_set_provider_cooldown('BINANCE', cool_s)
+                            if _h is not None:
+                                _h['cooldown_until'] = max(float(_h.get('cooldown_until', 0.0) or 0.0), time.time() + float(cool_s))
+                                _h['fail_streak'] = 0
+                        elif ex_u == 'BYBIT' and _mid_is_transient_exc(e):
+                            cool_s = int(_top_cooldown_for_error('BYBIT', e) or TOP_PROVIDER_COOLDOWN_SEC)
+                            _top_set_provider_cooldown('BYBIT', cool_s)
+                            if _h is not None:
+                                _h['cooldown_until'] = max(float(_h.get('cooldown_until', 0.0) or 0.0), time.time() + float(cool_s))
+                                _h['fail_streak'] = 0
                     except Exception:
                         pass
                     # swallow but count (optional)
@@ -21253,7 +21308,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         except Exception:
                             pass
 
-                return None
+                # no direct hit on this venue; continue below to cross-exchange/stale-cache fallbacks
                 # --- REST fallback across exchanges when WS/DB is empty ---
                 # On cold start, the WS->DB candle cache may lag or be empty. If the primary venue
                 # returns empty, try other configured venues before giving up.
@@ -21571,11 +21626,13 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
 
 
                     # --- Architecture C: prefetch candles for all symbols (primary exchange) ---
-                    mid_prefetch = os.getenv("MID_PREFETCH_CANDLES", "1").strip().lower() in ("1","true","yes","on")
+                    mid_prefetch = os.getenv("MID_PREFETCH_CANDLES", "0").strip().lower() in ("1","true","yes","on")
                     if mid_prefetch and symbols:
                         try:
                             prefetch_limit = int(os.getenv("MID_PREFETCH_LIMIT", "250") or 250)
                             prefetch_timeout = float(os.getenv("MID_PREFETCH_TIMEOUT_SEC", "25") or 25)
+                            prefetch_allow_rest = os.getenv("MID_PREFETCH_ALLOW_REST", "0").strip().lower() in ("1","true","yes","on")
+                            prefetch_fetch = _mid_fetch_klines_cached if prefetch_allow_rest else _mid_fetch_klines_wsdb_only
                             groups = defaultdict(list)
                             for _s in symbols:
                                 if is_blocked_symbol(_s):
@@ -21585,9 +21642,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                             tasks = []
                             for _ex, _syms in groups.items():
                                 for _s in _syms:
-                                    tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trigger, prefetch_limit, market_mid)))
-                                    tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_mid, prefetch_limit, market_mid)))
-                                    tasks.append(asyncio.create_task(_mid_fetch_klines_cached(_ex, _s, tf_trend, prefetch_limit, market_mid)))
+                                    tasks.append(asyncio.create_task(prefetch_fetch(_ex, _s, tf_trigger, prefetch_limit, market_mid)))
+                                    tasks.append(asyncio.create_task(prefetch_fetch(_ex, _s, tf_mid, prefetch_limit, market_mid)))
+                                    tasks.append(asyncio.create_task(prefetch_fetch(_ex, _s, tf_trend, prefetch_limit, market_mid)))
 
                             if tasks:
                                 if prefetch_timeout and prefetch_timeout > 0:
@@ -21725,7 +21782,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 if mkt_u == 'FUTURES':
                                     names = [x for x in try_order if x in ('BINANCE','BYBIT','OKX')]
                                 else:
-                                    names = try_order
+                                    names = list(try_order)
+                                healthy_names = [x for x in names if not _mid_exchange_temporarily_disabled(x, mkt_u)]
+                                if healthy_names:
+                                    names = healthy_names
                                 for name in names:
                                     try:
                                         # Fetch trigger TF first (cuts 3x HTTP load on misses -> fewer timeouts/no_candles)
