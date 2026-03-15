@@ -16579,7 +16579,7 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
     }
 
 
-def _mid_recalc_levels_from_trigger(direction: str, trigger_price: float, ta: dict | None, it: dict | None) -> tuple[float,float,float,float,float]:
+def _mid_recalc_levels_from_trigger(direction: str, trigger_price: float, ta: dict | None, it: dict | None, market: str | None = None) -> tuple[float,float,float,float,float]:
     """Recompute entry/SL/TP from the actual trigger price instead of reusing stale setup levels."""
     direction = str(direction or "").upper().strip()
     entry_emit = float(trigger_price or 0.0)
@@ -16625,7 +16625,8 @@ def _mid_recalc_levels_from_trigger(direction: str, trigger_price: float, ta: di
                 tp2_emit = max(float(tp2_emit), float(entry_emit) - max_dist)
     except Exception:
         pass
-    tp1_emit, tp2_emit, rr_emit = _mid_finalize_targets(direction, entry_emit, sl_emit, tp1_emit, tp2_emit, atr_use, market=str(market or "FUTURES"))
+    market_use = str(market or ta.get("market") or it.get("market") or "FUTURES")
+    tp1_emit, tp2_emit, rr_emit = _mid_finalize_targets(direction, entry_emit, sl_emit, tp1_emit, tp2_emit, atr_use, market=market_use)
     try:
         risk = abs(float(entry_emit) - float(sl_emit))
         target_emit = float(tp2_emit) if float(tp2_emit) > 0 else float(tp1_emit)
@@ -18106,7 +18107,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     entry_ref = float(price) if (price is not None and float(price) > 0) else float(it.get("entry") or entry0)
                                 except Exception:
                                     entry_ref = float(it.get("entry") or entry0)
-                                entry_emit, sl_emit, tp1_emit, tp2_emit, rr_emit = _mid_recalc_levels_from_trigger(direction, entry_ref, None, it)
+                                entry_emit, sl_emit, tp1_emit, tp2_emit, rr_emit = _mid_recalc_levels_from_trigger(direction, entry_ref, None, it, market)
                                 conf_emit = int(float(it.get("confidence") or it.get("min_confidence") or 0))
                                 conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "") or str(src_ex)
 
@@ -19539,7 +19540,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         entry_ref = float(price) if (price is not None and float(price) > 0) else _mid_pick_scalar(ta.get("entry"), entry0, it.get("entry"), default=0.0)
                     except Exception:
                         entry_ref = _mid_pick_scalar(ta.get("entry"), entry0, it.get("entry"), default=0.0)
-                    entry, sl, tp1, tp2, rr = _mid_recalc_levels_from_trigger(direction, entry_ref, ta, it)
+                    entry, sl, tp1, tp2, rr = _mid_recalc_levels_from_trigger(direction, entry_ref, ta, it, market)
                     conf = int(_mid_pick_scalar(ta.get("confidence"), it.get("confidence"), default=0.0))
 
                     conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "")
