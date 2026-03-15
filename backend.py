@@ -11351,6 +11351,54 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     except Exception:
         breakout_retest = "—"
 
+    # Directional contradiction hard-blocks (requested minimal patch)
+    try:
+        contradiction_reason = None
+        _pat = str(pattern or "—").strip()
+        _bo = str(breakout_retest or "—").strip()
+        _side_u = str(dir_trend or "").upper()
+
+        if _side_u == "LONG":
+            if _pat in {"Bearish Engulfing", "Shooting Star"}:
+                contradiction_reason = f"directional_contradiction pattern={_pat}"
+            elif _bo.startswith("BO↓"):
+                contradiction_reason = f"directional_contradiction breakout={_bo}"
+        elif _side_u == "SHORT":
+            if _pat in {"Bullish Engulfing", "Hammer"}:
+                contradiction_reason = f"directional_contradiction pattern={_pat}"
+            elif _bo.startswith("BO↑"):
+                contradiction_reason = f"directional_contradiction breakout={_bo}"
+
+        if contradiction_reason:
+            try:
+                _mid_inc_hard_block(1)
+                _mid_hardblock_track(str(contradiction_reason), symbol)
+                _k = f"block|{symbol}|{dir_trend}|{_mid_trap_reason_key(str(contradiction_reason))}"
+                _ctx = _MID_TICK_CTX.get()
+                _tick_key = f"{symbol}|{dir_trend}|block"
+                if _ctx is not None and _tick_key in _ctx.get('block', set()):
+                    _ctx['suppress_block'] = int(_ctx.get('suppress_block', 0)) + 1
+                else:
+                    if _ctx is not None:
+                        _ctx.setdefault('block', set()).add(_tick_key)
+                    if _mid_trap_should_log(_k):
+                        logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, contradiction_reason, float(entry))
+                _emit_mid_trap_event({
+                    "dir": str(dir_trend),
+                    "reason": str(contradiction_reason),
+                    "reason_key": _mid_trap_reason_key(str(contradiction_reason)),
+                    "entry": float(entry),
+                })
+            except Exception:
+                pass
+            try:
+                _fail("other", str(contradiction_reason))
+            except Exception:
+                pass
+            return None
+    except Exception:
+        pass
+
     # Range position filter (only when market structure is RANGE)
     range_pos = None
     range_pos_txt = "—"
