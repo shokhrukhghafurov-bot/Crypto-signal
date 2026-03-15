@@ -5757,20 +5757,59 @@ def _gate_pair(symbol: str) -> str:
 
 
 async def _fetch_bybit_price(symbol: str, *, futures: bool) -> float:
-    """Public last price from Bybit v5 market tickers."""
-    symbol = str(symbol or "").upper().replace("/", "").replace("-", "").strip()
+    """Public last price from Bybit v5 market tickers with light retry/fallback parsing."""
+    symbol = str(symbol or "").upper().replace("/", "").replace("-", "").replace(":", "").strip()
     if not symbol:
         return 0.0
     category = "linear" if futures else "spot"
     url = "https://api.bybit.com/v5/market/tickers"
+
+    def _extract_price(data) -> float:
+        if not isinstance(data, dict):
+            return 0.0
+        try:
+            ret_code = int(data.get("retCode", 0) or 0)
+        except Exception:
+            ret_code = 0
+        if ret_code != 0:
+            return 0.0
+        lst = (((data or {}).get("result") or {}).get("list") or [])
+        if lst and isinstance(lst, list) and isinstance(lst[0], dict):
+            item = lst[0] or {}
+            for key in ("lastPrice", "last_price", "indexPrice", "markPrice"):
+                try:
+                    px = float(item.get(key) or 0.0)
+                    if px > 0:
+                        return px
+                except Exception:
+                    continue
+            try:
+                bid = float(item.get("bid1Price") or 0.0)
+                ask = float(item.get("ask1Price") or 0.0)
+                if bid > 0 and ask > 0:
+                    return (bid + ask) / 2.0
+                if bid > 0:
+                    return bid
+                if ask > 0:
+                    return ask
+            except Exception:
+                pass
+        return 0.0
+
     try:
         timeout = aiohttp.ClientTimeout(total=6)
         async with aiohttp.ClientSession(timeout=timeout) as s:
-            async with s.get(url, params={"category": category, "symbol": symbol}) as r:
-                data = await r.json(content_type=None)
-                lst = (((data or {}).get("result") or {}).get("list") or [])
-                if lst and isinstance(lst, list):
-                    return float((lst[0] or {}).get("lastPrice") or 0.0)
+            for attempt in range(3):
+                try:
+                    async with s.get(url, params={"category": category, "symbol": symbol}) as r:
+                        data = await r.json(content_type=None)
+                    px = _extract_price(data)
+                    if px > 0:
+                        return float(px)
+                except Exception:
+                    pass
+                if attempt < 2:
+                    await asyncio.sleep(0.25 * (attempt + 1))
     except Exception:
         pass
     return 0.0
