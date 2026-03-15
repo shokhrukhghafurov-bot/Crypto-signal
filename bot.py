@@ -3295,10 +3295,39 @@ def _too_late_reason_key(reason: str) -> str:
     }.get((reason or "").upper(), "sig_too_late_reason_error")
 
 
+def _effective_signal_targets(sig: Signal) -> tuple[float, float]:
+    """Normalize TP display/use for single-target signals.
+
+    If TP2 is missing, zero, or effectively equal to TP1, treat the signal as
+    single-target: TP1 stays as final target and TP2 is hidden/ignored.
+    """
+    try:
+        tp1 = float(getattr(sig, "tp1", 0.0) or 0.0)
+    except Exception:
+        tp1 = 0.0
+    try:
+        tp2 = float(getattr(sig, "tp2", 0.0) or 0.0)
+    except Exception:
+        tp2 = 0.0
+
+    eff_tp1 = tp1 if tp1 > 0 else 0.0
+    eff_tp2 = tp2 if (tp2 > 0 and (eff_tp1 <= 0 or abs(tp2 - eff_tp1) > 1e-12)) else 0.0
+    return eff_tp1, eff_tp2
+
+
+def _normalize_too_late_reason(sig: Signal, reason: str) -> str:
+    """Prevent single-target signals from being reported as TP2-hit."""
+    rs = str(reason or "").upper().strip()
+    eff_tp1, eff_tp2 = _effective_signal_targets(sig)
+    if rs == "TP2" and eff_tp2 <= 0 and eff_tp1 > 0:
+        return "TP1"
+    return rs or "ERROR"
+
+
 async def _expire_signal_message(call: types.CallbackQuery, sig: Signal, reason: str, price: float) -> None:
     """Remove the OPEN button and mark the signal as expired in-place."""
     uid = call.from_user.id
-    reason_key = _too_late_reason_key(reason)
+    reason_key = _too_late_reason_key(_normalize_too_late_reason(sig, reason))
     note = tr(uid, "sig_expired_note").format(
         reason=tr(uid, reason_key),
         price=_fmt_price(price),
@@ -3323,7 +3352,8 @@ def _too_late_text(uid: int, sig: Signal, reason: str, price: float) -> str:
     sym = _fmt_symbol(sig.symbol)
     hhmm = _fmt_hhmm(float(getattr(sig, "ts", 0.0) or 0.0))
 
-    reason_key = _too_late_reason_key(reason)
+    eff_tp1, eff_tp2 = _effective_signal_targets(sig)
+    reason_key = _too_late_reason_key(_normalize_too_late_reason(sig, reason))
 
     return tr(uid, "sig_too_late_body").format(
         market_emoji=mkt_emoji,
@@ -3331,12 +3361,11 @@ def _too_late_text(uid: int, sig: Signal, reason: str, price: float) -> str:
         symbol=sym,
         reason=tr(uid, reason_key),
         price=_fmt_price(price),
-        tp1=_fmt_price(getattr(sig, "tp1", None)),
-        tp2=_fmt_price(getattr(sig, "tp2", None)),
+        tp1=_fmt_price(eff_tp1 if eff_tp1 > 0 else None),
+        tp2=_fmt_price(eff_tp2 if eff_tp2 > 0 else None),
         sl=_fmt_price(getattr(sig, "sl", None)),
         time=hhmm,
     )
-
 
 
 def _price_unavailable_notice(uid: int, sig: 'Signal') -> str:
@@ -3841,7 +3870,7 @@ def _fmt_stats_block_ru(uid: int, title: str, b: dict | None = None) -> str:
 
     return (
         f"{title}\n"
-        f"{tr(uid, 'lbl_trades')}: {trades} | {tr(uid, 'lbl_tp2')}: {wins} | {tr(uid, 'lbl_sl')}: {losses} | "
+        f"{tr(uid, 'lbl_trades')}: {trades} | {tr(uid, 'lbl_wins')}: {wins} | {tr(uid, 'lbl_sl')}: {losses} | "
         f"{tr(uid, 'lbl_be')}: {be} | {tr(uid, 'lbl_tp1')}: {tp1}\n"
         f"{tr(uid, 'lbl_winrate')}: {wr:.1f}%\n"
         f"{tr(uid, 'lbl_pnl')}: {pnl:+.2f}%"
@@ -3861,7 +3890,7 @@ def _fmt_stats_block_en(title: str, b: dict | None = None) -> str:
     pnl = float(b.get("sum_pnl_pct", 0.0))
     return (
         f"{title}\n"
-        f"Trades: {trades} | TP2: {wins} | SL: {losses} | BE: {be} | TP1: {tp1}\n"
+        f"Trades: {trades} | Wins: {wins} | SL: {losses} | BE: {be} | TP1: {tp1}\n"
         f"Win rate: {wr:.1f}%\n"
         f"PnL: {pnl:+.2f}%"
     )
