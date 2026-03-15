@@ -56,7 +56,7 @@ from aiohttp import web, ClientSession
 
 import db_store
 
-from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test, mid_summary_heartbeat_loop, autotrade_anomaly_watchdog_loop
+from backend import Backend, Signal, MacroEvent, open_metrics, validate_autotrade_keys, ExchangeAPIError, autotrade_execute, autotrade_manager_loop, autotrade_healthcheck, autotrade_stress_test, mid_summary_heartbeat_loop, autotrade_anomaly_watchdog_loop, ws_candles_service_loop, candles_cache_cleanup_loop
 import time
 import hashlib
 import hmac
@@ -6276,6 +6276,20 @@ async def main() -> None:
     import time
     
     logger.info("Bot starting; TZ=%s", TZ_NAME)
+    worker_role = str(os.getenv("WORKER_ROLE", "") or "").strip().upper()
+    if worker_role == "WS_CANDLES":
+        logger.info("WORKER_ROLE=WS_CANDLES -> starting dedicated candles worker")
+        await init_db()
+        load_langs()
+        cleanup_enabled = str(os.getenv("CANDLES_CACHE_CLEANUP_ENABLED", "1") or "1").strip().lower() not in ("0","false","no","off")
+        if cleanup_enabled:
+            TASKS["candles-cache-cleanup"] = asyncio.create_task(candles_cache_cleanup_loop(backend), name="candles-cache-cleanup")
+            _attach_task_monitor("candles-cache-cleanup", TASKS["candles-cache-cleanup"])
+        TASKS["ws-candles"] = asyncio.create_task(ws_candles_service_loop(backend), name="ws-candles")
+        _attach_task_monitor("ws-candles", TASKS["ws-candles"])
+        logger.info("WS candles worker active; Telegram bot is not started in this role")
+        await asyncio.Event().wait()
+        return
     try:
         get_autotrade_master_key()
         logger.info("AUTOTRADE_MASTER_KEY validated successfully")
@@ -6292,6 +6306,14 @@ async def main() -> None:
     if purge_enabled and (not cleanup_enabled):
         TASKS["candles-cache-purge"] = asyncio.create_task(_candles_cache_purge_loop(), name="candles-cache-purge")
         _attach_task_monitor("candles-cache-purge", TASKS["candles-cache-purge"])
+
+    ws_inproc_enabled = str(os.getenv("CANDLES_WS_INPROC_ENABLED", "0") or "0").strip().lower() not in ("0","false","no","off")
+    if ws_inproc_enabled:
+        TASKS["ws-candles"] = asyncio.create_task(ws_candles_service_loop(backend), name="ws-candles")
+        _attach_task_monitor("ws-candles", TASKS["ws-candles"])
+        if cleanup_enabled:
+            TASKS["candles-cache-cleanup"] = asyncio.create_task(candles_cache_cleanup_loop(backend), name="candles-cache-cleanup")
+            _attach_task_monitor("candles-cache-cleanup", TASKS["candles-cache-cleanup"])
 
 
 
