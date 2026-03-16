@@ -1434,6 +1434,33 @@ def _mid_hardblock_key(reason: str) -> str:
     except Exception:
         return "unknown"
 
+
+def _mid_trigger_selected_hardblock_reason(reason: str) -> tuple[str | None, str | None]:
+    """Selectively enforce only RSI / ADX / volume hard-blocks during trigger.
+
+    Trigger intentionally ignores most ta['blocked']/block_reason values so legacy
+    pending behavior stays intact for late-entry, anti-bounce, BB-bounce and other
+    non-selected hard blocks. For the user-requested trio we short-circuit trigger
+    immediately when evaluate_on_exchange_mid_v2() reports them.
+
+    Returns (log_reason, apply_reason) or (None, None) when the raw reason should
+    remain ignored by trigger-time logic.
+    """
+    try:
+        raw = str(reason or "").strip()
+        if not raw:
+            return (None, None)
+        head = raw.split()[0].split("=", 1)[0].strip().lower()
+        if head in ("rsi_long", "rsi_short"):
+            return (head, head)
+        if head in ("adx_30m", "adx_1h", "regime_block"):
+            return ("regime_block", "regime_block")
+        if head == "vol_x":
+            return ("vol_low", "vol_low")
+        return (None, None)
+    except Exception:
+        return (None, None)
+
 def _mid_hardblock_reset_tick() -> None:
     global _MID_HARD_BLOCK_TICK_TOKEN, _MID_HARD_BLOCK_BY_KEY, _MID_HARD_BLOCK_SAMPLES
     try:
@@ -18518,6 +18545,47 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             it["_trig_vol_thr_why"] = ",".join(thr_why) if thr_why else "base"
                     except Exception:
                         pass
+                    # Selectively enforce only RSI / ADX / volume hard-blocks from ta.block_reason.
+                    # All other hard-block reasons remain ignored here to preserve existing trigger behaviour.
+                    try:
+                        hb_raw_reason = str(ta.get("block_reason") or "").strip()
+                        hb_log_reason, hb_apply_reason = _mid_trigger_selected_hardblock_reason(hb_raw_reason)
+                        if hb_apply_reason:
+                            try:
+                                if hb_apply_reason == "vol_low":
+                                    if isinstance(it.get("_trig_reqs"), dict):
+                                        it["_trig_reqs"]["vol_x"] = True
+                                    if isinstance(it.get("_trig_checks"), dict):
+                                        it["_trig_checks"]["vol_x"] = "fail"
+                                elif hb_apply_reason == "regime_block":
+                                    if isinstance(it.get("_trig_reqs"), dict):
+                                        it["_trig_reqs"]["adx"] = True
+                                    if isinstance(it.get("_trig_checks"), dict):
+                                        it["_trig_checks"]["adx"] = "fail"
+                                else:
+                                    if isinstance(it.get("_trig_reqs"), dict):
+                                        it["_trig_reqs"][hb_apply_reason] = True
+                                    if isinstance(it.get("_trig_checks"), dict):
+                                        it["_trig_checks"][hb_apply_reason] = "fail"
+                                it["_trig_fail_reasons"] = [str(hb_log_reason)]
+                                it["_trig_primary_reason"] = str(hb_log_reason)
+                                it["_trig_term_reason"] = str(hb_log_reason)
+                            except Exception:
+                                pass
+                            keep_it, outc = _pending_apply_fail(it, hb_apply_reason, now)
+                            _pending_log_trigger(sym, market, direction, outc, hb_log_reason, it, float(price))
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
+                            else:
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                            continue
+                    except Exception:
+                        pass
+
                     # Direction check
                     # By default we DO NOT block on minor direction flips at trigger-time because the setup was built earlier.
                     # We only soft-fail on direction mismatch when we detect a *strong reversal* (trend + strong ADX).
