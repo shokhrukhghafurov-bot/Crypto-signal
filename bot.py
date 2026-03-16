@@ -6442,6 +6442,16 @@ async def signal_outcome_loop() -> None:
 
                     # TP1 stage (BE armed)
                     if status == "TP1":
+                        # Legacy migration: single-target signals should not stay in TP1.
+                        if eff_tp2 <= 0 and eff_tp1 > 0:
+                            pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp1, part_entry_to_close=1.0)
+                            await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            await _send_closed_signal_report_card(t, final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
+                            logger.info("[sig-outcome] WIN sid=%s %s %s legacy_tp1_finalize tp1=%s src=%s", sid, market, symbol, _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
+                            _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            closed_win += 1
+                            continue
+
                         # WIN by TP2 if exists
                         if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
                             pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
