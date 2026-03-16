@@ -3066,7 +3066,43 @@ def _signal_text(uid: int, s: Signal, *, autotrade_hint: str = "") -> str:
 
     tp_lines = "\n".join(_tp_lines())
 
-    rr_line = f"{tr(uid, 'sig_rr')}: 1:{s.rr:.2f}"
+    def _rr_value(target_f: float) -> float | None:
+        try:
+            entry_f = float(getattr(s, 'entry', 0.0) or 0.0)
+            sl_f = float(getattr(s, 'sl', 0.0) or 0.0)
+            tgt_f = float(target_f or 0.0)
+            if entry_f <= 0 or sl_f <= 0 or tgt_f <= 0:
+                return None
+            side_s = str(getattr(s, 'direction', '') or '').upper()
+            is_short = (getattr(s, 'market', 'SPOT') != 'SPOT') and ('SHORT' in side_s)
+            if is_short:
+                risk = sl_f - entry_f
+                reward = entry_f - tgt_f
+            else:
+                risk = entry_f - sl_f
+                reward = tgt_f - entry_f
+            if risk <= 0 or reward <= 0:
+                return None
+            return float(reward / risk)
+        except Exception:
+            return None
+
+    def _rr_text() -> str:
+        try:
+            rr_label = tr(uid, 'sig_rr')
+            tp1_rr = _rr_value(getattr(s, 'tp1', 0.0))
+            tp2_rr = _rr_value(getattr(s, 'tp2', 0.0))
+            if tp1_rr is not None and tp2_rr is not None and abs(tp2_rr - tp1_rr) > 1e-12:
+                return f"{rr_label} TP1: 1:{tp1_rr:.2f}\n{rr_label} TP2: 1:{tp2_rr:.2f}"
+            if tp1_rr is not None:
+                return f"{rr_label}: 1:{tp1_rr:.2f}"
+            if tp2_rr is not None:
+                return f"{rr_label}: 1:{tp2_rr:.2f}"
+        except Exception:
+            pass
+        return f"{tr(uid, 'sig_rr')}: 1:{float(getattr(s, 'rr', 0.0) or 0.0):.2f}"
+
+    rr_line = _rr_text()
     conf_line = f"{tr(uid, 'sig_confidence')}: {s.confidence}/100"
     # Confirm line: primary venue that produced the signal.
     src_ex = (getattr(s, 'source_exchange', '') or '').strip()
