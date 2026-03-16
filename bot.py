@@ -2916,6 +2916,73 @@ def autotrade_keys_kb(uid: int) -> types.InlineKeyboardMarkup:
 
 
 
+def _parse_private_ta_uids(raw: str) -> set[int]:
+    out: set[int] = set()
+    for part in re.split(r"[\s,;]+", str(raw or "").strip()):
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except Exception:
+            continue
+    return out
+
+
+def _private_ta_uids() -> set[int]:
+    out: set[int] = set()
+    for env_name in ("PRIVATE_TA_UIDS", "PRIVATE_TA_TELEGRAM_IDS", "PRIVATE_TA_USER_IDS"):
+        out.update(_parse_private_ta_uids(os.getenv(env_name, "")))
+    return out
+
+
+def _uid_can_view_private_ta(uid: int) -> bool:
+    try:
+        if int(uid) == 0:
+            return True
+    except Exception:
+        pass
+    try:
+        return int(uid) in _private_ta_uids()
+    except Exception:
+        return False
+
+
+_PRIVATE_TA_LINE_RE = re.compile(
+    r"^(?:📊 TA score:|RSI(?:\([^)]*\))?:|ADX(?: .*?)?:|BB:|🧱 Trap:|Div:|Ch:|Liquidity:|Breakout/Retest:|Pattern:)",
+    re.UNICODE,
+)
+
+
+def _risk_note_for_uid(uid: int, risk_note: str) -> str:
+    text = str(risk_note or "").strip()
+    if not text:
+        return ""
+    if _uid_can_view_private_ta(uid):
+        return text
+
+    keep: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            continue
+        if _PRIVATE_TA_LINE_RE.match(line):
+            continue
+
+        # Remove inline internal flags if they leaked outside the TA block.
+        line = re.sub(r"\s*\|\s*trigger_revalidated=\d+\b", "", line)
+        line = re.sub(r"\s*\|\s*levels_recalc=\d+\b", "", line)
+        line = re.sub(r"\s*\|\s*smart_setup_emit=\d+\b", "", line)
+        line = re.sub(r"\s*\|\s*smart_conf=\d+/\d+\b", "", line)
+        line = re.sub(r"\s*\|\s*instant_vip=\d+\b", "", line)
+        line = line.strip().strip("|").strip()
+        if not line:
+            continue
+        keep.append(line)
+
+    return "\n".join(keep).strip()
+
+
+
 def _signal_text(uid: int, s: Signal, *, autotrade_hint: str = "") -> str:
     header = tr(uid, 'sig_spot_header') if s.market == 'SPOT' else tr(uid, 'sig_fut_header')
     market_banner = tr(uid, 'sig_spot_new') if s.market == 'SPOT' else tr(uid, 'sig_fut_new')
@@ -3007,7 +3074,7 @@ def _signal_text(uid: int, s: Signal, *, autotrade_hint: str = "") -> str:
 
     autotrade_line = f"{tr(uid, 'sig_autotrade')}: {autotrade_hint}\n" if autotrade_hint else ""
 
-    risk_note = (s.risk_note or '').strip()
+    risk_note = _risk_note_for_uid(uid, s.risk_note)
     risk_block = f"\n\n{risk_note}" if risk_note else ""
 
     return trf(uid, "msg_open_card",
