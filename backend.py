@@ -15027,7 +15027,22 @@ class Backend:
         """Return (allowed, reason_code, current_price).
 
         reason_code is one of: OK, TP2, TP1, SL, TIME, ERROR
+
+        IMPORTANT:
+        - Ignore zero / missing targets. Single-target signals often carry tp2=0.0,
+          and treating that as a real level marks every positive price as TP2-hit.
+        - For single-target setups, do not allow TP2 to shadow TP1 when tp2 is
+          absent or effectively equal to tp1.
         """
+        def _level_or_none(value) -> float | None:
+            try:
+                v = float(value)
+            except Exception:
+                return None
+            if not math.isfinite(v) or v <= 0:
+                return None
+            return v
+
         try:
             now = time.time()
             ttl = int(os.getenv("SIGNAL_OPEN_TTL_SECONDS", "1800"))  # 30 min default
@@ -15040,17 +15055,17 @@ class Backend:
 
             direction = (getattr(signal, "direction", None) or getattr(signal, "side", None) or "").upper()
             is_short = "SHORT" in direction
-            is_long = not is_short
 
-            tp1 = getattr(signal, "tp1", None)
-            tp2 = getattr(signal, "tp2", None)
-            sl = getattr(signal, "sl", None)
+            tp1_f = _level_or_none(getattr(signal, "tp1", None))
+            tp2_f = _level_or_none(getattr(signal, "tp2", None))
+            sl_f = _level_or_none(getattr(signal, "sl", None))
 
-            tp1_f = float(tp1) if tp1 is not None else None
-            tp2_f = float(tp2) if tp2 is not None else None
-            sl_f = float(sl) if sl is not None else None
+            # Single-target plans often store tp2 as 0 or duplicate tp1.
+            # In both cases TP2 must be ignored here.
+            if tp1_f is not None and tp2_f is not None and abs(tp2_f - tp1_f) <= 1e-12:
+                tp2_f = None
 
-            if is_long:
+            if not is_short:
                 if tp2_f is not None and price >= tp2_f:
                     return False, "TP2", price
                 if tp1_f is not None and price >= tp1_f:
