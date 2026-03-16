@@ -23320,6 +23320,152 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                             _rej_add(sym, f"pending_quality:{_pending_bad_reason}")
                                             continue
 
+                                    # SMART SETUP: emit immediately only for very strong setups.
+                                    #
+                                    # Rules:
+                                    # - confidence >= MID_SMART_SETUP_EMIT_CONF (default: 90)
+                                    # - if a valid entry zone exists, current price must already be inside/near it
+                                    # - if a valid entry zone exists but price is still far, keep pending and wait for the first touch
+                                    # - if no valid zone exists, allow immediate emit only for very strong setups
+                                    _smart_setup_enabled = os.getenv("MID_SMART_SETUP_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+                                    if _smart_setup_enabled:
+                                        _smart_emit_done = False
+                                        try:
+                                            try:
+                                                _smart_conf_need = int(float(os.getenv("MID_SMART_SETUP_EMIT_CONF", "90") or 90))
+                                            except Exception:
+                                                _smart_conf_need = 90
+                                            try:
+                                                _smart_near_atr = float(os.getenv("MID_SMART_SETUP_ZONE_NEAR_ATR", os.getenv("MID_PENDING_NEAR_ATR", "0.30")) or 0.30)
+                                            except Exception:
+                                                _smart_near_atr = 0.30
+                                            try:
+                                                _smart_near_pct = float(os.getenv("MID_SMART_SETUP_ZONE_NEAR_PCT", "0.004") or 0.004)
+                                            except Exception:
+                                                _smart_near_pct = 0.004
+                                            _smart_emit_if_no_zone = os.getenv("MID_SMART_SETUP_EMIT_IF_NO_ZONE", "1").strip().lower() in ("1", "true", "yes", "on")
+
+                                            _zone_src_l = str(rec.get("entry_zone_src") or "").strip().lower()
+                                            _zone_valid = False
+                                            try:
+                                                _zlo0 = float(rec.get("entry_low")) if rec.get("entry_low") is not None else None
+                                                _zhi0 = float(rec.get("entry_high")) if rec.get("entry_high") is not None else None
+                                                _zone_valid = bool((_zlo0 is not None) and (_zhi0 is not None) and (_zhi0 > _zlo0) and (_zone_src_l not in ("", "none", "too_wide", "error", "far")))
+                                            except Exception:
+                                                _zone_valid = False
+
+                                            _dist_now_atr = rec.get("dist_to_zone_at_create_atr")
+                                            _dist_now_pct = float(rec.get("dist_to_zone_at_create_pct") or 0.0)
+                                            _in_zone_now = False
+                                            try:
+                                                _px0 = float(rec.get("entry") or 0.0)
+                                                if _zone_valid:
+                                                    _in_zone_now = (float(rec.get("entry_low") or 0.0) <= _px0 <= float(rec.get("entry_high") or 0.0))
+                                            except Exception:
+                                                _in_zone_now = False
+                                            if _zone_valid and (not _in_zone_now):
+                                                try:
+                                                    if _dist_now_atr is None:
+                                                        _in_zone_now = (_dist_now_pct <= float(_smart_near_pct))
+                                                    else:
+                                                        _in_zone_now = (float(_dist_now_atr) <= float(_smart_near_atr)) or (_dist_now_pct <= float(_smart_near_pct))
+                                                except Exception:
+                                                    _in_zone_now = False
+
+                                            _risk_block_now = False
+                                            try:
+                                                for _rf in (risk_flags or []):
+                                                    _rf_s = str(_rf or "").strip().lower()
+                                                    if _rf_s.startswith("trap:") or _rf_s.startswith("block:") or _rf_s in ("far_zone", "scale_mismatch"):
+                                                        _risk_block_now = True
+                                                        break
+                                            except Exception:
+                                                _risk_block_now = False
+
+                                            _conf_now = int(float(rec.get("confidence") or 0))
+                                            _strong_now = (_conf_now >= int(_smart_conf_need))
+                                            _emit_now = bool(_strong_now and ( ((_zone_valid and _in_zone_now) or ((not _zone_valid) and _smart_emit_if_no_zone)) ) and (not _risk_block_now))
+
+                                            try:
+                                                rec["smart_setup"] = bool(_strong_now)
+                                                rec["smart_zone_valid"] = bool(_zone_valid)
+                                                rec["smart_in_zone_now"] = bool(_in_zone_now)
+                                                rec["smart_conf_need"] = int(_smart_conf_need)
+                                                rec["smart_emit_now"] = bool(_emit_now)
+                                            except Exception:
+                                                pass
+
+                                            _can_emit_now = True
+                                            try:
+                                                _can_emit_now = bool(self.can_emit_mid(sym))
+                                            except Exception:
+                                                _can_emit_now = True
+
+                                            if _emit_now and _can_emit_now:
+                                                sig_emit = Signal(
+                                                    signal_id=self.next_signal_id(),
+                                                    market=marketu,
+                                                    symbol=sym,
+                                                    direction=diru,
+                                                    timeframe=f"{tf_trigger}/{tf_mid}/{tf_trend}",
+                                                    entry=float(entry),
+                                                    sl=float(sl),
+                                                    tp1=float(tp1),
+                                                    tp2=float(tp2),
+                                                    rr=float(tp2_r if tp_policy=="R" else rr),
+                                                    confidence=int(round(conf)),
+                                                    confirmations=conf_names,
+                                                    source_exchange=best_name,
+                                                    available_exchanges=conf_names,
+                                                    risk_note=(str(risk_note or "").strip() + (" | " if str(risk_note or "").strip() else "") + f"smart_setup_emit=1 smart_conf={int(_conf_now)}/{int(_smart_conf_need)}").strip(),
+                                                    ts=time.time(),
+                                                )
+                                                try:
+                                                    self.mark_emitted_mid(sym, sig_emit.direction, sig_emit.market)
+                                                except TypeError:
+                                                    try:
+                                                        self.mark_emitted_mid(sym)
+                                                    except Exception:
+                                                        pass
+                                                except Exception:
+                                                    pass
+                                                self.last_signal = sig_emit
+                                                if sig_emit.market == "SPOT":
+                                                    self.last_spot_signal = sig_emit
+                                                else:
+                                                    self.last_futures_signal = sig_emit
+                                                _mid_stage_add("passed_ta", 1)
+                                                _mid_stage_add("triggered", 1)
+                                                await emit_signal_cb(sig_emit)
+                                                _mid_emitted += 1
+                                                try:
+                                                    _mid_metrics_inc("setups_found", 1)
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    logger.info(
+                                                        "[mid][smart-setup] emit_now sym=%s market=%s dir=%s conf=%s zone_valid=%s in_zone_now=%s zone_src=%s",
+                                                        sym,
+                                                        marketu,
+                                                        diru,
+                                                        int(_conf_now),
+                                                        1 if _zone_valid else 0,
+                                                        1 if _in_zone_now else 0,
+                                                        _zone_src_l or "-",
+                                                    )
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    _rej_ok(sym, "emitted")
+                                                except Exception:
+                                                    pass
+                                                await asyncio.sleep(2)
+                                                _smart_emit_done = True
+                                        except Exception:
+                                            _smart_emit_done = False
+                                        if _smart_emit_done:
+                                            continue
+
                                     await self.add_mid_pending(rec)
                                     self.mark_mid_pending(sym, direction=diru, market=marketu)
                                     _mid_stage_add("passed_ta", 1)
