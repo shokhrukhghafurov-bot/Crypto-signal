@@ -7910,6 +7910,28 @@ def open_metrics(sig: "Signal") -> dict:
     }
 
 
+MIN_SIGNAL_PROFIT_PCT = max(0.0, float(os.getenv("MIN_SIGNAL_PROFIT_PCT", "1.0") or 1.0))
+
+def signal_expected_profit_pct(sig: "Signal") -> float:
+    """Estimated signal profit % using TP2 if available, otherwise TP1."""
+    try:
+        side = (getattr(sig, "direction", "") or "LONG").upper().strip()
+        entry = float(getattr(sig, "entry", 0.0) or 0.0)
+        tp = float(getattr(sig, "tp2", 0.0) or getattr(sig, "tp1", 0.0) or 0.0)
+        return float(calc_profit_pct(entry, tp, side))
+    except Exception:
+        return 0.0
+
+def signal_min_profit_gate(sig: "Signal") -> tuple[bool, float, float]:
+    """Return (ok, expected_profit_pct, min_required_pct)."""
+    try:
+        min_req = max(0.0, float(os.getenv("MIN_SIGNAL_PROFIT_PCT", str(MIN_SIGNAL_PROFIT_PCT)) or MIN_SIGNAL_PROFIT_PCT))
+    except Exception:
+        min_req = float(MIN_SIGNAL_PROFIT_PCT)
+    profit = signal_expected_profit_pct(sig)
+    return (float(profit) >= float(min_req), float(profit), float(min_req))
+
+
 
 def _price_debug_block(uid: int, *, price: float, source: str, side: str, sl: float | None, tp1: float | None, tp2: float | None, sl_label_key: str | None = None) -> str:
     """Human-readable debug block for a trade.
@@ -16096,6 +16118,15 @@ class Backend:
                             ts=time.time(),
                         )
 
+                        _profit_ok, _profit_pct, _profit_min = signal_min_profit_gate(sig)
+                        if not _profit_ok:
+                            logger.info("[signal][skip_profit] %s market=%s dir=%s profit=%.3f%% min=%.3f%%", sig.symbol, sig.market, sig.direction, float(_profit_pct), float(_profit_min))
+                            try:
+                                _rej_add(sym, f"profit_lt_{float(_profit_min):.2f}")
+                            except Exception:
+                                pass
+                            continue
+
                         self.mark_emitted(sym)
                         self.last_signal = sig
                         if sig.market == "SPOT":
@@ -18162,6 +18193,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     ts=time.time(),
                                 )
 
+                                _profit_ok, _profit_pct, _profit_min = signal_min_profit_gate(sig)
+                                if not _profit_ok:
+                                    logger.info("[signal][skip_profit] %s market=%s dir=%s profit=%.3f%% min=%.3f%%", sig.symbol, sig.market, sig.direction, float(_profit_pct), float(_profit_min))
+                                    _pending_log_trigger(sym, market, direction, "skip", f"profit_lt_{float(_profit_min):.2f}", it, float(price))
+                                    continue
+
                                 try:
                                     self.mark_emitted_mid(sym, sig.direction, sig.market)
                                 except TypeError:
@@ -19638,6 +19675,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         risk_note=str(it.get("risk_note") or "ENTRY CONFIRMED") + " | trigger_revalidated=1 | levels_recalc=1",
                         ts=time.time(),
                     )
+
+                    _profit_ok, _profit_pct, _profit_min = signal_min_profit_gate(sig)
+                    if not _profit_ok:
+                        logger.info("[signal][skip_profit] %s market=%s dir=%s profit=%.3f%% min=%.3f%%", sig.symbol, sig.market, sig.direction, float(_profit_pct), float(_profit_min))
+                        _pending_log_trigger(sym, market, direction, "skip", f"profit_lt_{float(_profit_min):.2f}", it, float(price))
+                        _pending_clear_cooldown(it)
+                        continue
 
                     try:
                         self.mark_emitted_mid(sym, sig.direction, sig.market)
@@ -23420,6 +23464,15 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     risk_note=(str(risk_note or "").strip() + (" | " if str(risk_note or "").strip() else "") + f"smart_setup_emit=1 smart_conf={int(_conf_now)}/{int(_smart_conf_need)}").strip(),
                                                     ts=time.time(),
                                                 )
+                                                _profit_ok, _profit_pct, _profit_min = signal_min_profit_gate(sig_emit)
+                                                if not _profit_ok:
+                                                    logger.info("[signal][skip_profit] %s market=%s dir=%s profit=%.3f%% min=%.3f%%", sig_emit.symbol, sig_emit.market, sig_emit.direction, float(_profit_pct), float(_profit_min))
+                                                    try:
+                                                        _rej_add(sym, f"profit_lt_{float(_profit_min):.2f}")
+                                                    except Exception:
+                                                        pass
+                                                    continue
+
                                                 try:
                                                     self.mark_emitted_mid(sym, sig_emit.direction, sig_emit.market)
                                                 except TypeError:
@@ -23497,6 +23550,15 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 _rej_add(sym, "pending_exception")
                             # do NOT emit now
                         else:
+                            _profit_ok, _profit_pct, _profit_min = signal_min_profit_gate(sig)
+                            if not _profit_ok:
+                                logger.info("[signal][skip_profit] %s market=%s dir=%s profit=%.3f%% min=%.3f%%", sig.symbol, sig.market, sig.direction, float(_profit_pct), float(_profit_min))
+                                try:
+                                    _rej_add(sym, f"profit_lt_{float(_profit_min):.2f}")
+                                except Exception:
+                                    pass
+                                continue
+
                             try:
                                 self.mark_emitted_mid(sym, sig.direction, sig.market)
                             except TypeError:
