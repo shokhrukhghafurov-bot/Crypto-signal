@@ -15046,9 +15046,27 @@ class Backend:
             tp2 = getattr(signal, "tp2", None)
             sl = getattr(signal, "sl", None)
 
-            tp1_f = float(tp1) if tp1 is not None else None
-            tp2_f = float(tp2) if tp2 is not None else None
-            sl_f = float(sl) if sl is not None else None
+            # IMPORTANT:
+            # Signal objects often carry absent targets as 0 / 0.0 instead of None.
+            # The previous logic treated tp2=0.0 as a real target, so for LONG signals
+            # `price >= tp2_f` was always true and the signal was incorrectly marked as
+            # already worked out. In the UI this then got normalized to a fake
+            # "TP1 reached" message for single-target signals.
+            def _norm_level(v):
+                try:
+                    fv = float(v)
+                except Exception:
+                    return None
+                return fv if fv > 0 else None
+
+            tp1_f = _norm_level(tp1)
+            tp2_f = _norm_level(tp2)
+            sl_f = _norm_level(sl)
+
+            # Single-target signals may store TP2 as 0 or as a duplicate of TP1.
+            # In both cases TP2 must be ignored for the late-open check.
+            if tp1_f is not None and tp2_f is not None and abs(tp2_f - tp1_f) <= 1e-12:
+                tp2_f = None
 
             if is_long:
                 if tp2_f is not None and price >= tp2_f:
