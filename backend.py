@@ -1436,12 +1436,10 @@ def _mid_hardblock_key(reason: str) -> str:
 
 
 def _mid_trigger_selected_hardblock_reason(reason: str) -> tuple[str | None, str | None]:
-    """Selectively enforce only RSI / ADX / volume hard-blocks during trigger.
+    """Selectively enforce hard-blocks that must be respected at actual entry / emit.
 
-    Trigger intentionally ignores most ta['blocked']/block_reason values so legacy
-    pending behavior stays intact for late-entry, anti-bounce, BB-bounce and other
-    non-selected hard blocks. For the user-requested trio we short-circuit trigger
-    immediately when evaluate_on_exchange_mid_v2() reports them.
+    Pending scan may soften late-entry / anti-bounce, but once price is actually
+    entering the zone we must block them just like RSI / ADX / volume.
 
     Returns (log_reason, apply_reason) or (None, None) when the raw reason should
     remain ignored by trigger-time logic.
@@ -1457,6 +1455,10 @@ def _mid_trigger_selected_hardblock_reason(reason: str) -> tuple[str | None, str
             return ("regime_block", "regime_block")
         if head == "vol_x":
             return ("vol_low", "vol_low")
+        if head == "late_entry_atr":
+            return ("late_entry", "late_entry")
+        if head in ("anti_bounce_short", "anti_bounce_long"):
+            return ("anti_bounce", "anti_bounce")
         return (None, None)
     except Exception:
         return (None, None)
@@ -1515,8 +1517,8 @@ def _mid_soft_block_penalty_for_reason(reason: str):
     """Return (bucket, penalty) when a former hard-block should become a score penalty.
 
     None means the reason must remain a hard block. We keep truly bad entries blocked
-    (deep late entries / extreme-near-level entries), while borderline cases become
-    score penalties so strong setups can still pass.
+    (deep late entries / deep anti-bounce / extreme-near-level entries), while borderline
+    cases become score penalties so strong pending setups can still survive scan.
     """
     try:
         if not _mid_soft_blocks_enabled():
@@ -1547,6 +1549,28 @@ def _mid_soft_block_penalty_for_reason(reason: str):
             if move > (limit * hard_mult):
                 return None
             return ("late_entry_penalty", -abs(_pen("MID_PENALTY_LATE_ENTRY_ATR", 10.0)))
+
+        if r.startswith("anti_bounce_short"):
+            m = re.search(r"dist_low_atr=([0-9.]+)\s*>\s*([0-9.]+)", r)
+            if not m:
+                return None
+            dist = float(m.group(1))
+            limit = max(1e-9, float(m.group(2)))
+            hard_mult = _pen("MID_HARD_ANTI_BOUNCE_MULT", 1.35)
+            if dist > (limit * hard_mult):
+                return None
+            return ("anti_bounce_penalty", -abs(_pen("MID_PENALTY_ANTI_BOUNCE_ATR", 9.0)))
+
+        if r.startswith("anti_bounce_long"):
+            m = re.search(r"dist_high_atr=([0-9.]+)\s*>\s*([0-9.]+)", r)
+            if not m:
+                return None
+            dist = float(m.group(1))
+            limit = max(1e-9, float(m.group(2)))
+            hard_mult = _pen("MID_HARD_ANTI_BOUNCE_MULT", 1.35)
+            if dist > (limit * hard_mult):
+                return None
+            return ("anti_bounce_penalty", -abs(_pen("MID_PENALTY_ANTI_BOUNCE_ATR", 9.0)))
 
         if r.startswith("near_recent_low"):
             m = re.search(r"dist_atr=([0-9.]+)\s*<\s*([0-9.]+)", r)
@@ -7999,11 +8023,16 @@ def _mid_instant_emit_gate(*,
                            near_extreme_ok: bool,
                            near_extreme_reason: str = "",
                            micro_trap_ok: bool = False,
-                           micro_trap_reason: str = "") -> tuple[bool, str, dict]:
+                           micro_trap_reason: str = "",
+                           late_entry_ok: bool = True,
+                           late_entry_reason: str = "",
+                           anti_bounce_ok: bool = True,
+                           anti_bounce_reason: str = "") -> tuple[bool, str, dict]:
     """Strict VIP gate for smart_setup_emit / pending instant emit.
 
     This is intentionally *stricter* than the normal pending pipeline.
-    Anything that fails here should remain pending, not be discarded outright.
+    For instant emit we must respect late-entry / anti-bounce immediately,
+    because there is no extra retest stage left to normalize the setup.
     """
     meta: dict[str, object] = {}
     try:
@@ -8044,6 +8073,8 @@ def _mid_instant_emit_gate(*,
         "allow_no_zone_breakout": bool(allow_no_zone_breakout),
         "near_extreme_ok": bool(near_extreme_ok),
         "micro_trap_ok": bool(micro_trap_ok),
+        "late_entry_ok": bool(late_entry_ok),
+        "anti_bounce_ok": bool(anti_bounce_ok),
         "risk_flags": sorted(flags),
     })
 
@@ -8061,6 +8092,10 @@ def _mid_instant_emit_gate(*,
         return (False, str(near_extreme_reason or "instant_near_extreme"), meta)
     if not micro_trap_ok:
         return (False, str(micro_trap_reason or "instant_micro_trap"), meta)
+    if not late_entry_ok:
+        return (False, str(late_entry_reason or "instant_late_entry"), meta)
+    if not anti_bounce_ok:
+        return (False, str(anti_bounce_reason or "instant_anti_bounce"), meta)
 
     if (market or "SPOT").upper().strip() == "FUTURES":
         allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_INSTANT_EMIT_ALLOWED_REGIMES_FUTURES", "TREND,TRENDING,EXPANSION")) if str(x).strip()}
@@ -8278,6 +8313,101 @@ FOMC_DECISION_HOUR_ET = max(0, min(23, _env_int("FOMC_DECISION_HOUR_ET", 14)))
 FOMC_DECISION_MINUTE_ET = max(0, min(59, _env_int("FOMC_DECISION_MINUTE_ET", 0)))
 
 # ------------------ Models ------------------
+def _mid_late_entry_anti_bounce_reasons(*,
+                                      side: str,
+                                      close: float,
+                                      recent_low: float,
+                                      recent_high: float,
+                                      atr_30m: float,
+                                      market: str = "SPOT",
+                                      adx_30m: float | None = None) -> tuple[str | None, str | None]:
+    """Shared late-entry / anti-bounce checks.
+
+    Used by scan-stage soft penalties and by hard entry-time gates.
+    """
+    try:
+        atr = float(atr_30m or 0.0)
+        px = float(close or 0.0)
+        rl = float(recent_low or 0.0)
+        rh = float(recent_high or 0.0)
+        if atr <= 0 or px <= 0:
+            return (None, None)
+
+        late_entry_max = MID_ULTRA_LATE_ENTRY_ATR_MAX if MID_ULTRA_SAFE else MID_LATE_ENTRY_ATR_MAX
+        mkt_u = (market or "SPOT").upper().strip()
+        fut_late_mult = 1.0
+        fut_bounce_mult = 1.0
+        if mkt_u == "FUTURES" and os.getenv("MID_FUT_ADAPT_FILTERS", "1").strip().lower() in ("1","true","yes","on"):
+            _le_fut = _env_float("MID_LATE_ENTRY_ATR_MAX_FUT", 0.0)
+            if _le_fut and _le_fut > 0:
+                late_entry_max = min(late_entry_max, float(_le_fut)) if MID_ULTRA_SAFE else float(_le_fut)
+            if adx_30m is not None and os.getenv("MID_FUT_ADAPT_BY_ADX", "1").strip().lower() in ("1","true","yes","on"):
+                adx = float(adx_30m)
+                adx_strong = _env_float("MID_FUT_ADX_STRONG", 30.0)
+                adx_med = _env_float("MID_FUT_ADX_MED", 25.0)
+                if adx >= adx_strong:
+                    fut_late_mult = _env_float("MID_FUT_LATE_MULT_STRONG", 1.15)
+                    fut_bounce_mult = _env_float("MID_FUT_BOUNCE_MULT_STRONG", 1.10)
+                elif adx >= adx_med:
+                    fut_late_mult = _env_float("MID_FUT_LATE_MULT_MED", 1.08)
+                    fut_bounce_mult = _env_float("MID_FUT_BOUNCE_MULT_MED", 1.06)
+                else:
+                    fut_late_mult = _env_float("MID_FUT_LATE_MULT_WEAK", 0.98)
+                    fut_bounce_mult = _env_float("MID_FUT_BOUNCE_MULT_WEAK", 0.98)
+        late_entry_max *= float(fut_late_mult)
+
+        bounce_scale = 1.0
+        if os.getenv("MID_ADAPTIVE_FILTERS", "0").strip().lower() in ("1","true","yes","on") and atr > 0 and px > 0:
+            atrp = (atr / px) * 100.0
+            low = float(os.getenv("MID_ADAPT_ATR_PCT_LOW", "2.0") or 2.0)
+            high = float(os.getenv("MID_ADAPT_ATR_PCT_HIGH", "6.0") or 6.0)
+            if high <= low:
+                t = 0.5
+            else:
+                t = (atrp - low) / (high - low)
+            t = max(0.0, min(1.0, float(t)))
+            late_tight = float(os.getenv("MID_ADAPT_LATE_TIGHTEN_MIN", "0.90") or 0.90)
+            late_wide  = float(os.getenv("MID_ADAPT_LATE_WIDEN_MAX", "1.15") or 1.15)
+            bounce_tight = float(os.getenv("MID_ADAPT_BOUNCE_TIGHTEN_MIN", "0.90") or 0.90)
+            bounce_wide  = float(os.getenv("MID_ADAPT_BOUNCE_WIDEN_MAX", "1.30") or 1.30)
+            late_scale = late_wide + t * (late_tight - late_wide)
+            bounce_scale = bounce_wide + t * (bounce_tight - bounce_wide)
+            late_entry_max *= float(late_scale)
+
+        late_reason = None
+        if str(side).upper() == "LONG":
+            move_from_low = (px - rl) / atr
+            if move_from_low > late_entry_max:
+                late_reason = f"late_entry_atr={move_from_low:.2f} > {late_entry_max:g}"
+        else:
+            move_from_high = (rh - px) / atr
+            if move_from_high > late_entry_max:
+                late_reason = f"late_entry_atr={move_from_high:.2f} > {late_entry_max:g}"
+
+        anti_reason = None
+        if MID_ANTI_BOUNCE_ENABLED:
+            bounce_atr_max = float(globals().get("MID_ANTI_BOUNCE_ATR_MAX", _env_float("MID_ANTI_BOUNCE_ATR_MAX", 1.8)))
+            if mkt_u == "FUTURES":
+                _fut_b = _env_float("MID_ANTI_BOUNCE_ATR_MAX_FUT", 0.0)
+                if _fut_b and _fut_b > 0:
+                    bounce_atr_max = float(_fut_b)
+            _ab_short = _env_float("MID_ANTI_BOUNCE_SHORT_MAX", 0.0)
+            _ab_long  = _env_float("MID_ANTI_BOUNCE_LONG_MAX", 0.0)
+            bounce_short_max = (float(_ab_short) if _ab_short and _ab_short > 0 else bounce_atr_max) * (float(bounce_scale) * float(fut_bounce_mult))
+            bounce_long_max = (float(_ab_long) if _ab_long and _ab_long > 0 else bounce_atr_max) * (float(bounce_scale) * float(fut_bounce_mult))
+            if str(side).upper() == "SHORT":
+                dist_low_atr = (px - rl) / atr
+                if dist_low_atr > bounce_short_max:
+                    anti_reason = f"anti_bounce_short dist_low_atr={dist_low_atr:.2f} > {bounce_short_max:g}"
+            else:
+                dist_high_atr = (rh - px) / atr
+                if dist_high_atr > bounce_long_max:
+                    anti_reason = f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {bounce_long_max:g}"
+        return (late_reason, anti_reason)
+    except Exception:
+        return (None, None)
+
+
 def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low: float, recent_high: float,
                       atr_30m: float, rsi_5m: float, vwap: float, bb_pos: str | None,
                       ema20_5m: float | None, bos_down_5m: bool, two_red_5m: bool, lower_highs_5m: bool,
@@ -8425,16 +8555,20 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
             _mid_adapt_vol_mult = 1.0
             _mid_adapt_bounce_scale = 1.0
 
-        if atr_30m and atr_30m > 0 and not _skip_late_vwap_blocks:
-            if side.upper() == "LONG":
-                move_from_low = (close - recent_low) / atr_30m
-                if move_from_low > late_entry_max:
-                    return f"late_entry_atr={move_from_low:.2f} > {late_entry_max:g}"
-            else:  # SHORT
-                move_from_high = (recent_high - close) / atr_30m
-                if move_from_high > late_entry_max:
-                    return f"late_entry_atr={move_from_high:.2f} > {late_entry_max:g}"
-
+        if atr_30m and atr_30m > 0:
+            late_reason, anti_bounce_reason = _mid_late_entry_anti_bounce_reasons(
+                side=side,
+                close=close,
+                recent_low=recent_low,
+                recent_high=recent_high,
+                atr_30m=atr_30m,
+                market=market,
+                adx_30m=adx_30m,
+            )
+            if late_reason and not _skip_late_vwap_blocks:
+                return str(late_reason)
+            if anti_bounce_reason:
+                return str(anti_bounce_reason)
 
             # --- Near-extremes: avoid LONG right under resistance / SHORT right above support ---
             try:
@@ -8452,34 +8586,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                 if MID_FAIL_CLOSED:
                     return "mid_near_extreme_error"
                 pass
-            # --- Anti-bounce: block SHORT after sharp rebound from recent low (and vice versa for LONG) ---
-            if MID_ANTI_BOUNCE_ENABLED and atr_30m and atr_30m > 0:
-                # Prefer side-specific MAX if set; fall back to MID_ANTI_BOUNCE_ATR_MAX
-                bounce_atr_max = float(globals().get("MID_ANTI_BOUNCE_ATR_MAX", _env_float("MID_ANTI_BOUNCE_ATR_MAX", 1.8)))
-                # FUTURES-specific override (optional)
-                if mkt_u == "FUTURES":
-                    _fut_b = _env_float("MID_ANTI_BOUNCE_ATR_MAX_FUT", 0.0)
-                    if _fut_b and _fut_b > 0:
-                        bounce_atr_max = float(_fut_b)
-
-                _ab_short = _env_float("MID_ANTI_BOUNCE_SHORT_MAX", 0.0)
-                _ab_long  = _env_float("MID_ANTI_BOUNCE_LONG_MAX", 0.0)
-                bounce_short_max = float(_ab_short) if _ab_short and _ab_short > 0 else bounce_atr_max
-                bounce_long_max  = float(_ab_long)  if _ab_long  and _ab_long  > 0 else bounce_atr_max
-                bounce_scale = _mid_adapt_bounce_scale if '_mid_adapt_bounce_scale' in locals() else 1.0
-                bounce_short_max *= (bounce_scale * (fut_bounce_mult if 'fut_bounce_mult' in locals() else 1.0))
-                bounce_long_max *= (bounce_scale * (fut_bounce_mult if 'fut_bounce_mult' in locals() else 1.0))
-
-                if side.upper() == "SHORT":
-                    dist_low_atr = (close - recent_low) / atr_30m
-                    if dist_low_atr > bounce_short_max:
-                        return f"anti_bounce_short dist_low_atr={dist_low_atr:.2f} > {bounce_short_max:g}"
-                else:  # LONG
-                    dist_high_atr = (recent_high - close) / atr_30m
-                    if dist_high_atr > bounce_long_max:
-                        return f"anti_bounce_long dist_high_atr={dist_high_atr:.2f} > {bounce_long_max:g}"
-
-
+            # Late-entry / anti-bounce are evaluated via _mid_late_entry_anti_bounce_reasons().
 
             # --- HTF alignment guard (ULTRA SAFE): block countertrend entries in strong trends ---
             try:
@@ -11764,8 +11871,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         except Exception:
             pass
 
-        # Hard-block filters (anti_bounce_*, late_entry_atr, etc.) are SCAN-only.
-        # Once pending is created, TRIGGER must not kill it due to these post-setup heuristics.
+        # Scan stage may soften late-entry / anti-bounce for pending setups.
+        # Actual trigger / instant-emit will re-check them as hard gates right before entry.
         _phase = 'scan'
         try:
             _phase = str(_MID_EVAL_PHASE.get() or 'scan')
@@ -18826,8 +18933,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             it["_trig_vol_thr_why"] = ",".join(thr_why) if thr_why else "base"
                     except Exception:
                         pass
-                    # Selectively enforce only RSI / ADX / volume hard-blocks from ta.block_reason.
-                    # All other hard-block reasons remain ignored here to preserve existing trigger behaviour.
+                    # Enforce hard entry-time blockers from ta.block_reason.
+                    # Pending scan may soften some of them, but actual entry must respect them.
                     try:
                         hb_raw_reason = str(ta.get("block_reason") or "").strip()
                         hb_log_reason, hb_apply_reason = _mid_trigger_selected_hardblock_reason(hb_raw_reason)
@@ -18903,6 +19010,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             atr30=atr_now,
                             market=market,
                         )
+                        late_reason_now, anti_reason_now = _mid_late_entry_anti_bounce_reasons(
+                            side=direction,
+                            close=float(price),
+                            recent_low=recent_low_now,
+                            recent_high=recent_high_now,
+                            atr_30m=float(atr_now or 0.0),
+                            market=market,
+                            adx_30m=float(ta.get("adx4") or ta.get("adx_30m") or 0.0) if ta else None,
+                        )
+                        late_ok_now = not bool(late_reason_now)
+                        anti_ok_now = not bool(anti_reason_now)
                         micro_ok_now = bool(ta.get("trap_ok", False))
                         micro_reason_now = str(ta.get("trap_reason") or "instant_micro_trap")
                         try:
@@ -18950,6 +19068,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             near_extreme_reason=str(near_reason_now),
                             micro_trap_ok=bool(micro_ok_now),
                             micro_trap_reason=str(micro_reason_now),
+                            late_entry_ok=bool(late_ok_now),
+                            late_entry_reason=str(late_reason_now or ""),
+                            anti_bounce_ok=bool(anti_ok_now),
+                            anti_bounce_reason=str(anti_reason_now or ""),
                         )
                         try:
                             it["instant_emit_gate"] = dict(instant_meta or {})
@@ -19059,7 +19181,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             it["_trig_checks"]["direction"] = "pass"
                         except Exception:
                             pass
-                    # NOTE: Trigger intentionally ignores ta['blocked']/block_reason (anti_bounce_*, late_entry_atr, etc.).
+                    # Trigger re-applies hard entry-timing checks (late-entry / anti-bounce / RSI / ADX / volume) right before emit.
                     if not req_trap:
                         try:
                             it["_trig_checks"]["trap"] = "skip"
@@ -23844,6 +23966,17 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 atr30=_atr_now,
                                                 market=marketu,
                                             )
+                                            _late_reason_now, _anti_reason_now = _mid_late_entry_anti_bounce_reasons(
+                                                side=diru,
+                                                close=float(entry),
+                                                recent_low=_recent_low_now,
+                                                recent_high=_recent_high_now,
+                                                atr_30m=float(_atr_now or 0.0),
+                                                market=marketu,
+                                                adx_30m=float((base_r.get("adx4") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
+                                            )
+                                            _late_ok_now = not bool(_late_reason_now)
+                                            _anti_ok_now = not bool(_anti_reason_now)
                                             try:
                                                 _micro_ok_now, _micro_reason_now = _mid_micro_trap_ok(direction=diru, entry=float(entry), df5=df5i, atr30=float(_atr_now or 0.0))
                                             except Exception:
@@ -23864,6 +23997,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 near_extreme_reason=str(_near_reason_now),
                                                 micro_trap_ok=bool(_micro_ok_now),
                                                 micro_trap_reason=str(_micro_reason_now),
+                                                late_entry_ok=bool(_late_ok_now),
+                                                late_entry_reason=str(_late_reason_now or ""),
+                                                anti_bounce_ok=bool(_anti_ok_now),
+                                                anti_bounce_reason=str(_anti_reason_now or ""),
                                             )
 
                                             try:
