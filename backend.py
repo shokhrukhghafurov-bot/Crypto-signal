@@ -8773,6 +8773,10 @@ def _human_close_reason(uid: int, code: str | None, **kv: Any) -> str:
         return ""
     c = str(code).upper().strip()
 
+    # Full close at TP1 is a WIN, not a partial-TP1/TP2 event.
+    if c in ("TP1_REACHED", "FULL_TP1", "FULL_TP1_NO_TP2"):
+        return "Цена дошла до TP1 — фиксируем прибыль."
+
     # Map internal codes to i18n keys (keep keys stable)
     key_map = {
         "TP2_REACHED": "reason_tp2_reached",
@@ -15233,11 +15237,12 @@ class Backend:
                         pos_ref = _safe_json_obj(linked_pos.get("api_order_ref"))
                         pos_meta = _safe_json_obj(linked_pos.get("meta"))
                         pos_tp1_hit = bool(pos_meta.get("tp1_hit") or pos_ref.get("tp1_hit"))
+                        pos_raw_reason = str(pos_meta.get("closed_reason") or pos_ref.get("closed_reason") or "").upper().strip()
                         try:
                             pos_be_price = float(pos_meta.get("be_price") or pos_ref.get("be_price") or row.get("be_price") or 0.0)
                         except Exception:
                             pos_be_price = 0.0
-                        if pos_tp1_hit and not bool(row.get("tp1_hit")):
+                        if pos_tp1_hit and not bool(row.get("tp1_hit")) and pos_raw_reason not in ("FULL_TP1", "FULL_TP1_NO_TP2"):
                             try:
                                 tp1_sync_pnl = float(linked_pos.get("roi_percent")) if linked_pos.get("roi_percent") is not None else None
                             except Exception:
@@ -15263,7 +15268,7 @@ class Backend:
                                 roi_sync = float(linked_pos.get("roi_percent")) if linked_pos.get("roi_percent") is not None else None
                             except Exception:
                                 roi_sync = None
-                            raw_reason = pos_meta.get("closed_reason") or pos_ref.get("closed_reason") or ("EXECUTION_ERROR" if pos_status == "ERROR" else "SYNC_CLOSE")
+                            raw_reason = pos_raw_reason or ("EXECUTION_ERROR" if pos_status == "ERROR" else "SYNC_CLOSE")
                             mapped_close = map_closed_reason_to_trade_result(raw_reason, roi_sync)
                             trade_status = str(mapped_close.get("trade_status") or "CLOSED")
                             close_px = float(s.entry or 0.0)
@@ -15354,6 +15359,9 @@ class Backend:
                     status = str(row.get("status") or "ACTIVE").upper()
                     tp1_hit = bool(row.get("tp1_hit"))
                     be_price = float(row.get("be_price") or 0.0) if row.get("be_price") is not None else 0.0
+                    tp1_val = float(getattr(s, 'tp1', 0.0) or 0.0)
+                    tp2_val = float(getattr(s, 'tp2', 0.0) or 0.0)
+                    has_tp2 = bool(tp2_val > 0 and (tp1_val <= 0 or abs(tp2_val - tp1_val) > 1e-12))
 
                     # After TP1 we move protection SL to BE (entry +/- fee buffer).
                     # The debug block should reflect the *active* protective level, not the original signal SL.
@@ -15378,9 +15386,9 @@ class Backend:
                         )
 
                     # 1) Before TP1: TP2 (gap) -> WIN
-                    if not tp1_hit and s.tp2 and hit_tp(float(s.tp2)):
+                    if not tp1_hit and has_tp2 and hit_tp(tp2_val):
                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
-                        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.tp2), close_reason="WIN")
+                        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=tp2_val, close_reason="WIN")
                         import datetime as _dt
                         now_utc = _dt.datetime.now(_dt.timezone.utc)
                         rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
@@ -15412,7 +15420,7 @@ class Backend:
                         if dbg:
                             txt += "\n\n" + dbg
                         await safe_send(bot, uid, txt, ctx="msg_auto_win")
-                        await db_store.close_trade(trade_id, status="WIN", price=float(s.tp2), pnl_total_pct=float(pnl))
+                        await db_store.close_trade(trade_id, status="WIN", price=tp2_val, pnl_total_pct=float(pnl))
                         self._sl_breach_since.pop(trade_id, None)
                         try:
                             if hasattr(self, "_tp1_peak_px"):
@@ -15423,6 +15431,54 @@ class Backend:
                             pass
                         try:
                             await _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=bool(s.tp2), hit_tp2=True)
+                        except Exception:
+                            pass
+                        continue
+
+                    # 1b) Single-target signal: TP1 is the final target -> WIN immediately.
+                    if not tp1_hit and (not has_tp2) and tp1_val > 0 and hit_tp(tp1_val):
+                        trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=False)
+                        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=tp1_val, close_reason="WIN")
+                        import datetime as _dt
+                        now_utc = _dt.datetime.now(_dt.timezone.utc)
+                        rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
+                        close_agent = _trf(uid, "close_agent_smart_manager")
+                        _r = _human_close_reason(uid, "FULL_TP1_NO_TP2")
+                        reason_line = (_trf(uid, "lbl_reason", reason=_r) + "\n") if _r else ""
+                        emoji = "🟢"
+                        txt = _trf(uid, "msg_auto_win",
+                            symbol=s.symbol,
+                            market=market,
+                            emoji=emoji,
+                            side=str(getattr(s,'direction','') or '').upper() or "LONG",
+                            after_tp1="",
+                            rr=rr,
+                            close_agent=close_agent,
+                            reason_line=reason_line,
+                            entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
+                            sl=f"{float(getattr(s,'sl',0.0) or 0.0):.6f}",
+                            tp1=f"{tp1_val:.6f}",
+                            tp2="-",
+                            be_line="",
+                            pnl_total=fmt_pnl_pct(float(pnl)),
+                            opened_time=fmt_dt_msk(row.get("opened_at")),
+                            closed_time=fmt_dt_msk(now_utc),
+                            status="WIN",
+                        )
+                        if dbg:
+                            txt += "\n\n" + dbg
+                        await safe_send(bot, uid, txt, ctx="msg_auto_win")
+                        await db_store.close_trade(trade_id, status="WIN", price=tp1_val, pnl_total_pct=float(pnl))
+                        self._sl_breach_since.pop(trade_id, None)
+                        try:
+                            if hasattr(self, "_tp1_peak_px"):
+                                self._tp1_peak_px.pop(trade_id, None)
+                            if hasattr(self, "_be_skip_until"):
+                                self._be_skip_until.pop(trade_id, None)
+                        except Exception:
+                            pass
+                        try:
+                            await _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=False, hit_tp2=False)
                         except Exception:
                             pass
                         continue
@@ -15514,7 +15570,7 @@ class Backend:
                         continue
 
                     # 3) TP1 -> partial close + BE
-                    if not tp1_hit and s.tp1 and hit_tp(float(s.tp1)):
+                    if not tp1_hit and has_tp2 and s.tp1 and hit_tp(float(s.tp1)):
                         be_px = _be_exit_price(s.entry, side, market)
                         tp2_val = float(getattr(s,'tp2',0.0) or 0.0)
                         tp2_disp = (f"{tp2_val:.6f}" if tp2_val > 0 else "-")
@@ -15562,6 +15618,55 @@ class Backend:
                         _full_tp1 = float(calc_profit_pct(s.entry, float(s.tp1), side))
                         _fixed_tp1 = (_full_tp1 * (_p/100.0)) if _has_tp2 else _full_tp1
                         await db_store.set_tp1(trade_id, be_price=float(be_px), price=float(s.tp1), pnl_pct=float(_fixed_tp1))
+                        continue
+
+                    # Legacy migration: old builds could leave single-target trades in TP1.
+                    # Finalize them as WIN immediately so they do not linger in TP1/BE flow.
+                    if status == "TP1" and (not has_tp2) and tp1_val > 0:
+                        trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=False)
+                        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=tp1_val, close_reason="WIN")
+                        import datetime as _dt
+                        now_utc = _dt.datetime.now(_dt.timezone.utc)
+                        rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
+                        close_agent = _trf(uid, "close_agent_smart_manager")
+                        _r = _human_close_reason(uid, "FULL_TP1_NO_TP2")
+                        reason_line = (_trf(uid, "lbl_reason", reason=_r) + "\n") if _r else ""
+                        emoji = "🟢"
+                        txt = _trf(uid, "msg_auto_win",
+                            symbol=s.symbol,
+                            market=market,
+                            emoji=emoji,
+                            side=str(getattr(s,'direction','') or '').upper() or "LONG",
+                            after_tp1="",
+                            rr=rr,
+                            close_agent=close_agent,
+                            reason_line=reason_line,
+                            entry=f"{float(getattr(s,'entry',0.0) or 0.0):.6f}",
+                            sl=f"{float(getattr(s,'sl',0.0) or 0.0):.6f}",
+                            tp1=f"{tp1_val:.6f}",
+                            tp2="-",
+                            be_line="",
+                            pnl_total=fmt_pnl_pct(float(pnl)),
+                            opened_time=fmt_dt_msk(row.get("opened_at")),
+                            closed_time=fmt_dt_msk(now_utc),
+                            status="WIN",
+                        )
+                        if dbg:
+                            txt += "\n\n" + dbg
+                        await safe_send(bot, uid, txt, ctx="msg_auto_win")
+                        await db_store.close_trade(trade_id, status="WIN", price=tp1_val, pnl_total_pct=float(pnl))
+                        self._sl_breach_since.pop(trade_id, None)
+                        try:
+                            if hasattr(self, "_tp1_peak_px"):
+                                self._tp1_peak_px.pop(trade_id, None)
+                            if hasattr(self, "_be_skip_until"):
+                                self._be_skip_until.pop(trade_id, None)
+                        except Exception:
+                            pass
+                        try:
+                            await _mid_autotune_update_on_close(market=market, orig_text=str(row.get('orig_text') or ''), timeframe=str(getattr(s,'timeframe','') or ''), tp2_present=False, hit_tp2=False)
+                        except Exception:
+                            pass
                         continue
 
                     # 3) After TP1: emergency hard SL (always) + BE logic (optional)
@@ -15756,9 +15861,9 @@ class Backend:
 
                     # 4) TP2 -> WIN
 
-                    if s.tp2 and hit_tp(float(s.tp2)):
+                    if has_tp2 and hit_tp(tp2_val):
                         trade_ctx = UserTrade(user_id=uid, signal=s, tp1_hit=tp1_hit)
-                        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=float(s.tp2), close_reason="WIN")
+                        pnl = _calc_effective_pnl_pct(trade_ctx, close_price=tp2_val, close_reason="WIN")
                         import datetime as _dt
                         now_utc = _dt.datetime.now(_dt.timezone.utc)
                         rr = _calc_rr_str(float(getattr(s,'entry',0.0) or 0.0), float(getattr(s,'sl',0.0) or 0.0), float(getattr(s,'tp1',0.0) or 0.0), float(getattr(s,'tp2',0.0) or 0.0))
@@ -15790,7 +15895,7 @@ class Backend:
                         if dbg:
                             txt += "\n\n" + dbg
                         await safe_send(bot, uid, txt, ctx="msg_auto_win")
-                        await db_store.close_trade(trade_id, status="WIN", price=float(s.tp2), pnl_total_pct=float(pnl))
+                        await db_store.close_trade(trade_id, status="WIN", price=tp2_val, pnl_total_pct=float(pnl))
                         self._sl_breach_since.pop(trade_id, None)
                         try:
                             if hasattr(self, "_tp1_peak_px"):
