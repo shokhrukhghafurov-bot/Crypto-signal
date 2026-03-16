@@ -16215,31 +16215,18 @@ def _linreg_channel_bounds(df: pd.DataFrame, *, window: int = 120, k: float = 2.
         return (float("nan"), float("nan"))
 
 def _mid_quality_first_enabled() -> bool:
-    """Quality-first mode: scan must keep only strong setups; trigger must be strict."""
-    try:
-        v = os.getenv("MID_QUALITY_FIRST", "1")
-        return str(v).strip().lower() in ("1", "true", "yes", "on")
-    except Exception:
-        return True
+    """Quality-first mode is mandatory for MID and is always enabled in code."""
+    return True
 
 
 def _mid_trigger_min_passed() -> int:
-    """Smart-trigger threshold.
-
-    Quality-first keeps a strict default (9) only when MID_TRIGGER_MIN_PASSED is not set.
-    If MID_TRIGGER_MIN_PASSED is provided via env, use that exact threshold.
-    """
+    """Smart-trigger threshold controlled only via MID_TRIGGER_MIN_PASSED env."""
     try:
         raw_env = os.getenv("MID_TRIGGER_MIN_PASSED", None)
         raw_txt = "" if raw_env is None else str(raw_env).strip()
         raw = int(float(raw_txt or 0))
     except Exception:
-        raw_txt = ""
         raw = 0
-    if _mid_quality_first_enabled():
-        if raw_txt == "":
-            return 9
-        return max(0, raw)
     return max(0, raw)
 
 
@@ -19445,7 +19432,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         try:
                             need_passed = _mid_trigger_min_passed()
                         except Exception:
-                            need_passed = 9 if _mid_quality_first_enabled() else 0
+                            need_passed = 0
                         try:
                             strict_required = str(os.getenv("MID_TRIGGER_STRICT_REQUIRED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
                         except Exception:
@@ -20480,7 +20467,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                 try:
                     trig_need_passed = _mid_trigger_min_passed()
                 except Exception:
-                    trig_need_passed = 9 if _mid_quality_first_enabled() else 0
+                    trig_need_passed = 0
                 trig_req_struct30 = str(os.getenv("MID_TRIGGER_REQUIRE_STRUCTURE_30M", "0") or "0").strip().lower() not in ("0","false","no","off")
                 trig_req_struct1h = str(os.getenv("MID_TRIGGER_REQUIRE_STRUCTURE_1H", "0") or "0").strip().lower() not in ("0","false","no","off")
                 trig_mode = str(os.getenv("MID_TRIGGER_MODE", os.getenv("MID_MODE", "")) or "").strip()
