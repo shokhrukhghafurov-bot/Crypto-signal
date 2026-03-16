@@ -3103,7 +3103,6 @@ def _signal_text(uid: int, s: Signal, *, autotrade_hint: str = "") -> str:
         return f"{tr(uid, 'sig_rr')}: 1:{float(getattr(s, 'rr', 0.0) or 0.0):.2f}"
 
     rr_line = _rr_text()
-    conf_line = f"{tr(uid, 'sig_confidence')}: {s.confidence}/100"
     # Confirm line: primary venue that produced the signal.
     src_ex = (getattr(s, 'source_exchange', '') or '').strip()
     confirm_line = f"{tr(uid, 'sig_confirm')}: {src_ex}"
@@ -3126,7 +3125,6 @@ def _signal_text(uid: int, s: Signal, *, autotrade_hint: str = "") -> str:
         sl=f"{s.sl:.6f}",
         tp_lines=tp_lines,
         rr_line=rr_line,
-        conf_line=conf_line,
         confirm_line=confirm_line,
         autotrade_line=autotrade_line,
         risk_block=risk_block,
