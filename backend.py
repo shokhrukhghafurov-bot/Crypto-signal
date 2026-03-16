@@ -7932,6 +7932,157 @@ def signal_min_profit_gate(sig: "Signal") -> tuple[bool, float, float]:
     return (float(profit) >= float(min_req), float(profit), float(min_req))
 
 
+def _mid_instant_emit_market_thresholds(market: str) -> tuple[float, float]:
+    """Return strict ATR%% and volume minimums for VIP instant emit."""
+    m = (market or "SPOT").upper().strip()
+    try:
+        if m == "FUTURES":
+            min_atr = float(os.getenv("MID_INSTANT_EMIT_MIN_ATR_PCT_FUTURES", os.getenv("MID_INSTANT_EMIT_MIN_ATR_PCT_FUT", "0.11")) or 0.11)
+            min_vol = float(os.getenv("MID_INSTANT_EMIT_MIN_VOL_X_FUTURES", os.getenv("MID_INSTANT_EMIT_MIN_VOL_X_FUT", "0.28")) or 0.28)
+        else:
+            min_atr = float(os.getenv("MID_INSTANT_EMIT_MIN_ATR_PCT_SPOT", "0.18") or 0.18)
+            min_vol = float(os.getenv("MID_INSTANT_EMIT_MIN_VOL_X_SPOT", "0.10") or 0.10)
+    except Exception:
+        if m == "FUTURES":
+            return (0.11, 0.28)
+        return (0.18, 0.10)
+    return (float(max(0.0, min_atr)), float(max(0.0, min_vol)))
+
+
+def _mid_instant_emit_near_extreme_ok(*, direction: str, entry: float, recent_low: float | None, recent_high: float | None,
+                                      atr30: float | None, market: str = "SPOT") -> tuple[bool, str]:
+    """Mandatory recent-extreme distance guard for VIP instant emit."""
+    try:
+        atr = float(atr30 or 0.0)
+        px = float(entry or 0.0)
+        if atr <= 0 or px <= 0:
+            return (False, "near_extreme_no_atr")
+        m = (market or "SPOT").upper().strip()
+        if m == "FUTURES":
+            thr = float(os.getenv("MID_INSTANT_EMIT_NEAR_EXTREME_ATR_FUTURES", os.getenv("MID_INSTANT_EMIT_NEAR_EXTREME_ATR_FUT", "0.45")) or 0.45)
+        else:
+            thr = float(os.getenv("MID_INSTANT_EMIT_NEAR_EXTREME_ATR_SPOT", "0.35") or 0.35)
+        d = (direction or "").upper().strip()
+        if d == "LONG":
+            hi = float(recent_high or 0.0)
+            if hi <= 0:
+                return (False, "near_extreme_no_high")
+            dist = (hi - px) / atr
+            if dist < float(thr):
+                return (False, f"near_recent_high dist_atr={dist:.2f} < {thr:g}")
+            return (True, f"near_recent_high dist_atr={dist:.2f}")
+        if d == "SHORT":
+            lo = float(recent_low or 0.0)
+            if lo <= 0:
+                return (False, "near_extreme_no_low")
+            dist = (px - lo) / atr
+            if dist < float(thr):
+                return (False, f"near_recent_low dist_atr={dist:.2f} < {thr:g}")
+            return (True, f"near_recent_low dist_atr={dist:.2f}")
+    except Exception as e:
+        return (False, f"near_extreme_error:{e}")
+    return (False, "near_extreme_bad_dir")
+
+
+def _mid_instant_emit_gate(*,
+                           market: str,
+                           direction: str,
+                           confidence: float,
+                           sig: "Signal" | None,
+                           atr_pct: float | None,
+                           vol_x: float | None,
+                           regime: str | None,
+                           risk_flags=None,
+                           zone_valid: bool,
+                           in_zone_now: bool,
+                           allow_no_zone_breakout: bool,
+                           near_extreme_ok: bool,
+                           near_extreme_reason: str = "",
+                           micro_trap_ok: bool = False,
+                           micro_trap_reason: str = "") -> tuple[bool, str, dict]:
+    """Strict VIP gate for smart_setup_emit / pending instant emit.
+
+    This is intentionally *stricter* than the normal pending pipeline.
+    Anything that fails here should remain pending, not be discarded outright.
+    """
+    meta: dict[str, object] = {}
+    try:
+        conf_need = int(float(os.getenv("MID_SMART_SETUP_EMIT_CONF", "90") or 90))
+    except Exception:
+        conf_need = 90
+    try:
+        no_zone_extra_conf = int(float(os.getenv("MID_INSTANT_EMIT_NO_ZONE_EXTRA_CONF", "5") or 5))
+    except Exception:
+        no_zone_extra_conf = 5
+    try:
+        profit_need = max(1.0, float(os.getenv("MID_INSTANT_EMIT_MIN_PROFIT_PCT", "1.0") or 1.0))
+    except Exception:
+        profit_need = 1.0
+
+    flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
+    hard_flags = {"far_zone", "scale_mismatch", "blocked", "vol_low", "atrpct_low", "regime_range_no_breakout"}
+
+    conf_v = float(confidence or 0.0)
+    atr_v = float(atr_pct or 0.0)
+    vol_v = float(vol_x or 0.0)
+    min_atr, min_vol = _mid_instant_emit_market_thresholds(market)
+    profit_v = signal_expected_profit_pct(sig) if sig is not None else 0.0
+    reg_u = str(regime or "").upper().strip()
+
+    meta.update({
+        "conf": int(round(conf_v)),
+        "conf_need": int(conf_need),
+        "atr_pct": float(atr_v),
+        "atr_need": float(min_atr),
+        "vol_x": float(vol_v),
+        "vol_need": float(min_vol),
+        "profit_pct": float(profit_v),
+        "profit_need": float(profit_need),
+        "regime": reg_u,
+        "zone_valid": bool(zone_valid),
+        "in_zone_now": bool(in_zone_now),
+        "allow_no_zone_breakout": bool(allow_no_zone_breakout),
+        "near_extreme_ok": bool(near_extreme_ok),
+        "micro_trap_ok": bool(micro_trap_ok),
+        "risk_flags": sorted(flags),
+    })
+
+    if conf_v < float(conf_need):
+        return (False, f"instant_conf_low:{int(round(conf_v))}<{conf_need}", meta)
+    if flags & hard_flags:
+        return (False, f"instant_risk_flags:{','.join(sorted(flags & hard_flags))}", meta)
+    if profit_v < float(profit_need):
+        return (False, f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}", meta)
+    if atr_v < float(min_atr):
+        return (False, f"instant_atr_low:{atr_v:.3f}<{min_atr:.3f}", meta)
+    if vol_v < float(min_vol):
+        return (False, f"instant_vol_low:{vol_v:.2f}<{min_vol:.2f}", meta)
+    if not near_extreme_ok:
+        return (False, str(near_extreme_reason or "instant_near_extreme"), meta)
+    if not micro_trap_ok:
+        return (False, str(micro_trap_reason or "instant_micro_trap"), meta)
+
+    if (market or "SPOT").upper().strip() == "FUTURES":
+        allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_INSTANT_EMIT_ALLOWED_REGIMES_FUTURES", "TREND,TRENDING,EXPANSION")) if str(x).strip()}
+        if reg_u not in allowed_regimes:
+            return (False, f"instant_regime_block:{reg_u or '-'}", meta)
+
+    if bool(zone_valid):
+        if not bool(in_zone_now):
+            return (False, "instant_zone_wait", meta)
+    else:
+        if not bool(allow_no_zone_breakout):
+            return (False, "instant_zone_missing", meta)
+        if conf_v < float(conf_need + no_zone_extra_conf):
+            return (False, f"instant_no_zone_conf:{int(round(conf_v))}<{conf_need + no_zone_extra_conf}", meta)
+        if atr_v < float(min_atr * 1.05):
+            return (False, f"instant_no_zone_atr:{atr_v:.3f}<{(min_atr * 1.05):.3f}", meta)
+        if vol_v < float(min_vol * 1.10):
+            return (False, f"instant_no_zone_vol:{vol_v:.2f}<{(min_vol * 1.10):.2f}", meta)
+
+    return (True, "pass", meta)
+
+
 
 def _price_debug_block(uid: int, *, price: float, source: str, side: str, sl: float | None, tp1: float | None, tp2: float | None, sl_label_key: str | None = None) -> str:
     """Human-readable debug block for a trade.
@@ -18173,7 +18324,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # Normally we wait until price reaches the planned entry zone/price.
                     # For debugging (or "emit on create" behavior), you can bypass this wait:
                     # MID_PENDING_INSTANT_EMIT=1 + MID_PENDING_INSTANT_EMIT_IGNORE_ZONE=1
-                    if not (pending_instant_emit and instant_ignore_zone):
+                    _debug_wait_bypass = bool(pending_instant_emit and instant_ignore_zone and (instant_emit_due_to_nofilters or pending_skip_checks))
+                    if not _debug_wait_bypass:
                         if use_zone:
                             if not (float(price) >= lo and float(price) <= hi):
                                 keep.append(it)
@@ -18714,6 +18866,135 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             continue
                     except Exception:
                         pass
+
+                    # Strict VIP instant emit (quality-first): only after current TA re-check.
+                    try:
+                        instant_mode_enabled = bool(pending_instant_emit and (pending_emit_on_zone or instant_ignore_zone or pending_skip_checks or instant_emit_due_to_nofilters))
+                    except Exception:
+                        instant_mode_enabled = False
+                    if instant_mode_enabled:
+                        try:
+                            zone_valid_now = bool(use_zone and hi > lo)
+                        except Exception:
+                            zone_valid_now = False
+                        try:
+                            in_zone_now = bool(_in_zone_for_trigger or _entered_zone_for_trigger)
+                        except Exception:
+                            in_zone_now = False
+                        try:
+                            atr_now = float(ta.get("atr30") or ta.get("atr_abs") or 0.0)
+                        except Exception:
+                            atr_now = 0.0
+                        try:
+                            recent_low_now = float(df30["low"].astype(float).tail(120).min())
+                            recent_high_now = float(df30["high"].astype(float).tail(120).max())
+                        except Exception:
+                            try:
+                                recent_low_now = float(df30["low"].astype(float).min())
+                                recent_high_now = float(df30["high"].astype(float).max())
+                            except Exception:
+                                recent_low_now = 0.0
+                                recent_high_now = 0.0
+                        near_ok_now, near_reason_now = _mid_instant_emit_near_extreme_ok(
+                            direction=direction,
+                            entry=float(price),
+                            recent_low=recent_low_now,
+                            recent_high=recent_high_now,
+                            atr30=atr_now,
+                            market=market,
+                        )
+                        micro_ok_now = bool(ta.get("trap_ok", False))
+                        micro_reason_now = str(ta.get("trap_reason") or "instant_micro_trap")
+                        try:
+                            entry_ref = float(price) if (price is not None and float(price) > 0) else float(it.get("entry") or entry0)
+                        except Exception:
+                            entry_ref = float(it.get("entry") or entry0)
+                        entry_emit, sl_emit, tp1_emit, tp2_emit, rr_emit = _mid_recalc_levels_from_trigger(direction, entry_ref, None, it, market)
+                        conf_emit = int(float(it.get("confidence") or it.get("min_confidence") or 0))
+                        try:
+                            conf_emit = max(conf_emit, int(float(it.get("_trig_conf") or 0)))
+                        except Exception:
+                            pass
+                        conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "") or str(src_ex)
+                        sig_instant = Signal(
+                            signal_id=self.next_signal_id(),
+                            market=market,
+                            symbol=sym,
+                            direction=direction,
+                            timeframe=str(it.get("timeframe") or "5m/30m/1h"),
+                            entry=entry_emit,
+                            sl=sl_emit,
+                            tp1=tp1_emit,
+                            tp2=tp2_emit,
+                            rr=rr_emit,
+                            confidence=conf_emit,
+                            confirmations=conf_names,
+                            source_exchange=src_ex,
+                            available_exchanges=conf_names,
+                            risk_note=str(it.get("risk_note") or "") + " | instant_vip=1 | levels_recalc=1",
+                            ts=time.time(),
+                        )
+                        instant_ok, instant_reason, instant_meta = _mid_instant_emit_gate(
+                            market=market,
+                            direction=direction,
+                            confidence=float(conf_emit),
+                            sig=sig_instant,
+                            atr_pct=float(ta.get("atr_pct") or 0.0),
+                            vol_x=float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0),
+                            regime=str(ta.get("regime") or ""),
+                            risk_flags=it.get("risk_flags"),
+                            zone_valid=bool(zone_valid_now),
+                            in_zone_now=bool(in_zone_now),
+                            allow_no_zone_breakout=bool((not zone_valid_now) and instant_ignore_zone),
+                            near_extreme_ok=bool(near_ok_now),
+                            near_extreme_reason=str(near_reason_now),
+                            micro_trap_ok=bool(micro_ok_now),
+                            micro_trap_reason=str(micro_reason_now),
+                        )
+                        try:
+                            it["instant_emit_gate"] = dict(instant_meta or {})
+                            it["instant_emit_gate_reason"] = str(instant_reason)
+                            it["instant_emit_gate_ok"] = bool(instant_ok)
+                        except Exception:
+                            pass
+                        if instant_ok:
+                            _can_emit_now = True
+                            try:
+                                _can_emit_now = bool(self.can_emit_mid(sym))
+                            except Exception:
+                                _can_emit_now = True
+                            if _can_emit_now:
+                                try:
+                                    self.mark_emitted_mid(sym, sig_instant.direction, sig_instant.market)
+                                except TypeError:
+                                    try:
+                                        self.mark_emitted_mid(sym)
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
+                                self.last_signal = sig_instant
+                                if sig_instant.market == "SPOT":
+                                    self.last_spot_signal = sig_instant
+                                else:
+                                    self.last_futures_signal = sig_instant
+                                await emit_signal_cb(sig_instant)
+                                _pending_log_trigger(sym, market, direction, "pass", "instant_emit_vip", it, float(price))
+                                logger.info("[mid][pending] INSTANT_EMIT_VIP %s %s %s conf=%s atr%%=%.3f vol=%.2f regime=%s", sym, market, direction, int(conf_emit), float(ta.get("atr_pct") or 0.0), float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0), str(ta.get("regime") or "-"))
+                                try:
+                                    _mid_metrics_inc("pending_triggered", 1)
+                                except Exception:
+                                    pass
+                                try:
+                                    _mid_stage_add("triggered", 1)
+                                except Exception:
+                                    pass
+                                continue
+                        else:
+                            try:
+                                logger.info("[mid][pending] instant_emit_vip skip sym=%s market=%s dir=%s reason=%s", sym, market, direction, instant_reason)
+                            except Exception:
+                                pass
 
                     # Direction check
                     # By default we DO NOT block on minor direction flips at trigger-time because the setup was built earlier.
@@ -23521,19 +23802,69 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 except Exception:
                                                     _in_zone_now = False
 
-                                            _risk_block_now = False
-                                            try:
-                                                for _rf in (risk_flags or []):
-                                                    _rf_s = str(_rf or "").strip().lower()
-                                                    if _rf_s.startswith("trap:") or _rf_s.startswith("block:") or _rf_s in ("far_zone", "scale_mismatch"):
-                                                        _risk_block_now = True
-                                                        break
-                                            except Exception:
-                                                _risk_block_now = False
-
                                             _conf_now = int(float(rec.get("confidence") or 0))
                                             _strong_now = (_conf_now >= int(_smart_conf_need))
-                                            _emit_now = bool(_strong_now and ( ((_zone_valid and _in_zone_now) or ((not _zone_valid) and _smart_emit_if_no_zone)) ) and (not _risk_block_now))
+                                            sig_emit = Signal(
+                                                signal_id=self.next_signal_id(),
+                                                market=marketu,
+                                                symbol=sym,
+                                                direction=diru,
+                                                timeframe=f"{tf_trigger}/{tf_mid}/{tf_trend}",
+                                                entry=float(entry),
+                                                sl=float(sl),
+                                                tp1=float(tp1),
+                                                tp2=float(tp2),
+                                                rr=float(tp2_r if tp_policy=="R" else rr),
+                                                confidence=int(round(conf)),
+                                                confirmations=conf_names,
+                                                source_exchange=best_name,
+                                                available_exchanges=conf_names,
+                                                risk_note=(str(risk_note or "").strip() + (" | " if str(risk_note or "").strip() else "") + f"smart_setup_emit=1 smart_conf={int(_conf_now)}/{int(_smart_conf_need)}").strip(),
+                                                ts=time.time(),
+                                            )
+                                            try:
+                                                _recent_low_now = float(df30i["low"].astype(float).tail(120).min())
+                                                _recent_high_now = float(df30i["high"].astype(float).tail(120).max())
+                                            except Exception:
+                                                try:
+                                                    _recent_low_now = float(df30i["low"].astype(float).min())
+                                                    _recent_high_now = float(df30i["high"].astype(float).max())
+                                                except Exception:
+                                                    _recent_low_now = 0.0
+                                                    _recent_high_now = 0.0
+                                            try:
+                                                _atr_now = float((base_r.get("atr_abs") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or rec.get("atr_at_create") or 0.0)
+                                            except Exception:
+                                                _atr_now = float(rec.get("atr_at_create") or 0.0)
+                                            _near_ok_now, _near_reason_now = _mid_instant_emit_near_extreme_ok(
+                                                direction=diru,
+                                                entry=float(entry),
+                                                recent_low=_recent_low_now,
+                                                recent_high=_recent_high_now,
+                                                atr30=_atr_now,
+                                                market=marketu,
+                                            )
+                                            try:
+                                                _micro_ok_now, _micro_reason_now = _mid_micro_trap_ok(direction=diru, entry=float(entry), df5=df5i, atr30=float(_atr_now or 0.0))
+                                            except Exception:
+                                                _micro_ok_now, _micro_reason_now = (False, "instant_micro_trap_error")
+                                            _emit_now, _emit_reason, _emit_meta = _mid_instant_emit_gate(
+                                                market=marketu,
+                                                direction=diru,
+                                                confidence=float(_conf_now),
+                                                sig=sig_emit,
+                                                atr_pct=float((base_r.get("atr_pct") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("atr_pct_at_create") or 0.0) or 0.0),
+                                                vol_x=float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("rel_vol_at_create") or 0.0) or 0.0),
+                                                regime=str((base_r.get("regime") if ("base_r" in locals() and isinstance(base_r, dict)) else "") or ""),
+                                                risk_flags=risk_flags,
+                                                zone_valid=bool(_zone_valid),
+                                                in_zone_now=bool(_in_zone_now),
+                                                allow_no_zone_breakout=bool(_smart_emit_if_no_zone),
+                                                near_extreme_ok=bool(_near_ok_now),
+                                                near_extreme_reason=str(_near_reason_now),
+                                                micro_trap_ok=bool(_micro_ok_now),
+                                                micro_trap_reason=str(_micro_reason_now),
+                                            )
 
                                             try:
                                                 rec["smart_setup"] = bool(_strong_now)
@@ -23541,6 +23872,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 rec["smart_in_zone_now"] = bool(_in_zone_now)
                                                 rec["smart_conf_need"] = int(_smart_conf_need)
                                                 rec["smart_emit_now"] = bool(_emit_now)
+                                                rec["smart_emit_reason"] = str(_emit_reason)
+                                                rec["smart_emit_meta"] = dict(_emit_meta or {})
                                             except Exception:
                                                 pass
 
@@ -23551,33 +23884,6 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 _can_emit_now = True
 
                                             if _emit_now and _can_emit_now:
-                                                sig_emit = Signal(
-                                                    signal_id=self.next_signal_id(),
-                                                    market=marketu,
-                                                    symbol=sym,
-                                                    direction=diru,
-                                                    timeframe=f"{tf_trigger}/{tf_mid}/{tf_trend}",
-                                                    entry=float(entry),
-                                                    sl=float(sl),
-                                                    tp1=float(tp1),
-                                                    tp2=float(tp2),
-                                                    rr=float(tp2_r if tp_policy=="R" else rr),
-                                                    confidence=int(round(conf)),
-                                                    confirmations=conf_names,
-                                                    source_exchange=best_name,
-                                                    available_exchanges=conf_names,
-                                                    risk_note=(str(risk_note or "").strip() + (" | " if str(risk_note or "").strip() else "") + f"smart_setup_emit=1 smart_conf={int(_conf_now)}/{int(_smart_conf_need)}").strip(),
-                                                    ts=time.time(),
-                                                )
-                                                _profit_ok, _profit_pct, _profit_min = signal_min_profit_gate(sig_emit)
-                                                if not _profit_ok:
-                                                    logger.info("[signal][skip_profit] %s market=%s dir=%s profit=%.3f%% min=%.3f%%", sig_emit.symbol, sig_emit.market, sig_emit.direction, float(_profit_pct), float(_profit_min))
-                                                    try:
-                                                        _rej_add(sym, f"profit_lt_{float(_profit_min):.2f}")
-                                                    except Exception:
-                                                        pass
-                                                    continue
-
                                                 try:
                                                     self.mark_emitted_mid(sym, sig_emit.direction, sig_emit.market)
                                                 except TypeError:
@@ -23602,7 +23908,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     pass
                                                 try:
                                                     logger.info(
-                                                        "[mid][smart-setup] emit_now sym=%s market=%s dir=%s conf=%s zone_valid=%s in_zone_now=%s zone_src=%s",
+                                                        "[mid][smart-setup] emit_now sym=%s market=%s dir=%s conf=%s zone_valid=%s in_zone_now=%s zone_src=%s atr%%=%.3f vol=%.2f regime=%s",
                                                         sym,
                                                         marketu,
                                                         diru,
@@ -23610,6 +23916,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                         1 if _zone_valid else 0,
                                                         1 if _in_zone_now else 0,
                                                         _zone_src_l or "-",
+                                                        float((_emit_meta or {}).get("atr_pct") or 0.0),
+                                                        float((_emit_meta or {}).get("vol_x") or 0.0),
+                                                        str((_emit_meta or {}).get("regime") or "-"),
                                                     )
                                                 except Exception:
                                                     pass
@@ -23619,6 +23928,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     pass
                                                 await asyncio.sleep(2)
                                                 _smart_emit_done = True
+                                            else:
+                                                try:
+                                                    logger.info("[mid][smart-setup] pending_not_emit sym=%s market=%s dir=%s reason=%s", sym, marketu, diru, _emit_reason)
+                                                except Exception:
+                                                    pass
                                         except Exception:
                                             _smart_emit_done = False
                                         if _smart_emit_done:
