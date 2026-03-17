@@ -808,6 +808,37 @@ def get_autotrade_master_key() -> str:
 
 logger = logging.getLogger("crypto-signal")
 
+def _smart_setup_log(event: str, **fields) -> None:
+    """Robust smart-setup logger with stdout fallback when logger handlers are absent.
+
+    Some deployments only surface stdout/stderr and silently drop logger.info lines when
+    logging is not fully configured. For critical smart-setup decisions, mirror the message
+    to stdout if neither the dedicated logger nor the root logger has handlers.
+    """
+    try:
+        parts = []
+        for k, v in (fields or {}).items():
+            try:
+                parts.append(f"{k}={v}")
+            except Exception:
+                parts.append(f"{k}=<err>")
+        msg = f"[mid][smart-setup] {event}"
+        if parts:
+            msg += " " + " ".join(parts)
+        try:
+            logger.info(msg)
+        except Exception:
+            pass
+        try:
+            root_logger = logging.getLogger()
+            has_handlers = bool(getattr(logger, "handlers", None)) or bool(getattr(root_logger, "handlers", None))
+            if not has_handlers:
+                print(msg, flush=True)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 # --- Top symbols cache & provider cooldown (prevents REST storms / bans) ---
 TOP_SYMBOLS_TTL_SEC = int(os.getenv("TOP_SYMBOLS_TTL_SEC", "300") or "300")  # cache top list for N seconds
 TOP_PROVIDER_COOLDOWN_SEC = int(os.getenv("TOP_PROVIDER_COOLDOWN_SEC", "90") or "90")
@@ -8078,43 +8109,64 @@ def _mid_instant_emit_gate(*,
         "risk_flags": sorted(flags),
     })
 
+    fail_reasons: list[str] = []
+
+    def _add_fail(reason: str) -> None:
+        try:
+            s = str(reason or "").strip()
+        except Exception:
+            s = "instant_gate_unknown"
+        if s and s not in fail_reasons:
+            fail_reasons.append(s)
+
     if conf_v < float(conf_need):
-        return (False, f"instant_conf_low:{int(round(conf_v))}<{conf_need}", meta)
+        _add_fail(f"instant_conf_low:{int(round(conf_v))}<{conf_need}")
     if flags & hard_flags:
-        return (False, f"instant_risk_flags:{','.join(sorted(flags & hard_flags))}", meta)
+        _add_fail(f"instant_risk_flags:{','.join(sorted(flags & hard_flags))}")
     if profit_v < float(profit_need):
-        return (False, f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}", meta)
+        _add_fail(f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}")
     if atr_v < float(min_atr):
-        return (False, f"instant_atr_low:{atr_v:.3f}<{min_atr:.3f}", meta)
+        _add_fail(f"instant_atr_low:{atr_v:.3f}<{min_atr:.3f}")
     if vol_v < float(min_vol):
-        return (False, f"instant_vol_low:{vol_v:.2f}<{min_vol:.2f}", meta)
+        _add_fail(f"instant_vol_low:{vol_v:.2f}<{min_vol:.2f}")
     if not near_extreme_ok:
-        return (False, str(near_extreme_reason or "instant_near_extreme"), meta)
+        _add_fail(str(near_extreme_reason or "instant_near_extreme"))
     if not micro_trap_ok:
-        return (False, str(micro_trap_reason or "instant_micro_trap"), meta)
+        _add_fail(str(micro_trap_reason or "instant_micro_trap"))
     if not late_entry_ok:
-        return (False, str(late_entry_reason or "instant_late_entry"), meta)
+        _add_fail(str(late_entry_reason or "instant_late_entry"))
     if not anti_bounce_ok:
-        return (False, str(anti_bounce_reason or "instant_anti_bounce"), meta)
+        _add_fail(str(anti_bounce_reason or "instant_anti_bounce"))
 
     if (market or "SPOT").upper().strip() == "FUTURES":
         allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_INSTANT_EMIT_ALLOWED_REGIMES_FUTURES", "TREND,TRENDING,EXPANSION")) if str(x).strip()}
         if reg_u not in allowed_regimes:
-            return (False, f"instant_regime_block:{reg_u or '-'}", meta)
+            _add_fail(f"instant_regime_block:{reg_u or '-'}")
 
     if bool(zone_valid):
         if not bool(in_zone_now):
-            return (False, "instant_zone_wait", meta)
+            _add_fail("instant_zone_wait")
     else:
         if not bool(allow_no_zone_breakout):
-            return (False, "instant_zone_missing", meta)
+            _add_fail("instant_zone_missing")
         if conf_v < float(conf_need + no_zone_extra_conf):
-            return (False, f"instant_no_zone_conf:{int(round(conf_v))}<{conf_need + no_zone_extra_conf}", meta)
+            _add_fail(f"instant_no_zone_conf:{int(round(conf_v))}<{conf_need + no_zone_extra_conf}")
         if atr_v < float(min_atr * 1.05):
-            return (False, f"instant_no_zone_atr:{atr_v:.3f}<{(min_atr * 1.05):.3f}", meta)
+            _add_fail(f"instant_no_zone_atr:{atr_v:.3f}<{(min_atr * 1.05):.3f}")
         if vol_v < float(min_vol * 1.10):
-            return (False, f"instant_no_zone_vol:{vol_v:.2f}<{(min_vol * 1.10):.2f}", meta)
+            _add_fail(f"instant_no_zone_vol:{vol_v:.2f}<{(min_vol * 1.10):.2f}")
 
+    if fail_reasons:
+        meta["fail_reasons"] = list(fail_reasons)
+        meta["fail_reason_count"] = len(fail_reasons)
+        meta["all_reasons"] = "|".join(fail_reasons)
+        meta["primary_reason"] = str(fail_reasons[0])
+        return (False, str(fail_reasons[0]), meta)
+
+    meta["fail_reasons"] = []
+    meta["fail_reason_count"] = 0
+    meta["all_reasons"] = "pass"
+    meta["primary_reason"] = "pass"
     return (True, "pass", meta)
 
 
@@ -19114,7 +19166,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 continue
                         else:
                             try:
-                                logger.info("[mid][pending] instant_emit_vip skip sym=%s market=%s dir=%s reason=%s", sym, market, direction, instant_reason)
+                                logger.info("[mid][pending] instant_emit_vip skip sym=%s market=%s dir=%s reason=%s all_reasons=%s", sym, market, direction, instant_reason, str((instant_meta or {}).get("all_reasons") or instant_reason))
                             except Exception:
                                 pass
 
@@ -24020,6 +24072,12 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                             except Exception:
                                                 _can_emit_now = True
 
+                                            _smart_pending_reason = str(_emit_reason or "")
+                                            if _emit_now and (not _can_emit_now):
+                                                _smart_pending_reason = _smart_pending_reason or "emit_cooldown"
+                                            elif (not _emit_now):
+                                                _smart_pending_reason = _smart_pending_reason or "gate_block"
+
                                             if _emit_now and _can_emit_now:
                                                 try:
                                                     self.mark_emitted_mid(sym, sig_emit.direction, sig_emit.market)
@@ -24043,22 +24101,21 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     _mid_metrics_inc("setups_found", 1)
                                                 except Exception:
                                                     pass
-                                                try:
-                                                    logger.info(
-                                                        "[mid][smart-setup] emit_now sym=%s market=%s dir=%s conf=%s zone_valid=%s in_zone_now=%s zone_src=%s atr%%=%.3f vol=%.2f regime=%s",
-                                                        sym,
-                                                        marketu,
-                                                        diru,
-                                                        int(_conf_now),
-                                                        1 if _zone_valid else 0,
-                                                        1 if _in_zone_now else 0,
-                                                        _zone_src_l or "-",
-                                                        float((_emit_meta or {}).get("atr_pct") or 0.0),
-                                                        float((_emit_meta or {}).get("vol_x") or 0.0),
-                                                        str((_emit_meta or {}).get("regime") or "-"),
-                                                    )
-                                                except Exception:
-                                                    pass
+                                                _smart_setup_log(
+                                                    "emit_now",
+                                                    sym=sym,
+                                                    market=marketu,
+                                                    dir=diru,
+                                                    conf=int(_conf_now),
+                                                    zone_valid=1 if _zone_valid else 0,
+                                                    in_zone_now=1 if _in_zone_now else 0,
+                                                    zone_src=_zone_src_l or "-",
+                                                    atr_pct=f"{float((_emit_meta or {}).get('atr_pct') or 0.0):.3f}",
+                                                    vol=f"{float((_emit_meta or {}).get('vol_x') or 0.0):.2f}",
+                                                    regime=str((_emit_meta or {}).get("regime") or "-"),
+                                                    reason=str((_emit_meta or {}).get("primary_reason") or _emit_reason or "emit_now"),
+                                                    all_reasons=str((_emit_meta or {}).get("all_reasons") or _emit_reason or "emit_now"),
+                                                )
                                                 try:
                                                     _rej_ok(sym, "emitted")
                                                 except Exception:
@@ -24066,11 +24123,34 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 await asyncio.sleep(2)
                                                 _smart_emit_done = True
                                             else:
-                                                try:
-                                                    logger.info("[mid][smart-setup] pending_not_emit sym=%s market=%s dir=%s reason=%s", sym, marketu, diru, _emit_reason)
-                                                except Exception:
-                                                    pass
-                                        except Exception:
+                                                _smart_setup_log(
+                                                    "pending_not_emit",
+                                                    sym=sym,
+                                                    market=marketu,
+                                                    dir=diru,
+                                                    conf=int(_conf_now),
+                                                    zone_valid=1 if _zone_valid else 0,
+                                                    in_zone_now=1 if _in_zone_now else 0,
+                                                    zone_src=_zone_src_l or "-",
+                                                    can_emit=1 if _can_emit_now else 0,
+                                                    atr_pct=f"{float((_emit_meta or {}).get('atr_pct') or 0.0):.3f}",
+                                                    vol=f"{float((_emit_meta or {}).get('vol_x') or 0.0):.2f}",
+                                                    regime=str((_emit_meta or {}).get("regime") or "-"),
+                                                    reason=str((_emit_meta or {}).get("primary_reason") or _smart_pending_reason or "pending"),
+                                                    all_reasons=str((_emit_meta or {}).get("all_reasons") or _smart_pending_reason or "pending"),
+                                                )
+                                        except Exception as _smart_setup_exc:
+                                            try:
+                                                _smart_setup_log(
+                                                    "error",
+                                                    sym=sym,
+                                                    market=marketu,
+                                                    dir=diru,
+                                                    error=type(_smart_setup_exc).__name__,
+                                                    detail=str(_smart_setup_exc),
+                                                )
+                                            except Exception:
+                                                pass
                                             _smart_emit_done = False
                                         if _smart_emit_done:
                                             continue
