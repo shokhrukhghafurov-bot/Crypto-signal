@@ -8006,12 +8006,21 @@ def _mid_instant_emit_market_thresholds(market: str) -> tuple[float, float]:
 
 def _mid_instant_emit_near_extreme_ok(*, direction: str, entry: float, recent_low: float | None, recent_high: float | None,
                                       atr30: float | None, market: str = "SPOT") -> tuple[bool, str]:
-    """Mandatory recent-extreme distance guard for VIP instant emit."""
+    """Recent-extreme guard for VIP instant emit.
+
+    Missing context should not hard-block instant emit by default. False negatives were
+    common when recent high/low data was absent or ATR was temporarily unavailable.
+    Set MID_INSTANT_EMIT_NEAR_EXTREME_REQUIRE_DATA=1 to restore fail-closed behavior.
+    """
+    try:
+        require_data = str(os.getenv("MID_INSTANT_EMIT_NEAR_EXTREME_REQUIRE_DATA", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        require_data = False
     try:
         atr = float(atr30 or 0.0)
         px = float(entry or 0.0)
         if atr <= 0 or px <= 0:
-            return (False, "near_extreme_no_atr")
+            return ((False, "near_extreme_no_atr") if require_data else (True, "near_extreme_skip_no_atr"))
         m = (market or "SPOT").upper().strip()
         if m == "FUTURES":
             thr = float(os.getenv("MID_INSTANT_EMIT_NEAR_EXTREME_ATR_FUTURES", os.getenv("MID_INSTANT_EMIT_NEAR_EXTREME_ATR_FUT", "0.45")) or 0.45)
@@ -8021,7 +8030,7 @@ def _mid_instant_emit_near_extreme_ok(*, direction: str, entry: float, recent_lo
         if d == "LONG":
             hi = float(recent_high or 0.0)
             if hi <= 0:
-                return (False, "near_extreme_no_high")
+                return ((False, "near_extreme_no_high") if require_data else (True, "near_extreme_skip_no_high"))
             dist = (hi - px) / atr
             if dist < float(thr):
                 return (False, f"near_recent_high dist_atr={dist:.2f} < {thr:g}")
@@ -8029,14 +8038,42 @@ def _mid_instant_emit_near_extreme_ok(*, direction: str, entry: float, recent_lo
         if d == "SHORT":
             lo = float(recent_low or 0.0)
             if lo <= 0:
-                return (False, "near_extreme_no_low")
+                return ((False, "near_extreme_no_low") if require_data else (True, "near_extreme_skip_no_low"))
             dist = (px - lo) / atr
             if dist < float(thr):
                 return (False, f"near_recent_low dist_atr={dist:.2f} < {thr:g}")
             return (True, f"near_recent_low dist_atr={dist:.2f}")
     except Exception as e:
-        return (False, f"near_extreme_error:{e}")
-    return (False, "near_extreme_bad_dir")
+        return ((False, f"near_extreme_error:{e}") if require_data else (True, f"near_extreme_skip_error:{type(e).__name__}"))
+    return (True, "near_extreme_skip_bad_dir")
+
+
+def _mid_instant_emit_reason_priority(reason: str) -> tuple[int, str]:
+    """Stable ordering for instant-emit blockers so the primary reason is actionable."""
+    s = str(reason or "").strip()
+    key = s.lower()
+    priorities = [
+        ("instant_zone_wait", 10),
+        ("instant_zone_missing", 11),
+        ("instant_conf_low", 20),
+        ("instant_no_zone_conf", 21),
+        ("instant_profit_low", 30),
+        ("instant_atr_low", 40),
+        ("instant_vol_low", 41),
+        ("instant_regime_block", 50),
+        ("near_recent_", 60),
+        ("near_extreme_", 61),
+        ("micro_", 70),
+        ("late_entry_", 80),
+        ("anti_bounce_", 81),
+        ("instant_no_zone_atr", 90),
+        ("instant_no_zone_vol", 91),
+        ("instant_risk_flags", 100),
+    ]
+    for prefix, score in priorities:
+        if key.startswith(prefix):
+            return (score, key)
+    return (500, key)
 
 
 def _mid_instant_emit_gate(*,
@@ -8080,7 +8117,7 @@ def _mid_instant_emit_gate(*,
         profit_need = 1.0
 
     flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
-    hard_flags = {"far_zone", "scale_mismatch", "blocked", "vol_low", "atrpct_low", "regime_range_no_breakout"}
+    hard_flags = {"far_zone", "scale_mismatch", "blocked", "structure_mismatch", "regime_range_no_breakout"}
 
     conf_v = float(confidence or 0.0)
     atr_v = float(atr_pct or 0.0)
@@ -8107,9 +8144,12 @@ def _mid_instant_emit_gate(*,
         "late_entry_ok": bool(late_entry_ok),
         "anti_bounce_ok": bool(anti_bounce_ok),
         "risk_flags": sorted(flags),
+        "risk_flags_input": sorted(flags),
     })
 
     fail_reasons: list[str] = []
+    applied_risk_flags: list[str] = []
+    ignored_risk_flags: list[str] = []
 
     def _add_fail(reason: str) -> None:
         try:
@@ -8121,8 +8161,30 @@ def _mid_instant_emit_gate(*,
 
     if conf_v < float(conf_need):
         _add_fail(f"instant_conf_low:{int(round(conf_v))}<{conf_need}")
-    if flags & hard_flags:
-        _add_fail(f"instant_risk_flags:{','.join(sorted(flags & hard_flags))}")
+
+    # Only keep generic scan-stage flags here when they are still relevant *now*.
+    # ATR/VOL have dedicated current-metric checks below, so we do not duplicate them
+    # via stale risk_flags from scan stage.
+    for _flag in sorted(flags):
+        if _flag in ("vol_low",):
+            ignored_risk_flags.append(_flag)
+            continue
+        if _flag in ("atrpct_low", "atr_low", "volatility_low"):
+            ignored_risk_flags.append(_flag)
+            continue
+        if _flag == "regime_range_no_breakout":
+            if reg_u in {"RANGE", "CHOPPY", "COMPRESSION", "SIDEWAYS", "-", ""}:
+                applied_risk_flags.append(_flag)
+            else:
+                ignored_risk_flags.append(_flag)
+            continue
+        if _flag in hard_flags:
+            applied_risk_flags.append(_flag)
+            continue
+        ignored_risk_flags.append(_flag)
+
+    if applied_risk_flags:
+        _add_fail(f"instant_risk_flags:{','.join(applied_risk_flags)}")
     if profit_v < float(profit_need):
         _add_fail(f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}")
     if atr_v < float(min_atr):
@@ -8156,7 +8218,13 @@ def _mid_instant_emit_gate(*,
         if vol_v < float(min_vol * 1.10):
             _add_fail(f"instant_no_zone_vol:{vol_v:.2f}<{(min_vol * 1.10):.2f}")
 
+    meta["applied_risk_flags"] = list(applied_risk_flags)
+    meta["ignored_risk_flags"] = list(ignored_risk_flags)
+    meta["applied_risk_flags_text"] = ",".join(applied_risk_flags) if applied_risk_flags else "-"
+    meta["ignored_risk_flags_text"] = ",".join(ignored_risk_flags) if ignored_risk_flags else "-"
+
     if fail_reasons:
+        fail_reasons = sorted(fail_reasons, key=_mid_instant_emit_reason_priority)
         meta["fail_reasons"] = list(fail_reasons)
         meta["fail_reason_count"] = len(fail_reasons)
         meta["all_reasons"] = "|".join(fail_reasons)
@@ -24031,8 +24099,19 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                             _anti_ok_now = not bool(_anti_reason_now)
                                             try:
                                                 _micro_ok_now, _micro_reason_now = _mid_micro_trap_ok(direction=diru, entry=float(entry), df5=df5i, atr30=float(_atr_now or 0.0))
-                                            except Exception:
-                                                _micro_ok_now, _micro_reason_now = (False, "instant_micro_trap_error")
+                                            except Exception as _micro_exc:
+                                                _micro_ok_now, _micro_reason_now = (True, f"micro_trap_skip_error:{type(_micro_exc).__name__}")
+                                                try:
+                                                    _smart_setup_log(
+                                                        "micro_trap_skip",
+                                                        sym=sym,
+                                                        market=marketu,
+                                                        dir=diru,
+                                                        error=type(_micro_exc).__name__,
+                                                        detail=str(_micro_exc),
+                                                    )
+                                                except Exception:
+                                                    pass
                                             _emit_now, _emit_reason, _emit_meta = _mid_instant_emit_gate(
                                                 market=marketu,
                                                 direction=diru,
@@ -24113,6 +24192,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     atr_pct=f"{float((_emit_meta or {}).get('atr_pct') or 0.0):.3f}",
                                                     vol=f"{float((_emit_meta or {}).get('vol_x') or 0.0):.2f}",
                                                     regime=str((_emit_meta or {}).get("regime") or "-"),
+                                                    risk_flags=str((_emit_meta or {}).get("risk_flags_input") or []),
+                                                    applied_flags=str((_emit_meta or {}).get("applied_risk_flags_text") or "-"),
+                                                    ignored_flags=str((_emit_meta or {}).get("ignored_risk_flags_text") or "-"),
                                                     reason=str((_emit_meta or {}).get("primary_reason") or _emit_reason or "emit_now"),
                                                     all_reasons=str((_emit_meta or {}).get("all_reasons") or _emit_reason or "emit_now"),
                                                 )
@@ -24136,6 +24218,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     atr_pct=f"{float((_emit_meta or {}).get('atr_pct') or 0.0):.3f}",
                                                     vol=f"{float((_emit_meta or {}).get('vol_x') or 0.0):.2f}",
                                                     regime=str((_emit_meta or {}).get("regime") or "-"),
+                                                    risk_flags=str((_emit_meta or {}).get("risk_flags_input") or []),
+                                                    applied_flags=str((_emit_meta or {}).get("applied_risk_flags_text") or "-"),
+                                                    ignored_flags=str((_emit_meta or {}).get("ignored_risk_flags_text") or "-"),
                                                     reason=str((_emit_meta or {}).get("primary_reason") or _smart_pending_reason or "pending"),
                                                     all_reasons=str((_emit_meta or {}).get("all_reasons") or _smart_pending_reason or "pending"),
                                                 )
