@@ -476,7 +476,12 @@
     "sm_reason_hold_to_tp2": "holding to TP2: mode={mode}, prob_tp2={prob_tp2}",
     "sm_reason_tp1_partial_closed": "mode={mode}; closed={closed_qty}; remaining={remaining_qty}; {detail}",
     "sm_reason_tp1_full_close": "mode={mode}; {detail}",
-    "sm_msg_decision": "{title}\n{symbol} | {market} | {side}\n\n📌 Trigger: {trigger}\n📌 Decision: {decision}\n💹 Decision price: {px_decision}\n{level_label}: {level_price}\n🧠 Reason: {reason}\n🔌 Price source: {source}"
+    "sm_msg_decision": "{title}\n{symbol} | {market} | {side}\n\n📌 Trigger: {trigger}\n📌 Decision: {decision}\n💹 Decision price: {px_decision}\n{level_label}: {level_price}\n🧠 Reason: {reason}\n🔌 Price source: {source}",
+    "reason_tp2_runner_exit": "After breaking TP2, price extended higher and the position was closed above TP2 on the first 1m micro-reversal.",
+    "sm_reason_tp2_runner_started": "strong impulse above TP2 -> runner active; exit = first 1m opposite candle / 1m micro structure break / sharp return to TP2",
+    "sm_reason_tp2_runner_first_opposite": "first 1m opposite candle after extension; closed above TP2 at {close_price} (TP2={tp2_price}, peak={peak_price}, pullback={pullback_pct}%)",
+    "sm_reason_tp2_runner_micro_break": "1m micro structure break ({pattern}); closed above TP2 at {close_price} (TP2={tp2_price}, peak={peak_price})",
+    "sm_reason_tp2_runner_return_tp2": "market snapped back to TP2; closed without waiting at {close_price} (TP2={tp2_price}, peak={peak_price})"
   },
   "ru": {
     "access_blocked": "",
@@ -955,7 +960,11 @@
     "sm_reason_hold_to_tp2": "удерживаем до TP2: режим={mode}, prob_tp2={prob_tp2}",
     "sm_reason_tp1_partial_closed": "режим={mode}; закрыто={closed_qty}; осталось={remaining_qty}; {detail}",
     "sm_reason_tp1_full_close": "режим={mode}; {detail}",
-    "sm_msg_decision": "{title}\n{symbol} | {market} | {side}\n\n📌 Триггер: {trigger}\n📌 Решение: {decision}\n💹 Цена решения: {px_decision}\n{level_label}: {level_price}\n🧠 Причина: {reason}\n🔌 Источник цены: {source}"
+    "sm_msg_decision": "{title}\n{symbol} | {market} | {side}\n\n📌 Триггер: {trigger}\n📌 Решение: {decision}\n💹 Цена решения: {px_decision}\n{level_label}: {level_price}\n🧠 Причина: {reason}\n🔌 Источник цены: {source}",
+    "reason_tp2_runner_exit": "После пробоя TP2 импульс продолжился выше, и позиция была закрыта выше TP2 по первому 1m микро-развороту.",
+    "sm_reason_tp2_runner_started": "сильный импульс выше TP2 → запускаем runner; выход = первая 1m свеча против позиции / 1m micro structure break / резкий возврат к TP2",
+    "sm_reason_tp2_runner_first_opposite": "первая 1m свеча против позиции после протяжки; закрыли выше TP2 по {close_price} (TP2={tp2_price}, peak={peak_price}, pullback={pullback_pct}%)",
+    "sm_reason_tp2_runner_micro_break": "1m micro structure break ({pattern}); закрыли выше TP2 по {close_price} (TP2={tp2_price}, peak={peak_price})",
+    "sm_reason_tp2_runner_return_tp2": "рынок резко вернулся к TP2; закрыли без ожидания по {close_price} (TP2={tp2_price}, peak={peak_price})"
   }
 }
-
