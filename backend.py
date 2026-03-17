@@ -11885,6 +11885,14 @@ def _mid_pending_recency_guard(rec: dict, *, now_ts: float | None = None) -> tup
     except Exception:
         width_atr_raw = None
     try:
+        width_atr_fast = float(rec.get("zone_width_atr_fast")) if rec.get("zone_width_atr_fast") is not None else None
+    except Exception:
+        width_atr_fast = None
+    try:
+        width_atr_slow = float(rec.get("zone_width_atr_slow")) if rec.get("zone_width_atr_slow") is not None else None
+    except Exception:
+        width_atr_slow = None
+    try:
         width_pct = float(rec.get("zone_width_pct")) if rec.get("zone_width_pct") is not None else None
     except Exception:
         width_pct = None
@@ -11892,13 +11900,33 @@ def _mid_pending_recency_guard(rec: dict, *, now_ts: float | None = None) -> tup
         atr_pct_create = float(rec.get("atr_pct_at_create")) if rec.get("atr_pct_at_create") is not None else None
     except Exception:
         atr_pct_create = None
+    try:
+        atr_pct_fast_create = float(rec.get("atr_pct_fast_at_create")) if rec.get("atr_pct_fast_at_create") is not None else None
+    except Exception:
+        atr_pct_fast_create = None
+    try:
+        atr_pct_slow_create = float(rec.get("atr_pct_slow_at_create")) if rec.get("atr_pct_slow_at_create") is not None else None
+    except Exception:
+        atr_pct_slow_create = None
     if width_atr is None and width_atr_raw is not None:
         width_atr = width_atr_raw
+    if width_atr_fast is None and width_atr is not None:
+        width_atr_fast = width_atr
     if width_atr is None and width_pct is not None and atr_pct_create is not None and float(atr_pct_create) > 0:
         try:
             width_atr = float(width_pct) / max(float(atr_pct_create) / 100.0, 1e-9)
         except Exception:
             width_atr = None
+    if width_atr_fast is None and width_pct is not None and atr_pct_fast_create is not None and float(atr_pct_fast_create) > 0:
+        try:
+            width_atr_fast = float(width_pct) / max(float(atr_pct_fast_create) / 100.0, 1e-9)
+        except Exception:
+            width_atr_fast = None
+    if width_atr_slow is None and width_pct is not None and atr_pct_slow_create is not None and float(atr_pct_slow_create) > 0:
+        try:
+            width_atr_slow = float(width_pct) / max(float(atr_pct_slow_create) / 100.0, 1e-9)
+        except Exception:
+            width_atr_slow = None
     bo = str(rec.get("bo_rt") or rec.get("breakout_retest") or "").strip()
     try:
         bo_age_create_bars = int(float(rec.get("breakout_first_age_bars_create"))) if rec.get("breakout_first_age_bars_create") is not None else None
@@ -11943,11 +11971,22 @@ def _mid_pending_recency_guard(rec: dict, *, now_ts: float | None = None) -> tup
         except Exception:
             bo_total_age_bars = None
 
+    width_guard = None
+    try:
+        _ws = [float(x) for x in (width_atr, width_atr_fast, width_atr_slow) if x is not None and math.isfinite(float(x)) and float(x) > 0]
+        if _ws:
+            width_guard = max(_ws)
+    except Exception:
+        width_guard = width_atr if width_atr is not None else width_atr_fast
+
     meta.update({
         "age_min": float(age_min_now),
         "zone_src": zsrc,
         "zone_width_atr": width_atr,
         "zone_width_atr_raw": width_atr_raw,
+        "zone_width_atr_fast": width_atr_fast,
+        "zone_width_atr_slow": width_atr_slow,
+        "zone_width_atr_guard": width_guard,
         "zone_width_pct": width_pct,
         "bo": bo,
         "bo_age_create_bars": bo_age_create_bars,
@@ -11959,8 +11998,15 @@ def _mid_pending_recency_guard(rec: dict, *, now_ts: float | None = None) -> tup
         max_fb_w = float(os.getenv("MID_PENDING_GUARD_MAX_FALLBACK_ZONE_WIDTH_ATR", "1.20") or 1.20)
     except Exception:
         max_fb_w = 1.20
-    if zsrc in ("fallback", "far") and width_atr is not None and width_atr > max_fb_w:
-        return (False, f"zone_stale:{zsrc}:width_atr={float(width_atr):.2f}>{float(max_fb_w):g}", meta)
+    if zsrc in ("fallback", "far") and width_guard is not None and width_guard > max_fb_w:
+        return (False, f"zone_stale:{zsrc}:width_atr={float(width_guard):.2f}>{float(max_fb_w):g}", meta)
+
+    try:
+        max_any_w = float(os.getenv("MID_PENDING_GUARD_MAX_ZONE_WIDTH_ATR_ANY", "4.00") or 4.0)
+    except Exception:
+        max_any_w = 4.0
+    if width_guard is not None and max_any_w > 0 and width_guard > max_any_w:
+        return (False, f"zone_too_wide_guard:{float(width_guard):.2f}>{float(max_any_w):g}", meta)
 
     try:
         max_fb_age_min = float(os.getenv("MID_PENDING_GUARD_MAX_FALLBACK_AGE_MIN", "20") or 20.0)
@@ -11996,6 +12042,12 @@ def _mid_pending_recency_guard(rec: dict, *, now_ts: float | None = None) -> tup
             max_move_atr = float(os.getenv("MID_PENDING_BREAKOUT_MAX_MOVE_ATR", os.getenv("MID_LATE_ENTRY_ATR_MAX", "1.35")) or 1.35)
         except Exception:
             max_move_atr = 1.35
+        try:
+            max_breakout_w = float(os.getenv("MID_PENDING_BREAKOUT_MAX_ZONE_WIDTH_ATR", "3.00") or 3.0)
+        except Exception:
+            max_breakout_w = 3.0
+        if width_guard is not None and max_breakout_w > 0 and width_guard > max_breakout_w:
+            return (False, f"breakout_zone_too_wide:{float(width_guard):.2f}>{float(max_breakout_w):g}", meta)
         if bo_age_create_bars is not None and bo_age_create_bars > max_age_bars:
             return (False, f"breakout_stale_create:{bo_age_create_bars}b>{max_age_bars}", meta)
         if bo_total_age_bars is not None and bo_total_age_bars > max_total_bars:
@@ -24575,22 +24627,26 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
 
                                     # --- Zone diagnostics at creation (helps debug why pending never triggers) ---
                                     try:
-                                        _atr0 = None
+                                        _atr_fast = None
+                                        _atr_slow = None
                                         try:
                                             if hasattr(chosen_df5, 'columns') and 'atr' in chosen_df5.columns:
-                                                _atr0 = float(chosen_df5['atr'].astype(float).iloc[-1])
+                                                _atr_fast = float(chosen_df5['atr'].astype(float).iloc[-1])
                                         except Exception:
-                                            _atr0 = None
+                                            _atr_fast = None
                                         try:
-                                            if (_atr0 is None or _atr0 <= 0) and hasattr(chosen_df30, 'columns') and 'atr' in chosen_df30.columns:
-                                                _atr0 = float(chosen_df30['atr'].astype(float).iloc[-1])
+                                            if hasattr(chosen_df30, 'columns') and 'atr' in chosen_df30.columns:
+                                                _atr_slow = float(chosen_df30['atr'].astype(float).iloc[-1])
                                         except Exception:
-                                            pass
+                                            _atr_slow = None
+                                        _atr0 = _atr_fast if (_atr_fast is not None and _atr_fast > 0) else _atr_slow
                                         if _atr0 is None or _atr0 <= 0:
                                             _atr0 = float(entry) * 0.001
                                         _zone_w = float(entry_high) - float(entry_low)
                                         _zone_w_atr = float(_zone_w) / float(_atr0) if float(_atr0) > 0 else 0.0
                                         _zone_w_atr_raw = float(_zone_w_atr)
+                                        _zone_w_atr_fast = float(_zone_w) / float(_atr_fast) if (_atr_fast is not None and float(_atr_fast) > 0) else None
+                                        _zone_w_atr_slow = float(_zone_w) / float(_atr_slow) if (_atr_slow is not None and float(_atr_slow) > 0) else None
                                         _zone_w_pct = float(_zone_w) / float(entry) if float(entry) > 0 else 0.0
                                         if float(entry) < float(entry_low):
                                             _dist0 = float(entry_low) - float(entry)
@@ -24617,6 +24673,14 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         except Exception:
                                             _atr_pct_now = 0.0
                                         try:
+                                            _atr_pct_fast = (float(_atr_fast) / float(entry) * 100.0) if (_atr_fast is not None and float(entry) > 0) else None
+                                        except Exception:
+                                            _atr_pct_fast = None
+                                        try:
+                                            _atr_pct_slow = (float(_atr_slow) / float(entry) * 100.0) if (_atr_slow is not None and float(entry) > 0) else None
+                                        except Exception:
+                                            _atr_pct_slow = None
+                                        try:
                                             if (float(_min_atr_abs) > 0 and float(_atr0) < float(_min_atr_abs)) or (float(_min_atr_pct) > 0 and float(_atr_pct_now) < float(_min_atr_pct)):
                                                 _dist0_atr = None
                                                 _zone_w_atr = None
@@ -24630,8 +24694,14 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
 
                                     except Exception:
                                         _atr0 = float(entry) * 0.001
+                                        _atr_fast = _atr0
+                                        _atr_slow = None
+                                        _atr_pct_fast = (_atr0 / float(entry) * 100.0) if float(entry) > 0 else None
+                                        _atr_pct_slow = None
                                         _zone_w_atr = 0.0
                                         _zone_w_atr_raw = 0.0
+                                        _zone_w_atr_fast = 0.0
+                                        _zone_w_atr_slow = None
                                         _zone_w_pct = 0.0
                                         _dist0_atr = 0.0
                                         _dist0_atr_raw = 0.0
@@ -24707,6 +24777,21 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         _bo_move_pct_create = float(_bo_meta.get("breakout_move_pct")) if _bo_meta.get("breakout_move_pct") is not None else None
                                     except Exception:
                                         _bo_move_pct_create = None
+                                    try:
+                                        _bo_meta_src = str(_bo_meta.get("meta_source") or "")
+                                    except Exception:
+                                        _bo_meta_src = ""
+                                    if _bo_lbl and _bo_lbl not in ("-", "—", "NONE") and _bo_age_bars_create is None and _bo_move_atr_create is None:
+                                        try:
+                                            _bo_age_bars_create = 0
+                                            _bo_age_sec_create = 0.0
+                                            _bo_move_atr_create = float(_dist0_atr) if _dist0_atr is not None else None
+                                            _bo_move_pct_create = float(_dist0_pct) if _dist0_pct is not None else None
+                                            if _bo_meta.get("breakout_ts_ms") is None:
+                                                _bo_meta["breakout_ts_ms"] = int(float(_rec_created_ts) * 1000.0)
+                                            _bo_meta_src = "approx_from_create"
+                                        except Exception:
+                                            pass
 
                                     rec = {
                                         "key": key,
@@ -24731,11 +24816,18 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "breakout_first_move_atr_create": _bo_move_atr_create,
                                         "breakout_first_move_pct_create": _bo_move_pct_create,
                                         "breakout_bar_sec": int(_bo_meta.get("bar_sec") or 300),
+                                        "breakout_meta_source": _bo_meta_src or ("snapshot" if _bo_meta.get("breakout_age_bars") is not None else ""),
                                         "atr_at_create": float(_atr0) if ("_atr0" in locals() and _atr0) else float(entry) * 0.001,
                                         "atr_pct_at_create": float((base_r.get("atr_pct") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
+                                        "atr_fast_at_create": float(_atr_fast) if ("_atr_fast" in locals() and _atr_fast is not None) else None,
+                                        "atr_slow_at_create": float(_atr_slow) if ("_atr_slow" in locals() and _atr_slow is not None) else None,
+                                        "atr_pct_fast_at_create": float(_atr_pct_fast) if ("_atr_pct_fast" in locals() and _atr_pct_fast is not None) else None,
+                                        "atr_pct_slow_at_create": float(_atr_pct_slow) if ("_atr_pct_slow" in locals() and _atr_pct_slow is not None) else None,
                                         "rel_vol_at_create": float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
                                         "zone_width_atr": (float(_zone_w_atr) if (_zone_w_atr is not None) else None) if ("_zone_w_atr" in locals()) else None,
                                         "zone_width_atr_raw": (float(_zone_w_atr_raw) if ("_zone_w_atr_raw" in locals() and _zone_w_atr_raw is not None) else None),
+                                        "zone_width_atr_fast": (float(_zone_w_atr_fast) if ("_zone_w_atr_fast" in locals() and _zone_w_atr_fast is not None) else None),
+                                        "zone_width_atr_slow": (float(_zone_w_atr_slow) if ("_zone_w_atr_slow" in locals() and _zone_w_atr_slow is not None) else None),
                                         "zone_width_pct": float(_zone_w_pct) if ("_zone_w_pct" in locals()) else 0.0,
                                         "dist_to_zone_at_create_atr": (float(_dist0_atr) if (_dist0_atr is not None) else None) if ("_dist0_atr" in locals()) else None,
                                         "dist_to_zone_at_create_atr_raw": (float(_dist0_atr_raw) if ("_dist0_atr_raw" in locals() and _dist0_atr_raw is not None) else None),
