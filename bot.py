@@ -3231,7 +3231,7 @@ def _report_close_reason(final_status: str, *, after_tp1: bool = False, has_tp2:
         return "После TP1 цена вернулась к BE — закрытие без убытка."
     if st == "CLOSED":
         return "Сигнал закрыт по времени — лимит сопровождения истёк."
-    return "Сигнал закрыт Smart Manager."
+    return "Сигнал закрыт."
 
 
 def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pct: float, closed_at: dt.datetime | None = None) -> str:
@@ -3275,7 +3275,6 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
         f"📌 Статус: {_report_close_status(st, after_tp1=after_tp1)}\n"
         f"📊 Итог PnL: {_report_pnl_pct(pnl_total_pct)}\n"
         f"📊 Risk/Reward: 1 : {rr}\n"
-        f"⚡ Закрытие: Smart Manager\n"
         f"🧠 Причина: {reason}\n\n"
         f"──────────────\n\n"
         f"{price_block}\n\n"
