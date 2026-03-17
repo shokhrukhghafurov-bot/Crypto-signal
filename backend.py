@@ -8493,37 +8493,36 @@ def _mid_instant_emit_market_thresholds(market: str) -> tuple[float, float]:
     return (float(max(0.0, min_atr)), float(max(0.0, min_vol)))
 
 
-def _mid_instant_emit_profit_cap(market: str) -> float:
-    """Return early-entry instant profit cap separately for spot and futures.
+def _mid_instant_profit_cap(market: str) -> float:
+    """Return instant profit cap per market with backward-compatible fallback.
 
-    Backward compatibility:
-      - SPOT: MID_EARLY_ENTRY_INSTANT_PROFIT_CAP_SPOT -> MID_EARLY_ENTRY_INSTANT_PROFIT_CAP
-      - FUTURES: MID_EARLY_ENTRY_INSTANT_PROFIT_CAP_FUTURES / _FUT -> MID_EARLY_ENTRY_INSTANT_PROFIT_CAP
+    Defaults:
+      - SPOT: 1.0
+      - FUTURES: 0.5
+    Legacy MID_EARLY_ENTRY_INSTANT_PROFIT_CAP still works as a shared fallback when
+    market-specific envs are not provided.
     """
     m = (market or "SPOT").upper().strip()
+    base_default = 0.5 if m == "FUTURES" else 1.0
+    common_raw = os.getenv("MID_EARLY_ENTRY_INSTANT_PROFIT_CAP")
+    try:
+        common = float(common_raw) if common_raw not in (None, "") else float(base_default)
+    except Exception:
+        common = float(base_default)
     try:
         if m == "FUTURES":
-            cap = float(
+            value = float(
                 os.getenv(
                     "MID_EARLY_ENTRY_INSTANT_PROFIT_CAP_FUTURES",
-                    os.getenv(
-                        "MID_EARLY_ENTRY_INSTANT_PROFIT_CAP_FUT",
-                        os.getenv("MID_EARLY_ENTRY_INSTANT_PROFIT_CAP", "0.75"),
-                    ),
+                    os.getenv("MID_EARLY_ENTRY_INSTANT_PROFIT_CAP_FUT", str(common)),
                 )
-                or 0.75
+                or common
             )
         else:
-            cap = float(
-                os.getenv(
-                    "MID_EARLY_ENTRY_INSTANT_PROFIT_CAP_SPOT",
-                    os.getenv("MID_EARLY_ENTRY_INSTANT_PROFIT_CAP", "0.75"),
-                )
-                or 0.75
-            )
+            value = float(os.getenv("MID_EARLY_ENTRY_INSTANT_PROFIT_CAP_SPOT", str(common)) or common)
     except Exception:
-        cap = 0.75
-    return float(max(0.0, cap))
+        value = common
+    return float(max(0.0, value))
 
 
 def _mid_instant_emit_near_extreme_ok(*, direction: str, entry: float, recent_low: float | None, recent_high: float | None,
@@ -9004,10 +9003,10 @@ def _mid_instant_emit_gate(*,
     try:
         profit_need = float(os.getenv("MID_INSTANT_EMIT_MIN_PROFIT_PCT", "1.0") or 1.0)
         if _MID_EARLY_ENTRY_GUARD and _mid_soft_blocks_enabled():
-            profit_need = min(float(profit_need), float(_mid_instant_emit_profit_cap(market)))
+            profit_need = min(float(profit_need), float(_mid_instant_profit_cap(market)))
         profit_need = max(0.0, float(profit_need))
     except Exception:
-        profit_need = float(_mid_instant_emit_profit_cap(market)) if _MID_EARLY_ENTRY_GUARD else 1.0
+        profit_need = float(_mid_instant_profit_cap(market)) if _MID_EARLY_ENTRY_GUARD else 1.0
 
     flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
     hard_flags = {"far_zone", "scale_mismatch", "blocked", "structure_mismatch", "regime_range_no_breakout"}
@@ -22692,11 +22691,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     except Exception:
                         late_entry_raw_cfg = float(late_entry_cfg)
                     try:
-                        instant_profit_cap_spot = float(_mid_instant_emit_profit_cap("SPOT"))
+                        instant_profit_cap_spot = float(_mid_instant_profit_cap("SPOT"))
                     except Exception:
                         instant_profit_cap_spot = 0.75
                     try:
-                        instant_profit_cap_fut = float(_mid_instant_emit_profit_cap("FUTURES"))
+                        instant_profit_cap_fut = float(_mid_instant_profit_cap("FUTURES"))
                     except Exception:
                         instant_profit_cap_fut = 0.75
                     try:
