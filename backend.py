@@ -1469,8 +1469,9 @@ def _mid_hardblock_key(reason: str) -> str:
 def _mid_trigger_selected_hardblock_reason(reason: str) -> tuple[str | None, str | None]:
     """Selectively enforce hard-blocks that must be respected at actual entry / emit.
 
-    Pending scan may soften late-entry / anti-bounce, but once price is actually
-    entering the zone we must block them just like RSI / ADX / volume.
+    Borderline late-entry / anti-bounce cases stay *soft* at trigger-time when
+    MID_SOFT_BLOCKS_ENABLED=1 and the same soft-penalty logic says the setup is
+    still acceptable. Deep / clearly bad entries remain hard-blocked.
 
     Returns (log_reason, apply_reason) or (None, None) when the raw reason should
     remain ignored by trigger-time logic.
@@ -1487,8 +1488,18 @@ def _mid_trigger_selected_hardblock_reason(reason: str) -> tuple[str | None, str
         if head == "vol_x":
             return ("vol_low", "vol_low")
         if head == "late_entry_atr":
+            try:
+                if _mid_soft_block_penalty_for_reason(raw) is not None:
+                    return (None, None)
+            except Exception:
+                pass
             return ("late_entry", "late_entry")
         if head in ("anti_bounce_short", "anti_bounce_long"):
+            try:
+                if _mid_soft_block_penalty_for_reason(raw) is not None:
+                    return (None, None)
+            except Exception:
+                pass
             return ("anti_bounce", "anti_bounce")
         return (None, None)
     except Exception:
@@ -19054,7 +19065,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         pass
                     # Enforce hard entry-time blockers from ta.block_reason.
-                    # Pending scan may soften some of them, but actual entry must respect them.
+                    # Borderline late-entry / anti-bounce cases may stay soft here
+                    # when MID_SOFT_BLOCKS_ENABLED=1; deep cases still hard-block.
                     try:
                         hb_raw_reason = str(ta.get("block_reason") or "").strip()
                         hb_log_reason, hb_apply_reason = _mid_trigger_selected_hardblock_reason(hb_raw_reason)
@@ -19091,6 +19103,31 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 except Exception:
                                     pass
                             continue
+                        elif hb_raw_reason:
+                            try:
+                                hb_soft = _mid_soft_block_penalty_for_reason(hb_raw_reason)
+                            except Exception:
+                                hb_soft = None
+                            if hb_soft is not None:
+                                try:
+                                    sp_key, sp_val = hb_soft
+                                    if isinstance(it.get("_trig_checks"), dict):
+                                        _hb_head = hb_raw_reason.split()[0].split("=", 1)[0].strip().lower()
+                                        if _hb_head == "late_entry_atr":
+                                            it["_trig_checks"]["late_entry"] = "skip"
+                                        elif _hb_head in ("anti_bounce_short", "anti_bounce_long"):
+                                            it["_trig_checks"]["anti_bounce"] = "skip"
+                                    tsoft = it.get("_trig_soft_penalties")
+                                    if not isinstance(tsoft, dict):
+                                        tsoft = {}
+                                        it["_trig_soft_penalties"] = tsoft
+                                    tsoft[str(sp_key)] = float(tsoft.get(str(sp_key), 0.0) or 0.0) + float(sp_val)
+                                    it["_trig_soft_reason"] = str(hb_raw_reason)
+                                    _k = f"pending-soft|{sym}|{direction}|{_mid_trap_reason_key(str(hb_raw_reason))}"
+                                    if _mid_trap_should_log(_k):
+                                        logger.info("[mid][pending][soft] %s %s %s reason=%s penalty=%+.1f px=%.6g", sym, market, direction, hb_raw_reason, float(sp_val), float(price))
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
 
@@ -21151,6 +21188,53 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     int(min_score_fut), int(min_score_spot), int(min_conf),
                     int(top_n), float(ttl_min)
                 )
+                try:
+                    late_entry_cfg = float(MID_ULTRA_LATE_ENTRY_ATR_MAX if MID_ULTRA_SAFE else MID_LATE_ENTRY_ATR_MAX)
+                except Exception:
+                    late_entry_cfg = float(os.getenv("MID_LATE_ENTRY_ATR_MAX", "2.2") or 2.2)
+                try:
+                    anti_bounce_cfg = float(MID_ANTI_BOUNCE_ATR_MAX)
+                except Exception:
+                    anti_bounce_cfg = float(os.getenv("MID_ANTI_BOUNCE_ATR_MAX", "1.8") or 1.8)
+                try:
+                    hard_late_mult = float(os.getenv("MID_HARD_LATE_ENTRY_MULT", "1.50") or 1.50)
+                except Exception:
+                    hard_late_mult = 1.50
+                try:
+                    hard_anti_mult = float(os.getenv("MID_HARD_ANTI_BOUNCE_MULT", "1.35") or 1.35)
+                except Exception:
+                    hard_anti_mult = 1.35
+                try:
+                    smart_setup_enabled = str(os.getenv("MID_SMART_SETUP_ENABLED", "1") or "1").strip().lower() in ("1","true","yes","on")
+                except Exception:
+                    smart_setup_enabled = True
+                try:
+                    smart_conf_need = int(float(os.getenv("MID_SMART_SETUP_EMIT_CONF", "90") or 90))
+                except Exception:
+                    smart_conf_need = 90
+                try:
+                    smart_near_atr = float(os.getenv("MID_SMART_SETUP_ZONE_NEAR_ATR", os.getenv("MID_PENDING_NEAR_ATR", "0.30")) or 0.30)
+                except Exception:
+                    smart_near_atr = 0.30
+                try:
+                    smart_near_pct = float(os.getenv("MID_SMART_SETUP_ZONE_NEAR_PCT", "0.004") or 0.004)
+                except Exception:
+                    smart_near_pct = 0.004
+                try:
+                    logger.info(
+                        "[mid][cfg2] soft_blocks=%s late_atr=%s hard_late_mult=%s anti_atr=%s hard_anti_mult=%s smart_setup=%s smart_conf=%s smart_near_atr=%s smart_near_pct=%s",
+                        int(_mid_soft_blocks_enabled()),
+                        float(late_entry_cfg),
+                        float(hard_late_mult),
+                        float(anti_bounce_cfg),
+                        float(hard_anti_mult),
+                        int(smart_setup_enabled),
+                        int(smart_conf_need),
+                        float(smart_near_atr),
+                        float(smart_near_pct),
+                    )
+                except Exception:
+                    pass
             except Exception:
                 pass
             min_rr = float(os.getenv("MID_MIN_RR","2.0"))
