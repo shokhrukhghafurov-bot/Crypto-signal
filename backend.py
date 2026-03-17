@@ -6556,11 +6556,16 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             qty_hint=qty_used,
                         )
 
-                    async def _mark_local_full_close(close_reason: str, *, tp1_hit: bool | None = None, be_moved_value: bool | None = None) -> None:
+                    async def _mark_local_full_close(close_reason: str, *, close_price_value: float | None = None, close_price_source: str | None = None, close_note: str | None = None, tp1_hit: bool | None = None, be_moved_value: bool | None = None) -> None:
                         reason_norm = _normalize_autotrade_close_reason(close_reason or "SYNC_CLOSE")
                         try:
+                            close_px_keep = float(close_price_value) if close_price_value is not None else float(px)
+                        except Exception:
+                            close_px_keep = float(px)
+                        close_px_src = str(close_price_source or ("market" if reason_norm not in ("TP2", "FULL_TP1", "FULL_TP1_NO_TP2", "BE", "SL") else "signal"))
+                        try:
                             logger.info(
-                                "SMART_CLOSE uid=%s market=%s ex=%s sym=%s side=%s virtual=%s px=%.10f entry=%.10f tp1=%.10f tp2=%.10f sl=%.10f be=%.10f qty=%.10f reason=%s px_src=%s",
+                                "SMART_CLOSE uid=%s market=%s ex=%s sym=%s side=%s virtual=%s px=%.10f entry=%.10f tp1=%.10f tp2=%.10f sl=%.10f be=%.10f qty=%.10f reason=%s close_px=%.10f close_px_src=%s note=%s px_src=%s",
                                 uid,
                                 mt,
                                 ex,
@@ -6575,12 +6580,20 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                 float(be_price),
                                 float(qty),
                                 reason_norm,
+                                float(close_px_keep),
+                                close_px_src,
+                                str(close_note or ""),
                                 str(px_src or "-"),
                             )
                         except Exception:
                             pass
                         ref["qty"] = 0.0
                         ref["closed_reason"] = reason_norm
+                        if close_px_keep > 0:
+                            ref["closed_price"] = float(close_px_keep)
+                            ref["closed_price_source"] = close_px_src
+                        if close_note:
+                            ref["closed_note"] = str(close_note)
                         if tp1_hit is not None:
                             ref["tp1_hit"] = bool(tp1_hit)
                         if be_moved_value is not None:
@@ -6596,6 +6609,11 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             "closed_reason": reason_norm,
                             "qty": 0.0,
                         }
+                        if close_px_keep > 0:
+                            patch["closed_price"] = float(close_px_keep)
+                            patch["closed_price_source"] = close_px_src
+                        if close_note:
+                            patch["closed_note"] = str(close_note)
                         if tp1_hit is not None:
                             patch["tp1_hit"] = bool(tp1_hit)
                         if be_moved_value is not None:
@@ -6993,7 +7011,11 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                         except Exception:
                             return max(0.05, min(0.95, float(TP1_PARTIAL_PCT)))
 
-                    async def _notify_smart_decision(trigger: str, decision: str, *, level_label: str, level_price: float, reason: str, cooldown_sec: float = 30.0) -> None:
+                    async def _notify_smart_decision(trigger: str, decision: str, *, level_label: str, level_price: float, reason: str, cooldown_sec: float = 30.0, decision_price: float | None = None) -> None:
+                        try:
+                            px_decision_val = float(decision_price) if decision_price is not None else float(px)
+                        except Exception:
+                            px_decision_val = float(px)
                         txt = _trf(
                             uid,
                             "sm_msg_decision",
@@ -7003,7 +7025,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             side=_sm_side_text(),
                             trigger=trigger,
                             decision=_sm_decision_text(decision),
-                            px_decision=_fmt_sm_price(px),
+                            px_decision=_fmt_sm_price(px_decision_val),
                             level_label=_sm_level_text(level_label),
                             level_price=_fmt_sm_price(level_price),
                             reason=reason,
@@ -7511,7 +7533,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             fail_reason = sl_close_error or last_close_explain or _sm_reason_close_returned_false()
                             await _notify_smart_decision("SL", "NOT CLOSED", level_label="SL", level_price=sl_struct if sl_struct > 0 else sl_hard, reason=fail_reason, cooldown_sec=15.0)
 
-                    # --- TP2 runner management: after strong TP2 touch, hold for extension and exit on peak reversal or direct return to TP2 ---
+                    # --- TP2 runner management: after strong TP2 touch, hold above TP2 and exit by real 1m reversal / micro-structure break / sharp return to TP2 ---
                     if tp2 > 0 and tp2_runner_active:
                         runner_floor = float(tp2_runner_floor_px or tp2 or 0.0)
                         runner_peak = float(tp2_runner_peak_px or px)
@@ -7522,7 +7544,6 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                 tp2_runner_peak_px = float(runner_peak)
                                 dirty = True
                             peak_ext_pct = max(0.0, (runner_peak / max(1e-9, runner_floor) - 1.0) * 100.0) if runner_floor > 0 else 0.0
-                            giveback_from_peak_pct = max(0.0, (1.0 - (px / max(1e-9, runner_peak))) * 100.0) if runner_peak > 0 else 0.0
                             back_to_tp2 = runner_floor > 0 and px <= runner_floor
                         else:
                             if px < runner_peak:
@@ -7531,15 +7552,120 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                 tp2_runner_peak_px = float(runner_peak)
                                 dirty = True
                             peak_ext_pct = max(0.0, (1.0 - (runner_peak / max(1e-9, runner_floor))) * 100.0) if runner_floor > 0 else 0.0
-                            giveback_from_peak_pct = max(0.0, (px / max(1e-9, runner_peak) - 1.0) * 100.0) if runner_peak > 0 else 0.0
                             back_to_tp2 = runner_floor > 0 and px >= runner_floor
 
                         runner_ready = (now_ts - float(tp2_runner_armed_ts or 0.0)) >= max(0.0, float(TP2_RUN_MIN_HOLD_SEC))
                         tp2_runner_reason = ""
-                        if runner_ready and back_to_tp2:
+                        tp2_runner_reason_user = ""
+                        tp2_runner_close_px = float(px)
+
+                        if back_to_tp2:
                             tp2_runner_reason = f"tp2_return peak_ext={peak_ext_pct:.2f}% peak={runner_peak:.4f} floor={runner_floor:.4f}"
-                        elif runner_ready and peak_ext_pct >= float(TP2_RUN_MIN_PEAK_EXT_PCT) and giveback_from_peak_pct >= float(TP2_RUN_PEAK_GIVEBACK_PCT):
-                            tp2_runner_reason = f"tp2_peak_reversal peak_ext={peak_ext_pct:.2f}% giveback={giveback_from_peak_pct:.2f}% peak={runner_peak:.4f}"
+                            tp2_runner_close_px = float(px)
+                            tp2_runner_reason_user = _trf(
+                                uid,
+                                "sm_reason_tp2_runner_return_tp2",
+                                close_price=_fmt_sm_price(tp2_runner_close_px),
+                                tp2_price=_fmt_sm_price(tp2),
+                                peak_price=_fmt_sm_price(runner_peak),
+                            )
+                        elif runner_ready and price_backend is not None and hasattr(price_backend, "load_candles"):
+                            try:
+                                tp2_run_pullback_min_pct = max(0.01, float(os.getenv("SMART_TP2_RUN_1M_PULLBACK_MIN_PCT", "0.10") or 0.10))
+                            except Exception:
+                                tp2_run_pullback_min_pct = 0.10
+                            try:
+                                tp2_run_micro_lookback = max(4, int(os.getenv("SMART_TP2_RUN_1M_MICRO_LOOKBACK", "6") or 6))
+                            except Exception:
+                                tp2_run_micro_lookback = 6
+                            try:
+                                df1m_run = await price_backend.load_candles(symbol, "1m", mt, limit=max(20, tp2_run_micro_lookback + 6))
+                            except Exception:
+                                df1m_run = pd.DataFrame()
+                            df1m_run = _mid_norm_ohlcv(df1m_run)
+                            if df1m_run is not None and not getattr(df1m_run, "empty", True) and len(df1m_run) >= 4:
+                                df1m_run = df1m_run.copy().reset_index(drop=True)
+                                if "open_time_ms" in df1m_run.columns:
+                                    try:
+                                        close_ms = pd.to_numeric(df1m_run["open_time_ms"], errors="coerce").fillna(0).astype("int64") + 60000
+                                        mask_closed = (close_ms <= int(now_ts * 1000)) & (close_ms > int(float(tp2_runner_armed_ts or 0.0) * 1000))
+                                        df1m_closed = df1m_run.loc[mask_closed].copy().reset_index(drop=True)
+                                    except Exception:
+                                        df1m_closed = df1m_run.iloc[:-1].copy().reset_index(drop=True)
+                                else:
+                                    df1m_closed = df1m_run.iloc[:-1].copy().reset_index(drop=True)
+
+                                if len(df1m_closed) >= 1:
+                                    last_c = df1m_closed.iloc[-1]
+                                    last_open = float(last_c.get("open") or 0.0)
+                                    last_high = float(last_c.get("high") or 0.0)
+                                    last_low = float(last_c.get("low") or 0.0)
+                                    last_close = float(last_c.get("close") or 0.0)
+                                    tp2_runner_close_px = float(last_close or px)
+                                    if direction == "LONG":
+                                        pullback_from_peak_pct = max(0.0, (1.0 - (tp2_runner_close_px / max(1e-9, runner_peak))) * 100.0) if runner_peak > 0 else 0.0
+                                        first_opposite = (last_close < last_open) and (pullback_from_peak_pct >= tp2_run_pullback_min_pct)
+                                        micro_break = False
+                                        if len(df1m_closed) >= max(4, tp2_run_micro_lookback):
+                                            recent = df1m_closed.tail(tp2_run_micro_lookback).reset_index(drop=True)
+                                            highs = recent["high"].astype(float).tolist()
+                                            lows = recent["low"].astype(float).tolist()
+                                            lc = float(recent["close"].astype(float).iloc[-1])
+                                            prev_hi = max(highs[:-2]) if len(highs) >= 3 else highs[-2]
+                                            prev_lo = min(lows[:-2]) if len(lows) >= 3 else lows[-2]
+                                            micro_break = (highs[-2] < prev_hi) and (lows[-2] < prev_lo) and (lc < lows[-2])
+                                        if first_opposite:
+                                            tp2_runner_reason = f"tp2_first_red_1m peak_ext={peak_ext_pct:.2f}% pullback={pullback_from_peak_pct:.2f}% peak={runner_peak:.4f} c1m={last_close:.4f}"
+                                            tp2_runner_reason_user = _trf(
+                                                uid,
+                                                "sm_reason_tp2_runner_first_opposite",
+                                                close_price=_fmt_sm_price(tp2_runner_close_px),
+                                                tp2_price=_fmt_sm_price(tp2),
+                                                peak_price=_fmt_sm_price(runner_peak),
+                                                pullback_pct=f"{pullback_from_peak_pct:.2f}",
+                                            )
+                                        elif micro_break:
+                                            tp2_runner_reason = f"tp2_micro_break_1m peak_ext={peak_ext_pct:.2f}% peak={runner_peak:.4f} c1m={last_close:.4f}"
+                                            tp2_runner_reason_user = _trf(
+                                                uid,
+                                                "sm_reason_tp2_runner_micro_break",
+                                                pattern="LH/LL break",
+                                                close_price=_fmt_sm_price(tp2_runner_close_px),
+                                                tp2_price=_fmt_sm_price(tp2),
+                                                peak_price=_fmt_sm_price(runner_peak),
+                                            )
+                                    else:
+                                        pullback_from_peak_pct = max(0.0, (tp2_runner_close_px / max(1e-9, runner_peak) - 1.0) * 100.0) if runner_peak > 0 else 0.0
+                                        first_opposite = (last_close > last_open) and (pullback_from_peak_pct >= tp2_run_pullback_min_pct)
+                                        micro_break = False
+                                        if len(df1m_closed) >= max(4, tp2_run_micro_lookback):
+                                            recent = df1m_closed.tail(tp2_run_micro_lookback).reset_index(drop=True)
+                                            highs = recent["high"].astype(float).tolist()
+                                            lows = recent["low"].astype(float).tolist()
+                                            lc = float(recent["close"].astype(float).iloc[-1])
+                                            prev_hi = min(highs[:-2]) if len(highs) >= 3 else highs[-2]
+                                            prev_lo = max(lows[:-2]) if len(lows) >= 3 else lows[-2]
+                                            micro_break = (highs[-2] > prev_hi) and (lows[-2] > prev_lo) and (lc > highs[-2])
+                                        if first_opposite:
+                                            tp2_runner_reason = f"tp2_first_green_1m peak_ext={peak_ext_pct:.2f}% pullback={pullback_from_peak_pct:.2f}% peak={runner_peak:.4f} c1m={last_close:.4f}"
+                                            tp2_runner_reason_user = _trf(
+                                                uid,
+                                                "sm_reason_tp2_runner_first_opposite",
+                                                close_price=_fmt_sm_price(tp2_runner_close_px),
+                                                tp2_price=_fmt_sm_price(tp2),
+                                                peak_price=_fmt_sm_price(runner_peak),
+                                                pullback_pct=f"{pullback_from_peak_pct:.2f}",
+                                            )
+                                        elif micro_break:
+                                            tp2_runner_reason = f"tp2_micro_break_1m peak_ext={peak_ext_pct:.2f}% peak={runner_peak:.4f} c1m={last_close:.4f}"
+                                            tp2_runner_reason_user = _trf(
+                                                uid,
+                                                "sm_reason_tp2_runner_micro_break",
+                                                pattern="HH/HL break",
+                                                close_price=_fmt_sm_price(tp2_runner_close_px),
+                                                tp2_price=_fmt_sm_price(tp2),
+                                                peak_price=_fmt_sm_price(runner_peak),
+                                            )
 
                         if tp2_runner_reason:
                             close_ok = False
@@ -7550,8 +7676,8 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                 tp2_runner_close_error = str(e)
                                 _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] tp2-runner close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
                             if close_ok:
-                                await _notify_smart_decision("TP2", "CLOSED", level_label="TP2", level_price=tp2, reason=_sm_join_reason(tp2_runner_reason, last_close_explain or _sm_reason_market_close_sent(last_close_norm_qty or qty)), cooldown_sec=5.0)
-                                await _mark_local_full_close("TP2_RUNNER", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
+                                await _notify_smart_decision("TP2", "CLOSED", level_label="TP2", level_price=tp2, decision_price=tp2_runner_close_px, reason=_sm_join_reason(tp2_runner_reason_user or tp2_runner_reason, last_close_explain or _sm_reason_market_close_sent(last_close_norm_qty or qty)), cooldown_sec=5.0)
+                                await _mark_local_full_close("TP2_RUNNER", close_price_value=tp2_runner_close_px, close_price_source="market", close_note=tp2_runner_reason, tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
                                 pnl_usdt, roi_percent = _smart_close_snapshot()
 
                                 await db_store.close_autotrade_position(
@@ -7603,7 +7729,10 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                     "NOT CLOSED",
                                     level_label="TP2",
                                     level_price=tp2,
-                                    reason=f"strong_impulse run_above_tp2 mom={tp2_mom_fav_pct:.2f}% prob={tp2_prob_now:.2f}; exit=peak_reversal_or_return_to_tp2",
+                                    reason=_sm_join_reason(
+                                        _tr(uid, "sm_reason_tp2_runner_started"),
+                                        f"mom={tp2_mom_fav_pct:.2f}% prob={tp2_prob_now:.2f}",
+                                    ),
                                     cooldown_sec=10.0,
                                 )
                             else:
@@ -9683,6 +9812,7 @@ def _human_close_reason(uid: int, code: str | None, **kv: Any) -> str:
         "SMART_HARD_SL": "reason_smart_hard_sl",
         "TRAIL_EXIT": "reason_trail_exit",
         "REVERSAL_EXIT": "reason_reversal_exit",
+        "TP2_RUNNER": "reason_tp2_runner_exit",
         "FULL_TP1": "reason_tp2_reached",
         "FULL_TP1_NO_TP2": "reason_tp2_reached",
         "BE": "reason_smart_be",
@@ -9736,6 +9866,7 @@ AUTOTRADE_CLOSED_REASON_CANON = {
     "FULL_TP1",
     "FULL_TP1_NO_TP2",
     "TP2",
+    "TP2_RUNNER",
     "BE",
     "REVERSAL_EXIT",
     "TRAIL_EXIT",
@@ -9788,6 +9919,7 @@ def map_closed_reason_to_trade_result(reason: str | None, roi: float | None = No
         "FULL_TP1": {"trade_status": "WIN", "trade_result": "WIN", "card_reason": "FULL_TP1", "close_price_source": "tp1"},
         "FULL_TP1_NO_TP2": {"trade_status": "WIN", "trade_result": "WIN", "card_reason": "FULL_TP1_NO_TP2", "close_price_source": "tp1"},
         "TP2": {"trade_status": "WIN", "trade_result": "WIN", "card_reason": "TP2", "close_price_source": "tp2"},
+        "TP2_RUNNER": {"trade_status": "WIN", "trade_result": "WIN", "card_reason": "TP2_RUNNER", "close_price_source": "market"},
         "BE": {"trade_status": "BE", "trade_result": "BE", "card_reason": "BE", "close_price_source": "be"},
         "REVERSAL_EXIT": {"trade_status": "WIN", "trade_result": "WIN", "card_reason": "REVERSAL_EXIT", "close_price_source": "market"},
         "TRAIL_EXIT": {"trade_status": "WIN", "trade_result": "WIN", "card_reason": "TRAIL_EXIT", "close_price_source": "market"},
@@ -16609,8 +16741,14 @@ class Backend:
                             trade_status = str(mapped_close.get("trade_status") or "CLOSED")
                             close_px = float(s.entry or 0.0)
                             try:
+                                pos_closed_px = float(pos_meta.get("closed_price") or pos_ref.get("closed_price") or 0.0)
+                            except Exception:
+                                pos_closed_px = 0.0
+                            try:
                                 px_src = str(mapped_close.get("close_price_source") or "market")
-                                if px_src == "be":
+                                if pos_closed_px > 0:
+                                    close_px = float(pos_closed_px)
+                                elif px_src == "be":
                                     close_px = float(pos_be_price or s.entry or 0.0)
                                 elif px_src == "tp2" and float(getattr(s, "tp2", 0.0) or 0.0) > 0:
                                     close_px = float(getattr(s, "tp2", 0.0) or 0.0)
