@@ -25197,6 +25197,21 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 market=marketu,
                                                 adx_30m=float((base_r.get("adx4") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
                                             )
+                                            try:
+                                                _late_relief_ok_now, _late_relief_reason_now, _late_relief_meta_now = _mid_pending_trigger_breakout_late_relief(
+                                                    rec,
+                                                    now_ts=time.time(),
+                                                    in_zone_now=bool(_in_zone_now),
+                                                )
+                                            except Exception:
+                                                _late_relief_ok_now, _late_relief_reason_now, _late_relief_meta_now = (False, "", {})
+                                            if _late_reason_now and _late_relief_ok_now:
+                                                try:
+                                                    rec["smart_emit_late_relief"] = str(_late_relief_reason_now or "fresh_breakout_zone")
+                                                    rec["smart_emit_late_relief_meta"] = dict(_late_relief_meta_now or {})
+                                                except Exception:
+                                                    pass
+                                                _late_reason_now = None
                                             _late_ok_now = not bool(_late_reason_now)
                                             _anti_ok_now = not bool(_anti_reason_now)
                                             _df5i_now = locals().get("df5i")
