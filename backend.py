@@ -12058,6 +12058,89 @@ def _mid_pending_recency_guard(rec: dict, *, now_ts: float | None = None) -> tup
     return (True, "", meta)
 
 
+def _mid_pending_trigger_breakout_late_relief(rec: dict, *, now_ts: float | None = None, in_zone_now: bool = False) -> tuple[bool, str, dict]:
+    """Allow a narrow, very fresh BO/RT pending to survive trigger-time late_entry.
+
+    This is intentionally stricter than smart-setup fastpath: we only relax the
+    trigger-time late-entry blocker when the pending is already inside the zone,
+    the zone is reasonably narrow, and the breakout age is still extremely fresh.
+    It prevents false `late_entry` on fresh BO/RT retests without reopening the
+    older stale-pending problem.
+    """
+    meta: dict = {}
+    try:
+        enabled = str(os.getenv("MID_PENDING_TRIGGER_BREAKOUT_LATE_BYPASS", "1")).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        enabled = True
+    if not enabled:
+        return (False, "disabled", meta)
+    if not isinstance(rec, dict) or not bool(in_zone_now):
+        return (False, "not_in_zone", meta)
+
+    try:
+        _, _, gmeta = _mid_pending_recency_guard(rec, now_ts=now_ts)
+        if isinstance(gmeta, dict):
+            meta.update(gmeta)
+    except Exception:
+        gmeta = {}
+
+    bo = str(rec.get("bo_rt") or rec.get("breakout_retest") or meta.get("bo") or "").strip()
+    bo_u = bo.upper()
+    bo_active = bool(bo) and bo not in ("-", "—", "NONE") and ("BO" in bo_u)
+    if not bo_active:
+        return (False, "no_bo", meta)
+
+    try:
+        width_guard = meta.get("zone_width_atr_guard")
+        if width_guard is None and rec.get("zone_width_atr") is not None:
+            width_guard = float(rec.get("zone_width_atr"))
+        width_guard = float(width_guard) if width_guard is not None else None
+    except Exception:
+        width_guard = None
+    try:
+        max_w = float(os.getenv("MID_PENDING_TRIGGER_BREAKOUT_LATE_BYPASS_MAX_ZONE_ATR", "1.60") or 1.60)
+    except Exception:
+        max_w = 1.60
+    if width_guard is None or width_guard <= 0:
+        return (False, "zone_width_unknown", meta)
+    if max_w > 0 and width_guard > max_w:
+        return (False, f"zone_too_wide:{float(width_guard):.2f}>{float(max_w):g}", meta)
+
+    try:
+        total_bars = meta.get("bo_total_age_bars")
+        if total_bars is None and rec.get("breakout_first_age_bars_create") is not None:
+            bar_sec = max(1, int(float(rec.get("breakout_bar_sec") or 300)))
+            created_ts = float(rec.get("created_ts") or 0.0)
+            now_v = float(now_ts if now_ts is not None else time.time())
+            age_sec = max(0.0, now_v - created_ts) if created_ts > 0 else 0.0
+            total_bars = int(float(rec.get("breakout_first_age_bars_create") or 0) + round(age_sec / float(bar_sec)))
+        total_bars = int(total_bars) if total_bars is not None else None
+    except Exception:
+        total_bars = None
+    if total_bars is None:
+        return (False, "bo_age_unknown", meta)
+
+    try:
+        max_bars_rt = int(float(os.getenv("MID_PENDING_TRIGGER_BREAKOUT_LATE_BYPASS_MAX_BARS_RT", "2") or 2))
+    except Exception:
+        max_bars_rt = 2
+    try:
+        max_bars_bo = int(float(os.getenv("MID_PENDING_TRIGGER_BREAKOUT_LATE_BYPASS_MAX_BARS_BO", "1") or 1))
+    except Exception:
+        max_bars_bo = 1
+    max_bars = max_bars_rt if ("RT" in bo_u or "+RT" in bo_u) else max_bars_bo
+    if max_bars > 0 and total_bars > max_bars:
+        return (False, f"bo_too_old:{int(total_bars)}>{int(max_bars)}", meta)
+
+    meta.update({
+        "bo": bo,
+        "bo_total_age_bars": total_bars,
+        "zone_width_atr_guard": width_guard,
+        "late_relief": True,
+    })
+    return (True, f"fresh_breakout_zone:{bo}:{int(total_bars)}b", meta)
+
+
 def _mid_order_block(df30i: pd.DataFrame, *, direction: str, atr30: float) -> Tuple[Optional[Tuple[float, float]], bool]:
     """Detect a simple order block on 30m and whether current 5m price is retesting it.
     Returns (zone(low,high), valid_found). Zone is in absolute price.
@@ -18057,6 +18140,20 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
                 if not ok_q:
                     removed += 1
                     continue
+                try:
+                    _bo_lbl = str(it.get("bo_rt") or it.get("breakout_retest") or "").strip()
+                    if _bo_lbl and _bo_lbl not in ("-", "—", "NONE") and it.get("breakout_first_age_bars_create") is None and it.get("created_ts") is not None:
+                        it["breakout_first_age_bars_create"] = 0
+                        try:
+                            it["breakout_first_age_sec_create"] = 0.0
+                            if it.get("breakout_first_ts") is None:
+                                it["breakout_first_ts"] = int(float(it.get("created_ts")) * 1000.0)
+                            if not it.get("breakout_meta_source"):
+                                it["breakout_meta_source"] = "load_approx_from_create"
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 ok_guard, _, _ = _mid_pending_recency_guard(it, now_ts=now_ts)
                 if not ok_guard:
                     removed += 1
@@ -19816,6 +19913,27 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     try:
                         hb_raw_reason = str(ta.get("block_reason") or "").strip()
                         hb_log_reason, hb_apply_reason = _mid_trigger_selected_hardblock_reason(hb_raw_reason)
+                        try:
+                            _late_relief_ok, _late_relief_reason, _late_relief_meta = _mid_pending_trigger_breakout_late_relief(
+                                it,
+                                now_ts=now,
+                                in_zone_now=bool(_in_zone_for_trigger or _entered_zone_for_trigger),
+                            )
+                        except Exception:
+                            _late_relief_ok, _late_relief_reason, _late_relief_meta = (False, "", {})
+                        if hb_apply_reason == "late_entry" and _late_relief_ok:
+                            try:
+                                if isinstance(it.get("_trig_reqs"), dict):
+                                    it["_trig_reqs"]["late_entry"] = False
+                                if isinstance(it.get("_trig_checks"), dict):
+                                    it["_trig_checks"]["late_entry"] = "skip"
+                                it["_trig_term_reason"] = str(_late_relief_reason or "fresh_breakout_zone")
+                                it["_trig_primary_reason"] = str(_late_relief_reason or "fresh_breakout_zone")
+                                it["_trig_late_relief"] = str(_late_relief_reason or "fresh_breakout_zone")
+                                it["_trig_late_relief_meta"] = dict(_late_relief_meta or {})
+                            except Exception:
+                                pass
+                            hb_log_reason, hb_apply_reason = (None, None)
                         if hb_apply_reason:
                             try:
                                 if hb_apply_reason == "vol_low":
@@ -19922,6 +20040,21 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             market=market,
                             adx_30m=float(ta.get("adx4") or ta.get("adx_30m") or 0.0) if ta else None,
                         )
+                        try:
+                            _late_relief_ok_now, _late_relief_reason_now, _late_relief_meta_now = _mid_pending_trigger_breakout_late_relief(
+                                it,
+                                now_ts=now,
+                                in_zone_now=bool(in_zone_now),
+                            )
+                        except Exception:
+                            _late_relief_ok_now, _late_relief_reason_now, _late_relief_meta_now = (False, "", {})
+                        if late_reason_now and _late_relief_ok_now:
+                            try:
+                                it["instant_emit_late_relief"] = str(_late_relief_reason_now or "fresh_breakout_zone")
+                                it["instant_emit_late_relief_meta"] = dict(_late_relief_meta_now or {})
+                            except Exception:
+                                pass
+                            late_reason_now = None
                         late_ok_now = not bool(late_reason_now)
                         anti_ok_now = not bool(anti_reason_now)
                         micro_ok_now = bool(ta.get("trap_ok", False))
@@ -25143,7 +25276,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 breakout_fresh_reason=str(_breakout_fast_reason or ""),
                                                 breakout_bypass_zone=bool(_breakout_fast_ok),
                                                 breakout_bypass_near_extreme=False,
-                                                breakout_bypass_late_entry=False,
+                                                breakout_bypass_late_entry=bool(_late_relief_ok_now),
                                             )
 
                                             try:
