@@ -515,6 +515,13 @@ import statistics
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List, Any
 
+from smart_manager_core import (
+    SmartDecisionEngine,
+    SmartExitEngine,
+    SmartPositionState,
+    clamp01,
+)
+
 ### MID AUTO-TUNE (TP2 hit-rate control)
 _MID_AUTOTUNE_ENABLED = os.getenv("MID_AUTOTUNE_ENABLED", "0").strip().lower() not in ("0","false","no","off")
 _MID_AUTOTUNE_TARGET = float(os.getenv("MID_AUTOTUNE_TARGET", "0.70") or 0.70)
@@ -880,6 +887,16 @@ def get_autotrade_master_key() -> str:
     return key
 
 logger = logging.getLogger("crypto-signal")
+
+
+def _smart_log_exception(context: str, exc: Exception, *, level: str = "warning") -> None:
+    """Log smart-manager exceptions instead of silently swallowing them."""
+    try:
+        log_fn = logger.warning if str(level).lower() == "warning" else logger.exception
+        log_fn("[smart-manager] %s: %s", context, exc)
+    except Exception:
+        pass
+
 
 def _smart_setup_log(event: str, **fields) -> None:
     """Robust smart-setup logger with stdout fallback when logger handlers are absent.
@@ -1995,6 +2012,9 @@ _SL_BUFFER_PCT = float(os.getenv("SL_BUFFER_PCT", "0.05") or 0.05)
 # Smart Trade Manager PRO — ENV (SAFE DEFAULTS)
 # These globals MUST exist because some parts of the code (e.g., track_loop)
 # reference SMART_* names directly. If an env var is missing or malformed,
+# we still keep structural management deterministic. Note: SMART_ARM_SL_AFTER_PCT
+# is preserved for backward compatibility, but structural SL now arms immediately
+# when an explicit SL exists; anti-noise confirmation is handled separately.
 # we fall back to safe defaults (no NameError, no crash).
 # =======================
 
@@ -6125,8 +6145,8 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                         try:
                             meta.update(patch)
                             r["meta"] = meta
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            _smart_log_exception("smart_close_log", e)
                     except Exception:
                         pass
 
@@ -6412,8 +6432,8 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                 "last_reconcile_error_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                                 "last_reconcile_rate_limited": bool(is_binance_rl),
                             })
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            _smart_log_exception("smart_close_ref_persist", e)
                         if is_binance_rl:
                             logger.info("Soft reconcile skipped for pos_id=%s due to Binance rate limit: %s", pos_id, e)
                         else:
@@ -6456,8 +6476,8 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                             await _bybit_cancel_order(api_key=api_key, api_secret=api_secret, category=cat, symbol=symbol, order_id=str(oid))
                                     except Exception:
                                         pass
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            _smart_log_exception("smart_close_meta_sync", e)
                         # Clear stored child order ids so legacy branch won't touch them.
                         ref["tp1_order_id"] = None
                         ref["tp2_order_id"] = None
@@ -6585,8 +6605,8 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                 str(close_note or ""),
                                 str(px_src or "-"),
                             )
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            _smart_log_exception("smart_notify_send", e)
                         ref["qty"] = 0.0
                         ref["closed_reason"] = reason_norm
                         if close_px_keep > 0:
@@ -6852,7 +6872,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                     now_ts = time.time()
 
                     # Tunables (env)
-                    ARM_SL_AFTER_PCT = float(os.getenv("SMART_ARM_SL_AFTER_PCT", "0.22") or 0.22)          # arm normal SL after +X% move in favor
+                    ARM_SL_AFTER_PCT = float(os.getenv("SMART_ARM_SL_AFTER_PCT", "0.22") or 0.22)          # legacy compatibility knob; structural SL below arms immediately when SL exists
                     HARD_SL_PCT      = float(os.getenv("SMART_HARD_SL_PCT", "2.80") or 2.80)               # emergency stop while SL is not armed
 
                     # TP1 -> TP2 probability decision
@@ -6903,21 +6923,28 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                     TP2_RUN_PEAK_GIVEBACK_PCT = _env_float_mid("SMART_TP2_RUN_PEAK_GIVEBACK_PCT", 0.24, is_mid)
                     TP2_RUN_MIN_HOLD_SEC = _env_float_mid("SMART_TP2_RUN_MIN_HOLD_SEC", 1.0, is_mid)
 
-                    # Persistent state in ref
-                    state = str(ref.get("sm_state") or "INIT").upper()
-                    armed_sl = bool(ref.get("armed_sl"))
-                    tp1_seen = bool(ref.get("tp1_seen"))
-                    tp1_partial = bool(ref.get("tp1_partial"))
-                    tp1_ts = float(ref.get("tp1_ts") or 0.0)
-                    be_pending = bool(ref.get("be_pending"))
-                    last_px = float(ref.get("last_px") or px)
-                    last_px_ts = float(ref.get("last_px_ts") or now_ts)
-                    best_px = float(ref.get("best_px") or px)
-                    hard_sl = float(ref.get("hard_sl") or 0.0)
-                    tp2_runner_active = bool(ref.get("tp2_runner_active"))
-                    tp2_runner_peak_px = float(ref.get("tp2_runner_peak_px") or px)
-                    tp2_runner_floor_px = float(ref.get("tp2_runner_floor_px") or tp2 or 0.0)
-                    tp2_runner_armed_ts = float(ref.get("tp2_runner_armed_ts") or 0.0)
+                    # Persistent state in ref (typed overlay to reduce fragile dict access).
+                    sm_pos = SmartPositionState.from_ref(
+                        ref,
+                        direction=direction,
+                        entry_price=entry_p,
+                        current_price=px,
+                        now_ts=now_ts,
+                    )
+                    state = sm_pos.sm_state
+                    armed_sl = sm_pos.armed_sl
+                    tp1_seen = sm_pos.tp1_seen
+                    tp1_partial = sm_pos.tp1_partial
+                    tp1_ts = sm_pos.tp1_ts
+                    be_pending = sm_pos.be_pending
+                    last_px = sm_pos.last_px
+                    last_px_ts = sm_pos.last_px_ts
+                    best_px = sm_pos.best_px
+                    hard_sl = sm_pos.hard_sl
+                    tp2_runner_active = sm_pos.tp2_runner_active
+                    tp2_runner_peak_px = sm_pos.tp2_runner_peak_px
+                    tp2_runner_floor_px = float(sm_pos.tp2_runner_floor_px or tp2 or 0.0)
+                    tp2_runner_armed_ts = sm_pos.tp2_runner_armed_ts
 
                     dirty = False
                     last_close_explain = ""
@@ -6991,25 +7018,19 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                         return "; ".join(out)
 
                     def _clamp01(v: float) -> float:
-                        try:
-                            return max(0.0, min(1.0, float(v)))
-                        except Exception:
-                            return 0.0
+                        return clamp01(v)
 
                     def _smart_dynamic_partial_pct(*, prob_tp2: float, prog_to_tp2: float, mom_fav_pct: float, dist_pct: float, giveback_frac: float) -> float:
-                        try:
-                            p_min = max(0.05, min(0.95, float(TP1_PARTIAL_MIN_PCT)))
-                            p_max = max(p_min, min(0.95, float(TP1_PARTIAL_MAX_PCT)))
-                            base_pct = max(p_min, min(p_max, float(TP1_PARTIAL_PCT)))
-                            hold_score = 0.70 * _clamp01(prob_tp2) + 0.20 * _clamp01(prog_to_tp2)
-                            if dist_pct > 0:
-                                hold_score += 0.10 * _clamp01(float(mom_fav_pct) / max(0.05, float(dist_pct)))
-                            hold_score -= 0.20 * _clamp01(giveback_frac)
-                            hold_score = _clamp01(hold_score)
-                            dyn_pct = p_max - ((p_max - p_min) * hold_score)
-                            return max(p_min, min(p_max, (float(base_pct) + float(dyn_pct)) / 2.0))
-                        except Exception:
-                            return max(0.05, min(0.95, float(TP1_PARTIAL_PCT)))
+                        return SmartDecisionEngine.compute_dynamic_partial_pct(
+                            prob_tp2=prob_tp2,
+                            prog_to_tp2=prog_to_tp2,
+                            mom_fav_pct=mom_fav_pct,
+                            dist_pct=dist_pct,
+                            giveback_frac=giveback_frac,
+                            tp1_partial_pct=TP1_PARTIAL_PCT,
+                            tp1_partial_min_pct=TP1_PARTIAL_MIN_PCT,
+                            tp1_partial_max_pct=TP1_PARTIAL_MAX_PCT,
+                        )
 
                     async def _notify_smart_decision(trigger: str, decision: str, *, level_label: str, level_price: float, reason: str, cooldown_sec: float = 30.0, decision_price: float | None = None) -> None:
                         try:
@@ -7120,76 +7141,48 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                         last_px_ts = float(now_ts)
                         dirty = True
 
-                    # Arm normal SL only after a small move in favor (so we don't "arm into a dump")
-                    # For FUTURES we treat SL as structure: arm immediately if SL is provided.
-                    # (Noise handling is done via confirmation in SMART STRUCTURAL SL below.)
-                    if (not armed_sl) and float(sl or 0.0) > 0:
+                    # Structural SL arms as soon as an explicit SL exists. False breaches are handled
+                    # by the structural confirmation logic below, which is safer than delaying the arm.
+                    if SmartDecisionEngine.should_arm_sl(sl_price=sl, armed_sl=armed_sl):
                         armed_sl = True
                         ref["armed_sl"] = True
                         ref["sm_state"] = "PROTECT"
                         dirty = True
                     # Reversal exit (close near the top/bottom when retrace starts)
                     if entry_p > 0 and best_px > 0:
-                        tp2_prob_now = _clamp01(float(ref.get("tp2_prob") or 0.0))
-                        tp1_mode_now = str(ref.get("tp1_mode") or "").upper()
-                        rev_gain_need = float(PEAK_MIN_GAIN_PCT)
-                        rev_retr_need = float(REV_EXIT_PCT)
-                        if tp1_mode_now == "HOLD_TO_TP2":
-                            rev_gain_need *= (1.15 + 0.35 * tp2_prob_now)
-                            rev_retr_need *= (1.25 + 0.55 * tp2_prob_now)
-                        elif bool(ref.get("tp1_partial")):
-                            rev_gain_need *= 1.05
-                            rev_retr_need *= 1.10
-                        elif not tp1_seen:
-                            rev_gain_need *= 0.95
-                        if direction == "LONG":
-                            gain_pct = (best_px / entry_p - 1.0) * 100.0
-                            retr_pct = (1.0 - (px / best_px)) * 100.0 if best_px > 0 else 0.0
-                            if gain_pct >= rev_gain_need and retr_pct >= rev_retr_need:
-                                close_ok = False
-                                try:
-                                    close_ok = await _close_market(qty)
-                                except Exception as e:
-                                    _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                                if close_ok:
-                                    await _mark_local_full_close("REVERSAL_EXIT", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
-                                    pnl_usdt, roi_percent = _smart_close_snapshot()
+                        reversal_exit = SmartExitEngine.evaluate_reversal_exit(
+                            direction=direction,
+                            entry_price=entry_p,
+                            current_price=px,
+                            best_price=best_px,
+                            peak_min_gain_pct=PEAK_MIN_GAIN_PCT,
+                            reversal_exit_pct=REV_EXIT_PCT,
+                            tp1_mode=str(ref.get("tp1_mode") or ""),
+                            tp1_partial=bool(ref.get("tp1_partial")),
+                            tp2_probability=float(ref.get("tp2_prob") or 0.0),
+                            tp1_seen=tp1_seen,
+                        )
+                        if reversal_exit.should_close:
+                            close_ok = False
+                            try:
+                                close_ok = await _close_market(qty)
+                            except Exception as e:
+                                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                            if close_ok:
+                                await _mark_local_full_close("REVERSAL_EXIT", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
+                                pnl_usdt, roi_percent = _smart_close_snapshot()
 
-                                    await db_store.close_autotrade_position(
-                                        user_id=uid,
-                                        signal_id=r.get("signal_id"),
-                                        exchange=ex,
-                                        market_type=mt,
-                                        status="CLOSED",
-                                        pnl_usdt=pnl_usdt,
-                                        roi_percent=roi_percent,
-                                        row_id=int(r.get("id") or 0),
-                                    )
-                                    continue
-                        else:
-                            gain_pct = (1.0 - (best_px / entry_p)) * 100.0
-                            retr_pct = ((px / best_px) - 1.0) * 100.0 if best_px > 0 else 0.0
-                            if gain_pct >= rev_gain_need and retr_pct >= rev_retr_need:
-                                close_ok = False
-                                try:
-                                    close_ok = await _close_market(qty)
-                                except Exception as e:
-                                    _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
-                                if close_ok:
-                                    await _mark_local_full_close("REVERSAL_EXIT", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
-                                    pnl_usdt, roi_percent = _smart_close_snapshot()
-
-                                    await db_store.close_autotrade_position(
-                                        user_id=uid,
-                                        signal_id=r.get("signal_id"),
-                                        exchange=ex,
-                                        market_type=mt,
-                                        status="CLOSED",
-                                        pnl_usdt=pnl_usdt,
-                                        roi_percent=roi_percent,
-                                        row_id=int(r.get("id") or 0),
-                                    )
-                                    continue
+                                await db_store.close_autotrade_position(
+                                    user_id=uid,
+                                    signal_id=r.get("signal_id"),
+                                    exchange=ex,
+                                    market_type=mt,
+                                    status="CLOSED",
+                                    pnl_usdt=pnl_usdt,
+                                    roi_percent=roi_percent,
+                                    row_id=int(r.get("id") or 0),
+                                )
+                                continue
 
                     # Effective SL: before arming -> HARD SL only; after arming -> original SL (fallback to HARD if missing)
 
@@ -7220,43 +7213,31 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             gain_now_pct = (1.0 - (px / entry_p)) * 100.0
 
                     # --- Weakness exit BEFORE TP1: protect early profit if the move fades before target ---
-                    best_gain_pct = 0.0
-                    giveback_pct = 0.0
-                    giveback_frac = 0.0
-                    progress_to_tp1 = 0.0
-                    if entry_p > 0 and best_px > 0:
-                        if direction == "LONG":
-                            best_gain_pct = (best_px / entry_p - 1.0) * 100.0
-                        else:
-                            best_gain_pct = (1.0 - (best_px / entry_p)) * 100.0
-                    if tp1 > 0 and entry_p > 0 and tp1 != entry_p:
-                        if direction == "LONG":
-                            progress_to_tp1 = (best_px - entry_p) / (tp1 - entry_p)
-                        else:
-                            progress_to_tp1 = (entry_p - best_px) / (entry_p - tp1)
-                        progress_to_tp1 = max(0.0, min(1.5, float(progress_to_tp1)))
-                    if best_gain_pct > 0:
-                        giveback_pct = max(0.0, best_gain_pct - gain_now_pct)
-                        giveback_frac = giveback_pct / max(1e-9, best_gain_pct)
-
-                    weakness_before_tp1 = bool(
-                        WEAKNESS_EXIT_ENABLED
-                        and tp1 > 0
-                        and (not tp1_seen)
-                        and gain_now_pct >= max(float(WEAKNESS_MIN_RETAIN_PCT), 0.0)
-                        and best_gain_pct >= float(WEAKNESS_MIN_GAIN)
-                        and progress_to_tp1 >= float(WEAKNESS_MIN_TP1_PROGRESS)
-                        and progress_to_tp1 <= float(WEAKNESS_TP1_PROGRESS_MAX)
-                        and giveback_pct >= float(WEAKNESS_MIN_GIVEBACK)
-                        and giveback_frac >= float(WEAKNESS_GIVEBACK_FRAC)
-                        and neg_count >= max(1, int(WEAKNESS_NEG_HITS))
+                    weakness_eval = SmartExitEngine.evaluate_weakness_exit(
+                        direction=direction,
+                        entry_price=entry_p,
+                        current_price=px,
+                        best_price=best_px,
+                        tp1_price=tp1,
+                        tp1_seen=tp1_seen,
+                        neg_count=neg_count,
+                        weakness_enabled=WEAKNESS_EXIT_ENABLED,
+                        weakness_min_gain_pct=WEAKNESS_MIN_GAIN,
+                        weakness_min_giveback_pct=WEAKNESS_MIN_GIVEBACK,
+                        weakness_giveback_fraction=WEAKNESS_GIVEBACK_FRAC,
+                        weakness_min_tp1_progress=WEAKNESS_MIN_TP1_PROGRESS,
+                        weakness_tp1_progress_max=WEAKNESS_TP1_PROGRESS_MAX,
+                        weakness_neg_hits=WEAKNESS_NEG_HITS,
+                        weakness_min_retain_pct=WEAKNESS_MIN_RETAIN_PCT,
                     )
-                    if weakness_before_tp1:
+                    best_gain_pct = float(weakness_eval.best_gain_pct)
+                    giveback_pct = float(weakness_eval.giveback_pct)
+                    giveback_frac = float(weakness_eval.giveback_frac)
+                    progress_to_tp1 = float(weakness_eval.progress_to_tp1)
+
+                    if weakness_eval.should_close:
                         weakness_close_error = ""
-                        weakness_reason = (
-                            f"before_tp1_weakness peak={best_gain_pct:.2f}% now={gain_now_pct:.2f}% "
-                            f"giveback={giveback_pct:.2f}%({giveback_frac * 100.0:.0f}%) tp1_progress={progress_to_tp1:.2f} neg_hits={int(neg_count)}"
-                        )
+                        weakness_reason = str(weakness_eval.reason)
                         close_ok = False
                         try:
                             close_ok = await _close_market(qty)
@@ -7379,84 +7360,50 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             return False
                         return (d / entry_p) * 100.0 >= SL_DEEP_PCT
 
-                    # Update breach tracking state
+                    # Update breach tracking state and structural decision via typed core helper.
                     sl_hits = int(ref.get("sl_hits") or 0)
                     sl_first_ts = float(ref.get("sl_first_ts") or 0.0)
                     sl_extreme = float(ref.get("sl_extreme") or 0.0)  # lowest px for LONG breach, highest for SHORT breach
 
-                    crossed = _hit_struct()
+                    def _allow_struct_close() -> bool:
+                        if not SL_USE_5M_CLOSE or sl_first_ts <= 0:
+                            return True
+                        try:
+                            next5m = (math.floor(float(sl_first_ts) / 300.0) + 1.0) * 300.0
+                        except Exception:
+                            return True
+                        # wait for the next 5m boundary (proxy for a candle close confirmation)
+                        return float(now_ts) >= float(next5m)
 
-                    if crossed:
-                        if sl_first_ts <= 0:
-                            sl_first_ts = now_ts
-                            # init extreme
-                            sl_extreme = px
-                        # update extreme
-                        if direction == "LONG":
-                            sl_extreme = min(sl_extreme, px) if sl_extreme else px
-                        else:
-                            sl_extreme = max(sl_extreme, px) if sl_extreme else px
-                        sl_hits += 1
+                    sl_eval = SmartExitEngine.evaluate_structural_sl(
+                        direction=direction,
+                        entry_price=entry_p,
+                        current_price=px,
+                        sl_price=sl_struct,
+                        hard_sl_price=sl_hard,
+                        now_ts=now_ts,
+                        sl_hits=sl_hits,
+                        sl_first_ts=sl_first_ts,
+                        sl_extreme=sl_extreme,
+                        sl_confirm_hits=SL_CONFIRM_HITS,
+                        sl_confirm_sec=SL_CONFIRM_SEC,
+                        sl_deep_pct=SL_DEEP_PCT,
+                        sl_grace_sec=SL_GRACE_SEC,
+                        sl_reclaim_pct=SL_RECLAIM_PCT,
+                        sl_bounce_pct=SL_BOUNCE_PCT,
+                        allow_struct_close=_allow_struct_close(),
+                    )
+                    crossed = bool(sl_eval.crossed)
+                    sl_close = bool(sl_eval.should_close)
+                    sl_hits = int(sl_eval.sl_hits)
+                    sl_first_ts = float(sl_eval.sl_first_ts)
+                    sl_extreme = float(sl_eval.sl_extreme)
+                    if (ref.get("sl_hits") or 0) != sl_hits or float(ref.get("sl_first_ts") or 0.0) != sl_first_ts or float(ref.get("sl_extreme") or 0.0) != sl_extreme:
                         ref["sl_hits"] = int(sl_hits)
                         ref["sl_first_ts"] = float(sl_first_ts)
                         ref["sl_extreme"] = float(sl_extreme)
                         dirty = True
-                    else:
-                        # If we reclaimed quickly after a sweep, reset immediately
-                        if sl_hits != 0 or sl_first_ts != 0.0 or sl_extreme != 0.0:
-                            ref["sl_hits"] = 0
-                            ref["sl_first_ts"] = 0.0
-                            ref["sl_extreme"] = 0.0
-                            dirty = True
-
-                    # Decide close:
-                    # - HARD SL: immediate (failsafe)
-                    # - Deep breach: immediate
-                    # - Otherwise: require confirmation AND no quick reclaim/bounce within grace window
-                    sl_close = False
-                    if _hit_hard():
-                        sl_close = True
-                    elif crossed and _deep_breach():
-                        sl_close = True
-                    elif crossed:
-                        # Grace: if price reclaims above SL quickly -> do not close
-                        age = (now_ts - sl_first_ts) if sl_first_ts > 0 else 0.0
-
-                        def _allow_struct_close() -> bool:
-                            if not SL_USE_5M_CLOSE or sl_first_ts <= 0:
-                                return True
-                            try:
-                                next5m = (math.floor(float(sl_first_ts) / 300.0) + 1.0) * 300.0
-                            except Exception:
-                                return True
-                            # wait for the next 5m boundary (proxy for a candle close confirmation)
-                            return float(now_ts) >= float(next5m)
-
-                        # bounce check: if price bounced enough from extreme AND reclaimed -> reset (noise sweep)
-                        bounced = False
-                        if sl_extreme and entry_p > 0:
-                            if direction == "LONG":
-                                # bounce up from lowest point
-                                bounced = ((px - sl_extreme) / entry_p) * 100.0 >= SL_BOUNCE_PCT
-                            else:
-                                bounced = ((sl_extreme - px) / entry_p) * 100.0 >= SL_BOUNCE_PCT
-
-                        if age <= SL_GRACE_SEC and (_reclaimed() or bounced):
-                            ref["sl_hits"] = 0
-                            ref["sl_first_ts"] = 0.0
-                            ref["sl_extreme"] = 0.0
-                            dirty = True
-                            sl_close = False
-                        else:
-                            # Confirm by hits or time-under (after grace window starts to matter)
-                            if sl_hits >= SL_CONFIRM_HITS:
-                                # require that we are past the minimal confirm sec OR past grace sec
-                                min_age = min(SL_CONFIRM_SEC, SL_GRACE_SEC) if SL_GRACE_SEC > 0 else SL_CONFIRM_SEC
-                                if age >= max(0.0, float(min_age)):
-                                    sl_close = _allow_struct_close()
-                            elif sl_first_ts > 0:
-                                if age >= max(0.0, float(SL_CONFIRM_SEC)) and age >= max(0.0, float(SL_GRACE_SEC)):
-                                    sl_close = _allow_struct_close()
+                    age = float(sl_eval.age_sec)
 
                     if mt == "spot" and crossed:
                         _log_rate_limited(
@@ -7465,7 +7412,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             f"px_decision={px:.10f} px_src={str(px_src or '-')} "
                             f"sl={sl_struct:.10f} crossed={crossed} sl_close={sl_close} "
                             f"hits={sl_hits} age={((now_ts - sl_first_ts) if sl_first_ts > 0 else 0.0):.2f}s "
-                            f"deep={_deep_breach()} hard={_hit_hard()}",
+                            f"deep={bool(sl_eval.deep_breach)} hard={bool(sl_eval.hard_hit)}",
                             every_s=5,
                             level="info",
                         )
@@ -7513,7 +7460,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             level="info",
                         )
                         if close_ok:
-                            sl_reason = _tr(uid, "sm_reason_hard_sl") if _hit_hard() else (_tr(uid, "sm_reason_deep_breach") if (crossed and _deep_breach()) else _tr(uid, "sm_reason_structure_break"))
+                            sl_reason = _tr(uid, "sm_reason_hard_sl") if bool(sl_eval.hard_hit) else (_tr(uid, "sm_reason_deep_breach") if bool(sl_eval.deep_breach) else _tr(uid, "sm_reason_structure_break"))
                             await _notify_smart_decision("SL", "CLOSED", level_label="SL", level_price=sl_struct if sl_struct > 0 else sl_hard, reason=_sm_join_reason(sl_reason, last_close_explain or _sm_reason_market_close_sent(last_close_norm_qty or qty)), cooldown_sec=5.0)
                             await _mark_local_full_close("SL", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")), be_moved_value=bool(ref.get("be_moved") or meta.get("be_moved")))
                             pnl_usdt, roi_percent = _smart_close_snapshot()
@@ -7559,7 +7506,19 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                         tp2_runner_reason_user = ""
                         tp2_runner_close_px = float(px)
 
-                        if back_to_tp2:
+                        runner_eval = SmartExitEngine.evaluate_tp2_runner(
+                            direction=direction,
+                            current_price=px,
+                            runner_floor_price=runner_floor,
+                            runner_peak_price=runner_peak,
+                            now_ts=now_ts,
+                            armed_ts=tp2_runner_armed_ts,
+                            min_hold_sec=TP2_RUN_MIN_HOLD_SEC,
+                            min_peak_extension_pct=TP2_RUN_MIN_PEAK_EXT_PCT,
+                            peak_giveback_pct=TP2_RUN_PEAK_GIVEBACK_PCT,
+                        )
+
+                        if runner_eval.back_to_tp2:
                             tp2_runner_reason = f"tp2_return peak_ext={peak_ext_pct:.2f}% peak={runner_peak:.4f} floor={runner_floor:.4f}"
                             tp2_runner_close_px = float(px)
                             tp2_runner_reason_user = _trf(
@@ -7568,6 +7527,17 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                 close_price=_fmt_sm_price(tp2_runner_close_px),
                                 tp2_price=_fmt_sm_price(tp2),
                                 peak_price=_fmt_sm_price(runner_peak),
+                            )
+                        elif runner_eval.should_close:
+                            tp2_runner_reason = f"tp2_peak_giveback peak_ext={runner_eval.peak_extension_pct:.2f}% giveback={runner_eval.giveback_from_peak_pct:.2f}% peak={runner_peak:.4f} floor={runner_floor:.4f}"
+                            tp2_runner_close_px = float(px)
+                            tp2_runner_reason_user = _trf(
+                                uid,
+                                "sm_reason_tp2_runner_first_opposite",
+                                close_price=_fmt_sm_price(tp2_runner_close_px),
+                                tp2_price=_fmt_sm_price(tp2),
+                                peak_price=_fmt_sm_price(runner_peak),
+                                pullback_pct=f"{runner_eval.giveback_from_peak_pct:.2f}",
                             )
                         elif runner_ready and price_backend is not None and hasattr(price_backend, "load_candles"):
                             try:
@@ -7765,59 +7735,36 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
 
                     # --- TP1: probability engine (TP2 vs take profit now) ---
                     if (tp1 > 0) and (not tp1_seen) and _hit_tp(tp1):
-                        # Momentum vs anchor (%)
-                        mom_fav_pct = 0.0
-                        mom_adv_pct = 0.0
-                        if last_px > 0:
-                            if direction == "LONG":
-                                mom_fav_pct = max(0.0, (px / last_px - 1.0) * 100.0)
-                                mom_adv_pct = max(0.0, (1.0 - (px / last_px)) * 100.0)
-                            else:
-                                mom_fav_pct = max(0.0, (1.0 - (px / last_px)) * 100.0)
-                                mom_adv_pct = max(0.0, (px / last_px - 1.0) * 100.0)
-
-                        # Progress to TP2 (0..1) and distance remaining (%)
-                        prob_tp2 = 0.0
-                        prog = 0.0
-                        dist = 0.0
-                        tp2_giveback_frac = 0.0
-                        if tp2 > 0 and entry_p > 0 and tp2 != entry_p:
-                            if direction == "LONG":
-                                prog = (px - entry_p) / (tp2 - entry_p)
-                                dist = max(0.0, (tp2 - px) / max(1e-9, px)) * 100.0
-                                best_gain_now = max(0.0, (best_px / entry_p - 1.0) * 100.0) if best_px > 0 else 0.0
-                                gain_now_tp = max(0.0, (px / entry_p - 1.0) * 100.0)
-                            else:
-                                prog = (entry_p - px) / (entry_p - tp2)
-                                dist = max(0.0, (px - tp2) / max(1e-9, px)) * 100.0
-                                best_gain_now = max(0.0, (1.0 - (best_px / entry_p)) * 100.0) if best_px > 0 else 0.0
-                                gain_now_tp = max(0.0, (1.0 - (px / entry_p)) * 100.0)
-                            prog = _clamp01(float(prog))
-                            if best_gain_now > 0:
-                                tp2_giveback_frac = _clamp01((best_gain_now - gain_now_tp) / max(1e-9, best_gain_now))
-                            # If momentum is strong relative to remaining distance, higher probability.
-                            mom_factor = 0.0
-                            if dist > 0:
-                                mom_factor = _clamp01(mom_fav_pct / max(0.05, dist))
-                            fade_factor = 1.0 - tp2_giveback_frac
-                            # Smarter stable blend: progress + momentum + anti-fade.
-                            prob_tp2 = _clamp01(0.50 * prog + 0.35 * mom_factor + 0.15 * fade_factor)
+                        tp1_decision = SmartDecisionEngine.finalize_tp1_decision(
+                            base=SmartDecisionEngine.compute_tp2_probability(
+                                entry_price=entry_p,
+                                current_price=px,
+                                best_price=best_px,
+                                last_price=last_px,
+                                tp2_price=tp2,
+                                direction=direction,
+                            ),
+                            tp2_price=tp2,
+                            force_full_if_no_tp2=FORCE_FULL_TP1_NO_TP2,
+                            prob_strong=TP2_PROB_STRONG,
+                            prob_med=TP2_PROB_MED,
+                            tp1_partial_pct=TP1_PARTIAL_PCT,
+                            tp1_partial_min_pct=TP1_PARTIAL_MIN_PCT,
+                            tp1_partial_max_pct=TP1_PARTIAL_MAX_PCT,
+                        )
+                        mom_fav_pct = float(tp1_decision.momentum_favor_pct)
+                        mom_adv_pct = float(tp1_decision.momentum_adverse_pct)
+                        prob_tp2 = float(tp1_decision.probability)
+                        prog = float(tp1_decision.progress_to_tp2)
+                        dist = float(tp1_decision.distance_to_tp2_pct)
+                        tp2_giveback_frac = float(tp1_decision.giveback_fraction)
 
                         ref["tp1_seen"] = True
                         tp1_seen = True
                         ref["tp2_prob"] = float(prob_tp2)
                         dirty = True
 
-                        # Decision
-                        if (tp2 <= 0) and FORCE_FULL_TP1_NO_TP2:
-                            mode = "FULL_TP1_NO_TP2"
-                        elif prob_tp2 >= TP2_PROB_STRONG:
-                            mode = "HOLD_TO_TP2"
-                        elif prob_tp2 >= TP2_PROB_MED:
-                            mode = "PARTIAL_TP1"
-                        else:
-                            mode = "FULL_TP1"
-
+                        mode = str(tp1_decision.mode)
                         ref["tp1_mode"] = mode
                         dirty = True
 
@@ -7831,13 +7778,13 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                 pass
                             await _notify_smart_decision("TP1", "NOT CLOSED", level_label="TP1", level_price=tp1, reason=_trf(uid, "sm_reason_hold_to_tp2", mode=_sm_mode_text(mode), prob_tp2=f"{prob_tp2:.2f}"), cooldown_sec=30.0)
                         elif mode == "PARTIAL_TP1":
-                            partial_pct = _smart_dynamic_partial_pct(
+                            partial_pct = float(tp1_decision.partial_pct or _smart_dynamic_partial_pct(
                                 prob_tp2=float(prob_tp2),
                                 prog_to_tp2=float(prog),
                                 mom_fav_pct=float(mom_fav_pct),
                                 dist_pct=float(dist),
                                 giveback_frac=float(tp2_giveback_frac),
-                            )
+                            ))
                             q_close = max(0.0, qty * max(0.05, min(0.95, partial_pct)))
                             q_rem = max(0.0, qty - q_close)
                             if q_close > 0:
@@ -7915,26 +7862,21 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                     buf_pct = max(float(BE_MIN_PCT), min(float(BE_MAX_PCT), float(BE_MIN_PCT) + float(BE_VOL_MULT) * float(vol_pct)))
 
                                     tp2_prob_now = _clamp01(float(ref.get("tp2_prob") or 0.0))
-                                    profit_lock_share = max(
-                                        0.0,
-                                        min(
-                                            0.95,
-                                            float(PROFIT_LOCK_MAX_PCT) - ((float(PROFIT_LOCK_MAX_PCT) - float(PROFIT_LOCK_MIN_PCT)) * tp2_prob_now),
-                                        ),
-                                    )
                                     be_fee = float(_be_with_fee_buffer(entry_p, direction=direction) or 0.0)
-                                    if direction == "LONG":
-                                        be_dyn = float(entry_p) * (1.0 + (buf_pct / 100.0))
-                                        be_lock = 0.0
-                                        if PROFIT_LOCK_ENABLED and px > entry_p:
-                                            be_lock = float(entry_p) + max(0.0, float(px - entry_p)) * profit_lock_share
-                                        be_price = max(be_fee, be_dyn, be_lock)
-                                    else:
-                                        be_dyn = float(entry_p) * (1.0 - (buf_pct / 100.0))
-                                        be_lock = 0.0
-                                        if PROFIT_LOCK_ENABLED and px < entry_p:
-                                            be_lock = float(entry_p) - max(0.0, float(entry_p - px)) * profit_lock_share
-                                        be_price = min([v for v in ((be_fee if be_fee > 0 else be_dyn), be_dyn, (be_lock if be_lock > 0 else be_dyn))])
+                                    be_price = SmartDecisionEngine.compute_be_price(
+                                        entry_price=entry_p,
+                                        current_price=px,
+                                        last_price=last_px,
+                                        direction=direction,
+                                        be_min_pct=BE_MIN_PCT,
+                                        be_max_pct=BE_MAX_PCT,
+                                        be_vol_mult=BE_VOL_MULT,
+                                        be_fee_price=be_fee,
+                                        profit_lock_enabled=PROFIT_LOCK_ENABLED,
+                                        profit_lock_min_pct=PROFIT_LOCK_MIN_PCT,
+                                        profit_lock_max_pct=PROFIT_LOCK_MAX_PCT,
+                                        tp2_probability=tp2_prob_now,
+                                    )
 
                                     ref["be_price"] = float(be_price)
                                     ref["be_moved"] = True
@@ -7973,12 +7915,12 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                     if dirty:
                         try:
                             await db_store.update_autotrade_order_ref(row_id=int(r.get("id") or 0), api_order_ref=json.dumps(ref))
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            _smart_log_exception("smart_dirty_ref_persist", e)
                         try:
                             await _sync_pos_meta()
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            _smart_log_exception("smart_dirty_meta_sync", e)
 
                     continue
 # If TP1 filled and BE not moved: cancel SL and place new SL at entry (BE)
