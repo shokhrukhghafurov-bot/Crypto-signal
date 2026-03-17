@@ -18695,9 +18695,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
 
 
-        # Add to rolling trigger-reject digest (only when not a successful emit).
+        # Add to rolling trigger-reject digest only for real failures/skips.
+        # IMPORTANT:
+        # - outcome=emit is a SUCCESSFUL pending trigger and must NOT pollute
+        #   trig_no_inzone / emit_blocker with reason=smart_threshold_pass.
+        # - outcome=pass is also successful (instant/vip emit paths).
         try:
-            if str(outcome or "").lower() != "pass":
+            _outcome_l = str(outcome or "").lower()
+            if _outcome_l not in ("pass", "emit"):
                 in_zone_flag = False
                 try:
                     in_zone_flag = bool(it.get("_in_zone_tol") or it.get("_in_zone") or False)
