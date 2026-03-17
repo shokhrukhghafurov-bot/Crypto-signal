@@ -8295,31 +8295,31 @@ def _mid_smart_setup_breakout_fastpath(*,
     except Exception:
         conf_need = 90
     try:
-        conf_relax = int(float(os.getenv("MID_SMART_SETUP_BREAKOUT_CONF_RELAX", "2") or 2))
+        conf_relax = int(float(os.getenv("MID_SMART_SETUP_BREAKOUT_CONF_RELAX", "0") or 0))
     except Exception:
-        conf_relax = 2
+        conf_relax = 0
     conf_need = max(0, int(conf_need) - int(max(0, conf_relax)))
 
     min_atr, min_vol = _mid_instant_emit_market_thresholds(market)
     try:
-        atr_mult = float(os.getenv("MID_SMART_SETUP_BREAKOUT_ATR_MULT", "0.85") or 0.85)
+        atr_mult = float(os.getenv("MID_SMART_SETUP_BREAKOUT_ATR_MULT", "1.00") or 1.00)
     except Exception:
-        atr_mult = 0.85
+        atr_mult = 1.00
     try:
-        vol_mult = float(os.getenv("MID_SMART_SETUP_BREAKOUT_VOL_MULT", "0.80") or 0.80)
+        vol_mult = float(os.getenv("MID_SMART_SETUP_BREAKOUT_VOL_MULT", "1.00") or 1.00)
     except Exception:
-        vol_mult = 0.80
+        vol_mult = 1.00
     atr_need = max(0.0, float(min_atr) * max(0.0, float(atr_mult)))
     vol_need = max(0.0, float(min_vol) * max(0.0, float(vol_mult)))
 
     try:
-        max_dist_atr = float(os.getenv("MID_SMART_SETUP_BREAKOUT_MAX_ZONE_DIST_ATR", "1.35") or 1.35)
+        max_dist_atr = float(os.getenv("MID_SMART_SETUP_BREAKOUT_MAX_ZONE_DIST_ATR", "0.35") or 0.35)
     except Exception:
-        max_dist_atr = 1.35
+        max_dist_atr = 0.35
     try:
-        max_dist_pct = float(os.getenv("MID_SMART_SETUP_BREAKOUT_MAX_ZONE_DIST_PCT", "0.025") or 0.025)
+        max_dist_pct = float(os.getenv("MID_SMART_SETUP_BREAKOUT_MAX_ZONE_DIST_PCT", "0.006") or 0.006)
     except Exception:
-        max_dist_pct = 0.025
+        max_dist_pct = 0.006
 
     try:
         allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_SMART_SETUP_BREAKOUT_ALLOWED_REGIMES", "TREND,TRENDING,EXPANSION")) if str(x).strip()}
@@ -24610,8 +24610,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 breakout_fresh_ok=bool(_breakout_fast_ok),
                                                 breakout_fresh_reason=str(_breakout_fast_reason or ""),
                                                 breakout_bypass_zone=bool(_breakout_fast_ok),
-                                                breakout_bypass_near_extreme=bool(_breakout_fast_ok),
-                                                breakout_bypass_late_entry=bool(_breakout_fast_ok),
+                                                breakout_bypass_near_extreme=False,
+                                                breakout_bypass_late_entry=False,
                                             )
 
                                             try:
