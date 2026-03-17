@@ -11707,6 +11707,246 @@ def _mid_breakout_retest_trigger(df5i: pd.DataFrame, *, direction: str, support:
         return (False, "—")
 
 
+def _mid_df_row_time_ms(df: pd.DataFrame, idx: int) -> int | None:
+    """Best-effort candle/open time extractor for diagnostics."""
+    try:
+        if df is None or getattr(df, "empty", True):
+            return None
+        i = int(idx)
+        for col in ("open_time_ms", "open_time", "timestamp", "time", "t"):
+            if col in df.columns:
+                try:
+                    v = df[col].iloc[i]
+                    if hasattr(v, "timestamp"):
+                        return int(float(v.timestamp()) * 1000.0)
+                    fv = float(v)
+                    if not math.isfinite(fv):
+                        continue
+                    if fv > 1e12:
+                        return int(fv)
+                    if fv > 1e9:
+                        return int(fv * 1000.0)
+                except Exception:
+                    pass
+        try:
+            iv = df.index[i]
+            if hasattr(iv, "timestamp"):
+                return int(float(iv.timestamp()) * 1000.0)
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+
+
+def _mid_breakout_retest_snapshot(df5i: pd.DataFrame, *, direction: str, support: float | None, resistance: float | None, atr5: float) -> dict:
+    """Explain *when* the first breakout happened and how stale it already is.
+
+    This is used to prevent creating pending setups long after the first BO/RT event,
+    which later shows up as trigger-time `late_entry`.
+    """
+    meta = {
+        "triggered": False,
+        "label": "—",
+        "breakout_idx": None,
+        "breakout_ts_ms": None,
+        "breakout_level": None,
+        "breakout_price": None,
+        "breakout_age_bars": None,
+        "breakout_age_sec": None,
+        "breakout_move_atr": None,
+        "breakout_move_pct": None,
+        "bar_sec": 300,
+        "has_retest": False,
+    }
+    try:
+        if df5i is None or df5i.empty or len(df5i) < 10:
+            return meta
+        diru = str(direction or "").upper()
+        d = df5i.tail(int(os.getenv("MID_BORT_LOOKBACK_5M", "36") or 36)).copy()
+        highs = d["high"].astype(float).values
+        lows = d["low"].astype(float).values
+        closes = d["close"].astype(float).values
+        last_idx = len(closes) - 1
+        if last_idx < 1:
+            return meta
+
+        try:
+            t0 = _mid_df_row_time_ms(d, max(0, last_idx - 1))
+            t1 = _mid_df_row_time_ms(d, last_idx)
+            if t0 is not None and t1 is not None and int(t1) > int(t0):
+                meta["bar_sec"] = max(1, int(round((int(t1) - int(t0)) / 1000.0)))
+        except Exception:
+            pass
+
+        tol = max(float(atr5) * 0.25 if (atr5 and atr5 > 0) else 0.0, float(closes[-1]) * float(os.getenv("MID_BORT_TOL_PCT", "0.0015") or 0.0015))
+        retest_bars = int(os.getenv("MID_RETEST_MAX_BARS_5M", "8") or 8)
+
+        sup = float(support) if (support is not None and support == support) else float("nan")
+        res = float(resistance) if (resistance is not None and resistance == resistance) else float("nan")
+
+        bo_idx = None
+        lvl = None
+        side = ""
+        if diru == "LONG" and not np.isnan(res) and res > 0:
+            for i in range(1, len(closes)):
+                if closes[i - 1] <= res and closes[i] > res:
+                    bo_idx = i
+                    lvl = float(res)
+                    side = "UP"
+                    break
+        elif diru == "SHORT" and not np.isnan(sup) and sup > 0:
+            for i in range(1, len(closes)):
+                if closes[i - 1] >= sup and closes[i] < sup:
+                    bo_idx = i
+                    lvl = float(sup)
+                    side = "DN"
+                    break
+        if bo_idx is None:
+            return meta
+
+        def _has_retest(start_idx: int, level: float, side_txt: str) -> bool:
+            jmax = min(len(closes), start_idx + 1 + max(1, retest_bars))
+            for j in range(start_idx + 1, jmax):
+                if side_txt == "UP":
+                    if (lows[j] <= level + tol) and (closes[j] > level):
+                        return True
+                else:
+                    if (highs[j] >= level - tol) and (closes[j] < level):
+                        return True
+            return False
+
+        has_retest = _has_retest(int(bo_idx), float(lvl), side)
+        age_bars = max(0, int(last_idx) - int(bo_idx))
+        bo_ts = _mid_df_row_time_ms(d, int(bo_idx))
+        last_ts = _mid_df_row_time_ms(d, int(last_idx))
+        age_sec = None
+        if bo_ts is not None and last_ts is not None and int(last_ts) >= int(bo_ts):
+            age_sec = max(0.0, (int(last_ts) - int(bo_ts)) / 1000.0)
+        else:
+            age_sec = float(age_bars * int(meta.get("bar_sec") or 300))
+        anchor_px = float(closes[int(bo_idx)])
+        move_atr = None
+        move_pct = None
+        try:
+            if float(atr5) > 0:
+                move_atr = abs(float(closes[last_idx]) - anchor_px) / float(atr5)
+        except Exception:
+            move_atr = None
+        try:
+            if anchor_px > 0:
+                move_pct = abs(float(closes[last_idx]) - anchor_px) / anchor_px
+        except Exception:
+            move_pct = None
+
+        meta.update({
+            "triggered": True,
+            "label": ("BO↑+RT" if has_retest else "BO↑") if side == "UP" else (("BO↓+RT" if has_retest else "BO↓") if side == "DN" else "—"),
+            "breakout_idx": int(bo_idx),
+            "breakout_ts_ms": int(bo_ts) if bo_ts is not None else None,
+            "breakout_level": float(lvl) if lvl is not None else None,
+            "breakout_price": float(anchor_px),
+            "breakout_age_bars": int(age_bars),
+            "breakout_age_sec": float(age_sec) if age_sec is not None else None,
+            "breakout_move_atr": float(move_atr) if move_atr is not None else None,
+            "breakout_move_pct": float(move_pct) if move_pct is not None else None,
+            "has_retest": bool(has_retest),
+        })
+        return meta
+    except Exception:
+        return meta
+
+
+def _mid_pending_recency_guard(rec: dict, *, now_ts: float | None = None) -> tuple[bool, str, dict]:
+    """Guard against creating/keeping pending records that are already stale.
+
+    This targets the exact failure mode seen in logs:
+    setup is created after BO/RT already happened, zone is wide/fallback, then trigger
+    reaches zone only to die with `late_entry` many polls later.
+    """
+    meta: dict = {}
+    try:
+        now_v = float(now_ts if now_ts is not None else time.time())
+    except Exception:
+        now_v = time.time()
+    try:
+        created_ts = float(rec.get("created_ts") or 0.0)
+    except Exception:
+        created_ts = 0.0
+    age_sec_now = max(0.0, now_v - created_ts) if created_ts > 0 else 0.0
+    age_min_now = age_sec_now / 60.0
+    zsrc = str(rec.get("entry_zone_src") or rec.get("zone_source") or "").strip().lower()
+    try:
+        width_atr = float(rec.get("zone_width_atr")) if rec.get("zone_width_atr") is not None else None
+    except Exception:
+        width_atr = None
+    try:
+        width_pct = float(rec.get("zone_width_pct")) if rec.get("zone_width_pct") is not None else None
+    except Exception:
+        width_pct = None
+    bo = str(rec.get("bo_rt") or rec.get("breakout_retest") or "").strip()
+    try:
+        bo_age_create_bars = int(float(rec.get("breakout_first_age_bars_create"))) if rec.get("breakout_first_age_bars_create") is not None else None
+    except Exception:
+        bo_age_create_bars = None
+    try:
+        bo_move_atr = float(rec.get("breakout_first_move_atr_create")) if rec.get("breakout_first_move_atr_create") is not None else None
+    except Exception:
+        bo_move_atr = None
+    try:
+        bar_sec = max(1, int(float(rec.get("breakout_bar_sec") or 300)))
+    except Exception:
+        bar_sec = 300
+    bo_total_age_bars = None
+    if bo_age_create_bars is not None:
+        try:
+            bo_total_age_bars = int(bo_age_create_bars + round(age_sec_now / float(bar_sec)))
+        except Exception:
+            bo_total_age_bars = bo_age_create_bars
+
+    meta.update({
+        "age_min": float(age_min_now),
+        "zone_src": zsrc,
+        "zone_width_atr": width_atr,
+        "zone_width_pct": width_pct,
+        "bo": bo,
+        "bo_age_create_bars": bo_age_create_bars,
+        "bo_total_age_bars": bo_total_age_bars,
+        "bo_move_atr": bo_move_atr,
+    })
+
+    try:
+        max_fb_w = float(os.getenv("MID_PENDING_GUARD_MAX_FALLBACK_ZONE_WIDTH_ATR", "1.20") or 1.20)
+    except Exception:
+        max_fb_w = 1.20
+    if zsrc in ("fallback", "far") and width_atr is not None and width_atr > max_fb_w:
+        return (False, f"zone_stale:{zsrc}:width_atr={float(width_atr):.2f}>{float(max_fb_w):g}", meta)
+
+    # Only apply breakout age/move guard when the setup really came from BO/RT context.
+    bo_active = bool(bo) and bo not in ("-", "—", "NONE")
+    if bo_active:
+        try:
+            max_age_bars = int(float(os.getenv("MID_PENDING_BREAKOUT_MAX_AGE_BARS", "6") or 6))
+        except Exception:
+            max_age_bars = 6
+        try:
+            max_total_bars = int(float(os.getenv("MID_PENDING_BREAKOUT_MAX_TOTAL_AGE_BARS", "18") or 18))
+        except Exception:
+            max_total_bars = 18
+        try:
+            max_move_atr = float(os.getenv("MID_PENDING_BREAKOUT_MAX_MOVE_ATR", os.getenv("MID_LATE_ENTRY_ATR_MAX", "1.35")) or 1.35)
+        except Exception:
+            max_move_atr = 1.35
+        if bo_age_create_bars is not None and bo_age_create_bars > max_age_bars:
+            return (False, f"breakout_stale_create:{bo_age_create_bars}b>{max_age_bars}", meta)
+        if bo_total_age_bars is not None and bo_total_age_bars > max_total_bars:
+            return (False, f"breakout_stale_total:{bo_total_age_bars}b>{max_total_bars}", meta)
+        if bo_move_atr is not None and bo_move_atr > max_move_atr:
+            return (False, f"breakout_late_move_atr:{float(bo_move_atr):.2f}>{float(max_move_atr):g}", meta)
+
+    return (True, "", meta)
+
+
 def _mid_order_block(df30i: pd.DataFrame, *, direction: str, atr30: float) -> Tuple[Optional[Tuple[float, float]], bool]:
     """Detect a simple order block on 30m and whether current 5m price is retesting it.
     Returns (zone(low,high), valid_found). Zone is in absolute price.
@@ -11954,6 +12194,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     sweep_txt = "—"
     bo_rt_trigger = False
     bo_rt_label = "—"
+    bo_rt_meta: dict = {}
     ob_zone = None  # (low, high)
     ob_found = False
     ob_retest = False
@@ -11997,6 +12238,10 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
         if use_bort:
             bo_rt_trigger, bo_rt_label = _mid_breakout_retest_trigger(df5i, direction=str(dir_trend), support=sup_lvl, resistance=res_lvl, atr5=float(atr5))
+            try:
+                bo_rt_meta = _mid_breakout_retest_snapshot(df5i, direction=str(dir_trend), support=sup_lvl, resistance=res_lvl, atr5=float(atr5))
+            except Exception:
+                bo_rt_meta = {}
 
         # Order block on 30m + retest on 5m
         if use_ob:
@@ -17701,6 +17946,10 @@ def _mid_build_entry_zone(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.DataFr
                 if not ok_q:
                     removed += 1
                     continue
+                ok_guard, _, _ = _mid_pending_recency_guard(it, now_ts=now_ts)
+                if not ok_guard:
+                    removed += 1
+                    continue
                 out.append(it)
             return out, removed
 
@@ -18172,8 +18421,43 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             except Exception:
                 checks_kv = ""
 
+            _age_m = 0.0
+            _zone_src = str(it.get("entry_zone_src") or "-")
+            _zone_w_atr = "-"
+            _bo_txt = str(it.get("bo_rt") or it.get("breakout_retest") or "-")
+            _bo_age_create = "-"
+            _bo_total_age = "-"
+            _bo_move_atr = "-"
+            try:
+                _cts = float(it.get("created_ts") or 0.0)
+                if _cts > 0:
+                    _age_m = max(0.0, (time.time() - _cts) / 60.0)
+            except Exception:
+                _age_m = 0.0
+            try:
+                if it.get("zone_width_atr") is not None:
+                    _zone_w_atr = f"{float(it.get('zone_width_atr')):.2f}"
+            except Exception:
+                _zone_w_atr = "-"
+            try:
+                if it.get("breakout_first_age_bars_create") is not None:
+                    _bo_age_create = str(int(float(it.get("breakout_first_age_bars_create"))))
+            except Exception:
+                _bo_age_create = "-"
+            try:
+                _bar_sec = max(1, int(float(it.get("breakout_bar_sec") or 300)))
+                if it.get("breakout_first_age_bars_create") is not None:
+                    _bo_total_age = str(int(float(it.get("breakout_first_age_bars_create")) + round((_age_m * 60.0) / float(_bar_sec))))
+            except Exception:
+                _bo_total_age = _bo_age_create
+            try:
+                if it.get("breakout_first_move_atr_create") is not None:
+                    _bo_move_atr = f"{float(it.get('breakout_first_move_atr_create')):.2f}"
+            except Exception:
+                _bo_move_atr = "-"
+
             logger.info(
-                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s term=%s trap_reason=%s in_zone=%s attempts=%s fails=%s px=%.6g enabled=%s passed_n=%s need_passed=%s pass=%s fail=%s skip=%s ne=%s checks=%s",
+                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s term=%s trap_reason=%s in_zone=%s attempts=%s fails=%s px=%.6g age_m=%.1f zone_src=%s zone_w_atr=%s bo=%s bo_age_create=%s bo_age_total=%s bo_move_atr=%s enabled=%s passed_n=%s need_passed=%s pass=%s fail=%s skip=%s ne=%s checks=%s",
                 str(sym), str(market), str(direction),
                 str(outcome), str(reason or ""), term_reason,
                 str(it.get("_trig_trap_reason") if (it.get("_trig_trap_reason") is not None) else (it.get("trap_reason") or "")),
@@ -18181,6 +18465,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 int(it.get("trigger_attempts") or 0),
                 int(it.get("fail_count") or 0),
                 float(price),
+                float(_age_m),
+                _zone_src,
+                _zone_w_atr,
+                _bo_txt,
+                _bo_age_create,
+                _bo_total_age,
+                _bo_move_atr,
                 int(it.get("_trig_enabled_count") or 0),
                 int(it.get("_trig_passed_count") or 0),
                 int(it.get("_trig_need_passed") or 0),
@@ -18952,8 +19243,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     if _in_zone_for_trigger:
                         trig_inzone_checked_n += 1
                     try:
+                        _age_m_eval = 0.0
+                        try:
+                            _cts_eval = float(it.get("created_ts") or 0.0)
+                            if _cts_eval > 0:
+                                _age_m_eval = max(0.0, (now - _cts_eval) / 60.0)
+                        except Exception:
+                            _age_m_eval = 0.0
                         logger.info(
-                            "[mid][pending][trigger_eval] %s %s %s entered_zone=%s recheck_in_zone=%s attempts=%s fails=%s px=%.6g",
+                            "[mid][pending][trigger_eval] %s %s %s entered_zone=%s recheck_in_zone=%s attempts=%s fails=%s px=%.6g age_m=%.1f zone_src=%s zone_w_atr=%s bo=%s bo_age_bars=%s",
                             sym,
                             market,
                             direction,
@@ -18962,6 +19260,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             int(it.get("trigger_attempts") or 0),
                             int(it.get("fail_count") or 0),
                             float(price),
+                            float(_age_m_eval),
+                            str(it.get("entry_zone_src") or "-"),
+                            ("-" if it.get("zone_width_atr") is None else f"{float(it.get('zone_width_atr')):.2f}"),
+                            str(it.get("bo_rt") or it.get("breakout_retest") or "-"),
+                            ("-" if it.get("breakout_first_age_bars_create") is None else str(int(it.get("breakout_first_age_bars_create")))),
                         )
                     except Exception:
                         pass
@@ -24301,6 +24604,28 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         _max_attempts = int(os.getenv("MID_FAR_MAX_ATTEMPTS", "10") or 10)
                                         _max_fails = int(os.getenv("MID_FAR_MAX_FAILS", "3") or 3)
 
+                                    _rec_created_ts = time.time()
+                                    try:
+                                        _bo_meta = dict(bo_rt_meta or {})
+                                    except Exception:
+                                        _bo_meta = {}
+                                    try:
+                                        _bo_age_bars_create = int(_bo_meta.get("breakout_age_bars")) if _bo_meta.get("breakout_age_bars") is not None else None
+                                    except Exception:
+                                        _bo_age_bars_create = None
+                                    try:
+                                        _bo_age_sec_create = float(_bo_meta.get("breakout_age_sec")) if _bo_meta.get("breakout_age_sec") is not None else None
+                                    except Exception:
+                                        _bo_age_sec_create = None
+                                    try:
+                                        _bo_move_atr_create = float(_bo_meta.get("breakout_move_atr")) if _bo_meta.get("breakout_move_atr") is not None else None
+                                    except Exception:
+                                        _bo_move_atr_create = None
+                                    try:
+                                        _bo_move_pct_create = float(_bo_meta.get("breakout_move_pct")) if _bo_meta.get("breakout_move_pct") is not None else None
+                                    except Exception:
+                                        _bo_move_pct_create = None
+
                                     rec = {
                                         "key": key,
                                         "market": marketu,
@@ -24314,6 +24639,16 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "entry_low": entry_low,
                                         "entry_high": entry_high,
                                         "entry_zone_src": str(z_src),
+                                        "bo_rt": str((base_r.get("bo_rt") if ("base_r" in locals() and isinstance(base_r, dict)) else bo_rt_label) or bo_rt_label or "—"),
+                                        "breakout_retest": str((base_r.get("breakout_retest") if ("base_r" in locals() and isinstance(base_r, dict)) else bo_rt_label) or bo_rt_label or "—"),
+                                        "breakout_first_ts": int(_bo_meta.get("breakout_ts_ms")) if _bo_meta.get("breakout_ts_ms") is not None else None,
+                                        "breakout_first_price": float(_bo_meta.get("breakout_price")) if _bo_meta.get("breakout_price") is not None else None,
+                                        "breakout_first_level": float(_bo_meta.get("breakout_level")) if _bo_meta.get("breakout_level") is not None else None,
+                                        "breakout_first_age_bars_create": _bo_age_bars_create,
+                                        "breakout_first_age_sec_create": _bo_age_sec_create,
+                                        "breakout_first_move_atr_create": _bo_move_atr_create,
+                                        "breakout_first_move_pct_create": _bo_move_pct_create,
+                                        "breakout_bar_sec": int(_bo_meta.get("bar_sec") or 300),
                                         "atr_at_create": float(_atr0) if ("_atr0" in locals() and _atr0) else float(entry) * 0.001,
                                         "atr_pct_at_create": float((base_r.get("atr_pct") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
                                         "rel_vol_at_create": float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
@@ -24335,7 +24670,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "ttl_min": float(_ttl_min),
                                         "max_attempts": int(_max_attempts),
                                         "max_fails": int(_max_fails),
-                                        "created_ts": time.time(),
+                                        "created_ts": float(_rec_created_ts),
                                         "trigger_attempts": 0,
                                         "fail_count": 0,
                                         "last_attempt_ts": 0.0,
@@ -24353,6 +24688,27 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 rec["reverse_dist_atr"] = float(_reverse_dist_atr)
                                         except Exception:
                                             pass
+                                    _create_guard_ok, _create_guard_reason, _create_guard_meta = _mid_pending_recency_guard(rec, now_ts=float(_rec_created_ts))
+                                    if not _create_guard_ok:
+                                        try:
+                                            logger.info(
+                                                "[mid][pending][guard] %s %s %s allow=0 reason=%s zone_src=%s zone_w_atr=%s bo=%s bo_age_bars=%s bo_move_atr=%s",
+                                                sym, marketu, diru, str(_create_guard_reason),
+                                                str((_create_guard_meta or {}).get("zone_src") or str(z_src)),
+                                                ("-" if ((_create_guard_meta or {}).get("zone_width_atr") is None) else f"{float((_create_guard_meta or {}).get('zone_width_atr')):.2f}"),
+                                                str((_create_guard_meta or {}).get("bo") or rec.get("bo_rt") or "-"),
+                                                ("-" if ((_create_guard_meta or {}).get("bo_age_create_bars") is None) else str(int((_create_guard_meta or {}).get("bo_age_create_bars")))),
+                                                ("-" if ((_create_guard_meta or {}).get("bo_move_atr") is None) else f"{float((_create_guard_meta or {}).get('bo_move_atr')):.2f}"),
+                                            )
+                                        except Exception:
+                                            pass
+                                        try:
+                                            _pending_skip(sym, f"create_guard:{_create_guard_reason}")
+                                        except Exception:
+                                            pass
+                                        _mid_f_rejected += 1
+                                        _rej_add(sym, f"pending_guard:{_create_guard_reason}")
+                                        continue
                                     _pre_conf_ok = True
                                     _pre_conf_bad = ""
                                     try:
@@ -24724,6 +25080,19 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                             continue
 
                                     await self.add_mid_pending(rec)
+                                    try:
+                                        logger.info(
+                                            "[mid][pending][create] %s %s %s zone_src=%s zone_w_atr=%s dist0_atr=%s bo=%s bo_age_bars=%s bo_move_atr=%s",
+                                            sym, marketu, diru,
+                                            str(rec.get("entry_zone_src") or "-"),
+                                            ("-" if rec.get("zone_width_atr") is None else f"{float(rec.get('zone_width_atr')):.2f}"),
+                                            ("-" if rec.get("dist_to_zone_at_create_atr") is None else f"{float(rec.get('dist_to_zone_at_create_atr')):.2f}"),
+                                            str(rec.get("bo_rt") or rec.get("breakout_retest") or "-"),
+                                            ("-" if rec.get("breakout_first_age_bars_create") is None else str(int(rec.get("breakout_first_age_bars_create")))),
+                                            ("-" if rec.get("breakout_first_move_atr_create") is None else f"{float(rec.get('breakout_first_move_atr_create')):.2f}"),
+                                        )
+                                    except Exception:
+                                        pass
                                     self.mark_mid_pending(sym, direction=diru, market=marketu)
                                     _mid_stage_add("passed_ta", 1)
                                     _mid_stage_add("created_pending", 1)
