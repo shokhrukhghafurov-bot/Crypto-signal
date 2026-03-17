@@ -24097,8 +24097,22 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                             )
                                             _late_ok_now = not bool(_late_reason_now)
                                             _anti_ok_now = not bool(_anti_reason_now)
+                                            _df5i_now = locals().get("df5i")
+                                            if _df5i_now is None:
+                                                try:
+                                                    _df5_raw_now = rec.get("df5") if isinstance(rec, dict) else None
+                                                except Exception:
+                                                    _df5_raw_now = None
+                                                try:
+                                                    if _df5_raw_now is not None and not getattr(_df5_raw_now, "empty", True):
+                                                        _df5i_now = _add_indicators(_df5_raw_now)
+                                                except Exception:
+                                                    _df5i_now = _df5_raw_now
                                             try:
-                                                _micro_ok_now, _micro_reason_now = _mid_micro_trap_ok(direction=diru, entry=float(entry), df5=df5i, atr30=float(_atr_now or 0.0))
+                                                if _df5i_now is None or getattr(_df5i_now, "empty", True):
+                                                    _micro_ok_now, _micro_reason_now = (True, "micro_trap_skip_no_df5")
+                                                else:
+                                                    _micro_ok_now, _micro_reason_now = _mid_micro_trap_ok(direction=diru, entry=float(entry), df5=_df5i_now, atr30=float(_atr_now or 0.0))
                                             except Exception as _micro_exc:
                                                 _micro_ok_now, _micro_reason_now = (True, f"micro_trap_skip_error:{type(_micro_exc).__name__}")
                                                 try:
