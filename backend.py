@@ -13806,6 +13806,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "pattern": pattern,
         "support": support,
         "resistance": resistance,
+        "recent_low": recent_low,
+        "recent_high": recent_high,
         "breakout_retest": breakout_retest,
         "regime": mid_regime,
         "structure_hhhl_1h": struct_hhhl_1h,
@@ -14298,6 +14300,261 @@ def _ta_score(*,
     score = 50.0 + 50.0 * math.tanh((raw - 50.0) / 35.0)
 
     return int(max(0, min(100, round(score))))
+
+def _ta_letter_from_score(score: Any) -> str:
+    """Fallback score->letter mapping for TA quality."""
+    try:
+        s = float(score)
+    except Exception:
+        s = 0.0
+    if s >= 90:
+        return "A"
+    if s >= 80:
+        return "A-"
+    if s >= 70:
+        return "B-"
+    if s >= 55:
+        return "C"
+    return "C-"
+
+
+def _ta_grade_rank(grade: str) -> int:
+    order = {"A": 0, "A-": 1, "B-": 2, "C": 3, "C-": 4}
+    return order.get(str(grade or "").strip(), 4)
+
+
+def _ta_worse_grade(left: str, right: str) -> str:
+    return left if _ta_grade_rank(left) >= _ta_grade_rank(right) else right
+
+
+def _ta_signal_grade(ta: Dict[str, Any]) -> str:
+    """Classify a signal into A / A- / B- / C / C-.
+
+    Primary logic follows the user rubric for MID signals: start from A and
+    subtract for weaknesses across trend/VWAP/RSI/MACD/ADX/volume/entry/structure.
+    For legacy/main signals (where fewer fields are available), fall back to a
+    score-based mapping and only apply the penalties that can be evaluated from
+    the visible TA snapshot.
+    """
+    try:
+        if not ta:
+            return "C-"
+
+        def fget(*keys: str):
+            for key in keys:
+                try:
+                    val = ta.get(key)
+                except Exception:
+                    val = None
+                if val in (None, "", "—"):
+                    continue
+                try:
+                    num = float(val)
+                    if np.isnan(num):
+                        continue
+                    return num
+                except Exception:
+                    continue
+            return None
+
+        def sget(*keys: str) -> str:
+            for key in keys:
+                try:
+                    val = ta.get(key)
+                except Exception:
+                    val = None
+                if val in (None, ""):
+                    continue
+                txt = str(val).strip()
+                if txt:
+                    return txt
+            return ""
+
+        direction = sget("direction", "dir4", "dir1").upper()
+        score_val = fget("confidence", "ta_score", "score", "total")
+        fallback_grade = _ta_letter_from_score(score_val)
+        if direction not in ("LONG", "SHORT"):
+            return fallback_grade
+
+        penalties = 0
+        seen = 0
+        fatal_reason = ""
+
+        entry = fget("entry")
+        atr30 = fget("atr30", "atr_abs")
+        adx30 = fget("adx1")
+        adx1h = fget("adx4")
+        rsi = fget("rsi", "rsi15")
+        macd = fget("macd_hist", "macd_hist15")
+        volx = fget("rel_vol", "vol_rel")
+        vwap_val = fget("vwap_val")
+        support = fget("support")
+        resistance = fget("resistance")
+        recent_low = fget("recent_low")
+        recent_high = fget("recent_high")
+        pattern = sget("pattern")
+        channel = sget("channel").lower()
+        mstruct = sget("mstruct", "structure").upper()
+        breakout_retest = sget("breakout_retest", "bo_rt")
+        ob_retest = bool(ta.get("ob_retest", False))
+        trap_ok = bool(ta.get("trap_ok", True))
+        reason_blob = " | ".join(
+            [
+                sget("trap_reason"),
+                sget("block_reason"),
+            ]
+        ).lower()
+
+        if not trap_ok:
+            fatal_reason = "trap_block"
+        elif "directional_contradiction" in reason_blob:
+            fatal_reason = "directional_contradiction"
+        elif "anti_bounce" in reason_blob:
+            fatal_reason = "anti_bounce"
+        elif "wrong_vwap_side" in reason_blob or "vwap_bias" in reason_blob:
+            fatal_reason = "wrong_vwap_side"
+
+        if not fatal_reason and entry is not None and vwap_val is not None and vwap_val > 0:
+            seen += 1
+            if direction == "LONG" and entry <= vwap_val:
+                fatal_reason = "wrong_vwap_side"
+            if direction == "SHORT" and entry >= vwap_val:
+                fatal_reason = "wrong_vwap_side"
+
+        late_reason = ""
+        anti_reason = ""
+        if not fatal_reason and entry is not None and atr30 and atr30 > 0 and recent_low is not None and recent_high is not None:
+            seen += 1
+            try:
+                late_reason, anti_reason = _mid_late_entry_anti_bounce_reasons(
+                    side=direction,
+                    close=float(entry),
+                    recent_low=float(recent_low),
+                    recent_high=float(recent_high),
+                    atr_30m=float(atr30),
+                    market="FUTURES",
+                    adx_30m=(float(adx30) if adx30 is not None else None),
+                )
+            except Exception:
+                late_reason, anti_reason = "", ""
+            if anti_reason:
+                fatal_reason = "anti_bounce"
+            elif late_reason:
+                m = re.search(r"late_entry_atr=([0-9.]+)\s*>\s*([0-9.]+)", str(late_reason))
+                strong_mult = float(os.getenv("MID_GRADE_LATE_ENTRY_FATAL_MULT", "1.25") or 1.25)
+                if m:
+                    actual = float(m.group(1))
+                    limit = max(1e-9, float(m.group(2)))
+                    if actual >= limit * strong_mult:
+                        fatal_reason = "late_entry"
+                    else:
+                        penalties += 2
+                else:
+                    penalties += 2
+
+        if fatal_reason:
+            return "C-"
+
+        if rsi is not None:
+            seen += 1
+            if direction == "LONG":
+                if not (54.0 <= rsi <= 62.0):
+                    penalties += 1
+            else:
+                if not (38.0 <= rsi <= 46.0):
+                    penalties += 1
+
+        if macd is not None:
+            seen += 1
+            if direction == "LONG" and macd < 0:
+                penalties += 1
+            elif direction == "SHORT" and macd > 0:
+                penalties += 1
+
+        if volx is not None:
+            seen += 1
+            if volx < 0.8:
+                penalties += 1
+
+        if adx30 is not None or adx1h is not None:
+            seen += 1
+            weak_adx = False
+            if adx30 is not None and adx30 < 30.0:
+                weak_adx = True
+            if adx1h is not None and adx1h < 28.0:
+                weak_adx = True
+            if weak_adx:
+                penalties += 1
+
+        if channel:
+            seen += 1
+            if (direction == "LONG" and "asc@upper" in channel) or (direction == "SHORT" and "desc@lower" in channel):
+                penalties += 1
+
+        if mstruct:
+            seen += 1
+            if "RANGE" in mstruct:
+                penalties += 1
+
+        if pattern:
+            seen += 1
+            pat_u = pattern.strip().lower()
+            if pat_u in ("doji", "inside bar"):
+                penalties += 1
+
+        if breakout_retest or ("ob_retest" in ta):
+            seen += 1
+            if direction == "LONG":
+                if breakout_retest.startswith("BO↓"):
+                    return "C-"
+                if not (breakout_retest.startswith("BO↑ + Retest") or ob_retest):
+                    penalties += 1
+            else:
+                if breakout_retest.startswith("BO↑"):
+                    return "C-"
+                if not (breakout_retest.startswith("BO↓ + Retest") or ob_retest):
+                    penalties += 1
+
+        if entry is not None and atr30 and atr30 > 0:
+            near_level_atr = float(os.getenv("MID_GRADE_NEAR_LEVEL_ATR", "0.35") or 0.35)
+            if direction == "LONG" and resistance is not None and resistance > entry:
+                seen += 1
+                if (resistance - entry) <= float(atr30) * near_level_atr:
+                    penalties += 1
+            elif direction == "SHORT" and support is not None and entry > support:
+                seen += 1
+                if (entry - support) <= float(atr30) * near_level_atr:
+                    penalties += 1
+
+        if "near_recent_high" in reason_blob or "near_recent_low" in reason_blob:
+            penalties += 1
+
+        if seen < 4:
+            return fallback_grade
+
+        if penalties <= 0:
+            grade = "A"
+        elif penalties == 1:
+            grade = "A-"
+        elif penalties <= 3:
+            grade = "B-"
+        elif penalties <= 5:
+            grade = "C"
+        else:
+            grade = "C-"
+
+        # Legacy/main snapshots often have fewer institutional fields; keep score as a
+        # lower-bound safety net so a weak raw TA score cannot look better than it is.
+        if seen < 7 and score_val is not None:
+            grade = _ta_worse_grade(grade, fallback_grade)
+        return grade
+    except Exception:
+        try:
+            return _ta_letter_from_score(ta.get("confidence", ta.get("ta_score", ta.get("score", 0))))
+        except Exception:
+            return "C-"
+
+
 def _fmt_ta_block(ta: Dict[str, Any]) -> str:
     """
     Format TA snapshot for Telegram/UX. Keep it short but informative.
@@ -14337,8 +14594,9 @@ def _fmt_ta_block(ta: Dict[str, Any]) -> str:
             except Exception:
                 return "—"
 
+        grade = _ta_signal_grade(ta)
         lines = [
-            f"📊 TA score: {fint(score)}/100 | Mode: {SIGNAL_MODE}",
+            f"📊 TA score: {fint(score)}/100 | Grade: {grade} | Mode: {SIGNAL_MODE}",
             f"RSI: {fnum(rsi, '{:.1f}')} | MACD hist: {fnum(macd_h, '{:.4f}')}",
             f"ADX 1h/4h: {fnum(adx1, '{:.1f}')}/{fnum(adx4, '{:.1f}')} | ATR%: {fnum(atrp, '{:.2f}')}",
             f"BB: {bb} | Vol xAvg: {fnum(volr, '{:.2f}')} | VWAP: {vwap}",
@@ -14396,8 +14654,9 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
         eq_lo = ta.get("eq_lo", None)
         sweep = ta.get("sweep", "")
         obtxt = "YES" if bool(ta.get("ob_retest", False)) else "—"
+        grade = _ta_signal_grade(ta)
         lines = [
-            f"📊 TA score: {int(round(float(score))):d}/100 | Mode: {mode_txt}",
+            f"📊 TA score: {int(round(float(score))):d}/100 | Grade: {grade} | Mode: {mode_txt}",
             f"RSI(5m): {rsi:.1f} | MACD hist(5m): {macd_hist:.4f}",
             f"ADX 30m/1h: {adx_30m:.1f}/{adx_1h:.1f} | ATR% (30m): {atr_pct:.2f}",
             f"BB: {bb} | Vol xAvg: {volx:.2f} | VWAP: {vwap}",
