@@ -8175,6 +8175,140 @@ def _mid_instant_emit_reason_priority(reason: str) -> tuple[int, str]:
     return (500, key)
 
 
+def _mid_smart_setup_breakout_fastpath(*,
+                                      market: str,
+                                      direction: str,
+                                      confidence: float,
+                                      atr_pct: float | None,
+                                      vol_x: float | None,
+                                      regime: str | None,
+                                      bo_rt_label: str | None,
+                                      dist_to_zone_atr: float | None,
+                                      dist_to_zone_pct: float | None,
+                                      risk_flags=None) -> tuple[bool, str, dict]:
+    """Allow smart-setup to emit on a fresh breakout before the retest.
+
+    Default behavior is conservative: only fresh directional BO labels with adequate
+    volatility/volume and limited distance from the planned zone may bypass the usual
+    "wait for zone touch" logic. This targets the exact case where a strong impulse
+    starts and the setup should not be forced into pending mode first.
+    """
+    meta: dict[str, object] = {}
+    try:
+        enabled = str(os.getenv("MID_SMART_SETUP_BREAKOUT_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        enabled = True
+    if not enabled:
+        return (False, "breakout_fast_disabled", meta)
+
+    diru = str(direction or "").upper().strip()
+    bo = str(bo_rt_label or "").strip().upper()
+    reg_u = str(regime or "").upper().strip()
+    flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
+
+    try:
+        conf_need = int(float(os.getenv("MID_SMART_SETUP_BREAKOUT_CONF", os.getenv("MID_SMART_SETUP_EMIT_CONF", "90")) or 90))
+    except Exception:
+        conf_need = 90
+    try:
+        conf_relax = int(float(os.getenv("MID_SMART_SETUP_BREAKOUT_CONF_RELAX", "2") or 2))
+    except Exception:
+        conf_relax = 2
+    conf_need = max(0, int(conf_need) - int(max(0, conf_relax)))
+
+    min_atr, min_vol = _mid_instant_emit_market_thresholds(market)
+    try:
+        atr_mult = float(os.getenv("MID_SMART_SETUP_BREAKOUT_ATR_MULT", "0.85") or 0.85)
+    except Exception:
+        atr_mult = 0.85
+    try:
+        vol_mult = float(os.getenv("MID_SMART_SETUP_BREAKOUT_VOL_MULT", "0.80") or 0.80)
+    except Exception:
+        vol_mult = 0.80
+    atr_need = max(0.0, float(min_atr) * max(0.0, float(atr_mult)))
+    vol_need = max(0.0, float(min_vol) * max(0.0, float(vol_mult)))
+
+    try:
+        max_dist_atr = float(os.getenv("MID_SMART_SETUP_BREAKOUT_MAX_ZONE_DIST_ATR", "1.35") or 1.35)
+    except Exception:
+        max_dist_atr = 1.35
+    try:
+        max_dist_pct = float(os.getenv("MID_SMART_SETUP_BREAKOUT_MAX_ZONE_DIST_PCT", "0.025") or 0.025)
+    except Exception:
+        max_dist_pct = 0.025
+
+    try:
+        allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_SMART_SETUP_BREAKOUT_ALLOWED_REGIMES", "TREND,TRENDING,EXPANSION")) if str(x).strip()}
+    except Exception:
+        allowed_regimes = {"TREND", "TRENDING", "EXPANSION"}
+    hard_flags = {"far_zone", "scale_mismatch", "blocked", "structure_mismatch", "regime_range_no_breakout"}
+    active_hard_flags = sorted([x for x in flags if x in hard_flags])
+
+    bo_ok = False
+    if diru == "LONG":
+        bo_ok = bo.startswith("BO↑") or bo.startswith("BOUP") or bo.startswith("BO+")
+    elif diru == "SHORT":
+        bo_ok = bo.startswith("BO↓") or bo.startswith("BODN") or bo.startswith("BO-")
+
+    atr_v = float(atr_pct or 0.0)
+    vol_v = float(vol_x or 0.0)
+    conf_v = float(confidence or 0.0)
+    dist_atr_v = None if dist_to_zone_atr is None else float(dist_to_zone_atr)
+    dist_pct_v = float(dist_to_zone_pct or 0.0)
+    if dist_atr_v is None:
+        dist_ok = dist_pct_v <= float(max_dist_pct)
+    else:
+        dist_ok = (dist_atr_v <= float(max_dist_atr)) or (dist_pct_v <= float(max_dist_pct))
+
+    meta.update({
+        "enabled": bool(enabled),
+        "bo_rt": bo,
+        "bo_ok": bool(bo_ok),
+        "regime": reg_u,
+        "allowed_regimes": sorted(allowed_regimes),
+        "conf": int(round(conf_v)),
+        "conf_need": int(conf_need),
+        "atr_pct": float(atr_v),
+        "atr_need": float(atr_need),
+        "vol_x": float(vol_v),
+        "vol_need": float(vol_need),
+        "dist_to_zone_atr": dist_atr_v,
+        "dist_to_zone_pct": float(dist_pct_v),
+        "max_dist_atr": float(max_dist_atr),
+        "max_dist_pct": float(max_dist_pct),
+        "hard_flags": list(active_hard_flags),
+    })
+
+    reasons: list[str] = []
+    if not bo_ok:
+        reasons.append(f"breakout_fast_no_bo:{bo or '-'}")
+    if allowed_regimes and reg_u not in allowed_regimes:
+        reasons.append(f"breakout_fast_regime:{reg_u or '-'}")
+    if conf_v < float(conf_need):
+        reasons.append(f"breakout_fast_conf:{int(round(conf_v))}<{int(conf_need)}")
+    if atr_v < float(atr_need):
+        reasons.append(f"breakout_fast_atr:{atr_v:.3f}<{atr_need:.3f}")
+    if vol_v < float(vol_need):
+        reasons.append(f"breakout_fast_vol:{vol_v:.2f}<{vol_need:.2f}")
+    if active_hard_flags:
+        reasons.append(f"breakout_fast_flags:{','.join(active_hard_flags)}")
+    if not dist_ok:
+        if dist_atr_v is None:
+            reasons.append(f"breakout_fast_zone_dist_pct:{dist_pct_v:.4f}>{max_dist_pct:.4f}")
+        else:
+            reasons.append(f"breakout_fast_zone_dist:{dist_atr_v:.2f}>{max_dist_atr:.2f}")
+
+    if reasons:
+        meta["fail_reasons"] = list(reasons)
+        meta["primary_reason"] = str(reasons[0])
+        meta["all_reasons"] = "|".join(reasons)
+        return (False, str(reasons[0]), meta)
+
+    meta["primary_reason"] = "breakout_fastpass"
+    meta["all_reasons"] = "breakout_fastpass"
+    return (True, "breakout_fastpass", meta)
+
+
 def _mid_instant_emit_gate(*,
                            market: str,
                            direction: str,
@@ -8194,7 +8328,12 @@ def _mid_instant_emit_gate(*,
                            late_entry_ok: bool = True,
                            late_entry_reason: str = "",
                            anti_bounce_ok: bool = True,
-                           anti_bounce_reason: str = "") -> tuple[bool, str, dict]:
+                           anti_bounce_reason: str = "",
+                           breakout_fresh_ok: bool = False,
+                           breakout_fresh_reason: str = "",
+                           breakout_bypass_zone: bool = False,
+                           breakout_bypass_near_extreme: bool = False,
+                           breakout_bypass_late_entry: bool = False) -> tuple[bool, str, dict]:
     """Strict VIP gate for smart_setup_emit / pending instant emit.
 
     This is intentionally *stricter* than the normal pending pipeline.
@@ -8247,11 +8386,17 @@ def _mid_instant_emit_gate(*,
         "anti_bounce_ok": bool(anti_bounce_ok),
         "risk_flags": sorted(flags),
         "risk_flags_input": sorted(flags),
+        "breakout_fresh_ok": bool(breakout_fresh_ok),
+        "breakout_fresh_reason": str(breakout_fresh_reason or ""),
+        "breakout_bypass_zone": bool(breakout_bypass_zone),
+        "breakout_bypass_near_extreme": bool(breakout_bypass_near_extreme),
+        "breakout_bypass_late_entry": bool(breakout_bypass_late_entry),
     })
 
     fail_reasons: list[str] = []
     applied_risk_flags: list[str] = []
     ignored_risk_flags: list[str] = []
+    ignored_checks: list[str] = []
 
     def _add_fail(reason: str) -> None:
         try:
@@ -8294,11 +8439,17 @@ def _mid_instant_emit_gate(*,
     if vol_v < float(min_vol):
         _add_fail(f"instant_vol_low:{vol_v:.2f}<{min_vol:.2f}")
     if not near_extreme_ok:
-        _add_fail(str(near_extreme_reason or "instant_near_extreme"))
+        if breakout_fresh_ok and breakout_bypass_near_extreme:
+            ignored_checks.append(str(near_extreme_reason or "instant_near_extreme"))
+        else:
+            _add_fail(str(near_extreme_reason or "instant_near_extreme"))
     if not micro_trap_ok:
         _add_fail(str(micro_trap_reason or "instant_micro_trap"))
     if not late_entry_ok:
-        _add_fail(str(late_entry_reason or "instant_late_entry"))
+        if breakout_fresh_ok and breakout_bypass_late_entry:
+            ignored_checks.append(str(late_entry_reason or "instant_late_entry"))
+        else:
+            _add_fail(str(late_entry_reason or "instant_late_entry"))
     if not anti_bounce_ok:
         _add_fail(str(anti_bounce_reason or "instant_anti_bounce"))
 
@@ -8309,9 +8460,12 @@ def _mid_instant_emit_gate(*,
 
     if bool(zone_valid):
         if not bool(in_zone_now):
-            _add_fail("instant_zone_wait")
+            if breakout_fresh_ok and breakout_bypass_zone:
+                ignored_checks.append("instant_zone_wait")
+            else:
+                _add_fail("instant_zone_wait")
     else:
-        if not bool(allow_no_zone_breakout):
+        if not bool(allow_no_zone_breakout or breakout_fresh_ok):
             _add_fail("instant_zone_missing")
         if conf_v < float(conf_need + no_zone_extra_conf):
             _add_fail(f"instant_no_zone_conf:{int(round(conf_v))}<{conf_need + no_zone_extra_conf}")
@@ -8322,6 +8476,8 @@ def _mid_instant_emit_gate(*,
 
     meta["applied_risk_flags"] = list(applied_risk_flags)
     meta["ignored_risk_flags"] = list(ignored_risk_flags)
+    meta["ignored_checks"] = list(ignored_checks)
+    meta["ignored_checks_text"] = ",".join([str(x) for x in ignored_checks if str(x).strip()]) if ignored_checks else "-"
     meta["applied_risk_flags_text"] = ",".join(applied_risk_flags) if applied_risk_flags else "-"
     meta["ignored_risk_flags_text"] = ",".join(ignored_risk_flags) if ignored_risk_flags else "-"
 
@@ -24319,6 +24475,30 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     )
                                                 except Exception:
                                                     pass
+                                            try:
+                                                _bo_rt_now = str((base_r.get("bo_rt") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("bo_rt") or rec.get("breakout_retest") or "") or "")
+                                            except Exception:
+                                                _bo_rt_now = ""
+                                            _breakout_fast_ok = False
+                                            _breakout_fast_reason = ""
+                                            _breakout_fast_meta = {}
+                                            try:
+                                                _breakout_fast_ok, _breakout_fast_reason, _breakout_fast_meta = _mid_smart_setup_breakout_fastpath(
+                                                    market=marketu,
+                                                    direction=diru,
+                                                    confidence=float(_conf_now),
+                                                    atr_pct=float((base_r.get("atr_pct") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("atr_pct_at_create") or 0.0) or 0.0),
+                                                    vol_x=float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("rel_vol_at_create") or 0.0) or 0.0),
+                                                    regime=str((base_r.get("regime") if ("base_r" in locals() and isinstance(base_r, dict)) else "") or ""),
+                                                    bo_rt_label=str(_bo_rt_now),
+                                                    dist_to_zone_atr=_dist_now_atr,
+                                                    dist_to_zone_pct=float(_dist_now_pct),
+                                                    risk_flags=risk_flags,
+                                                )
+                                            except Exception as _bo_exc:
+                                                _breakout_fast_ok = False
+                                                _breakout_fast_reason = f"breakout_fast_error:{type(_bo_exc).__name__}"
+                                                _breakout_fast_meta = {"primary_reason": _breakout_fast_reason}
                                             _emit_now, _emit_reason, _emit_meta = _mid_instant_emit_gate(
                                                 market=marketu,
                                                 direction=diru,
@@ -24339,6 +24519,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 late_entry_reason=str(_late_reason_now or ""),
                                                 anti_bounce_ok=bool(_anti_ok_now),
                                                 anti_bounce_reason=str(_anti_reason_now or ""),
+                                                breakout_fresh_ok=bool(_breakout_fast_ok),
+                                                breakout_fresh_reason=str(_breakout_fast_reason or ""),
+                                                breakout_bypass_zone=bool(_breakout_fast_ok),
+                                                breakout_bypass_near_extreme=bool(_breakout_fast_ok),
+                                                breakout_bypass_late_entry=bool(_breakout_fast_ok),
                                             )
 
                                             try:
@@ -24346,6 +24531,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 rec["smart_zone_valid"] = bool(_zone_valid)
                                                 rec["smart_in_zone_now"] = bool(_in_zone_now)
                                                 rec["smart_conf_need"] = int(_smart_conf_need)
+                                                rec["smart_breakout_fast_ok"] = bool(_breakout_fast_ok)
+                                                rec["smart_breakout_fast_reason"] = str(_breakout_fast_reason or "")
+                                                rec["smart_breakout_fast_meta"] = dict(_breakout_fast_meta or {})
                                                 rec["smart_emit_now"] = bool(_emit_now)
                                                 rec["smart_emit_reason"] = str(_emit_reason)
                                                 rec["smart_emit_meta"] = dict(_emit_meta or {})
