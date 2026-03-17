@@ -8537,6 +8537,231 @@ def _mid_instant_emit_near_extreme_ok(*, direction: str, entry: float, recent_lo
     return (True, "near_extreme_skip_bad_dir")
 
 
+def _mid_smart_setup_trap_eval(*,
+                                 market: str,
+                                 direction: str,
+                                 entry: float | None,
+                                 atr30_abs: float | None,
+                                 bb_pos: str | None = None,
+                                 vwap_val: float | None = None,
+                                 last_body: float | None = None,
+                                 vol_x: float | None = None,
+                                 vol_last: float | None = None,
+                                 vol_avg: float | None = None,
+                                 breakout_fresh_ok: bool = False,
+                                 in_zone_now: bool = False,
+                                 allow_no_zone_breakout: bool = False,
+                                 confidence: float | None = None) -> tuple[bool, str, dict]:
+    """Separate smart-setup trap for instant emit only.
+
+    Design goal: reduce SL on impulsive smart_setup entries *without* noticeably
+    reducing total signal count. When this trap fails, the caller should simply
+    skip instant emit and keep the setup alive for pending / retest handling.
+    """
+    meta: dict[str, object] = {}
+    try:
+        enabled = str(os.getenv("MID_SMART_SETUP_TRAP_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        enabled = True
+    meta["enabled"] = bool(enabled)
+    if not enabled:
+        meta["primary_reason"] = "smart_setup_trap_disabled"
+        meta["all_reasons"] = "smart_setup_trap_disabled"
+        return (True, "smart_setup_trap_disabled", meta)
+
+    try:
+        active = bool(breakout_fresh_ok) or bool(allow_no_zone_breakout) or (not bool(in_zone_now))
+    except Exception:
+        active = True
+    meta["active"] = bool(active)
+    meta["breakout_fresh_ok"] = bool(breakout_fresh_ok)
+    meta["in_zone_now"] = bool(in_zone_now)
+    meta["allow_no_zone_breakout"] = bool(allow_no_zone_breakout)
+    if not active:
+        meta["primary_reason"] = "smart_setup_trap_inactive"
+        meta["all_reasons"] = "smart_setup_trap_inactive"
+        return (True, "smart_setup_trap_inactive", meta)
+
+    try:
+        only_breakout = str(os.getenv("MID_SMART_SETUP_TRAP_ONLY_BREAKOUT", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        only_breakout = False
+    if only_breakout and not bool(breakout_fresh_ok):
+        meta["primary_reason"] = "smart_setup_trap_skip_non_breakout"
+        meta["all_reasons"] = "smart_setup_trap_skip_non_breakout"
+        return (True, "smart_setup_trap_skip_non_breakout", meta)
+
+    try:
+        mkt = (market or "SPOT").upper().strip()
+    except Exception:
+        mkt = "SPOT"
+    try:
+        diru = (direction or "").upper().strip()
+    except Exception:
+        diru = ""
+    try:
+        px = float(entry or 0.0)
+    except Exception:
+        px = 0.0
+    try:
+        atr = float(atr30_abs or 0.0)
+    except Exception:
+        atr = 0.0
+    try:
+        vwap = float(vwap_val or 0.0)
+    except Exception:
+        vwap = 0.0
+    try:
+        body_atr = (abs(float(last_body or 0.0)) / atr) if atr > 0 else 0.0
+    except Exception:
+        body_atr = 0.0
+    try:
+        conf_v = float(confidence or 0.0)
+    except Exception:
+        conf_v = 0.0
+    try:
+        vol_ratio = float(vol_x or 0.0)
+    except Exception:
+        vol_ratio = 0.0
+    if not vol_ratio:
+        try:
+            _vl = float(vol_last or 0.0)
+            _va = float(vol_avg or 0.0)
+            if _va > 0:
+                vol_ratio = _vl / _va
+        except Exception:
+            vol_ratio = 0.0
+
+    bb = str(bb_pos or "").strip()
+    vwap_dist_atr = (abs(px - vwap) / atr) if (px > 0 and vwap > 0 and atr > 0) else 0.0
+
+    try:
+        relax_at = float(os.getenv("MID_SMART_SETUP_TRAP_RELAX_CONF", "97") or 97)
+    except Exception:
+        relax_at = 97.0
+    try:
+        relax_mult = float(os.getenv("MID_SMART_SETUP_TRAP_RELAX_MULT", "1.08") or 1.08)
+    except Exception:
+        relax_mult = 1.08
+
+    if mkt == "FUTURES":
+        try:
+            max_vwap_dist = float(os.getenv("MID_SMART_SETUP_TRAP_VWAP_DIST_ATR_MAX_FUT", "1.15") or 1.15)
+        except Exception:
+            max_vwap_dist = 1.15
+    else:
+        try:
+            max_vwap_dist = float(os.getenv("MID_SMART_SETUP_TRAP_VWAP_DIST_ATR_MAX_SPOT", "1.00") or 1.00)
+        except Exception:
+            max_vwap_dist = 1.00
+    if conf_v >= relax_at:
+        max_vwap_dist *= max(1.0, float(relax_mult))
+
+    try:
+        bb_combo_vwap_min = float(os.getenv("MID_SMART_SETUP_TRAP_BB_COMBO_VWAP_MIN", "0.90") or 0.90)
+    except Exception:
+        bb_combo_vwap_min = 0.90
+    try:
+        impulse_body_min = float(os.getenv("MID_SMART_SETUP_TRAP_IMPULSE_BODY_ATR_MIN", "0.50") or 0.50)
+    except Exception:
+        impulse_body_min = 0.50
+    try:
+        impulse_vwap_min = float(os.getenv("MID_SMART_SETUP_TRAP_IMPULSE_VWAP_MIN", "0.85") or 0.85)
+    except Exception:
+        impulse_vwap_min = 0.85
+    try:
+        impulse_vol_min = float(os.getenv("MID_SMART_SETUP_TRAP_IMPULSE_VOL_X_MIN", "0.0") or 0.0)
+    except Exception:
+        impulse_vol_min = 0.0
+
+    if diru == "LONG":
+        bb_extreme = bb in ("↑high",)
+        bb_soft = bb in ("mid→high",)
+    elif diru == "SHORT":
+        bb_extreme = bb in ("↓low",)
+        bb_soft = bb in ("low→mid",)
+    else:
+        bb_extreme = False
+        bb_soft = False
+
+    meta.update({
+        "market": mkt,
+        "dir": diru,
+        "bb_pos": bb or "-",
+        "bb_extreme": bool(bb_extreme),
+        "bb_soft": bool(bb_soft),
+        "entry": float(px),
+        "atr30_abs": float(atr),
+        "vwap_val": float(vwap),
+        "vwap_dist_atr": float(vwap_dist_atr),
+        "max_vwap_dist_atr": float(max_vwap_dist),
+        "body_atr": float(body_atr),
+        "impulse_body_min": float(impulse_body_min),
+        "impulse_vwap_min": float(impulse_vwap_min),
+        "vol_x": float(vol_ratio),
+        "impulse_vol_min": float(impulse_vol_min),
+        "confidence": float(conf_v),
+        "relax_conf": float(relax_at),
+    })
+
+    reasons: list[str] = []
+    try:
+        block_bb_extreme = str(os.getenv("MID_SMART_SETUP_TRAP_BLOCK_BB_EXTREME", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        block_bb_extreme = True
+    if block_bb_extreme and bb_extreme:
+        reasons.append(f"smart_setup_trap_bb_extreme:{bb or '-'}")
+
+    try:
+        block_vwap_stretch = str(os.getenv("MID_SMART_SETUP_TRAP_BLOCK_VWAP_STRETCH", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        block_vwap_stretch = True
+    if block_vwap_stretch and vwap_dist_atr > float(max_vwap_dist):
+        reasons.append(f"smart_setup_trap_vwap_ext:{vwap_dist_atr:.2f}>{max_vwap_dist:.2f}")
+
+    try:
+        block_bb_combo = str(os.getenv("MID_SMART_SETUP_TRAP_BLOCK_BB_COMBO", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        block_bb_combo = True
+    if block_bb_combo and bb_soft and vwap_dist_atr >= float(bb_combo_vwap_min):
+        reasons.append(f"smart_setup_trap_bb_stretch:{bb or '-'}|vwap={vwap_dist_atr:.2f}")
+
+    try:
+        block_impulse = str(os.getenv("MID_SMART_SETUP_TRAP_BLOCK_IMPULSE", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        block_impulse = True
+    if block_impulse and body_atr >= float(impulse_body_min) and vwap_dist_atr >= float(impulse_vwap_min) and float(vol_ratio) >= float(impulse_vol_min):
+        if bb_soft or bb_extreme or bool(breakout_fresh_ok):
+            reasons.append(f"smart_setup_trap_impulse:body={body_atr:.2f}|vwap={vwap_dist_atr:.2f}|vol={vol_ratio:.2f}")
+
+    if reasons:
+        meta["fail_reasons"] = list(reasons)
+        meta["primary_reason"] = str(reasons[0])
+        meta["all_reasons"] = "|".join(reasons)
+        try:
+            _smart_setup_log(
+                "trap_block",
+                market=mkt,
+                dir=diru,
+                reason=str(reasons[0]),
+                all_reasons=str(meta.get("all_reasons") or reasons[0]),
+                bb=bb or "-",
+                vwap_dist=f"{vwap_dist_atr:.2f}",
+                body_atr=f"{body_atr:.2f}",
+                conf=f"{conf_v:.1f}",
+                in_zone=int(bool(in_zone_now)),
+                breakout=int(bool(breakout_fresh_ok)),
+            )
+        except Exception:
+            pass
+        return (False, str(reasons[0]), meta)
+
+    meta["fail_reasons"] = []
+    meta["primary_reason"] = "pass"
+    meta["all_reasons"] = "pass"
+    return (True, "pass", meta)
+
+
 def _mid_instant_emit_reason_priority(reason: str) -> tuple[int, str]:
     """Stable ordering for instant-emit blockers so the primary reason is actionable."""
     s = str(reason or "").strip()
@@ -8550,6 +8775,7 @@ def _mid_instant_emit_reason_priority(reason: str) -> tuple[int, str]:
         ("instant_atr_low", 40),
         ("instant_vol_low", 41),
         ("instant_regime_block", 50),
+        ("smart_setup_trap_", 55),
         ("near_recent_", 60),
         ("near_extreme_", 61),
         ("micro_", 70),
@@ -8723,7 +8949,10 @@ def _mid_instant_emit_gate(*,
                            breakout_fresh_reason: str = "",
                            breakout_bypass_zone: bool = False,
                            breakout_bypass_near_extreme: bool = False,
-                           breakout_bypass_late_entry: bool = False) -> tuple[bool, str, dict]:
+                           breakout_bypass_late_entry: bool = False,
+                           smart_setup_trap_ok: bool = True,
+                           smart_setup_trap_reason: str = "",
+                           smart_setup_trap_meta: dict | None = None) -> tuple[bool, str, dict]:
     """Strict VIP gate for smart_setup_emit / pending instant emit.
 
     This is intentionally *stricter* than the normal pending pipeline.
@@ -8781,6 +9010,9 @@ def _mid_instant_emit_gate(*,
         "breakout_bypass_zone": bool(breakout_bypass_zone),
         "breakout_bypass_near_extreme": bool(breakout_bypass_near_extreme),
         "breakout_bypass_late_entry": bool(breakout_bypass_late_entry),
+        "smart_setup_trap_ok": bool(smart_setup_trap_ok),
+        "smart_setup_trap_reason": str(smart_setup_trap_reason or ""),
+        "smart_setup_trap_meta": dict(smart_setup_trap_meta or {}),
     })
 
     fail_reasons: list[str] = []
@@ -8822,6 +9054,8 @@ def _mid_instant_emit_gate(*,
 
     if applied_risk_flags:
         _add_fail(f"instant_risk_flags:{','.join(applied_risk_flags)}")
+    if not smart_setup_trap_ok:
+        _add_fail(str(smart_setup_trap_reason or "smart_setup_trap"))
     if profit_v < float(profit_need):
         _add_fail(f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}")
     if atr_v < float(min_atr):
@@ -25587,6 +25821,22 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 _breakout_fast_ok = False
                                                 _breakout_fast_reason = f"breakout_fast_error:{type(_bo_exc).__name__}"
                                                 _breakout_fast_meta = {"primary_reason": _breakout_fast_reason}
+                                            _smart_trap_ok, _smart_trap_reason, _smart_trap_meta = _mid_smart_setup_trap_eval(
+                                                market=marketu,
+                                                direction=diru,
+                                                entry=float(entry),
+                                                atr30_abs=float(_atr_now or 0.0),
+                                                bb_pos=str((base_r.get("bb") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("bb") or "") or ""),
+                                                vwap_val=float((base_r.get("vwap_val") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("vwap_val") or 0.0) or 0.0),
+                                                last_body=float((base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("last_body") or 0.0) or 0.0),
+                                                vol_x=float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("rel_vol_at_create") or 0.0) or 0.0),
+                                                vol_last=float((base_r.get("vol_last") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("vol_last") or 0.0) or 0.0),
+                                                vol_avg=float((base_r.get("vol_avg") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("vol_avg") or 0.0) or 0.0),
+                                                breakout_fresh_ok=bool(_breakout_fast_ok),
+                                                in_zone_now=bool(_in_zone_now),
+                                                allow_no_zone_breakout=bool(_smart_emit_if_no_zone),
+                                                confidence=float(_conf_now),
+                                            )
                                             _emit_now, _emit_reason, _emit_meta = _mid_instant_emit_gate(
                                                 market=marketu,
                                                 direction=diru,
@@ -25612,6 +25862,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 breakout_bypass_zone=bool(_breakout_fast_ok),
                                                 breakout_bypass_near_extreme=False,
                                                 breakout_bypass_late_entry=bool(_late_relief_ok_now),
+                                                smart_setup_trap_ok=bool(_smart_trap_ok),
+                                                smart_setup_trap_reason=str(_smart_trap_reason or ""),
+                                                smart_setup_trap_meta=dict(_smart_trap_meta or {}),
                                             )
 
                                             try:
@@ -25622,6 +25875,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 rec["smart_breakout_fast_ok"] = bool(_breakout_fast_ok)
                                                 rec["smart_breakout_fast_reason"] = str(_breakout_fast_reason or "")
                                                 rec["smart_breakout_fast_meta"] = dict(_breakout_fast_meta or {})
+                                                rec["smart_setup_trap_ok"] = bool(_smart_trap_ok)
+                                                rec["smart_setup_trap_reason"] = str(_smart_trap_reason or "")
+                                                rec["smart_setup_trap_meta"] = dict(_smart_trap_meta or {})
                                                 rec["smart_emit_now"] = bool(_emit_now)
                                                 rec["smart_emit_reason"] = str(_emit_reason)
                                                 rec["smart_emit_meta"] = dict(_emit_meta or {})
