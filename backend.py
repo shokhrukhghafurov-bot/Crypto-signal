@@ -11881,9 +11881,24 @@ def _mid_pending_recency_guard(rec: dict, *, now_ts: float | None = None) -> tup
     except Exception:
         width_atr = None
     try:
+        width_atr_raw = float(rec.get("zone_width_atr_raw")) if rec.get("zone_width_atr_raw") is not None else None
+    except Exception:
+        width_atr_raw = None
+    try:
         width_pct = float(rec.get("zone_width_pct")) if rec.get("zone_width_pct") is not None else None
     except Exception:
         width_pct = None
+    try:
+        atr_pct_create = float(rec.get("atr_pct_at_create")) if rec.get("atr_pct_at_create") is not None else None
+    except Exception:
+        atr_pct_create = None
+    if width_atr is None and width_atr_raw is not None:
+        width_atr = width_atr_raw
+    if width_atr is None and width_pct is not None and atr_pct_create is not None and float(atr_pct_create) > 0:
+        try:
+            width_atr = float(width_pct) / max(float(atr_pct_create) / 100.0, 1e-9)
+        except Exception:
+            width_atr = None
     bo = str(rec.get("bo_rt") or rec.get("breakout_retest") or "").strip()
     try:
         bo_age_create_bars = int(float(rec.get("breakout_first_age_bars_create"))) if rec.get("breakout_first_age_bars_create") is not None else None
@@ -11893,21 +11908,46 @@ def _mid_pending_recency_guard(rec: dict, *, now_ts: float | None = None) -> tup
         bo_move_atr = float(rec.get("breakout_first_move_atr_create")) if rec.get("breakout_first_move_atr_create") is not None else None
     except Exception:
         bo_move_atr = None
+    if bo_move_atr is None and rec.get("breakout_first_move_pct_create") is not None and atr_pct_create is not None and float(atr_pct_create) > 0:
+        try:
+            bo_move_atr = float(rec.get("breakout_first_move_pct_create")) / max(float(atr_pct_create) / 100.0, 1e-9)
+        except Exception:
+            bo_move_atr = None
     try:
         bar_sec = max(1, int(float(rec.get("breakout_bar_sec") or 300)))
     except Exception:
         bar_sec = 300
+    try:
+        bo_first_ts = float(rec.get("breakout_first_ts")) if rec.get("breakout_first_ts") is not None else None
+        if bo_first_ts and bo_first_ts > 1e12:
+            bo_first_ts = bo_first_ts / 1000.0
+    except Exception:
+        bo_first_ts = None
+    if bo_age_create_bars is None:
+        try:
+            if rec.get("breakout_first_age_sec_create") is not None:
+                bo_age_create_bars = int(round(float(rec.get("breakout_first_age_sec_create")) / float(bar_sec)))
+            elif bo_first_ts and created_ts > 0:
+                bo_age_create_bars = int(round(max(0.0, created_ts - float(bo_first_ts)) / float(bar_sec)))
+        except Exception:
+            bo_age_create_bars = None
     bo_total_age_bars = None
     if bo_age_create_bars is not None:
         try:
             bo_total_age_bars = int(bo_age_create_bars + round(age_sec_now / float(bar_sec)))
         except Exception:
             bo_total_age_bars = bo_age_create_bars
+    elif bo_first_ts:
+        try:
+            bo_total_age_bars = int(round(max(0.0, now_v - float(bo_first_ts)) / float(bar_sec)))
+        except Exception:
+            bo_total_age_bars = None
 
     meta.update({
         "age_min": float(age_min_now),
         "zone_src": zsrc,
         "zone_width_atr": width_atr,
+        "zone_width_atr_raw": width_atr_raw,
         "zone_width_pct": width_pct,
         "bo": bo,
         "bo_age_create_bars": bo_age_create_bars,
@@ -11921,6 +11961,25 @@ def _mid_pending_recency_guard(rec: dict, *, now_ts: float | None = None) -> tup
         max_fb_w = 1.20
     if zsrc in ("fallback", "far") and width_atr is not None and width_atr > max_fb_w:
         return (False, f"zone_stale:{zsrc}:width_atr={float(width_atr):.2f}>{float(max_fb_w):g}", meta)
+
+    try:
+        max_fb_age_min = float(os.getenv("MID_PENDING_GUARD_MAX_FALLBACK_AGE_MIN", "20") or 20.0)
+    except Exception:
+        max_fb_age_min = 20.0
+    try:
+        max_far_age_min = float(os.getenv("MID_PENDING_GUARD_MAX_FAR_AGE_MIN", "12") or 12.0)
+    except Exception:
+        max_far_age_min = 12.0
+    try:
+        max_unknown_zone_age_min = float(os.getenv("MID_PENDING_GUARD_MAX_UNKNOWN_ZONE_AGE_MIN", "15") or 15.0)
+    except Exception:
+        max_unknown_zone_age_min = 15.0
+    if zsrc == "fallback" and max_fb_age_min > 0 and age_min_now > max_fb_age_min:
+        return (False, f"fallback_age:{float(age_min_now):.1f}m>{float(max_fb_age_min):g}", meta)
+    if zsrc == "far" and max_far_age_min > 0 and age_min_now > max_far_age_min:
+        return (False, f"far_age:{float(age_min_now):.1f}m>{float(max_far_age_min):g}", meta)
+    if zsrc in ("fallback", "far") and width_atr is None and max_unknown_zone_age_min > 0 and age_min_now > max_unknown_zone_age_min:
+        return (False, f"zone_unknown_age:{float(age_min_now):.1f}m>{float(max_unknown_zone_age_min):g}", meta)
 
     # Only apply breakout age/move guard when the setup really came from BO/RT context.
     bo_active = bool(bo) and bo not in ("-", "—", "NONE")
@@ -18435,8 +18494,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             except Exception:
                 _age_m = 0.0
             try:
-                if it.get("zone_width_atr") is not None:
-                    _zone_w_atr = f"{float(it.get('zone_width_atr')):.2f}"
+                _zw_log = it.get("zone_width_atr") if it.get("zone_width_atr") is not None else it.get("zone_width_atr_raw")
+                if _zw_log is not None:
+                    _zone_w_atr = f"{float(_zw_log):.2f}"
             except Exception:
                 _zone_w_atr = "-"
             try:
@@ -19262,7 +19322,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             float(price),
                             float(_age_m_eval),
                             str(it.get("entry_zone_src") or "-"),
-                            ("-" if it.get("zone_width_atr") is None else f"{float(it.get('zone_width_atr')):.2f}"),
+                            ("-" if it.get("zone_width_atr") is None and it.get("zone_width_atr_raw") is None else f"{float(it.get('zone_width_atr') if it.get('zone_width_atr') is not None else it.get('zone_width_atr_raw')):.2f}"),
                             str(it.get("bo_rt") or it.get("breakout_retest") or "-"),
                             ("-" if it.get("breakout_first_age_bars_create") is None else str(int(it.get("breakout_first_age_bars_create")))),
                         )
@@ -24530,6 +24590,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                             _atr0 = float(entry) * 0.001
                                         _zone_w = float(entry_high) - float(entry_low)
                                         _zone_w_atr = float(_zone_w) / float(_atr0) if float(_atr0) > 0 else 0.0
+                                        _zone_w_atr_raw = float(_zone_w_atr)
                                         _zone_w_pct = float(_zone_w) / float(entry) if float(entry) > 0 else 0.0
                                         if float(entry) < float(entry_low):
                                             _dist0 = float(entry_low) - float(entry)
@@ -24539,6 +24600,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                             _dist0 = 0.0
                                         
                                         _dist0_atr = float(_dist0) / float(_atr0) if float(_atr0) > 0 else 0.0
+                                        _dist0_atr_raw = float(_dist0_atr)
                                         _dist0_pct = float(_dist0) / float(entry) if float(entry) > 0 else 0.0
                                         # If volatility is extremely low, ATR-based distance becomes meaningless.
                                         # In that case, prefer percentage distance and avoid far/near classification by ATR.
@@ -24569,8 +24631,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     except Exception:
                                         _atr0 = float(entry) * 0.001
                                         _zone_w_atr = 0.0
+                                        _zone_w_atr_raw = 0.0
                                         _zone_w_pct = 0.0
                                         _dist0_atr = 0.0
+                                        _dist0_atr_raw = 0.0
                                         _dist0_pct = 0.0
 
                                     # FAR-zone handling: allow pending even if entry zone is far from current entry,
@@ -24609,6 +24673,24 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         _bo_meta = dict(bo_rt_meta or {})
                                     except Exception:
                                         _bo_meta = {}
+                                    try:
+                                        _bo_lbl = str((base_r.get("bo_rt") if ("base_r" in locals() and isinstance(base_r, dict)) else bo_rt_label) or bo_rt_label or "").strip()
+                                    except Exception:
+                                        _bo_lbl = str(bo_rt_label or "").strip()
+                                    if _bo_lbl and _bo_lbl not in ("-", "—", "NONE"):
+                                        try:
+                                            _need_bo_backfill = any(_bo_meta.get(k) is None for k in ("breakout_age_bars", "breakout_move_atr", "breakout_ts_ms"))
+                                        except Exception:
+                                            _need_bo_backfill = True
+                                        if _need_bo_backfill:
+                                            try:
+                                                _bo_meta_backfill = _mid_breakout_retest_snapshot(chosen_df5, direction=str(diru), support=sup_lvl, resistance=res_lvl, atr5=float(_atr0 or atr5 or 0.0))
+                                                if isinstance(_bo_meta_backfill, dict):
+                                                    for _k, _v in _bo_meta_backfill.items():
+                                                        if _bo_meta.get(_k) is None and _v is not None:
+                                                            _bo_meta[_k] = _v
+                                            except Exception:
+                                                pass
                                     try:
                                         _bo_age_bars_create = int(_bo_meta.get("breakout_age_bars")) if _bo_meta.get("breakout_age_bars") is not None else None
                                     except Exception:
@@ -24653,8 +24735,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "atr_pct_at_create": float((base_r.get("atr_pct") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
                                         "rel_vol_at_create": float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
                                         "zone_width_atr": (float(_zone_w_atr) if (_zone_w_atr is not None) else None) if ("_zone_w_atr" in locals()) else None,
+                                        "zone_width_atr_raw": (float(_zone_w_atr_raw) if ("_zone_w_atr_raw" in locals() and _zone_w_atr_raw is not None) else None),
                                         "zone_width_pct": float(_zone_w_pct) if ("_zone_w_pct" in locals()) else 0.0,
                                         "dist_to_zone_at_create_atr": (float(_dist0_atr) if (_dist0_atr is not None) else None) if ("_dist0_atr" in locals()) else None,
+                                        "dist_to_zone_at_create_atr_raw": (float(_dist0_atr_raw) if ("_dist0_atr_raw" in locals() and _dist0_atr_raw is not None) else None),
                                         "dist_to_zone_at_create_pct": float(_dist0_pct) if ("_dist0_pct" in locals()) else 0.0,
                                         "sl": float(sl),
                                         "tp1": float(tp1),
