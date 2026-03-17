@@ -8493,6 +8493,39 @@ def _mid_instant_emit_market_thresholds(market: str) -> tuple[float, float]:
     return (float(max(0.0, min_atr)), float(max(0.0, min_vol)))
 
 
+def _mid_instant_emit_profit_cap(market: str) -> float:
+    """Return early-entry instant profit cap separately for spot and futures.
+
+    Backward compatibility:
+      - SPOT: MID_EARLY_ENTRY_INSTANT_PROFIT_CAP_SPOT -> MID_EARLY_ENTRY_INSTANT_PROFIT_CAP
+      - FUTURES: MID_EARLY_ENTRY_INSTANT_PROFIT_CAP_FUTURES / _FUT -> MID_EARLY_ENTRY_INSTANT_PROFIT_CAP
+    """
+    m = (market or "SPOT").upper().strip()
+    try:
+        if m == "FUTURES":
+            cap = float(
+                os.getenv(
+                    "MID_EARLY_ENTRY_INSTANT_PROFIT_CAP_FUTURES",
+                    os.getenv(
+                        "MID_EARLY_ENTRY_INSTANT_PROFIT_CAP_FUT",
+                        os.getenv("MID_EARLY_ENTRY_INSTANT_PROFIT_CAP", "0.75"),
+                    ),
+                )
+                or 0.75
+            )
+        else:
+            cap = float(
+                os.getenv(
+                    "MID_EARLY_ENTRY_INSTANT_PROFIT_CAP_SPOT",
+                    os.getenv("MID_EARLY_ENTRY_INSTANT_PROFIT_CAP", "0.75"),
+                )
+                or 0.75
+            )
+    except Exception:
+        cap = 0.75
+    return float(max(0.0, cap))
+
+
 def _mid_instant_emit_near_extreme_ok(*, direction: str, entry: float, recent_low: float | None, recent_high: float | None,
                                       atr30: float | None, market: str = "SPOT") -> tuple[bool, str]:
     """Recent-extreme guard for VIP instant emit.
@@ -8971,10 +9004,10 @@ def _mid_instant_emit_gate(*,
     try:
         profit_need = float(os.getenv("MID_INSTANT_EMIT_MIN_PROFIT_PCT", "1.0") or 1.0)
         if _MID_EARLY_ENTRY_GUARD and _mid_soft_blocks_enabled():
-            profit_need = min(float(profit_need), float(os.getenv("MID_EARLY_ENTRY_INSTANT_PROFIT_CAP", "0.75") or 0.75))
+            profit_need = min(float(profit_need), float(_mid_instant_emit_profit_cap(market)))
         profit_need = max(0.0, float(profit_need))
     except Exception:
-        profit_need = 0.75 if _MID_EARLY_ENTRY_GUARD else 1.0
+        profit_need = float(_mid_instant_emit_profit_cap(market)) if _MID_EARLY_ENTRY_GUARD else 1.0
 
     flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
     hard_flags = {"far_zone", "scale_mismatch", "blocked", "structure_mismatch", "regime_range_no_breakout"}
@@ -22659,9 +22692,13 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     except Exception:
                         late_entry_raw_cfg = float(late_entry_cfg)
                     try:
-                        instant_profit_cap = float(os.getenv("MID_EARLY_ENTRY_INSTANT_PROFIT_CAP", "0.75") or 0.75)
+                        instant_profit_cap_spot = float(_mid_instant_emit_profit_cap("SPOT"))
                     except Exception:
-                        instant_profit_cap = 0.75
+                        instant_profit_cap_spot = 0.75
+                    try:
+                        instant_profit_cap_fut = float(_mid_instant_emit_profit_cap("FUTURES"))
+                    except Exception:
+                        instant_profit_cap_fut = 0.75
                     try:
                         instant_vol_cap_spot = float(os.getenv("MID_EARLY_ENTRY_INSTANT_VOL_CAP_SPOT", "0.03") or 0.03)
                     except Exception:
@@ -22671,7 +22708,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     except Exception:
                         instant_vol_cap_fut = 0.05
                     logger.info(
-                        "[mid][cfg2] soft_blocks=%s early_guard=%s ultra_safe=%s late_atr_raw=%s late_atr=%s hard_late_mult=%s anti_atr=%s hard_anti_mult=%s smart_setup=%s smart_conf=%s smart_near_atr=%s smart_near_pct=%s instant_profit_cap=%s instant_vol_cap_spot=%s instant_vol_cap_fut=%s",
+                        "[mid][cfg2] soft_blocks=%s early_guard=%s ultra_safe=%s late_atr_raw=%s late_atr=%s hard_late_mult=%s anti_atr=%s hard_anti_mult=%s smart_setup=%s smart_conf=%s smart_near_atr=%s smart_near_pct=%s instant_profit_cap_spot=%s instant_profit_cap_fut=%s instant_vol_cap_spot=%s instant_vol_cap_fut=%s",
                         int(_mid_soft_blocks_enabled()),
                         int(bool(_MID_EARLY_ENTRY_GUARD)),
                         int(bool(MID_ULTRA_SAFE)),
@@ -22684,7 +22721,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         int(smart_conf_need),
                         float(smart_near_atr),
                         float(smart_near_pct),
-                        float(instant_profit_cap),
+                        float(instant_profit_cap_spot),
+                        float(instant_profit_cap_fut),
                         float(instant_vol_cap_spot),
                         float(instant_vol_cap_fut),
                     )
