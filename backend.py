@@ -398,6 +398,47 @@ if _MID_EARLY_ENTRY_GUARD and _MID_SOFT_BLOCKS_BOOT and (_MID_SMART_SETUP_BOOT o
     if float(MID_LATE_ENTRY_ATR_MAX) < float(_mid_late_floor):
         MID_LATE_ENTRY_ATR_MAX = float(_mid_late_floor)
 
+
+def _mid_early_entry_guard_enabled() -> bool:
+    try:
+        return bool(_MID_EARLY_ENTRY_GUARD) and bool(_mid_soft_blocks_enabled())
+    except Exception:
+        try:
+            return bool(_MID_EARLY_ENTRY_GUARD)
+        except Exception:
+            return False
+
+
+def _mid_effective_late_entry_max(*, market: str = "SPOT", adx_30m: float | None = None) -> float:
+    """Return the normalized late-entry threshold before adaptive scaling.
+
+    It respects ULTRA/base source selection and optional FUT override, but does not
+    apply ADX/adaptive multipliers. Those stay in the caller so they are applied once.
+    """
+    try:
+        late_entry_max = float(MID_ULTRA_LATE_ENTRY_ATR_MAX if MID_ULTRA_SAFE else MID_LATE_ENTRY_ATR_MAX)
+    except Exception:
+        try:
+            late_entry_max = float(os.getenv("MID_LATE_ENTRY_ATR_MAX", "2.2") or 2.2)
+        except Exception:
+            late_entry_max = 2.2
+    try:
+        mkt_u = (market or "SPOT").upper().strip()
+    except Exception:
+        mkt_u = "SPOT"
+    if mkt_u == "FUTURES" and os.getenv("MID_FUT_ADAPT_FILTERS", "1").strip().lower() in ("1","true","yes","on"):
+        _le_fut = _env_float("MID_LATE_ENTRY_ATR_MAX_FUT", 0.0)
+        if _le_fut and _le_fut > 0:
+            late_entry_max = min(late_entry_max, float(_le_fut)) if MID_ULTRA_SAFE else float(_le_fut)
+    if _mid_early_entry_guard_enabled():
+        try:
+            floor_v = float(os.getenv("MID_EARLY_ENTRY_LATE_ATR_FLOOR", "1.25") or 1.25)
+        except Exception:
+            floor_v = 1.25
+        if late_entry_max < floor_v:
+            late_entry_max = float(floor_v)
+    return float(late_entry_max)
+
 # --- MID ULTRA SAFE (reduce SL dramatically; fewer but higher-quality signals) ---
 MID_ULTRA_SAFE = os.getenv("MID_ULTRA_SAFE", "0").strip().lower() in ("1","true","yes","on")
 # Strong-trend countertrend blocker (uses 30m ADX)
@@ -8514,14 +8555,11 @@ def _mid_late_entry_anti_bounce_reasons(*,
         if atr <= 0 or px <= 0:
             return (None, None)
 
-        late_entry_max = MID_ULTRA_LATE_ENTRY_ATR_MAX if MID_ULTRA_SAFE else MID_LATE_ENTRY_ATR_MAX
+        late_entry_max = _mid_effective_late_entry_max(market=market, adx_30m=adx_30m)
         mkt_u = (market or "SPOT").upper().strip()
         fut_late_mult = 1.0
         fut_bounce_mult = 1.0
         if mkt_u == "FUTURES" and os.getenv("MID_FUT_ADAPT_FILTERS", "1").strip().lower() in ("1","true","yes","on"):
-            _le_fut = _env_float("MID_LATE_ENTRY_ATR_MAX_FUT", 0.0)
-            if _le_fut and _le_fut > 0:
-                late_entry_max = min(late_entry_max, float(_le_fut)) if MID_ULTRA_SAFE else float(_le_fut)
             if adx_30m is not None and os.getenv("MID_FUT_ADAPT_BY_ADX", "1").strip().lower() in ("1","true","yes","on"):
                 adx = float(adx_30m)
                 adx_strong = _env_float("MID_FUT_ADX_STRONG", 30.0)
@@ -8624,7 +8662,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         _skip_late_vwap_blocks = bool((_phase == "scan") and _pending_enabled and _pending_skip_hb and (not _quality_first))
 
         # ULTRA SAFE: tighten filters dynamically for near-zero SL preference
-        late_entry_max = MID_ULTRA_LATE_ENTRY_ATR_MAX if MID_ULTRA_SAFE else MID_LATE_ENTRY_ATR_MAX
+        late_entry_max = _mid_effective_late_entry_max(market=market, adx_30m=adx_30m)
         vwap_dist_max = MID_ULTRA_VWAP_DIST_ATR_MAX if MID_ULTRA_SAFE else MID_VWAP_DIST_ATR_MAX
         rsi_long_max = MID_ULTRA_RSI_LONG_MAX if MID_ULTRA_SAFE else MID_RSI_LONG_MAX
         rsi_long_min = MID_ULTRA_RSI_LONG_MIN if MID_ULTRA_SAFE else MID_RSI_LONG_MIN
@@ -8642,8 +8680,7 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
                 # Optional hard overrides (set >0 to take effect)
                 _le_fut = _env_float("MID_LATE_ENTRY_ATR_MAX_FUT", 0.0)
                 _vw_fut = _env_float("MID_VWAP_DIST_ATR_MAX_FUT", 0.0)
-                if _le_fut and _le_fut > 0:
-                    late_entry_max = min(late_entry_max, float(_le_fut)) if MID_ULTRA_SAFE else float(_le_fut)
+                # late_entry_max already includes FUT/ULTRA normalization via _mid_effective_late_entry_max()
                 if _vw_fut and _vw_fut > 0:
                     vwap_dist_max = min(vwap_dist_max, float(_vw_fut)) if MID_ULTRA_SAFE else float(_vw_fut)
 
@@ -21239,9 +21276,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     int(top_n), float(ttl_min)
                 )
                 try:
-                    late_entry_cfg = float(MID_ULTRA_LATE_ENTRY_ATR_MAX if MID_ULTRA_SAFE else MID_LATE_ENTRY_ATR_MAX)
+                    late_entry_cfg = float(_mid_effective_late_entry_max(market="SPOT", adx_30m=None))
                 except Exception:
-                    late_entry_cfg = float(os.getenv("MID_LATE_ENTRY_ATR_MAX", "2.2") or 2.2)
+                    late_entry_cfg = float(MID_LATE_ENTRY_ATR_MAX if not MID_ULTRA_SAFE else MID_ULTRA_LATE_ENTRY_ATR_MAX)
                 try:
                     anti_bounce_cfg = float(MID_ANTI_BOUNCE_ATR_MAX)
                 except Exception:
@@ -21288,9 +21325,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     except Exception:
                         instant_vol_cap_fut = 0.05
                     logger.info(
-                        "[mid][cfg2] soft_blocks=%s early_guard=%s late_atr_raw=%s late_atr=%s hard_late_mult=%s anti_atr=%s hard_anti_mult=%s smart_setup=%s smart_conf=%s smart_near_atr=%s smart_near_pct=%s instant_profit_cap=%s instant_vol_cap_spot=%s instant_vol_cap_fut=%s",
+                        "[mid][cfg2] soft_blocks=%s early_guard=%s ultra_safe=%s late_atr_raw=%s late_atr=%s hard_late_mult=%s anti_atr=%s hard_anti_mult=%s smart_setup=%s smart_conf=%s smart_near_atr=%s smart_near_pct=%s instant_profit_cap=%s instant_vol_cap_spot=%s instant_vol_cap_fut=%s",
                         int(_mid_soft_blocks_enabled()),
                         int(bool(_MID_EARLY_ENTRY_GUARD)),
+                        int(bool(MID_ULTRA_SAFE)),
                         float(late_entry_raw_cfg),
                         float(late_entry_cfg),
                         float(hard_late_mult),
