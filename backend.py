@@ -365,6 +365,38 @@ MID_CLIMAX_VOL_X = float(os.getenv("MID_CLIMAX_VOL_X", "2.5"))              # la
 MID_CLIMAX_BODY_ATR = float(os.getenv("MID_CLIMAX_BODY_ATR", "1.2"))         # abs(close-open)/ATR_30m
 MID_CLIMAX_COOLDOWN_BARS = int(os.getenv("MID_CLIMAX_COOLDOWN_BARS", "1"))   # block next N bars after climax
 
+# Early-entry guard: some deployments still inject ultra-tight legacy env values
+# (for example MID_LATE_ENTRY_ATR_MAX=0.9), which makes pending/trigger paths miss
+# the start of the move even when soft-block mode is enabled. For the early-entry
+# preset we normalize obviously too-strict values to a sane floor inside code so the
+# runtime stays usable even if the platform env is stale.
+try:
+    _MID_EARLY_ENTRY_GUARD = (os.getenv("MID_EARLY_ENTRY_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+except Exception:
+    _MID_EARLY_ENTRY_GUARD = True
+try:
+    _MID_SOFT_BLOCKS_BOOT = (os.getenv("MID_SOFT_BLOCKS_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+except Exception:
+    _MID_SOFT_BLOCKS_BOOT = True
+try:
+    _MID_SMART_SETUP_BOOT = (os.getenv("MID_SMART_SETUP_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+except Exception:
+    _MID_SMART_SETUP_BOOT = True
+try:
+    _MID_REQUIRE_TRIGGER_BOOT = (os.getenv("MID_REQUIRE_TRIGGER", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+except Exception:
+    _MID_REQUIRE_TRIGGER_BOOT = True
+try:
+    _MID_LATE_ENTRY_ATR_MAX_RAW = float(MID_LATE_ENTRY_ATR_MAX)
+except Exception:
+    _MID_LATE_ENTRY_ATR_MAX_RAW = 2.2
+if _MID_EARLY_ENTRY_GUARD and _MID_SOFT_BLOCKS_BOOT and (_MID_SMART_SETUP_BOOT or _MID_REQUIRE_TRIGGER_BOOT):
+    try:
+        _mid_late_floor = float(os.getenv("MID_EARLY_ENTRY_LATE_ATR_FLOOR", "1.25") or 1.25)
+    except Exception:
+        _mid_late_floor = 1.25
+    if float(MID_LATE_ENTRY_ATR_MAX) < float(_mid_late_floor):
+        MID_LATE_ENTRY_ATR_MAX = float(_mid_late_floor)
 
 # --- MID ULTRA SAFE (reduce SL dramatically; fewer but higher-quality signals) ---
 MID_ULTRA_SAFE = os.getenv("MID_ULTRA_SAFE", "0").strip().lower() in ("1","true","yes","on")
@@ -7999,7 +8031,11 @@ def signal_min_profit_gate(sig: "Signal") -> tuple[bool, float, float]:
 
 
 def _mid_instant_emit_market_thresholds(market: str) -> tuple[float, float]:
-    """Return strict ATR%% and volume minimums for VIP instant emit."""
+    """Return strict ATR%% and volume minimums for VIP instant emit.
+
+    In early-entry mode we cap legacy-deployment thresholds to sane values so smart-setup
+    can still emit near the start of the move instead of always falling back to pending.
+    """
     m = (market or "SPOT").upper().strip()
     try:
         if m == "FUTURES":
@@ -8010,8 +8046,19 @@ def _mid_instant_emit_market_thresholds(market: str) -> tuple[float, float]:
             min_vol = float(os.getenv("MID_INSTANT_EMIT_MIN_VOL_X_SPOT", "0.10") or 0.10)
     except Exception:
         if m == "FUTURES":
-            return (0.11, 0.28)
-        return (0.18, 0.10)
+            min_atr, min_vol = 0.11, 0.28
+        else:
+            min_atr, min_vol = 0.18, 0.10
+    try:
+        if _MID_EARLY_ENTRY_GUARD and _mid_soft_blocks_enabled():
+            if m == "FUTURES":
+                min_atr = min(float(min_atr), float(os.getenv("MID_EARLY_ENTRY_INSTANT_ATR_CAP_FUTURES", os.getenv("MID_EARLY_ENTRY_INSTANT_ATR_CAP_FUT", "0.09")) or 0.09))
+                min_vol = min(float(min_vol), float(os.getenv("MID_EARLY_ENTRY_INSTANT_VOL_CAP_FUTURES", os.getenv("MID_EARLY_ENTRY_INSTANT_VOL_CAP_FUT", "0.05")) or 0.05))
+            else:
+                min_atr = min(float(min_atr), float(os.getenv("MID_EARLY_ENTRY_INSTANT_ATR_CAP_SPOT", "0.15") or 0.15))
+                min_vol = min(float(min_vol), float(os.getenv("MID_EARLY_ENTRY_INSTANT_VOL_CAP_SPOT", "0.03") or 0.03))
+    except Exception:
+        pass
     return (float(max(0.0, min_atr)), float(max(0.0, min_vol)))
 
 
@@ -8123,9 +8170,12 @@ def _mid_instant_emit_gate(*,
     except Exception:
         no_zone_extra_conf = 5
     try:
-        profit_need = max(1.0, float(os.getenv("MID_INSTANT_EMIT_MIN_PROFIT_PCT", "1.0") or 1.0))
+        profit_need = float(os.getenv("MID_INSTANT_EMIT_MIN_PROFIT_PCT", "1.0") or 1.0)
+        if _MID_EARLY_ENTRY_GUARD and _mid_soft_blocks_enabled():
+            profit_need = min(float(profit_need), float(os.getenv("MID_EARLY_ENTRY_INSTANT_PROFIT_CAP", "0.75") or 0.75))
+        profit_need = max(0.0, float(profit_need))
     except Exception:
-        profit_need = 1.0
+        profit_need = 0.75 if _MID_EARLY_ENTRY_GUARD else 1.0
 
     flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
     hard_flags = {"far_zone", "scale_mismatch", "blocked", "structure_mismatch", "regime_range_no_breakout"}
@@ -21221,9 +21271,27 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                 except Exception:
                     smart_near_pct = 0.004
                 try:
+                    try:
+                        late_entry_raw_cfg = float(_MID_LATE_ENTRY_ATR_MAX_RAW)
+                    except Exception:
+                        late_entry_raw_cfg = float(late_entry_cfg)
+                    try:
+                        instant_profit_cap = float(os.getenv("MID_EARLY_ENTRY_INSTANT_PROFIT_CAP", "0.75") or 0.75)
+                    except Exception:
+                        instant_profit_cap = 0.75
+                    try:
+                        instant_vol_cap_spot = float(os.getenv("MID_EARLY_ENTRY_INSTANT_VOL_CAP_SPOT", "0.03") or 0.03)
+                    except Exception:
+                        instant_vol_cap_spot = 0.03
+                    try:
+                        instant_vol_cap_fut = float(os.getenv("MID_EARLY_ENTRY_INSTANT_VOL_CAP_FUTURES", os.getenv("MID_EARLY_ENTRY_INSTANT_VOL_CAP_FUT", "0.05")) or 0.05)
+                    except Exception:
+                        instant_vol_cap_fut = 0.05
                     logger.info(
-                        "[mid][cfg2] soft_blocks=%s late_atr=%s hard_late_mult=%s anti_atr=%s hard_anti_mult=%s smart_setup=%s smart_conf=%s smart_near_atr=%s smart_near_pct=%s",
+                        "[mid][cfg2] soft_blocks=%s early_guard=%s late_atr_raw=%s late_atr=%s hard_late_mult=%s anti_atr=%s hard_anti_mult=%s smart_setup=%s smart_conf=%s smart_near_atr=%s smart_near_pct=%s instant_profit_cap=%s instant_vol_cap_spot=%s instant_vol_cap_fut=%s",
                         int(_mid_soft_blocks_enabled()),
+                        int(bool(_MID_EARLY_ENTRY_GUARD)),
+                        float(late_entry_raw_cfg),
                         float(late_entry_cfg),
                         float(hard_late_mult),
                         float(anti_bounce_cfg),
@@ -21232,6 +21300,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         int(smart_conf_need),
                         float(smart_near_atr),
                         float(smart_near_pct),
+                        float(instant_profit_cap),
+                        float(instant_vol_cap_spot),
+                        float(instant_vol_cap_fut),
                     )
                 except Exception:
                     pass
