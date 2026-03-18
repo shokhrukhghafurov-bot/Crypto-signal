@@ -13583,6 +13583,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                                     )
                                     if _late_dbg:
                                         _last_ok_entry = _late_dbg.get("last_ok_entry", float("nan"))
+                                        _last_ok_entry_s = (f"{float(_last_ok_entry):.6g}" if not np.isnan(float(_last_ok_entry)) else "nan")
                                         _late_dbg_tail = (
                                             " recent_low=%.6g recent_high=%.6g atr30=%.6g"
                                             " move_atr=%.2f limit_atr=%.2f cutoff=%.6g"
@@ -13600,7 +13601,23 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                                             float(_late_dbg["extreme_px"]),
                                             str(_late_dbg.get("last_ok_pos", "-")),
                                             str(_late_dbg["last_ok_ts"]),
-                                            (f"{float(_last_ok_entry):.6g}" if not np.isnan(float(_last_ok_entry)) else "nan"),
+                                            _last_ok_entry_s,
+                                        )
+                                        logger.info(
+                                            "[mid][late_hint] %s dir=%s entry=%.6g reason=%s move_atr=%.2f limit_atr=%.2f cutoff=%.6g extreme_pos=%s extreme_ts=%s extreme_px=%.6g last_ok_pos=%s last_ok_ts=%s last_ok_entry=%s",
+                                            symbol,
+                                            dir_trend,
+                                            float(entry),
+                                            reason,
+                                            float(_late_dbg["move_atr"]),
+                                            float(_late_dbg["limit_atr"]),
+                                            float(_late_dbg["cutoff_px"]),
+                                            str(_late_dbg.get("extreme_pos", "-")),
+                                            str(_late_dbg["extreme_ts"]),
+                                            float(_late_dbg["extreme_px"]),
+                                            str(_late_dbg.get("last_ok_pos", "-")),
+                                            str(_late_dbg["last_ok_ts"]),
+                                            _last_ok_entry_s,
                                         )
                             except Exception:
                                 _late_dbg_tail = ""
