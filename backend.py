@@ -8403,6 +8403,38 @@ def signal_min_profit_gate(sig: "Signal") -> tuple[bool, float, float]:
     return (float(profit) >= float(min_req), float(profit), float(min_req))
 
 
+
+def signal_rr_gate(sig: "Signal") -> tuple[bool, float, float]:
+    """Return (ok, effective_rr, min_required_rr).
+
+    RR must be computed from the actual structural SL/TP shown to the user, otherwise
+    late entries with artificially tight ATR stops look good on paper and then die on SL.
+    """
+    try:
+        market = str(getattr(sig, "market", "FUTURES") or "FUTURES").upper().strip()
+    except Exception:
+        market = "FUTURES"
+    try:
+        if market == "SPOT":
+            min_req = float(os.getenv("MID_MIN_RR_EMIT_SPOT", "1.20") or 1.20)
+        else:
+            min_req = float(os.getenv("MID_MIN_RR_EMIT_FUTURES", os.getenv("MID_MIN_RR_EMIT_FUT", "1.15")) or 1.15)
+    except Exception:
+        min_req = 1.20 if market == "SPOT" else 1.15
+
+    try:
+        entry = float(getattr(sig, "entry", 0.0) or 0.0)
+        sl = float(getattr(sig, "sl", 0.0) or 0.0)
+        tp1 = float(getattr(sig, "tp1", 0.0) or 0.0)
+        tp2 = float(getattr(sig, "tp2", 0.0) or 0.0)
+        risk = abs(entry - sl)
+        target = tp2 if tp2 > 0 else tp1
+        rr = (abs(target - entry) / risk) if (risk > 1e-12 and target > 0) else 0.0
+    except Exception:
+        rr = 0.0
+    return (float(rr) >= float(min_req), float(rr), float(min_req))
+
+
 def _mid_instant_emit_market_thresholds(market: str) -> tuple[float, float]:
     """Return strict ATR%% and volume minimums for VIP instant emit.
 
@@ -8958,6 +8990,7 @@ def _mid_instant_emit_gate(*,
     vol_v = float(vol_x or 0.0)
     min_atr, min_vol = _mid_instant_emit_market_thresholds(market)
     profit_v = signal_expected_profit_pct(sig) if sig is not None else 0.0
+    rr_ok, rr_v, rr_need = signal_rr_gate(sig) if sig is not None else (False, 0.0, 0.0)
     reg_u = str(regime or "").upper().strip()
 
     meta.update({
@@ -8969,6 +9002,8 @@ def _mid_instant_emit_gate(*,
         "vol_need": float(min_vol),
         "profit_pct": float(profit_v),
         "profit_need": float(profit_need),
+        "rr": float(rr_v),
+        "rr_need": float(rr_need),
         "regime": reg_u,
         "zone_valid": bool(zone_valid),
         "in_zone_now": bool(in_zone_now),
@@ -9032,6 +9067,8 @@ def _mid_instant_emit_gate(*,
         _add_fail(str(smart_setup_trap_reason or "smart_setup_trap"))
     if profit_v < float(profit_need):
         _add_fail(f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}")
+    if not rr_ok:
+        _add_fail(f"instant_rr_low:{rr_v:.2f}<{rr_need:.2f}")
     if atr_v < float(min_atr):
         _add_fail(f"instant_atr_low:{atr_v:.3f}<{min_atr:.3f}")
     if vol_v < float(min_vol):
@@ -13870,6 +13907,162 @@ def _build_levels(direction: str, entry: float, atr: float, *, tp2_r: float | No
     return sl, tp1, tp2, rr
 
 
+
+def _mid_struct_zone_bounds(ta: dict | None = None, it: dict | None = None) -> tuple[float | None, float | None]:
+    ta = ta or {}
+    it = it or {}
+    vals_lo = []
+    vals_hi = []
+    for src in (ta, it):
+        try:
+            lo = src.get("entry_low")
+            hi = src.get("entry_high")
+        except Exception:
+            lo = hi = None
+        try:
+            lo_f = float(lo) if lo is not None else None
+        except Exception:
+            lo_f = None
+        try:
+            hi_f = float(hi) if hi is not None else None
+        except Exception:
+            hi_f = None
+        if lo_f is not None and hi_f is not None and math.isfinite(lo_f) and math.isfinite(hi_f) and hi_f > lo_f > 0:
+            vals_lo.append(lo_f)
+            vals_hi.append(hi_f)
+    if vals_lo and vals_hi:
+        return (float(min(vals_lo)), float(max(vals_hi)))
+    return (None, None)
+
+
+def _mid_pick_entry_anchor(direction: str,
+                           trigger_price: float,
+                           atr: float,
+                           ta: dict | None = None,
+                           it: dict | None = None) -> float:
+    """Pick a realistic early entry only when price is still inside/very near the zone.
+
+    We never snap a far-away impulse back to the zone because that would create an
+    unfillable optimistic entry. In that case we keep the real trigger price and let
+    RR/late-entry gates block the setup.
+    """
+    d = str(direction or "").upper().strip()
+    px = float(trigger_price or 0.0)
+    if px <= 0:
+        return px
+    atr_f = abs(float(atr or 0.0))
+    ta = ta or {}
+    it = it or {}
+    zlo, zhi = _mid_struct_zone_bounds(ta, it)
+    snap_atr = float(os.getenv("MID_STRUCT_ENTRY_SNAP_ATR", "0.12") or 0.12)
+    snap_pct = float(os.getenv("MID_STRUCT_ENTRY_SNAP_PCT", "0.0015") or 0.0015)
+    drift = max(atr_f * max(0.0, snap_atr), px * max(0.0, snap_pct))
+
+    if zlo is not None and zhi is not None and zhi > zlo:
+        if d == "LONG":
+            structural_entry = float(zhi)
+            if px <= structural_entry + drift:
+                return float(min(px, structural_entry))
+        elif d == "SHORT":
+            structural_entry = float(zlo)
+            if px >= structural_entry - drift:
+                return float(max(px, structural_entry))
+
+    for src in (ta, it):
+        try:
+            base = float(src.get("entry") or 0.0)
+        except Exception:
+            base = 0.0
+        if base > 0 and math.isfinite(base):
+            if abs(px - base) <= drift:
+                return float(base)
+            break
+    return float(px)
+
+
+def _mid_anchor_sl_to_structure(direction: str,
+                                entry: float,
+                                raw_sl: float,
+                                atr: float,
+                                ta: dict | None = None,
+                                it: dict | None = None) -> float:
+    """Move SL behind real structure instead of keeping a tight ATR stop inside the zone."""
+    d = str(direction or "").upper().strip()
+    entry_f = float(entry or 0.0)
+    sl_f = float(raw_sl or 0.0)
+    atr_f = abs(float(atr or 0.0))
+    ta = ta or {}
+    it = it or {}
+    if entry_f <= 0 or sl_f <= 0:
+        return sl_f
+
+    buf_atr = float(os.getenv("MID_STRUCT_SL_BUFFER_ATR", "0.25") or 0.25)
+    buf_pct = float(os.getenv("MID_STRUCT_SL_BUFFER_PCT", "0.0010") or 0.0010)
+    buf = max(atr_f * max(0.0, buf_atr), abs(entry_f) * max(0.0, buf_pct), 1e-12)
+
+    zlo, zhi = _mid_struct_zone_bounds(ta, it)
+    anchors: list[float] = []
+
+    def _push(v) -> None:
+        try:
+            fv = float(v)
+        except Exception:
+            return
+        if not math.isfinite(fv) or fv <= 0:
+            return
+        anchors.append(float(fv))
+
+    if d == "LONG":
+        _push(zlo)
+        _push(ta.get("support"))
+        _push(it.get("support"))
+        _push(ta.get("eq_lo"))
+        _push(it.get("eq_lo"))
+        _push(ta.get("sl"))
+        _push(it.get("sl"))
+        below = [x for x in anchors if x < entry_f]
+        if below:
+            return float(min(sl_f, min(below) - buf))
+        return float(sl_f)
+
+    if d == "SHORT":
+        _push(zhi)
+        _push(ta.get("resistance"))
+        _push(it.get("resistance"))
+        _push(ta.get("eq_hi"))
+        _push(it.get("eq_hi"))
+        _push(ta.get("sl"))
+        _push(it.get("sl"))
+        above = [x for x in anchors if x > entry_f]
+        if above:
+            return float(max(sl_f, max(above) + buf))
+        return float(sl_f)
+
+    return float(sl_f)
+
+
+def _mid_reprice_targets_from_risk(direction: str,
+                                   entry: float,
+                                   sl: float,
+                                   *,
+                                   tp2_r: float | None = None) -> tuple[float, float, float]:
+    d = str(direction or "").upper().strip()
+    entry_f = float(entry or 0.0)
+    sl_f = float(sl or 0.0)
+    risk = abs(entry_f - sl_f)
+    if risk <= 1e-12:
+        return (0.0, 0.0, 0.0)
+    tp2_mult = float(tp2_r) if tp2_r is not None else float(TP2_R)
+    if d == "LONG":
+        tp1_f = entry_f + float(TP1_R) * risk
+        tp2_f = entry_f + float(tp2_mult) * risk
+    else:
+        tp1_f = entry_f - float(TP1_R) * risk
+        tp2_f = entry_f - float(tp2_mult) * risk
+    rr_f = abs(tp2_f - entry_f) / risk
+    return (float(tp1_f), float(tp2_f), float(rr_f))
+
+
 def _mid_finalize_targets(direction: str,
                           entry: float,
                           sl: float,
@@ -18164,6 +18357,15 @@ class Backend:
                             ts=time.time(),
                         )
 
+                        _rr_ok, _rr_val, _rr_min = signal_rr_gate(sig)
+                        if not _rr_ok:
+                            logger.info("[signal][skip_rr] %s market=%s dir=%s rr=%.3f min=%.3f", sig.symbol, sig.market, sig.direction, float(_rr_val), float(_rr_min))
+                            try:
+                                _rej_add(sym, f"rr_lt_{float(_rr_min):.2f}")
+                            except Exception:
+                                pass
+                            continue
+
                         _profit_ok, _profit_pct, _profit_min = signal_min_profit_gate(sig)
                         if not _profit_ok:
                             logger.info("[signal][skip_profit] %s market=%s dir=%s profit=%.3f%% min=%.3f%%", sig.symbol, sig.market, sig.direction, float(_profit_pct), float(_profit_min))
@@ -18689,11 +18891,22 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
 
 
 def _mid_recalc_levels_from_trigger(direction: str, trigger_price: float, ta: dict | None, it: dict | None, market: str | None = None) -> tuple[float,float,float,float,float]:
-    """Recompute entry/SL/TP from the actual trigger price instead of reusing stale setup levels."""
+    """Recompute entry/SL/TP from the actual trigger price with structure-aware entry/SL.
+
+    Key changes:
+    - keep the real trigger price unless price is still inside/very near the entry zone
+    - anchor SL behind real structure (zone/support/resistance), not inside the zone
+    - reprice TP1/TP2 from the new structural risk so RR stays honest
+    """
     direction = str(direction or "").upper().strip()
-    entry_emit = float(trigger_price or 0.0)
     ta = ta or {}
     it = it or {}
+
+    try:
+        trigger_f = float(trigger_price or 0.0)
+    except Exception:
+        trigger_f = 0.0
+
     atr_use = None
     for cand in (ta.get("atr30"), ta.get("atr_abs"), it.get("atr_at_create")):
         try:
@@ -18704,7 +18917,8 @@ def _mid_recalc_levels_from_trigger(direction: str, trigger_price: float, ta: di
         except Exception:
             pass
     if not atr_use or atr_use <= 0:
-        atr_use = max(abs(entry_emit) * 0.001, 1e-9)
+        atr_use = max(abs(trigger_f) * 0.001, 1e-9)
+
     tp2_r_use = None
     for cand in (ta.get("tp2_r"), it.get("tp2_r")):
         try:
@@ -18714,16 +18928,17 @@ def _mid_recalc_levels_from_trigger(direction: str, trigger_price: float, ta: di
                 break
         except Exception:
             pass
+
+    entry_emit = _mid_pick_entry_anchor(direction, float(trigger_f), float(atr_use), ta, it)
     sl_emit, tp1_emit, tp2_emit, rr_emit = _build_levels(direction, float(entry_emit), float(atr_use), tp2_r=tp2_r_use)
+    sl_emit = _mid_anchor_sl_to_structure(direction, float(entry_emit), float(sl_emit), float(atr_use), ta, it)
+
     try:
-        sl_old = float(ta.get("sl") or it.get("sl") or 0.0)
-        if sl_old > 0:
-            if direction == "LONG":
-                sl_emit = max(sl_emit, sl_old)
-            elif direction == "SHORT":
-                sl_emit = min(sl_emit, sl_old)
+        if os.getenv("MID_REPRICE_TARGETS_ON_STRUCT_SL", "1").strip().lower() not in ("0", "false", "no", "off"):
+            tp1_emit, tp2_emit, rr_emit = _mid_reprice_targets_from_risk(direction, float(entry_emit), float(sl_emit), tp2_r=tp2_r_use)
     except Exception:
         pass
+
     try:
         max_tp2_atr = float(os.getenv("MID_MAX_TP2_ATR", "0") or 0.0)
         if max_tp2_atr > 0 and atr_use > 0:
@@ -18734,6 +18949,7 @@ def _mid_recalc_levels_from_trigger(direction: str, trigger_price: float, ta: di
                 tp2_emit = max(float(tp2_emit), float(entry_emit) - max_dist)
     except Exception:
         pass
+
     market_use = str(market or ta.get("market") or it.get("market") or "FUTURES")
     tp1_emit, tp2_emit, rr_emit = _mid_finalize_targets(direction, entry_emit, sl_emit, tp1_emit, tp2_emit, atr_use, market=market_use)
     try:
@@ -20317,6 +20533,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     risk_note=str(it.get("risk_note") or "INSTANT_EMIT (filters bypassed)") + " | levels_recalc=1",
                                     ts=time.time(),
                                 )
+
+                                _rr_ok, _rr_val, _rr_min = signal_rr_gate(sig)
+                                if not _rr_ok:
+                                    logger.info("[signal][skip_rr] %s market=%s dir=%s rr=%.3f min=%.3f", sig.symbol, sig.market, sig.direction, float(_rr_val), float(_rr_min))
+                                    _pending_log_trigger(sym, market, direction, "skip", f"rr_lt_{float(_rr_min):.2f}", it, float(price))
+                                    continue
 
                                 _profit_ok, _profit_pct, _profit_min = signal_min_profit_gate(sig)
                                 if not _profit_ok:
@@ -22006,6 +22228,13 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         risk_note=str(it.get("risk_note") or "ENTRY CONFIRMED") + " | trigger_revalidated=1 | levels_recalc=1",
                         ts=time.time(),
                     )
+
+                    _rr_ok, _rr_val, _rr_min = signal_rr_gate(sig)
+                    if not _rr_ok:
+                        logger.info("[signal][skip_rr] %s market=%s dir=%s rr=%.3f min=%.3f", sig.symbol, sig.market, sig.direction, float(_rr_val), float(_rr_min))
+                        _pending_log_trigger(sym, market, direction, "skip", f"rr_lt_{float(_rr_min):.2f}", it, float(price))
+                        _pending_clear_cooldown(it)
+                        continue
 
                     _profit_ok, _profit_pct, _profit_min = signal_min_profit_gate(sig)
                     if not _profit_ok:
@@ -25243,7 +25472,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         direction=direction,
                         timeframe=f"{tf_trigger}/{tf_mid}/{tf_trend}",
                         entry=entry, sl=sl, tp1=float(tp1), tp2=float(tp2),
-                        rr=float(tp2_r if tp_policy=="R" else rr),
+                        rr=float(rr),
                         confidence=int(round(conf)),
                         confirmations=conf_names,
                         source_exchange=best_name,
@@ -25760,7 +25989,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "sl": float(sl),
                                         "tp1": float(tp1),
                                         "tp2": float(tp2),
-                                        "rr": float(tp2_r if tp_policy=="R" else rr),
+                                        "rr": float(rr),
                                         "tp2_r": float(tp2_r),
                                         "confidence": int(round(conf)),
                                         "confirmations": conf_names,
@@ -25950,7 +26179,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 sl=float(sl),
                                                 tp1=float(tp1),
                                                 tp2=float(tp2),
-                                                rr=float(tp2_r if tp_policy=="R" else rr),
+                                                rr=float(rr),
                                                 confidence=int(round(conf)),
                                                 confirmations=conf_names,
                                                 source_exchange=best_name,
@@ -26261,6 +26490,15 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 _rej_add(sym, "pending_exception")
                             # do NOT emit now
                         else:
+                            _rr_ok, _rr_val, _rr_min = signal_rr_gate(sig)
+                            if not _rr_ok:
+                                logger.info("[signal][skip_rr] %s market=%s dir=%s rr=%.3f min=%.3f", sig.symbol, sig.market, sig.direction, float(_rr_val), float(_rr_min))
+                                try:
+                                    _rej_add(sym, f"rr_lt_{float(_rr_min):.2f}")
+                                except Exception:
+                                    pass
+                                continue
+
                             _profit_ok, _profit_pct, _profit_min = signal_min_profit_gate(sig)
                             if not _profit_ok:
                                 logger.info("[signal][skip_profit] %s market=%s dir=%s profit=%.3f%% min=%.3f%%", sig.symbol, sig.market, sig.direction, float(_profit_pct), float(_profit_min))
