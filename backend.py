@@ -1504,7 +1504,7 @@ def _mid_last_noemit_tail(symbol: str, *, direction: str | None = None) -> str:
             return ""
         parts = []
         want_dir = str(direction or "").upper().strip()
-        for src in ("pending", "scan"):
+        for src in ("pending", "scan", "block"):
             rec = bucket.get(src)
             if not isinstance(rec, dict):
                 continue
@@ -13695,6 +13695,18 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 try:
                     _mid_inc_hard_block(1)
                     _mid_hardblock_track(str(reason), symbol)
+                    try:
+                        _mid_record_noemit(
+                            str(symbol),
+                            source="block",
+                            stage="hard",
+                            reason=str(reason),
+                            reasons=[str(reason)],
+                            direction=str(dir_trend),
+                            ts=time.time(),
+                        )
+                    except Exception:
+                        pass
                     _k = f"block|{symbol}|{dir_trend}|{_mid_trap_reason_key(str(reason))}"
                     _ctx = _MID_TICK_CTX.get()
                     _tick_key = f"{symbol}|{dir_trend}|block"
