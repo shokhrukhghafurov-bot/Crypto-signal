@@ -28919,7 +28919,13 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             else:
                 entry_trigger_txt = (("Триггер входа: " + " + ".join(trig_parts)) if is_ru else ("Entry trigger: " + " + ".join(trig_parts)))
 
-            inv_lvl = max(0.0, entry_lo - max(atr_abs * 0.15, price * 0.0008))
+            inv_ref = float(entry_lo)
+            try:
+                if (not sweep_long) and eq_lo is not None:
+                    inv_ref = min(inv_ref, float(eq_lo))
+            except Exception:
+                pass
+            inv_lvl = max(0.0, inv_ref - max(atr_abs * 0.15, price * 0.0008))
             inv_lvl_out = float(inv_lvl)
             entry_inval_txt = (f"Инвалидация: закрепление 5м ниже {_fmt_int_space(inv_lvl)}" if is_ru else f"Invalidation: 5m close below {_fmt_int_space(inv_lvl)}")
 
@@ -28997,7 +29003,13 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             else:
                 entry_trigger_txt = (("Триггер входа: " + " + ".join(trig_parts)) if is_ru else ("Entry trigger: " + " + ".join(trig_parts)))
 
-            inv_lvl = entry_hi + max(atr_abs * 0.15, price * 0.0008)
+            inv_ref = float(entry_hi)
+            try:
+                if (not sweep_short) and eq_hi is not None:
+                    inv_ref = max(inv_ref, float(eq_hi))
+            except Exception:
+                pass
+            inv_lvl = inv_ref + max(atr_abs * 0.15, price * 0.0008)
             inv_lvl_out = float(inv_lvl)
             entry_inval_txt = (f"Инвалидация: закрепление 5м выше {_fmt_int_space(inv_lvl)}" if is_ru else f"Invalidation: 5m close above {_fmt_int_space(inv_lvl)}")
 
@@ -29230,17 +29242,32 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             long_p = 100 - short_p
 
 
-        # Probability correction when volume is weak (prevents high % with low confirmation)
+        # Probability correction under weak confirmation.
+        # Keep the directional edge aligned with structural/institutional bias,
+        # but compress the advantage toward 50/50 when confirmation is poor.
         try:
             if "weak_volume" in risk_flags_inst:
+                fav = float(long_p if bias == "LONG" else short_p)
+                fav = 50.0 + max(0.0, fav - 50.0) * 0.45
+                fav = max(50.0, min(65.0, fav))
                 if bias == "LONG":
-                    long_p = int(round(float(long_p) * 0.70))
+                    long_p = int(round(fav))
                     short_p = 100 - long_p
                 else:
-                    short_p = int(round(float(short_p) * 0.70))
+                    short_p = int(round(fav))
                     long_p = 100 - short_p
-                long_p = max(1, min(99, int(long_p)))
-                short_p = 100 - long_p
+            if "rr_too_low" in risk_flags_inst:
+                fav = float(long_p if bias == "LONG" else short_p)
+                fav = 50.0 + max(0.0, fav - 50.0) * 0.70
+                fav = max(50.0, min(75.0, fav))
+                if bias == "LONG":
+                    long_p = int(round(fav))
+                    short_p = 100 - long_p
+                else:
+                    short_p = int(round(fav))
+                    long_p = 100 - short_p
+            long_p = max(1, min(99, int(long_p)))
+            short_p = 100 - long_p
         except Exception:
             pass
 
@@ -29280,23 +29307,83 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
     def _join_nonempty(items):
         return ", ".join([str(x) for x in items if str(x or "").strip() and str(x).strip() not in ("—", "-")]) or "—"
 
+    def _pick_level(candidates, *, side: str, ref: float, skip: set[float] | None = None):
+        skip = skip or set()
+        vals = []
+        for v in candidates:
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if not (fv == fv) or fv <= 0:
+                continue
+            if any(abs(fv - s) <= max(1e-9, abs(ref) * 0.0005) for s in skip):
+                continue
+            if side == "below" and fv < ref:
+                vals.append(fv)
+            elif side == "above" and fv > ref:
+                vals.append(fv)
+        if not vals:
+            return None
+        return max(vals) if side == "below" else min(vals)
+
+    def _fmt_lvl_or_dash(v):
+        try:
+            return _fmt_int_space(float(v))
+        except Exception:
+            return "—"
+
+    local_support_lvl = _pick_level([
+        support1, chan_support,
+        (vp_sess.get('val') if isinstance(vp_sess, dict) else None),
+        (vb.get('bands', {}).get('-1.0') if isinstance(vb, dict) else None),
+    ], side="below", ref=float(price))
+    local_resist_lvl = _pick_level([
+        pivot,
+        (vb.get('vwap') if isinstance(vb, dict) else None),
+        (vb.get('bands', {}).get('+1.0') if isinstance(vb, dict) else None),
+        entry_lo,
+        resistance1,
+    ], side="above", ref=float(price))
+    deeper_support_lvl = _pick_level([
+        support2, support1, chan_support,
+        (vp.get('val') if isinstance(vp, dict) else None),
+        (vp_sess.get('val') if isinstance(vp_sess, dict) else None),
+    ], side="below", ref=float(local_support_lvl if local_support_lvl is not None else price), skip={float(local_support_lvl)} if local_support_lvl is not None else None)
+    higher_resist_lvl = _pick_level([
+        entry_hi, resistance1, resistance2, chan_resist,
+        (vp.get('vah') if isinstance(vp, dict) else None),
+        (vp_sess.get('vah') if isinstance(vp_sess, dict) else None),
+    ], side="above", ref=float(local_resist_lvl if local_resist_lvl is not None else price), skip={float(local_resist_lvl)} if local_resist_lvl is not None else None)
+
+    local_support_s = _fmt_lvl_or_dash(local_support_lvl if local_support_lvl is not None else support1)
+    local_resist_s = _fmt_lvl_or_dash(local_resist_lvl if local_resist_lvl is not None else pivot)
+    deeper_support_s = _fmt_lvl_or_dash(deeper_support_lvl if deeper_support_lvl is not None else support2)
+    higher_resist_s = _fmt_lvl_or_dash(higher_resist_lvl if higher_resist_lvl is not None else resistance1)
+    entry_lo_s = _fmt_lvl_or_dash(entry_lo)
+    entry_hi_s = _fmt_lvl_or_dash(entry_hi)
+
     if bias == "LONG":
         bullish_lines = [
-            _tr_i18n(lang, "analysis_bullish_hold", support=s1_s, target=r1_s),
-            _tr_i18n(lang, "analysis_bullish_break", level=r1_s, target=r2_s),
+            (f"Удержание {local_support_s} / возврат выше {local_resist_s} → {higher_resist_s}" if is_ru else f"Hold {local_support_s} / reclaim {local_resist_s} → {higher_resist_s}"),
+            (f"Закрепление выше {higher_resist_s} → {r2_s}" if is_ru else f"Break and hold above {higher_resist_s} → {r2_s}"),
         ]
         bearish_lines = [
-            _tr_i18n(lang, "analysis_bearish_loss", support=s1_s, target=s2_s),
+            (f"Потеря {local_support_s} → {deeper_support_s}" if is_ru else f"Loss of {local_support_s} → {deeper_support_s}"),
+            (f"Потеря {deeper_support_s} → {s2_s}" if (is_ru and deeper_support_s not in ("—", s2_s)) else (f"Loss of {deeper_support_s} → {s2_s}" if (not is_ru and deeper_support_s not in ("—", s2_s)) else None)),
         ]
+        bearish_lines = [x for x in bearish_lines if x]
         primary_scenario = _tr_i18n(lang, "analysis_primary_long")
     else:
         bullish_lines = [
-            _tr_i18n(lang, "analysis_bullish_hold", support=s1_s, target=r1_s),
-            _tr_i18n(lang, "analysis_bullish_break", level=r1_s, target=r2_s),
+            (f"Удержание {local_support_s} / возврат выше {local_resist_s} → {entry_lo_s if entry_lo_s != '—' else higher_resist_s}" if is_ru else f"Hold {local_support_s} / reclaim {local_resist_s} → {entry_lo_s if entry_lo_s != '—' else higher_resist_s}"),
+            (f"Закрепление выше {entry_hi_s if entry_hi_s != '—' else higher_resist_s} → {r2_s}" if is_ru else f"Break and hold above {entry_hi_s if entry_hi_s != '—' else higher_resist_s} → {r2_s}"),
         ]
         bearish_lines = [
-            _tr_i18n(lang, "analysis_bearish_loss", support=s1_s, target=s2_s),
+            (f"Потеря {local_support_s} → {deeper_support_s}" if is_ru else f"Loss of {local_support_s} → {deeper_support_s}"),
+            (f"Потеря {deeper_support_s} → {s2_s}" if (is_ru and deeper_support_s not in ("—", s2_s)) else (f"Loss of {deeper_support_s} → {s2_s}" if (not is_ru and deeper_support_s not in ("—", s2_s)) else None)),
         ]
+        bearish_lines = [x for x in bearish_lines if x]
         primary_scenario = _tr_i18n(lang, "analysis_primary_short")
 
     resistance_txt = f"{r1_s} / {r2_s}"
