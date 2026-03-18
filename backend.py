@@ -15404,6 +15404,30 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
     except Exception:
         _phase = "scan"
 
+    # Trigger-time contradiction block must be defined inside this function.
+    # Without this local initialization/logic the pending trigger path crashes with
+    # NameError when building the TA payload (blocked/block_reason fields).
+    contradiction_block_reason = ""
+    try:
+        contradiction_reason = None
+        _pat = str(pattern or "—").strip()
+        _bo = str(breakout_retest or "—").strip()
+        _side_u = str(dir_trend or "").upper()
+        if _side_u == "LONG":
+            if _pat in ("bear_engulf", "evening_star"):
+                contradiction_reason = f"directional_contradiction pattern={_pat}"
+            elif _bo.startswith("BO↓"):
+                contradiction_reason = f"directional_contradiction breakout={_bo}"
+        elif _side_u == "SHORT":
+            if _pat in ("bull_engulf", "morning_star"):
+                contradiction_reason = f"directional_contradiction pattern={_pat}"
+            elif _bo.startswith("BO↑"):
+                contradiction_reason = f"directional_contradiction breakout={_bo}"
+        if contradiction_reason:
+            contradiction_block_reason = str(contradiction_reason)
+    except Exception:
+        contradiction_block_reason = ""
+
     ta: Dict[str, Any] = {
         "direction": dir_trend,
         "entry": entry,
@@ -22035,10 +22059,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             "vol_x": ("vol_low", "vol_low"),
                         }
                         # Reuse the already-resolved smart trigger flag from the current trigger pass.
+                        # Avoid fragile self-reference here so refactors cannot turn this into NameError.
                         try:
-                            smart_trigger = bool(smart_trigger)
+                            smart_trigger = bool(locals().get("smart_trigger", False))
                         except Exception:
-                            smart_trigger = str(os.getenv("MID_SMART_TRIGGER", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+                            smart_trigger = False
+                        if not smart_trigger:
+                            try:
+                                smart_trigger = str(os.getenv("MID_SMART_TRIGGER", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+                            except Exception:
+                                smart_trigger = False
                         try:
                             need_passed = _mid_trigger_min_passed()
                         except Exception:
