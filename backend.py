@@ -9485,6 +9485,18 @@ def _mid_late_entry_debug_hint(*,
             except Exception:
                 return str(v)
 
+        def _row_ts(i):
+            try:
+                ms = _mid_df_row_time_ms(df5, int(i))
+                if ms is not None and int(ms) > 0:
+                    return dt.datetime.fromtimestamp(float(ms) / 1000.0, tz=ZoneInfo(TZ_NAME)).isoformat()
+            except Exception:
+                pass
+            try:
+                return _fmt_ts(df5.index[int(i)])
+            except Exception:
+                return "-"
+
         side_u = str(side).upper().strip()
 
         if side_u == "LONG":
@@ -9506,9 +9518,9 @@ def _mid_late_entry_debug_hint(*,
                 "move_atr": float(move_atr),
                 "limit_atr": float(limit_atr),
                 "cutoff_px": float(cutoff_px),
-                "extreme_ts": _fmt_ts(df5.index[extreme_pos]),
+                "extreme_ts": _row_ts(extreme_pos),
                 "extreme_px": float(rl),
-                "last_ok_ts": _fmt_ts(df5.index[last_ok_pos]) if last_ok_pos is not None else "-",
+                "last_ok_ts": _row_ts(last_ok_pos) if last_ok_pos is not None else "-",
                 "last_ok_entry": float(close_s.iloc[last_ok_pos]) if last_ok_pos is not None else float("nan"),
             }
 
@@ -9530,9 +9542,9 @@ def _mid_late_entry_debug_hint(*,
             "move_atr": float(move_atr),
             "limit_atr": float(limit_atr),
             "cutoff_px": float(cutoff_px),
-            "extreme_ts": _fmt_ts(df5.index[extreme_pos]),
+            "extreme_ts": _row_ts(extreme_pos),
             "extreme_px": float(rh),
-            "last_ok_ts": _fmt_ts(df5.index[last_ok_pos]) if last_ok_pos is not None else "-",
+            "last_ok_ts": _row_ts(last_ok_pos) if last_ok_pos is not None else "-",
             "last_ok_entry": float(close_s.iloc[last_ok_pos]) if last_ok_pos is not None else float("nan"),
         }
     except Exception:
