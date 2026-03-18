@@ -1427,6 +1427,102 @@ _MID_TRIG_REJECT_TICK_LAST: dict = {}  # same shape as CUR, but frozen after eac
 # Auto sample log throttle (prints a few [mid][pending][sample] lines even when MID_PENDING_DEBUG_SAMPLES=0)
 _MID_PENDING_LAST_AUTO_SAMPLE_TS = 0.0
 
+# Last known "why no emit" snapshot per symbol.
+# Sources:
+#   - scan: setup never reached pending/emit during the scan phase
+#   - pending: setup reached pending, but trigger-time checks blocked emit
+_MID_LAST_NOEMIT_BY_SYMBOL: dict = {}
+
+def _mid_fmt_diag_wall_ts(ts: float | int | None) -> str:
+    try:
+        tv = float(ts or 0.0)
+        if not math.isfinite(tv) or tv <= 0:
+            return "-"
+        return dt.datetime.fromtimestamp(tv, tz=ZoneInfo(TZ_NAME)).isoformat()
+    except Exception:
+        return "-"
+
+def _mid_diag_reason_token(reason: str | None) -> str:
+    try:
+        r = str(reason or "").strip()
+        if not r:
+            return "-"
+        tok = r.split()[0]
+        for sep in ("=", ":"):
+            if sep in tok:
+                tok = tok.split(sep, 1)[0]
+        tok = tok.strip()
+        return tok or r[:64]
+    except Exception:
+        return "-"
+
+def _mid_record_noemit(symbol: str, *, source: str, stage: str | None = None, reason: str | None = None, reasons=None, direction: str | None = None, ts: float | None = None) -> None:
+    try:
+        sym = str(symbol or "").upper().strip()
+        src = str(source or "scan").strip().lower() or "scan"
+        if not sym:
+            return
+        rr = []
+        try:
+            for x in list(reasons or []):
+                sx = str(x or "").strip()
+                if sx and sx not in rr:
+                    rr.append(sx)
+        except Exception:
+            rr = []
+        if not rr and reason:
+            rr = [str(reason)]
+        try:
+            max_reasons = int(float(os.getenv("MID_LATE_HINT_NOEMIT_MAX", "6") or 6))
+        except Exception:
+            max_reasons = 6
+        max_reasons = max(1, min(int(max_reasons), 12))
+        rec = {
+            "source": src,
+            "stage": str(stage or "-").strip() or "-",
+            "reason": str(reason or (rr[0] if rr else "-")).strip() or "-",
+            "reasons": rr[:max_reasons],
+            "direction": str(direction or "").upper().strip(),
+            "ts": float(ts or time.time()),
+        }
+        bucket = _MID_LAST_NOEMIT_BY_SYMBOL.get(sym)
+        if not isinstance(bucket, dict):
+            bucket = {}
+        bucket[src] = rec
+        bucket["_updated_ts"] = float(rec["ts"])
+        _MID_LAST_NOEMIT_BY_SYMBOL[sym] = bucket
+    except Exception:
+        pass
+
+def _mid_last_noemit_tail(symbol: str, *, direction: str | None = None) -> str:
+    try:
+        sym = str(symbol or "").upper().strip()
+        if not sym:
+            return ""
+        bucket = _MID_LAST_NOEMIT_BY_SYMBOL.get(sym)
+        if not isinstance(bucket, dict):
+            return ""
+        parts = []
+        want_dir = str(direction or "").upper().strip()
+        for src in ("pending", "scan"):
+            rec = bucket.get(src)
+            if not isinstance(rec, dict):
+                continue
+            rec_dir = str(rec.get("direction") or "").upper().strip()
+            if want_dir and rec_dir and rec_dir != want_dir:
+                continue
+            ts_s = _mid_fmt_diag_wall_ts(rec.get("ts"))
+            stage_s = str(rec.get("stage") or "-")
+            reason_s = str(rec.get("reason") or "-")
+            rr = [str(x) for x in list(rec.get("reasons") or []) if str(x).strip()]
+            if not rr and reason_s not in ("", "-"):
+                rr = [reason_s]
+            rr_short = ",".join([_mid_diag_reason_token(x) for x in rr[:6]]) if rr else "-"
+            parts.append(f" noemit_{src}_stage={stage_s} noemit_{src}_reason={reason_s} noemit_{src}_reasons={rr_short} noemit_{src}_ts={ts_s}")
+        return "".join(parts)
+    except Exception:
+        return ""
+
 
 # Per-tick hard-block breakdown snapshot (for /health and minute status logs)
 MID_LAST_HARDBLOCK_TOP = ""
@@ -12422,52 +12518,92 @@ def _mid_df_row_time_ms(df: pd.DataFrame, idx: int) -> int | None:
         if df is None or getattr(df, "empty", True):
             return None
         i = int(idx)
-        time_cols = (
-            "open_time_ms", "open_time", "timestamp", "time", "t",
-            "close_time_ms", "close_time", "ts", "datetime", "date",
-        )
-        for col in time_cols:
-            if col in df.columns:
-                try:
-                    v = df[col].iloc[i]
-                    if hasattr(v, "timestamp"):
-                        return int(float(v.timestamp()) * 1000.0)
-                    fv = float(v)
-                    if not math.isfinite(fv):
-                        continue
-                    # milliseconds since epoch
-                    if fv >= 1e12:
-                        return int(fv)
-                    # seconds since epoch
-                    if fv >= 1e9:
-                        return int(fv * 1000.0)
-                except Exception:
-                    pass
-                try:
-                    v = df[col].iloc[i]
-                    ts = pd.Timestamp(v)
-                    if not pd.isna(ts):
+
+        def _as_ms(v):
+            try:
+                if v is None:
+                    return None
+                if isinstance(v, str):
+                    sv = v.strip()
+                    if not sv or sv in ("-", "nan", "NaN", "None"):
+                        return None
+                    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", sv):
+                        v = float(sv)
+                    else:
+                        ts = pd.Timestamp(sv)
+                        if pd.isna(ts):
+                            return None
                         if ts.tzinfo is None:
                             ts = ts.tz_localize(ZoneInfo(TZ_NAME))
                         else:
                             ts = ts.tz_convert(ZoneInfo(TZ_NAME))
                         return int(ts.timestamp() * 1000.0)
+                if hasattr(v, "timestamp") and not isinstance(v, (int, float, np.integer, np.floating)):
+                    return int(float(v.timestamp()) * 1000.0)
+                fv = float(v)
+                if not math.isfinite(fv):
+                    return None
+                if fv >= 1e15:
+                    return int(fv / 1000.0)
+                if fv >= 1e12:
+                    return int(fv)
+                if fv >= 1e9:
+                    return int(fv * 1000.0)
+                return None
+            except Exception:
+                try:
+                    ts = pd.Timestamp(v)
+                    if pd.isna(ts):
+                        return None
+                    if ts.tzinfo is None:
+                        ts = ts.tz_localize(ZoneInfo(TZ_NAME))
+                    else:
+                        ts = ts.tz_convert(ZoneInfo(TZ_NAME))
+                    return int(ts.timestamp() * 1000.0)
                 except Exception:
-                    pass
+                    return None
+
+        canonical = {
+            "open_time_ms", "open_time", "opentime", "open time",
+            "timestamp", "time", "time_ms", "t", "ts", "ts_ms",
+            "datetime", "date", "index", "candle_time", "candle_ts",
+            "open_ts", "close_ts", "start_time", "starttime",
+            "close_time_ms", "close_time", "closetime",
+        }
+        col_map = {}
+        try:
+            for col in list(df.columns):
+                key = str(col).strip().lower().replace("_", " " if False else "_")
+                col_map[str(col).strip().lower()] = col
+                col_map[str(col).strip().lower().replace(" ", "_")] = col
+        except Exception:
+            col_map = {}
+        ordered = [
+            "open_time_ms", "open_time", "opentime", "timestamp", "time", "time_ms", "t",
+            "close_time_ms", "close_time", "closetime", "ts", "ts_ms",
+            "datetime", "date", "candle_time", "candle_ts", "open_ts", "close_ts",
+            "start_time", "starttime", "index",
+        ]
+        seen_cols = []
+        for want in ordered:
+            real = col_map.get(str(want).strip().lower())
+            if real is not None and real not in seen_cols:
+                seen_cols.append(real)
+        for col in seen_cols:
+            try:
+                ms = _as_ms(df[col].iloc[i])
+                if ms is not None and int(ms) > 0:
+                    return int(ms)
+            except Exception:
+                pass
+
         try:
             iv = df.index[i]
-            if hasattr(iv, "timestamp"):
-                return int(float(iv.timestamp()) * 1000.0)
-            # Do not interpret plain integer positional indexes as timestamps.
             if isinstance(iv, (int, float, np.integer, np.floating)):
                 return None
-            ts = pd.Timestamp(iv)
-            if not pd.isna(ts):
-                if ts.tzinfo is None:
-                    ts = ts.tz_localize(ZoneInfo(TZ_NAME))
-                else:
-                    ts = ts.tz_convert(ZoneInfo(TZ_NAME))
-                return int(ts.timestamp() * 1000.0)
+            ms = _as_ms(iv)
+            if ms is not None and int(ms) > 0:
+                return int(ms)
         except Exception:
             pass
         return None
@@ -13584,11 +13720,12 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                                     if _late_dbg:
                                         _last_ok_entry = _late_dbg.get("last_ok_entry", float("nan"))
                                         _last_ok_entry_s = (f"{float(_last_ok_entry):.6g}" if not np.isnan(float(_last_ok_entry)) else "nan")
+                                        _late_noemit_tail = _mid_last_noemit_tail(symbol, direction=str(dir_trend))
                                         _late_dbg_tail = (
                                             " recent_low=%.6g recent_high=%.6g atr30=%.6g"
                                             " move_atr=%.2f limit_atr=%.2f cutoff=%.6g"
                                             " extreme_pos=%s extreme_ts=%s extreme_px=%.6g"
-                                            " last_ok_pos=%s last_ok_ts=%s last_ok_entry=%s"
+                                            " last_ok_pos=%s last_ok_ts=%s last_ok_entry=%s%s"
                                         ) % (
                                             float(recent_low),
                                             float(recent_high),
@@ -13602,9 +13739,10 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                                             str(_late_dbg.get("last_ok_pos", "-")),
                                             str(_late_dbg["last_ok_ts"]),
                                             _last_ok_entry_s,
+                                            _late_noemit_tail,
                                         )
                                         logger.info(
-                                            "[mid][late_hint] %s dir=%s entry=%.6g reason=%s move_atr=%.2f limit_atr=%.2f cutoff=%.6g extreme_pos=%s extreme_ts=%s extreme_px=%.6g last_ok_pos=%s last_ok_ts=%s last_ok_entry=%s",
+                                            "[mid][late_hint] %s dir=%s entry=%.6g reason=%s move_atr=%.2f limit_atr=%.2f cutoff=%.6g extreme_pos=%s extreme_ts=%s extreme_px=%.6g last_ok_pos=%s last_ok_ts=%s last_ok_entry=%s%s",
                                             symbol,
                                             dir_trend,
                                             float(entry),
@@ -13618,6 +13756,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                                             str(_late_dbg.get("last_ok_pos", "-")),
                                             str(_late_dbg["last_ok_ts"]),
                                             _last_ok_entry_s,
+                                            _late_noemit_tail,
                                         )
                             except Exception:
                                 _late_dbg_tail = ""
@@ -19930,6 +20069,23 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 _fmt_klist(not_eval),
                 checks_kv,
             )
+            try:
+                _outcome_l2 = str(outcome or "").lower()
+                if _outcome_l2 not in ("pass", "emit"):
+                    _in_zone2 = bool(it.get("_in_zone_tol") or it.get("_in_zone") or False)
+                    _fail_rs = list(it.get("_trig_fail_reasons") or [])
+                    _primary = str(term_reason or reason or (_fail_rs[0] if _fail_rs else "unknown"))
+                    _mid_record_noemit(
+                        str(sym),
+                        source="pending",
+                        stage=("inzone" if _in_zone2 else "pre"),
+                        reason=_primary,
+                        reasons=_fail_rs or [_primary],
+                        direction=str(direction),
+                        ts=time.time(),
+                    )
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -25257,6 +25413,18 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 _rbest = _rs[0]
                                         else:
                                             _rbest = ("unknown" if str(_st or '')=='other' else str(_st or 'other'))
+                                        try:
+                                            _mid_record_noemit(
+                                                str(sym),
+                                                source="scan",
+                                                stage=str(_st),
+                                                reason=str(_rbest),
+                                                reasons=_rs or [str(_rbest)],
+                                                direction="",
+                                                ts=time.time(),
+                                            )
+                                        except Exception:
+                                            pass
                                         # Count detailed no-signal reasons only for the 'other' bucket,
                                         # and normalize to a base reason name (e.g. "rsi_long=37.7" -> "rsi_long",
                                         # "near_1h_low dist=..." -> "near_1h_low").
