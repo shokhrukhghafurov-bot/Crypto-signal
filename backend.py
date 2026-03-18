@@ -9481,21 +9481,34 @@ def _mid_late_entry_debug_hint(*,
 
         def _fmt_ts(v):
             try:
+                if isinstance(v, (int, float, np.integer, np.floating)):
+                    return None
                 return v.isoformat()
             except Exception:
-                return str(v)
+                try:
+                    if isinstance(v, (int, float, np.integer, np.floating)):
+                        return None
+                    return str(v)
+                except Exception:
+                    return None
 
         def _row_ts(i):
             try:
+                if i is None:
+                    return "-"
                 ms = _mid_df_row_time_ms(df5, int(i))
                 if ms is not None and int(ms) > 0:
                     return dt.datetime.fromtimestamp(float(ms) / 1000.0, tz=ZoneInfo(TZ_NAME)).isoformat()
             except Exception:
                 pass
             try:
-                return _fmt_ts(df5.index[int(i)])
+                iv = df5.index[int(i)]
+                sv = _fmt_ts(iv)
+                if sv:
+                    return sv
             except Exception:
-                return "-"
+                pass
+            return "-"
 
         side_u = str(side).upper().strip()
 
@@ -9518,8 +9531,10 @@ def _mid_late_entry_debug_hint(*,
                 "move_atr": float(move_atr),
                 "limit_atr": float(limit_atr),
                 "cutoff_px": float(cutoff_px),
+                "extreme_pos": int(extreme_pos),
                 "extreme_ts": _row_ts(extreme_pos),
                 "extreme_px": float(rl),
+                "last_ok_pos": (int(last_ok_pos) if last_ok_pos is not None else None),
                 "last_ok_ts": _row_ts(last_ok_pos) if last_ok_pos is not None else "-",
                 "last_ok_entry": float(close_s.iloc[last_ok_pos]) if last_ok_pos is not None else float("nan"),
             }
@@ -9542,8 +9557,10 @@ def _mid_late_entry_debug_hint(*,
             "move_atr": float(move_atr),
             "limit_atr": float(limit_atr),
             "cutoff_px": float(cutoff_px),
+            "extreme_pos": int(extreme_pos),
             "extreme_ts": _row_ts(extreme_pos),
             "extreme_px": float(rh),
+            "last_ok_pos": (int(last_ok_pos) if last_ok_pos is not None else None),
             "last_ok_ts": _row_ts(last_ok_pos) if last_ok_pos is not None else "-",
             "last_ok_entry": float(close_s.iloc[last_ok_pos]) if last_ok_pos is not None else float("nan"),
         }
@@ -12395,12 +12412,21 @@ def _mid_breakout_retest_trigger(df5i: pd.DataFrame, *, direction: str, support:
 
 
 def _mid_df_row_time_ms(df: pd.DataFrame, idx: int) -> int | None:
-    """Best-effort candle/open time extractor for diagnostics."""
+    """Best-effort candle/open time extractor for diagnostics.
+
+    Important: never treat a plain integer RangeIndex value like `226` as a timestamp.
+    When the frame has been reset_index(drop=True), those integers are only row positions,
+    not candle times. In that case we return None and let the caller log the explicit row pos.
+    """
     try:
         if df is None or getattr(df, "empty", True):
             return None
         i = int(idx)
-        for col in ("open_time_ms", "open_time", "timestamp", "time", "t"):
+        time_cols = (
+            "open_time_ms", "open_time", "timestamp", "time", "t",
+            "close_time_ms", "close_time", "ts", "datetime", "date",
+        )
+        for col in time_cols:
             if col in df.columns:
                 try:
                     v = df[col].iloc[i]
@@ -12409,16 +12435,39 @@ def _mid_df_row_time_ms(df: pd.DataFrame, idx: int) -> int | None:
                     fv = float(v)
                     if not math.isfinite(fv):
                         continue
-                    if fv > 1e12:
+                    # milliseconds since epoch
+                    if fv >= 1e12:
                         return int(fv)
-                    if fv > 1e9:
+                    # seconds since epoch
+                    if fv >= 1e9:
                         return int(fv * 1000.0)
+                except Exception:
+                    pass
+                try:
+                    v = df[col].iloc[i]
+                    ts = pd.Timestamp(v)
+                    if not pd.isna(ts):
+                        if ts.tzinfo is None:
+                            ts = ts.tz_localize(ZoneInfo(TZ_NAME))
+                        else:
+                            ts = ts.tz_convert(ZoneInfo(TZ_NAME))
+                        return int(ts.timestamp() * 1000.0)
                 except Exception:
                     pass
         try:
             iv = df.index[i]
             if hasattr(iv, "timestamp"):
                 return int(float(iv.timestamp()) * 1000.0)
+            # Do not interpret plain integer positional indexes as timestamps.
+            if isinstance(iv, (int, float, np.integer, np.floating)):
+                return None
+            ts = pd.Timestamp(iv)
+            if not pd.isna(ts):
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize(ZoneInfo(TZ_NAME))
+                else:
+                    ts = ts.tz_convert(ZoneInfo(TZ_NAME))
+                return int(ts.timestamp() * 1000.0)
         except Exception:
             pass
         return None
@@ -13537,8 +13586,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                                         _late_dbg_tail = (
                                             " recent_low=%.6g recent_high=%.6g atr30=%.6g"
                                             " move_atr=%.2f limit_atr=%.2f cutoff=%.6g"
-                                            " extreme_ts=%s extreme_px=%.6g"
-                                            " last_ok_ts=%s last_ok_entry=%s"
+                                            " extreme_pos=%s extreme_ts=%s extreme_px=%.6g"
+                                            " last_ok_pos=%s last_ok_ts=%s last_ok_entry=%s"
                                         ) % (
                                             float(recent_low),
                                             float(recent_high),
@@ -13546,8 +13595,10 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                                             float(_late_dbg["move_atr"]),
                                             float(_late_dbg["limit_atr"]),
                                             float(_late_dbg["cutoff_px"]),
+                                            str(_late_dbg.get("extreme_pos", "-")),
                                             str(_late_dbg["extreme_ts"]),
                                             float(_late_dbg["extreme_px"]),
+                                            str(_late_dbg.get("last_ok_pos", "-")),
                                             str(_late_dbg["last_ok_ts"]),
                                             (f"{float(_last_ok_entry):.6g}" if not np.isnan(float(_last_ok_entry)) else "nan"),
                                         )
