@@ -1577,6 +1577,12 @@ def _mid_trigger_selected_hardblock_reason(reason: str) -> tuple[str | None, str
             return ("regime_block", "regime_block")
         if head == "vol_x":
             return ("vol_low", "vol_low")
+        if head == "directional_contradiction":
+            return ("directional_contradiction", "directional_contradiction")
+        if head in ("near_recent_low", "near_recent_high"):
+            return ("near_recent_extreme", "near_recent_extreme")
+        if head in ("vwap_dist_atr", "vwap_bias", "wrong_vwap_side"):
+            return ("vwap_dist", "vwap_dist")
         if head == "late_entry_atr":
             try:
                 if _mid_soft_block_penalty_for_reason(raw) is not None:
@@ -9444,13 +9450,12 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
             _phase = str(_MID_EVAL_PHASE.get() or "scan")
         except Exception:
             _phase = "scan"
-        _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
-        _quality_first = _mid_quality_first_enabled()
-        if (not _quality_first) and _pending_enabled and _postsetup_only and _phase == "scan":
+        _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "1").strip().lower() not in ("0", "false", "no", "off")
+        if _pending_enabled and _postsetup_only and _phase == "scan":
             return None
 
         # Skip only late-entry/vwap-distance blocks during SCAN when pending mode is enabled.
-        _skip_late_vwap_blocks = bool((_phase == "scan") and _pending_enabled and _pending_skip_hb and (not _quality_first))
+        _skip_late_vwap_blocks = bool((_phase == "scan") and _pending_enabled and _pending_skip_hb)
 
         # ULTRA SAFE: tighten filters dynamically for near-zero SL preference
         late_entry_max = _mid_effective_late_entry_max(market=market, adx_30m=adx_30m)
@@ -12955,7 +12960,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         use_ob = _mid_bool_env("MID_USE_ORDER_BLOCK", "1")
         require_trigger = _mid_bool_env("MID_REQUIRE_TRIGGER", "1")
         pending_enabled = _mid_bool_env("MID_PENDING_ENABLED", "0")
-        postsetup_only = _mid_bool_env("MID_FILTERS_AFTER_SETUP", "0")
+        postsetup_only = _mid_bool_env("MID_FILTERS_AFTER_SETUP", "1")
 
         if use_regime:
             mid_regime = _mid_market_regime(df30i, df1hi, entry=float(entry), atr30=float(atr30), adx30=(float(adx30) if not np.isnan(adx30) else None))
@@ -13497,7 +13502,10 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     except Exception:
         breakout_retest = "—"
 
-    # Directional contradiction hard-blocks (requested minimal patch)
+    # Directional contradiction is dynamic and should be re-checked at actual entry.
+    # In post-setup mode we keep the setup alive on SCAN and enforce the blocker on TRIGGER
+    # after fresh TA re-evaluation, so logs show the real reason instead of generic no_ta.
+    contradiction_block_reason = ""
     try:
         contradiction_reason = None
         _pat = str(pattern or "—").strip()
@@ -13516,32 +13524,43 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 contradiction_reason = f"directional_contradiction breakout={_bo}"
 
         if contradiction_reason:
+            contradiction_block_reason = str(contradiction_reason)
             try:
-                _mid_inc_hard_block(1)
-                _mid_hardblock_track(str(contradiction_reason), symbol)
-                _k = f"block|{symbol}|{dir_trend}|{_mid_trap_reason_key(str(contradiction_reason))}"
-                _ctx = _MID_TICK_CTX.get()
-                _tick_key = f"{symbol}|{dir_trend}|block"
-                if _ctx is not None and _tick_key in _ctx.get('block', set()):
-                    _ctx['suppress_block'] = int(_ctx.get('suppress_block', 0)) + 1
-                else:
-                    if _ctx is not None:
-                        _ctx.setdefault('block', set()).add(_tick_key)
-                    if _mid_trap_should_log(_k):
-                        logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, contradiction_reason, float(entry))
-                _emit_mid_trap_event({
-                    "dir": str(dir_trend),
-                    "reason": str(contradiction_reason),
-                    "reason_key": _mid_trap_reason_key(str(contradiction_reason)),
-                    "entry": float(entry),
-                })
+                _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+                _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "1").strip().lower() not in ("0", "false", "no", "off")
+                _phase_now = str(_phase or "scan").lower()
+                _defer_to_trigger = bool(_pending_enabled and _postsetup_only and _phase_now == "scan")
             except Exception:
-                pass
-            try:
-                _fail("other", str(contradiction_reason))
-            except Exception:
-                pass
-            return None
+                _phase_now = "scan"
+                _defer_to_trigger = False
+
+            if (_phase_now != "trigger") and (not _defer_to_trigger):
+                try:
+                    _mid_inc_hard_block(1)
+                    _mid_hardblock_track(str(contradiction_reason), symbol)
+                    _k = f"block|{symbol}|{dir_trend}|{_mid_trap_reason_key(str(contradiction_reason))}"
+                    _ctx = _MID_TICK_CTX.get()
+                    _tick_key = f"{symbol}|{dir_trend}|block"
+                    if _ctx is not None and _tick_key in _ctx.get('block', set()):
+                        _ctx['suppress_block'] = int(_ctx.get('suppress_block', 0)) + 1
+                    else:
+                        if _ctx is not None:
+                            _ctx.setdefault('block', set()).add(_tick_key)
+                        if _mid_trap_should_log(_k):
+                            logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, contradiction_reason, float(entry))
+                    _emit_mid_trap_event({
+                        "dir": str(dir_trend),
+                        "reason": str(contradiction_reason),
+                        "reason_key": _mid_trap_reason_key(str(contradiction_reason)),
+                        "entry": float(entry),
+                    })
+                except Exception:
+                    pass
+                try:
+                    _fail("other", str(contradiction_reason))
+                except Exception:
+                    pass
+                return None
     except Exception:
         pass
 
@@ -13724,13 +13743,14 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         min_score = int(os.getenv("MID_MIN_SCORE_SPOT", "76")) if mkt_u2 == "SPOT" else int(os.getenv("MID_MIN_SCORE_FUTURES", "72"))
         if min_score > 0 and int(confidence) < int(min_score):
             _pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
-            _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
+            _postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "1").strip().lower() not in ("0", "false", "no", "off")
             _phase = "scan"
             try:
                 _phase = str(_MID_EVAL_PHASE.get() or "scan")
             except Exception:
                 _phase = "scan"
-            if _mid_quality_first_enabled() or not (_pending_enabled and _postsetup_only and _phase == "scan"):
+            _defer_score_gate = bool(str(_phase).lower() == "trigger") or bool(_pending_enabled and _postsetup_only and _phase == "scan")
+            if not _defer_score_gate:
                 _fail("other", f"score_low score={int(confidence)} min={int(min_score)}")
                 return None
     except Exception:
@@ -15399,8 +15419,8 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "trap_reason": str(trap_reason or ""),
         # Hard blocks (late_entry_atr / near_extremes / bb_bounce / regime_block / etc.)
         # are applied on TRIGGER, not on SCAN when MID_FILTERS_AFTER_SETUP=1.
-        "blocked": False,
-        "block_reason": "",
+        "blocked": bool(contradiction_block_reason),
+        "block_reason": str(contradiction_block_reason or ""),
 
         # fields used by MID filters/formatter
         "dir1": dir_mid,
@@ -21645,7 +21665,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     # If scan stage skipped hard filters (MID_FILTERS_AFTER_SETUP=1),
                     # apply the same filters here at trigger moment.
-                    postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
+                    postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "1").strip().lower() not in ("0", "false", "no", "off")
                     if postsetup_only:
                         # Trigger score gate can be disabled separately.
                         # Rationale: some users want score to be enforced only at scan/setup stage,
@@ -23060,7 +23080,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
             # Log the effective flags and key thresholds once per tick.
             try:
                 pending_enabled = str(os.getenv("MID_PENDING_ENABLED", "0") or "0").strip().lower() not in ("0","false","no","off")
-                postsetup_only = str(os.getenv("MID_FILTERS_AFTER_SETUP", "0") or "0").strip().lower() not in ("0","false","no","off")
+                postsetup_only = str(os.getenv("MID_FILTERS_AFTER_SETUP", "1") or "0").strip().lower() not in ("0","false","no","off")
                 require_trigger = str(os.getenv("MID_REQUIRE_TRIGGER", "1") or "1").strip().lower() not in ("0","false","no","off")
                 min_conf = 0  # confidence filter removed permanently
                 ttl_min = float(os.getenv("MID_PENDING_TTL_MIN", os.getenv("MID_PENDING_TTL_MINUTES", "150")) or 150)
@@ -25070,7 +25090,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         base_r = best_r
                         # Mode switch: create setups first, apply filters later at trigger.
                         pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
-                        postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "0").strip().lower() not in ("0", "false", "no", "off")
+                        postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "1").strip().lower() not in ("0", "false", "no", "off")
                         scan_soft = bool(pending_enabled and postsetup_only)
                         # --- Anti-trap filters: skip candidates that look like tops/bottoms ---
                         # If user wants filters only after setup (pending/trigger model),
