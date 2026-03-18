@@ -3482,9 +3482,10 @@ async def get_autotrade_stats(
     - some closes (especially smart-manager virtual exits) may temporarily miss top-level
       pnl_usdt/roi_percent in ``autotrade_positions``. We therefore backfill the stats view
       from linked trades and, when needed, approximate PnL from persisted api_order_ref/meta.
-    - ``active`` prefers the real current OPEN count, but if a short-lived sync lag makes
-      it zero while the cohort math clearly shows still-open trades, we fall back to the
-      residual ``opened - closed_total`` for the selected period.
+    - ``active`` must reflect the real current OPEN count only.
+      Do not derive it from period cohort math like ``opened - closed_total`` because
+      that produces false positives when the selected period contains historical opens
+      and closes that do not match the current live state.
     """
     pool = get_pool()
     uid = int(user_id)
@@ -3766,11 +3767,25 @@ async def get_autotrade_stats(
         elif sign < 0:
             closed_minus += 1
 
-    opened_i = int(opened or 0)
-    active_i = int(active or 0)
+    opened_i = max(int(opened or 0), 0)
+    active_i = max(int(active or 0), 0)
 
-    if active_i <= 0 and opened_i > closed_total:
-        active_i = max(opened_i - closed_total, 0)
+    # IMPORTANT:
+    # 'Активных сейчас' is a live-state metric, not a period-derived estimate.
+    # The old fallback `opened - closed_total` looked reasonable on paper, but it
+    # overcounted when the selected period contained historical opens/closes that
+    # no longer matched the current OPEN rows. That is exactly how users could see
+    # 'Активных сейчас: 3' while in reality there were 0 active positions.
+    #
+    # If a deployment ever needs the legacy behavior for debugging, it can be
+    # explicitly re-enabled via env, but the safe default is OFF.
+    if active_i <= 0:
+        try:
+            legacy_fallback = str(os.getenv("AUTOTRADE_STATS_ACTIVE_RESIDUAL_FALLBACK", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            legacy_fallback = False
+        if legacy_fallback and opened_i > closed_total:
+            active_i = max(opened_i - closed_total, 0)
 
     roi = (pnl_total / invested_closed * 100.0) if invested_closed > 0 else 0.0
 
