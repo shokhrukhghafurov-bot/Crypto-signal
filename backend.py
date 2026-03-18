@@ -9664,6 +9664,221 @@ def _mid_late_entry_debug_hint(*,
         return None
 
 
+def _mid_probe_last_ok_noemit(*,
+                              symbol: str,
+                              side: str,
+                              df5,
+                              last_ok_pos: int | None,
+                              recent_low: float,
+                              recent_high: float,
+                              atr_30m: float,
+                              market: str = "SPOT",
+                              adx_30m: float | None = None,
+                              htf_dir_1h: str | None = None,
+                              htf_dir_30m: str | None = None) -> dict | None:
+    """Best-effort re-check of hard filters on the historical last_ok candle.
+
+    This does NOT reconstruct the full emit pipeline. It only probes the visible
+    hard filters on the last candle that was still inside the late-entry cutoff.
+    """
+    try:
+        if df5 is None or len(df5) == 0 or last_ok_pos is None:
+            return None
+        i = int(last_ok_pos)
+        if i < 0 or i >= len(df5):
+            return None
+
+        dfi = df5.iloc[: i + 1].copy()
+        if dfi.empty:
+            return None
+
+        def _norm(x):
+            try:
+                return str(x or "").strip().lower().replace(" ", "_")
+            except Exception:
+                return ""
+
+        col_map = {}
+        try:
+            for col in list(dfi.columns):
+                col_map[_norm(col)] = col
+        except Exception:
+            col_map = {}
+
+        def _pick_col(*names):
+            for nm in names:
+                real = col_map.get(_norm(nm))
+                if real is not None:
+                    return real
+            for nm in names:
+                want = _norm(nm)
+                for key, real in col_map.items():
+                    if key == want or key.startswith(want):
+                        return real
+            return None
+
+        def _f_at(row, *names, default=float('nan')):
+            col = _pick_col(*names)
+            if col is None:
+                return default
+            try:
+                v = row[col]
+                if isinstance(v, str):
+                    v = v.strip()
+                fv = float(v)
+                return fv if math.isfinite(fv) else default
+            except Exception:
+                return default
+
+        row = dfi.iloc[i]
+        close = _f_at(row, 'close', default=float('nan'))
+        o = _f_at(row, 'open', default=float('nan'))
+        hi = pd.to_numeric(dfi[_pick_col('high')], errors='coerce') if _pick_col('high') is not None else pd.Series(dtype=float)
+        lo = pd.to_numeric(dfi[_pick_col('low')], errors='coerce') if _pick_col('low') is not None else pd.Series(dtype=float)
+        cl = pd.to_numeric(dfi[_pick_col('close')], errors='coerce') if _pick_col('close') is not None else pd.Series(dtype=float)
+        op = pd.to_numeric(dfi[_pick_col('open')], errors='coerce') if _pick_col('open') is not None else pd.Series(dtype=float)
+        vol = pd.to_numeric(dfi[_pick_col('volume', 'vol')], errors='coerce') if _pick_col('volume', 'vol') is not None else pd.Series(dtype=float)
+
+        if np.isnan(close) and len(cl):
+            close = float(cl.iloc[-1])
+        if np.isnan(o):
+            o = float(close) if math.isfinite(float(close)) else float('nan')
+
+        if not math.isfinite(float(close)) or float(close) <= 0:
+            return None
+
+        rl = float(recent_low) if recent_low and math.isfinite(float(recent_low)) and float(recent_low) > 0 else (float(lo.min()) if len(lo) else float('nan'))
+        rh = float(recent_high) if recent_high and math.isfinite(float(recent_high)) and float(recent_high) > 0 else (float(hi.max()) if len(hi) else float('nan'))
+
+        rsi_5m = _f_at(row, 'rsi', 'rsi_14', 'rsi14')
+        vwap = _f_at(row, 'vwap', 'vwap_5m', default=float(close))
+        ema20 = _f_at(row, 'ema20', 'ema_20', 'ema20_5m', 'ema_20_5m')
+
+        bb_low = _f_at(row, 'bb_low', 'bb_lower', 'bollinger_low', 'bb_l')
+        bb_mid = _f_at(row, 'bb_mid', 'bb_middle', 'bollinger_mid', 'bb_m')
+        bb_high = _f_at(row, 'bb_high', 'bb_upper', 'bollinger_high', 'bb_h')
+        bb_pos = _bb_position(float(close), float(bb_low), float(bb_mid), float(bb_high))
+
+        bos_down_5m = False
+        bos_up_5m = False
+        two_red_5m = False
+        two_green_5m = False
+        lower_highs_5m = False
+        higher_lows_5m = False
+        last_vol = 0.0
+        avg_vol = 0.0
+        climax_recent_bars = 0
+        last_body = 0.0
+
+        try:
+            if len(cl) >= 2 and len(op) >= 2:
+                two_red_5m = bool(float(cl.iloc[-1]) < float(op.iloc[-1]) and float(cl.iloc[-2]) < float(op.iloc[-2]))
+                two_green_5m = bool(float(cl.iloc[-1]) > float(op.iloc[-1]) and float(cl.iloc[-2]) > float(op.iloc[-2]))
+                last_body = abs(float(cl.iloc[-1]) - float(op.iloc[-1]))
+            elif len(cl) >= 1 and len(op) >= 1:
+                last_body = abs(float(cl.iloc[-1]) - float(op.iloc[-1]))
+        except Exception:
+            pass
+        try:
+            if len(lo) >= 2:
+                bos_down_5m = bool(float(lo.iloc[-1]) < float(lo.iloc[-2]))
+            if len(hi) >= 2:
+                bos_up_5m = bool(float(hi.iloc[-1]) > float(hi.iloc[-2]))
+        except Exception:
+            pass
+        try:
+            tol = max(0.0, float(MID_HL_TOL_PCT))
+            nlh = max(3, int(MID_LOWER_HIGHS_LOOKBACK))
+            nhl = max(3, int(MID_HIGHER_LOWS_LOOKBACK))
+            if len(hi) >= nlh:
+                hh = [float(x) for x in hi.iloc[-nlh:].tolist()]
+                lower_highs_5m = all(hh[j] <= hh[j-1] * (1.0 + tol) for j in range(1, len(hh)))
+            if len(lo) >= nhl:
+                ll = [float(x) for x in lo.iloc[-nhl:].tolist()]
+                higher_lows_5m = all(ll[j] >= ll[j-1] * (1.0 - tol) for j in range(1, len(ll)))
+        except Exception:
+            pass
+        try:
+            if len(vol):
+                last_vol = float(vol.iloc[-1]) if math.isfinite(float(vol.iloc[-1])) else 0.0
+                prev = vol.iloc[max(0, len(vol)-21):max(0, len(vol)-1)]
+                if len(prev):
+                    avg_vol = float(prev.mean()) if math.isfinite(float(prev.mean())) else 0.0
+                if avg_vol > 0 and last_vol >= avg_vol * 2.0:
+                    climax_recent_bars = 1
+        except Exception:
+            pass
+
+        tok = None
+        try:
+            tok = _MID_EVAL_PHASE.set('trigger')
+        except Exception:
+            tok = None
+        try:
+            probe_reason = _mid_block_reason(
+                symbol=str(symbol),
+                side=str(side),
+                close=float(close),
+                o=float(o) if math.isfinite(float(o)) else float(close),
+                recent_low=float(rl) if math.isfinite(float(rl)) else float(close),
+                recent_high=float(rh) if math.isfinite(float(rh)) else float(close),
+                atr_30m=float(atr_30m),
+                rsi_5m=float(rsi_5m) if math.isfinite(float(rsi_5m)) else float('nan'),
+                vwap=float(vwap) if math.isfinite(float(vwap)) else float(close),
+                bb_pos=str(bb_pos or '—'),
+                ema20_5m=(float(ema20) if math.isfinite(float(ema20)) else None),
+                bos_down_5m=bool(bos_down_5m),
+                two_red_5m=bool(two_red_5m),
+                lower_highs_5m=bool(lower_highs_5m),
+                bos_up_5m=bool(bos_up_5m),
+                two_green_5m=bool(two_green_5m),
+                higher_lows_5m=bool(higher_lows_5m),
+                last_vol=float(last_vol),
+                avg_vol=float(avg_vol),
+                last_body=float(last_body),
+                climax_recent_bars=int(climax_recent_bars),
+                market=str(market or 'SPOT'),
+                htf_dir_1h=str(htf_dir_1h or side),
+                htf_dir_30m=str(htf_dir_30m or side),
+                adx_30m=(float(adx_30m) if adx_30m is not None and math.isfinite(float(adx_30m)) else None),
+            )
+        finally:
+            try:
+                if tok is not None:
+                    _MID_EVAL_PHASE.reset(tok)
+            except Exception:
+                pass
+
+        result = {
+            'probe_stage': ('hard' if probe_reason else 'pass'),
+            'probe_reason': (str(probe_reason) if probe_reason else '-'),
+            'probe_mode': 'best_effort_hardfilters',
+            'probe_entry': float(close),
+        }
+
+        if not probe_reason:
+            try:
+                bucket = _MID_LAST_NOEMIT_BY_SYMBOL.get(str(symbol).upper().strip())
+                if isinstance(bucket, dict):
+                    for src in ('pending', 'scan'):
+                        rec = bucket.get(src)
+                        if not isinstance(rec, dict):
+                            continue
+                        rec_dir = str(rec.get('direction') or '').upper().strip()
+                        want_dir = str(side or '').upper().strip()
+                        if want_dir and rec_dir and rec_dir != want_dir:
+                            continue
+                        result['probe_stage'] = str(rec.get('stage') or src)
+                        result['probe_reason'] = str(rec.get('reason') or '-')
+                        result['probe_mode'] = f'last_recorded_{src}'
+                        break
+            except Exception:
+                pass
+        return result
+    except Exception:
+        return None
+
+
 def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low: float, recent_high: float,
                       atr_30m: float, rsi_5m: float, vwap: float, bb_pos: str | None,
                       ema20_5m: float | None, bos_down_5m: bool, two_red_5m: bool, lower_highs_5m: bool,
@@ -13733,11 +13948,37 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                                         _last_ok_entry = _late_dbg.get("last_ok_entry", float("nan"))
                                         _last_ok_entry_s = (f"{float(_last_ok_entry):.6g}" if not np.isnan(float(_last_ok_entry)) else "nan")
                                         _late_noemit_tail = _mid_last_noemit_tail(symbol, direction=str(dir_trend))
+                                        _last_ok_probe_tail = ""
+                                        try:
+                                            _last_ok_probe = _mid_probe_last_ok_noemit(
+                                                symbol=str(symbol),
+                                                side=str(dir_trend),
+                                                df5=w,
+                                                last_ok_pos=_late_dbg.get("last_ok_pos"),
+                                                recent_low=float(recent_low),
+                                                recent_high=float(recent_high),
+                                                atr_30m=float(atr30),
+                                                market=market,
+                                                adx_30m=float(adx30) if not np.isnan(adx30) else None,
+                                                htf_dir_1h=str(dir_trend),
+                                                htf_dir_30m=str(dir_mid),
+                                            )
+                                            if _last_ok_probe:
+                                                _last_ok_probe_tail = (
+                                                    " last_ok_probe_stage=%s last_ok_probe_reason=%s last_ok_probe_mode=%s last_ok_probe_entry=%.6g"
+                                                ) % (
+                                                    str(_last_ok_probe.get("probe_stage", "-")),
+                                                    str(_last_ok_probe.get("probe_reason", "-")),
+                                                    str(_last_ok_probe.get("probe_mode", "-")),
+                                                    float(_last_ok_probe.get("probe_entry", float('nan'))),
+                                                )
+                                        except Exception:
+                                            _last_ok_probe_tail = ""
                                         _late_dbg_tail = (
                                             " recent_low=%.6g recent_high=%.6g atr30=%.6g"
                                             " move_atr=%.2f limit_atr=%.2f cutoff=%.6g"
                                             " extreme_pos=%s extreme_ts=%s extreme_px=%.6g"
-                                            " last_ok_pos=%s last_ok_ts=%s last_ok_entry=%s%s"
+                                            " last_ok_pos=%s last_ok_ts=%s last_ok_entry=%s%s%s"
                                         ) % (
                                             float(recent_low),
                                             float(recent_high),
@@ -13751,10 +13992,11 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                                             str(_late_dbg.get("last_ok_pos", "-")),
                                             str(_late_dbg["last_ok_ts"]),
                                             _last_ok_entry_s,
+                                            _last_ok_probe_tail,
                                             _late_noemit_tail,
                                         )
                                         logger.info(
-                                            "[mid][late_hint] %s dir=%s entry=%.6g reason=%s move_atr=%.2f limit_atr=%.2f cutoff=%.6g extreme_pos=%s extreme_ts=%s extreme_px=%.6g last_ok_pos=%s last_ok_ts=%s last_ok_entry=%s%s",
+                                            "[mid][late_hint] %s dir=%s entry=%.6g reason=%s move_atr=%.2f limit_atr=%.2f cutoff=%.6g extreme_pos=%s extreme_ts=%s extreme_px=%.6g last_ok_pos=%s last_ok_ts=%s last_ok_entry=%s%s%s",
                                             symbol,
                                             dir_trend,
                                             float(entry),
@@ -13768,6 +14010,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                                             str(_late_dbg.get("last_ok_pos", "-")),
                                             str(_late_dbg["last_ok_ts"]),
                                             _last_ok_entry_s,
+                                            _last_ok_probe_tail,
                                             _late_noemit_tail,
                                         )
                             except Exception:
