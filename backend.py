@@ -9418,6 +9418,127 @@ def _mid_late_entry_anti_bounce_reasons(*,
         return (None, None)
 
 
+def _mid_late_entry_debug_hint(*,
+                               side: str,
+                               entry: float,
+                               recent_low: float,
+                               recent_high: float,
+                               atr_30m: float,
+                               df5,
+                               market: str = "SPOT",
+                               adx_30m: float | None = None) -> dict | None:
+    """Return detailed context for a late-entry block log."""
+    try:
+        if df5 is None or len(df5) == 0:
+            return None
+
+        atr = float(atr_30m or 0.0)
+        px = float(entry or 0.0)
+        rl = float(recent_low or 0.0)
+        rh = float(recent_high or 0.0)
+        if atr <= 0 or px <= 0 or rl <= 0 or rh <= 0:
+            return None
+
+        limit_atr = float(_mid_effective_late_entry_max(market=market, adx_30m=adx_30m))
+
+        try:
+            mkt_u = (market or "SPOT").upper().strip()
+        except Exception:
+            mkt_u = "SPOT"
+
+        fut_late_mult = 1.0
+        if mkt_u == "FUTURES" and os.getenv("MID_FUT_ADAPT_FILTERS", "1").strip().lower() in ("1", "true", "yes", "on"):
+            if adx_30m is not None and os.getenv("MID_FUT_ADAPT_BY_ADX", "1").strip().lower() in ("1", "true", "yes", "on"):
+                adx = float(adx_30m)
+                adx_strong = _env_float("MID_FUT_ADX_STRONG", 30.0)
+                adx_med = _env_float("MID_FUT_ADX_MED", 25.0)
+                if adx >= adx_strong:
+                    fut_late_mult = _env_float("MID_FUT_LATE_MULT_STRONG", 1.15)
+                elif adx >= adx_med:
+                    fut_late_mult = _env_float("MID_FUT_LATE_MULT_MED", 1.08)
+                else:
+                    fut_late_mult = _env_float("MID_FUT_LATE_MULT_WEAK", 0.98)
+        limit_atr *= float(fut_late_mult)
+
+        if os.getenv("MID_ADAPTIVE_FILTERS", "0").strip().lower() in ("1", "true", "yes", "on") and atr > 0 and px > 0:
+            atrp = (atr / px) * 100.0
+            low = float(os.getenv("MID_ADAPT_ATR_PCT_LOW", "2.0") or 2.0)
+            high = float(os.getenv("MID_ADAPT_ATR_PCT_HIGH", "6.0") or 6.0)
+            if high <= low:
+                t = 0.5
+            else:
+                t = (atrp - low) / (high - low)
+            t = max(0.0, min(1.0, float(t)))
+
+            late_tight = float(os.getenv("MID_ADAPT_LATE_TIGHTEN_MIN", "0.90") or 0.90)
+            late_wide = float(os.getenv("MID_ADAPT_LATE_WIDEN_MAX", "1.15") or 1.15)
+            late_scale = late_wide + t * (late_tight - late_wide)
+            limit_atr *= float(late_scale)
+
+        close_s = df5["close"].astype(float)
+        low_s = df5["low"].astype(float)
+        high_s = df5["high"].astype(float)
+
+        def _fmt_ts(v):
+            try:
+                return v.isoformat()
+            except Exception:
+                return str(v)
+
+        side_u = str(side).upper().strip()
+
+        if side_u == "LONG":
+            move_atr = (px - rl) / atr
+            cutoff_px = rl + limit_atr * atr
+
+            low_arr = low_s.to_numpy(dtype=float)
+            tol = max(1e-12, atr * 1e-6)
+            pos_arr = np.where(np.isclose(low_arr, rl, rtol=0.0, atol=tol))[0]
+            extreme_pos = int(pos_arr[-1]) if len(pos_arr) else int(np.argmin(low_arr))
+
+            last_ok_pos = None
+            for i in range(extreme_pos, len(close_s)):
+                c = float(close_s.iloc[i])
+                if c <= cutoff_px:
+                    last_ok_pos = i
+
+            return {
+                "move_atr": float(move_atr),
+                "limit_atr": float(limit_atr),
+                "cutoff_px": float(cutoff_px),
+                "extreme_ts": _fmt_ts(df5.index[extreme_pos]),
+                "extreme_px": float(rl),
+                "last_ok_ts": _fmt_ts(df5.index[last_ok_pos]) if last_ok_pos is not None else "-",
+                "last_ok_entry": float(close_s.iloc[last_ok_pos]) if last_ok_pos is not None else float("nan"),
+            }
+
+        move_atr = (rh - px) / atr
+        cutoff_px = rh - limit_atr * atr
+
+        high_arr = high_s.to_numpy(dtype=float)
+        tol = max(1e-12, atr * 1e-6)
+        pos_arr = np.where(np.isclose(high_arr, rh, rtol=0.0, atol=tol))[0]
+        extreme_pos = int(pos_arr[-1]) if len(pos_arr) else int(np.argmax(high_arr))
+
+        last_ok_pos = None
+        for i in range(extreme_pos, len(close_s)):
+            c = float(close_s.iloc[i])
+            if c >= cutoff_px:
+                last_ok_pos = i
+
+        return {
+            "move_atr": float(move_atr),
+            "limit_atr": float(limit_atr),
+            "cutoff_px": float(cutoff_px),
+            "extreme_ts": _fmt_ts(df5.index[extreme_pos]),
+            "extreme_px": float(rh),
+            "last_ok_ts": _fmt_ts(df5.index[last_ok_pos]) if last_ok_pos is not None else "-",
+            "last_ok_entry": float(close_s.iloc[last_ok_pos]) if last_ok_pos is not None else float("nan"),
+        }
+    except Exception:
+        return None
+
+
 def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low: float, recent_high: float,
                       atr_30m: float, rsi_5m: float, vwap: float, bb_pos: str | None,
                       ema20_5m: float | None, bos_down_5m: bool, two_red_5m: bool, lower_highs_5m: bool,
@@ -13386,7 +13507,48 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                         if _ctx is not None:
                             _ctx.setdefault('block', set()).add(_tick_key)
                         if _mid_trap_should_log(_k):
-                            logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, reason, float(entry))
+                            _late_dbg_tail = ""
+                            try:
+                                if str(reason).startswith("late_entry_atr="):
+                                    _late_dbg = _mid_late_entry_debug_hint(
+                                        side=str(dir_trend),
+                                        entry=float(entry),
+                                        recent_low=float(recent_low),
+                                        recent_high=float(recent_high),
+                                        atr_30m=float(atr30),
+                                        df5=w,
+                                        market=market,
+                                        adx_30m=float(adx30) if not np.isnan(adx30) else None,
+                                    )
+                                    if _late_dbg:
+                                        _last_ok_entry = _late_dbg.get("last_ok_entry", float("nan"))
+                                        _late_dbg_tail = (
+                                            " recent_low=%.6g recent_high=%.6g atr30=%.6g"
+                                            " move_atr=%.2f limit_atr=%.2f cutoff=%.6g"
+                                            " extreme_ts=%s extreme_px=%.6g"
+                                            " last_ok_ts=%s last_ok_entry=%s"
+                                        ) % (
+                                            float(recent_low),
+                                            float(recent_high),
+                                            float(atr30),
+                                            float(_late_dbg["move_atr"]),
+                                            float(_late_dbg["limit_atr"]),
+                                            float(_late_dbg["cutoff_px"]),
+                                            str(_late_dbg["extreme_ts"]),
+                                            float(_late_dbg["extreme_px"]),
+                                            str(_late_dbg["last_ok_ts"]),
+                                            (f"{float(_last_ok_entry):.6g}" if not np.isnan(float(_last_ok_entry)) else "nan"),
+                                        )
+                            except Exception:
+                                _late_dbg_tail = ""
+                            logger.info(
+                                "[mid][block] %s dir=%s reason=%s entry=%.6g%s",
+                                symbol,
+                                dir_trend,
+                                reason,
+                                float(entry),
+                                _late_dbg_tail,
+                            )
                     # Reuse MID trap sink/digest to show why MID hard-filters blocked entries
                     _emit_mid_trap_event({
                         "dir": str(dir_trend),
