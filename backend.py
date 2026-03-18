@@ -27345,19 +27345,34 @@ async def candles_cache_cleanup_loop(backend: 'Backend') -> None:
 # ===============================
 
 # --- Institutional token analysis (multi-timeframe) ---
-_I18N_CACHE = {"data": None, "mtime": 0.0}
+_ANALYSIS_I18N_CACHE = {"data": None, "mtime": 0.0}
 
 def _load_i18n_dict() -> dict:
-    """Loads i18n.json next to this file. Cached by mtime."""
-    import os, json, time
+    """Loads i18n.json next to this file. Cached by mtime.
+
+    Important: this cache must stay isolated from the generic backend i18n cache
+    defined earlier in the file. Reusing the same global name breaks analysis
+    cards after any regular translation lookup warms the main cache.
+    """
+    import os, json
     try:
         p = os.path.join(os.path.dirname(__file__), "i18n.json")
         st = os.stat(p)
-        if _I18N_CACHE["data"] is None or float(st.st_mtime) != float(_I18N_CACHE["mtime"]):
-            _I18N_CACHE["data"] = json.loads(open(p, "r", encoding="utf-8").read())
-            _I18N_CACHE["mtime"] = float(st.st_mtime)
-        return _I18N_CACHE["data"] or {}
+        if _ANALYSIS_I18N_CACHE["data"] is None or float(st.st_mtime) != float(_ANALYSIS_I18N_CACHE["mtime"]):
+            with open(p, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                return {}
+            _ANALYSIS_I18N_CACHE["data"] = data
+            _ANALYSIS_I18N_CACHE["mtime"] = float(st.st_mtime)
+        return _ANALYSIS_I18N_CACHE["data"] or {}
     except Exception:
+        try:
+            legacy = globals().get("_I18N_CACHE")
+            if isinstance(legacy, dict) and ("ru" in legacy or "en" in legacy):
+                return legacy
+        except Exception:
+            pass
         return {}
 
 def _tr_i18n(lang: str, key: str, **kwargs) -> str:
