@@ -5851,7 +5851,7 @@ async def _futures_position_size(*, ex: str, api_key: str, api_secret: str, symb
 async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, backend_instance=None) -> None:
     """Background loop to manage SL/TP/BE for real orders.
 
-    notify_api_error(user_id:int, text:str) will be called only on API errors.
+    notify_api_error(user_id:int, exchange:str, market_type:str, text:str) will be called only on API errors.
     notify_smart_event(user_id:int, text:str) may be called for SL/TP decisions.
     """
 
@@ -8052,7 +8052,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             tp1_filled = (str(o.get("status")) == "FILLED")
                         except ExchangeAPIError as e:
                             try:
-                                notify_api_error(uid, f"⚠️ Auto-trade ERROR ({ex} {mt})\n{str(e)[:200]}")
+                                await notify_api_error(uid, ex, mt, str(e)[:200])
                             except Exception:
                                 pass
                             continue
@@ -8065,7 +8065,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             tp1_filled = (str(st) == "Filled")
                         except ExchangeAPIError as e:
                             try:
-                                notify_api_error(uid, f"⚠️ Auto-trade ERROR ({ex} {mt})\n{str(e)[:200]}")
+                                await notify_api_error(uid, ex, mt, str(e)[:200])
                             except Exception:
                                 pass
                             continue
@@ -8170,7 +8170,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             sl_filled = (str(o_sl.get("status")) == "FILLED")
                         except ExchangeAPIError as e:
                             try:
-                                notify_api_error(uid, f"⚠️ Auto-trade ERROR ({ex} {mt})\n{str(e)[:200]}")
+                                await notify_api_error(uid, ex, mt, str(e)[:200])
                             except Exception:
                                 pass
                             continue
@@ -8183,7 +8183,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             sl_filled = (str(stx) == "Filled")
                         except ExchangeAPIError as e:
                             try:
-                                notify_api_error(uid, f"⚠️ Auto-trade ERROR ({ex} {mt})\n{str(e)[:200]}")
+                                await notify_api_error(uid, ex, mt, str(e)[:200])
                             except Exception:
                                 pass
                             continue
@@ -8251,7 +8251,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             tp_filled = (str(o_tp.get("status")) == "FILLED")
                         except ExchangeAPIError as e:
                             try:
-                                notify_api_error(uid, f"⚠️ Auto-trade ERROR ({ex} {mt})\n{str(e)[:200]}")
+                                await notify_api_error(uid, ex, mt, str(e)[:200])
                             except Exception:
                                 pass
                             continue
@@ -8264,7 +8264,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             tp_filled = (str(stx) == "Filled")
                         except ExchangeAPIError as e:
                             try:
-                                notify_api_error(uid, f"⚠️ Auto-trade ERROR ({ex} {mt})\n{str(e)[:200]}")
+                                await notify_api_error(uid, ex, mt, str(e)[:200])
                             except Exception:
                                 pass
                             continue
