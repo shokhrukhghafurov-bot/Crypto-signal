@@ -23504,6 +23504,28 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                     pass
                 return False
 
+            def _mid_market_fallback_target(market: str) -> str | None:
+                try:
+                    mkt = str(market or "SPOT").upper().strip() or "SPOT"
+                    fb_global = str(os.getenv('MID_CANDLES_MARKET_FALLBACK', '1') or '1').strip().lower() not in ('0','false','no','off')
+                    if not fb_global:
+                        return None
+                    if mkt == 'FUTURES':
+                        fb_on = str(os.getenv('MID_CANDLES_FUTURES_FALLBACK_SPOT', '1') or '1').strip().lower() not in ('0','false','no','off')
+                        return 'SPOT' if fb_on else None
+                    if mkt == 'SPOT':
+                        fb_on = str(os.getenv('MID_CANDLES_SPOT_FALLBACK_FUTURES', '1') or '1').strip().lower() not in ('0','false','no','off')
+                        return 'FUTURES' if fb_on else None
+                    return None
+                except Exception:
+                    return None
+
+            def _mid_effective_market(market: str) -> str:
+                mkt = str(market or 'SPOT').upper().strip() or 'SPOT'
+                if os.getenv('MID_CANDLES_FORCE_SPOT', '0').strip().lower() not in ('0','false','no','off'):
+                    return 'SPOT'
+                return mkt if mkt in ('SPOT', 'FUTURES') else 'SPOT'
+
             def _mid_primary_for_symbol(symb: str) -> str:
                 preferred = None
                 if MID_CANDLES_LIGHT_MODE or MID_CANDLES_BINANCE_FIRST:
@@ -23599,10 +23621,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                 try:
                     # Global MID kline concurrency guard (prevents HTTP overload -> timeouts -> no_candles)
                     async with _mid_klines_sem:
-                        mkt = (market or 'SPOT').upper().strip()
-                        # PRODUCTION: optionally force SPOT candles to avoid FUTURES-only instrument gaps
-                        if os.getenv('MID_CANDLES_FORCE_SPOT', '0').strip().lower() not in ('0','false','no','off'):
-                            mkt = 'SPOT'
+                        mkt = _mid_effective_market(market)
+                        market = mkt
 
                         # PRODUCTION: drop obviously-bad symbols early (saves REST/WS limits and prevents no_candles storms)
                         _sym = (symb or '').strip().upper()
@@ -23659,27 +23679,42 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         # Fast-skip pairs we already know are unsupported on this exchange/market/TF
                         try:
                             if api._is_unsupported_cached(ex_name, mkt, _sym, tf):
-                                _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_cached')
-                                return pd.DataFrame()
+                                alt = _mid_market_fallback_target(mkt)
+                                if alt and alt != mkt and not api._is_unsupported_cached(ex_name, alt, _sym, tf):
+                                    mkt = alt
+                                    market = alt
+                                else:
+                                    _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_cached')
+                                    return pd.DataFrame()
                         except Exception:
                             pass
                         if ex_name in ('GATEIO','MEXC') and mkt == 'FUTURES':
-                            # Futures candles are not implemented for these adapters. Mark unsupported and skip.
-                            try:
-                                api._mark_unsupported(ex_name, mkt, symb, tf)
-                            except Exception:
-                                pass
-                            _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_market')
-                            return None
+                            alt = _mid_market_fallback_target(mkt)
+                            if alt and alt != mkt:
+                                mkt = alt
+                                market = alt
+                            else:
+                                # Futures candles are not implemented for these adapters. Mark unsupported and skip.
+                                try:
+                                    api._mark_unsupported(ex_name, mkt, symb, tf)
+                                except Exception:
+                                    pass
+                                _mid_diag_add(symb, ex_name, mkt, tf, 'unsupported_market')
+                                return None
                         # Availability check (cached): skip symbols that don't exist on this exchange/market
                         try:
                             if not await api._market_supported_ex(ex_name, mkt, _sym):
-                                try:
-                                    api._mark_unsupported(ex_name, mkt, _sym, tf)
-                                except Exception:
-                                    pass
-                                _mid_diag_add(_sym, ex_name, mkt, tf, 'unsupported_pair')
-                                return pd.DataFrame()
+                                alt = _mid_market_fallback_target(mkt)
+                                if alt and alt != mkt:
+                                    mkt = alt
+                                    market = alt
+                                else:
+                                    try:
+                                        api._mark_unsupported(ex_name, mkt, _sym, tf)
+                                    except Exception:
+                                        pass
+                                    _mid_diag_add(_sym, ex_name, mkt, tf, 'unsupported_pair')
+                                    return pd.DataFrame()
                         except Exception:
                             # If availability check fails, fall back to request
                             pass
@@ -23894,6 +23929,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 """
                                 nonlocal _mid_db_hit, _mid_candles_cache
                                 try:
+                                    market = _mid_effective_market(market)
                                     _sn = (symb or '').strip().upper()
                                     _sn = _sn.replace('-', '').replace('_', '').replace(':', '').replace('/', '')
                                     for _suf in ('SWAP','PERP','PERPETUAL','FUT','FUTURES'):
@@ -23989,6 +24025,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
             async def _mid_fetch_klines_cached(ex_name: str, symb: str, tf: str, limit: int, market: str) -> Optional[pd.DataFrame]:
 
                 nonlocal _mid_candles_net_fail, _mid_candles_unsupported, _mid_candles_partial, _mid_db_hit, _mid_rest_refill, _mid_candles_cache, _mid_candles_empty, _mid_candles_empty_reasons, _mid_candles_empty_samples, _mid_candles_fallback
+                market = _mid_effective_market(market)
                 # Normalize symbol consistently for cache + unsupported markers
                 _sn = (symb or '').strip().upper()
                 _sn = _sn.replace('-', '').replace('_', '').replace(':', '').replace('/', '')
@@ -24002,9 +24039,15 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                 # Fast skip: known unsupported (avoid repeated empty/unsupported storms)
                 try:
                     if api._is_unsupported_cached(ex_name, mkt0, symb, tf):
-                        _mid_candles_unsupported += 1
-                        _mid_diag_add(symb, ex_name, mkt0, tf, 'unsupported_cached', 'pre')
-                        return None
+                        alt = _mid_market_fallback_target(mkt0)
+                        if alt and alt != mkt0 and not api._is_unsupported_cached(ex_name, alt, symb, tf):
+                            mkt0 = alt
+                            market = alt
+                            key = (ex_name, mkt0, symb, tf, int(limit))
+                        else:
+                            _mid_candles_unsupported += 1
+                            _mid_diag_add(symb, ex_name, mkt0, tf, 'unsupported_cached', 'pre')
+                            return None
                 except Exception:
                     pass
                 # Fast skip: market/symbol not supported according to cached instruments
@@ -24014,13 +24057,19 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         # IMPORTANT: treat "unknown" availability (e.g. cold start / markets fetch failed) as supported.
                         _sup = await api._market_supported_ex(ex_name, mkt0, symb)
                         if _sup is False:
-                            try:
-                                api._mark_unsupported(ex_name, mkt0, symb, tf)
-                            except Exception:
-                                pass
-                            _mid_diag_add(symb, ex_name, mkt0, tf, 'unsupported_pair', 'pre')
-                            _mid_candles_unsupported += 1
-                            return None
+                            alt = _mid_market_fallback_target(mkt0)
+                            if alt and alt != mkt0:
+                                mkt0 = alt
+                                market = alt
+                                key = (ex_name, mkt0, symb, tf, int(limit))
+                            else:
+                                try:
+                                    api._mark_unsupported(ex_name, mkt0, symb, tf)
+                                except Exception:
+                                    pass
+                                _mid_diag_add(symb, ex_name, mkt0, tf, 'unsupported_pair', 'pre')
+                                _mid_candles_unsupported += 1
+                                return None
                 except Exception:
                     # If availability check fails, fall back to request
                     pass
@@ -24952,9 +25001,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 if t in ("5m", "5min", "5"):
                                     return int(os.getenv("MID_NEED_5M_BARS", os.getenv("MID_NEED_BARS_5M", "60")) or 60)
                                 if t in ("30m", "30min", "30"):
-                                    return int(os.getenv("MID_NEED_30M_BARS", os.getenv("MID_NEED_BARS_30M", "200")) or 200)
+                                    return int(os.getenv("MID_NEED_30M_BARS", os.getenv("MID_NEED_BARS_30M", "120")) or 120)
                                 # default: 1h+
-                                return int(os.getenv("MID_NEED_1H_BARS", os.getenv("MID_NEED_BARS_1H", "200")) or 200)
+                                return int(os.getenv("MID_NEED_1H_BARS", os.getenv("MID_NEED_BARS_1H", "120")) or 120)
                             except Exception:
                                 return 0
 
