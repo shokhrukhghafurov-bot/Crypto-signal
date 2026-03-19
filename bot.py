@@ -2497,8 +2497,18 @@ async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str,
     except Exception:
         pass
 
+def _smart_manager_notify_enabled() -> bool:
+    raw = os.getenv("SMART_MANAGER_NOTIFY_ENABLED")
+    if raw is None or str(raw).strip() == "":
+        raw = os.getenv("SMART_MANAGER_SEND_MESSAGES", "1")
+    return str(raw or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 async def _notify_smart_manager_event(uid: int, text: str) -> None:
     try:
+        if not _smart_manager_notify_enabled():
+            logger.info("[smart-manager] notify skipped by env uid=%s", uid)
+            return
         logger.info("[smart-manager] notify uid=%s text=%s", uid, (text or "")[:500].replace("\n", " | "))
         await safe_send(uid, text, ctx="smart_manager_event")
     except Exception:
