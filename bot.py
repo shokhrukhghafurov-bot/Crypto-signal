@@ -2488,14 +2488,14 @@ async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str,
     try:
         await safe_send(uid, msg)
     except Exception:
-        pass
+        logger.exception("[autotrade] failed to send user api error uid=%s ex=%s mt=%s", uid, ex, mt)
     # Also forward to @errorrrrrrg_bot (admin error bot), if enabled
     try:
         send_to_err = (os.getenv("AUTOTRADE_SEND_API_ERRORS_TO_ERROR_BOT", "1") or "1").strip().lower() not in ("0","false","no","off")
         if send_to_err:
             await _error_bot_send(f"🤖 Auto-trade API ERROR\nuid={uid}\n{title} ({ex} {mt})\n{error_text}"[:3900])
     except Exception:
-        pass
+        logger.exception("[autotrade] failed to forward api error to error bot uid=%s ex=%s mt=%s", uid, ex, mt)
 
 async def _notify_smart_manager_event(uid: int, text: str) -> None:
     try:
@@ -2508,7 +2508,7 @@ async def _notify_smart_manager_event(uid: int, text: str) -> None:
             return
         await safe_send(uid, text, ctx="smart_manager_event")
     except Exception:
-        pass
+        logger.exception("[smart-manager] notify failed uid=%s", uid)
 
 def _fernet() -> Fernet:
     try:
