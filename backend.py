@@ -25001,9 +25001,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 if t in ("5m", "5min", "5"):
                                     return int(os.getenv("MID_NEED_5M_BARS", os.getenv("MID_NEED_BARS_5M", "60")) or 60)
                                 if t in ("30m", "30min", "30"):
-                                    return int(os.getenv("MID_NEED_30M_BARS", os.getenv("MID_NEED_BARS_30M", "120")) or 120)
+                                    return int(os.getenv("MID_NEED_30M_BARS", os.getenv("MID_NEED_BARS_30M", "150")) or 150)
                                 # default: 1h+
-                                return int(os.getenv("MID_NEED_1H_BARS", os.getenv("MID_NEED_BARS_1H", "120")) or 120)
+                                return int(os.getenv("MID_NEED_1H_BARS", os.getenv("MID_NEED_BARS_1H", "150")) or 150)
                             except Exception:
                                 return 0
 
