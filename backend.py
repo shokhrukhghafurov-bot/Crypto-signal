@@ -7705,9 +7705,11 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                     "NOT CLOSED",
                                     level_label="TP2",
                                     level_price=tp2,
-                                    reason=_sm_join_reason(
-                                        _tr(uid, "sm_reason_tp2_runner_started"),
-                                        f"mom={tp2_mom_fav_pct:.2f}% prob={tp2_prob_now:.2f}",
+                                    reason=_trf(
+                                        uid,
+                                        "sm_reason_tp2_runner_started",
+                                        mom=f"{tp2_mom_fav_pct:.2f}%",
+                                        prob=f"{tp2_prob_now:.2f}",
                                     ),
                                     cooldown_sec=10.0,
                                 )
@@ -7782,7 +7784,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                 await _sync_pos_meta({"tp1_hit": True})
                             except Exception:
                                 pass
-                            await _notify_smart_decision("TP1", "NOT CLOSED", level_label="TP1", level_price=tp1, reason=_trf(uid, "sm_reason_hold_to_tp2", mode=_sm_mode_text(mode), prob_tp2=f"{prob_tp2:.2f}"), cooldown_sec=30.0)
+                            await _notify_smart_decision("TP1", "NOT CLOSED", level_label="TP1", level_price=tp1, reason=_trf(uid, "sm_reason_hold_to_tp2", mode=_sm_mode_text(mode), prob_tp2=f"{prob_tp2:.2f}", progress=f"{prog:.2f}", mom_fav=f"{mom_fav_pct:.2f}%", mom_adv=f"{mom_adv_pct:.2f}%"), cooldown_sec=30.0)
                         elif mode == "PARTIAL_TP1":
                             partial_pct = float(tp1_decision.partial_pct or _smart_dynamic_partial_pct(
                                 prob_tp2=float(prob_tp2),
