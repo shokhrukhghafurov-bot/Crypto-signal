@@ -20897,8 +20897,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # Structure alignment at trigger-time is a *strong* filter.
                     # If enabled by default it can block nearly all signals during pullbacks / ranges.
                     # So we default it to OFF, and users can explicitly enable it via env.
-                    req_struct_30m = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_30M", True)
-                    req_struct_1h = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_1H", True)
+                    req_struct_30m = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_30M", False)
+                    req_struct_1h = _env_true("MID_TRIGGER_REQUIRE_STRUCTURE_1H", False)
                     
                     # Trap: by default, follow global trap switches if they are set; otherwise enabled.
                     try:
