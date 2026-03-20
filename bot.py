@@ -739,6 +739,8 @@ def _should_forward_to_error_bot(levelno: int, msg: str) -> bool:
         "invalid key", "api key", "permission", "timeout", "timed out",
         "order failed", "failed to place", "failed to execute", "connection error",
         "network", "http 5", "rate limit", "too many requests", "denied",
+        "close failed", "failed to close", "close_market failed", "close market failed",
+        "not closed", "could not close", "unable to close", "reduce-only",
         "dead"
     )
     is_real_error = any(x in m for x in real_error_markers)
@@ -749,6 +751,12 @@ def _should_forward_to_error_bot(levelno: int, msg: str) -> bool:
         return True
 
     if levelno >= min_level and is_real_error:
+        return True
+
+    if levelno >= logging.INFO and any(x in m for x in (
+        "close failed", "failed to close", "close_market failed", "close market failed",
+        "not closed", "could not close", "unable to close"
+    )):
         return True
 
     # 7) Optional: scanner/mid/scan_block forwarding (still filtered above)
@@ -2422,6 +2430,8 @@ AUTOTRADE_STATS_STATE: Dict[int, Dict[str, str]] = {}
 # Notify only on API errors (anti-spam)
 AUTOTRADE_API_ERR_LAST: Dict[tuple[int, str, str], float] = {}
 AUTOTRADE_API_ERR_COOLDOWN_SEC = 300
+SMART_MANAGER_ERR_LAST: Dict[tuple[int, str], float] = {}
+SMART_MANAGER_ERROR_BOT_COOLDOWN_SEC = float(os.getenv("SMART_MANAGER_ERROR_BOT_COOLDOWN_SEC", "60") or 60)
 
 # Notify (optional) when Auto-trade is SKIPPED due to access/keys/confirmations (diagnostics)
 AUTOTRADE_SKIP_LAST: Dict[tuple[int, str], float] = {}  # (uid, reason) -> last_ts
@@ -2544,8 +2554,43 @@ async def _notify_autotrade_api_error(uid: int, exchange: str, market_type: str,
     except Exception:
         logger.exception("[autotrade] failed to forward api error to error bot uid=%s ex=%s mt=%s", uid, ex, mt)
 
+def _smart_event_needs_error_bot(text: str) -> bool:
+    m = str(text or "").lower()
+    markers = (
+        "not closed", "не закры", "close failed", "failed to close",
+        "close_market failed", "close market failed", "could not close", "unable to close",
+        "execution error", "ошибка исполнения", "ошибка закрытия",
+        "close returned false", "reduce-only", "tp1 not closed", "tp2 not closed", "sl not closed"
+    )
+    return any(x in m for x in markers)
+
+
+async def _forward_smart_manager_error_to_error_bot(uid: int, text: str) -> None:
+    try:
+        if not _smart_event_needs_error_bot(text):
+            return
+        key = (int(uid), str(text or "")[:1000])
+        now = time.time()
+        last = SMART_MANAGER_ERR_LAST.get(key, 0.0)
+        if now - last < SMART_MANAGER_ERROR_BOT_COOLDOWN_SEC:
+            return
+        SMART_MANAGER_ERR_LAST[key] = now
+        payload = f"🤖 SMART MANAGER CLOSE ERROR\nuid={uid}\n{text}"[:3900]
+        if _ERROR_AGG_ENABLED and _ERROR_AGG_WINDOW_SEC > 0:
+            _error_agg_note(logging.ERROR, "smart-manager-direct", payload)
+        else:
+            await _error_bot_send(payload)
+    except Exception:
+        logger.exception("[smart-manager] failed to forward direct error uid=%s", uid)
+
+
 async def _notify_smart_manager_event(uid: int, text: str) -> None:
     try:
+        try:
+            await _forward_smart_manager_error_to_error_bot(uid, text)
+        except Exception:
+            logger.exception("[smart-manager] direct error forward failed uid=%s", uid)
+
         raw_enabled = os.getenv("SMART_MANAGER_NOTIFY_ENABLED")
         if raw_enabled is None:
             raw_enabled = os.getenv("SMART_MANAGER_SEND_MESSAGES", "1")
