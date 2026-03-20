@@ -487,6 +487,13 @@
     "sm_reason_weakness_exit": "the move weakened before TP1: peak={best_gain}%, giveback={giveback}% ({giveback_frac}% of the move), TP1 progress={progress}, negative hits={neg_hits}; closing to protect profit",
     "sm_reason_early_exit": "adverse momentum repeated while the trade is already in profit: negative hits={neg_hits}/{need_hits}, current gain={gain_now}% (min={min_gain}%), adverse move={adverse}% (threshold={adverse_need}%); closing early",
     "sm_reason_reversal_exit": "after a strong move, price started reversing from the peak: peak gain={gain}%, retrace={retrace}% (gain threshold={gain_need}%, retrace threshold={retrace_need}%); closing the position",
+    "sm_inv_bos_against": "BOS/CHoCH against the position",
+    "sm_inv_reclaim_loss": "reclaim loss under entry",
+    "sm_inv_vwap_loss": "VWAP side lost",
+    "sm_inv_ema20_loss": "EMA20 5m lost",
+    "sm_inv_trend_loss": "micro trend turned against the trade",
+    "sm_inv_slow_drift": "slow adverse drift",
+    "sm_reason_invalidation_exit": "post-entry invalidation detected before SL: score={score}, age={age_bars}x5m, current loss={loss}% (cap={max_loss}%, full SL={full_sl}%); signals: {components}. Closing early before hard SL.",
     "sm_reason_trail_exit": "the trailing protection was hit and held for {confirm_sec}s: trail={trail_price}, current={current_price}; closing the position",
     "sm_reason_execution_error": "Smart Manager decided to close the position, but the exchange returned an execution error: {detail}"
   },
@@ -978,7 +985,15 @@
     "sm_reason_weakness_exit": "движение ослабло ещё до TP1: пик={best_gain}%, откат={giveback}% ({giveback_frac}% от движения), прогресс к TP1={progress}, негативных импульсов={neg_hits}; закрываем, чтобы защитить прибыль",
     "sm_reason_early_exit": "появилась серия негативного импульса, пока позиция уже в плюсе: негативных импульсов={neg_hits}/{need_hits}, текущая прибыль={gain_now}% (минимум={min_gain}%), adverse move={adverse}% (порог={adverse_need}%); закрываем досрочно",
     "sm_reason_reversal_exit": "после сильного движения цена начала разворот от пика: прибыль на пике={gain}%, откат={retrace}% (порог прибыли={gain_need}%, порог отката={retrace_need}%); закрываем позицию",
+    "sm_inv_bos_against": "BOS/CHoCH против позиции",
+    "sm_inv_reclaim_loss": "потеря reclaim ниже входа",
+    "sm_inv_vwap_loss": "потеря стороны VWAP",
+    "sm_inv_ema20_loss": "потеря EMA20 5m",
+    "sm_inv_trend_loss": "микро-тренд развернулся против сделки",
+    "sm_inv_slow_drift": "медленное движение против позиции",
+    "sm_reason_invalidation_exit": "ещё до SL зафиксирована пост-входная инвалидация: score={score}, возраст={age_bars}x5m, текущий результат={loss}% против позиции (лимит раннего выхода={max_loss}%, полный SL={full_sl}%); сигналы: {components}. Закрываемся раньше, не дожидаясь hard SL.",
     "sm_reason_trail_exit": "сработала трейлинг-защита и цена удержалась за уровнем {confirm_sec}с: трейл={trail_price}, текущая цена={current_price}; закрываем позицию",
     "sm_reason_execution_error": "Smart Manager решил закрыть позицию, но биржа вернула ошибку исполнения: {detail}"
   }
 }
+
