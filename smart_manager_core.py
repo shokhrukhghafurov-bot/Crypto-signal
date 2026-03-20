@@ -141,6 +141,20 @@ class ReversalExitDecision:
 
 
 @dataclass(slots=True)
+class InvalidationExitDecision:
+    should_close: bool
+    score: int
+    loss_now_pct: float
+    gain_now_pct: float
+    full_sl_loss_pct: float
+    max_early_loss_pct: float
+    progress_to_tp1: float
+    bars_since_entry: int
+    components: str
+    reason: str
+
+
+@dataclass(slots=True)
 class StructuralSLDecision:
     should_close: bool
     crossed: bool
@@ -390,6 +404,117 @@ class SmartExitEngine:
             f"giveback={giveback_pct:.2f}%({giveback_frac * 100.0:.0f}%) tp1_progress={progress_to_tp1:.2f} neg_hits={int(neg_count or 0)}"
         )
         return WeaknessExitDecision(should_close, best_gain_pct, giveback_pct, giveback_frac, progress_to_tp1, reason)
+
+    @staticmethod
+    def evaluate_invalidation_exit(*, direction: str, entry_price: float, current_price: float, best_price: float, tp1_price: float, sl_price: float, tp1_seen: bool, open_age_sec: float, neg_count: int, bos_against: bool, reclaim_loss: bool, vwap_loss: bool, ema20_loss: bool, trend_loss: bool, invalidation_enabled: bool, invalidation_min_bars: int, invalidation_max_bars: int, invalidation_score_close: int, invalidation_score_on_loss: int, invalidation_neg_hits: int, invalidation_min_loss_pct: float, invalidation_max_loss_pct: float, invalidation_sl_frac_cap: float, invalidation_score_override: int = 4) -> InvalidationExitDecision:
+        direction = str(direction or "LONG").upper()
+        entry = float(entry_price or 0.0)
+        px = float(current_price or 0.0)
+        best_px = float(best_price or px)
+        tp1 = float(tp1_price or 0.0)
+        sl = float(sl_price or 0.0)
+        bars_since_entry = max(0, int(float(open_age_sec or 0.0) // 300.0))
+
+        gain_now_pct = 0.0
+        loss_now_pct = 0.0
+        best_gain_pct = 0.0
+        progress_to_tp1 = 0.0
+        full_sl_loss_pct = 0.0
+
+        if entry > 0:
+            if direction == "LONG":
+                gain_now_pct = (px / entry - 1.0) * 100.0 if px > 0 else 0.0
+                loss_now_pct = max(0.0, (1.0 - (px / entry)) * 100.0) if px > 0 else 0.0
+                if best_px > 0:
+                    best_gain_pct = max(0.0, (best_px / entry - 1.0) * 100.0)
+                if sl > 0 and sl < entry:
+                    full_sl_loss_pct = max(0.0, (1.0 - (sl / entry)) * 100.0)
+            else:
+                gain_now_pct = (1.0 - (px / entry)) * 100.0 if px > 0 else 0.0
+                loss_now_pct = max(0.0, (px / entry - 1.0) * 100.0) if px > 0 else 0.0
+                if best_px > 0:
+                    best_gain_pct = max(0.0, (1.0 - (best_px / entry)) * 100.0)
+                if sl > 0 and sl > entry:
+                    full_sl_loss_pct = max(0.0, (sl / entry - 1.0) * 100.0)
+
+        if tp1 > 0 and entry > 0 and tp1 != entry:
+            try:
+                if direction == "LONG":
+                    progress_to_tp1 = (best_px - entry) / (tp1 - entry)
+                else:
+                    progress_to_tp1 = (entry - best_px) / (entry - tp1)
+            except Exception:
+                progress_to_tp1 = 0.0
+            progress_to_tp1 = max(0.0, min(1.5, float(progress_to_tp1)))
+
+        max_early_loss_pct = max(0.0, float(invalidation_max_loss_pct or 0.0))
+        sl_frac_cap = max(0.0, float(invalidation_sl_frac_cap or 0.0))
+        if full_sl_loss_pct > 0 and sl_frac_cap > 0:
+            dyn_cap = full_sl_loss_pct * sl_frac_cap
+            max_early_loss_pct = min(max_early_loss_pct, dyn_cap) if max_early_loss_pct > 0 else dyn_cap
+
+        score = 0
+        components: list[str] = []
+        if bool(bos_against):
+            score += 2
+            components.append("bos_against")
+        if bool(reclaim_loss):
+            score += 1
+            components.append("reclaim_loss")
+        if bool(vwap_loss):
+            score += 1
+            components.append("vwap_loss")
+        if bool(ema20_loss):
+            score += 1
+            components.append("ema20_loss")
+        if bool(trend_loss):
+            score += 1
+            components.append("trend_loss")
+
+        slow_drift = int(neg_count or 0) >= max(1, int(invalidation_neg_hits or 1))
+        if slow_drift:
+            score += 1
+            components.append("slow_drift")
+
+        min_bars = max(0, int(invalidation_min_bars or 0))
+        max_bars = int(invalidation_max_bars or 0)
+        within_window = bars_since_entry >= min_bars and (max_bars <= 0 or bars_since_entry <= max_bars)
+
+        soft_cap_ok = (max_early_loss_pct <= 0.0) or (loss_now_pct <= max_early_loss_pct)
+        score_close = score >= max(1, int(invalidation_score_close or 1))
+        score_on_loss = score >= max(1, int(invalidation_score_on_loss or 1)) and loss_now_pct >= max(0.0, float(invalidation_min_loss_pct or 0.0))
+        override_close = False
+        if score >= max(1, int(invalidation_score_override or 1)):
+            if full_sl_loss_pct > 0:
+                override_close = loss_now_pct < max(max_early_loss_pct, full_sl_loss_pct * 0.92)
+            else:
+                override_close = soft_cap_ok
+
+        should_close = bool(
+            invalidation_enabled
+            and (not tp1_seen)
+            and within_window
+            and ((score_close and soft_cap_ok) or (score_on_loss and soft_cap_ok) or override_close)
+        )
+
+        reason = (
+            f"post_entry_invalidation score={score} bars={bars_since_entry} "
+            f"loss={loss_now_pct:.2f}% cap={max_early_loss_pct:.2f}% full_sl={full_sl_loss_pct:.2f}% "
+            f"progress={progress_to_tp1:.2f} neg_hits={int(neg_count or 0)} best_gain={best_gain_pct:.2f}% "
+            f"flags={','.join(components) if components else 'none'}"
+        )
+        return InvalidationExitDecision(
+            should_close,
+            score,
+            loss_now_pct,
+            gain_now_pct,
+            full_sl_loss_pct,
+            max_early_loss_pct,
+            progress_to_tp1,
+            bars_since_entry,
+            ",".join(components),
+            reason,
+        )
 
     @staticmethod
     def evaluate_structural_sl(*, direction: str, entry_price: float, current_price: float, sl_price: float, hard_sl_price: float, now_ts: float, sl_hits: int, sl_first_ts: float, sl_extreme: float, sl_confirm_hits: int, sl_confirm_sec: float, sl_deep_pct: float, sl_grace_sec: float, sl_reclaim_pct: float, sl_bounce_pct: float, allow_struct_close: bool = True) -> StructuralSLDecision:
