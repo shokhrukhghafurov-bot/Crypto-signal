@@ -2246,6 +2246,64 @@ def _binance_rate_limit_cooldown_sec() -> float:
     return max(5.0, min(v, 900.0))
 
 
+def _binance_request_timeout_sec() -> float:
+    try:
+        v = float(os.getenv("BINANCE_HTTP_TIMEOUT_SEC", "15") or 15)
+    except Exception:
+        v = 15.0
+    return max(5.0, min(v, 60.0))
+
+
+def _binance_request_max_attempts() -> int:
+    try:
+        v = int(float(os.getenv("BINANCE_SIGNED_MAX_ATTEMPTS", "3") or 3))
+    except Exception:
+        v = 3
+    return max(2, min(v, 6))
+
+
+def _binance_request_retry_sleep_sec(attempt: int) -> float:
+    try:
+        base = float(os.getenv("BINANCE_SIGNED_RETRY_BASE_SEC", "0.8") or 0.8)
+    except Exception:
+        base = 0.8
+    try:
+        cap = float(os.getenv("BINANCE_SIGNED_RETRY_MAX_SEC", "4") or 4)
+    except Exception:
+        cap = 4.0
+    step = max(0, int(attempt or 0))
+    delay = max(0.0, float(base)) * (2 ** step)
+    return max(0.0, min(delay, max(0.5, float(cap))))
+
+
+def _binance_is_transient_request_error(exc: Exception | BaseException | None) -> bool:
+    if exc is None:
+        return False
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, aiohttp.ClientError, OSError, ConnectionResetError)):
+        return True
+    return _binance_is_transient_error_message(exc)
+
+
+def _binance_is_transient_error_message(err) -> bool:
+    s = str(err or "")
+    sl = s.lower()
+    needles = (
+        "timeout",
+        "timed out",
+        "serverdisconnectederror",
+        "clientconnectorerror",
+        "clientoserror",
+        "connectionreseterror",
+        "connection reset",
+        "temporarily unavailable",
+        "temporary failure",
+        "cannot connect to host",
+        "name or service not known",
+        "network is unreachable",
+    )
+    return any(n in sl for n in needles)
+
+
 def _binance_is_rate_limit_error_message(err) -> bool:
     s = str(err or "")
     sl = s.lower()
@@ -2351,12 +2409,15 @@ async def _binance_signed_request(
     api_secret: str,
     params: dict | None = None,
 ) -> dict:
-    """Binance signed request helper with server-time sync, retry on -1021 and cooldown on 429/-1003."""
+    """Binance signed request helper with time-sync, timestamp retry and transient network retry."""
     params = dict(params or {})
     _binance_normalize_recv_window(params)
     headers = {"X-MBX-APIKEY": api_key}
+    max_attempts = _binance_request_max_attempts()
+    transient_codes = {"-1001", "-1007"}
+    transient_http_statuses = {408, 500, 502, 503, 504}
 
-    for attempt in range(2):
+    for attempt in range(max_attempts):
         await _binance_wait_request_slot()
         try:
             await _binance_sync_server_time(session, base_url=base_url, force=(attempt > 0))
@@ -2377,13 +2438,33 @@ async def _binance_signed_request(
         except ExchangeAPIError:
             raise
         except Exception as e:
-            raise ExchangeAPIError(f"Binance API error: {e}")
+            if _binance_is_transient_request_error(e) and (attempt + 1) < max_attempts:
+                delay = _binance_request_retry_sleep_sec(attempt)
+                _log_rate_limited(
+                    f"binance_retry:{method.upper()}:{path}",
+                    f"[binance] transient request error {type(e).__name__} on {method.upper()} {path}; retry {attempt + 1}/{max_attempts} in {delay:.1f}s",
+                    every_s=30,
+                    level="warning",
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise ExchangeAPIError(f"Binance API error: {type(e).__name__}: {e}")
 
         if r.status != 200:
             err = ExchangeAPIError(f"Binance API HTTP {r.status}: {data}")
             await _binance_note_rate_limit(err)
             if (attempt == 0) and _binance_is_timestamp_error_message(err):
                 await _binance_sync_server_time(session, base_url=base_url, force=True)
+                continue
+            if (r.status in transient_http_statuses) and (attempt + 1) < max_attempts:
+                delay = _binance_request_retry_sleep_sec(attempt)
+                _log_rate_limited(
+                    f"binance_retry_http:{method.upper()}:{path}:{r.status}",
+                    f"[binance] transient HTTP {r.status} on {method.upper()} {path}; retry {attempt + 1}/{max_attempts} in {delay:.1f}s",
+                    every_s=30,
+                    level="warning",
+                )
+                await asyncio.sleep(delay)
                 continue
             raise err
 
@@ -2394,6 +2475,16 @@ async def _binance_signed_request(
                 await _binance_note_rate_limit(err)
                 if (attempt == 0) and ((str(raw_code) == "-1021") or _binance_is_timestamp_error_message(err)):
                     await _binance_sync_server_time(session, base_url=base_url, force=True)
+                    continue
+                if (str(raw_code) in transient_codes) and (attempt + 1) < max_attempts:
+                    delay = _binance_request_retry_sleep_sec(attempt)
+                    _log_rate_limited(
+                        f"binance_retry_code:{method.upper()}:{path}:{raw_code}",
+                        f"[binance] transient API code {raw_code} on {method.upper()} {path}; retry {attempt + 1}/{max_attempts} in {delay:.1f}s",
+                        every_s=30,
+                        level="warning",
+                    )
+                    await asyncio.sleep(delay)
                     continue
                 raise err
 
@@ -3790,13 +3881,30 @@ def _binance_is_position_row(d: dict | None, symbol: str) -> bool:
     return any(k in d for k in ("positionAmt", "positionSide", "entryPrice", "unRealizedProfit", "notional"))
 
 
-async def _binance_futures_position_context(*, api_key: str, api_secret: str, symbol: str) -> dict:
-    timeout = aiohttp.ClientTimeout(total=10)
+async def _binance_futures_position_context(
+    *,
+    api_key: str,
+    api_secret: str,
+    symbol: str,
+    session: aiohttp.ClientSession | None = None,
+) -> dict:
+    timeout = aiohttp.ClientTimeout(total=_binance_request_timeout_sec())
     rows: list[dict] = []
     payload_valid = False
-    async with aiohttp.ClientSession(timeout=timeout) as s:
+    if session is None:
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            data = await _binance_signed_request(
+                s,
+                base_url="https://fapi.binance.com",
+                path="/fapi/v2/positionRisk",
+                method="GET",
+                api_key=api_key,
+                api_secret=api_secret,
+                params={"symbol": symbol.upper(), "recvWindow": "5000"},
+            )
+    else:
         data = await _binance_signed_request(
-            s,
+            session,
             base_url="https://fapi.binance.com",
             path="/fapi/v2/positionRisk",
             method="GET",
@@ -5746,11 +5854,11 @@ async def _spot_base_balance(*, ex: str, api_key: str, api_secret: str, passphra
     return 0.0
 
 async def _futures_position_size(*, ex: str, api_key: str, api_secret: str, symbol: str, category: str = "linear", passphrase: str | None = None, position_side: str | None = None) -> float:
-    timeout = aiohttp.ClientTimeout(total=10)
+    timeout = aiohttp.ClientTimeout(total=_binance_request_timeout_sec())
     async with aiohttp.ClientSession(timeout=timeout) as s:
         ex = (ex or "").lower().strip()
         if ex == "binance":
-            ctx = await _binance_futures_position_context(api_key=api_key, api_secret=api_secret, symbol=symbol)
+            ctx = await _binance_futures_position_context(api_key=api_key, api_secret=api_secret, symbol=symbol, session=s)
             if not bool(ctx.get("payload_valid", True)):
                 raise ExchangeAPIError(f"Binance positionRisk invalid payload for {symbol}")
             rows = list(ctx.get("rows") or [])
@@ -6432,16 +6540,25 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                     except Exception as e:
                         # Never crash the manager loop because of reconcile.
                         is_binance_rl = (ex == "binance" and _binance_is_rate_limit_error_message(e))
+                        is_binance_transient = (ex == "binance" and _binance_is_transient_error_message(e))
                         try:
                             await _sync_pos_meta({
                                 "last_reconcile_error": str(e)[:500],
                                 "last_reconcile_error_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                                 "last_reconcile_rate_limited": bool(is_binance_rl),
+                                "last_reconcile_transient": bool(is_binance_transient),
                             })
                         except Exception as e:
                             _smart_log_exception("smart_close_ref_persist", e)
                         if is_binance_rl:
                             logger.info("Soft reconcile skipped for pos_id=%s due to Binance rate limit: %s", pos_id, e)
+                        elif is_binance_transient:
+                            _log_rate_limited(
+                                f"smart_reconcile_transient:{ex}:{symbol}",
+                                f"Soft reconcile transient Binance error for pos_id={pos_id} sym={symbol}: {e}",
+                                every_s=max(30, int(_RECONCILE_COOLDOWN_SEC)),
+                                level="warning",
+                            )
                         else:
                             logger.exception("Soft reconcile error for pos_id=%s", pos_id)
                 tp1_id = ref.get("tp1_order_id")
