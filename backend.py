@@ -7022,6 +7022,21 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                     WEAKNESS_NEG_HITS = _env_int_mid("SMART_WEAKNESS_NEG_HITS", 1, is_mid)
                     WEAKNESS_MIN_RETAIN_PCT = _env_float_mid("SMART_WEAKNESS_MIN_RETAIN_PCT", 0.05, is_mid)
 
+                    # Post-entry invalidation BEFORE SL (allows early exit in a small loss / tiny profit)
+                    INVALIDATION_EXIT_ENABLED = (os.getenv("SMART_INVALIDATION_EXIT_ENABLED", "1" if is_mid else "0").strip().lower() not in ("0","false","no","off"))
+                    INVALIDATION_MIN_BARS = _env_int_mid("SMART_INVALIDATION_MIN_5M_BARS", 1, is_mid)
+                    INVALIDATION_MAX_BARS = _env_int_mid("SMART_INVALIDATION_MAX_5M_BARS", 6, is_mid)
+                    INVALIDATION_SCORE_CLOSE = _env_int_mid("SMART_INVALIDATION_SCORE_CLOSE", 3, is_mid)
+                    INVALIDATION_SCORE_LOSS = _env_int_mid("SMART_INVALIDATION_SCORE_LOSS", 2, is_mid)
+                    INVALIDATION_NEG_HITS = _env_int_mid("SMART_INVALIDATION_NEG_HITS", max(2, EARLY_EXIT_CONSEC), is_mid)
+                    INVALIDATION_MIN_LOSS_PCT = _env_float_mid("SMART_INVALIDATION_MIN_LOSS_PCT", 0.10, is_mid)
+                    INVALIDATION_MAX_LOSS_PCT = _env_float_mid("SMART_INVALIDATION_MAX_LOSS_PCT", 0.55, is_mid)
+                    INVALIDATION_SL_FRAC_CAP = _env_float_mid("SMART_INVALIDATION_SL_FRAC_CAP", 0.30, is_mid)
+                    INVALIDATION_SCORE_OVERRIDE = _env_int_mid("SMART_INVALIDATION_SCORE_OVERRIDE", 4, is_mid)
+                    INVALIDATION_CACHE_SEC = _env_float_mid("SMART_INVALIDATION_CACHE_SEC", 20.0, is_mid)
+                    INVALIDATION_RECLAIM_BUFFER_PCT = _env_float_mid("SMART_INVALIDATION_RECLAIM_BUFFER_PCT", 0.05, is_mid)
+                    INVALIDATION_RECLAIM_MIN_GAIN_PCT = _env_float_mid("SMART_INVALIDATION_RECLAIM_MIN_GAIN_PCT", 0.10, is_mid)
+
                     # Dynamic BE
                     BE_DELAY_SEC     = _env_float_mid("SMART_BE_DELAY_SEC", 25.0, is_mid)                  # delay before arming BE after partial TP1
                     BE_MIN_PCT       = _env_float_mid("SMART_BE_MIN_PCT", 0.06, is_mid)
@@ -7175,6 +7190,31 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             retrace=f"{retrace_pct:.2f}",
                             gain_need=f"{gain_need:.2f}",
                             retrace_need=f"{retrace_need:.2f}",
+                        )
+
+                    def _sm_invalidation_component_text(name: str) -> str:
+                        key = {
+                            "bos_against": "sm_inv_bos_against",
+                            "reclaim_loss": "sm_inv_reclaim_loss",
+                            "vwap_loss": "sm_inv_vwap_loss",
+                            "ema20_loss": "sm_inv_ema20_loss",
+                            "trend_loss": "sm_inv_trend_loss",
+                            "slow_drift": "sm_inv_slow_drift",
+                        }.get(str(name or "").strip().lower())
+                        return _tr(uid, key) if key else str(name or "")
+
+                    def _sm_reason_invalidation_exit(*, score: int, loss_now_pct: float, max_loss_pct: float, full_sl_loss_pct: float, bars_since_entry: int, components: str) -> str:
+                        comp_tokens = [str(x).strip() for x in str(components or "").split(",") if str(x).strip()]
+                        comp_text = ", ".join(_sm_invalidation_component_text(x) for x in comp_tokens) or "-"
+                        return _trf(
+                            uid,
+                            "sm_reason_invalidation_exit",
+                            score=int(score),
+                            loss=f"{loss_now_pct:.2f}",
+                            max_loss=f"{max_loss_pct:.2f}",
+                            full_sl=f"{full_sl_loss_pct:.2f}",
+                            age_bars=int(bars_since_entry),
+                            components=comp_text,
                         )
 
                     def _sm_reason_trail_exit(*, trail_price: float, current_price: float, confirm_sec: float) -> str:
@@ -7490,6 +7530,172 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                         else:
                             fail_reason = _sm_reason_execution_error(weakness_close_error or last_close_explain or _sm_reason_close_returned_false())
                             await _notify_smart_decision("WEAKNESS", "NOT CLOSED", level_label="TP1", level_price=tp1, reason=fail_reason, cooldown_sec=15.0)
+
+                    invalidation_eval = None
+                    if INVALIDATION_EXIT_ENABLED and is_mid and mt == "futures" and entry_p > 0 and (not tp1_seen):
+                        try:
+                            inv_fetch_max_bars = max(1, int(INVALIDATION_MAX_BARS or 1))
+                        except Exception:
+                            inv_fetch_max_bars = 6
+                        if float(open_age_sec or 0.0) <= float((inv_fetch_max_bars + 2) * 300):
+                            inv_refresh = (now_ts - float(ref.get("inv_eval_ts") or 0.0)) >= max(5.0, float(INVALIDATION_CACHE_SEC or 20.0))
+                            bos_against = bool(ref.get("inv_bos_against"))
+                            reclaim_loss = bool(ref.get("inv_reclaim_loss"))
+                            vwap_loss = bool(ref.get("inv_vwap_loss"))
+                            ema20_loss = bool(ref.get("inv_ema20_loss"))
+                            trend_loss = bool(ref.get("inv_trend_loss"))
+                            if inv_refresh:
+                                try:
+                                    df5_inv = await price_backend.load_candles(symbol, "5m", mt, limit=48)
+                                    df5_inv = _mid_norm_ohlcv(df5_inv)
+                                except Exception:
+                                    df5_inv = None
+                                if df5_inv is not None and not getattr(df5_inv, "empty", True) and len(df5_inv) >= 8:
+                                    try:
+                                        df5_closed = df5_inv.copy()
+                                        try:
+                                            if len(df5_closed) >= 3 and "open_time_ms" in df5_closed.columns:
+                                                last_ot_ms = float(df5_closed.iloc[-1].get("open_time_ms", float("nan")))
+                                                if np.isfinite(last_ot_ms) and last_ot_ms > 0 and (last_ot_ms / 1000.0) > (now_ts - 240.0):
+                                                    df5_closed = df5_closed.iloc[:-1]
+                                        except Exception:
+                                            pass
+                                        if len(df5_closed) >= 8:
+                                            op5 = df5_closed["open"].astype(float)
+                                            hi5 = df5_closed["high"].astype(float)
+                                            lo5 = df5_closed["low"].astype(float)
+                                            cl5 = df5_closed["close"].astype(float)
+                                            close_last_5m = float(cl5.iloc[-1])
+                                            ema20_5m = float(cl5.ewm(span=20, adjust=False).mean().iloc[-1]) if len(cl5) >= 5 else float("nan")
+                                            vwap_5m = calc_vwap(df5_closed.tail(24))
+
+                                            bos_against = False
+                                            try:
+                                                lb = 20
+                                                k = max(2, int(MID_BOS_RECENT_BARS))
+                                                if len(lo5) >= lb + k + 1:
+                                                    prev_low = float(lo5.iloc[-(lb + k + 1):-(k)].min())
+                                                    prev_high = float(hi5.iloc[-(lb + k + 1):-(k)].max())
+                                                    for j in range(-k, 0):
+                                                        _low = float(lo5.iloc[j])
+                                                        _high = float(hi5.iloc[j])
+                                                        _close = float(cl5.iloc[j])
+                                                        if direction == "LONG" and (_low < prev_low) and (_close < prev_low):
+                                                            bos_against = True
+                                                        if direction == "SHORT" and (_high > prev_high) and (_close > prev_high):
+                                                            bos_against = True
+                                            except Exception:
+                                                bos_against = False
+
+                                            two_red_5m = bool(len(cl5) >= 2 and float(cl5.iloc[-1]) < float(op5.iloc[-1]) and float(cl5.iloc[-2]) < float(op5.iloc[-2]))
+                                            two_green_5m = bool(len(cl5) >= 2 and float(cl5.iloc[-1]) > float(op5.iloc[-1]) and float(cl5.iloc[-2]) > float(op5.iloc[-2]))
+                                            lower_highs_5m = False
+                                            higher_lows_5m = False
+                                            try:
+                                                tol = max(0.0, float(MID_HL_TOL_PCT))
+                                                nlh = max(3, int(MID_LOWER_HIGHS_LOOKBACK))
+                                                if len(hi5) >= nlh:
+                                                    hh = [float(x) for x in hi5.iloc[-nlh:].tolist()]
+                                                    lower_highs_5m = all(hh[i] <= hh[i - 1] * (1.0 + tol) for i in range(1, len(hh)))
+                                                nhl = max(3, int(MID_HIGHER_LOWS_LOOKBACK))
+                                                if len(lo5) >= nhl:
+                                                    ll = [float(x) for x in lo5.iloc[-nhl:].tolist()]
+                                                    higher_lows_5m = all(ll[i] >= ll[i - 1] * (1.0 - tol) for i in range(1, len(ll)))
+                                            except Exception:
+                                                lower_highs_5m = False
+                                                higher_lows_5m = False
+
+                                            if direction == "LONG":
+                                                vwap_loss = bool((vwap_5m is not None) and close_last_5m < float(vwap_5m))
+                                                ema20_loss = bool((ema20_5m == ema20_5m) and close_last_5m < float(ema20_5m))
+                                                trend_loss = bool(two_red_5m or lower_highs_5m)
+                                                best_gain_live = max(0.0, (best_px / entry_p - 1.0) * 100.0) if best_px > 0 else 0.0
+                                                reclaim_loss = bool(best_gain_live >= float(INVALIDATION_RECLAIM_MIN_GAIN_PCT) and close_last_5m <= entry_p * (1.0 - float(INVALIDATION_RECLAIM_BUFFER_PCT) / 100.0))
+                                            else:
+                                                vwap_loss = bool((vwap_5m is not None) and close_last_5m > float(vwap_5m))
+                                                ema20_loss = bool((ema20_5m == ema20_5m) and close_last_5m > float(ema20_5m))
+                                                trend_loss = bool(two_green_5m or higher_lows_5m)
+                                                best_gain_live = max(0.0, (1.0 - (best_px / entry_p)) * 100.0) if best_px > 0 else 0.0
+                                                reclaim_loss = bool(best_gain_live >= float(INVALIDATION_RECLAIM_MIN_GAIN_PCT) and close_last_5m >= entry_p * (1.0 + float(INVALIDATION_RECLAIM_BUFFER_PCT) / 100.0))
+
+                                            ref["inv_eval_ts"] = float(now_ts)
+                                            ref["inv_bos_against"] = bool(bos_against)
+                                            ref["inv_reclaim_loss"] = bool(reclaim_loss)
+                                            ref["inv_vwap_loss"] = bool(vwap_loss)
+                                            ref["inv_ema20_loss"] = bool(ema20_loss)
+                                            ref["inv_trend_loss"] = bool(trend_loss)
+                                            dirty = True
+                                    except Exception as e:
+                                        _smart_log_exception("mid_presl_invalidation_flags", e)
+
+                            invalidation_eval = SmartExitEngine.evaluate_invalidation_exit(
+                                direction=direction,
+                                entry_price=entry_p,
+                                current_price=px,
+                                best_price=best_px,
+                                tp1_price=tp1,
+                                sl_price=sl,
+                                tp1_seen=tp1_seen,
+                                open_age_sec=open_age_sec,
+                                neg_count=neg_count,
+                                bos_against=bool(ref.get("inv_bos_against")),
+                                reclaim_loss=bool(ref.get("inv_reclaim_loss")),
+                                vwap_loss=bool(ref.get("inv_vwap_loss")),
+                                ema20_loss=bool(ref.get("inv_ema20_loss")),
+                                trend_loss=bool(ref.get("inv_trend_loss")),
+                                invalidation_enabled=INVALIDATION_EXIT_ENABLED,
+                                invalidation_min_bars=INVALIDATION_MIN_BARS,
+                                invalidation_max_bars=INVALIDATION_MAX_BARS,
+                                invalidation_score_close=INVALIDATION_SCORE_CLOSE,
+                                invalidation_score_on_loss=INVALIDATION_SCORE_LOSS,
+                                invalidation_neg_hits=INVALIDATION_NEG_HITS,
+                                invalidation_min_loss_pct=INVALIDATION_MIN_LOSS_PCT,
+                                invalidation_max_loss_pct=INVALIDATION_MAX_LOSS_PCT,
+                                invalidation_sl_frac_cap=INVALIDATION_SL_FRAC_CAP,
+                                invalidation_score_override=INVALIDATION_SCORE_OVERRIDE,
+                            )
+                            if invalidation_eval.should_close:
+                                invalidation_close_error = ""
+                                invalidation_reason = _sm_reason_invalidation_exit(
+                                    score=int(invalidation_eval.score),
+                                    loss_now_pct=float(invalidation_eval.loss_now_pct),
+                                    max_loss_pct=float(invalidation_eval.max_early_loss_pct),
+                                    full_sl_loss_pct=float(invalidation_eval.full_sl_loss_pct),
+                                    bars_since_entry=int(invalidation_eval.bars_since_entry),
+                                    components=str(invalidation_eval.components or ""),
+                                )
+                                close_ok = False
+                                try:
+                                    close_ok = await _close_market(qty)
+                                except Exception as e:
+                                    invalidation_close_error = str(e)
+                                    _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] invalidation-exit close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="error")
+                                if close_ok:
+                                    await _notify_smart_decision(
+                                        "INVALIDATION",
+                                        "CLOSED",
+                                        level_label="SL",
+                                        level_price=sl if sl > 0 else px,
+                                        reason=_sm_join_reason(invalidation_reason, last_close_explain or _sm_reason_market_close_sent(last_close_norm_qty or qty)),
+                                        cooldown_sec=5.0,
+                                    )
+                                    await _mark_local_full_close("INVALIDATION_EXIT", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
+                                    pnl_usdt, roi_percent = _smart_close_snapshot()
+
+                                    await db_store.close_autotrade_position(
+                                        user_id=uid,
+                                        signal_id=r.get("signal_id"),
+                                        exchange=ex,
+                                        market_type=mt,
+                                        status="CLOSED",
+                                        pnl_usdt=pnl_usdt,
+                                        roi_percent=roi_percent,
+                                        row_id=int(r.get("id") or 0),
+                                    )
+                                    continue
+                                else:
+                                    fail_reason = _sm_reason_execution_error(invalidation_close_error or last_close_explain or _sm_reason_close_returned_false())
+                                    await _notify_smart_decision("INVALIDATION", "NOT CLOSED", level_label="SL", level_price=sl if sl > 0 else px, reason=fail_reason, cooldown_sec=15.0)
 
                     if neg_count >= max(1, int(EARLY_EXIT_CONSEC)) and gain_now_pct >= float(EARLY_EXIT_MIN_GAIN):
                         close_ok = False
