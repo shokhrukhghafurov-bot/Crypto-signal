@@ -28189,7 +28189,7 @@ def _inst_trap_score(divergence=False, sweep_prob=0, ofp=None, rr_ok=True, weak_
     except Exception:
         return 0
 
-async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES", lang: str = "ru") -> str:
+async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES", lang: str = "ru", return_bundle: bool = False) -> str | dict:
     """
     Institutional-style TA analysis.
     Output format is Telegram Markdown and follows the required template.
@@ -29988,6 +29988,163 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         _tr_i18n(lang, "analysis_preference_line", value=bias),
     ]
     report = "\n".join([x for x in report_lines if x is not None])
+
+    def _zone_text(a, b, fallback_a=None, fallback_b=None):
+        vals = []
+        for v in (a, b, fallback_a, fallback_b):
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if fv == fv and fv > 0:
+                vals.append(fv)
+        if len(vals) >= 2:
+            lo, hi = min(vals[0], vals[1]), max(vals[0], vals[1])
+            return f"{_fmt_int_space(lo)} – {_fmt_int_space(hi)}"
+        if len(vals) == 1:
+            return _fmt_int_space(vals[0])
+        return "—"
+
+    scenario_entry_zone = _zone_text(entry_lo, entry_hi, local_resist_lvl, higher_resist_lvl)
+    scenario_short_sweep_zone = _zone_text(eq_hi, higher_resist_lvl, resistance1, entry_hi)
+    scenario_long_discount_zone = _zone_text(deeper_support_lvl, support2, local_support_lvl, support1)
+    scenario_short_break_entry = _fmt_lvl_or_dash(local_support_lvl if local_support_lvl is not None else support1)
+    scenario_long_bounce_entry = _zone_text(local_support_lvl, deeper_support_lvl, support1, support2)
+    scenario_short_retest_sl = _fmt_lvl_or_dash(higher_resist_lvl if higher_resist_lvl is not None else resistance1)
+    scenario_short_sweep_sl = _fmt_lvl_or_dash(resistance2 if resistance2 is not None else higher_resist_lvl)
+    scenario_short_break_sl = _fmt_lvl_or_dash(local_resist_lvl if local_resist_lvl is not None else pivot)
+    scenario_long_reclaim_sl = _fmt_lvl_or_dash(local_support_lvl if local_support_lvl is not None else support1)
+    scenario_long_bounce_sl = _fmt_lvl_or_dash(deeper_support_lvl if deeper_support_lvl is not None else support2)
+    scenario_long_discount_sl = _fmt_lvl_or_dash(support2 if support2 is not None else deeper_support_lvl)
+    scenario_short_tp1 = _fmt_lvl_or_dash(local_support_lvl if local_support_lvl is not None else support1)
+    scenario_short_tp2 = _fmt_lvl_or_dash(deeper_support_lvl if deeper_support_lvl is not None else support2)
+    scenario_short_tp3 = _fmt_lvl_or_dash(support2 if support2 is not None else deeper_support_lvl)
+    scenario_long_tp1 = _fmt_lvl_or_dash(local_resist_lvl if local_resist_lvl is not None else pivot)
+    scenario_long_tp2 = _fmt_lvl_or_dash(higher_resist_lvl if higher_resist_lvl is not None else resistance1)
+    scenario_long_tp3 = _fmt_lvl_or_dash(resistance2 if resistance2 is not None else higher_resist_lvl)
+    scenario_eqh = _fmt_lvl_or_dash(eq_hi if eq_hi is not None else higher_resist_lvl)
+    scenario_eql = _fmt_lvl_or_dash(eq_lo if eq_lo is not None else deeper_support_lvl)
+
+    if is_ru:
+        scenario_lines = [
+            f"🧠 Сценарии — {sym}",
+            f"Рынок: {mkt_label}",
+            f"Цена: {price_s} USDT",
+            "",
+            "Контекст:",
+            f"• 4H: {trend4}",
+            f"• 1H: {trend1}",
+            f"• 5M: {trend5}",
+            f"• Структура: {struct_lbl}",
+            f"• Приоритет: {bias_txt}",
+            "",
+            "СЦЕНАРИЙ SHORT",
+            "Short A — ретест supply",
+            f"Вход: {scenario_entry_zone}",
+            "Триггер: возврат в зону -> rejection -> BOS 5m вниз -> объем подтверждает",
+            f"SL: {scenario_short_retest_sl}",
+            f"TP: {scenario_short_tp1} / {scenario_short_tp2} / {scenario_short_tp3}",
+            "",
+            "Short B — sweep liquidity сверху",
+            f"Вход: {scenario_short_sweep_zone}",
+            f"Триггер: съем ликвидности выше {scenario_eqh} -> быстрый возврат под зону -> BOS 5m вниз",
+            f"SL: {scenario_short_sweep_sl}",
+            f"TP: {entry_lo_s} / {scenario_short_tp1} / {scenario_short_tp2}",
+            "",
+            "Short C — пробой поддержки",
+            f"Вход: ретест {scenario_short_break_entry} снизу",
+            f"Триггер: потеря {scenario_short_break_entry} -> закрепление ниже на 5m/15m -> слабый ретест",
+            f"SL: {scenario_short_break_sl}",
+            f"TP: {scenario_short_tp2} / {scenario_short_tp3}",
+            "",
+            "СЦЕНАРИЙ LONG",
+            "Long A — reclaim зоны",
+            f"Вход: {scenario_entry_zone}",
+            f"Триггер: возврат выше {local_resist_s} -> закрепление выше {entry_hi_s} -> BOS 5m вверх",
+            f"SL: {scenario_long_reclaim_sl}",
+            f"TP: {scenario_long_tp1} / {scenario_long_tp2} / {scenario_long_tp3}",
+            "",
+            "Long B — отскок от поддержки",
+            f"Вход: {scenario_long_bounce_entry}",
+            f"Триггер: удержание {local_support_s} или ложный пробой -> BOS 5m вверх -> рост объема",
+            f"SL: {scenario_long_bounce_sl}",
+            f"TP: {local_resist_s} / {scenario_long_tp2} / {scenario_long_tp3}",
+            "",
+            "Long C — deep discount long",
+            f"Вход: {scenario_long_discount_zone}",
+            f"Триггер: сильный выкуп от {scenario_eql if scenario_eql != '—' else scenario_short_tp2} -> база на 5m/15m -> BOS вверх",
+            f"SL: {scenario_long_discount_sl}",
+            f"TP: {local_support_s} / {local_resist_s} / {scenario_long_tp2}",
+            "",
+            "Правило:",
+            "• Без триггера = NO TRADE",
+            "• Файл дополняет основной анализ и не заменяет его",
+        ]
+    else:
+        scenario_lines = [
+            f"🧠 Scenarios — {sym}",
+            f"Market: {mkt_label}",
+            f"Price: {price_s} USDT",
+            "",
+            "Context:",
+            f"• 4H: {trend4}",
+            f"• 1H: {trend1}",
+            f"• 5M: {trend5}",
+            f"• Structure: {struct_lbl}",
+            f"• Bias: {bias_txt}",
+            "",
+            "SHORT SCENARIO",
+            "Short A — retest supply",
+            f"Entry: {scenario_entry_zone}",
+            "Trigger: reclaim into zone -> rejection -> 5m BOS down -> volume confirms",
+            f"SL: {scenario_short_retest_sl}",
+            f"TP: {scenario_short_tp1} / {scenario_short_tp2} / {scenario_short_tp3}",
+            "",
+            "Short B — sweep liquidity above",
+            f"Entry: {scenario_short_sweep_zone}",
+            f"Trigger: take liquidity above {scenario_eqh} -> fast return below zone -> 5m BOS down",
+            f"SL: {scenario_short_sweep_sl}",
+            f"TP: {entry_lo_s} / {scenario_short_tp1} / {scenario_short_tp2}",
+            "",
+            "Short C — support breakdown",
+            f"Entry: retest {scenario_short_break_entry} from below",
+            f"Trigger: loss of {scenario_short_break_entry} -> 5m/15m close below -> weak retest",
+            f"SL: {scenario_short_break_sl}",
+            f"TP: {scenario_short_tp2} / {scenario_short_tp3}",
+            "",
+            "LONG SCENARIO",
+            "Long A — reclaim zone",
+            f"Entry: {scenario_entry_zone}",
+            f"Trigger: reclaim above {local_resist_s} -> hold above {entry_hi_s} -> 5m BOS up",
+            f"SL: {scenario_long_reclaim_sl}",
+            f"TP: {scenario_long_tp1} / {scenario_long_tp2} / {scenario_long_tp3}",
+            "",
+            "Long B — support bounce",
+            f"Entry: {scenario_long_bounce_entry}",
+            f"Trigger: hold {local_support_s} or false break -> 5m BOS up -> volume expansion",
+            f"SL: {scenario_long_bounce_sl}",
+            f"TP: {local_resist_s} / {scenario_long_tp2} / {scenario_long_tp3}",
+            "",
+            "Long C — deep discount long",
+            f"Entry: {scenario_long_discount_zone}",
+            f"Trigger: strong reaction from {scenario_eql if scenario_eql != '—' else scenario_short_tp2} -> base on 5m/15m -> BOS up",
+            f"SL: {scenario_long_discount_sl}",
+            f"TP: {local_support_s} / {local_resist_s} / {scenario_long_tp2}",
+            "",
+            "Rule:",
+            "• No trigger = NO TRADE",
+            "• This file supplements the main analysis and does not replace it",
+        ]
+    scenario_text = "\n".join([x for x in scenario_lines if x is not None])
+
+    if return_bundle:
+        return {
+            "report": report,
+            "scenario_text": scenario_text,
+            "scenario_filename": f"{sym}_scenarios.txt",
+            "symbol": sym,
+            "market": mkt_label,
+        }
     return report
 
 
