@@ -30114,25 +30114,43 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
     if short_sweep_sl_lo is None:
         short_sweep_sl_lo = _level_plus(
             sweep_zone_hi or price,
-            pct=0.006,
-            atr_mult=0.55,
-            minimum=max(sweep_width * 1.2, _buffer_from(sweep_zone_hi or price, pct=0.0035, atr_mult=0.3)),
+            pct=0.008,
+            atr_mult=0.75,
+            minimum=max(sweep_width * 1.6, _buffer_from(sweep_zone_hi or price, pct=0.005, atr_mult=0.4)),
         )
     short_sweep_sl_hi = _level_plus(
         short_sweep_sl_lo or sweep_zone_hi or price,
-        pct=0.004,
-        atr_mult=0.45,
-        minimum=max(sweep_width * 0.8, _buffer_from(short_sweep_sl_lo or sweep_zone_hi or price, pct=0.0025, atr_mult=0.2)),
+        pct=0.0045,
+        atr_mult=0.5,
+        minimum=max(sweep_width * 0.9, _buffer_from(short_sweep_sl_lo or sweep_zone_hi or price, pct=0.003, atr_mult=0.25)),
     )
     if short_sweep_sl_hi is not None and short_sweep_sl_lo is not None and short_sweep_sl_hi <= short_sweep_sl_lo:
-        short_sweep_sl_hi = _level_plus(short_sweep_sl_lo, pct=0.0025, atr_mult=0.2, minimum=max(sweep_width * 0.5, 0.0))
+        short_sweep_sl_hi = _level_plus(short_sweep_sl_lo, pct=0.003, atr_mult=0.25, minimum=max(sweep_width * 0.6, 0.0))
     scenario_short_sweep_sl = _fmt_range(short_sweep_sl_lo, short_sweep_sl_hi)
 
     short_break_entry = _clean_level(local_support_lvl) or _first_below(price, support1, deeper_support_lvl, session_val)
-    short_break_sl_lo = _first_above(short_break_entry or price, local_resist_lvl, entry_zone_lo, pivot)
-    short_break_sl_hi = _first_above(short_break_sl_lo or short_break_entry or price, entry_zone_hi, local_resist_lvl, pivot)
-    if short_break_sl_lo is None:
-        short_break_sl_lo = _level_plus(short_break_entry or price, pct=0.002, atr_mult=0.15)
+    short_break_cap = _first_above(short_break_entry or price, pivot, entry_zone_lo, entry_zone_hi, local_resist_lvl)
+    short_break_sl_lo = None
+    short_break_sl_hi = None
+    if short_break_cap is not None and short_break_entry is not None and short_break_cap > short_break_entry:
+        short_break_span = float(short_break_cap) - float(short_break_entry)
+        short_break_sl_lo = float(short_break_entry) + (short_break_span * 0.55)
+        short_break_sl_hi = float(short_break_entry) + (short_break_span * 0.8)
+    else:
+        short_break_sl_lo = _level_plus(
+            short_break_entry or price,
+            pct=0.004,
+            atr_mult=0.35,
+            minimum=_buffer_from(short_break_entry or price, pct=0.0025, atr_mult=0.2),
+        )
+        short_break_sl_hi = _level_plus(
+            short_break_sl_lo or short_break_entry or price,
+            pct=0.0025,
+            atr_mult=0.2,
+            minimum=_buffer_from(short_break_sl_lo or short_break_entry or price, pct=0.0015, atr_mult=0.12),
+        )
+    if short_break_sl_hi is not None and short_break_sl_lo is not None and short_break_sl_hi <= short_break_sl_lo:
+        short_break_sl_hi = _level_plus(short_break_sl_lo, pct=0.002, atr_mult=0.15, minimum=0.0)
     scenario_short_break_sl = _fmt_range(short_break_sl_lo, short_break_sl_hi) if short_break_sl_hi is not None else _fmt_int_space(short_break_sl_lo) if short_break_sl_lo is not None else '—'
 
     short_tp1 = _clean_level(local_support_lvl) or _first_below(entry_zone_lo or price, session_val, support1)
