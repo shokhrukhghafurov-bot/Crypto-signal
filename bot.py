@@ -1097,8 +1097,10 @@ class ErrorBotLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = record.getMessage()
+            msg_l = str(msg or "").lower()
             has_exc = bool(getattr(record, "exc_info", None) or getattr(record, "stack_info", None))
-            must_forward = bool(record.levelno >= logging.ERROR or has_exc)
+            looks_like_exception = ("traceback" in msg_l or "exception" in msg_l)
+            must_forward = bool(record.levelno >= logging.ERROR or has_exc or looks_like_exception)
             if not must_forward and not _should_forward_to_error_bot(record.levelno, msg):
                 return
             _levelno, _logger_name, payload = _error_record_payload(record)
