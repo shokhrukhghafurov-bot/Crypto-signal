@@ -5209,7 +5209,7 @@ async def autotrade_input_handler(message: types.Message) -> None:
                 processing_msg = None
 
             try:
-                report = await backend.analyze_symbol_institutional(symbol, market="AUTO", lang=get_lang(uid))
+                analysis_payload = await backend.analyze_symbol_institutional(symbol, market="AUTO", lang=get_lang(uid), return_bundle=True)
             except Exception as e:
                 logger.exception("analysis failed for %s", symbol)
                 msg = tr(uid, "analysis_error") if ("analysis_error" in I18N.get(get_lang(uid), {})) else "Ошибка анализа. Попробуй позже."
@@ -5223,6 +5223,15 @@ async def autotrade_input_handler(message: types.Message) -> None:
                         pass
                 await message.answer(msg, reply_markup=menu_kb(uid))
                 return
+
+            scenario_text = None
+            scenario_filename = None
+            if isinstance(analysis_payload, dict):
+                report = str(analysis_payload.get("report") or "")
+                scenario_text = str(analysis_payload.get("scenario_text") or "").strip() or None
+                scenario_filename = str(analysis_payload.get("scenario_filename") or f"{symbol}_scenarios.txt")
+            else:
+                report = str(analysis_payload)
 
             # If we auto-normalized/auto-picked, prepend a small hint.
             # IMPORTANT: do NOT wrap with Markdown markers here — the note can contain
@@ -5251,6 +5260,17 @@ async def autotrade_input_handler(message: types.Message) -> None:
                     await _send_long(chat_id, str(report), reply_markup=kb)
                 except Exception:
                     pass
+
+            if scenario_text:
+                try:
+                    scenario_payload = BufferedInputFile(
+                        scenario_text.encode("utf-8"),
+                        filename=(scenario_filename or f"{symbol}_scenarios.txt"),
+                    )
+                    scenario_caption = f"🧠 Сценарии: {symbol}" if get_lang(uid).startswith("ru") else f"🧠 Scenarios: {symbol}"
+                    await bot.send_document(chat_id, document=scenario_payload, caption=scenario_caption)
+                except Exception:
+                    logger.exception("failed to send scenario file for %s", symbol)
             return
 
         state = AUTOTRADE_INPUT.get(uid)
