@@ -29957,15 +29957,6 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         _tr_i18n(lang, "analysis_confidence_line", value=_loc_conf(conf_txt)),
         "",
         line,
-        _tr_i18n(lang, "analysis_section_scenarios"),
-        "",
-        _tr_i18n(lang, "analysis_bullish_title"),
-        *bullish_lines,
-        "",
-        _tr_i18n(lang, "analysis_bearish_title"),
-        *bearish_lines,
-        "",
-        line,
         _tr_i18n(lang, "analysis_section_trade_plan"),
         "",
         _tr_i18n(lang, "analysis_trade_status_line", value=_loc_trade_status(trade_status_inst if trade_status_inst else '—')),
@@ -30113,23 +30104,35 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             sweep_zone_lo = max(entry_zone_hi, sweep_zone_hi - max((sweep_zone_hi - entry_zone_hi) * 0.25, _buffer_from(sweep_zone_hi, pct=0.002, atr_mult=0.12)))
     scenario_short_sweep_zone = _fmt_range(sweep_zone_lo, sweep_zone_hi)
 
-    sweep_base_sl = _clean_level(inv_lvl_out) or _level_plus(sweep_zone_hi or price, pct=0.004, atr_mult=0.35)
-    sweep_min_buffer = _buffer_from(sweep_zone_hi or price, pct=0.0045, atr_mult=0.30)
-    short_sweep_sl_lo = None
-    if sweep_zone_hi is not None:
-        short_sweep_sl_lo = max(sweep_base_sl or 0.0, (sweep_zone_hi + (sweep_min_buffer or 0.0)))
-    else:
-        short_sweep_sl_lo = sweep_base_sl
-    short_sweep_sl_hi = _level_plus(short_sweep_sl_lo or sweep_zone_hi or price, pct=0.003, atr_mult=0.30)
+    sweep_width = 0.0
+    try:
+        if _clean_level(sweep_zone_lo) is not None and _clean_level(sweep_zone_hi) is not None:
+            sweep_width = max(0.0, float(sweep_zone_hi) - float(sweep_zone_lo))
+    except Exception:
+        sweep_width = 0.0
+    short_sweep_sl_lo = _clean_level(inv_lvl_out)
+    if short_sweep_sl_lo is None:
+        short_sweep_sl_lo = _level_plus(
+            sweep_zone_hi or price,
+            pct=0.006,
+            atr_mult=0.55,
+            minimum=max(sweep_width * 1.2, _buffer_from(sweep_zone_hi or price, pct=0.0035, atr_mult=0.3)),
+        )
+    short_sweep_sl_hi = _level_plus(
+        short_sweep_sl_lo or sweep_zone_hi or price,
+        pct=0.004,
+        atr_mult=0.45,
+        minimum=max(sweep_width * 0.8, _buffer_from(short_sweep_sl_lo or sweep_zone_hi or price, pct=0.0025, atr_mult=0.2)),
+    )
+    if short_sweep_sl_hi is not None and short_sweep_sl_lo is not None and short_sweep_sl_hi <= short_sweep_sl_lo:
+        short_sweep_sl_hi = _level_plus(short_sweep_sl_lo, pct=0.0025, atr_mult=0.2, minimum=max(sweep_width * 0.5, 0.0))
     scenario_short_sweep_sl = _fmt_range(short_sweep_sl_lo, short_sweep_sl_hi)
 
     short_break_entry = _clean_level(local_support_lvl) or _first_below(price, support1, deeper_support_lvl, session_val)
-    short_break_sl_lo = _level_plus(short_break_entry or price, pct=0.003, atr_mult=0.22)
-    short_break_sl_hi = _level_plus(short_break_sl_lo or short_break_entry or price, pct=0.0022, atr_mult=0.16)
-    if _is_valid_level(local_resist_lvl) and short_break_sl_hi is not None and float(local_resist_lvl) < short_break_sl_hi:
-        short_break_sl_hi = float(local_resist_lvl)
-    if short_break_sl_lo is not None and short_break_sl_hi is not None and short_break_sl_hi <= short_break_sl_lo:
-        short_break_sl_hi = _level_plus(short_break_sl_lo, pct=0.0015, atr_mult=0.10)
+    short_break_sl_lo = _first_above(short_break_entry or price, local_resist_lvl, entry_zone_lo, pivot)
+    short_break_sl_hi = _first_above(short_break_sl_lo or short_break_entry or price, entry_zone_hi, local_resist_lvl, pivot)
+    if short_break_sl_lo is None:
+        short_break_sl_lo = _level_plus(short_break_entry or price, pct=0.002, atr_mult=0.15)
     scenario_short_break_sl = _fmt_range(short_break_sl_lo, short_break_sl_hi) if short_break_sl_hi is not None else _fmt_int_space(short_break_sl_lo) if short_break_sl_lo is not None else '—'
 
     short_tp1 = _clean_level(local_support_lvl) or _first_below(entry_zone_lo or price, session_val, support1)
@@ -30151,7 +30154,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
     bounce_zone_lo = _clean_level(deeper_support_lvl) or _first_below(price, support1, support2, session_val)
     bounce_zone_hi = _clean_level(local_support_lvl) or _first_above(bounce_zone_lo or price, session_val, entry_zone_lo, pivot)
     scenario_long_bounce_entry = _fmt_range(bounce_zone_lo, bounce_zone_hi)
-    long_bounce_sl = _level_minus(bounce_zone_lo or price, pct=0.0025, atr_mult=0.22)
+    long_bounce_sl = _clean_level(deeper_support_lvl) or _first_below(bounce_zone_lo or price, support1, support2)
     long_bounce_tp1 = _first_above(bounce_zone_hi or price, local_resist_lvl, entry_zone_lo, entry_zone_hi, session_vah)
     long_bounce_tp2 = _first_above(long_bounce_tp1 or bounce_zone_hi or price, entry_zone_hi, higher_resist_lvl, resistance1)
     long_bounce_tp3 = _first_above(long_bounce_tp2 or long_bounce_tp1 or bounce_zone_hi or price, eqh_level, resistance1, resistance2)
@@ -30323,8 +30326,8 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             'title_ru': 'deep discount long',
             'title_en': 'deep discount long',
             'entry': scenario_long_discount_zone,
-            'trigger_ru': f'сильный выкуп по всей зоне {scenario_long_discount_zone} -> база на 5m/15m -> BOS вверх',
-            'trigger_en': f'strong reaction across zone {scenario_long_discount_zone} -> base on 5m/15m -> BOS up',
+            'trigger_ru': f'сильный выкуп из зоны {scenario_long_discount_zone} -> база на 5m/15m -> BOS вверх',
+            'trigger_en': f'strong reaction from zone {scenario_long_discount_zone} -> base on 5m/15m -> BOS up',
             'sl_ru': ('ниже ' + _fmt_int_space(long_discount_sl)) if long_discount_sl is not None else 'ниже поддержки',
             'sl_en': ('below ' + _fmt_int_space(long_discount_sl)) if long_discount_sl is not None else 'below support',
             'tp': _fmt_tp_values(long_c_tps, direction='asc'),
