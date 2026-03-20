@@ -7283,7 +7283,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                     try:
                                         trail_closed = await _close_market(qty)
                                     except Exception as e:
-                                        _log_rate_limited(f"smart_trail_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] trail close failed {ex}/{mt} {symbol}: {e}", every_s=30, level="warning")
+                                        _log_rate_limited(f"smart_trail_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] trail close failed {ex}/{mt} {symbol}: {e}", every_s=30, level="error")
                                     if trail_closed:
                                         await _notify_smart_decision(
                                             "TP2",
@@ -7363,7 +7363,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             try:
                                 close_ok = await _close_market(qty)
                             except Exception as e:
-                                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="error")
                             if close_ok:
                                 await _notify_smart_decision(
                                     "TP2",
@@ -7470,7 +7470,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             close_ok = await _close_market(qty)
                         except Exception as e:
                             weakness_close_error = str(e)
-                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] weakness-exit close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] weakness-exit close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="error")
                         if close_ok:
                             await _notify_smart_decision("WEAKNESS", "CLOSED", level_label="TP1", level_price=tp1, reason=weakness_reason, cooldown_sec=5.0)
                             await _mark_local_full_close("WEAKNESS_EXIT", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
@@ -7506,7 +7506,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             close_ok = await _close_market(qty)
                         except Exception as e:
                             early_exit_error = str(e)
-                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] early-exit close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] early-exit close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="error")
                         if close_ok:
                             await _notify_smart_decision("TP1", "CLOSED", level_label="TP1", level_price=tp1 if tp1 > 0 else px, reason=_sm_join_reason(early_exit_reason, last_close_explain or _sm_reason_market_close_sent(last_close_norm_qty or qty)), cooldown_sec=5.0)
                             await _mark_local_full_close("EARLY_EXIT", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
@@ -7689,7 +7689,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                             close_ok = await _close_market(qty)
                         except Exception as e:
                             sl_close_error = str(e)
-                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="error")
 
                         _log_rate_limited(
                             f"smart_spot_close_diag:{uid}:{ex}:{symbol}",
@@ -7885,7 +7885,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                 close_ok = await _close_market(qty)
                             except Exception as e:
                                 tp2_runner_close_error = str(e)
-                                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] tp2-runner close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                                _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] tp2-runner close failed {ex}/{mt} {symbol}: {e}", every_s=60, level="error")
                             if close_ok:
                                 await _notify_smart_decision("TP2", "CLOSED", level_label="TP2", level_price=tp2, decision_price=tp2_runner_close_px, reason=_sm_join_reason(tp2_runner_reason_user or tp2_runner_reason, last_close_explain or _sm_reason_market_close_sent(last_close_norm_qty or qty)), cooldown_sec=5.0)
                                 await _mark_local_full_close("TP2_RUNNER", close_price_value=tp2_runner_close_px, close_price_source="market", close_note=tp2_runner_reason, tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
@@ -7950,7 +7950,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                                     close_ok = await _close_market(qty)
                                 except Exception as e:
                                     tp2_close_error = str(e)
-                                    _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                                    _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="error")
                                 if close_ok:
                                     await _notify_smart_decision("TP2", "CLOSED", level_label="TP2", level_price=tp2, reason=_sm_join_reason(_tr(uid, "sm_reason_tp2_reached"), last_close_explain or _sm_reason_market_close_sent(last_close_norm_qty or qty)), cooldown_sec=5.0)
                                     await _mark_local_full_close("TP2", tp1_hit=bool(ref.get("tp1_hit") or meta.get("tp1_hit")))
@@ -8132,7 +8132,7 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
                         try:
                             close_ok = await _close_market(qty)
                         except Exception as e:
-                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="info")
+                            _log_rate_limited(f"smart_close_err:{uid}:{ex}:{mt}:{symbol}", f"[SMART] close_market failed {ex}/{mt} {symbol}: {e}", every_s=60, level="error")
                         if close_ok:
                             await _mark_local_full_close("BE", tp1_hit=True, be_moved_value=True)
                             pnl_usdt, roi_percent = _smart_close_snapshot()
