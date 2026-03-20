@@ -795,21 +795,28 @@ async def _error_agg_flush(key: tuple[int,str,str]) -> None:
         levelno, logger_name, msg = key
         first_ts = float(ent.get("first_ts") or 0.0)
         last_ts = float(ent.get("last_ts") or first_ts)
-        text = (
-            f"❗ {logging.getLevelName(levelno)} x{cnt} (aggregated {int(_ERROR_AGG_WINDOW_SEC)}s)\n"
-            f"{logger_name}\n"
-            f"{msg}\n"
-            f"first: {_fmt_ts(first_ts)}\n"
-            f"last:  {_fmt_ts(last_ts)}"
-        )
+        base_msg = str(msg or "")
+        if base_msg.startswith("❗ "):
+            text = base_msg + f"\nrepeat_count={cnt}\nfirst: {_fmt_ts(first_ts)}\nlast:  {_fmt_ts(last_ts)}"
+        else:
+            text = (
+                f"❗ {logging.getLevelName(levelno)} x{cnt} (aggregated {int(_ERROR_AGG_WINDOW_SEC)}s)\n"
+                f"{logger_name}\n"
+                f"{base_msg}\n"
+                f"first: {_fmt_ts(first_ts)}\n"
+                f"last:  {_fmt_ts(last_ts)}"
+            )
         await _error_bot_send(text)
         _ERROR_AGG.pop(key, None)
     except Exception:
         _ERROR_AGG.pop(key, None)
 
 def _error_agg_note(levelno: int, logger_name: str, msg: str) -> None:
+    immediate_text = str(msg or "")
+    if not immediate_text.startswith("❗ "):
+        immediate_text = f"❗ {logging.getLevelName(levelno)}\n{logger_name}\n{immediate_text}"
     if not _ERROR_AGG_ENABLED or _ERROR_AGG_WINDOW_SEC <= 0:
-        asyncio.create_task(_error_bot_send(f"❗ {logging.getLevelName(levelno)}\n{logger_name}\n{msg}"))
+        asyncio.create_task(_error_bot_send(immediate_text[:3900]))
         return
 
     # memory guard
@@ -822,7 +829,10 @@ def _error_agg_note(levelno: int, logger_name: str, msg: str) -> None:
     if not ent:
         _ERROR_AGG[key] = {"count": 1, "first_ts": now, "last_ts": now}
         # Send first occurrence immediately
-        asyncio.create_task(_error_bot_send(f"❗ {logging.getLevelName(levelno)}\n{logger_name}\n{msg}"))
+        immediate_text = str(msg or "")
+        if not immediate_text.startswith("❗ "):
+            immediate_text = f"❗ {logging.getLevelName(levelno)}\n{logger_name}\n{immediate_text}"
+        asyncio.create_task(_error_bot_send(immediate_text[:3900]))
         # Flush summary later if repeated
         asyncio.create_task(_error_agg_flush(key))
         return
@@ -1058,13 +1068,48 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
     except Exception as e:
         logger.error("[mid] failed to start MID components: %s", e)
 
+def _error_record_payload(record: logging.LogRecord) -> tuple[int, str, str]:
+    levelno = int(getattr(record, "levelno", logging.ERROR) or logging.ERROR)
+    logger_name = str(getattr(record, "name", "root") or "root")
+    try:
+        msg = record.getMessage()
+    except Exception:
+        msg = str(getattr(record, "msg", "") or "")
+
+    lines = [msg]
+    try:
+        if record.exc_info:
+            fmt = logging.Formatter()
+            exc_text = fmt.formatException(record.exc_info)
+            if exc_text:
+                lines.append(exc_text)
+        elif record.stack_info:
+            lines.append(str(record.stack_info))
+    except Exception:
+        pass
+
+    body = "\n".join(str(x) for x in lines if str(x or "").strip())
+    text = f"❗ {logging.getLevelName(levelno)}\n{logger_name}\n{body}".strip()
+    return levelno, logger_name, text[:3900]
+
+
 class ErrorBotLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = record.getMessage()
-            if not _should_forward_to_error_bot(record.levelno, msg):
+            has_exc = bool(getattr(record, "exc_info", None) or getattr(record, "stack_info", None))
+            must_forward = bool(record.levelno >= logging.ERROR or has_exc)
+            if not must_forward and not _should_forward_to_error_bot(record.levelno, msg):
                 return
-            _error_agg_note(record.levelno, record.name, msg)
+            _levelno, _logger_name, payload = _error_record_payload(record)
+            if _ERROR_AGG_ENABLED and _ERROR_AGG_WINDOW_SEC > 0:
+                _error_agg_note(_levelno, _logger_name, payload)
+            else:
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(_error_bot_send(payload))
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -8215,6 +8260,5 @@ if __name__ == "__main__":
 # ===============================
 # AUTO SYMBOL ANALYSIS HANDLER
 # ===============================
-
 
 
