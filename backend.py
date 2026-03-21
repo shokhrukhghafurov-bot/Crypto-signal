@@ -29820,12 +29820,68 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         except Exception:
             return "—"
 
+    def _stable_unique_levels(vals):
+        out = []
+        for v in vals or []:
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if not (fv == fv) or fv <= 0:
+                continue
+            if not any(abs(fv - ex) <= max(1e-9, abs(fv) * 1e-6) for ex in out):
+                out.append(fv)
+        return sorted(out)
+
+    def _stable_swing_levels(_df, *, tail_n: int, left: int = 3, right: int = 3):
+        try:
+            if _df is None or getattr(_df, "empty", True) or len(_df) < (left + right + 10):
+                return [], []
+            src = _df.tail(max(tail_n, left + right + 10)).reset_index(drop=True)
+            _sh, _sl = _swing_points(src, left=left, right=right)
+            hi = _stable_unique_levels([p for _, p in _sh])
+            lo = _stable_unique_levels([p for _, p in _sl])
+            return hi, lo
+        except Exception:
+            return [], []
+
+    anchor_hi_1h, anchor_lo_1h = _stable_swing_levels(
+        df1 if (df1 is not None and not getattr(df1, "empty", True) and len(df1) >= 60) else None,
+        tail_n=120,
+        left=3,
+        right=3,
+    )
+    anchor_hi_4h, anchor_lo_4h = _stable_swing_levels(
+        df4 if (df4 is not None and not getattr(df4, "empty", True) and len(df4) >= 30) else None,
+        tail_n=45,
+        left=2,
+        right=2,
+    )
+    anchor_hi_pool = _stable_unique_levels((anchor_hi_4h or []) + (anchor_hi_1h or []))
+    anchor_lo_pool = _stable_unique_levels((anchor_lo_4h or []) + (anchor_lo_1h or []))
+    anchor_support_near = _pick_level(anchor_lo_pool, side="below", ref=float(price))
+    anchor_support_deep = _pick_level(
+        anchor_lo_pool,
+        side="below",
+        ref=float(anchor_support_near if anchor_support_near is not None else price),
+        skip={float(anchor_support_near)} if anchor_support_near is not None else None,
+    )
+    anchor_resist_near = _pick_level(anchor_hi_pool, side="above", ref=float(price))
+    anchor_resist_high = _pick_level(
+        anchor_hi_pool,
+        side="above",
+        ref=float(anchor_resist_near if anchor_resist_near is not None else price),
+        skip={float(anchor_resist_near)} if anchor_resist_near is not None else None,
+    )
+
     local_support_lvl = _pick_level([
+        anchor_support_near,
         support1, chan_support,
         (vp_sess.get('val') if isinstance(vp_sess, dict) else None),
         (vb.get('bands', {}).get('-1.0') if isinstance(vb, dict) else None),
     ], side="below", ref=float(price))
     local_resist_lvl = _pick_level([
+        anchor_resist_near,
         pivot,
         (vb.get('vwap') if isinstance(vb, dict) else None),
         (vb.get('bands', {}).get('+1.0') if isinstance(vb, dict) else None),
@@ -29833,11 +29889,13 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         resistance1,
     ], side="above", ref=float(price))
     deeper_support_lvl = _pick_level([
+        anchor_support_deep,
         support2, support1, chan_support,
         (vp.get('val') if isinstance(vp, dict) else None),
         (vp_sess.get('val') if isinstance(vp_sess, dict) else None),
     ], side="below", ref=float(local_support_lvl if local_support_lvl is not None else price), skip={float(local_support_lvl)} if local_support_lvl is not None else None)
     higher_resist_lvl = _pick_level([
+        anchor_resist_high,
         entry_hi, resistance1, resistance2, chan_resist,
         (vp.get('vah') if isinstance(vp, dict) else None),
         (vp_sess.get('vah') if isinstance(vp_sess, dict) else None),
@@ -30086,6 +30144,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
     except Exception:
         weak_volume_now = True
     scenarios_wait = bool(low_conf or weak_volume_now or entry_status in ('WAIT', 'READY', 'INVALID'))
+    scenario_hard_anchor = str(os.getenv("SCENARIO_STABLE_HARD_ANCHOR", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
 
     entry_zone_lo = _clean_level(entry_lo) or _first_below(price, local_resist_lvl, higher_resist_lvl, resistance1)
     entry_zone_hi = _clean_level(entry_hi) or _first_above(entry_zone_lo or price, local_resist_lvl, higher_resist_lvl, resistance1)
@@ -30096,6 +30155,34 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             entry_zone_width = max(0.0, float(entry_zone_hi) - float(entry_zone_lo))
     except Exception:
         entry_zone_width = 0.0
+
+    if scenario_hard_anchor:
+        try:
+            stable_zone_cap = max(float(atr_abs) * 1.8, float(price) * 0.0045)
+        except Exception:
+            stable_zone_cap = max(float(price) * 0.0045, 0.0)
+        try:
+            snap_tol = max(float(atr_abs) * 1.25, float(price) * 0.0045)
+        except Exception:
+            snap_tol = max(float(price) * 0.0045, 0.0)
+        anchor_hi_ref = _clean_level(anchor_resist_near) or _clean_level(higher_resist_lvl) or _clean_level(local_resist_lvl)
+        anchor_lo_ref = _clean_level(anchor_support_near) or _clean_level(local_support_lvl)
+        if anchor_hi_ref is not None and (entry_zone_hi is None or abs(float(entry_zone_hi) - float(anchor_hi_ref)) <= snap_tol):
+            entry_zone_hi = float(anchor_hi_ref)
+        if entry_zone_hi is not None:
+            base_lo = _clean_level(entry_zone_lo)
+            if anchor_lo_ref is not None:
+                base_lo = max(float(anchor_lo_ref), float(entry_zone_hi) - float(stable_zone_cap))
+            elif base_lo is None:
+                base_lo = float(entry_zone_hi) - float(stable_zone_cap)
+            if base_lo is not None and float(entry_zone_hi) > float(base_lo):
+                entry_zone_lo = float(base_lo)
+        scenario_entry_zone = _fmt_range(entry_zone_lo, entry_zone_hi)
+        try:
+            if entry_zone_lo is not None and entry_zone_hi is not None and entry_zone_hi > entry_zone_lo:
+                entry_zone_width = max(0.0, float(entry_zone_hi) - float(entry_zone_lo))
+        except Exception:
+            entry_zone_width = 0.0
 
     # Trigger-based retest shorts should invalidate just above the rejection/zone,
     # not at a distant structural resistance. This keeps scenario SL logical after
@@ -30304,14 +30391,14 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             return False
         return any(tp < lo_v for tp in _dedupe_levels(tps, direction='desc'))
 
-    def _valid_short_break(entry, sl, tps):
+    def _valid_short_break(entry, sl, tps, *, require_below_price=True):
         entry_v = _clean_level(entry)
         sl_v = _clean_level(sl)
         if entry_v is None or sl_v is None:
             return False
         if sl_v <= entry_v:
             return False
-        if entry_v >= float(price) * 0.999:
+        if require_below_price and entry_v >= float(price) * 0.999:
             return False
         return any(tp < entry_v for tp in _dedupe_levels(tps, direction='desc'))
 
@@ -30331,11 +30418,133 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             return False
         return any(tp > hi_v for tp in _dedupe_levels(tps, direction='asc'))
 
+    scenario_stable_mode = str(os.getenv("SCENARIO_STABLE_5D", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+    scenario_use_price_filters = str(os.getenv("SCENARIO_STABLE_USE_PRICE_FILTERS", "0") or "0").strip().lower() not in ("0", "false", "no", "off")
+    try:
+        scenario_ttl_sec = int(float(os.getenv("SCENARIO_STABLE_TTL_SEC", str(5 * 24 * 3600))) or (5 * 24 * 3600))
+    except Exception:
+        scenario_ttl_sec = 5 * 24 * 3600
+    scenario_ttl_sec = max(3600, min(30 * 24 * 3600, int(scenario_ttl_sec)))
+
+    def _scenario_state_path() -> Path:
+        try:
+            base = os.getenv("SCENARIO_STABLE_DIR")
+            root = Path(base).expanduser() if base else (Path(__file__).resolve().parent / ".scenario_state")
+        except Exception:
+            root = Path(".scenario_state")
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        safe_sym = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(sym or "UNKNOWN"))
+        safe_mkt = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(mkt or "SPOT"))
+        return root / f"{safe_mkt}_{safe_sym}_scenario_5d.json"
+
+    def _scenario_state_load():
+        try:
+            path = _scenario_state_path()
+            if not path.exists():
+                return None
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else None
+        except Exception:
+            return None
+
+    def _scenario_state_bounds() -> tuple[float | None, float | None]:
+        vals = _dedupe_levels([
+            entry_zone_lo, entry_zone_hi,
+            short_retest_sl,
+            sweep_zone_lo, sweep_zone_hi, short_sweep_sl_lo, short_sweep_sl_hi,
+            short_break_entry, short_break_sl_lo, short_break_sl_hi,
+            short_tp1, short_tp2, short_tp3,
+            long_reclaim_sl, long_tp1, long_tp2, long_tp3,
+            bounce_zone_lo, bounce_zone_hi, long_bounce_sl, long_bounce_tp1, long_bounce_tp2, long_bounce_tp3,
+            discount_zone_lo, discount_zone_hi, long_discount_sl, long_discount_tp1, long_discount_tp2, long_discount_tp3,
+        ], direction='asc')
+        if not vals:
+            return (None, None)
+        return (float(vals[0]), float(vals[-1]))
+
+    def _scenario_state_can_reuse(st) -> bool:
+        if not scenario_stable_mode or not isinstance(st, dict):
+            return False
+        try:
+            if str(st.get("symbol") or "") != str(sym) or str(st.get("market") or "") != str(mkt):
+                return False
+            ts = float(st.get("ts") or 0.0)
+            if ts <= 0 or (time.time() - ts) > float(scenario_ttl_sec):
+                return False
+            lo = _clean_level(st.get("min_level"))
+            hi = _clean_level(st.get("max_level"))
+            pad = max(float(atr_abs) * 3.25, float(price) * 0.02)
+            if lo is not None and price < (float(lo) - pad):
+                return False
+            if hi is not None and price > (float(hi) + pad):
+                return False
+            prev_anchor_sup = _clean_level(st.get("anchor_support_near"))
+            prev_anchor_res = _clean_level(st.get("anchor_resist_near"))
+            cur_anchor_sup = _clean_level(anchor_support_near) or _clean_level(local_support_lvl) or _clean_level(support1)
+            cur_anchor_res = _clean_level(anchor_resist_near) or _clean_level(local_resist_lvl) or _clean_level(resistance1)
+            anchor_pad = max(float(atr_abs) * 4.5, float(price) * 0.02)
+            if prev_anchor_sup is not None and price < (float(prev_anchor_sup) - anchor_pad):
+                return False
+            if prev_anchor_res is not None and price > (float(prev_anchor_res) + anchor_pad * 1.35):
+                return False
+            if prev_anchor_sup is not None and cur_anchor_sup is not None:
+                if abs(float(prev_anchor_sup) - float(cur_anchor_sup)) > max(float(atr_abs) * 6.0, float(price) * 0.03):
+                    return False
+            if prev_anchor_res is not None and cur_anchor_res is not None:
+                if abs(float(prev_anchor_res) - float(cur_anchor_res)) > max(float(atr_abs) * 6.0, float(price) * 0.03):
+                    return False
+            prev_s1 = _clean_level(st.get("range_low"))
+            prev_r1 = _clean_level(st.get("range_high"))
+            if prev_s1 is not None and prev_r1 is not None and resistance1 is not None and support1 is not None and prev_r1 > prev_s1:
+                old_mid = (float(prev_s1) + float(prev_r1)) / 2.0
+                new_mid = (float(support1) + float(resistance1)) / 2.0
+                drift = abs(new_mid - old_mid)
+                max_drift = max(float(atr_abs) * (8.0 if scenario_hard_anchor else 4.0), float(price) * (0.035 if scenario_hard_anchor else 0.018))
+                if drift > max_drift:
+                    return False
+                old_rng = max(1e-9, float(prev_r1) - float(prev_s1))
+                new_rng = max(1e-9, float(resistance1) - float(support1))
+                if abs(new_rng - old_rng) / old_rng > (0.65 if scenario_hard_anchor else 0.35):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _scenario_state_save(short_items, long_items):
+        if not scenario_stable_mode:
+            return
+        try:
+            lo_b, hi_b = _scenario_state_bounds()
+            payload = {
+                "version": 7,
+                "ts": time.time(),
+                "symbol": str(sym),
+                "market": str(mkt),
+                "structure": str(struct_lbl or ""),
+                "range_low": float(support1) if support1 is not None else None,
+                "range_high": float(resistance1) if resistance1 is not None else None,
+                "price_anchor": float(price),
+                "anchor_support_near": float(anchor_support_near) if anchor_support_near is not None else None,
+                "anchor_support_deep": float(anchor_support_deep) if anchor_support_deep is not None else None,
+                "anchor_resist_near": float(anchor_resist_near) if anchor_resist_near is not None else None,
+                "anchor_resist_high": float(anchor_resist_high) if anchor_resist_high is not None else None,
+                "min_level": lo_b,
+                "max_level": hi_b,
+                "short_scenarios": list(short_items or []),
+                "long_scenarios": list(long_items or []),
+            }
+            _scenario_state_path().write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
     short_scenarios = []
     long_scenarios = []
 
     short_a_tps = _dedupe_levels([short_tp1, short_tp2, short_tp3], direction='desc')
-    if _valid_short_range(entry_zone_lo, entry_zone_hi, short_retest_sl, short_a_tps, require_near_price=True):
+    if _valid_short_range(entry_zone_lo, entry_zone_hi, short_retest_sl, short_a_tps, require_near_price=scenario_use_price_filters):
         short_scenarios.append({
             'title_ru': 'ретест supply',
             'title_en': 'retest supply',
@@ -30348,7 +30557,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         })
 
     short_b_tps = _dedupe_levels([entry_zone_lo, short_tp1, short_tp2], direction='desc')
-    if _valid_short_range(sweep_zone_lo, sweep_zone_hi, short_sweep_sl_hi or short_sweep_sl_lo, short_b_tps, require_near_price=True, require_above=entry_zone_hi):
+    if _valid_short_range(sweep_zone_lo, sweep_zone_hi, short_sweep_sl_hi or short_sweep_sl_lo, short_b_tps, require_near_price=scenario_use_price_filters, require_above=entry_zone_hi):
         short_scenarios.append({
             'title_ru': 'sweep liquidity сверху',
             'title_en': 'sweep liquidity above',
@@ -30362,7 +30571,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
 
     short_c_tps = _dedupe_levels([short_tp2, short_tp3], direction='desc')
     short_break_sl_anchor = short_break_sl_lo or short_break_sl_hi
-    if _valid_short_break(short_break_entry, short_break_sl_anchor, short_c_tps):
+    if _valid_short_break(short_break_entry, short_break_sl_anchor, short_c_tps, require_below_price=scenario_use_price_filters):
         short_scenarios.append({
             'title_ru': 'пробой поддержки',
             'title_en': 'support breakdown',
@@ -30381,7 +30590,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         direction='asc',
         min_rr_first=0.75,
     )
-    if _valid_long_range(entry_zone_lo, entry_zone_hi, long_reclaim_sl, long_a_tps, require_near_price=True):
+    if _valid_long_range(entry_zone_lo, entry_zone_hi, long_reclaim_sl, long_a_tps, require_near_price=scenario_use_price_filters):
         long_scenarios.append({
             'title_ru': 'reclaim зоны',
             'title_en': 'reclaim zone',
@@ -30394,7 +30603,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         })
 
     long_b_tps = _dedupe_levels([long_bounce_tp1, long_bounce_tp2, long_bounce_tp3], direction='asc')
-    if _valid_long_range(bounce_zone_lo, bounce_zone_hi, long_bounce_sl, long_b_tps, require_below_price=True):
+    if _valid_long_range(bounce_zone_lo, bounce_zone_hi, long_bounce_sl, long_b_tps, require_below_price=scenario_use_price_filters):
         long_scenarios.append({
             'title_ru': 'отскок от поддержки',
             'title_en': 'support bounce',
@@ -30418,6 +30627,17 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             'sl_en': ('below ' + _fmt_int_space(long_discount_sl)) if long_discount_sl is not None else 'below support',
             'tp': _fmt_tp_values(long_c_tps, direction='asc'),
         })
+
+    prev_scenarios_state = _scenario_state_load()
+    if _scenario_state_can_reuse(prev_scenarios_state):
+        prev_short = prev_scenarios_state.get('short_scenarios') if isinstance(prev_scenarios_state, dict) else None
+        prev_long = prev_scenarios_state.get('long_scenarios') if isinstance(prev_scenarios_state, dict) else None
+        if isinstance(prev_short, list) and prev_short:
+            short_scenarios = prev_short
+        if isinstance(prev_long, list) and prev_long:
+            long_scenarios = prev_long
+    else:
+        _scenario_state_save(short_scenarios, long_scenarios)
 
     def _render_side_block(side_key, items):
         if not items:
