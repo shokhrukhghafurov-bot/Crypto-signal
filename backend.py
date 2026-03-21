@@ -28990,14 +28990,33 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
     entry = price
     sl_pad = max(atr_abs * 0.6, entry * 0.001)  # 0.1% or 0.6 ATR
 
+    def _plan_targets(entry_v, sl_v, base_tp1, base_tp2, *, direction):
+        risk = abs(float(entry_v) - float(sl_v))
+        if risk <= 0:
+            return float(base_tp1), float(base_tp2)
+        try:
+            atr_unit = max(float(atr_abs), abs(float(entry_v)) * 0.0028, 1e-9)
+        except Exception:
+            atr_unit = max(abs(float(entry_v)) * 0.0028, 1e-9)
+        sign = 1.0 if direction == "LONG" else -1.0
+        tp1_floor = float(entry_v) + sign * max(abs(float(base_tp1) - float(entry_v)), risk * 1.15, atr_unit * 1.35)
+        tp2_floor = float(entry_v) + sign * max(abs(float(base_tp2) - float(entry_v)), risk * 2.55, atr_unit * 3.25)
+        min_gap = max(risk * 0.80, atr_unit * 0.90)
+        if direction == "LONG":
+            if tp2_floor <= tp1_floor:
+                tp2_floor = tp1_floor + min_gap
+        else:
+            if tp2_floor >= tp1_floor:
+                tp2_floor = tp1_floor - min_gap
+        return float(tp1_floor), float(tp2_floor)
+
     if bias == "LONG":
         base_sl = min(support1, float(swing_lo), float(chan_support))
         sl = base_sl - sl_pad
 
         base_tp1 = min(resistance1, float(chan_resist))
         base_tp2 = max(resistance2, float(chan_resist))
-        tp1 = base_tp1
-        tp2 = base_tp2
+        tp1, tp2 = _plan_targets(entry, sl, base_tp1, base_tp2, direction="LONG")
 
         rr = (tp2 - entry) / max(1e-9, (entry - sl))
     else:
@@ -29006,8 +29025,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
 
         base_tp1 = max(support1, float(chan_support))
         base_tp2 = min(support2, float(chan_support))
-        tp1 = base_tp1
-        tp2 = base_tp2
+        tp1, tp2 = _plan_targets(entry, sl, base_tp1, base_tp2, direction="SHORT")
 
         rr = (entry - tp2) / max(1e-9, (sl - entry))
 
@@ -30590,6 +30608,145 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             return kept
         return vals[-1:] if vals else []
 
+    def _scenario_entry_mid(lo=None, hi=None, entry=None):
+        lo_v = _clean_level(lo)
+        hi_v = _clean_level(hi)
+        entry_v = _clean_level(entry)
+        if lo_v is not None and hi_v is not None and hi_v > lo_v:
+            return (float(lo_v) + float(hi_v)) / 2.0
+        if entry_v is not None:
+            return float(entry_v)
+        return float(hi_v) if hi_v is not None else (float(lo_v) if lo_v is not None else None)
+
+    def _scenario_rr_max(entry_ref, sl, tp_vals, direction):
+        entry_v = _clean_level(entry_ref)
+        sl_v = _clean_level(sl)
+        vals = _dedupe_levels(tp_vals, direction=direction)
+        if entry_v is None or sl_v is None or not vals:
+            return 0.0
+        risk = abs(float(entry_v) - float(sl_v))
+        if risk <= 0:
+            return 0.0
+        out = 0.0
+        for tp in vals:
+            reward = (float(tp) - float(entry_v)) if direction == 'asc' else (float(entry_v) - float(tp))
+            if reward > 0:
+                out = max(out, reward / risk)
+        return float(out)
+
+    def _scenario_pack(*, side, title_ru, title_en, entry_text, trigger_ru, trigger_en, sl_ru, sl_en, tp_vals, direction, entry_lo=None, entry_hi=None, entry_ref=None, sl=None, priority=0.0, bucket='near'):
+        entry_mid = _scenario_entry_mid(entry_lo, entry_hi, entry_ref)
+        dist_abs = abs(float(entry_mid) - float(price)) if entry_mid is not None else 1e18
+        dist_pct = dist_abs / max(abs(float(price)), 1e-9) if entry_mid is not None else 1e9
+        item = {
+            'title_ru': title_ru,
+            'title_en': title_en,
+            'entry': entry_text,
+            'trigger_ru': trigger_ru,
+            'trigger_en': trigger_en,
+            'sl_ru': sl_ru,
+            'sl_en': sl_en,
+            'tp': _fmt_tp_values(tp_vals, direction=direction),
+            '_side': str(side),
+            '_entry_mid': float(entry_mid) if entry_mid is not None else None,
+            '_entry_lo': _clean_level(entry_lo),
+            '_entry_hi': _clean_level(entry_hi),
+            '_entry_ref': _clean_level(entry_ref),
+            '_sl': _clean_level(sl),
+            '_tp_vals': _dedupe_levels(tp_vals, direction=direction),
+            '_rr_max': _scenario_rr_max(entry_ref if entry_ref is not None else entry_mid, sl, tp_vals, direction),
+            '_priority': float(priority),
+            '_distance_abs': float(dist_abs),
+            '_distance_pct': float(dist_pct),
+            '_bucket': str(bucket),
+        }
+        return item
+
+    def _scenario_score(item):
+        try:
+            dist_pct = float(item.get('_distance_pct') or 1e9)
+        except Exception:
+            dist_pct = 1e9
+        try:
+            rr_max = float(item.get('_rr_max') or 0.0)
+        except Exception:
+            rr_max = 0.0
+        try:
+            priority = float(item.get('_priority') or 0.0)
+        except Exception:
+            priority = 0.0
+        score = priority + min(2.8, rr_max * 0.45)
+        score += max(0.0, 2.6 - dist_pct * 160.0)
+        if dist_pct <= 0.0075:
+            score += 0.8
+        if dist_pct <= 0.0035:
+            score += 0.4
+        side = str(item.get('_side') or '').lower()
+        bias_l = str(bias_txt or '').lower()
+        if side == 'long' and any(tok in bias_l for tok in ('long', 'bull', 'buy')):
+            score += 0.5
+        elif side == 'short' and any(tok in bias_l for tok in ('short', 'bear', 'sell')):
+            score += 0.5
+        return float(score)
+
+    def _filter_side_scenarios(items, side):
+        if not items:
+            return []
+        ranked = sorted(list(items), key=lambda it: (-_scenario_score(it), float(it.get('_distance_abs') or 1e18)))
+        primary = dict(ranked[0])
+        primary['contingency'] = False
+        out = [primary]
+        primary_mid = _clean_level(primary.get('_entry_mid'))
+        try:
+            far_gap = max(float(atr_abs) * 3.2, float(price) * 0.018)
+        except Exception:
+            far_gap = max(float(price) * 0.018, 0.0)
+        contingency = None
+        for cand in ranked[1:]:
+            cand_mid = _clean_level(cand.get('_entry_mid'))
+            if cand_mid is None:
+                continue
+            if primary_mid is not None and abs(float(cand_mid) - float(primary_mid)) < far_gap:
+                continue
+            if float(cand.get('_distance_pct') or 0.0) < 0.014 and str(cand.get('_bucket') or '') != 'deep':
+                continue
+            contingency = dict(cand)
+            contingency['contingency'] = True
+            break
+        if contingency is not None:
+            out.append(contingency)
+        return out
+
+    def _resolve_cross_side_conflicts(short_items, long_items):
+        if not short_items or not long_items:
+            return short_items, long_items
+        short_primary = dict(short_items[0])
+        long_primary = dict(long_items[0])
+        short_mid = _clean_level(short_primary.get('_entry_mid'))
+        long_mid = _clean_level(long_primary.get('_entry_mid'))
+        if short_mid is None or long_mid is None:
+            return short_items, long_items
+        try:
+            conflict_gap = max(float(atr_abs) * 2.0, float(price) * 0.0075)
+        except Exception:
+            conflict_gap = max(float(price) * 0.0075, 0.0)
+        if abs(float(short_mid) - float(long_mid)) > conflict_gap:
+            return short_items, long_items
+        short_score = _scenario_score(short_primary)
+        long_score = _scenario_score(long_primary)
+        keep = 'short' if short_score >= long_score else 'long'
+        if abs(short_score - long_score) < 0.35:
+            bias_l = str(bias_txt or '').lower()
+            if any(tok in bias_l for tok in ('long', 'bull', 'buy')):
+                keep = 'long'
+            elif any(tok in bias_l for tok in ('short', 'bear', 'sell')):
+                keep = 'short'
+        if keep == 'short':
+            long_items = [it for it in long_items if bool(it.get('contingency'))][:1]
+        else:
+            short_items = [it for it in short_items if bool(it.get('contingency'))][:1]
+        return short_items, long_items
+
     def _valid_range(lo, hi):
         lo_v = _clean_level(lo)
         hi_v = _clean_level(hi)
@@ -30687,7 +30844,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         if not scenario_stable_mode or not isinstance(st, dict):
             return False
         try:
-            if int(st.get("version") or 0) < 9:
+            if int(st.get("version") or 0) < 10:
                 return False
             if str(st.get("symbol") or "") != str(sym) or str(st.get("market") or "") != str(mkt):
                 return False
@@ -30747,7 +30904,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         try:
             lo_b, hi_b = _scenario_state_bounds()
             payload = {
-                "version": 9,
+                "version": 10,
                 "ts": time.time(),
                 "symbol": str(sym),
                 "market": str(mkt),
@@ -30771,45 +30928,67 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
     short_scenarios = []
     long_scenarios = []
 
-    short_a_tps = _rr_target_ladder(entry_zone_lo or price, short_retest_sl, [short_tp1, short_tp2, short_tp3], direction='desc', rr_steps=(0.9, 1.8, 2.8))
+    short_a_tps = _rr_target_ladder(entry_zone_lo or price, short_retest_sl, [short_tp1, short_tp2, short_tp3], direction='desc', rr_steps=(1.20, 2.50, 3.80))
     if _valid_short_range(entry_zone_lo, entry_zone_hi, short_retest_sl, short_a_tps, require_near_price=scenario_use_price_filters):
-        short_scenarios.append({
-            'title_ru': 'ретест supply',
-            'title_en': 'retest supply',
-            'entry': scenario_entry_zone,
-            'trigger_ru': 'возврат в зону -> rejection -> BOS 5m вниз -> объем подтверждает',
-            'trigger_en': 'reclaim into zone -> rejection -> 5m BOS down -> volume confirms',
-            'sl_ru': _fmt_int_space(short_retest_sl) if short_retest_sl is not None else '—',
-            'sl_en': _fmt_int_space(short_retest_sl) if short_retest_sl is not None else '—',
-            'tp': _fmt_tp_values(short_a_tps, direction='desc'),
-        })
+        short_scenarios.append(_scenario_pack(
+            side='short',
+            title_ru='ретест supply',
+            title_en='retest supply',
+            entry_text=scenario_entry_zone,
+            trigger_ru='возврат в зону -> rejection -> BOS 5m вниз -> объем подтверждает',
+            trigger_en='reclaim into zone -> rejection -> 5m BOS down -> volume confirms',
+            sl_ru=_fmt_int_space(short_retest_sl) if short_retest_sl is not None else '—',
+            sl_en=_fmt_int_space(short_retest_sl) if short_retest_sl is not None else '—',
+            tp_vals=short_a_tps,
+            direction='desc',
+            entry_lo=entry_zone_lo,
+            entry_hi=entry_zone_hi,
+            entry_ref=entry_zone_lo or entry_zone_hi or price,
+            sl=short_retest_sl,
+            priority=2.35,
+            bucket='near',
+        ))
 
-    short_b_tps = _rr_target_ladder(sweep_zone_lo or entry_zone_lo or price, short_sweep_sl_hi or short_sweep_sl_lo, [entry_zone_lo, short_tp1, short_tp2, short_tp3], direction='desc', rr_steps=(1.0, 2.0, 3.0))
+    short_b_tps = _rr_target_ladder(sweep_zone_lo or entry_zone_lo or price, short_sweep_sl_hi or short_sweep_sl_lo, [entry_zone_lo, short_tp1, short_tp2, short_tp3], direction='desc', rr_steps=(1.35, 2.70, 4.10))
     if _valid_short_range(sweep_zone_lo, sweep_zone_hi, short_sweep_sl_hi or short_sweep_sl_lo, short_b_tps, require_near_price=scenario_use_price_filters, require_above=entry_zone_hi):
-        short_scenarios.append({
-            'title_ru': 'sweep liquidity сверху',
-            'title_en': 'sweep liquidity above',
-            'entry': scenario_short_sweep_zone,
-            'trigger_ru': f'съем ликвидности выше {scenario_eqh} -> быстрый возврат под зону -> BOS 5m вниз',
-            'trigger_en': f'take liquidity above {scenario_eqh} -> fast return below zone -> 5m BOS down',
-            'sl_ru': scenario_short_sweep_sl,
-            'sl_en': scenario_short_sweep_sl,
-            'tp': _fmt_tp_values(short_b_tps, direction='desc'),
-        })
+        short_scenarios.append(_scenario_pack(
+            side='short',
+            title_ru='sweep liquidity сверху',
+            title_en='sweep liquidity above',
+            entry_text=scenario_short_sweep_zone,
+            trigger_ru=f'съем ликвидности выше {scenario_eqh} -> быстрый возврат под зону -> BOS 5m вниз',
+            trigger_en=f'take liquidity above {scenario_eqh} -> fast return below zone -> 5m BOS down',
+            sl_ru=scenario_short_sweep_sl,
+            sl_en=scenario_short_sweep_sl,
+            tp_vals=short_b_tps,
+            direction='desc',
+            entry_lo=sweep_zone_lo,
+            entry_hi=sweep_zone_hi,
+            entry_ref=sweep_zone_lo or sweep_zone_hi or price,
+            sl=short_sweep_sl_hi or short_sweep_sl_lo,
+            priority=2.55,
+            bucket='near',
+        ))
 
     short_break_sl_anchor = short_break_sl_lo or short_break_sl_hi
-    short_c_tps = _rr_target_ladder(short_break_entry or price, short_break_sl_anchor, [short_tp1, short_tp2, short_tp3], direction='desc', rr_steps=(1.1, 2.1, 3.2))
+    short_c_tps = _rr_target_ladder(short_break_entry or price, short_break_sl_anchor, [short_tp1, short_tp2, short_tp3], direction='desc', rr_steps=(1.45, 2.90, 4.40))
     if _valid_short_break(short_break_entry, short_break_sl_anchor, short_c_tps, require_below_price=scenario_use_price_filters):
-        short_scenarios.append({
-            'title_ru': 'пробой поддержки',
-            'title_en': 'support breakdown',
-            'entry': (f'ретест {scenario_short_break_entry} снизу' if is_ru else f'retest {scenario_short_break_entry} from below'),
-            'trigger_ru': f'потеря {scenario_short_break_entry} -> закрепление ниже на 5m/15m -> слабый ретест',
-            'trigger_en': f'loss of {scenario_short_break_entry} -> 5m/15m close below -> weak retest',
-            'sl_ru': scenario_short_break_sl,
-            'sl_en': scenario_short_break_sl,
-            'tp': _fmt_tp_values(short_c_tps, direction='desc'),
-        })
+        short_scenarios.append(_scenario_pack(
+            side='short',
+            title_ru='пробой поддержки',
+            title_en='support breakdown',
+            entry_text=(f'ретест {scenario_short_break_entry} снизу' if is_ru else f'retest {scenario_short_break_entry} from below'),
+            trigger_ru=f'потеря {scenario_short_break_entry} -> закрепление ниже на 5m/15m -> слабый ретест',
+            trigger_en=f'loss of {scenario_short_break_entry} -> 5m/15m close below -> weak retest',
+            sl_ru=scenario_short_break_sl,
+            sl_en=scenario_short_break_sl,
+            tp_vals=short_c_tps,
+            direction='desc',
+            entry_ref=short_break_entry or price,
+            sl=short_break_sl_anchor,
+            priority=3.15,
+            bucket='near',
+        ))
 
     long_a_tps = _rr_target_ladder(
         entry_zone_hi or entry_zone_lo or price,
@@ -30819,48 +30998,76 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             long_reclaim_sl,
             [long_tp1, long_tp2, long_tp3],
             direction='asc',
-            min_rr_first=0.75,
+            min_rr_first=1.00,
         ),
         direction='asc',
-        rr_steps=(0.9, 1.8, 2.8),
+        rr_steps=(1.20, 2.50, 3.80),
     )
     if _valid_long_range(entry_zone_lo, entry_zone_hi, long_reclaim_sl, long_a_tps, require_near_price=scenario_use_price_filters):
-        long_scenarios.append({
-            'title_ru': 'reclaim зоны',
-            'title_en': 'reclaim zone',
-            'entry': scenario_entry_zone,
-            'trigger_ru': f'возврат выше {local_resist_s} -> закрепление выше {entry_hi_s} -> BOS 5m вверх',
-            'trigger_en': f'reclaim above {local_resist_s} -> hold above {entry_hi_s} -> 5m BOS up',
-            'sl_ru': _fmt_int_space(long_reclaim_sl) if long_reclaim_sl is not None else '—',
-            'sl_en': _fmt_int_space(long_reclaim_sl) if long_reclaim_sl is not None else '—',
-            'tp': _fmt_tp_values(long_a_tps, direction='asc'),
-        })
+        long_scenarios.append(_scenario_pack(
+            side='long',
+            title_ru='reclaim зоны',
+            title_en='reclaim zone',
+            entry_text=scenario_entry_zone,
+            trigger_ru=f'возврат выше {local_resist_s} -> закрепление выше {entry_hi_s} -> BOS 5m вверх',
+            trigger_en=f'reclaim above {local_resist_s} -> hold above {entry_hi_s} -> 5m BOS up',
+            sl_ru=_fmt_int_space(long_reclaim_sl) if long_reclaim_sl is not None else '—',
+            sl_en=_fmt_int_space(long_reclaim_sl) if long_reclaim_sl is not None else '—',
+            tp_vals=long_a_tps,
+            direction='asc',
+            entry_lo=entry_zone_lo,
+            entry_hi=entry_zone_hi,
+            entry_ref=entry_zone_hi or entry_zone_lo or price,
+            sl=long_reclaim_sl,
+            priority=2.45,
+            bucket='near',
+        ))
 
-    long_b_tps = _rr_target_ladder(bounce_zone_hi or bounce_zone_lo or price, long_bounce_sl, [long_bounce_tp1, long_bounce_tp2, long_bounce_tp3], direction='asc', rr_steps=(1.0, 2.0, 3.0))
+    long_b_tps = _rr_target_ladder(bounce_zone_hi or bounce_zone_lo or price, long_bounce_sl, [long_bounce_tp1, long_bounce_tp2, long_bounce_tp3], direction='asc', rr_steps=(1.30, 2.60, 4.00))
     if _valid_long_range(bounce_zone_lo, bounce_zone_hi, long_bounce_sl, long_b_tps, require_below_price=scenario_use_price_filters):
-        long_scenarios.append({
-            'title_ru': 'отскок от поддержки',
-            'title_en': 'support bounce',
-            'entry': scenario_long_bounce_entry,
-            'trigger_ru': f'удержание {local_support_s} или ложный пробой -> BOS 5m вверх -> рост объема',
-            'trigger_en': f'hold {local_support_s} or false break -> 5m BOS up -> volume expansion',
-            'sl_ru': _fmt_int_space(long_bounce_sl) if long_bounce_sl is not None else '—',
-            'sl_en': _fmt_int_space(long_bounce_sl) if long_bounce_sl is not None else '—',
-            'tp': _fmt_tp_values(long_b_tps, direction='asc'),
-        })
+        long_scenarios.append(_scenario_pack(
+            side='long',
+            title_ru='отскок от поддержки',
+            title_en='support bounce',
+            entry_text=scenario_long_bounce_entry,
+            trigger_ru=f'удержание {local_support_s} или ложный пробой -> BOS 5m вверх -> рост объема',
+            trigger_en=f'hold {local_support_s} or false break -> 5m BOS up -> volume expansion',
+            sl_ru=_fmt_int_space(long_bounce_sl) if long_bounce_sl is not None else '—',
+            sl_en=_fmt_int_space(long_bounce_sl) if long_bounce_sl is not None else '—',
+            tp_vals=long_b_tps,
+            direction='asc',
+            entry_lo=bounce_zone_lo,
+            entry_hi=bounce_zone_hi,
+            entry_ref=bounce_zone_hi or bounce_zone_lo or price,
+            sl=long_bounce_sl,
+            priority=2.10,
+            bucket='near',
+        ))
 
-    long_c_tps = _rr_target_ladder(discount_zone_hi or discount_zone_lo or price, long_discount_sl, [long_discount_tp1, long_discount_tp2, long_discount_tp3], direction='asc', rr_steps=(1.1, 2.1, 3.2))
-    if _valid_long_range(discount_zone_lo, discount_zone_hi, long_discount_sl, long_c_tps, require_below= bounce_zone_lo or price):
-        long_scenarios.append({
-            'title_ru': 'deep discount long',
-            'title_en': 'deep discount long',
-            'entry': scenario_long_discount_zone,
-            'trigger_ru': f'сильный выкуп из зоны {scenario_long_discount_zone} -> база на 5m/15m -> BOS вверх',
-            'trigger_en': f'strong reaction from zone {scenario_long_discount_zone} -> base on 5m/15m -> BOS up',
-            'sl_ru': ('ниже ' + _fmt_int_space(long_discount_sl)) if long_discount_sl is not None else 'ниже поддержки',
-            'sl_en': ('below ' + _fmt_int_space(long_discount_sl)) if long_discount_sl is not None else 'below support',
-            'tp': _fmt_tp_values(long_c_tps, direction='asc'),
-        })
+    long_c_tps = _rr_target_ladder(discount_zone_hi or discount_zone_lo or price, long_discount_sl, [long_discount_tp1, long_discount_tp2, long_discount_tp3], direction='asc', rr_steps=(1.55, 3.10, 4.70))
+    if _valid_long_range(discount_zone_lo, discount_zone_hi, long_discount_sl, long_c_tps, require_below=bounce_zone_lo or price):
+        long_scenarios.append(_scenario_pack(
+            side='long',
+            title_ru='deep discount long',
+            title_en='deep discount long',
+            entry_text=scenario_long_discount_zone,
+            trigger_ru=f'сильный выкуп из зоны {scenario_long_discount_zone} -> база на 5m/15m -> BOS вверх',
+            trigger_en=f'strong reaction from zone {scenario_long_discount_zone} -> base on 5m/15m -> BOS up',
+            sl_ru=('ниже ' + _fmt_int_space(long_discount_sl)) if long_discount_sl is not None else 'ниже поддержки',
+            sl_en=('below ' + _fmt_int_space(long_discount_sl)) if long_discount_sl is not None else 'below support',
+            tp_vals=long_c_tps,
+            direction='asc',
+            entry_lo=discount_zone_lo,
+            entry_hi=discount_zone_hi,
+            entry_ref=discount_zone_hi or discount_zone_lo or price,
+            sl=long_discount_sl,
+            priority=1.35,
+            bucket='deep',
+        ))
+
+    short_scenarios = _filter_side_scenarios(short_scenarios, 'short')
+    long_scenarios = _filter_side_scenarios(long_scenarios, 'long')
+    short_scenarios, long_scenarios = _resolve_cross_side_conflicts(short_scenarios, long_scenarios)
 
     prev_scenarios_state = _scenario_state_load()
     if _scenario_state_can_reuse(prev_scenarios_state):
@@ -30883,6 +31090,8 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         for idx, item in enumerate(items):
             label = letters[idx] if idx < len(letters) else str(idx + 1)
             title = item['title_ru'] if is_ru else item['title_en']
+            if item.get('contingency'):
+                title = ((f'запасной сценарий — {title}') if is_ru else (f'contingency — {title}'))
             trigger = item['trigger_ru'] if is_ru else item['trigger_en']
             sl_text = item['sl_ru'] if is_ru else item['sl_en']
             entry_label = 'Вход' if is_ru else 'Entry'
