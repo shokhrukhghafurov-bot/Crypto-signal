@@ -9862,6 +9862,57 @@ def _mid_late_entry_anti_bounce_reasons(*,
         return (None, None)
 
 
+def _mid_recent_extremes_for_late_entry(df5=None, df30=None, *, lookback: int | None = None) -> tuple[float, float]:
+    """Compute recent_low/recent_high for late-entry/near-extreme checks.
+
+    Use the same 5m lookback across scan and trigger paths to avoid inflated
+    trigger-time distances caused by mixing a local 5m scan window with a broad
+    30m trigger window.
+
+    Fallbacks:
+    - If 5m data is unavailable, use an equivalent 30m time horizon.
+    - If all else fails, use the full available 30m frame.
+    """
+    try:
+        late_lookback = int(float(lookback if lookback is not None else (os.getenv("MID_LATE_ENTRY_LOOKBACK", "48") or 48)))
+    except Exception:
+        late_lookback = 48
+    if late_lookback < 10:
+        late_lookback = 48
+
+    try:
+        if df5 is not None and not getattr(df5, "empty", True):
+            w5 = df5.tail(late_lookback) if len(df5) >= late_lookback else df5
+            return (
+                float(w5["low"].astype(float).min()),
+                float(w5["high"].astype(float).max()),
+            )
+    except Exception:
+        pass
+
+    try:
+        if df30 is not None and not getattr(df30, "empty", True):
+            bars30 = max(1, int(math.ceil(float(late_lookback) / 6.0)))
+            w30 = df30.tail(bars30) if len(df30) >= bars30 else df30
+            return (
+                float(w30["low"].astype(float).min()),
+                float(w30["high"].astype(float).max()),
+            )
+    except Exception:
+        pass
+
+    try:
+        if df30 is not None and not getattr(df30, "empty", True):
+            return (
+                float(df30["low"].astype(float).min()),
+                float(df30["high"].astype(float).max()),
+            )
+    except Exception:
+        pass
+
+    return (0.0, 0.0)
+
+
 def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low: float, recent_high: float,
                       atr_30m: float, rsi_5m: float, vwap: float, bb_pos: str | None,
                       ema20_5m: float | None, bos_down_5m: bool, two_red_5m: bool, lower_highs_5m: bool,
@@ -13660,13 +13711,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     # NOTE: We keep the thresholds centralized in globals (MID_*), and produce
     # a human-readable reason for logs / error-bot digest.
     try:
-        late_lookback = int(float(os.getenv("MID_LATE_ENTRY_LOOKBACK", "48") or 48))
-        if late_lookback < 10:
-            late_lookback = 48
-
-        w = df5i.tail(late_lookback) if len(df5i) >= late_lookback else df5i
-        recent_low = float(w["low"].astype(float).min())
-        recent_high = float(w["high"].astype(float).max())
+        recent_low, recent_high = _mid_recent_extremes_for_late_entry(df5=df5i, df30=df30i)
 
         o5 = float(last5.get("open", np.nan))
         c5 = float(last5.get("close", np.nan))
@@ -15933,13 +15978,8 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
     # concrete reasons like bb_bounce, near_extremes, regime_block, etc.
     try:
         if str(_phase).lower() == "trigger":
-            # recent extremes from 30m (stable)
-            try:
-                recent_low = float(df30i["low"].astype(float).tail(120).min())
-                recent_high = float(df30i["high"].astype(float).tail(120).max())
-            except Exception:
-                recent_low = float(df30i["low"].astype(float).min())
-                recent_high = float(df30i["high"].astype(float).max())
+            # Use the same recent-extremes window as scan-time late-entry logic.
+            recent_low, recent_high = _mid_recent_extremes_for_late_entry(df5=df5i, df30=df30i)
 
             # 5m helpers (best-effort)
             ema20_5m = float("nan")
@@ -21523,16 +21563,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             atr_now = float(ta.get("atr30") or ta.get("atr_abs") or 0.0)
                         except Exception:
                             atr_now = 0.0
-                        try:
-                            recent_low_now = float(df30["low"].astype(float).tail(120).min())
-                            recent_high_now = float(df30["high"].astype(float).tail(120).max())
-                        except Exception:
-                            try:
-                                recent_low_now = float(df30["low"].astype(float).min())
-                                recent_high_now = float(df30["high"].astype(float).max())
-                            except Exception:
-                                recent_low_now = 0.0
-                                recent_high_now = 0.0
+                        recent_low_now, recent_high_now = _mid_recent_extremes_for_late_entry(df5=df5, df30=df30)
                         near_ok_now, near_reason_now = _mid_instant_emit_near_extreme_ok(
                             direction=direction,
                             entry=float(price),
@@ -26764,16 +26795,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 risk_note=(str(risk_note or "").strip() + (" | " if str(risk_note or "").strip() else "") + f"smart_setup_emit=1 smart_conf={int(_conf_now)}/{int(_smart_conf_need)}").strip(),
                                                 ts=time.time(),
                                             )
-                                            try:
-                                                _recent_low_now = float(df30i["low"].astype(float).tail(120).min())
-                                                _recent_high_now = float(df30i["high"].astype(float).tail(120).max())
-                                            except Exception:
-                                                try:
-                                                    _recent_low_now = float(df30i["low"].astype(float).min())
-                                                    _recent_high_now = float(df30i["high"].astype(float).max())
-                                                except Exception:
-                                                    _recent_low_now = 0.0
-                                                    _recent_high_now = 0.0
+                                            _recent_low_now, _recent_high_now = _mid_recent_extremes_for_late_entry(df5=df5i, df30=df30i)
                                             try:
                                                 _atr_now = float((base_r.get("atr_abs") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or rec.get("atr_at_create") or 0.0)
                                             except Exception:
