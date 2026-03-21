@@ -1573,7 +1573,9 @@ def _mid_trigger_selected_hardblock_reason(reason: str) -> tuple[str | None, str
         head = raw.split()[0].split("=", 1)[0].strip().lower()
         if head in ("rsi_long", "rsi_short"):
             return (head, head)
-        if head in ("adx_30m", "adx_1h", "regime_block"):
+        if head in ("adx_30m", "adx_1h"):
+            return (head, "regime_block")
+        if head == "regime_block":
             return ("regime_block", "regime_block")
         if head == "vol_x":
             return ("vol_low", "vol_low")
@@ -20149,6 +20151,37 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
             except Exception:
                 checks_kv = ""
 
+            raw_reason = ""
+            try:
+                raw_reason = str(it.get("_trig_hardblock_raw_reason") or "").strip()
+            except Exception:
+                raw_reason = ""
+
+            def _fmt_dbg_num(v):
+                try:
+                    if v is None or v == "":
+                        return "-"
+                    return f"{float(v):.2f}"
+                except Exception:
+                    return "-"
+
+            try:
+                _adx30_dbg = _fmt_dbg_num(it.get("_trig_adx_30m"))
+            except Exception:
+                _adx30_dbg = "-"
+            try:
+                _min_adx30_dbg = _fmt_dbg_num(it.get("_trig_min_adx_30m"))
+            except Exception:
+                _min_adx30_dbg = "-"
+            try:
+                _adx1h_dbg = _fmt_dbg_num(it.get("_trig_adx_1h"))
+            except Exception:
+                _adx1h_dbg = "-"
+            try:
+                _min_adx1h_dbg = _fmt_dbg_num(it.get("_trig_min_adx_1h"))
+            except Exception:
+                _min_adx1h_dbg = "-"
+
             _age_m = 0.0
             _zone_src = str(it.get("entry_zone_src") or "-")
             _zone_w_atr = "-"
@@ -20186,9 +20219,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 _bo_move_atr = "-"
 
             logger.info(
-                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s term=%s trap_reason=%s in_zone=%s attempts=%s fails=%s px=%.6g age_m=%.1f zone_src=%s zone_w_atr=%s bo=%s bo_age_create=%s bo_age_total=%s bo_move_atr=%s enabled=%s passed_n=%s need_passed=%s pass=%s fail=%s skip=%s ne=%s checks=%s",
+                "[mid][pending][trigger] %s %s %s outcome=%s reason=%s raw_reason=%s term=%s trap_reason=%s in_zone=%s attempts=%s fails=%s px=%.6g age_m=%.1f zone_src=%s zone_w_atr=%s bo=%s bo_age_create=%s bo_age_total=%s bo_move_atr=%s adx_30m=%s min_adx_30m=%s adx_1h=%s min_adx_1h=%s enabled=%s passed_n=%s need_passed=%s pass=%s fail=%s skip=%s ne=%s checks=%s",
                 str(sym), str(market), str(direction),
-                str(outcome), str(reason or ""), term_reason,
+                str(outcome), str(reason or ""), raw_reason, term_reason,
                 str(it.get("_trig_trap_reason") if (it.get("_trig_trap_reason") is not None) else (it.get("trap_reason") or "")),
                 int(1 if (bool(it.get("_in_zone_tol") or it.get("_in_zone") or False)) else 0),
                 int(it.get("trigger_attempts") or 0),
@@ -20201,6 +20234,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 _bo_age_create,
                 _bo_total_age,
                 _bo_move_atr,
+                _adx30_dbg,
+                _min_adx30_dbg,
+                _adx1h_dbg,
+                _min_adx1h_dbg,
                 int(it.get("_trig_enabled_count") or 0),
                 int(it.get("_trig_passed_count") or 0),
                 int(it.get("_trig_need_passed") or 0),
@@ -21117,6 +21154,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             "confidence": "ne",
                             "score": "ne",
                             "vol_x": "ne",
+                            "adx_30m": "ne",
+                            "adx_1h": "ne",
+                            "regime_block": "ne",
                             "late_entry": "ne",
                             "anti_bounce": "ne",
                         }
@@ -21375,6 +21415,27 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         it["_trig_trap_reason"] = str(ta.get("trap_reason") or "")
                     except Exception:
                         it["_trig_trap_reason"] = ""
+                    try:
+                        it["_trig_adx_30m"] = float(ta.get("adx1") or ta.get("adx_30m") or 0.0)
+                    except Exception:
+                        it["_trig_adx_30m"] = None
+                    try:
+                        it["_trig_adx_1h"] = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
+                    except Exception:
+                        it["_trig_adx_1h"] = None
+                    try:
+                        _trig_mkt = str(market or it.get("market") or "SPOT").upper().strip()
+                        it["_trig_min_adx_30m"] = float(_mid_autotune_get_param("MID_MIN_ADX_30M", float(os.getenv("MID_MIN_ADX_30M", "0") or 0), _trig_mkt))
+                        it["_trig_min_adx_1h"] = float(_mid_autotune_get_param("MID_MIN_ADX_1H", float(os.getenv("MID_MIN_ADX_1H", "0") or 0), _trig_mkt))
+                    except Exception:
+                        try:
+                            it["_trig_min_adx_30m"] = float(os.getenv("MID_MIN_ADX_30M", "0") or 0)
+                        except Exception:
+                            it["_trig_min_adx_30m"] = None
+                        try:
+                            it["_trig_min_adx_1h"] = float(os.getenv("MID_MIN_ADX_1H", "0") or 0)
+                        except Exception:
+                            it["_trig_min_adx_1h"] = None
 
                     # Precompute trigger-time volume debug fields (volx/thr/thr_base/thr_why) so logs are never blank,
                     # even when an earlier trigger filter (e.g. score_low) short-circuits.
@@ -21491,10 +21552,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     if isinstance(it.get("_trig_checks"), dict):
                                         it["_trig_checks"]["vol_x"] = (f"fail:{raw_reason_for_log}" if raw_reason_for_log else "fail")
                                 elif hb_apply_reason == "regime_block":
+                                    _hb_head = raw_reason_for_log.split()[0].split("=", 1)[0].strip().lower() if raw_reason_for_log else "regime_block"
+                                    _hb_key = _hb_head if _hb_head in ("adx_30m", "adx_1h") else "regime_block"
                                     if isinstance(it.get("_trig_reqs"), dict):
-                                        it["_trig_reqs"]["adx"] = True
+                                        it["_trig_reqs"][_hb_key] = True
                                     if isinstance(it.get("_trig_checks"), dict):
-                                        it["_trig_checks"]["adx"] = (f"fail:{raw_reason_for_log}" if raw_reason_for_log else "fail")
+                                        it["_trig_checks"][_hb_key] = (f"fail:{raw_reason_for_log}" if raw_reason_for_log else "fail")
                                 else:
                                     if isinstance(it.get("_trig_reqs"), dict):
                                         it["_trig_reqs"][hb_apply_reason] = True
@@ -22244,13 +22307,29 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         use_regime = os.getenv("MID_USE_REGIME","1").strip().lower() not in ("0","false","no","off")
                         if use_regime:
                             try:
-                                min_adx_30m = float(os.getenv("MID_MIN_ADX_30M","0") or 0)
-                                min_adx_1h = float(os.getenv("MID_MIN_ADX_1H","0") or 0)
-                                adx30 = float(ta.get("adx1") or ta.get("adx_30m") or 0.0)
-                                adx1h = float(ta.get("adx4") or ta.get("adx_1h") or 0.0)
+                                min_adx_30m = float(it.get("_trig_min_adx_30m") if (it.get("_trig_min_adx_30m") is not None) else _mid_autotune_get_param("MID_MIN_ADX_30M", float(os.getenv("MID_MIN_ADX_30M","0") or 0), str(market or it.get("market") or "SPOT").upper().strip()))
+                                min_adx_1h = float(it.get("_trig_min_adx_1h") if (it.get("_trig_min_adx_1h") is not None) else _mid_autotune_get_param("MID_MIN_ADX_1H", float(os.getenv("MID_MIN_ADX_1H","0") or 0), str(market or it.get("market") or "SPOT").upper().strip()))
+                                adx30 = float(it.get("_trig_adx_30m") if (it.get("_trig_adx_30m") is not None) else (ta.get("adx1") or ta.get("adx_30m") or 0.0))
+                                adx1h = float(it.get("_trig_adx_1h") if (it.get("_trig_adx_1h") is not None) else (ta.get("adx4") or ta.get("adx_1h") or 0.0))
+                                it["_trig_adx_30m"] = adx30
+                                it["_trig_adx_1h"] = adx1h
+                                it["_trig_min_adx_30m"] = min_adx_30m
+                                it["_trig_min_adx_1h"] = min_adx_1h
                                 if min_adx_30m and adx30 < min_adx_30m:
+                                    raw_reason = f"adx_30m={adx30:.2f}<min={min_adx_30m:.2f}"
+                                    try:
+                                        if isinstance(it.get("_trig_reqs"), dict):
+                                            it["_trig_reqs"]["adx_30m"] = True
+                                        if isinstance(it.get("_trig_checks"), dict):
+                                            it["_trig_checks"]["adx_30m"] = f"fail:{raw_reason}"
+                                        it["_trig_fail_reasons"] = ["regime_block"]
+                                        it["_trig_primary_reason"] = "regime_block"
+                                        it["_trig_term_reason"] = raw_reason
+                                        it["_trig_hardblock_raw_reason"] = raw_reason
+                                    except Exception:
+                                        pass
                                     keep_it, outc = _pending_apply_fail(it, "regime_block", now)
-                                    _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
+                                    _pending_log_trigger(sym, market, direction, outc, raw_reason, it, float(price))
                                     if keep_it:
                                         keep.append(it)
                                         any_wait = True
@@ -22261,8 +22340,20 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                             pass
                                     continue
                                 if min_adx_1h and adx1h < min_adx_1h:
+                                    raw_reason = f"adx_1h={adx1h:.2f}<min={min_adx_1h:.2f}"
+                                    try:
+                                        if isinstance(it.get("_trig_reqs"), dict):
+                                            it["_trig_reqs"]["adx_1h"] = True
+                                        if isinstance(it.get("_trig_checks"), dict):
+                                            it["_trig_checks"]["adx_1h"] = f"fail:{raw_reason}"
+                                        it["_trig_fail_reasons"] = ["regime_block"]
+                                        it["_trig_primary_reason"] = "regime_block"
+                                        it["_trig_term_reason"] = raw_reason
+                                        it["_trig_hardblock_raw_reason"] = raw_reason
+                                    except Exception:
+                                        pass
                                     keep_it, outc = _pending_apply_fail(it, "regime_block", now)
-                                    _pending_log_trigger(sym, market, direction, outc, "regime_block", it, float(price))
+                                    _pending_log_trigger(sym, market, direction, outc, raw_reason, it, float(price))
                                     if keep_it:
                                         keep.append(it)
                                         any_wait = True
