@@ -30090,10 +30090,33 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
     entry_zone_lo = _clean_level(entry_lo) or _first_below(price, local_resist_lvl, higher_resist_lvl, resistance1)
     entry_zone_hi = _clean_level(entry_hi) or _first_above(entry_zone_lo or price, local_resist_lvl, higher_resist_lvl, resistance1)
     scenario_entry_zone = _fmt_range(entry_zone_lo, entry_zone_hi)
+    entry_zone_width = 0.0
+    try:
+        if entry_zone_lo is not None and entry_zone_hi is not None and entry_zone_hi > entry_zone_lo:
+            entry_zone_width = max(0.0, float(entry_zone_hi) - float(entry_zone_lo))
+    except Exception:
+        entry_zone_width = 0.0
 
-    short_retest_sl = _clean_level(inv_lvl_out) or _first_above(entry_zone_hi or price, higher_resist_lvl, resistance1, eq_hi)
+    # Trigger-based retest shorts should invalidate just above the rejection/zone,
+    # not at a distant structural resistance. This keeps scenario SL logical after
+    # BOS confirmation and prevents very wide, unrealistic stop placement.
+    short_retest_sl = _clean_level(inv_lvl_out)
+    short_retest_sl_cap = _level_plus(
+        entry_zone_hi or price,
+        pct=0.0045,
+        atr_mult=0.35,
+        minimum=max(entry_zone_width * 1.2, _buffer_from(entry_zone_hi or price, pct=0.0025, atr_mult=0.2)),
+    )
+    short_retest_sl_tight = _level_plus(
+        entry_zone_hi or price,
+        pct=0.0022,
+        atr_mult=0.18,
+        minimum=max(entry_zone_width * 0.55, _buffer_from(entry_zone_hi or price, pct=0.0012, atr_mult=0.08)),
+    )
+    if short_retest_sl is None or (short_retest_sl_cap is not None and short_retest_sl > short_retest_sl_cap):
+        short_retest_sl = short_retest_sl_tight or short_retest_sl_cap or _first_above(entry_zone_hi or price, higher_resist_lvl, resistance1, eq_hi)
     if short_retest_sl is None:
-        short_retest_sl = _level_plus(entry_zone_hi or price, pct=0.004, atr_mult=0.45, minimum=(abs((entry_zone_hi or price) - (entry_zone_lo or price)) * 0.8))
+        short_retest_sl = _level_plus(entry_zone_hi or price, pct=0.0032, atr_mult=0.28, minimum=max(entry_zone_width * 0.8, 0.0))
 
     eqh_level = _clean_level(eq_hi) or _first_above(entry_zone_hi or price, resistance1, higher_resist_lvl)
     sweep_zone_hi = eqh_level or _first_above(entry_zone_hi or price, resistance1, higher_resist_lvl, resistance2)
@@ -30159,9 +30182,26 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
     if short_tp3 is None:
         short_tp3 = _clean_level(support2)
 
-    long_reclaim_sl = _clean_level(local_support_lvl) or _first_below(entry_zone_lo or price, support1, deeper_support_lvl, session_val)
+    # Confirmed reclaim longs should invalidate on loss of the reclaimed zone,
+    # not on a deep support far below the trigger. Cap SL depth to keep the
+    # scenario usable after hold-above + BOS confirmation.
+    long_reclaim_sl = _clean_level(local_resist_lvl) or _clean_level(entry_zone_lo)
+    long_reclaim_sl_floor = _level_minus(
+        entry_zone_lo or price,
+        pct=0.0045,
+        atr_mult=0.35,
+        minimum=max(entry_zone_width * 1.2, _buffer_from(entry_zone_lo or price, pct=0.0025, atr_mult=0.2)),
+    )
+    _deep_long_reclaim_sl = _first_below(entry_zone_lo or price, local_resist_lvl, session_val, support1, deeper_support_lvl)
+    if _deep_long_reclaim_sl is not None and (long_reclaim_sl_floor is None or _deep_long_reclaim_sl >= long_reclaim_sl_floor):
+        long_reclaim_sl = _deep_long_reclaim_sl
     if long_reclaim_sl is None:
-        long_reclaim_sl = _level_minus(entry_zone_lo or price, pct=0.0025, atr_mult=0.2)
+        long_reclaim_sl = _level_minus(
+            entry_zone_lo or price,
+            pct=0.0022,
+            atr_mult=0.18,
+            minimum=max(entry_zone_width * 0.55, _buffer_from(entry_zone_lo or price, pct=0.0012, atr_mult=0.08)),
+        )
 
     long_tp1 = _first_above(entry_zone_hi or price, session_vah, higher_resist_lvl, resistance1)
     long_tp2 = _first_above(long_tp1 or entry_zone_hi or price, eqh_level, higher_resist_lvl, resistance1, resistance2)
@@ -30222,6 +30262,28 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
     def _fmt_tp_values(values, *, direction=None):
         vals = _dedupe_levels(values, direction=direction)
         return _fmt_tp_chain(*vals) if vals else '—'
+
+    def _filter_targets_by_rr(entry_ref, sl, values, *, direction, min_rr_first=0.0):
+        vals = _dedupe_levels(values, direction=direction)
+        entry_v = _clean_level(entry_ref)
+        sl_v = _clean_level(sl)
+        if entry_v is None or sl_v is None:
+            return vals
+        risk = abs(float(entry_v) - float(sl_v))
+        if risk <= 0:
+            return vals
+        kept = []
+        for tp in vals:
+            reward = (float(tp) - float(entry_v)) if direction == 'asc' else (float(entry_v) - float(tp))
+            if reward <= 0:
+                continue
+            rr_now = reward / risk if risk > 0 else 0.0
+            if not kept and rr_now < float(min_rr_first):
+                continue
+            kept.append(float(tp))
+        if kept:
+            return kept
+        return vals[-1:] if vals else []
 
     def _valid_range(lo, hi):
         lo_v = _clean_level(lo)
@@ -30312,7 +30374,13 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             'tp': _fmt_tp_values(short_c_tps, direction='desc'),
         })
 
-    long_a_tps = _dedupe_levels([long_tp1, long_tp2, long_tp3], direction='asc')
+    long_a_tps = _filter_targets_by_rr(
+        entry_zone_hi or entry_zone_lo or price,
+        long_reclaim_sl,
+        [long_tp1, long_tp2, long_tp3],
+        direction='asc',
+        min_rr_first=0.75,
+    )
     if _valid_long_range(entry_zone_lo, entry_zone_hi, long_reclaim_sl, long_a_tps, require_near_price=True):
         long_scenarios.append({
             'title_ru': 'reclaim зоны',
