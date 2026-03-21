@@ -30530,6 +30530,44 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         vals = _dedupe_levels(values, direction=direction)
         return _fmt_tp_chain(*vals) if vals else '—'
 
+    def _rr_target_ladder(entry_ref, sl, values, *, direction, rr_steps=(1.0, 2.0, 3.0)):
+        vals = _dedupe_levels(values, direction=direction)
+        entry_v = _clean_level(entry_ref)
+        sl_v = _clean_level(sl)
+        if entry_v is None or sl_v is None:
+            return vals[:3]
+        risk = abs(float(entry_v) - float(sl_v))
+        if risk <= 0:
+            return vals[:3]
+        try:
+            atr_unit = max(float(atr_abs), abs(float(entry_v)) * 0.0025, 1e-9)
+        except Exception:
+            atr_unit = max(abs(float(entry_v)) * 0.0025, 1e-9)
+        sign = 1.0 if direction == 'asc' else -1.0
+        candidates = list(vals)
+        for idx, rr in enumerate(rr_steps, start=1):
+            floor_move = max(risk * float(rr), atr_unit * (0.9 + 0.7 * idx))
+            candidates.append(float(entry_v) + sign * floor_move)
+        ordered = _dedupe_levels(candidates, direction=direction)
+        ladder = []
+        for idx, rr in enumerate(rr_steps, start=1):
+            threshold = float(entry_v) + sign * max(risk * float(rr), atr_unit * (0.9 + 0.7 * idx))
+            chosen = None
+            if direction == 'asc':
+                for v in ordered:
+                    if float(v) >= threshold:
+                        chosen = float(v)
+                        break
+            else:
+                for v in ordered:
+                    if float(v) <= threshold:
+                        chosen = float(v)
+                        break
+            if chosen is None:
+                chosen = threshold
+            ladder.append(chosen)
+        return _dedupe_levels(ladder, direction=direction)
+
     def _filter_targets_by_rr(entry_ref, sl, values, *, direction, min_rr_first=0.0):
         vals = _dedupe_levels(values, direction=direction)
         entry_v = _clean_level(entry_ref)
@@ -30649,11 +30687,9 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         if not scenario_stable_mode or not isinstance(st, dict):
             return False
         try:
-            if int(st.get("version") or 0) < 8:
+            if int(st.get("version") or 0) < 9:
                 return False
             if str(st.get("symbol") or "") != str(sym) or str(st.get("market") or "") != str(mkt):
-                return False
-            if str(st.get("structure") or "") and str(st.get("structure") or "") != str(struct_lbl or ""):
                 return False
             ts = float(st.get("ts") or 0.0)
             if ts <= 0 or (time.time() - ts) > float(scenario_ttl_sec):
@@ -30662,13 +30698,13 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             prev_price_anchor = _clean_level(st.get("price_anchor"))
             if prev_price_anchor is not None:
                 price_anchor_drift = abs(float(price) - float(prev_price_anchor))
-                price_anchor_limit = max(float(atr_abs) * (3.0 if scenario_hard_anchor else 1.75), float(price) * (0.012 if scenario_hard_anchor else 0.006))
+                price_anchor_limit = max(float(atr_abs) * (5.0 if scenario_hard_anchor else 3.0), float(price) * (0.018 if scenario_hard_anchor else 0.010))
                 if price_anchor_drift > price_anchor_limit:
                     return False
 
             lo = _clean_level(st.get("min_level"))
             hi = _clean_level(st.get("max_level"))
-            pad = max(float(atr_abs) * 2.25, float(price) * 0.012)
+            pad = max(float(atr_abs) * 3.5, float(price) * 0.018)
             if lo is not None and price < (float(lo) - pad):
                 return False
             if hi is not None and price > (float(hi) + pad):
@@ -30677,16 +30713,16 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             prev_anchor_res = _clean_level(st.get("anchor_resist_near"))
             cur_anchor_sup = _clean_level(anchor_support_near) or _clean_level(local_support_lvl) or _clean_level(support1)
             cur_anchor_res = _clean_level(anchor_resist_near) or _clean_level(local_resist_lvl) or _clean_level(resistance1)
-            anchor_pad = max(float(atr_abs) * 3.0, float(price) * 0.012)
+            anchor_pad = max(float(atr_abs) * 4.5, float(price) * 0.018)
             if prev_anchor_sup is not None and price < (float(prev_anchor_sup) - anchor_pad):
                 return False
-            if prev_anchor_res is not None and price > (float(prev_anchor_res) + anchor_pad * 1.15):
+            if prev_anchor_res is not None and price > (float(prev_anchor_res) + anchor_pad * 1.25):
                 return False
             if prev_anchor_sup is not None and cur_anchor_sup is not None:
-                if abs(float(prev_anchor_sup) - float(cur_anchor_sup)) > max(float(atr_abs) * 4.5, float(price) * 0.02):
+                if abs(float(prev_anchor_sup) - float(cur_anchor_sup)) > max(float(atr_abs) * 6.0, float(price) * 0.03):
                     return False
             if prev_anchor_res is not None and cur_anchor_res is not None:
-                if abs(float(prev_anchor_res) - float(cur_anchor_res)) > max(float(atr_abs) * 4.5, float(price) * 0.02):
+                if abs(float(prev_anchor_res) - float(cur_anchor_res)) > max(float(atr_abs) * 6.0, float(price) * 0.03):
                     return False
             prev_s1 = _clean_level(st.get("range_low"))
             prev_r1 = _clean_level(st.get("range_high"))
@@ -30694,12 +30730,12 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
                 old_mid = (float(prev_s1) + float(prev_r1)) / 2.0
                 new_mid = (float(support1) + float(resistance1)) / 2.0
                 drift = abs(new_mid - old_mid)
-                max_drift = max(float(atr_abs) * (6.0 if scenario_hard_anchor else 3.0), float(price) * (0.025 if scenario_hard_anchor else 0.012))
+                max_drift = max(float(atr_abs) * (8.0 if scenario_hard_anchor else 4.5), float(price) * (0.032 if scenario_hard_anchor else 0.018))
                 if drift > max_drift:
                     return False
                 old_rng = max(1e-9, float(prev_r1) - float(prev_s1))
                 new_rng = max(1e-9, float(resistance1) - float(support1))
-                if abs(new_rng - old_rng) / old_rng > (0.45 if scenario_hard_anchor else 0.22):
+                if abs(new_rng - old_rng) / old_rng > (0.60 if scenario_hard_anchor else 0.30):
                     return False
             return True
         except Exception:
@@ -30711,7 +30747,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         try:
             lo_b, hi_b = _scenario_state_bounds()
             payload = {
-                "version": 8,
+                "version": 9,
                 "ts": time.time(),
                 "symbol": str(sym),
                 "market": str(mkt),
@@ -30735,7 +30771,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
     short_scenarios = []
     long_scenarios = []
 
-    short_a_tps = _dedupe_levels([short_tp1, short_tp2, short_tp3], direction='desc')
+    short_a_tps = _rr_target_ladder(entry_zone_lo or price, short_retest_sl, [short_tp1, short_tp2, short_tp3], direction='desc', rr_steps=(0.9, 1.8, 2.8))
     if _valid_short_range(entry_zone_lo, entry_zone_hi, short_retest_sl, short_a_tps, require_near_price=scenario_use_price_filters):
         short_scenarios.append({
             'title_ru': 'ретест supply',
@@ -30748,7 +30784,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             'tp': _fmt_tp_values(short_a_tps, direction='desc'),
         })
 
-    short_b_tps = _dedupe_levels([entry_zone_lo, short_tp1, short_tp2], direction='desc')
+    short_b_tps = _rr_target_ladder(sweep_zone_lo or entry_zone_lo or price, short_sweep_sl_hi or short_sweep_sl_lo, [entry_zone_lo, short_tp1, short_tp2, short_tp3], direction='desc', rr_steps=(1.0, 2.0, 3.0))
     if _valid_short_range(sweep_zone_lo, sweep_zone_hi, short_sweep_sl_hi or short_sweep_sl_lo, short_b_tps, require_near_price=scenario_use_price_filters, require_above=entry_zone_hi):
         short_scenarios.append({
             'title_ru': 'sweep liquidity сверху',
@@ -30761,8 +30797,8 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             'tp': _fmt_tp_values(short_b_tps, direction='desc'),
         })
 
-    short_c_tps = _dedupe_levels([short_tp2, short_tp3], direction='desc')
     short_break_sl_anchor = short_break_sl_lo or short_break_sl_hi
+    short_c_tps = _rr_target_ladder(short_break_entry or price, short_break_sl_anchor, [short_tp1, short_tp2, short_tp3], direction='desc', rr_steps=(1.1, 2.1, 3.2))
     if _valid_short_break(short_break_entry, short_break_sl_anchor, short_c_tps, require_below_price=scenario_use_price_filters):
         short_scenarios.append({
             'title_ru': 'пробой поддержки',
@@ -30775,12 +30811,18 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             'tp': _fmt_tp_values(short_c_tps, direction='desc'),
         })
 
-    long_a_tps = _filter_targets_by_rr(
+    long_a_tps = _rr_target_ladder(
         entry_zone_hi or entry_zone_lo or price,
         long_reclaim_sl,
-        [long_tp1, long_tp2, long_tp3],
+        _filter_targets_by_rr(
+            entry_zone_hi or entry_zone_lo or price,
+            long_reclaim_sl,
+            [long_tp1, long_tp2, long_tp3],
+            direction='asc',
+            min_rr_first=0.75,
+        ),
         direction='asc',
-        min_rr_first=0.75,
+        rr_steps=(0.9, 1.8, 2.8),
     )
     if _valid_long_range(entry_zone_lo, entry_zone_hi, long_reclaim_sl, long_a_tps, require_near_price=scenario_use_price_filters):
         long_scenarios.append({
@@ -30794,7 +30836,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             'tp': _fmt_tp_values(long_a_tps, direction='asc'),
         })
 
-    long_b_tps = _dedupe_levels([long_bounce_tp1, long_bounce_tp2, long_bounce_tp3], direction='asc')
+    long_b_tps = _rr_target_ladder(bounce_zone_hi or bounce_zone_lo or price, long_bounce_sl, [long_bounce_tp1, long_bounce_tp2, long_bounce_tp3], direction='asc', rr_steps=(1.0, 2.0, 3.0))
     if _valid_long_range(bounce_zone_lo, bounce_zone_hi, long_bounce_sl, long_b_tps, require_below_price=scenario_use_price_filters):
         long_scenarios.append({
             'title_ru': 'отскок от поддержки',
@@ -30807,7 +30849,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             'tp': _fmt_tp_values(long_b_tps, direction='asc'),
         })
 
-    long_c_tps = _dedupe_levels([long_discount_tp1, long_discount_tp2, long_discount_tp3], direction='asc')
+    long_c_tps = _rr_target_ladder(discount_zone_hi or discount_zone_lo or price, long_discount_sl, [long_discount_tp1, long_discount_tp2, long_discount_tp3], direction='asc', rr_steps=(1.1, 2.1, 3.2))
     if _valid_long_range(discount_zone_lo, discount_zone_hi, long_discount_sl, long_c_tps, require_below= bounce_zone_lo or price):
         long_scenarios.append({
             'title_ru': 'deep discount long',
