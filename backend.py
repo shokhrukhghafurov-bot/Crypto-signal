@@ -21077,6 +21077,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             "confidence": "ne",
                             "score": "ne",
                             "vol_x": "ne",
+                            "late_entry": "ne",
+                            "anti_bounce": "ne",
                         }
                         it["_trig_reqs"] = {}
                     except Exception:
@@ -21425,30 +21427,47 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
                             hb_log_reason, hb_apply_reason = (None, None)
+                        try:
+                            _smart_trigger_active = bool(smart_trigger)
+                        except Exception:
+                            _smart_trigger_active = False
+                        if hb_apply_reason == "late_entry" and _smart_trigger_active:
+                            try:
+                                raw_reason_for_gate = str(hb_raw_reason or hb_log_reason or "late_entry").strip() or "late_entry"
+                                if isinstance(it.get("_trig_reqs"), dict):
+                                    it["_trig_reqs"]["late_entry"] = True
+                                if isinstance(it.get("_trig_checks"), dict):
+                                    it["_trig_checks"]["late_entry"] = f"fail:{raw_reason_for_gate}"
+                                it["_trig_late_entry_reason"] = raw_reason_for_gate
+                            except Exception:
+                                pass
+                            hb_log_reason, hb_apply_reason = (None, None)
                         if hb_apply_reason:
+                            raw_reason_for_log = str(hb_raw_reason or hb_log_reason or "").strip()
                             try:
                                 if hb_apply_reason == "vol_low":
                                     if isinstance(it.get("_trig_reqs"), dict):
                                         it["_trig_reqs"]["vol_x"] = True
                                     if isinstance(it.get("_trig_checks"), dict):
-                                        it["_trig_checks"]["vol_x"] = "fail"
+                                        it["_trig_checks"]["vol_x"] = (f"fail:{raw_reason_for_log}" if raw_reason_for_log else "fail")
                                 elif hb_apply_reason == "regime_block":
                                     if isinstance(it.get("_trig_reqs"), dict):
                                         it["_trig_reqs"]["adx"] = True
                                     if isinstance(it.get("_trig_checks"), dict):
-                                        it["_trig_checks"]["adx"] = "fail"
+                                        it["_trig_checks"]["adx"] = (f"fail:{raw_reason_for_log}" if raw_reason_for_log else "fail")
                                 else:
                                     if isinstance(it.get("_trig_reqs"), dict):
                                         it["_trig_reqs"][hb_apply_reason] = True
                                     if isinstance(it.get("_trig_checks"), dict):
-                                        it["_trig_checks"][hb_apply_reason] = "fail"
-                                it["_trig_fail_reasons"] = [str(hb_log_reason)]
-                                it["_trig_primary_reason"] = str(hb_log_reason)
-                                it["_trig_term_reason"] = str(hb_log_reason)
+                                        it["_trig_checks"][hb_apply_reason] = (f"fail:{raw_reason_for_log}" if raw_reason_for_log else "fail")
+                                it["_trig_fail_reasons"] = [str(hb_apply_reason)]
+                                it["_trig_primary_reason"] = str(hb_apply_reason)
+                                it["_trig_term_reason"] = str(raw_reason_for_log or hb_apply_reason)
+                                it["_trig_hardblock_raw_reason"] = str(raw_reason_for_log)
                             except Exception:
                                 pass
                             keep_it, outc = _pending_apply_fail(it, hb_apply_reason, now)
-                            _pending_log_trigger(sym, market, direction, outc, hb_log_reason, it, float(price))
+                            _pending_log_trigger(sym, market, direction, outc, (raw_reason_for_log or hb_log_reason or hb_apply_reason), it, float(price))
                             if keep_it:
                                 keep.append(it)
                                 any_wait = True
@@ -22495,7 +22514,25 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             "confidence": ("confidence_low", "confidence_low"),
                             "score": ("score_low", "score_low"),
                             "vol_x": ("vol_low", "vol_low"),
+                            "late_entry": ("late_entry", "late_entry"),
                         }
+                        def _resolve_trigger_log_reason(fail_key: str, default_reason: str) -> str:
+                            try:
+                                fk = str(fail_key or "").strip()
+                                if fk == "late_entry":
+                                    raw_reason = ""
+                                    tc = it.get("_trig_checks") if isinstance(it.get("_trig_checks"), dict) else {}
+                                    if isinstance(tc, dict):
+                                        raw_reason = str(tc.get("late_entry") or "").strip()
+                                        if raw_reason.lower().startswith("fail:"):
+                                            raw_reason = raw_reason.split(":", 1)[1].strip()
+                                    if not raw_reason:
+                                        raw_reason = str(it.get("_trig_late_entry_reason") or "").strip()
+                                    if raw_reason:
+                                        return raw_reason
+                                return str(default_reason or fk or "")
+                            except Exception:
+                                return str(default_reason or fail_key or "")
                         # Reuse the already-resolved smart trigger flag from the current trigger pass.
                         # Avoid fragile self-reference here so refactors cannot turn this into NameError.
                         try:
@@ -22538,10 +22575,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             # Quality-first: even in smart mode we do not allow failed required checks.
                             if strict_required and required_failed:
                                 first_key = str(required_failed[0])
-                                log_reason, apply_reason = _reason_map.get(first_key, (first_key, first_key))
+                                log_reason_base, apply_reason = _reason_map.get(first_key, (first_key, first_key))
+                                log_reason = _resolve_trigger_log_reason(first_key, log_reason_base)
                                 try:
                                     it["_trig_fail_reasons"] = [(_reason_map.get(k, (k, k))[0]) for k in required_failed]
-                                    it["_trig_primary_reason"] = str(log_reason)
+                                    it["_trig_primary_reason"] = str(log_reason_base)
                                     it["_trig_term_reason"] = str(log_reason)
                                 except Exception:
                                     pass
@@ -22596,10 +22634,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         else:
                             if required_failed:
                                 first_key = str(required_failed[0])
-                                log_reason, apply_reason = _reason_map.get(first_key, (first_key, first_key))
+                                log_reason_base, apply_reason = _reason_map.get(first_key, (first_key, first_key))
+                                log_reason = _resolve_trigger_log_reason(first_key, log_reason_base)
                                 try:
                                     it["_trig_fail_reasons"] = [(_reason_map.get(k, (k, k))[0]) for k in required_failed]
-                                    it["_trig_primary_reason"] = str(log_reason)
+                                    it["_trig_primary_reason"] = str(log_reason_base)
+                                    it["_trig_term_reason"] = str(log_reason)
                                 except Exception:
                                     pass
                                 keep_it, outc = _pending_apply_fail(it, apply_reason, now)
