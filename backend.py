@@ -28086,11 +28086,10 @@ def _tr_i18n(lang: str, key: str, **kwargs) -> str:
             return key
 
 def _fmt_int_space(x) -> str:
-    """Human-friendly price/level formatter.
+    """Human-friendly price/level formatter with adaptive precision.
 
-    Previously this formatted everything as an integer, which made low-priced
-    assets (e.g., PEPE at 0.0000...) display as 0. We keep the function name for
-    compatibility but format adaptively.
+    Keep higher precision for sub-100 instruments so scenario levels on assets
+    like CAKE do not collapse into the same rounded text value.
     """
     try:
         v = float(x)
@@ -28100,10 +28099,14 @@ def _fmt_int_space(x) -> str:
         av = abs(v)
         if av >= 1000:
             s = f"{v:,.0f}"
-        elif av >= 1:
+        elif av >= 100:
             s = f"{v:,.2f}"
-        elif av >= 0.01:
+        elif av >= 1:
+            s = f"{v:,.3f}"
+        elif av >= 0.1:
             s = f"{v:.4f}"
+        elif av >= 0.01:
+            s = f"{v:.5f}"
         elif av >= 0.0001:
             s = f"{v:.6f}"
         else:
@@ -30222,7 +30225,31 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         if len(vals) >= 2:
             lo_v, hi_v = min(vals), max(vals)
             if hi_v > lo_v:
-                return f"{_fmt_int_space(lo_v)} – {_fmt_int_space(hi_v)}"
+                lo_s = _fmt_int_space(lo_v)
+                hi_s = _fmt_int_space(hi_v)
+                if lo_s != hi_s:
+                    return f"{lo_s} – {hi_s}"
+
+                av = max(abs(lo_v), abs(hi_v))
+                if av >= 1000:
+                    start_nd = 1
+                elif av >= 100:
+                    start_nd = 3
+                elif av >= 1:
+                    start_nd = 4
+                elif av >= 0.1:
+                    start_nd = 5
+                elif av >= 0.01:
+                    start_nd = 6
+                else:
+                    start_nd = 7
+
+                for nd in range(start_nd, 9):
+                    lo_s = _fmt_float(lo_v, nd)
+                    hi_s = _fmt_float(hi_v, nd)
+                    if lo_s != hi_s:
+                        return f"{lo_s} – {hi_s}"
+                return lo_s
         if len(vals) == 1:
             return _fmt_int_space(vals[0])
         return "—"
@@ -30572,7 +30599,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         return any(tp > hi_v for tp in _dedupe_levels(tps, direction='asc'))
 
     scenario_stable_mode = str(os.getenv("SCENARIO_STABLE_5D", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
-    scenario_use_price_filters = str(os.getenv("SCENARIO_STABLE_USE_PRICE_FILTERS", "0") or "0").strip().lower() not in ("0", "false", "no", "off")
+    scenario_use_price_filters = str(os.getenv("SCENARIO_STABLE_USE_PRICE_FILTERS", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
     try:
         scenario_ttl_sec = int(float(os.getenv("SCENARIO_STABLE_TTL_SEC", str(5 * 24 * 3600))) or (5 * 24 * 3600))
     except Exception:
@@ -30622,14 +30649,26 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         if not scenario_stable_mode or not isinstance(st, dict):
             return False
         try:
+            if int(st.get("version") or 0) < 8:
+                return False
             if str(st.get("symbol") or "") != str(sym) or str(st.get("market") or "") != str(mkt):
+                return False
+            if str(st.get("structure") or "") and str(st.get("structure") or "") != str(struct_lbl or ""):
                 return False
             ts = float(st.get("ts") or 0.0)
             if ts <= 0 or (time.time() - ts) > float(scenario_ttl_sec):
                 return False
+
+            prev_price_anchor = _clean_level(st.get("price_anchor"))
+            if prev_price_anchor is not None:
+                price_anchor_drift = abs(float(price) - float(prev_price_anchor))
+                price_anchor_limit = max(float(atr_abs) * (3.0 if scenario_hard_anchor else 1.75), float(price) * (0.012 if scenario_hard_anchor else 0.006))
+                if price_anchor_drift > price_anchor_limit:
+                    return False
+
             lo = _clean_level(st.get("min_level"))
             hi = _clean_level(st.get("max_level"))
-            pad = max(float(atr_abs) * 3.25, float(price) * 0.02)
+            pad = max(float(atr_abs) * 2.25, float(price) * 0.012)
             if lo is not None and price < (float(lo) - pad):
                 return False
             if hi is not None and price > (float(hi) + pad):
@@ -30638,16 +30677,16 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             prev_anchor_res = _clean_level(st.get("anchor_resist_near"))
             cur_anchor_sup = _clean_level(anchor_support_near) or _clean_level(local_support_lvl) or _clean_level(support1)
             cur_anchor_res = _clean_level(anchor_resist_near) or _clean_level(local_resist_lvl) or _clean_level(resistance1)
-            anchor_pad = max(float(atr_abs) * 4.5, float(price) * 0.02)
+            anchor_pad = max(float(atr_abs) * 3.0, float(price) * 0.012)
             if prev_anchor_sup is not None and price < (float(prev_anchor_sup) - anchor_pad):
                 return False
-            if prev_anchor_res is not None and price > (float(prev_anchor_res) + anchor_pad * 1.35):
+            if prev_anchor_res is not None and price > (float(prev_anchor_res) + anchor_pad * 1.15):
                 return False
             if prev_anchor_sup is not None and cur_anchor_sup is not None:
-                if abs(float(prev_anchor_sup) - float(cur_anchor_sup)) > max(float(atr_abs) * 6.0, float(price) * 0.03):
+                if abs(float(prev_anchor_sup) - float(cur_anchor_sup)) > max(float(atr_abs) * 4.5, float(price) * 0.02):
                     return False
             if prev_anchor_res is not None and cur_anchor_res is not None:
-                if abs(float(prev_anchor_res) - float(cur_anchor_res)) > max(float(atr_abs) * 6.0, float(price) * 0.03):
+                if abs(float(prev_anchor_res) - float(cur_anchor_res)) > max(float(atr_abs) * 4.5, float(price) * 0.02):
                     return False
             prev_s1 = _clean_level(st.get("range_low"))
             prev_r1 = _clean_level(st.get("range_high"))
@@ -30655,12 +30694,12 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
                 old_mid = (float(prev_s1) + float(prev_r1)) / 2.0
                 new_mid = (float(support1) + float(resistance1)) / 2.0
                 drift = abs(new_mid - old_mid)
-                max_drift = max(float(atr_abs) * (8.0 if scenario_hard_anchor else 4.0), float(price) * (0.035 if scenario_hard_anchor else 0.018))
+                max_drift = max(float(atr_abs) * (6.0 if scenario_hard_anchor else 3.0), float(price) * (0.025 if scenario_hard_anchor else 0.012))
                 if drift > max_drift:
                     return False
                 old_rng = max(1e-9, float(prev_r1) - float(prev_s1))
                 new_rng = max(1e-9, float(resistance1) - float(support1))
-                if abs(new_rng - old_rng) / old_rng > (0.65 if scenario_hard_anchor else 0.35):
+                if abs(new_rng - old_rng) / old_rng > (0.45 if scenario_hard_anchor else 0.22):
                     return False
             return True
         except Exception:
@@ -30672,7 +30711,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         try:
             lo_b, hi_b = _scenario_state_bounds()
             payload = {
-                "version": 7,
+                "version": 8,
                 "ts": time.time(),
                 "symbol": str(sym),
                 "market": str(mkt),
