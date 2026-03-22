@@ -27163,7 +27163,19 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 risk_note=(str(risk_note or "").strip() + (" | " if str(risk_note or "").strip() else "") + f"smart_setup_emit=1 smart_conf={int(_conf_now)}/{int(_smart_conf_need)}").strip(),
                                                 ts=time.time(),
                                             )
-                                            _recent_low_now, _recent_high_now = _mid_recent_extremes_for_late_entry(df5=df5i, df30=df30i)
+                                            _df5i_now = locals().get("df5i")
+                                            if _df5i_now is None:
+                                                try:
+                                                    _df5_raw_now = rec.get("df5") if isinstance(rec, dict) else None
+                                                except Exception:
+                                                    _df5_raw_now = None
+                                                try:
+                                                    if _df5_raw_now is not None and not getattr(_df5_raw_now, "empty", True):
+                                                        _df5i_now = _add_indicators(_df5_raw_now)
+                                                except Exception:
+                                                    _df5i_now = _df5_raw_now
+                                            _df30i_now = locals().get("df30i")
+                                            _recent_low_now, _recent_high_now = _mid_recent_extremes_for_late_entry(df5=_df5i_now, df30=_df30i_now)
                                             try:
                                                 _atr_now = float((base_r.get("atr_abs") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or rec.get("atr_at_create") or 0.0)
                                             except Exception:
