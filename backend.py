@@ -1714,19 +1714,31 @@ def _mid_zone_touch_guard_reason(ta: dict | None) -> str:
     """Hard veto reasons for early zone-touch alerts.
 
     Zone-touch alerts must stay high-quality: we allow them only when the first
-    touch of the pending zone is directionally consistent. In addition to the
-    existing hard blockers, we explicitly veto zone-touch alerts for the most
-    dangerous local contradictions requested by the user:
+    touch of the pending zone is directionally consistent and the local RSI is
+    still inside the preferred entry window. In addition to the existing hard
+    blockers, we explicitly veto zone-touch alerts for the most dangerous local
+    contradictions requested by the user:
       - SHORT + BO↑ / BO↑ + Retest
       - LONG  + BO↓ / BO↓ + Retest
       - SHORT + Bullish Engulfing
       - LONG  + Bearish Engulfing
+      - LONG / SHORT outside the configured RSI entry window
     """
     try:
         t = ta if isinstance(ta, dict) else {}
         raw = str(t.get("block_reason") or "").strip()
         head = raw.split()[0].split("=", 1)[0].strip().lower() if raw else ""
-        if head in ("directional_contradiction", "regime_block", "adx_30m", "adx_1h", "wrong_vwap_side", "vwap_bias", "vwap_dist_atr"):
+        if head in (
+            "directional_contradiction",
+            "regime_block",
+            "adx_30m",
+            "adx_1h",
+            "wrong_vwap_side",
+            "vwap_bias",
+            "vwap_dist_atr",
+            "rsi_long",
+            "rsi_short",
+        ):
             return raw or head
 
         side = ""
@@ -1752,6 +1764,26 @@ def _mid_zone_touch_guard_reason(ta: dict | None) -> str:
                 return f"directional_contradiction breakout={bo}"
             if pat == "Bearish Engulfing":
                 return f"directional_contradiction pattern={pat}"
+
+        try:
+            rsi_5m = float(t.get("rsi"))
+        except Exception:
+            rsi_5m = float("nan")
+        if rsi_5m == rsi_5m and side in ("LONG", "SHORT"):
+            rsi_long_max = MID_ULTRA_RSI_LONG_MAX if MID_ULTRA_SAFE else MID_RSI_LONG_MAX
+            rsi_long_min = MID_ULTRA_RSI_LONG_MIN if MID_ULTRA_SAFE else MID_RSI_LONG_MIN
+            rsi_short_min = MID_ULTRA_RSI_SHORT_MIN if MID_ULTRA_SAFE else MID_RSI_SHORT_MIN
+            rsi_short_max = MID_ULTRA_RSI_SHORT_MAX if MID_ULTRA_SAFE else MID_RSI_SHORT_MAX
+            if side == "LONG":
+                if rsi_5m >= rsi_long_max:
+                    return f"rsi_long={rsi_5m:.1f} >= {rsi_long_max:g}"
+                if rsi_5m < rsi_long_min:
+                    return f"rsi_long={rsi_5m:.1f} < {rsi_long_min:g}"
+            else:
+                if rsi_5m <= rsi_short_min:
+                    return f"rsi_short={rsi_5m:.1f} <= {rsi_short_min:g}"
+                if rsi_5m >= rsi_short_max:
+                    return f"rsi_short={rsi_5m:.1f} >= {rsi_short_max:g}"
 
         if bool(t.get("trap_ok", True)) is False:
             return str(t.get("trap_reason") or "trap_block")
