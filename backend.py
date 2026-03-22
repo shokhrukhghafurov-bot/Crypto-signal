@@ -1711,12 +1711,48 @@ def _mid_pending_entry_ref(it: dict | None, *, price: float | None = None, ta: d
 
 
 def _mid_zone_touch_guard_reason(ta: dict | None) -> str:
+    """Hard veto reasons for early zone-touch alerts.
+
+    Zone-touch alerts must stay high-quality: we allow them only when the first
+    touch of the pending zone is directionally consistent. In addition to the
+    existing hard blockers, we explicitly veto zone-touch alerts for the most
+    dangerous local contradictions requested by the user:
+      - SHORT + BO↑ / BO↑ + Retest
+      - LONG  + BO↓ / BO↓ + Retest
+      - SHORT + Bullish Engulfing
+      - LONG  + Bearish Engulfing
+    """
     try:
         t = ta if isinstance(ta, dict) else {}
         raw = str(t.get("block_reason") or "").strip()
         head = raw.split()[0].split("=", 1)[0].strip().lower() if raw else ""
         if head in ("directional_contradiction", "regime_block", "adx_30m", "adx_1h", "wrong_vwap_side", "vwap_bias", "vwap_dist_atr"):
             return raw or head
+
+        side = ""
+        for key in ("direction", "dir", "side", "dir4", "dir1"):
+            try:
+                v = str(t.get(key) or "").strip().upper()
+            except Exception:
+                v = ""
+            if v in ("LONG", "SHORT"):
+                side = v
+                break
+
+        bo = str(t.get("breakout_retest") or t.get("bo_rt") or "").strip()
+        pat = str(t.get("pattern") or "").strip()
+
+        if side == "SHORT":
+            if bo.startswith("BO↑"):
+                return f"directional_contradiction breakout={bo}"
+            if pat == "Bullish Engulfing":
+                return f"directional_contradiction pattern={pat}"
+        elif side == "LONG":
+            if bo.startswith("BO↓"):
+                return f"directional_contradiction breakout={bo}"
+            if pat == "Bearish Engulfing":
+                return f"directional_contradiction pattern={pat}"
+
         if bool(t.get("trap_ok", True)) is False:
             return str(t.get("trap_reason") or "trap_block")
         return ""
