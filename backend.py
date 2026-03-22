@@ -1753,17 +1753,21 @@ def _mid_zone_touch_guard_reason(ta: dict | None) -> str:
 
         bo = str(t.get("breakout_retest") or t.get("bo_rt") or "").strip()
         pat = str(t.get("pattern") or "").strip()
+        try:
+            pat_norm = " ".join(pat.split()).casefold()
+        except Exception:
+            pat_norm = ""
 
         if side == "SHORT":
             if bo.startswith("BO↑"):
                 return f"directional_contradiction breakout={bo}"
-            if pat == "Bullish Engulfing":
-                return f"directional_contradiction pattern={pat}"
+            if pat_norm == "bullish engulfing":
+                return f"directional_contradiction pattern={pat or pat_norm}"
         elif side == "LONG":
             if bo.startswith("BO↓"):
                 return f"directional_contradiction breakout={bo}"
-            if pat == "Bearish Engulfing":
-                return f"directional_contradiction pattern={pat}"
+            if pat_norm == "bearish engulfing":
+                return f"directional_contradiction pattern={pat or pat_norm}"
 
         try:
             rsi_5m = float(t.get("rsi"))
@@ -10506,6 +10510,58 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
         # if filter computation fails, respect fail-closed flag
         return "mid_filter_error" if MID_FAIL_CLOSED else None
     return None
+def _signal_levels_sanity_gate(sig: "Signal") -> tuple[bool, str]:
+    """Return (ok, reason) for basic signal-level sanity.
+
+    Used by zone-touch alerts so obviously broken anchored levels never reach
+    users. This is intentionally lightweight and direction-aware:
+      - entry/sl/tp must be positive and on the correct side of entry
+      - relative SL/TP distance must stay within a generous cap
+    """
+    try:
+        direction = str(getattr(sig, "direction", "") or getattr(sig, "side", "") or "").upper().strip()
+        entry = float(getattr(sig, "entry", 0.0) or 0.0)
+        sl = float(getattr(sig, "sl", 0.0) or 0.0)
+        tp1 = float(getattr(sig, "tp1", 0.0) or 0.0)
+        tp2 = float(getattr(sig, "tp2", 0.0) or 0.0)
+        if entry <= 0:
+            return (False, "entry<=0")
+        if sl <= 0:
+            return (False, "sl<=0")
+        target = tp2 if tp2 > 0 else tp1
+        if target <= 0:
+            return (False, "tp<=0")
+
+        is_short = ("SHORT" in direction)
+        eps = max(1e-12, abs(entry) * 1e-9)
+        if is_short:
+            if sl <= entry + eps:
+                return (False, f"sl_not_above_entry:{sl:.6g}<={entry:.6g}")
+            if target >= entry - eps:
+                return (False, f"tp_not_below_entry:{target:.6g}>={entry:.6g}")
+        else:
+            if sl >= entry - eps:
+                return (False, f"sl_not_below_entry:{sl:.6g}>={entry:.6g}")
+            if target <= entry + eps:
+                return (False, f"tp_not_above_entry:{target:.6g}<={entry:.6g}")
+
+        try:
+            max_rel = float(os.getenv("MID_ZONE_TOUCH_SANITY_MAX_REL_DIST", "0.50") or 0.50)
+        except Exception:
+            max_rel = 0.50
+        if max_rel > 0:
+            sl_rel = abs(sl - entry) / max(entry, eps)
+            tp_rel = abs(target - entry) / max(entry, eps)
+            if sl_rel > max_rel:
+                return (False, f"sl_rel_too_large:{sl_rel:.3f}>{max_rel:.3f}")
+            if tp_rel > max_rel:
+                return (False, f"tp_rel_too_large:{tp_rel:.3f}>{max_rel:.3f}")
+
+        return (True, "")
+    except Exception as e:
+        return (False, f"levels_sanity_error:{type(e).__name__}")
+
+
 def _normalize_signal_levels_inplace(sig) -> None:
     """Make signal levels direction-consistent.
 
@@ -21287,10 +21343,23 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                         risk_note=_touch_note,
                                         ts=time.time(),
                                     )
-                                    await emit_signal_cb(sig_zone)
-                                    it["zone_touch_alert_sent"] = True
-                                    it["zone_touch_alert_ts"] = float(now)
-                                    logger.info("[mid][pending][zone_touch_alert] %s %s %s conf=%s anchor=%.6g px=%.6g slip_atr=%.2f", sym, market, direction, int(_touch_conf_now), float(_touch_entry_ref), float(price), float(_touch_slip_atr))
+                                    _normalize_signal_levels_inplace(sig_zone)
+                                    _levels_ok, _levels_reason = _signal_levels_sanity_gate(sig_zone)
+                                    if not _levels_ok:
+                                        it["zone_touch_alert_guard_reason"] = f"levels_sanity:{_levels_reason}"
+                                    else:
+                                        _rr_ok, _rr_val, _rr_min = signal_rr_gate(sig_zone)
+                                        if not _rr_ok:
+                                            it["zone_touch_alert_guard_reason"] = f"rr_low:{_rr_val:.2f}<{_rr_min:.2f}"
+                                        else:
+                                            _profit_ok, _profit_pct, _profit_min = signal_min_profit_gate(sig_zone)
+                                            if not _profit_ok:
+                                                it["zone_touch_alert_guard_reason"] = f"profit_low:{_profit_pct:.3f}<{_profit_min:.3f}"
+                                            else:
+                                                await emit_signal_cb(sig_zone)
+                                                it["zone_touch_alert_sent"] = True
+                                                it["zone_touch_alert_ts"] = float(now)
+                                                logger.info("[mid][pending][zone_touch_alert] %s %s %s conf=%s anchor=%.6g px=%.6g slip_atr=%.2f", sym, market, direction, int(_touch_conf_now), float(_touch_entry_ref), float(price), float(_touch_slip_atr))
                                 else:
                                     it["zone_touch_alert_anchor_slip_atr"] = float(_touch_slip_atr)
                             elif _touch_guard:
