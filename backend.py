@@ -13002,6 +13002,45 @@ def _mid_liquidity_sweep_5m(df5i: pd.DataFrame, *, lookback: int = 20) -> Tuple[
         return (False, False, "—")
 
 
+def _mid_eq_levels_1h(df1hi: pd.DataFrame, *, entry: float, atr_pct: float) -> Tuple[float | None, float | None]:
+    """Best-effort Equal High/Low detection on 1h for MID formatter/context."""
+    try:
+        if df1hi is None or df1hi.empty:
+            return (None, None)
+
+        atr_abs_30m = abs(float(entry)) * (abs(float(atr_pct)) / 100.0) if (entry and atr_pct == atr_pct) else (abs(float(entry)) * 0.002)
+        tol_liq = max(atr_abs_30m * 0.4, abs(float(entry)) * 0.001)
+
+        def _swing_points(_df: pd.DataFrame, left: int = 3, right: int = 3):
+            try:
+                if _df is None or getattr(_df, "empty", True) or len(_df) < (left + right + 20):
+                    return [], []
+                highs = _df["high"].astype(float).values
+                lows = _df["low"].astype(float).values
+                sh, sl = [], []
+                for i in range(left, len(_df) - right):
+                    h = highs[i]
+                    l = lows[i]
+                    if h == max(highs[i-left:i+right+1]):
+                        sh.append((i, float(h)))
+                    if l == min(lows[i-left:i+right+1]):
+                        sl.append((i, float(l)))
+                return sh, sl
+            except Exception:
+                return [], []
+
+        eq_hi = None
+        eq_lo = None
+        sh, sl = _swing_points(df1hi, left=3, right=3)
+        if len(sh) >= 2 and abs(sh[-1][1] - sh[-2][1]) <= tol_liq:
+            eq_hi = (sh[-1][1] + sh[-2][1]) / 2.0
+        if len(sl) >= 2 and abs(sl[-1][1] - sl[-2][1]) <= tol_liq:
+            eq_lo = (sl[-1][1] + sl[-2][1]) / 2.0
+        return (eq_hi, eq_lo)
+    except Exception:
+        return (None, None)
+
+
 def _mid_breakout_retest_trigger(df5i: pd.DataFrame, *, direction: str, support: float | None, resistance: float | None, atr5: float) -> Tuple[bool, str]:
     """Detect breakout and (optional) retest on 5m using provided S/R levels.
     Returns (triggered, label).
@@ -13739,6 +13778,8 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     ob_zone = None  # (low, high)
     ob_found = False
     ob_retest = False
+    eq_hi = None
+    eq_lo = None
 
     try:
         use_regime = _mid_bool_env("MID_USE_REGIME", "1")
@@ -13767,6 +13808,12 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         if use_sweep:
             lb = int(os.getenv("MID_SWEEP_LOOKBACK_5M", "20") or 20)
             sweep_long, sweep_short, sweep_txt = _mid_liquidity_sweep_5m(df5i, lookback=lb)
+
+        # Equal Highs/Lows on 1h (for formatter + liquidity context)
+        try:
+            eq_hi, eq_lo = _mid_eq_levels_1h(df1hi, entry=float(entry), atr_pct=float(atr_pct))
+        except Exception:
+            eq_hi, eq_lo = (None, None)
 
         # Breakout+Retest trigger (levels from 30m, fallback to 1h)
         sup_lvl = res_lvl = None
@@ -14592,6 +14639,10 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "breakout_retest": breakout_retest,
         "regime": mid_regime,
         "structure_hhhl_1h": struct_hhhl_1h,
+        "eq_hi": eq_hi,
+        "eq_lo": eq_lo,
+        "sweep_long": bool(sweep_long),
+        "sweep_short": bool(sweep_short),
         "sweep": sweep_txt,
         "bo_rt": bo_rt_label,
         "ob_zone": ob_zone,
@@ -15334,7 +15385,7 @@ def _ta_signal_grade(ta: Dict[str, Any]) -> str:
         mstruct = sget("mstruct", "structure").upper()
         breakout_retest = sget("breakout_retest", "bo_rt")
         ob_retest = bool(ta.get("ob_retest", False))
-        trap_ok = bool(ta.get("trap_ok", True))
+        trap_ok = (bool(ta.get("trap_ok")) if ("trap_ok" in ta) else None)
         reason_blob = " | ".join(
             [
                 sget("trap_reason"),
@@ -15342,7 +15393,7 @@ def _ta_signal_grade(ta: Dict[str, Any]) -> str:
             ]
         ).lower()
 
-        if not trap_ok:
+        if trap_ok is False:
             fatal_reason = "trap_block"
         elif "directional_contradiction" in reason_blob:
             fatal_reason = "directional_contradiction"
@@ -15538,9 +15589,16 @@ def _fmt_ta_block(ta: Dict[str, Any]) -> str:
             f"ADX 1h/4h: {fnum(adx1, '{:.1f}')}/{fnum(adx4, '{:.1f}')} | ATR%: {fnum(atrp, '{:.2f}')}",
             f"BB: {bb} | Vol xAvg: {fnum(volr, '{:.2f}')} | VWAP: {vwap}",
         ]
-        trap_ok = bool(ta.get("trap_ok", True))
+        trap_filters_enabled = _mid_trap_env_bool("MID_TRAP_FILTERS", True)
+        trap_state_known = ("trap_ok" in ta)
+        trap_ok = (bool(ta.get("trap_ok")) if trap_state_known else None)
         trap_reason = str(ta.get("trap_reason", "") or "")
-        trap_line = "🧱 Trap: OK" if trap_ok else ("🧱 Trap: BLOCKED (" + trap_reason + ")" if trap_reason else "🧱 Trap: BLOCKED")
+        if not trap_filters_enabled:
+            trap_line = "🧱 Trap: OFF"
+        elif trap_ok is None:
+            trap_line = "🧱 Trap: —"
+        else:
+            trap_line = "🧱 Trap: OK" if trap_ok else ("🧱 Trap: BLOCKED (" + trap_reason + ")" if trap_reason else "🧱 Trap: BLOCKED")
         lines.append(trap_line)
         # extra context (keep concise)
         ctx = []
@@ -15566,54 +15624,226 @@ def _fmt_ta_block(ta: Dict[str, Any]) -> str:
         return ""
 
 def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
-    """TA block for ⚡ MID scanner (5m/30m/1h)."""
+    """TA block for ⚡ MID scanner (5m/30m/1h).
+
+    Ordinary signal = mandatory TA only.
+    PRO/verbose signal = mandatory TA + optional confluence fields.
+    Debug / institutional-only fields stay out of Telegram alerts.
+    """
     try:
         if not ta:
             return ""
-        score = ta.get("confidence", ta.get("ta_score", 0))
+
+        def _as_float(val, default=0.0):
+            try:
+                if val is None or (isinstance(val, float) and np.isnan(val)):
+                    return float(default)
+                return float(val)
+            except Exception:
+                return float(default)
+
+        def _safe_float(val, default=None):
+            try:
+                if val is None:
+                    return default
+                fv = float(val)
+                if np.isnan(fv):
+                    return default
+                return fv
+            except Exception:
+                return default
+
+        def _fmt_num(val, fmt="{:.2f}", default="—"):
+            try:
+                if val is None:
+                    return default
+                fv = float(val)
+                if np.isnan(fv):
+                    return default
+                return fmt.format(fv)
+            except Exception:
+                return default
+
+        def _fmt_signed(val, fmt="{:+.4f}", default="—"):
+            try:
+                if val is None:
+                    return default
+                fv = float(val)
+                if np.isnan(fv):
+                    return default
+                return fmt.format(fv)
+            except Exception:
+                return default
+
+        def _fmt_sr(val) -> str:
+            try:
+                if val is None:
+                    return "—"
+                fv = float(val)
+                if np.isnan(fv):
+                    return "—"
+                return _fmt_int_space(fv)
+            except Exception:
+                s = str(val or "").strip()
+                return s or "—"
+
+        def _fmt_zone(z) -> str:
+            try:
+                if z is None:
+                    return "—"
+                if isinstance(z, (list, tuple)) and len(z) >= 2 and z[0] is not None and z[1] is not None:
+                    z0 = float(z[0])
+                    z1 = float(z[1])
+                    if z1 < z0:
+                        z0, z1 = z1, z0
+                    return f"[{_fmt_int_space(z0)}-{_fmt_int_space(z1)}]"
+            except Exception:
+                pass
+            return str(z or "—")
+
+        def _env_float_local(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, str(default)) or default)
+            except Exception:
+                return float(default)
+
+        def _status_emoji(ok) -> str:
+            if ok is True:
+                return "✅"
+            if ok is False:
+                return "⚠️"
+            return "•"
+
         mode_txt = (mode or "").strip() or os.getenv("MID_SIGNAL_MODE", "") or os.getenv("SIGNAL_MODE", "")
         mode_txt = (mode_txt or "strict").strip().lower()
-        rsi = float(ta.get("rsi", 0.0) or 0.0)
-        macd_hist = float(ta.get("macd_hist", 0.0) or 0.0)
-        adx_30m = float(ta.get("adx1", 0.0) or 0.0)
-        adx_1h = float(ta.get("adx4", 0.0) or 0.0)
-        atr_pct = float(ta.get("atr_pct", 0.0) or 0.0)
-        bb = ta.get("bb", "—")
-        volx = float(ta.get("rel_vol", 0.0) or 0.0)
-        vwap = ta.get("vwap", "—")
-        ch = ta.get("channel", "—")
-        pa = ta.get("mstruct", ta.get("structure", "—"))
-        pattern = ta.get("pattern", "—")
-        sup = ta.get("support", "—")
-        res = ta.get("resistance", "—")
-        br = ta.get("breakout_retest", "—")
+
+        verbose_raw = (
+            os.getenv("MID_SIGNAL_VERBOSE", "")
+            or os.getenv("MID_TA_VERBOSE", "")
+            or os.getenv("MID_SIGNAL_TA_VARIANT", "")
+        ).strip().lower()
+        verbose_mode = verbose_raw in ("1", "true", "yes", "on", "pro", "verbose", "full")
+
+        direction = str(ta.get("direction") or ta.get("dir4") or ta.get("dir1") or "").strip().upper()
+        market_txt = str(ta.get("market") or os.getenv("MID_DEFAULT_MARKET", "FUTURES") or "FUTURES").strip().upper()
+        if market_txt not in ("SPOT", "FUTURES"):
+            market_txt = "FUTURES"
+
+        ta_score = ta.get("ta_score", ta.get("ta_score_total", ta.get("score", ta.get("confidence", 0))))
+        confidence = ta.get("ta_score_conf", ta.get("confidence", ta_score))
+        score_txt = _fmt_num(ta_score, "{:.0f}", default="0")
+        conf_txt = _fmt_num(confidence, "{:.0f}", default="0")
+        grade = _ta_signal_grade(ta)
+
+        score_need = _env_float_local("MID_MIN_SCORE_FUTURES" if market_txt == "FUTURES" else "MID_MIN_SCORE_SPOT", 90.0)
+        conf_need = _env_float_local("MID_MIN_CONFIDENCE", 90.0)
+
+        rsi = _as_float(ta.get("rsi", 0.0))
+        macd_hist = _as_float(ta.get("macd_hist", 0.0))
+        adx_30m = _as_float(ta.get("adx1", ta.get("adx_30m", 0.0)))
+        adx_1h = _as_float(ta.get("adx4", ta.get("adx_1h", 0.0)))
+        atr_pct = _as_float(ta.get("atr_pct", 0.0))
+        bb = str(ta.get("bb", "—") or "—")
+        volx = _as_float(ta.get("rel_vol", 0.0))
+        vwap = str(ta.get("vwap", "—") or "—")
+        vwap_val = _safe_float(ta.get("vwap_val"), None)
+        entry_val = _safe_float(ta.get("entry"), None)
+        ch = str(ta.get("channel", "—") or "—")
+        pa = str(ta.get("mstruct", ta.get("structure", "—")) or "—")
+        regime = str(ta.get("regime", "—") or "—")
+        pattern = str(ta.get("pattern", "—") or "—")
+        sup = ta.get("support", None)
+        res = ta.get("resistance", None)
+        br = str(ta.get("breakout_retest", "—") or "—")
+        bo_rt = str(ta.get("bo_rt", br) or "—")
         eq_hi = ta.get("eq_hi", None)
         eq_lo = ta.get("eq_lo", None)
-        sweep = ta.get("sweep", "")
+        sweep = str(ta.get("sweep", "") or "—")
         obtxt = "YES" if bool(ta.get("ob_retest", False)) else "—"
-        grade = _ta_signal_grade(ta)
-        lines = [
-            f"📊 TA score: {int(round(float(score))):d}/100 | Grade: {grade} | Mode: {mode_txt}",
-            f"RSI(5m): {rsi:.1f} | MACD hist(5m): {macd_hist:.4f}",
-            f"ADX 30m/1h: {adx_30m:.1f}/{adx_1h:.1f} | ATR% (30m): {atr_pct:.2f}",
-            f"BB: {bb} | Vol xAvg: {volx:.2f} | VWAP: {vwap}",
-            f"Ch: {ch} | PA: {pa} | Regime: {ta.get('regime', '—')}",
-            f"Liquidity: EQH: {(_fmt_int_space(eq_hi) if eq_hi is not None else '—')} | EQL: {(_fmt_int_space(eq_lo) if eq_lo is not None else '—')} | Sweep(5m): {sweep or '—'}",
-            f"Breakout/Retest: {br} | OB retest: {obtxt}",
-            f"Pattern: {pattern} | Support: {sup} | Resistance: {res}",
-        ]
-        trap_ok = bool(ta.get("trap_ok", True))
-        trap_reason = str(ta.get("trap_reason", "") or "")
-        trap_line = "🧱 Trap: OK" if trap_ok else ("🧱 Trap: BLOCKED (" + trap_reason + ")" if trap_reason else "🧱 Trap: BLOCKED")
-        # Put right after VWAP line
+        ob_zone = ta.get("ob_zone", None)
+        fvg = str(ta.get("fvg", "—") or "—")
+        fvg_active = bool(ta.get("fvg_active", False))
+        range_pos = str(ta.get("range_pos", "—") or "—")
+        rsi_div = str(ta.get("rsi_div", "—") or "—")
+        htf_struct = str(ta.get("structure_hhhl_1h", "—") or "—")
+
+        rsi_long_min = MID_ULTRA_RSI_LONG_MIN if MID_ULTRA_SAFE else MID_RSI_LONG_MIN
+        rsi_long_max = MID_ULTRA_RSI_LONG_MAX if MID_ULTRA_SAFE else MID_RSI_LONG_MAX
+        rsi_short_min = MID_ULTRA_RSI_SHORT_MIN if MID_ULTRA_SAFE else MID_RSI_SHORT_MIN
+        rsi_short_max = MID_ULTRA_RSI_SHORT_MAX if MID_ULTRA_SAFE else MID_RSI_SHORT_MAX
+        adx30_need = _env_float_local("MID_MIN_ADX_30M", 20.0)
+        adx1h_need = _env_float_local("MID_MIN_ADX_1H", 22.0)
+        vol_need = _env_float_local("MID_MIN_VOL_X", 0.0)
+
+        if direction == "LONG":
+            rsi_thr_txt = f"{rsi_long_min:g}-{rsi_long_max:g}"
+            rsi_ok = (rsi >= rsi_long_min) and (rsi < rsi_long_max)
+            macd_thr_txt = "> 0"
+            macd_ok = macd_hist > 0
+        elif direction == "SHORT":
+            rsi_thr_txt = f"{rsi_short_min:g}-{rsi_short_max:g}"
+            rsi_ok = (rsi > rsi_short_min) and (rsi <= rsi_short_max)
+            macd_thr_txt = "< 0"
+            macd_ok = macd_hist < 0
+        else:
+            rsi_thr_txt = "—"
+            rsi_ok = None
+            macd_thr_txt = "dir-based"
+            macd_ok = None
+
+        adx_ok = (adx_30m >= adx30_need) and (adx_1h >= adx1h_need)
+        vol_ok = (volx >= vol_need)
+
+        vwap_side_txt = vwap
+        vwap_ok = None
         try:
-            lines.insert(4, trap_line)
+            if entry_val is not None and vwap_val is not None and direction in ("LONG", "SHORT"):
+                if direction == "LONG":
+                    vwap_ok = entry_val >= vwap_val
+                    vwap_side_txt = f"above ({_fmt_num(entry_val, '{:.2f}')} >= {_fmt_num(vwap_val, '{:.2f}')})"
+                else:
+                    vwap_ok = entry_val <= vwap_val
+                    vwap_side_txt = f"below ({_fmt_num(entry_val, '{:.2f}')} <= {_fmt_num(vwap_val, '{:.2f}')})"
         except Exception:
-            lines.append(trap_line)
+            vwap_ok = None
+
+        trap_filters_enabled = _mid_trap_env_bool("MID_TRAP_FILTERS", True)
+        trap_state_known = ("trap_ok" in ta)
+        trap_ok = (bool(ta.get("trap_ok")) if trap_state_known else None)
+        trap_reason = str(ta.get("trap_reason", "") or "")
+        if not trap_filters_enabled:
+            trap_line = "🧱 Trap: OFF"
+        elif trap_ok is None:
+            trap_line = "🧱 Trap: —"
+        else:
+            trap_line = "🧱 Trap: OK" if trap_ok else ("🧱 Trap: BLOCKED (" + trap_reason + ")" if trap_reason else "🧱 Trap: BLOCKED")
+
+        lines = [
+            f"📊 TA score: {score_txt}/100 [need ≥{score_need:.0f}] | Grade: {grade} | Mode: {mode_txt}",
+            f"🎯 Confidence: {conf_txt}/100 [need ≥{conf_need:.0f}]",
+            f"{_status_emoji(rsi_ok)} RSI(5m): {rsi:.1f} [need {rsi_thr_txt}] | {_status_emoji(macd_ok)} MACD hist(5m): {_fmt_signed(macd_hist)} [need {macd_thr_txt}]",
+            f"{_status_emoji(adx_ok)} ADX 30m/1h: {adx_30m:.1f}/{adx_1h:.1f} [need ≥{adx30_need:.0f}/≥{adx1h_need:.0f}] | • ATR% (30m): {atr_pct:.2f}",
+            f"• BB: {bb} | {_status_emoji(vol_ok)} Vol xAvg: {volx:.2f} [need ≥{vol_need:.2f}] | {_status_emoji(vwap_ok)} VWAP: {vwap_side_txt}",
+            trap_line,
+            f"Ch: {ch} | PA: {pa} | Regime: {regime}",
+            f"Liquidity (EQH / EQL): {(_fmt_sr(eq_hi) if eq_hi is not None else '—')} / {(_fmt_sr(eq_lo) if eq_lo is not None else '—')} | Sweep(5m): {sweep}",
+            f"Breakout/Retest: {br} | OB retest: {obtxt}",
+            f"Pattern: {pattern} | Support: {_fmt_sr(sup)} | Resistance: {_fmt_sr(res)}",
+        ]
+
+        if verbose_mode:
+            ob_zone_txt = _fmt_zone(ob_zone)
+            fvg_txt = fvg
+            if fvg_txt != "—" and fvg_active:
+                fvg_txt += " active"
+            lines.extend([
+                f"➕ Additional TA: BO/RT: {bo_rt} | OB zone: {ob_zone_txt} | FVG: {fvg_txt}",
+                f"➕ HTF struct: {htf_struct} | Range pos: {range_pos} | RSI div: {rsi_div}",
+            ])
+
         return "\n".join(lines)
     except Exception:
         return ""
-
 
 def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
     score = 0
