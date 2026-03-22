@@ -1556,12 +1556,181 @@ def _mid_hardblock_key(reason: str) -> str:
         return "unknown"
 
 
-def _mid_trigger_selected_hardblock_reason(reason: str) -> tuple[str | None, str | None]:
+
+def _mid_zone_touch_alert_enabled() -> bool:
+    try:
+        return (os.getenv("MID_ZONE_TOUCH_ALERT_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return True
+
+
+def _mid_pending_is_fresh_bo_rt(it: dict | None, *, now_ts: float | None = None) -> bool:
+    try:
+        rec = it if isinstance(it, dict) else {}
+        bo_txt = str(rec.get("bo_rt") or rec.get("breakout_retest") or "").strip().upper()
+        if not bo_txt:
+            return False
+        if ("BO" not in bo_txt) and ("BREAKOUT" not in bo_txt) and ("RETEST" not in bo_txt):
+            return False
+        try:
+            max_bars = int(float(os.getenv("MID_FRESH_BO_RT_MAX_BARS", "4") or 4))
+        except Exception:
+            max_bars = 4
+        try:
+            max_sec = float(os.getenv("MID_FRESH_BO_RT_MAX_SEC", "1800") or 1800)
+        except Exception:
+            max_sec = 1800.0
+        try:
+            age_bars = rec.get("breakout_first_age_bars_create")
+            if age_bars is not None and int(float(age_bars)) <= max(0, max_bars):
+                return True
+        except Exception:
+            pass
+        try:
+            age_sec = rec.get("breakout_first_age_sec_create")
+            if age_sec is not None and float(age_sec) <= max(0.0, max_sec):
+                return True
+        except Exception:
+            pass
+        if now_ts is not None:
+            try:
+                first_ts = rec.get("breakout_first_ts")
+                if first_ts is not None:
+                    ts = float(first_ts)
+                    if ts > 1e12:
+                        ts /= 1000.0
+                    if ts > 0 and (float(now_ts) - ts) <= max(0.0, max_sec):
+                        return True
+            except Exception:
+                pass
+        return False
+    except Exception:
+        return False
+
+
+def _mid_pending_entry_ref(it: dict | None, *, price: float | None = None, ta: dict | None = None) -> tuple[float, bool, float]:
+    """Prefer the original pending anchor over the current market price.
+
+    Returns (entry_ref, too_far_from_anchor, slippage_atr).
+    too_far_from_anchor means the current market has drifted too far from the
+    stored pending entry idea and the setup should be skipped/expired instead of
+    being repriced from the worse market price.
+    """
+    rec = it if isinstance(it, dict) else {}
+    ta = ta or {}
+    try:
+        zone_mid = rec.get("pending_zone_mid")
+        if zone_mid is None:
+            lo = rec.get("entry_low")
+            hi = rec.get("entry_high")
+            if lo is not None and hi is not None:
+                try:
+                    zone_mid = (float(lo) + float(hi)) / 2.0
+                except Exception:
+                    zone_mid = None
+        anchor = None
+        for cand in (
+            rec.get("pending_entry_anchor"),
+            rec.get("pending_entry_ref"),
+            zone_mid,
+            rec.get("entry"),
+            ta.get("entry"),
+            price,
+        ):
+            try:
+                fv = float(cand or 0.0)
+                if fv > 0:
+                    anchor = fv
+                    break
+            except Exception:
+                pass
+        if not anchor or anchor <= 0:
+            return (0.0, False, 0.0)
+
+        current = None
+        for cand in (price, ta.get("entry"), ta.get("close"), anchor):
+            try:
+                fv = float(cand or 0.0)
+                if fv > 0:
+                    current = fv
+                    break
+            except Exception:
+                pass
+        if not current or current <= 0:
+            return (float(anchor), False, 0.0)
+
+        atr_use = None
+        for cand in (ta.get("atr30"), ta.get("atr_abs"), rec.get("atr_at_create")):
+            try:
+                fv = float(cand or 0.0)
+                if fv > 0:
+                    atr_use = fv
+                    break
+            except Exception:
+                pass
+        if not atr_use or atr_use <= 0:
+            atr_use = max(abs(float(anchor)) * 0.001, 1e-9)
+
+        in_zone = False
+        try:
+            lo = rec.get("entry_low")
+            hi = rec.get("entry_high")
+            if lo is not None and hi is not None:
+                lo_f = float(lo)
+                hi_f = float(hi)
+                if hi_f >= lo_f > 0:
+                    in_zone = bool(lo_f <= float(current) <= hi_f)
+        except Exception:
+            in_zone = False
+
+        try:
+            slip_atr = abs(float(current) - float(anchor)) / float(atr_use)
+        except Exception:
+            slip_atr = 0.0
+
+        try:
+            max_slip = float(rec.get("pending_max_slippage_atr") or 0.0)
+        except Exception:
+            max_slip = 0.0
+        if max_slip <= 0:
+            try:
+                env_name = "MID_PENDING_ANCHOR_MAX_SLIPPAGE_ATR_FRESH_BO_RT" if _mid_pending_is_fresh_bo_rt(rec) else "MID_PENDING_ANCHOR_MAX_SLIPPAGE_ATR"
+                default_v = "0.55" if env_name.endswith("FRESH_BO_RT") else "0.35"
+                max_slip = float(os.getenv(env_name, default_v) or default_v)
+            except Exception:
+                max_slip = 0.55 if _mid_pending_is_fresh_bo_rt(rec) else 0.35
+
+        too_far = bool((not in_zone) and max_slip > 0 and slip_atr > max_slip)
+        return (float(anchor), bool(too_far), float(slip_atr))
+    except Exception:
+        try:
+            fallback = float((it or {}).get("entry") or 0.0)
+        except Exception:
+            fallback = 0.0
+        return (float(fallback), False, 0.0)
+
+
+def _mid_zone_touch_guard_reason(ta: dict | None) -> str:
+    try:
+        t = ta if isinstance(ta, dict) else {}
+        raw = str(t.get("block_reason") or "").strip()
+        head = raw.split()[0].split("=", 1)[0].strip().lower() if raw else ""
+        if head in ("directional_contradiction", "regime_block", "adx_30m", "adx_1h", "wrong_vwap_side", "vwap_bias", "vwap_dist_atr"):
+            return raw or head
+        if bool(t.get("trap_ok", True)) is False:
+            return str(t.get("trap_reason") or "trap_block")
+        return ""
+    except Exception:
+        return ""
+
+
+def _mid_trigger_selected_hardblock_reason(reason: str, it: dict | None = None) -> tuple[str | None, str | None]:
     """Selectively enforce hard-blocks that must be respected at actual entry / emit.
 
-    Borderline late-entry / anti-bounce cases stay *soft* at trigger-time when
-    MID_SOFT_BLOCKS_ENABLED=1 and the same soft-penalty logic says the setup is
-    still acceptable. Deep / clearly bad entries remain hard-blocked.
+    Trigger-time logic is stricter than scan-time logic: late confirmations and
+    anti-bounce entries should usually be rejected rather than repriced from the
+    current market. The only intentional relaxation is for genuinely fresh
+    breakout/retest setups, where anti-bounce can remain advisory.
 
     Returns (log_reason, apply_reason) or (None, None) when the raw reason should
     remain ignored by trigger-time logic.
@@ -1571,6 +1740,7 @@ def _mid_trigger_selected_hardblock_reason(reason: str) -> tuple[str | None, str
         if not raw:
             return (None, None)
         head = raw.split()[0].split("=", 1)[0].strip().lower()
+        fresh_bo_rt = _mid_pending_is_fresh_bo_rt(it)
         if head in ("rsi_long", "rsi_short"):
             return (head, head)
         if head in ("adx_30m", "adx_1h"):
@@ -1586,18 +1756,14 @@ def _mid_trigger_selected_hardblock_reason(reason: str) -> tuple[str | None, str
         if head in ("vwap_dist_atr", "vwap_bias", "wrong_vwap_side"):
             return ("vwap_dist", "vwap_dist")
         if head == "late_entry_atr":
-            try:
-                if _mid_soft_block_penalty_for_reason(raw) is not None:
-                    return (None, None)
-            except Exception:
-                pass
             return ("late_entry", "late_entry")
         if head in ("anti_bounce_short", "anti_bounce_long"):
             try:
-                if _mid_soft_block_penalty_for_reason(raw) is not None:
-                    return (None, None)
+                relax_fresh = (os.getenv("MID_TRIGGER_RELAX_ANTI_BOUNCE_FRESH_BO_RT", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
             except Exception:
-                pass
+                relax_fresh = True
+            if fresh_bo_rt and relax_fresh:
+                return (None, None)
             return ("anti_bounce", "anti_bounce")
         return (None, None)
     except Exception:
@@ -4192,6 +4358,13 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     if is_blocked_symbol(sym):
         logger.warning("[autotrade] blocked stable pair skip: %s", sym)
         return _skip("blocked_symbol", symbol=sym)
+
+    try:
+        risk_note_u = str(getattr(sig, "risk_note", "") or "").upper()
+    except Exception:
+        risk_note_u = ""
+    if ("ZONE_TOUCH_ALERT=1" in risk_note_u) or ("NO_AUTOTRADE=1" in risk_note_u):
+        return _skip("zone_touch_alert", symbol=sym)
 
     st = await db_store.get_autotrade_settings(uid)
     mt = "spot" if market == "SPOT" else "futures"
@@ -21010,6 +21183,53 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         pass
 
+                    try:
+                        if _entered_zone_for_trigger and _mid_zone_touch_alert_enabled() and (not bool(it.get("zone_touch_alert_sent") or False)):
+                            try:
+                                _touch_conf_need = int(float(os.getenv("MID_ZONE_TOUCH_ALERT_MIN_CONF", os.getenv("MID_SMART_SETUP_EMIT_CONF", "90")) or 90))
+                            except Exception:
+                                _touch_conf_need = 90
+                            try:
+                                _touch_conf_now = int(float(it.get("confidence") or 0))
+                            except Exception:
+                                _touch_conf_now = 0
+                            _touch_guard = _mid_zone_touch_guard_reason(ta)
+                            _touch_strong = bool(_touch_conf_now >= _touch_conf_need) or _mid_pending_is_fresh_bo_rt(it, now_ts=now)
+                            if _touch_strong and (not _touch_guard):
+                                _touch_entry_ref, _touch_anchor_far, _touch_slip_atr = _mid_pending_entry_ref(it, price=price, ta=ta)
+                                if not _touch_anchor_far:
+                                    _touch_entry, _touch_sl, _touch_tp1, _touch_tp2, _touch_rr = _mid_recalc_levels_from_trigger(direction, _touch_entry_ref, ta, it, market)
+                                    _touch_note_base = str(it.get("risk_note") or "").strip()
+                                    _touch_note = (_touch_note_base + (" | " if _touch_note_base else "") + "zone_touch_alert=1 no_autotrade=1 levels_anchor=1").strip()
+                                    sig_zone = Signal(
+                                        signal_id=self.next_signal_id(),
+                                        market=market,
+                                        symbol=sym,
+                                        direction=direction,
+                                        timeframe=str(it.get("timeframe") or "5m/30m/1h"),
+                                        entry=_touch_entry,
+                                        sl=_touch_sl,
+                                        tp1=_touch_tp1,
+                                        tp2=_touch_tp2,
+                                        rr=_touch_rr,
+                                        confidence=_touch_conf_now,
+                                        confirmations=str(it.get("confirmations") or it.get("available_exchanges") or src_ex),
+                                        source_exchange=src_ex,
+                                        available_exchanges=str(it.get("available_exchanges") or it.get("confirmations") or src_ex),
+                                        risk_note=_touch_note,
+                                        ts=time.time(),
+                                    )
+                                    await emit_signal_cb(sig_zone)
+                                    it["zone_touch_alert_sent"] = True
+                                    it["zone_touch_alert_ts"] = float(now)
+                                    logger.info("[mid][pending][zone_touch_alert] %s %s %s conf=%s anchor=%.6g px=%.6g slip_atr=%.2f", sym, market, direction, int(_touch_conf_now), float(_touch_entry_ref), float(price), float(_touch_slip_atr))
+                                else:
+                                    it["zone_touch_alert_anchor_slip_atr"] = float(_touch_slip_atr)
+                            elif _touch_guard:
+                                it["zone_touch_alert_guard_reason"] = str(_touch_guard)
+                    except Exception:
+                        pass
+
                     trig_checked_n += 1
                     if _in_zone_for_trigger:
                         trig_inzone_checked_n += 1
@@ -21066,10 +21286,19 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
                             try:
-                                try:
-                                    entry_ref = float(price) if (price is not None and float(price) > 0) else float(it.get("entry") or entry0)
-                                except Exception:
-                                    entry_ref = float(it.get("entry") or entry0)
+                                entry_ref, _anchor_too_far, _anchor_slip_atr = _mid_pending_entry_ref(it, price=price, ta=None)
+                                if _anchor_too_far:
+                                    keep_it, outc = _pending_apply_fail(it, "late_entry", now)
+                                    _pending_log_trigger(sym, market, direction, outc, f"anchor_slippage_atr={float(_anchor_slip_atr):.2f}", it, float(price))
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
                                 entry_emit, sl_emit, tp1_emit, tp2_emit, rr_emit = _mid_recalc_levels_from_trigger(direction, entry_ref, None, it, market)
                                 conf_emit = int(float(it.get("confidence") or it.get("min_confidence") or 0))
                                 conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "") or str(src_ex)
@@ -21089,7 +21318,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     confirmations=conf_names,
                                     source_exchange=src_ex,
                                     available_exchanges=conf_names,
-                                    risk_note=str(it.get("risk_note") or "INSTANT_EMIT (filters bypassed)") + " | levels_recalc=1",
+                                    risk_note=str(it.get("risk_note") or "INSTANT_EMIT (filters bypassed)") + " | instant_emit_bypass=1 | levels_anchor=1",
                                     ts=time.time(),
                                 )
 
@@ -21506,7 +21735,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # when MID_SOFT_BLOCKS_ENABLED=1; deep cases still hard-block.
                     try:
                         hb_raw_reason = str(ta.get("block_reason") or "").strip()
-                        hb_log_reason, hb_apply_reason = _mid_trigger_selected_hardblock_reason(hb_raw_reason)
+                        hb_log_reason, hb_apply_reason = _mid_trigger_selected_hardblock_reason(hb_raw_reason, it)
                         try:
                             _late_relief_ok, _late_relief_reason, _late_relief_meta = _mid_pending_trigger_breakout_late_relief(
                                 it,
@@ -21663,10 +21892,19 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         anti_ok_now = not bool(anti_reason_now)
                         micro_ok_now = bool(ta.get("trap_ok", False))
                         micro_reason_now = str(ta.get("trap_reason") or "instant_micro_trap")
-                        try:
-                            entry_ref = float(price) if (price is not None and float(price) > 0) else float(it.get("entry") or entry0)
-                        except Exception:
-                            entry_ref = float(it.get("entry") or entry0)
+                        entry_ref, _anchor_too_far, _anchor_slip_atr = _mid_pending_entry_ref(it, price=price, ta=None)
+                        if _anchor_too_far:
+                            keep_it, outc = _pending_apply_fail(it, "late_entry", now)
+                            _pending_log_trigger(sym, market, direction, outc, f"anchor_slippage_atr={float(_anchor_slip_atr):.2f}", it, float(price))
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
+                            else:
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                            continue
                         entry_emit, sl_emit, tp1_emit, tp2_emit, rr_emit = _mid_recalc_levels_from_trigger(direction, entry_ref, None, it, market)
                         conf_emit = int(float(it.get("confidence") or it.get("min_confidence") or 0))
                         try:
@@ -21689,7 +21927,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             confirmations=conf_names,
                             source_exchange=src_ex,
                             available_exchanges=conf_names,
-                            risk_note=str(it.get("risk_note") or "") + " | instant_vip=1 | levels_recalc=1",
+                            risk_note=str(it.get("risk_note") or "") + " | instant_vip=1 | confirmed_entry=1 | levels_anchor=1",
                             ts=time.time(),
                         )
                         instant_ok, instant_reason, instant_meta = _mid_instant_emit_gate(
@@ -22256,6 +22494,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 min_score_spot = int(os.getenv("MID_MIN_SCORE_SPOT","76") or 76)
                                 min_score_fut = int(os.getenv("MID_MIN_SCORE_FUTURES","72") or 72)
                             need = float(min_score_fut if market == "FUTURES" else min_score_spot)
+                            try:
+                                if _mid_pending_is_fresh_bo_rt(it, now_ts=now):
+                                    need = max(0.0, float(need) - float(os.getenv("MID_TRIGGER_RELAX_SCORE_FRESH_BO_RT", "8") or 8))
+                                    it["_trig_score_need_relaxed"] = float(need)
+                            except Exception:
+                                pass
                             score = float(it.get("_trig_score") if (it.get("_trig_score") is not None) else (ta.get("score") or ta.get("total") or 0.0))
                             # Always record values for logging/diagnostics
                             try:
@@ -22497,7 +22741,20 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                         block_vol_range = os.getenv("MID_INST_BLOCK_VOL_LOW_RANGE", "0").strip().lower() in ("1","true","yes","on")
                                     except Exception:
                                         block_vol_range = False
-                                    if (inst_reg == "RANGE") and (not block_vol_range):
+                                    try:
+                                        _fresh_bo_rt_vol_relax = _mid_pending_is_fresh_bo_rt(it, now_ts=now) and ((os.getenv("MID_TRIGGER_RELAX_VOL_LOW_FRESH_BO_RT", "1") or "1").strip().lower() in ("1", "true", "yes", "on"))
+                                    except Exception:
+                                        _fresh_bo_rt_vol_relax = False
+                                    if _fresh_bo_rt_vol_relax:
+                                        try:
+                                            it["_trig_vol_thr_why"] = (str(it.get("_trig_vol_thr_why") or "") + ",FRESH_BO_RT").strip(",")
+                                        except Exception:
+                                            pass
+                                        try:
+                                            it["_trig_checks"]["vol_x"] = "pass(fresh_bo_rt)"
+                                        except Exception:
+                                            pass
+                                    elif (inst_reg == "RANGE") and (not block_vol_range):
                                         # keep waiting or pass through (no block)
                                         try:
                                             it["_trig_vol_thr_why"] = (str(it.get("_trig_vol_thr_why") or "") + ",IGNORED_RANGE").strip(",")
@@ -22849,10 +23106,19 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 return _fv
                         return default
 
-                    try:
-                        entry_ref = float(price) if (price is not None and float(price) > 0) else _mid_pick_scalar(ta.get("entry"), entry0, it.get("entry"), default=0.0)
-                    except Exception:
-                        entry_ref = _mid_pick_scalar(ta.get("entry"), entry0, it.get("entry"), default=0.0)
+                    entry_ref, _anchor_too_far, _anchor_slip_atr = _mid_pending_entry_ref(it, price=price, ta=ta)
+                    if _anchor_too_far:
+                        keep_it, outc = _pending_apply_fail(it, "late_entry", now)
+                        _pending_log_trigger(sym, market, direction, outc, f"anchor_slippage_atr={float(_anchor_slip_atr):.2f}", it, float(price))
+                        if keep_it:
+                            keep.append(it)
+                            any_wait = True
+                        else:
+                            try:
+                                removed_n += 1
+                            except Exception:
+                                pass
+                        continue
                     entry, sl, tp1, tp2, rr = _mid_recalc_levels_from_trigger(direction, entry_ref, ta, it, market)
                     conf = int(_mid_pick_scalar(ta.get("confidence"), it.get("confidence"), default=0.0))
 
@@ -22860,6 +23126,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     if not conf_names:
                         conf_names = str(src_ex)
 
+                    try:
+                        it["confirmed_entry_sent"] = True
+                        it["confirmed_entry_ts"] = float(now)
+                    except Exception:
+                        pass
                     sig = Signal(
                         signal_id=self.next_signal_id(),
                         market=market,
@@ -22875,7 +23146,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         confirmations=conf_names,
                         source_exchange=src_ex,
                         available_exchanges=conf_names,
-                        risk_note=str(it.get("risk_note") or "ENTRY CONFIRMED") + " | trigger_revalidated=1 | levels_recalc=1",
+                        risk_note=str(it.get("risk_note") or "ENTRY CONFIRMED") + " | confirmed_entry=1 | trigger_revalidated=1 | levels_anchor=1",
                         ts=time.time(),
                     )
 
@@ -26656,6 +26927,12 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "direction": diru,
                                         "timeframe": f"{tf_trigger}/{tf_mid}/{tf_trend}",
                                         "entry": float(entry),
+                                        "pending_entry_anchor": float(entry),
+                                        "pending_entry_ref": float(entry),
+                                        "pending_zone_mid": (((float(entry_low) + float(entry_high)) / 2.0) if (entry_low is not None and entry_high is not None) else float(entry)),
+                                        "pending_max_slippage_atr": (float(os.getenv("MID_PENDING_ANCHOR_MAX_SLIPPAGE_ATR_FRESH_BO_RT", "0.55") or 0.55) if _mid_pending_is_fresh_bo_rt({"bo_rt": str((base_r.get("bo_rt") if ("base_r" in locals() and isinstance(base_r, dict)) else bo_rt_label) or bo_rt_label or "—"), "breakout_retest": str((base_r.get("breakout_retest") if ("base_r" in locals() and isinstance(base_r, dict)) else bo_rt_label) or bo_rt_label or "—"), "breakout_first_age_bars_create": _bo_age_bars_create, "breakout_first_age_sec_create": _bo_age_sec_create}) else float(os.getenv("MID_PENDING_ANCHOR_MAX_SLIPPAGE_ATR", "0.35") or 0.35)),
+                                        "zone_touch_alert_sent": False,
+                                        "confirmed_entry_sent": False,
                                         "entry_low": entry_low,
                                         "entry_high": entry_high,
                                         "entry_zone_src": str(z_src),
@@ -27054,6 +27331,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 _smart_pending_reason = _smart_pending_reason or "gate_block"
 
                                             if _emit_now and _can_emit_now:
+                                                try:
+                                                    rec["confirmed_entry_sent"] = True
+                                                    rec["confirmed_entry_ts"] = float(time.time())
+                                                except Exception:
+                                                    pass
                                                 try:
                                                     self.mark_emitted_mid(sym, sig_emit.direction, sig_emit.market)
                                                 except TypeError:
