@@ -14793,6 +14793,21 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "ta_score_total": int(ta_score_total),
         "ta_score_conf": int(confidence),
     }
+    try:
+        if str(os.getenv("MID_STRUCTURE_FIRST_LEVELS", "1") or "1").strip().lower() not in ("0", "false", "no", "off"):
+            _sl_sf, _tp1_sf, _tp2_sf, _rr_sf, _ = _mid_build_structure_first_levels(
+                str(ta.get("direction") or dir_trend),
+                float(ta.get("entry") or entry),
+                float(ta.get("atr_abs") or ta.get("atr30") or atr30),
+                ta=ta,
+                it=None,
+                tp2_r=float(ta.get("tp2_r") or tp2_r),
+                market=str(market or "FUTURES"),
+            )
+            ta["sl"], ta["tp1"], ta["tp2"], ta["rr"] = float(_sl_sf), float(_tp1_sf), float(_tp2_sf), float(_rr_sf)
+            ta["level_engine"] = "STRUCTURE_FIRST"
+    except Exception:
+        pass
     ta["ta_block"] = _fmt_ta_block_mid(ta)
     return ta
 def choose_market(adx1_max: float, atr_pct_max: float) -> str:
@@ -15032,7 +15047,12 @@ def _mid_anchor_sl_to_structure(direction: str,
                                 atr: float,
                                 ta: dict | None = None,
                                 it: dict | None = None) -> float:
-    """Move SL behind real structure instead of keeping a tight ATR stop inside the zone."""
+    """Move SL behind the *nearest* valid structure, not the farthest extreme.
+
+    Structure-first logic should invalidate the idea at the closest meaningful
+    level behind the setup (zone edge / support-resistance / EQH-EQL / recent
+    swing), while ATR is used only as a safety buffer.
+    """
     d = str(direction or "").upper().strip()
     entry_f = float(entry or 0.0)
     sl_f = float(raw_sl or 0.0)
@@ -15064,11 +15084,15 @@ def _mid_anchor_sl_to_structure(direction: str,
         _push(it.get("support"))
         _push(ta.get("eq_lo"))
         _push(it.get("eq_lo"))
+        _push(ta.get("recent_low"))
+        _push(it.get("recent_low"))
         _push(ta.get("sl"))
         _push(it.get("sl"))
         below = [x for x in anchors if x < entry_f]
         if below:
-            return float(min(sl_f, min(below) - buf))
+            # nearest invalidation below entry
+            nearest = max(below)
+            return float(min(sl_f, nearest - buf))
         return float(sl_f)
 
     if d == "SHORT":
@@ -15077,11 +15101,15 @@ def _mid_anchor_sl_to_structure(direction: str,
         _push(it.get("resistance"))
         _push(ta.get("eq_hi"))
         _push(it.get("eq_hi"))
+        _push(ta.get("recent_high"))
+        _push(it.get("recent_high"))
         _push(ta.get("sl"))
         _push(it.get("sl"))
         above = [x for x in anchors if x > entry_f]
         if above:
-            return float(max(sl_f, max(above) + buf))
+            # nearest invalidation above entry
+            nearest = min(above)
+            return float(max(sl_f, nearest + buf))
         return float(sl_f)
 
     return float(sl_f)
@@ -15108,6 +15136,149 @@ def _mid_reprice_targets_from_risk(direction: str,
     rr_f = abs(tp2_f - entry_f) / risk
     return (float(tp1_f), float(tp2_f), float(rr_f))
 
+
+
+
+def _mid_collect_structural_target_levels(direction: str,
+                                          entry: float,
+                                          ta: dict | None = None,
+                                          it: dict | None = None) -> list[float]:
+    """Collect structure-derived TP candidates on the correct side of entry."""
+    d = str(direction or "").upper().strip()
+    entry_f = float(entry or 0.0)
+    ta = ta or {}
+    it = it or {}
+    levels: list[float] = []
+
+    def _push(v) -> None:
+        try:
+            fv = float(v)
+        except Exception:
+            return
+        if not math.isfinite(fv) or fv <= 0:
+            return
+        if d == "LONG":
+            if fv > entry_f * (1.0 + 1e-9):
+                levels.append(float(fv))
+        elif d == "SHORT":
+            if fv < entry_f * (1.0 - 1e-9):
+                levels.append(float(fv))
+
+    if d == "LONG":
+        keys = ("resistance", "eq_hi", "recent_high")
+    elif d == "SHORT":
+        keys = ("support", "eq_lo", "recent_low")
+    else:
+        return []
+
+    for src in (ta, it):
+        for key in keys:
+            try:
+                _push(src.get(key))
+            except Exception:
+                pass
+
+    if not levels:
+        return []
+
+    levels = sorted(levels) if d == "LONG" else sorted(levels, reverse=True)
+    dedup: list[float] = []
+    tol = max(abs(entry_f) * 0.001, 1e-12)
+    for lv in levels:
+        if not dedup or abs(lv - dedup[-1]) > tol:
+            dedup.append(float(lv))
+    return dedup
+
+
+def _mid_pick_structural_targets(direction: str,
+                                 entry: float,
+                                 sl: float,
+                                 atr: float,
+                                 ta: dict | None = None,
+                                 it: dict | None = None,
+                                 *,
+                                 tp2_r: float | None = None) -> tuple[float, float, float]:
+    """Pick TP1/TP2 from market structure first; ATR/RR is only fallback.
+
+    Priority:
+    - nearest structural level in trade direction becomes TP1
+    - next structural level becomes TP2
+    - only if there is no usable structural target do we fall back to risk-multiple targets
+    """
+    d = str(direction or "").upper().strip()
+    entry_f = float(entry or 0.0)
+    sl_f = float(sl or 0.0)
+    atr_f = abs(float(atr or 0.0))
+    risk = abs(entry_f - sl_f)
+    if entry_f <= 0 or risk <= 1e-12:
+        return (0.0, 0.0, 0.0)
+
+    candidates = _mid_collect_structural_target_levels(d, entry_f, ta=ta, it=it)
+    min_first = max(atr_f * 0.15, risk * 0.15, abs(entry_f) * 0.001)
+    min_gap = max(atr_f * 0.20, risk * 0.20, abs(entry_f) * 0.0015)
+
+    tp1_f = 0.0
+    tp2_f = 0.0
+    for lv in candidates:
+        dist = abs(float(lv) - entry_f)
+        if dist < min_first:
+            continue
+        if tp1_f <= 0:
+            tp1_f = float(lv)
+            continue
+        if abs(float(lv) - tp1_f) >= min_gap:
+            tp2_f = float(lv)
+            break
+
+    if tp1_f <= 0:
+        tp1_f, tp2_f, _ = _mid_reprice_targets_from_risk(d, entry_f, sl_f, tp2_r=tp2_r)
+    rr_f = _rr_from_levels(entry_f, sl_f, tp1_f, tp2_f)
+    return (float(tp1_f), float(tp2_f), float(rr_f))
+
+
+def _mid_build_structure_first_levels(direction: str,
+                                      entry: float,
+                                      atr: float,
+                                      *,
+                                      ta: dict | None = None,
+                                      it: dict | None = None,
+                                      tp2_r: float | None = None,
+                                      market: str = "FUTURES") -> tuple[float, float, float, float, float]:
+    """Structure-first level engine.
+
+    - Entry stays as provided by the caller.
+    - SL is anchored to the nearest invalidation behind structure and buffered by ATR.
+    - TP1/TP2 are chosen from structural targets.
+    - RR is measured from the actual emitted levels.
+    """
+    entry_f = float(entry or 0.0)
+    atr_f = abs(float(atr or 0.0))
+    if entry_f <= 0:
+        return (0.0, 0.0, 0.0, 0.0, 0.0)
+    if atr_f <= 0:
+        atr_f = max(abs(entry_f) * 0.001, 1e-9)
+
+    # Seed raw SL from ATR only as a fallback envelope.
+    _sl_seed, _tp1_seed, _tp2_seed, _rr_seed, sl_raw = _build_levels_meta(direction, entry_f, atr_f, tp2_r=tp2_r)
+    sl_struct = _mid_anchor_sl_to_structure(direction, entry_f, float(sl_raw), atr_f, ta, it)
+    sl_emit = _mid_clamp_sl(direction, entry_f, float(sl_struct))
+
+    tp1_emit, tp2_emit, _ = _mid_pick_structural_targets(direction, entry_f, sl_emit, atr_f, ta, it, tp2_r=tp2_r)
+
+    try:
+        max_tp2_atr = float(os.getenv("MID_MAX_TP2_ATR", "0") or 0.0)
+        if max_tp2_atr > 0 and atr_f > 0 and tp2_emit > 0:
+            max_dist = float(max_tp2_atr) * float(atr_f)
+            if str(direction or "").upper().strip() == "LONG":
+                tp2_emit = min(float(tp2_emit), float(entry_f) + max_dist)
+            else:
+                tp2_emit = max(float(tp2_emit), float(entry_f) - max_dist)
+    except Exception:
+        pass
+
+    tp1_emit, tp2_emit, _ = _mid_finalize_targets(direction, entry_f, sl_emit, tp1_emit, tp2_emit, atr_f, market=market)
+    rr_emit = _rr_from_levels(entry_f, sl_emit, tp1_emit, tp2_emit)
+    return float(sl_emit), float(tp1_emit), float(tp2_emit), float(rr_emit), float(sl_emit)
 
 def _mid_finalize_targets(direction: str,
                           entry: float,
@@ -16162,6 +16333,21 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
         "support": support,
         "resistance": resistance,
     }
+    try:
+        if str(os.getenv("MID_STRUCTURE_FIRST_LEVELS", "1") or "1").strip().lower() not in ("0", "false", "no", "off"):
+            _sl_sf, _tp1_sf, _tp2_sf, _rr_sf, _ = _mid_build_structure_first_levels(
+                str(ta.get("direction") or dir1),
+                float(ta.get("entry") or entry),
+                float(atr or 0.0),
+                ta=ta,
+                it=None,
+                tp2_r=float(tp2_r),
+                market="SPOT",
+            )
+            ta["sl"], ta["tp1"], ta["tp2"], ta["rr"] = float(_sl_sf), float(_tp1_sf), float(_tp2_sf), float(_rr_sf)
+            ta["level_engine"] = "STRUCTURE_FIRST"
+    except Exception:
+        pass
     return ta
 
 
@@ -16756,6 +16942,21 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
     except Exception:
         pass
 
+    try:
+        if str(os.getenv("MID_STRUCTURE_FIRST_LEVELS", "1") or "1").strip().lower() not in ("0", "false", "no", "off"):
+            _sl_sf, _tp1_sf, _tp2_sf, _rr_sf, _ = _mid_build_structure_first_levels(
+                str(ta.get("direction") or dir_trend),
+                float(ta.get("entry") or entry),
+                float(ta.get("atr_abs") or ta.get("atr30") or atr30),
+                ta=ta,
+                it=None,
+                tp2_r=float(ta.get("tp2_r") or tp2_r),
+                market=str(market or "FUTURES"),
+            )
+            ta["sl"], ta["tp1"], ta["tp2"], ta["rr"] = float(_sl_sf), float(_tp1_sf), float(_tp2_sf), float(_rr_sf)
+            ta["level_engine"] = "STRUCTURE_FIRST"
+    except Exception:
+        pass
     ta["ta_block"] = _fmt_ta_block_mid(ta)
     return ta
 
@@ -20178,31 +20379,17 @@ def _mid_recalc_levels_from_trigger(direction: str, trigger_price: float, ta: di
             pass
 
     entry_emit = _mid_pick_entry_anchor(direction, float(trigger_f), float(atr_use), ta, it)
-    sl_emit, tp1_emit, tp2_emit, rr_emit, sl_raw_emit = _build_levels_meta(direction, float(entry_emit), float(atr_use), tp2_r=tp2_r_use)
-    sl_raw_emit = _mid_anchor_sl_to_structure(direction, float(entry_emit), float(sl_raw_emit), float(atr_use), ta, it)
-    sl_emit = _mid_clamp_sl(direction, float(entry_emit), float(sl_raw_emit))
-
-    try:
-        if os.getenv("MID_REPRICE_TARGETS_ON_STRUCT_SL", "1").strip().lower() not in ("0", "false", "no", "off"):
-            tp1_emit, tp2_emit, _rr_effective = _mid_reprice_targets_from_risk(direction, float(entry_emit), float(sl_emit), tp2_r=tp2_r_use)
-    except Exception:
-        pass
-
-    try:
-        max_tp2_atr = float(os.getenv("MID_MAX_TP2_ATR", "0") or 0.0)
-        if max_tp2_atr > 0 and atr_use > 0:
-            max_dist = float(max_tp2_atr) * float(atr_use)
-            if direction == "LONG":
-                tp2_emit = min(float(tp2_emit), float(entry_emit) + max_dist)
-            elif direction == "SHORT":
-                tp2_emit = max(float(tp2_emit), float(entry_emit) - max_dist)
-    except Exception:
-        pass
-
     market_use = str(market or ta.get("market") or it.get("market") or "FUTURES")
-    tp1_emit, tp2_emit, _rr_effective = _mid_finalize_targets(direction, entry_emit, sl_emit, tp1_emit, tp2_emit, atr_use, market=market_use)
+    sl_emit, tp1_emit, tp2_emit, rr_emit, _sl_rr_ref = _mid_build_structure_first_levels(
+        direction,
+        float(entry_emit),
+        float(atr_use),
+        ta=ta,
+        it=it,
+        tp2_r=tp2_r_use,
+        market=market_use,
+    )
     sl_emit = _mid_clamp_sl(direction, float(entry_emit), float(sl_emit))
-    rr_emit = _rr_from_levels(float(entry_emit), float(sl_raw_emit), float(tp1_emit), float(tp2_emit))
     return float(entry_emit), float(sl_emit), float(tp1_emit), float(tp2_emit), float(rr_emit)
 
 
