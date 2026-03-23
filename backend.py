@@ -14795,7 +14795,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     }
     try:
         if str(os.getenv("MID_STRUCTURE_FIRST_LEVELS", "1") or "1").strip().lower() not in ("0", "false", "no", "off"):
-            _sl_sf, _tp1_sf, _tp2_sf, _rr_sf, _ = _mid_build_structure_first_levels(
+            _sl_sf, _tp1_sf, _tp2_sf, _rr_sf, _sl_rr_ref = _mid_build_structure_first_levels(
                 str(ta.get("direction") or dir_trend),
                 float(ta.get("entry") or entry),
                 float(ta.get("atr_abs") or ta.get("atr30") or atr30),
@@ -14805,6 +14805,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 market=str(market or "FUTURES"),
             )
             ta["sl"], ta["tp1"], ta["tp2"], ta["rr"] = float(_sl_sf), float(_tp1_sf), float(_tp2_sf), float(_rr_sf)
+            ta["sl_rr_ref"] = float(_sl_rr_ref)
             ta["level_engine"] = "STRUCTURE_FIRST"
     except Exception:
         pass
@@ -15047,11 +15048,12 @@ def _mid_anchor_sl_to_structure(direction: str,
                                 atr: float,
                                 ta: dict | None = None,
                                 it: dict | None = None) -> float:
-    """Move SL behind the *nearest* valid structure, not the farthest extreme.
+    """Anchor SL behind the nearest valid structure, with ATR used only as buffer.
 
-    Structure-first logic should invalidate the idea at the closest meaningful
-    level behind the setup (zone edge / support-resistance / EQH-EQL / recent
-    swing), while ATR is used only as a safety buffer.
+    Important behavior:
+    - raw ATR SL is only the fallback envelope / raw-risk reference
+    - if a closer structural invalidation exists, SL is *moved to that structure*
+    - final 10% cap is applied later by _mid_clamp_sl(...)
     """
     d = str(direction or "").upper().strip()
     entry_f = float(entry or 0.0)
@@ -15090,9 +15092,9 @@ def _mid_anchor_sl_to_structure(direction: str,
         _push(it.get("sl"))
         below = [x for x in anchors if x < entry_f]
         if below:
-            # nearest invalidation below entry
             nearest = max(below)
-            return float(min(sl_f, nearest - buf))
+            structural_sl = max(1e-12, float(nearest) - buf)
+            return float(structural_sl)
         return float(sl_f)
 
     if d == "SHORT":
@@ -15107,9 +15109,9 @@ def _mid_anchor_sl_to_structure(direction: str,
         _push(it.get("sl"))
         above = [x for x in anchors if x > entry_f]
         if above:
-            # nearest invalidation above entry
             nearest = min(above)
-            return float(max(sl_f, nearest + buf))
+            structural_sl = float(nearest) + buf
+            return float(structural_sl)
         return float(sl_f)
 
     return float(sl_f)
@@ -15198,12 +15200,13 @@ def _mid_pick_structural_targets(direction: str,
                                  it: dict | None = None,
                                  *,
                                  tp2_r: float | None = None) -> tuple[float, float, float]:
-    """Pick TP1/TP2 from market structure first; ATR/RR is only fallback.
+    """Pick TP1/TP2 from market structure first; risk geometry is fallback.
 
-    Priority:
-    - nearest structural level in trade direction becomes TP1
-    - next structural level becomes TP2
-    - only if there is no usable structural target do we fall back to risk-multiple targets
+    Rules:
+    - TP1 = nearest valid structural target in trade direction
+    - TP2 = next valid structural target
+    - if only one structural target exists, keep it as TP1 and build TP2 from risk
+    - if no structural targets exist, build both TP1/TP2 from risk
     """
     d = str(direction or "").upper().strip()
     entry_f = float(entry or 0.0)
@@ -15230,8 +15233,18 @@ def _mid_pick_structural_targets(direction: str,
             tp2_f = float(lv)
             break
 
+    fb_tp1, fb_tp2, _ = _mid_reprice_targets_from_risk(d, entry_f, sl_f, tp2_r=tp2_r)
     if tp1_f <= 0:
-        tp1_f, tp2_f, _ = _mid_reprice_targets_from_risk(d, entry_f, sl_f, tp2_r=tp2_r)
+        tp1_f = float(fb_tp1)
+    if tp2_f <= 0:
+        if tp1_f > 0:
+            if d == "LONG":
+                tp2_f = max(float(fb_tp2), float(tp1_f) + min_gap)
+            else:
+                tp2_f = min(float(fb_tp2), float(tp1_f) - min_gap)
+        else:
+            tp2_f = float(fb_tp2)
+
     rr_f = _rr_from_levels(entry_f, sl_f, tp1_f, tp2_f)
     return (float(tp1_f), float(tp2_f), float(rr_f))
 
@@ -15247,9 +15260,10 @@ def _mid_build_structure_first_levels(direction: str,
     """Structure-first level engine.
 
     - Entry stays as provided by the caller.
-    - SL is anchored to the nearest invalidation behind structure and buffered by ATR.
-    - TP1/TP2 are chosen from structural targets.
-    - RR is measured from the actual emitted levels.
+    - raw ATR SL is built first as fallback/raw-risk geometry.
+    - SL is then anchored to nearest structure and only after that clamped by the 10% cap.
+    - TP1/TP2 prefer structure; missing targets are completed from risk geometry.
+    - RR is displayed from the pre-clamp idea (raw/structural reference), not from an artificially tightened capped SL.
     """
     entry_f = float(entry or 0.0)
     atr_f = abs(float(atr or 0.0))
@@ -15258,11 +15272,14 @@ def _mid_build_structure_first_levels(direction: str,
     if atr_f <= 0:
         atr_f = max(abs(entry_f) * 0.001, 1e-9)
 
-    # Seed raw SL from ATR only as a fallback envelope.
+    # 1) Raw ATR geometry (fallback + raw-risk reference)
     _sl_seed, _tp1_seed, _tp2_seed, _rr_seed, sl_raw = _build_levels_meta(direction, entry_f, atr_f, tp2_r=tp2_r)
+
+    # 2) Structure anchor first, 10% hard cap after that
     sl_struct = _mid_anchor_sl_to_structure(direction, entry_f, float(sl_raw), atr_f, ta, it)
     sl_emit = _mid_clamp_sl(direction, entry_f, float(sl_struct))
 
+    # 3) Targets: structure first, risk fallback for missing legs
     tp1_emit, tp2_emit, _ = _mid_pick_structural_targets(direction, entry_f, sl_emit, atr_f, ta, it, tp2_r=tp2_r)
 
     try:
@@ -15277,8 +15294,11 @@ def _mid_build_structure_first_levels(direction: str,
         pass
 
     tp1_emit, tp2_emit, _ = _mid_finalize_targets(direction, entry_f, sl_emit, tp1_emit, tp2_emit, atr_f, market=market)
-    rr_emit = _rr_from_levels(entry_f, sl_emit, tp1_emit, tp2_emit)
-    return float(sl_emit), float(tp1_emit), float(tp2_emit), float(rr_emit), float(sl_emit)
+
+    # RR reference: use the pre-clamp structural idea when available, otherwise raw ATR stop.
+    sl_rr_ref = float(sl_struct) if float(sl_struct) > 0 else float(sl_raw)
+    rr_emit = _rr_from_levels(entry_f, sl_rr_ref, tp1_emit, tp2_emit)
+    return float(sl_emit), float(tp1_emit), float(tp2_emit), float(rr_emit), float(sl_rr_ref)
 
 def _mid_finalize_targets(direction: str,
                           entry: float,
@@ -16335,7 +16355,7 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
     }
     try:
         if str(os.getenv("MID_STRUCTURE_FIRST_LEVELS", "1") or "1").strip().lower() not in ("0", "false", "no", "off"):
-            _sl_sf, _tp1_sf, _tp2_sf, _rr_sf, _ = _mid_build_structure_first_levels(
+            _sl_sf, _tp1_sf, _tp2_sf, _rr_sf, _sl_rr_ref = _mid_build_structure_first_levels(
                 str(ta.get("direction") or dir1),
                 float(ta.get("entry") or entry),
                 float(atr or 0.0),
@@ -16345,6 +16365,7 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
                 market="SPOT",
             )
             ta["sl"], ta["tp1"], ta["tp2"], ta["rr"] = float(_sl_sf), float(_tp1_sf), float(_tp2_sf), float(_rr_sf)
+            ta["sl_rr_ref"] = float(_sl_rr_ref)
             ta["level_engine"] = "STRUCTURE_FIRST"
     except Exception:
         pass
@@ -16944,7 +16965,7 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
 
     try:
         if str(os.getenv("MID_STRUCTURE_FIRST_LEVELS", "1") or "1").strip().lower() not in ("0", "false", "no", "off"):
-            _sl_sf, _tp1_sf, _tp2_sf, _rr_sf, _ = _mid_build_structure_first_levels(
+            _sl_sf, _tp1_sf, _tp2_sf, _rr_sf, _sl_rr_ref = _mid_build_structure_first_levels(
                 str(ta.get("direction") or dir_trend),
                 float(ta.get("entry") or entry),
                 float(ta.get("atr_abs") or ta.get("atr30") or atr30),
@@ -16954,6 +16975,7 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
                 market=str(market or "FUTURES"),
             )
             ta["sl"], ta["tp1"], ta["tp2"], ta["rr"] = float(_sl_sf), float(_tp1_sf), float(_tp2_sf), float(_rr_sf)
+            ta["sl_rr_ref"] = float(_sl_rr_ref)
             ta["level_engine"] = "STRUCTURE_FIRST"
     except Exception:
         pass
