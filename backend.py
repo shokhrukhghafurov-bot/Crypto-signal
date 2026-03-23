@@ -12880,6 +12880,83 @@ def _mid_bool_env(name: str, default: str = "0") -> bool:
         return False
 
 
+def _mid_scan_critical_block_reason(*, side: str, rsi_5m: float | None, adx_30m: float | None, adx_1h: float | None, market: str = "SPOT") -> str | None:
+    """Return a setup-time hard blocker that must not be deferred to TRIGGER.
+
+    In MID pending mode with MID_FILTERS_AFTER_SETUP=1 we normally keep setups alive
+    during SCAN and re-check hard filters on TRIGGER. For RSI entry-window violations and
+    ADX regime violations this is too permissive: the setup itself is already invalid and
+    should not reach a setup/pending alert.
+    """
+    try:
+        if not _mid_bool_env("MID_SCAN_HARDBLOCK_RSI_ADX", "1"):
+            return None
+
+        if not (_mid_bool_env("MID_PENDING_ENABLED", "0") and _mid_bool_env("MID_FILTERS_AFTER_SETUP", "1")):
+            return None
+
+        try:
+            phase_now = str(_MID_EVAL_PHASE.get() or "scan").strip().lower()
+        except Exception:
+            phase_now = "scan"
+        if phase_now != "scan":
+            return None
+
+        side_u = str(side or "").strip().upper()
+        if side_u not in ("LONG", "SHORT"):
+            return None
+
+        try:
+            rsi = float(rsi_5m)
+        except Exception:
+            rsi = float("nan")
+
+        if rsi == rsi:
+            rsi_long_max = MID_ULTRA_RSI_LONG_MAX if MID_ULTRA_SAFE else MID_RSI_LONG_MAX
+            rsi_long_min = MID_ULTRA_RSI_LONG_MIN if MID_ULTRA_SAFE else MID_RSI_LONG_MIN
+            rsi_short_min = MID_ULTRA_RSI_SHORT_MIN if MID_ULTRA_SAFE else MID_RSI_SHORT_MIN
+            rsi_short_max = MID_ULTRA_RSI_SHORT_MAX if MID_ULTRA_SAFE else MID_RSI_SHORT_MAX
+            if side_u == "LONG":
+                if rsi >= rsi_long_max:
+                    return f"rsi_long={rsi:.1f} >= {rsi_long_max:g}"
+                if rsi < rsi_long_min:
+                    return f"rsi_long={rsi:.1f} < {rsi_long_min:g}"
+            else:
+                if rsi <= rsi_short_min:
+                    return f"rsi_short={rsi:.1f} <= {rsi_short_min:g}"
+                if rsi >= rsi_short_max:
+                    return f"rsi_short={rsi:.1f} >= {rsi_short_max:g}"
+
+        if _mid_bool_env("MID_USE_REGIME", "1"):
+            try:
+                market_u = str(market or "SPOT").upper().strip()
+            except Exception:
+                market_u = "SPOT"
+            if market_u not in ("SPOT", "FUTURES"):
+                market_u = "SPOT"
+
+            min_adx_30m = float(_mid_autotune_get_param("MID_MIN_ADX_30M", float(os.getenv("MID_MIN_ADX_30M", "0") or 0), market_u))
+            min_adx_1h = float(_mid_autotune_get_param("MID_MIN_ADX_1H", float(os.getenv("MID_MIN_ADX_1H", "0") or 0), market_u))
+
+            try:
+                adx30 = float(adx_30m)
+            except Exception:
+                adx30 = float("nan")
+            try:
+                adx1h = float(adx_1h)
+            except Exception:
+                adx1h = float("nan")
+
+            if min_adx_30m and adx30 == adx30 and adx30 < min_adx_30m:
+                return f"adx_30m={adx30:.2f}<min={min_adx_30m:.2f}"
+            if min_adx_1h and adx1h == adx1h and adx1h < min_adx_1h:
+                return f"adx_1h={adx1h:.2f}<min={min_adx_1h:.2f}"
+    except Exception:
+        return None
+
+    return None
+
+
 def _mid_market_regime(df30i: pd.DataFrame, df1hi: pd.DataFrame, *, entry: float, atr30: float, adx30: float | None) -> str:
     """Classify MID regime using 30m as primary with 1h confirmation.
     Returns one of: TRENDING, RANGING, EXPANSION, COMPRESSION.
@@ -14241,6 +14318,46 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 return None
     except Exception:
         # If filters fail, do not block signal.
+        pass
+
+    # Even when post-setup filters are deferred to TRIGGER, some blockers must kill
+    # the setup immediately so a pending/setup alert is never created for an invalid entry window.
+    try:
+        scan_hard_reason = _mid_scan_critical_block_reason(
+            side=str(dir_trend),
+            rsi_5m=(float(rsi5) if (rsi5 == rsi5) else None),
+            adx_30m=(float(adx30) if (adx30 == adx30) else None),
+            adx_1h=(float(adx1h) if (adx1h == adx1h) else None),
+            market=str(market or "SPOT"),
+        )
+        if scan_hard_reason:
+            try:
+                _mid_inc_hard_block(1)
+                _mid_hardblock_track(str(scan_hard_reason), symbol)
+                _k = f"block|{symbol}|{dir_trend}|{_mid_trap_reason_key(str(scan_hard_reason))}"
+                _ctx = _MID_TICK_CTX.get()
+                _tick_key = f"{symbol}|{dir_trend}|block"
+                if _ctx is not None and _tick_key in _ctx.get('block', set()):
+                    _ctx['suppress_block'] = int(_ctx.get('suppress_block', 0)) + 1
+                else:
+                    if _ctx is not None:
+                        _ctx.setdefault('block', set()).add(_tick_key)
+                    if _mid_trap_should_log(_k):
+                        logger.info("[mid][block] %s dir=%s reason=%s entry=%.6g", symbol, dir_trend, scan_hard_reason, float(entry))
+                _emit_mid_trap_event({
+                    "dir": str(dir_trend),
+                    "reason": str(scan_hard_reason),
+                    "reason_key": _mid_trap_reason_key(str(scan_hard_reason)),
+                    "entry": float(entry),
+                })
+            except Exception:
+                pass
+            try:
+                _fail("other", str(scan_hard_reason))
+            except Exception:
+                pass
+            return None
+    except Exception:
         pass
 
     # Pattern on 5m
