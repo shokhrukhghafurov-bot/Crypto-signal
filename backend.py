@@ -9096,10 +9096,10 @@ def signal_min_profit_gate(sig: "Signal") -> tuple[bool, float, float]:
 
 
 def signal_rr_gate(sig: "Signal") -> tuple[bool, float, float]:
-    """Return (ok, effective_rr, min_required_rr).
+    """Return (ok, rr_value, min_required_rr).
 
-    RR must be computed from the actual structural SL/TP shown to the user, otherwise
-    late entries with artificially tight ATR stops look good on paper and then die on SL.
+    In this deployment low-RR setups are allowed through, but we still calculate and
+    expose RR for logging/UI. When MID_ALLOW_LOW_RR_SIGNALS=0 the old hard gate remains.
     """
     try:
         market = str(getattr(sig, "market", "FUTURES") or "FUTURES").upper().strip()
@@ -9114,15 +9114,18 @@ def signal_rr_gate(sig: "Signal") -> tuple[bool, float, float]:
         min_req = 1.20 if market == "SPOT" else 1.15
 
     try:
-        entry = float(getattr(sig, "entry", 0.0) or 0.0)
-        sl = float(getattr(sig, "sl", 0.0) or 0.0)
-        tp1 = float(getattr(sig, "tp1", 0.0) or 0.0)
-        tp2 = float(getattr(sig, "tp2", 0.0) or 0.0)
-        risk = abs(entry - sl)
-        target = tp2 if tp2 > 0 else tp1
-        rr = (abs(target - entry) / risk) if (risk > 1e-12 and target > 0) else 0.0
+        rr = float(getattr(sig, "rr", 0.0) or 0.0)
+        if rr <= 0:
+            entry = float(getattr(sig, "entry", 0.0) or 0.0)
+            sl = float(getattr(sig, "sl", 0.0) or 0.0)
+            tp1 = float(getattr(sig, "tp1", 0.0) or 0.0)
+            tp2 = float(getattr(sig, "tp2", 0.0) or 0.0)
+            rr = _rr_from_levels(entry, sl, tp1, tp2)
     except Exception:
         rr = 0.0
+
+    if _mid_allow_low_rr_signals():
+        return (True, float(rr), float(min_req))
     return (float(rr) >= float(min_req), float(rr), float(min_req))
 
 
@@ -10600,7 +10603,12 @@ def _normalize_signal_levels_inplace(sig) -> None:
                     sig.tp1, sig.tp2 = tp2, tp1
             target = float(getattr(sig, "tp2", 0.0) or getattr(sig, "tp1", 0.0) or 0.0)
             risk = abs(entry - sl)
-            if target > 0 and risk > eps:
+            keep_rr = False
+            try:
+                keep_rr = _mid_preserve_precomputed_rr() and float(getattr(sig, "rr", 0.0) or 0.0) > 0
+            except Exception:
+                keep_rr = False
+            if (not keep_rr) and target > 0 and risk > eps:
                 sig.rr = abs(target - entry) / risk
             return
 
@@ -10635,7 +10643,12 @@ def _normalize_signal_levels_inplace(sig) -> None:
             sig.tp2 = entry + far_dist if far_dist > eps else 0.0
 
         target = float(getattr(sig, "tp2", 0.0) or getattr(sig, "tp1", 0.0) or 0.0)
-        if target > 0 and risk > eps:
+        keep_rr = False
+        try:
+            keep_rr = _mid_preserve_precomputed_rr() and float(getattr(sig, "rr", 0.0) or 0.0) > 0
+        except Exception:
+            keep_rr = False
+        if (not keep_rr) and target > 0 and risk > eps:
             sig.rr = abs(target - entry) / risk
     except Exception:
         return
@@ -14026,8 +14039,9 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         return float(max(1.3, min(3.2, r)))
 
     tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct)
-    sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
-    tp1, tp2, rr = _mid_finalize_targets(dir_trend, entry, sl, tp1, tp2, atr30, market=market)
+    sl, tp1, tp2, rr, sl_raw_for_rr = _build_levels_meta(dir_trend, entry, atr30, tp2_r=tp2_r)
+    tp1, tp2, _rr_effective = _mid_finalize_targets(dir_trend, entry, sl, tp1, tp2, atr30, market=market)
+    rr = _rr_from_levels(entry, sl_raw_for_rr, tp1, tp2)
     # --- Adaptive MID SL/TP scaling by ATR%% (optional) ---
     try:
         if os.getenv("MID_ADAPTIVE_SLTP", "0").strip().lower() in ("1","true","yes","on"):
@@ -14064,7 +14078,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                 sl = entry + r_sl
                 tp1 = entry - r_tp1
                 tp2 = entry - r_tp2
-            rr = abs(tp2 - entry) / max(1e-12, abs(entry - sl))
+            rr = _rr_from_levels(entry, sl_raw_for_rr, tp1, tp2)
     except Exception:
         pass
     tp1, tp2, rr = _mid_finalize_targets(dir_trend, entry, sl, tp1, tp2, atr30, market=market)
@@ -14863,17 +14877,79 @@ def _be_is_armed(*, side: str, price: float, tp1: float | None, tp2: float | Non
         return (px >= arm_lvl) if s == "LONG" else (px <= arm_lvl)
     except Exception:
         return True
-def _build_levels(direction: str, entry: float, atr: float, *, tp2_r: float | None = None) -> Tuple[float, float, float, float]:
-    R = max(1e-9, ATR_MULT_SL * atr)
-    if direction == "LONG":
-        sl = entry - R
-        tp1 = entry + TP1_R * R
-        tp2 = entry + (float(tp2_r) if tp2_r is not None else TP2_R) * R
+def _mid_max_sl_pct() -> float:
+    try:
+        v = float(os.getenv("MID_MAX_SL_PCT", "10") or 10.0)
+    except Exception:
+        v = 10.0
+    return max(0.0, float(v))
+
+
+def _mid_allow_low_rr_signals() -> bool:
+    return str(os.getenv("MID_ALLOW_LOW_RR_SIGNALS", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _mid_preserve_precomputed_rr() -> bool:
+    return str(os.getenv("MID_PRESERVE_PRECOMPUTED_RR", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _mid_clamp_sl(direction: str, entry: float, sl: float) -> float:
+    try:
+        entry_f = float(entry or 0.0)
+        sl_f = float(sl or 0.0)
+        if entry_f <= 0 or sl_f <= 0:
+            return sl_f
+        max_pct = _mid_max_sl_pct()
+        if max_pct <= 0:
+            return sl_f
+        cap = entry_f * (max_pct / 100.0)
+        if cap <= 0:
+            return sl_f
+        side = str(direction or "").upper().strip()
+        if side == "LONG":
+            min_sl = max(1e-12, entry_f - cap)
+            return float(max(sl_f, min_sl))
+        max_sl = entry_f + cap
+        return float(min(sl_f, max_sl))
+    except Exception:
+        return float(sl or 0.0)
+
+
+def _rr_from_levels(entry: float, sl_for_rr: float, tp1: float, tp2: float) -> float:
+    try:
+        entry_f = float(entry or 0.0)
+        sl_f = float(sl_for_rr or 0.0)
+        tp1_f = float(tp1 or 0.0)
+        tp2_f = float(tp2 or 0.0)
+        risk = abs(entry_f - sl_f)
+        target = tp2_f if tp2_f > 0 else tp1_f
+        return (abs(target - entry_f) / risk) if (risk > 1e-12 and target > 0) else 0.0
+    except Exception:
+        return 0.0
+
+
+def _build_levels_meta(direction: str, entry: float, atr: float, *, tp2_r: float | None = None) -> Tuple[float, float, float, float, float]:
+    side = str(direction or "").upper().strip()
+    raw_r = max(1e-9, ATR_MULT_SL * atr)
+    tp2_mult = float(tp2_r) if tp2_r is not None else TP2_R
+    if side == "LONG":
+        sl_raw = float(entry) - raw_r
     else:
-        sl = entry + R
-        tp1 = entry - TP1_R * R
-        tp2 = entry - (float(tp2_r) if tp2_r is not None else TP2_R) * R
-    rr = abs(tp2 - entry) / abs(entry - sl)
+        sl_raw = float(entry) + raw_r
+    sl = _mid_clamp_sl(side, float(entry), float(sl_raw))
+    eff_r = max(1e-9, abs(float(entry) - float(sl)))
+    if side == "LONG":
+        tp1 = float(entry) + TP1_R * eff_r
+        tp2 = float(entry) + tp2_mult * eff_r
+    else:
+        tp1 = max(1e-12, float(entry) - TP1_R * eff_r)
+        tp2 = max(1e-12, float(entry) - tp2_mult * eff_r)
+    rr = _rr_from_levels(float(entry), float(sl_raw), float(tp1), float(tp2))
+    return float(sl), float(tp1), float(tp2), float(rr), float(sl_raw)
+
+
+def _build_levels(direction: str, entry: float, atr: float, *, tp2_r: float | None = None) -> Tuple[float, float, float, float]:
+    sl, tp1, tp2, rr, _sl_raw = _build_levels_meta(direction, entry, atr, tp2_r=tp2_r)
     return sl, tp1, tp2, rr
 
 
@@ -16011,7 +16087,7 @@ def evaluate_on_exchange(df15: pd.DataFrame, df1h: pd.DataFrame, df4h: pd.DataFr
 
     atr_pct = (atr / entry) * 100.0 if entry > 0 else 0.0
     tp2_r = _adaptive_tp2_r(adx1)
-    sl, tp1, tp2, rr = _build_levels(dir1, entry, atr, tp2_r=tp2_r)
+    sl, tp1, tp2, rr, sl_raw_for_rr = _build_levels_meta(dir1, entry, atr, tp2_r=tp2_r)
 
     # Snapshot values
     rsi15 = float(last15.get("rsi", np.nan))
@@ -16262,8 +16338,9 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         return float(max(1.3, min(3.2, r)))
 
     tp2_r = _tp2_r_mid(adx1h, adx30, atr_pct)
-    sl, tp1, tp2, rr = _build_levels(dir_trend, entry, atr30, tp2_r=tp2_r)
-    tp1, tp2, rr = _mid_finalize_targets(dir_trend, entry, sl, tp1, tp2, atr30, market=market)
+    sl, tp1, tp2, rr, sl_raw_for_rr = _build_levels_meta(dir_trend, entry, atr30, tp2_r=tp2_r)
+    tp1, tp2, _rr_effective = _mid_finalize_targets(dir_trend, entry, sl, tp1, tp2, atr30, market=market)
+    rr = _rr_from_levels(entry, sl_raw_for_rr, tp1, tp2)
     # --- Trap filters ---
     # Macro trap (SCAN): strict anti-trap on higher TF (structure/extremes)
     # Micro trap (TRIGGER): rare + practical, blocks mainly on immediate opposite aggression.
@@ -19925,7 +20002,10 @@ def _mid_ta_gate_eval(rec: dict) -> dict:
             rr = float(rec.get("rr") or 0.0)
             min_rr = float(os.getenv("MID_MIN_RR", "0") or 0.0)
             rr_ok = (rr > 0 and (min_rr <= 0 or rr >= min_rr))
-            add("rr", "pass" if rr_ok else "block", reason=("rr" if rr_ok else f"rr<{min_rr:g}"), hard=not rr_ok)
+            if _mid_allow_low_rr_signals():
+                add("rr", "pass")
+            else:
+                add("rr", "pass" if rr_ok else "block", reason=("rr" if rr_ok else f"rr<{min_rr:g}"), hard=not rr_ok)
         except Exception:
             add("rr", "block", reason="rr_invalid", hard=True)
 
@@ -20098,12 +20178,13 @@ def _mid_recalc_levels_from_trigger(direction: str, trigger_price: float, ta: di
             pass
 
     entry_emit = _mid_pick_entry_anchor(direction, float(trigger_f), float(atr_use), ta, it)
-    sl_emit, tp1_emit, tp2_emit, rr_emit = _build_levels(direction, float(entry_emit), float(atr_use), tp2_r=tp2_r_use)
-    sl_emit = _mid_anchor_sl_to_structure(direction, float(entry_emit), float(sl_emit), float(atr_use), ta, it)
+    sl_emit, tp1_emit, tp2_emit, rr_emit, sl_raw_emit = _build_levels_meta(direction, float(entry_emit), float(atr_use), tp2_r=tp2_r_use)
+    sl_raw_emit = _mid_anchor_sl_to_structure(direction, float(entry_emit), float(sl_raw_emit), float(atr_use), ta, it)
+    sl_emit = _mid_clamp_sl(direction, float(entry_emit), float(sl_raw_emit))
 
     try:
         if os.getenv("MID_REPRICE_TARGETS_ON_STRUCT_SL", "1").strip().lower() not in ("0", "false", "no", "off"):
-            tp1_emit, tp2_emit, rr_emit = _mid_reprice_targets_from_risk(direction, float(entry_emit), float(sl_emit), tp2_r=tp2_r_use)
+            tp1_emit, tp2_emit, _rr_effective = _mid_reprice_targets_from_risk(direction, float(entry_emit), float(sl_emit), tp2_r=tp2_r_use)
     except Exception:
         pass
 
@@ -20119,13 +20200,9 @@ def _mid_recalc_levels_from_trigger(direction: str, trigger_price: float, ta: di
         pass
 
     market_use = str(market or ta.get("market") or it.get("market") or "FUTURES")
-    tp1_emit, tp2_emit, rr_emit = _mid_finalize_targets(direction, entry_emit, sl_emit, tp1_emit, tp2_emit, atr_use, market=market_use)
-    try:
-        risk = abs(float(entry_emit) - float(sl_emit))
-        target_emit = float(tp2_emit) if float(tp2_emit) > 0 else float(tp1_emit)
-        rr_emit = (abs(target_emit - float(entry_emit)) / risk) if (risk > 0 and target_emit > 0) else 0.0
-    except Exception:
-        rr_emit = 0.0
+    tp1_emit, tp2_emit, _rr_effective = _mid_finalize_targets(direction, entry_emit, sl_emit, tp1_emit, tp2_emit, atr_use, market=market_use)
+    sl_emit = _mid_clamp_sl(direction, float(entry_emit), float(sl_emit))
+    rr_emit = _rr_from_levels(float(entry_emit), float(sl_raw_emit), float(tp1_emit), float(tp2_emit))
     return float(entry_emit), float(sl_emit), float(tp1_emit), float(tp2_emit), float(rr_emit)
 
 
@@ -23114,7 +23191,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             # RR filter
                             min_rr = float(os.getenv("MID_MIN_RR", "0") or 0)
                             rr = float(ta.get("rr") or 0.0)
-                            if min_rr and rr < min_rr:
+                            if (not _mid_allow_low_rr_signals()) and min_rr and rr < min_rr:
                                 keep_it, outc = _pending_apply_fail(it, "rr_low", now)
                                 _pending_log_trigger(sym, market, direction, outc, "rr_low", it, float(price))
                                 if keep_it:
