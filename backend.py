@@ -16300,6 +16300,80 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
     except Exception:
         return ""
 
+
+def _mid_strip_ta_block_from_risk_note(note: str) -> str:
+    """Remove the previously embedded MID TA block from a risk_note string.
+
+    Trigger-confirmed / instant-revalidated emits must show the *current* TA snapshot,
+    not the stale scan-time one stored in pending risk_note.
+    """
+    try:
+        txt = str(note or "").replace("\r\n", "\n")
+    except Exception:
+        return ""
+    if not txt.strip():
+        return ""
+
+    try:
+        lines = txt.split("\n")
+        start = None
+        for i, line in enumerate(lines):
+            if str(line).strip().startswith("📊 TA score:"):
+                start = i
+                break
+        if start is None:
+            return txt.strip()
+
+        def _is_ta_line(line: str) -> bool:
+            s = str(line or "").strip()
+            if not s:
+                return True
+            if s.startswith((
+                "📊 TA score:",
+                "🎯 Confidence:",
+                "🧱 Trap:",
+                "Ch:",
+                "Liquidity (EQH / EQL):",
+                "Breakout/Retest:",
+                "Pattern:",
+                "➕ Additional TA:",
+                "➕ HTF struct:",
+            )):
+                return True
+            if s.startswith(("✅", "⚠️", "•")) and (
+                "RSI(5m):" in s or
+                "ADX 30m/1h:" in s or
+                "BB:" in s or
+                "VWAP:" in s
+            ):
+                return True
+            return False
+
+        end = start
+        while end < len(lines) and _is_ta_line(lines[end]):
+            end += 1
+        kept = lines[:start] + lines[end:]
+        return "\n".join(x for x in kept if str(x).strip()).strip()
+    except Exception:
+        return txt.strip()
+
+
+def _mid_refresh_signal_risk_note(base_note: str, ta: Dict[str, Any], mode: str = "") -> str:
+    """Replace stale scan-time TA block with the latest trigger-time MID TA block."""
+    try:
+        fresh_block = str(_fmt_ta_block_mid(ta or {}, mode) or "").strip()
+    except Exception:
+        fresh_block = ""
+    try:
+        extra = _mid_strip_ta_block_from_risk_note(base_note)
+    except Exception:
+        extra = str(base_note or "").strip()
+    if fresh_block and extra:
+        return f"{fresh_block}\n{extra}"
+    if fresh_block:
+        return fresh_block
+    return extra
+
 def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
     score = 0
     score += 0 if np.isnan(adx4) else int(min(25, max(0, (adx4 - 15) * 1.25)))
@@ -22504,7 +22578,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 _touch_entry_ref, _touch_anchor_far, _touch_slip_atr = _mid_pending_entry_ref(it, price=price, ta=ta)
                                 if not _touch_anchor_far:
                                     _touch_entry, _touch_sl, _touch_tp1, _touch_tp2, _touch_rr = _mid_recalc_levels_from_trigger(direction, _touch_entry_ref, ta, it, market)
-                                    _touch_note_base = str(it.get("risk_note") or "").strip()
+                                    _touch_note_base = _mid_refresh_signal_risk_note(str(it.get("risk_note") or ""), ta, mode)
                                     _touch_note = (_touch_note_base + (" | " if _touch_note_base else "") + "zone_touch_alert=1 no_autotrade=1 levels_anchor=1").strip()
                                     sig_zone = Signal(
                                         signal_id=self.next_signal_id(),
@@ -22860,7 +22934,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             confirmations=conf_names,
                             source_exchange=src_ex,
                             available_exchanges=conf_names,
-                            risk_note=str(it.get("risk_note") or "") + " | instant_vip=1 | confirmed_entry=1 | levels_anchor=1",
+                            risk_note=_mid_refresh_signal_risk_note(str(it.get("risk_note") or ""), ta, mode) + " | instant_vip=1 | confirmed_entry=1 | levels_anchor=1",
                             ts=time.time(),
                         )
                         instant_ok, instant_reason, instant_meta = _mid_instant_emit_gate(
@@ -24133,7 +24207,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         confirmations=conf_names,
                         source_exchange=src_ex,
                         available_exchanges=conf_names,
-                        risk_note=str(it.get("risk_note") or "ENTRY CONFIRMED") + " | confirmed_entry=1 | trigger_revalidated=1 | levels_anchor=1",
+                        risk_note=((_mid_refresh_signal_risk_note(str(it.get("risk_note") or ""), ta, mode) or "ENTRY CONFIRMED") + " | confirmed_entry=1 | trigger_revalidated=1 | levels_anchor=1"),
                         ts=time.time(),
                     )
 
