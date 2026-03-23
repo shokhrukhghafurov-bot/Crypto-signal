@@ -181,6 +181,17 @@ def _spawn_smart_manager_task() -> asyncio.Task | None:
     return task
 
 
+def _start_signal_outcome_task() -> asyncio.Task:
+    existing = TASKS.get("signal-outcome")
+    if existing and not existing.done():
+        logger.warning("signal_outcome_loop already running; skip duplicate start")
+        return existing
+    task = asyncio.create_task(signal_outcome_loop(), name="signal-outcome")
+    TASKS["signal-outcome"] = task
+    _attach_task_monitor("signal-outcome", task)
+    return task
+
+
 async def _restart_task_later(name: str, reason: str = "") -> None:
     if name != "smart-manager":
         return
@@ -6571,9 +6582,11 @@ async def signal_outcome_loop() -> None:
                             except Exception:
                                 px_to = 0.0
                             pnl_to = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=px_to, part_entry_to_close=1.0) if (entry > 0 and px_to > 0) else 0.0
-                            await db_store.close_signal_track(signal_id=sid, status="CLOSED", pnl_total_pct=float(pnl_to))
-                            await _send_closed_signal_report_card(t, final_status="CLOSED", pnl_total_pct=float(pnl_to), closed_at=now)
+                            closed_now = await db_store.close_signal_track(signal_id=sid, status="CLOSED", pnl_total_pct=float(pnl_to))
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            if not closed_now:
+                                continue
+                            await _send_closed_signal_report_card(t, final_status="CLOSED", pnl_total_pct=float(pnl_to), closed_at=now)
                             closed_timeout += 1
                             continue
 
@@ -6591,19 +6604,23 @@ async def signal_outcome_loop() -> None:
                         # WIN by TP2 (or TP1 if no TP2)
                         if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
                             pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if (eff_tp1 > 0 and eff_tp2 > 0) else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
-                            await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            closed_now = await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            if not closed_now:
+                                continue
                             await _send_closed_signal_report_card(t, final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
                             logger.info("[sig-outcome] WIN sid=%s %s %s px=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
-                            _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_win += 1
                             continue
                         if eff_tp2 <= 0 and eff_tp1 > 0 and _hit_tp(side, px, eff_tp1):
                             # single-target win at TP1
                             pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp1, part_entry_to_close=1.0)
-                            await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            closed_now = await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            if not closed_now:
+                                continue
                             await _send_closed_signal_report_card(t, final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
                             logger.info("[sig-outcome] WIN sid=%s %s %s px=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
-                            _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_win += 1
                             continue
                         # LOSS by SL (only before TP1 in strict mode)
@@ -6631,11 +6648,12 @@ async def signal_outcome_loop() -> None:
                             if crossed:
                                 if sig_sl_confirm_sec == 0 or (since is not None and (_time.time() - since) >= sig_sl_confirm_sec):
                                     pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
-                                    await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
+                                    closed_now = await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
+                                    _SIG_SL_BREACH_SINCE.pop(sid, None)
+                                    if not closed_now:
+                                        continue
                                     await _send_closed_signal_report_card(t, final_status="LOSS", pnl_total_pct=float(pnl), closed_at=now)
                                     logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
-                                    logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
-                                    _SIG_SL_BREACH_SINCE.pop(sid, None)
                                     closed_loss += 1
                                     continue
                         # TP1 hit -> arm BE
@@ -6673,10 +6691,12 @@ async def signal_outcome_loop() -> None:
                         # WIN by TP2 if exists
                         if eff_tp2 > 0 and _hit_tp(side, px, eff_tp2):
                             pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
-                            await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            closed_now = await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            if not closed_now:
+                                continue
                             await _send_closed_signal_report_card(t, final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
                             logger.info("[sig-outcome] WIN sid=%s %s %s px=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
-                            _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_win += 1
                             continue
 
@@ -6701,10 +6721,12 @@ async def signal_outcome_loop() -> None:
                             if crossed:
                                 if sig_sl_confirm_sec == 0 or (since is not None and (_time.time() - since) >= sig_sl_confirm_sec):
                                     pnl = _sig_net_pnl_tp1_then_sl(market=market, side=side, entry=entry, tp1=eff_tp1, sl=sl, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
-                                    await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
+                                    closed_now = await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
+                                    _SIG_SL_BREACH_SINCE.pop(sid, None)
+                                    if not closed_now:
+                                        continue
                                     await _send_closed_signal_report_card(t, final_status="LOSS", pnl_total_pct=float(pnl), closed_at=now)
                                     logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
-                                    _SIG_SL_BREACH_SINCE.pop(sid, None)
                                     closed_loss += 1
                                     continue
 
@@ -6730,18 +6752,22 @@ async def signal_outcome_loop() -> None:
                         if crossed and crossed_at_dt is not None and _BE_CONFIRM_SEC > 0:
                             if (now - crossed_at_dt).total_seconds() >= _BE_CONFIRM_SEC:
                                 pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
-                                await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
+                                closed_now = await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
+                                _SIG_SL_BREACH_SINCE.pop(sid, None)
+                                if not closed_now:
+                                    continue
                                 await _send_closed_signal_report_card(t, final_status="BE", pnl_total_pct=float(pnl), closed_at=now)
                                 logger.info("[sig-outcome] BE sid=%s %s %s px=%s be=%s tp1=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(entry), _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
-                                _SIG_SL_BREACH_SINCE.pop(sid, None)
                                 closed_be += 1
                                 continue
                         if crossed and crossed_at_dt is not None and _BE_CONFIRM_SEC == 0:
                             pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
-                            await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
+                            closed_now = await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl))
+                            _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            if not closed_now:
+                                continue
                             await _send_closed_signal_report_card(t, final_status="BE", pnl_total_pct=float(pnl), closed_at=now)
                             logger.info("[sig-outcome] BE sid=%s %s %s px=%s be=%s tp1=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(entry), _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
-                            _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_be += 1
                             continue
 
@@ -8257,7 +8283,7 @@ async def main() -> None:
             _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
 
             logger.info("Starting signal_outcome_loop")
-            asyncio.create_task(signal_outcome_loop())
+            _start_signal_outcome_task()
 
         # Auto-trade manager can run on all replicas (cluster-safe via DB lease/locks)
         TASKS["autotrade-manager"] = asyncio.create_task(
@@ -8312,7 +8338,7 @@ async def main() -> None:
     _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
 
     logger.info("Starting signal_outcome_loop")
-    asyncio.create_task(signal_outcome_loop())
+    _start_signal_outcome_task()
 
     # Auto-trade manager (SL/TP/BE) - runs in background.
     asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend))
