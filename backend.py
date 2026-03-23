@@ -21940,65 +21940,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         pass
 
-                    try:
-                        if _entered_zone_for_trigger and _mid_zone_touch_alert_enabled() and (not bool(it.get("zone_touch_alert_sent") or False)):
-                            try:
-                                _touch_conf_need = int(float(os.getenv("MID_ZONE_TOUCH_ALERT_MIN_CONF", os.getenv("MID_SMART_SETUP_EMIT_CONF", "90")) or 90))
-                            except Exception:
-                                _touch_conf_need = 90
-                            try:
-                                _touch_conf_now = int(float(it.get("confidence") or 0))
-                            except Exception:
-                                _touch_conf_now = 0
-                            _touch_guard = _mid_zone_touch_guard_reason(ta)
-                            _touch_strong = bool(_touch_conf_now >= _touch_conf_need) or _mid_pending_is_fresh_bo_rt(it, now_ts=now)
-                            if _touch_strong and (not _touch_guard):
-                                _touch_entry_ref, _touch_anchor_far, _touch_slip_atr = _mid_pending_entry_ref(it, price=price, ta=ta)
-                                if not _touch_anchor_far:
-                                    _touch_entry, _touch_sl, _touch_tp1, _touch_tp2, _touch_rr = _mid_recalc_levels_from_trigger(direction, _touch_entry_ref, ta, it, market)
-                                    _touch_note_base = str(it.get("risk_note") or "").strip()
-                                    _touch_note = (_touch_note_base + (" | " if _touch_note_base else "") + "zone_touch_alert=1 no_autotrade=1 levels_anchor=1").strip()
-                                    sig_zone = Signal(
-                                        signal_id=self.next_signal_id(),
-                                        market=market,
-                                        symbol=sym,
-                                        direction=direction,
-                                        timeframe=str(it.get("timeframe") or "5m/30m/1h"),
-                                        entry=_touch_entry,
-                                        sl=_touch_sl,
-                                        tp1=_touch_tp1,
-                                        tp2=_touch_tp2,
-                                        rr=_touch_rr,
-                                        confidence=_touch_conf_now,
-                                        confirmations=str(it.get("confirmations") or it.get("available_exchanges") or src_ex),
-                                        source_exchange=src_ex,
-                                        available_exchanges=str(it.get("available_exchanges") or it.get("confirmations") or src_ex),
-                                        risk_note=_touch_note,
-                                        ts=time.time(),
-                                    )
-                                    _normalize_signal_levels_inplace(sig_zone)
-                                    _levels_ok, _levels_reason = _signal_levels_sanity_gate(sig_zone)
-                                    if not _levels_ok:
-                                        it["zone_touch_alert_guard_reason"] = f"levels_sanity:{_levels_reason}"
-                                    else:
-                                        _rr_ok, _rr_val, _rr_min = signal_rr_gate(sig_zone)
-                                        if not _rr_ok:
-                                            it["zone_touch_alert_guard_reason"] = f"rr_low:{_rr_val:.2f}<{_rr_min:.2f}"
-                                        else:
-                                            _profit_ok, _profit_pct, _profit_min = signal_min_profit_gate(sig_zone)
-                                            if not _profit_ok:
-                                                it["zone_touch_alert_guard_reason"] = f"profit_low:{_profit_pct:.3f}<{_profit_min:.3f}"
-                                            else:
-                                                await emit_signal_cb(sig_zone)
-                                                it["zone_touch_alert_sent"] = True
-                                                it["zone_touch_alert_ts"] = float(now)
-                                                logger.info("[mid][pending][zone_touch_alert] %s %s %s conf=%s anchor=%.6g px=%.6g slip_atr=%.2f", sym, market, direction, int(_touch_conf_now), float(_touch_entry_ref), float(price), float(_touch_slip_atr))
-                                else:
-                                    it["zone_touch_alert_anchor_slip_atr"] = float(_touch_slip_atr)
-                            elif _touch_guard:
-                                it["zone_touch_alert_guard_reason"] = str(_touch_guard)
-                    except Exception:
-                        pass
+                    _zone_touch_alert_due = bool(
+                        _entered_zone_for_trigger
+                        and _mid_zone_touch_alert_enabled()
+                        and (not bool(it.get("zone_touch_alert_sent") or False))
+                    )
 
                     trig_checked_n += 1
                     if _in_zone_for_trigger:
@@ -22384,6 +22330,66 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
                         continue
+
+                    try:
+                        if _zone_touch_alert_due:
+                            try:
+                                _touch_conf_need = int(float(os.getenv("MID_ZONE_TOUCH_ALERT_MIN_CONF", os.getenv("MID_SMART_SETUP_EMIT_CONF", "90")) or 90))
+                            except Exception:
+                                _touch_conf_need = 90
+                            try:
+                                _touch_conf_now = int(float(it.get("confidence") or 0))
+                            except Exception:
+                                _touch_conf_now = 0
+                            _touch_guard = _mid_zone_touch_guard_reason(ta)
+                            _touch_strong = bool(_touch_conf_now >= _touch_conf_need) or _mid_pending_is_fresh_bo_rt(it, now_ts=now)
+                            if _touch_strong and (not _touch_guard):
+                                _touch_entry_ref, _touch_anchor_far, _touch_slip_atr = _mid_pending_entry_ref(it, price=price, ta=ta)
+                                if not _touch_anchor_far:
+                                    _touch_entry, _touch_sl, _touch_tp1, _touch_tp2, _touch_rr = _mid_recalc_levels_from_trigger(direction, _touch_entry_ref, ta, it, market)
+                                    _touch_note_base = str(it.get("risk_note") or "").strip()
+                                    _touch_note = (_touch_note_base + (" | " if _touch_note_base else "") + "zone_touch_alert=1 no_autotrade=1 levels_anchor=1").strip()
+                                    sig_zone = Signal(
+                                        signal_id=self.next_signal_id(),
+                                        market=market,
+                                        symbol=sym,
+                                        direction=direction,
+                                        timeframe=str(it.get("timeframe") or "5m/30m/1h"),
+                                        entry=_touch_entry,
+                                        sl=_touch_sl,
+                                        tp1=_touch_tp1,
+                                        tp2=_touch_tp2,
+                                        rr=_touch_rr,
+                                        confidence=_touch_conf_now,
+                                        confirmations=str(it.get("confirmations") or it.get("available_exchanges") or src_ex),
+                                        source_exchange=src_ex,
+                                        available_exchanges=str(it.get("available_exchanges") or it.get("confirmations") or src_ex),
+                                        risk_note=_touch_note,
+                                        ts=time.time(),
+                                    )
+                                    _normalize_signal_levels_inplace(sig_zone)
+                                    _levels_ok, _levels_reason = _signal_levels_sanity_gate(sig_zone)
+                                    if not _levels_ok:
+                                        it["zone_touch_alert_guard_reason"] = f"levels_sanity:{_levels_reason}"
+                                    else:
+                                        _rr_ok, _rr_val, _rr_min = signal_rr_gate(sig_zone)
+                                        if not _rr_ok:
+                                            it["zone_touch_alert_guard_reason"] = f"rr_low:{_rr_val:.2f}<{_rr_min:.2f}"
+                                        else:
+                                            _profit_ok, _profit_pct, _profit_min = signal_min_profit_gate(sig_zone)
+                                            if not _profit_ok:
+                                                it["zone_touch_alert_guard_reason"] = f"profit_low:{_profit_pct:.3f}<{_profit_min:.3f}"
+                                            else:
+                                                await emit_signal_cb(sig_zone)
+                                                it["zone_touch_alert_sent"] = True
+                                                it["zone_touch_alert_ts"] = float(now)
+                                                logger.info("[mid][pending][zone_touch_alert] %s %s %s conf=%s anchor=%.6g px=%.6g slip_atr=%.2f", sym, market, direction, int(_touch_conf_now), float(_touch_entry_ref), float(price), float(_touch_slip_atr))
+                                else:
+                                    it["zone_touch_alert_anchor_slip_atr"] = float(_touch_slip_atr)
+                            elif _touch_guard:
+                                it["zone_touch_alert_guard_reason"] = str(_touch_guard)
+                    except Exception:
+                        pass
 
                     # Snapshot trigger-time metrics for richer [mid][pending][trigger] logs
                     try:
