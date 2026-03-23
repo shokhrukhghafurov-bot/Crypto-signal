@@ -1959,8 +1959,12 @@ async def clear_signal_be_crossed(*, signal_id: int) -> None:
         )
 
 
-async def close_signal_track(*, signal_id: int, status: str, pnl_total_pct: float | None = None) -> None:
-    """Close a signal track with final status WIN/LOSS/BE/CLOSED and store pnl.
+async def close_signal_track(*, signal_id: int, status: str, pnl_total_pct: float | None = None) -> bool:
+    """Close an ACTIVE/TP1 signal track exactly once and store pnl.
+
+    Returns True only when this call transitioned the row from ACTIVE/TP1 to a final
+    state. A False return means the track was already closed elsewhere, which keeps
+    outcome loops idempotent across concurrent workers/restarts.
 
     Normalization matters for the admin dashboard:
       - WIN must never contribute negative PnL
@@ -1989,19 +1993,22 @@ async def close_signal_track(*, signal_id: int, status: str, pnl_total_pct: floa
 
     pool = get_pool()
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
-        await conn.execute(
+        row = await conn.fetchrow(
             """
             UPDATE signal_tracks
             SET status=$2,
                 closed_at=NOW(),
                 updated_at=NOW(),
                 pnl_total_pct=$3
-            WHERE signal_id=$1;
+            WHERE signal_id=$1
+              AND status IN ('ACTIVE','TP1')
+            RETURNING signal_id;
             """,
             int(signal_id),
             st,
             norm_pnl,
         )
+    return bool(row)
 
 
 async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
