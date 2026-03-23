@@ -16799,6 +16799,81 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
 
     support, resistance = _nearest_levels(df1hi)
 
+    # Breakout / Retest detection (simple but robust)
+    # IMPORTANT: trigger-time re-evaluation must rebuild this label locally.
+    # The pending trigger hard-block for directional contradiction relies on
+    # `breakout_retest` being present here; otherwise LONG+BO↓ / SHORT+BO↑
+    # silently slips through because the local contradiction check falls back
+    # to an empty block_reason.
+    breakout_retest = "—"
+    try:
+        sup_lvl = float(support) if support is not None else float("nan")
+        res_lvl = float(resistance) if resistance is not None else float("nan")
+        try:
+            tol = max(float(atr5) * 0.25, float(entry) * 0.0015)  # ~0.15% or 0.25 ATR(5m)
+        except Exception:
+            tol = float(entry) * 0.0015
+
+        d5 = df5i.tail(36).copy()  # last ~3h
+        if (not d5.empty) and len(d5) >= 10:
+            highs5 = d5["high"].astype(float).values
+            lows5 = d5["low"].astype(float).values
+            closes5 = d5["close"].astype(float).values
+
+            # Breakout up: close above resistance after being below/at it
+            bo_up_idx = None
+            if (not np.isnan(res_lvl)) and res_lvl > 0:
+                for i in range(1, len(closes5)):
+                    if closes5[i - 1] <= res_lvl and closes5[i] > res_lvl:
+                        bo_up_idx = i
+                        break
+
+            # Breakout down: close below support after being above/at it
+            bo_dn_idx = None
+            if (not np.isnan(sup_lvl)) and sup_lvl > 0:
+                for i in range(1, len(closes5)):
+                    if closes5[i - 1] >= sup_lvl and closes5[i] < sup_lvl:
+                        bo_dn_idx = i
+                        break
+
+            # Retest logic (after breakout)
+            ret_up = False
+            if bo_up_idx is not None:
+                for j in range(bo_up_idx + 1, len(closes5)):
+                    if (lows5[j] <= res_lvl + tol) and (closes5[j] > res_lvl):
+                        ret_up = True
+                        break
+
+            ret_dn = False
+            if bo_dn_idx is not None:
+                for j in range(bo_dn_idx + 1, len(closes5)):
+                    if (highs5[j] >= sup_lvl - tol) and (closes5[j] < sup_lvl):
+                        ret_dn = True
+                        break
+
+            # Prefer breakout in the same direction as the MID signal, but keep
+            # opposite BO/RT visible too so directional contradiction can hard-block.
+            if str(dir_trend).upper() == "LONG":
+                if bo_up_idx is not None and ret_up:
+                    breakout_retest = "BO↑ + Retest"
+                elif bo_up_idx is not None:
+                    breakout_retest = "BO↑"
+                elif bo_dn_idx is not None and ret_dn:
+                    breakout_retest = "BO↓ + Retest"
+                elif bo_dn_idx is not None:
+                    breakout_retest = "BO↓"
+            else:
+                if bo_dn_idx is not None and ret_dn:
+                    breakout_retest = "BO↓ + Retest"
+                elif bo_dn_idx is not None:
+                    breakout_retest = "BO↓"
+                elif bo_up_idx is not None and ret_up:
+                    breakout_retest = "BO↑ + Retest"
+                elif bo_up_idx is not None:
+                    breakout_retest = "BO↑"
+    except Exception:
+        breakout_retest = "—"
+
     # ---------- Liquidity zones + sweep (SMC-lite) ----------
     eq_hi = None
     eq_lo = None
@@ -16959,6 +17034,8 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "total": float(ta_score),
         "vwap": vwap_txt,
         "vwap_val": (float(vwap_val) if (not np.isnan(vwap_val)) else 0.0),
+        "breakout_retest": str(breakout_retest or "—"),
+        "bo_rt": str(breakout_retest or "—"),
         "pattern": pattern,
         "support": support,
         "resistance": resistance,
