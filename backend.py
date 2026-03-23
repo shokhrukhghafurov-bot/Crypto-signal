@@ -22225,6 +22225,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             it["_trig_reqs"]["direction"] = bool(os.getenv("MID_TRIGGER_REQUIRE_DIRECTION", "1").strip().lower() in ("1", "true", "yes", "on"))
                             it["_trig_reqs"]["trap"] = bool(req_trap)
                             it["_trig_reqs"]["bos_block"] = bool(True)
+                            it["_trig_reqs"]["macd_hist"] = bool(os.getenv("MID_TRIGGER_REQUIRE_MACD_HIST", "1").strip().lower() in ("1", "true", "yes", "on"))
                         
                     except Exception:
                         pass
@@ -22408,6 +22409,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 _touch_conf_now = 0
                             _touch_guard = _mid_zone_touch_guard_reason(ta)
+                            if not _touch_guard:
+                                try:
+                                    _touch_guard = _mid_macd_hist_emit_block_reason(str(direction), _safe_float(ta.get("macd_hist"), None))
+                                except Exception:
+                                    _touch_guard = _touch_guard or ""
                             _touch_strong = bool(_touch_conf_now >= _touch_conf_need) or _mid_pending_is_fresh_bo_rt(it, now_ts=now)
                             if _touch_strong and (not _touch_guard):
                                 _touch_entry_ref, _touch_anchor_far, _touch_slip_atr = _mid_pending_entry_ref(it, price=price, ta=ta)
@@ -23623,6 +23629,58 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                                 except Exception:
                                                     pass
                                             continue
+                        except Exception:
+                            pass
+                        try:
+                            # MACD hist direction gate (same display4 semantics as TA block).
+                            # -0.0005 must block LONG, +0.0005 must block SHORT.
+                            # -0.0000 / +0.0000 stay neutral because _mid_macd_hist_emit_block_reason()
+                            # uses the same 4-decimal representation shown in the signal card.
+                            req_macd_hist = False
+                            try:
+                                req_macd_hist = bool(it.get("_trig_reqs", {}).get("macd_hist", False))
+                            except Exception:
+                                req_macd_hist = bool(os.getenv("MID_TRIGGER_REQUIRE_MACD_HIST", "1").strip().lower() in ("1", "true", "yes", "on"))
+                            try:
+                                _macd_hist_now = _safe_float(ta.get("macd_hist"), None)
+                            except Exception:
+                                _macd_hist_now = None
+                            try:
+                                if isinstance(it.get("_trig_checks"), dict):
+                                    if not req_macd_hist:
+                                        it["_trig_checks"]["macd_hist"] = "skip"
+                                    else:
+                                        it["_trig_checks"]["macd_hist"] = "ne"
+                            except Exception:
+                                pass
+                            if req_macd_hist:
+                                raw_reason = _mid_macd_hist_emit_block_reason(str(direction), _macd_hist_now)
+                                if raw_reason:
+                                    try:
+                                        if isinstance(it.get("_trig_checks"), dict):
+                                            it["_trig_checks"]["macd_hist"] = f"fail:{raw_reason}"
+                                    except Exception:
+                                        pass
+                                    if full_diag:
+                                        _trig_add("macd_hist_block", "macd_hist")
+                                    else:
+                                        keep_it, outc = _pending_apply_fail(it, "macd_hist", now)
+                                        _pending_log_trigger(sym, market, direction, outc, raw_reason, it, float(price))
+                                        if keep_it:
+                                            keep.append(it)
+                                            any_wait = True
+                                        else:
+                                            try:
+                                                removed_n += 1
+                                            except Exception:
+                                                pass
+                                        continue
+                                else:
+                                    try:
+                                        if isinstance(it.get("_trig_checks"), dict):
+                                            it["_trig_checks"]["macd_hist"] = "pass"
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
                         try:
@@ -33084,4 +33142,5 @@ async def autotrade_anomaly_watchdog_loop(*, notify_api_error=None) -> None:
             logger.error("[AUTOTRADE_DIAG_LOOP_ERROR] %s\n%s", e, traceback.format_exc())
             await asyncio.sleep(10.0)
 # --- END AUTOTRADE ANOMALY WATCHDOG PATCH ---
+
 
