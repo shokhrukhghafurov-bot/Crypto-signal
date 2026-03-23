@@ -9677,7 +9677,7 @@ def _mid_instant_emit_gate(*,
         profit_need = float(_mid_instant_profit_cap(market)) if _MID_EARLY_ENTRY_GUARD else 1.0
 
     flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
-    hard_flags = {"far_zone", "scale_mismatch", "blocked", "structure_mismatch", "regime_range_no_breakout"}
+    hard_flags = {"far_zone", "scale_mismatch", "blocked", "structure_mismatch", "regime_range_no_breakout", "block:directional_contradiction"}
 
     conf_v = float(confidence or 0.0)
     atr_v = float(atr_pct or 0.0)
@@ -9733,6 +9733,12 @@ def _mid_instant_emit_gate(*,
 
     if conf_v < float(conf_need):
         _add_fail(f"instant_conf_low:{int(round(conf_v))}<{conf_need}")
+
+    # Instant emit must never bypass a scan-stage directional contradiction.
+    # Example: LONG + BO↓ / BO↓ + Retest should be rejected immediately even when
+    # smart setup emit is otherwise allowed.
+    if "block:directional_contradiction" in flags:
+        _add_fail("directional_contradiction")
 
     # Only keep generic scan-stage flags here when they are still relevant *now*.
     # ATR/VOL have dedicated current-metric checks below, so we do not duplicate them
