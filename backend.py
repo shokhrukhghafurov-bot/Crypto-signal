@@ -1040,6 +1040,7 @@ MID_REJECT_REASONS = {
     "late_entry",
     "vwap_dist",
     "anti_bounce",
+    "macd_hist",
     "score_low",
     "confidence_low",
     "trap_block",
@@ -1090,6 +1091,7 @@ MID_REJECT_ALIASES = {
     "anti_bounce": "anti_bounce",
     "anti_bounce_long": "anti_bounce",
     "anti_bounce_short": "anti_bounce",
+    "macd_hist": "macd_hist",
 
     "score": "score_low",
     "score_low": "score_low",
@@ -1710,6 +1712,48 @@ def _mid_pending_entry_ref(it: dict | None, *, price: float | None = None, ta: d
         return (float(fallback), False, 0.0)
 
 
+def _mid_macd_hist_display4(val: float | None) -> str:
+    """Return MACD hist string exactly like the TA block uses (+/- with 4 decimals)."""
+    try:
+        fv = float(val)
+        if not math.isfinite(fv):
+            return ""
+        return f"{fv:+.4f}"
+    except Exception:
+        return ""
+
+
+def _mid_macd_hist_emit_block_reason(direction: str, macd_hist: float | None) -> str:
+    """Hard-block emit only when MACD hist is *clearly* on the wrong side.
+
+    We intentionally use the same 4-decimal representation shown in the TA block so
+    values displayed as -0.0000 / +0.0000 are treated as neutral and do NOT block.
+    Example:
+      - LONG + -0.0152  -> block
+      - LONG + -0.0000  -> allow
+      - SHORT + +0.0152 -> block
+      - SHORT + +0.0000 -> allow
+    """
+    try:
+        side = str(direction or "").strip().upper()
+        if side not in ("LONG", "SHORT"):
+            return ""
+        disp = _mid_macd_hist_display4(macd_hist)
+        if not disp:
+            return ""
+        try:
+            disp_val = float(disp)
+        except Exception:
+            return ""
+        if side == "LONG" and disp_val < 0.0:
+            return f"macd_hist={disp} [need > 0]"
+        if side == "SHORT" and disp_val > 0.0:
+            return f"macd_hist={disp} [need < 0]"
+        return ""
+    except Exception:
+        return ""
+
+
 def _mid_zone_touch_guard_reason(ta: dict | None) -> str:
     """Hard veto reasons for early zone-touch alerts.
 
@@ -1723,6 +1767,7 @@ def _mid_zone_touch_guard_reason(ta: dict | None) -> str:
       - SHORT + Bullish Engulfing
       - LONG  + Bearish Engulfing
       - LONG / SHORT outside the configured RSI entry window
+      - clearly wrong-side MACD hist(5m) at emit time (but not displayed -0.0000 / +0.0000)
     """
     try:
         t = ta if isinstance(ta, dict) else {}
@@ -1789,6 +1834,10 @@ def _mid_zone_touch_guard_reason(ta: dict | None) -> str:
                 if rsi_5m >= rsi_short_max:
                     return f"rsi_short={rsi_5m:.1f} >= {rsi_short_max:g}"
 
+        _macd_reason = _mid_macd_hist_emit_block_reason(side, t.get("macd_hist"))
+        if _macd_reason:
+            return _macd_reason
+
         if bool(t.get("trap_ok", True)) is False:
             return str(t.get("trap_reason") or "trap_block")
         return ""
@@ -1815,6 +1864,8 @@ def _mid_trigger_selected_hardblock_reason(reason: str, it: dict | None = None) 
         fresh_bo_rt = _mid_pending_is_fresh_bo_rt(it)
         if head in ("rsi_long", "rsi_short"):
             return (head, head)
+        if head == "macd_hist":
+            return ("macd_hist", "macd_hist")
         if head in ("adx_30m", "adx_1h"):
             return (head, "regime_block")
         if head == "regime_block":
@@ -9652,7 +9703,8 @@ def _mid_instant_emit_gate(*,
                            breakout_bypass_late_entry: bool = False,
                            smart_setup_trap_ok: bool = True,
                            smart_setup_trap_reason: str = "",
-                           smart_setup_trap_meta: dict | None = None) -> tuple[bool, str, dict]:
+                           smart_setup_trap_meta: dict | None = None,
+                           macd_hist: float | None = None) -> tuple[bool, str, dict]:
     """Strict VIP gate for smart_setup_emit / pending instant emit.
 
     This is intentionally *stricter* than the normal pending pipeline.
@@ -9716,6 +9768,7 @@ def _mid_instant_emit_gate(*,
         "smart_setup_trap_ok": bool(smart_setup_trap_ok),
         "smart_setup_trap_reason": str(smart_setup_trap_reason or ""),
         "smart_setup_trap_meta": dict(smart_setup_trap_meta or {}),
+        "macd_hist": _mid_macd_hist_display4(macd_hist) or "—",
     })
 
     fail_reasons: list[str] = []
@@ -9739,6 +9792,10 @@ def _mid_instant_emit_gate(*,
     # smart setup emit is otherwise allowed.
     if "block:directional_contradiction" in flags:
         _add_fail("directional_contradiction")
+
+    _instant_macd_reason = _mid_macd_hist_emit_block_reason(direction, macd_hist)
+    if _instant_macd_reason:
+        _add_fail(_instant_macd_reason)
 
     # Only keep generic scan-stage flags here when they are still relevant *now*.
     # ATR/VOL have dedicated current-metric checks below, so we do not duplicate them
@@ -16963,6 +17020,8 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
                 htf_dir_30m=str(dir_mid),
                 adx_30m=float(adx30) if (adx30 == adx30) else None,
             )
+            if not reason:
+                reason = _mid_macd_hist_emit_block_reason(str(dir_trend), macd_hist5)
             if reason:
                 ta["blocked"] = True
                 ta["block_reason"] = str(reason)
@@ -22110,6 +22169,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             "regime_block": "ne",
                             "late_entry": "ne",
                             "anti_bounce": "ne",
+                            "macd_hist": "ne",
                         }
                         it["_trig_reqs"] = {}
                     except Exception:
@@ -22732,6 +22792,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             late_entry_reason=str(late_reason_now or ""),
                             anti_bounce_ok=bool(anti_ok_now),
                             anti_bounce_reason=str(anti_reason_now or ""),
+                            macd_hist=_safe_float(ta.get("macd_hist"), None),
                         )
                         try:
                             it["instant_emit_gate"] = dict(instant_meta or {})
@@ -23676,6 +23737,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             "score": ("score_low", "score_low"),
                             "vol_x": ("vol_low", "vol_low"),
                             "late_entry": ("late_entry", "late_entry"),
+                            "macd_hist": ("macd_hist_block", "macd_hist"),
                         }
                         def _resolve_trigger_log_reason(fail_key: str, default_reason: str) -> str:
                             try:
@@ -28093,6 +28155,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 smart_setup_trap_ok=bool(_smart_trap_ok),
                                                 smart_setup_trap_reason=str(_smart_trap_reason or ""),
                                                 smart_setup_trap_meta=dict(_smart_trap_meta or {}),
+                                                macd_hist=_safe_float((base_r.get("macd_hist") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("macd_hist")), None),
                                             )
 
                                             try:
