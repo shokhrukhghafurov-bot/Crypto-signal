@@ -12956,13 +12956,15 @@ def _mid_bool_env(name: str, default: str = "0") -> bool:
         return False
 
 
-def _mid_scan_critical_block_reason(*, side: str, rsi_5m: float | None, adx_30m: float | None, adx_1h: float | None, market: str = "SPOT") -> str | None:
+def _mid_scan_critical_block_reason(*, side: str, rsi_5m: float | None, macd_hist_5m: float | None, adx_30m: float | None, adx_1h: float | None, market: str = "SPOT") -> str | None:
     """Return a setup-time hard blocker that must not be deferred to TRIGGER.
 
     In MID pending mode with MID_FILTERS_AFTER_SETUP=1 we normally keep setups alive
-    during SCAN and re-check hard filters on TRIGGER. For RSI entry-window violations and
-    ADX regime violations this is too permissive: the setup itself is already invalid and
-    should not reach a setup/pending alert.
+    during SCAN and re-check hard filters on TRIGGER. For RSI entry-window violations,
+    clearly wrong-side MACD histogram values, and ADX regime violations this is too
+    permissive: the setup itself is already invalid and should not reach a setup/pending
+    alert. MACD uses the same 4-decimal display rule as the TA block, so values that are
+    shown as -0.0000 / +0.0000 stay neutral and are not hard-blocked.
     """
     try:
         if not _mid_bool_env("MID_SCAN_HARDBLOCK_RSI_ADX", "1"):
@@ -13002,6 +13004,11 @@ def _mid_scan_critical_block_reason(*, side: str, rsi_5m: float | None, adx_30m:
                     return f"rsi_short={rsi:.1f} <= {rsi_short_min:g}"
                 if rsi >= rsi_short_max:
                     return f"rsi_short={rsi:.1f} >= {rsi_short_max:g}"
+
+        if _mid_bool_env("MID_SCAN_HARDBLOCK_MACD", "1"):
+            macd_reason = _mid_macd_hist_emit_block_reason(side_u, macd_hist_5m)
+            if macd_reason:
+                return macd_reason
 
         if _mid_bool_env("MID_USE_REGIME", "1"):
             try:
@@ -14403,6 +14410,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         scan_hard_reason = _mid_scan_critical_block_reason(
             side=str(dir_trend),
             rsi_5m=(float(rsi5) if (rsi5 == rsi5) else None),
+            macd_hist_5m=(float(macd_hist5) if (macd_hist5 == macd_hist5) else None),
             adx_30m=(float(adx30) if (adx30 == adx30) else None),
             adx_1h=(float(adx1h) if (adx1h == adx1h) else None),
             market=str(market or "SPOT"),
@@ -16226,12 +16234,12 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
             rsi_thr_txt = f"{rsi_long_min:g}-{rsi_long_max:g}"
             rsi_ok = (rsi >= rsi_long_min) and (rsi < rsi_long_max)
             macd_thr_txt = "> 0"
-            macd_ok = macd_hist > 0
+            macd_ok = (_mid_macd_hist_emit_block_reason(direction, macd_hist) == "")
         elif direction == "SHORT":
             rsi_thr_txt = f"{rsi_short_min:g}-{rsi_short_max:g}"
             rsi_ok = (rsi > rsi_short_min) and (rsi <= rsi_short_max)
             macd_thr_txt = "< 0"
-            macd_ok = macd_hist < 0
+            macd_ok = (_mid_macd_hist_emit_block_reason(direction, macd_hist) == "")
         else:
             rsi_thr_txt = "—"
             rsi_ok = None
