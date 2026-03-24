@@ -16847,6 +16847,36 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
 
     support, resistance = _nearest_levels(df1hi)
 
+    # Breakout / Retest detection (trigger-safe).
+    # v2 missed local initialization of breakout_retest inside evaluate_on_exchange_mid_v2,
+    # which caused NameError during trigger TA payload build.
+    breakout_retest = "—"
+    try:
+        atr5 = float(last5.get("atr", np.nan))
+        if np.isnan(atr5) or atr5 <= 0:
+            try:
+                hi5 = df5i["high"].astype(float)
+                lo5 = df5i["low"].astype(float)
+                cl5 = df5i["close"].astype(float)
+                prev5 = cl5.shift(1)
+                tr5 = np.maximum(hi5 - lo5, np.maximum((hi5 - prev5).abs(), (lo5 - prev5).abs()))
+                atr5 = float(tr5.rolling(14).mean().iloc[-1])
+            except Exception:
+                atr5 = 0.0
+        if np.isnan(atr5) or atr5 <= 0:
+            atr5 = 0.0
+        _bo_ok, _bo_label = _mid_breakout_retest_trigger(
+            df5i,
+            direction=str(dir_trend),
+            support=support,
+            resistance=resistance,
+            atr5=float(atr5),
+        )
+        if _bo_ok and _bo_label:
+            breakout_retest = str(_bo_label)
+    except Exception:
+        breakout_retest = "—"
+
     # ---------- Liquidity zones + sweep (SMC-lite) ----------
     eq_hi = None
     eq_lo = None
@@ -24175,7 +24205,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # emitted: do not keep
                 except Exception as e:
                     try:
-                        logger.warning("[mid][pending][trigger] %s %s %s outcome=error reason=trigger_exception:%s px=%.6g", sym, market, direction, type(e).__name__, float(price))
+                        logger.warning("[mid][pending][trigger] %s %s %s outcome=error reason=trigger_exception:%s:%s px=%.6g", sym, market, direction, type(e).__name__, str(e), float(price))
                     except Exception:
                         pass
                     keep.append(it)
