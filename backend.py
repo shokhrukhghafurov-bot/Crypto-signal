@@ -16046,6 +16046,223 @@ def _ta_signal_grade(ta: Dict[str, Any]) -> str:
             return "C-"
 
 
+
+
+def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
+    """Human-friendly 0..10 strength score focused on the 5 core TA inputs.
+
+    Main drivers:
+      - RSI
+      - ADX (30m/1h mix)
+      - MACD histogram
+      - Relative volume
+      - VWAP location / stretch
+
+    Goal: very strong readings should noticeably raise the score, while weaker
+    but still acceptable readings should only raise it a little.
+    """
+    try:
+        if not ta:
+            return (0.0, "VERY WEAK")
+
+        def fget(*keys: str):
+            for key in keys:
+                try:
+                    val = ta.get(key)
+                except Exception:
+                    val = None
+                if val in (None, "", "—"):
+                    continue
+                try:
+                    num = float(val)
+                    if np.isnan(num):
+                        continue
+                    return num
+                except Exception:
+                    continue
+            return None
+
+        def sget(*keys: str) -> str:
+            for key in keys:
+                try:
+                    val = ta.get(key)
+                except Exception:
+                    val = None
+                if val in (None, ""):
+                    continue
+                txt = str(val).strip()
+                if txt:
+                    return txt
+            return ""
+
+        def _score_rsi(direction: str, rsi: float | None) -> float:
+            if rsi is None:
+                return 0.6
+            r = float(rsi)
+            if direction == "SHORT":
+                if 37.0 <= r <= 42.0:
+                    return 2.0
+                if 42.0 < r <= 47.0:
+                    return 1.6
+                if 32.0 <= r < 37.0:
+                    return 1.2
+                if 47.0 < r <= 50.0:
+                    return 0.8
+                if 50.0 < r <= 53.0:
+                    return 0.3
+                if r > 58.0:
+                    return -0.6
+                return 0.0
+            # LONG / default
+            if 58.0 <= r <= 63.0:
+                return 2.0
+            if 53.0 <= r < 58.0:
+                return 1.6
+            if 63.0 < r <= 68.0:
+                return 1.2
+            if 50.0 <= r < 53.0:
+                return 0.8
+            if 47.0 <= r < 50.0:
+                return 0.3
+            if r < 42.0:
+                return -0.6
+            return 0.0
+
+        def _score_adx(adx30: float | None, adx1h: float | None) -> float:
+            vals = [float(v) for v in (adx30, adx1h) if v is not None]
+            if not vals:
+                return 0.5
+            if len(vals) == 2:
+                mix = vals[0] * 0.45 + vals[1] * 0.55
+            else:
+                mix = vals[0]
+            if mix >= 35.0:
+                return 2.0
+            if mix >= 30.0:
+                return 1.6
+            if mix >= 25.0:
+                return 1.2
+            if mix >= 20.0:
+                return 0.8
+            if mix >= 15.0:
+                return 0.3
+            return 0.0
+
+        def _score_macd(direction: str, macd_hist: float | None) -> float:
+            if macd_hist is None:
+                return 0.5
+            h = float(macd_hist)
+            correct_side = (direction == "LONG" and h > 0) or (direction == "SHORT" and h < 0)
+            ah = abs(h)
+            if correct_side:
+                if ah >= 1e-2:
+                    return 2.0
+                if ah >= 1e-3:
+                    return 1.6
+                if ah >= 1e-4:
+                    return 1.2
+                if ah >= 1e-5:
+                    return 0.8
+                return 0.3
+            if ah >= 1e-3:
+                return -0.8
+            if ah >= 1e-5:
+                return -0.4
+            return 0.0
+
+        def _score_volume(vol_rel: float | None) -> float:
+            if vol_rel is None:
+                return 0.5
+            v = float(vol_rel)
+            if v >= 2.0:
+                return 2.0
+            if v >= 1.6:
+                return 1.6
+            if v >= 1.3:
+                return 1.2
+            if v >= 1.1:
+                return 0.8
+            if v >= 0.95:
+                return 0.4
+            if v >= 0.8:
+                return 0.1
+            return -0.3
+
+        def _score_vwap(direction: str,
+                        entry: float | None,
+                        vwap_val: float | None,
+                        atr_abs: float | None) -> float:
+            if entry is None or vwap_val is None or not vwap_val:
+                return 0.5
+            e = float(entry)
+            v = float(vwap_val)
+            dist = abs(e - v)
+            atr = abs(float(atr_abs)) if atr_abs not in (None, 0) else 0.0
+            stretch = (dist / atr) if atr > 1e-9 else None
+            on_right_side = (direction == "LONG" and e >= v) or (direction == "SHORT" and e <= v)
+            if not on_right_side:
+                return -0.8
+            if stretch is None:
+                return 1.0
+            if stretch <= 0.15:
+                return 0.7
+            if stretch <= 0.45:
+                return 1.2
+            if stretch <= 0.90:
+                return 1.8
+            if stretch <= 1.50:
+                return 1.3
+            return 0.7
+
+        direction = sget("direction", "dir4", "dir1").upper() or "LONG"
+        if direction not in {"LONG", "SHORT"}:
+            direction = "LONG"
+
+        rsi = fget("rsi", "rsi15")
+        adx30 = fget("adx1", "adx_30m")
+        adx1h = fget("adx4", "adx_1h")
+        macd = fget("macd_hist", "macd_hist15")
+        volx = fget("rel_vol", "vol_rel")
+        entry = fget("entry")
+        vwap_val = fget("vwap_val")
+        atr_abs = fget("atr30", "atr_abs")
+        if atr_abs is None:
+            atr_pct = fget("atr_pct")
+            if entry is not None and atr_pct is not None:
+                atr_abs = abs(float(entry)) * abs(float(atr_pct)) / 100.0
+
+        score = 0.0
+        score += _score_rsi(direction, rsi)
+        score += _score_adx(adx30, adx1h)
+        score += _score_macd(direction, macd)
+        score += _score_volume(volx)
+        score += _score_vwap(direction, entry, vwap_val, atr_abs)
+
+        # Tiny contextual nudges only; the 5 core TA items remain dominant.
+        trap_ok = ta.get("trap_ok") if ("trap_ok" in ta) else None
+        breakout = sget("breakout_retest", "bo_rt").upper()
+        if trap_ok is False:
+            score -= 0.4
+        if direction == "LONG" and breakout.startswith("BO↑ + RETEST"):
+            score += 0.2
+        elif direction == "SHORT" and breakout.startswith("BO↓ + RETEST"):
+            score += 0.2
+
+        score = round(max(0.0, min(10.0, score)), 1)
+        if score >= 8.5:
+            label = "VERY STRONG"
+        elif score >= 7.0:
+            label = "STRONG"
+        elif score >= 5.5:
+            label = "MEDIUM"
+        elif score >= 4.0:
+            label = "WEAK"
+        else:
+            label = "VERY WEAK"
+        return (score, label)
+    except Exception:
+        return (0.0, "VERY WEAK")
+
 def _fmt_ta_block(ta: Dict[str, Any]) -> str:
     """
     Format TA snapshot for Telegram/UX. Keep it short but informative.
@@ -16086,8 +16303,10 @@ def _fmt_ta_block(ta: Dict[str, Any]) -> str:
                 return "—"
 
         grade = _ta_signal_grade(ta)
+        strength10, strength_label = _signal_strength_10(ta)
         lines = [
             f"📊 TA score: {fint(score)}/100 | Grade: {grade} | Mode: {SIGNAL_MODE}",
+            f"🔥 Signal strength: {strength10:.1f}/10 ({strength_label})",
             f"RSI: {fnum(rsi, '{:.1f}')} | MACD hist: {fnum(macd_h, '{:.4f}')}",
             f"ADX 1h/4h: {fnum(adx1, '{:.1f}')}/{fnum(adx4, '{:.1f}')} | ATR%: {fnum(atrp, '{:.2f}')}",
             f"BB: {bb} | Vol xAvg: {fnum(volr, '{:.2f}')} | VWAP: {vwap}",
@@ -16237,6 +16456,7 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
         score_txt = _fmt_num(ta_score, "{:.0f}", default="0")
         conf_txt = _fmt_num(confidence, "{:.0f}", default="0")
         grade = _ta_signal_grade(ta)
+        strength10, strength_label = _signal_strength_10(ta)
 
         score_need = _env_float_local("MID_MIN_SCORE_FUTURES" if market_txt == "FUTURES" else "MID_MIN_SCORE_SPOT", 90.0)
         conf_need = _env_float_local("MID_MIN_CONFIDENCE", 90.0)
@@ -16323,6 +16543,7 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
 
         lines = [
             f"📊 TA score: {score_txt}/100 [need ≥{score_need:.0f}] | Grade: {grade} | Mode: {mode_txt}",
+            f"🔥 Signal strength: {strength10:.1f}/10 ({strength_label})",
             f"🎯 Confidence: {conf_txt}/100 [need ≥{conf_need:.0f}]",
             f"{_status_emoji(rsi_ok)} RSI(5m): {rsi:.1f} [need {rsi_thr_txt}] | {_status_emoji(macd_ok)} MACD hist(5m): {_fmt_signed(macd_hist)} [need {macd_thr_txt}]",
             f"{_status_emoji(adx_ok)} ADX 30m/1h: {adx_30m:.1f}/{adx_1h:.1f} [need ≥{adx30_need:.0f}/≥{adx1h_need:.0f}] | • ATR% (30m): {atr_pct:.2f}",
