@@ -16150,11 +16150,16 @@ def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
                 if ah >= 1e-5:
                     return 0.5
                 return 0.1
+            # Soft-fix: tiny wrong-side MACD around zero is mostly noise,
+            # not a hard bearish/bullish blocker. Keep a strong penalty only
+            # when the histogram is clearly on the wrong side.
             if ah >= 1e-3:
                 return -1.0
-            if ah >= 1e-5:
+            if ah >= 2e-4:
                 return -0.6
-            return -0.2
+            if ah >= 1e-5:
+                return -0.3
+            return -0.1
 
         def _score_volume(vol_rel: float | None) -> float:
             if vol_rel is None:
@@ -16268,8 +16273,15 @@ def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
             if ah < 1e-5:
                 caps.append(5.4)
             elif not correct_side:
-                caps.append(4.9)
-                blocker_count += 1
+                # Soft-fix for near-zero MACD: mild wrong-side noise should not
+                # crush the whole signal like a clear momentum conflict does.
+                if ah >= 1e-3:
+                    caps.append(4.9)
+                    blocker_count += 1
+                elif ah >= 2e-4:
+                    caps.append(5.4)
+                else:
+                    caps.append(5.9)
 
         if entry is not None and vwap_val is not None and float(vwap_val) != 0.0:
             on_right_side = (direction == "LONG" and float(entry) >= float(vwap_val)) or (direction == "SHORT" and float(entry) <= float(vwap_val))
@@ -16501,16 +16513,8 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
 
         ta_score = ta.get("ta_score", ta.get("ta_score_total", ta.get("score", ta.get("confidence", 0))))
         confidence = ta.get("ta_score_conf", ta.get("confidence", ta_score))
-        try:
-            ta_score_disp = max(0.0, min(100.0, float(ta_score)))
-        except Exception:
-            ta_score_disp = ta_score
-        try:
-            confidence_disp = max(0.0, min(100.0, float(confidence)))
-        except Exception:
-            confidence_disp = confidence
-        score_txt = _fmt_num(ta_score_disp, "{:.0f}", default="0")
-        conf_txt = _fmt_num(confidence_disp, "{:.0f}", default="0")
+        score_txt = _fmt_num(ta_score, "{:.0f}", default="0")
+        conf_txt = _fmt_num(confidence, "{:.0f}", default="0")
         grade = _ta_signal_grade(ta)
         strength10, strength_label = _signal_strength_10(ta)
 
@@ -16554,17 +16558,16 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
         adx1h_need = _env_float_local("MID_MIN_ADX_1H", 22.0)
         vol_need = _env_float_local("MID_MIN_VOL_X", 0.0)
 
-        # UI hints should match Signal strength, not the broader scan/pass gates.
         if direction == "LONG":
-            rsi_thr_txt = "54-62 ideal"
-            rsi_ok = (54.0 <= rsi <= 62.0)
-            macd_thr_txt = "> +0.0010 ideal"
-            macd_ok = (macd_hist > 0.0 and abs(macd_hist) >= 1e-3)
+            rsi_thr_txt = f"{rsi_long_min:g}-{rsi_long_max:g}"
+            rsi_ok = (rsi >= rsi_long_min) and (rsi < rsi_long_max)
+            macd_thr_txt = "> 0"
+            macd_ok = (_mid_macd_hist_emit_block_reason(direction, macd_hist) == "")
         elif direction == "SHORT":
-            rsi_thr_txt = "38-46 ideal"
-            rsi_ok = (38.0 <= rsi <= 46.0)
-            macd_thr_txt = "< -0.0010 ideal"
-            macd_ok = (macd_hist < 0.0 and abs(macd_hist) >= 1e-3)
+            rsi_thr_txt = f"{rsi_short_min:g}-{rsi_short_max:g}"
+            rsi_ok = (rsi > rsi_short_min) and (rsi <= rsi_short_max)
+            macd_thr_txt = "< 0"
+            macd_ok = (_mid_macd_hist_emit_block_reason(direction, macd_hist) == "")
         else:
             rsi_thr_txt = "—"
             rsi_ok = None
@@ -16572,7 +16575,7 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
             macd_ok = None
 
         adx_ok = (adx_30m >= adx30_need) and (adx_1h >= adx1h_need)
-        vol_ok = (volx >= 0.80)
+        vol_ok = (volx >= vol_need)
 
         vwap_side_txt = vwap
         vwap_ok = None
@@ -16604,7 +16607,7 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
             f"🎯 Confidence: {conf_txt}/100 [need ≥{conf_need:.0f}]",
             f"{_status_emoji(rsi_ok)} RSI(5m): {rsi:.1f} [need {rsi_thr_txt}] | {_status_emoji(macd_ok)} MACD hist(5m): {_fmt_signed(macd_hist)} [need {macd_thr_txt}]",
             f"{_status_emoji(adx_ok)} ADX 30m/1h: {adx_30m:.1f}/{adx_1h:.1f} [need ≥{adx30_need:.0f}/≥{adx1h_need:.0f}] | • ATR% (30m): {atr_pct:.2f}",
-            f"• BB: {bb} | {_status_emoji(vol_ok)} Vol xAvg: {volx:.2f} [ideal ≥0.80] | {_status_emoji(vwap_ok)} VWAP: {vwap_side_txt}",
+            f"• BB: {bb} | {_status_emoji(vol_ok)} Vol xAvg: {volx:.2f} [need ≥{vol_need:.2f}] | {_status_emoji(vwap_ok)} VWAP: {vwap_side_txt}",
             trap_line,
             f"Ch: {ch} | PA: {pa} | Regime: {regime}",
             f"Liquidity (EQH / EQL): {(_fmt_sr(eq_hi) if eq_hi is not None else '—')} / {(_fmt_sr(eq_lo) if eq_lo is not None else '—')} | Sweep(5m): {sweep}",
