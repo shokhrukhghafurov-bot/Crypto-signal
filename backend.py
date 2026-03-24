@@ -9348,7 +9348,6 @@ def _mid_smart_setup_trap_eval(*,
                                  vol_last: float | None = None,
                                  vol_avg: float | None = None,
                                  breakout_fresh_ok: bool = False,
-                                 origin_fast_ok: bool = False,
                                  in_zone_now: bool = False,
                                  allow_no_zone_breakout: bool = False,
                                  confidence: float | None = None) -> tuple[bool, str, dict]:
@@ -9375,7 +9374,6 @@ def _mid_smart_setup_trap_eval(*,
         active = True
     meta["active"] = bool(active)
     meta["breakout_fresh_ok"] = bool(breakout_fresh_ok)
-    meta["origin_fast_ok"] = bool(origin_fast_ok)
     meta["in_zone_now"] = bool(in_zone_now)
     meta["allow_no_zone_breakout"] = bool(allow_no_zone_breakout)
     if not active:
@@ -9444,18 +9442,6 @@ def _mid_smart_setup_trap_eval(*,
         relax_mult = float(os.getenv("MID_SMART_SETUP_TRAP_RELAX_MULT", "1.08") or 1.08)
     except Exception:
         relax_mult = 1.08
-    try:
-        origin_relax_mult = float(os.getenv("MID_SMART_SETUP_ORIGIN_TRAP_RELAX_MULT", "1.35") or 1.35)
-    except Exception:
-        origin_relax_mult = 1.35
-    try:
-        origin_skip_bb_combo = str(os.getenv("MID_SMART_SETUP_ORIGIN_TRAP_SKIP_BB_COMBO", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-    except Exception:
-        origin_skip_bb_combo = True
-    try:
-        origin_skip_impulse = str(os.getenv("MID_SMART_SETUP_ORIGIN_TRAP_SKIP_IMPULSE", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-    except Exception:
-        origin_skip_impulse = True
 
     if mkt == "FUTURES":
         try:
@@ -9469,8 +9455,6 @@ def _mid_smart_setup_trap_eval(*,
             max_vwap_dist = 1.00
     if conf_v >= relax_at:
         max_vwap_dist *= max(1.0, float(relax_mult))
-    if bool(origin_fast_ok):
-        max_vwap_dist *= max(1.0, float(origin_relax_mult))
 
     try:
         bb_combo_vwap_min = float(os.getenv("MID_SMART_SETUP_TRAP_BB_COMBO_VWAP_MIN", "0.90") or 0.90)
@@ -9539,8 +9523,7 @@ def _mid_smart_setup_trap_eval(*,
     except Exception:
         block_bb_combo = True
     if block_bb_combo and bb_soft and vwap_dist_atr >= float(bb_combo_vwap_min):
-        if not (bool(origin_fast_ok) and bool(origin_skip_bb_combo)):
-            reasons.append(f"smart_setup_trap_bb_stretch:{bb or '-'}|vwap={vwap_dist_atr:.2f}")
+        reasons.append(f"smart_setup_trap_bb_stretch:{bb or '-'}|vwap={vwap_dist_atr:.2f}")
 
     try:
         block_impulse = str(os.getenv("MID_SMART_SETUP_TRAP_BLOCK_IMPULSE", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
@@ -9548,8 +9531,7 @@ def _mid_smart_setup_trap_eval(*,
         block_impulse = True
     if block_impulse and body_atr >= float(impulse_body_min) and vwap_dist_atr >= float(impulse_vwap_min) and float(vol_ratio) >= float(impulse_vol_min):
         if bb_soft or bb_extreme or bool(breakout_fresh_ok):
-            if not (bool(origin_fast_ok) and bool(origin_skip_impulse)):
-                reasons.append(f"smart_setup_trap_impulse:body={body_atr:.2f}|vwap={vwap_dist_atr:.2f}|vol={vol_ratio:.2f}")
+            reasons.append(f"smart_setup_trap_impulse:body={body_atr:.2f}|vwap={vwap_dist_atr:.2f}|vol={vol_ratio:.2f}")
 
     if reasons:
         meta["fail_reasons"] = list(reasons)
@@ -9622,6 +9604,8 @@ def _mid_smart_setup_origin_fastpath(*,
                                     dist_to_zone_atr: float | None,
                                     dist_to_zone_pct: float | None,
                                     last_body: float | None,
+                                    origin_body: float | None = None,
+                                    origin_vol_x: float | None = None,
                                     sweep_long: bool = False,
                                     sweep_short: bool = False,
                                     risk_flags=None) -> tuple[bool, str, dict]:
@@ -9699,13 +9683,19 @@ def _mid_smart_setup_origin_fastpath(*,
 
     conf_v = float(confidence or 0.0)
     atr_v = float(atr_pct or 0.0)
-    vol_v = float(vol_x or 0.0)
     age_v = None if breakout_age_bars is None else int(breakout_age_bars)
     move_v = None if breakout_move_atr is None else float(breakout_move_atr)
     dist_atr_v = None if dist_to_zone_atr is None else float(dist_to_zone_atr)
     dist_pct_v = float(dist_to_zone_pct or 0.0)
     atr30_v = float(atr30_abs or 0.0)
-    body_v = abs(float(last_body or 0.0))
+    try:
+        vol_v = float(origin_vol_x if origin_vol_x is not None else (vol_x or 0.0))
+    except Exception:
+        vol_v = float(vol_x or 0.0)
+    try:
+        body_v = abs(float(origin_body if origin_body is not None else (last_body or 0.0)))
+    except Exception:
+        body_v = abs(float(last_body or 0.0))
     body_atr_v = (body_v / atr30_v) if atr30_v > 0 else 0.0
 
     meta.update({
@@ -9722,6 +9712,8 @@ def _mid_smart_setup_origin_fastpath(*,
         "vol_x": float(vol_v),
         "vol_need": float(vol_need),
         "body_atr": float(body_atr_v),
+        "body_source": "origin_body" if origin_body is not None else "last_body",
+        "vol_source": "origin_vol_x" if origin_vol_x is not None else "rel_vol",
         "body_need_atr": float(min_body_atr),
         "breakout_age_bars": age_v,
         "max_age_bars": int(max_age_bars),
@@ -9905,17 +9897,6 @@ def _mid_smart_setup_breakout_fastpath(*,
     return (True, "breakout_fastpass", meta)
 
 
-def _mid_origin_relaxable_trap_reason(reason: str) -> bool:
-    """Trap reasons that may be softened for origin fast-path entries."""
-    try:
-        r = str(reason or "").strip().lower()
-        if not r:
-            return False
-        return r.startswith("smart_setup_trap_vwap_ext") or r.startswith("smart_setup_trap_bb_stretch") or r.startswith("smart_setup_trap_impulse")
-    except Exception:
-        return False
-
-
 def _mid_instant_emit_gate(*,
                            market: str,
                            direction: str,
@@ -9981,38 +9962,6 @@ def _mid_instant_emit_gate(*,
     except Exception:
         profit_need = float(_mid_instant_profit_cap(market)) if _MID_EARLY_ENTRY_GUARD else 1.0
 
-    try:
-        origin_relax_profit = str(os.getenv("MID_SMART_SETUP_ORIGIN_RELAX_PROFIT", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-    except Exception:
-        origin_relax_profit = True
-    try:
-        origin_profit_mult = float(os.getenv("MID_SMART_SETUP_ORIGIN_PROFIT_RELAX_MULT", "0.45") or 0.45)
-    except Exception:
-        origin_profit_mult = 0.45
-    try:
-        origin_profit_floor = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_PROFIT_PCT", ("0.20" if str(market or "SPOT").upper().strip() == "FUTURES" else "0.30")) or ("0.20" if str(market or "SPOT").upper().strip() == "FUTURES" else "0.30"))
-    except Exception:
-        origin_profit_floor = 0.20 if str(market or "SPOT").upper().strip() == "FUTURES" else 0.30
-    try:
-        origin_relax_macd = str(os.getenv("MID_SMART_SETUP_ORIGIN_RELAX_MACD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-    except Exception:
-        origin_relax_macd = True
-    try:
-        origin_relax_trap = str(os.getenv("MID_SMART_SETUP_ORIGIN_RELAX_TRAP", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-    except Exception:
-        origin_relax_trap = True
-    try:
-        origin_relax_regime = str(os.getenv("MID_SMART_SETUP_ORIGIN_RELAX_REGIME", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-    except Exception:
-        origin_relax_regime = True
-
-    if origin_fast_ok and origin_relax_profit:
-        try:
-            relaxed_profit_need = max(0.0, max(float(origin_profit_floor), float(profit_need) * max(0.0, float(origin_profit_mult))))
-            profit_need = min(float(profit_need), float(relaxed_profit_need))
-        except Exception:
-            pass
-
     flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
     hard_flags = {"far_zone", "scale_mismatch", "blocked", "structure_mismatch", "regime_range_no_breakout", "block:directional_contradiction"}
 
@@ -10057,10 +10006,6 @@ def _mid_instant_emit_gate(*,
         "origin_bypass_late_entry": bool(origin_bypass_late_entry),
         "origin_bypass_anti_bounce": bool(origin_bypass_anti_bounce),
         "origin_conf_need": (None if origin_conf_need is None else int(float(origin_conf_need))),
-        "origin_relax_profit": bool(origin_relax_profit),
-        "origin_relax_macd": bool(origin_relax_macd),
-        "origin_relax_trap": bool(origin_relax_trap),
-        "origin_relax_regime": bool(origin_relax_regime),
         "smart_setup_trap_ok": bool(smart_setup_trap_ok),
         "smart_setup_trap_reason": str(smart_setup_trap_reason or ""),
         "smart_setup_trap_meta": dict(smart_setup_trap_meta or {}),
@@ -10091,10 +10036,7 @@ def _mid_instant_emit_gate(*,
 
     _instant_macd_reason = _mid_macd_hist_emit_block_reason(direction, macd_hist)
     if _instant_macd_reason:
-        if origin_fast_ok and origin_relax_macd:
-            ignored_checks.append(str(_instant_macd_reason))
-        else:
-            _add_fail(_instant_macd_reason)
+        _add_fail(_instant_macd_reason)
 
     # Only keep generic scan-stage flags here when they are still relevant *now*.
     # ATR/VOL have dedicated current-metric checks below, so we do not duplicate them
@@ -10120,11 +10062,7 @@ def _mid_instant_emit_gate(*,
     if applied_risk_flags:
         _add_fail(f"instant_risk_flags:{','.join(applied_risk_flags)}")
     if not smart_setup_trap_ok:
-        _trap_reason = str(smart_setup_trap_reason or "smart_setup_trap")
-        if origin_fast_ok and origin_relax_trap and _mid_origin_relaxable_trap_reason(_trap_reason):
-            ignored_checks.append(_trap_reason)
-        else:
-            _add_fail(_trap_reason)
+        _add_fail(str(smart_setup_trap_reason or "smart_setup_trap"))
     if profit_v < float(profit_need):
         _add_fail(f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}")
     if not rr_ok:
@@ -10154,11 +10092,7 @@ def _mid_instant_emit_gate(*,
     if (market or "SPOT").upper().strip() == "FUTURES":
         allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_INSTANT_EMIT_ALLOWED_REGIMES_FUTURES", "TREND,TRENDING,EXPANSION")) if str(x).strip()}
         if reg_u not in allowed_regimes:
-            _reg_reason = f"instant_regime_block:{reg_u or '-'}"
-            if origin_fast_ok and origin_relax_regime and reg_u in {"", "-", "—"}:
-                ignored_checks.append(_reg_reason)
-            else:
-                _add_fail(_reg_reason)
+            _add_fail(f"instant_regime_block:{reg_u or '-'}")
 
     if bool(zone_valid):
         if not bool(in_zone_now):
@@ -17271,6 +17205,8 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
 
     # --- 5m micro structure helpers (used by institutional trigger) ---
     last_body = 0.0
+    prev_body = 0.0
+    origin_body = 0.0
     disp_body_atr = 0.0
     bos_up_5m = False
     bos_down_5m = False
@@ -17280,6 +17216,8 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
     higher_lows_5m = False
     vol_last = float("nan")
     vol_avg = float("nan")
+    prev_rel_vol = float("nan")
+    origin_vol_x = float("nan")
     try:
         op = df5i["open"].astype(float)
         hi = df5i["high"].astype(float)
@@ -17293,14 +17231,42 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
             last_body = abs(float(cl.iloc[-1]) - float(op.iloc[-1]))
         except Exception:
             last_body = 0.0
+        try:
+            prev_body = abs(float(cl.iloc[-2]) - float(op.iloc[-2])) if len(cl) >= 2 else 0.0
+        except Exception:
+            prev_body = 0.0
+        try:
+            origin_body = max(float(last_body or 0.0), float(prev_body or 0.0))
+        except Exception:
+            origin_body = float(last_body or 0.0)
 
         try:
             vv = df5i["volume"].astype(float)
             vol_last = float(vv.iloc[-1])
             vol_avg = float(vv.rolling(20).mean().iloc[-1])
+            try:
+                if len(vv) >= 2:
+                    _prev_avg = float(vv.rolling(20).mean().iloc[-2])
+                    _prev_vol = float(vv.iloc[-2])
+                    prev_rel_vol = (_prev_vol / _prev_avg) if (_prev_avg and not np.isnan(_prev_avg) and _prev_avg > 0) else float("nan")
+                else:
+                    prev_rel_vol = float("nan")
+            except Exception:
+                prev_rel_vol = float("nan")
+            try:
+                _curr_rel = float(vol_rel) if (vol_rel == vol_rel) else 0.0
+            except Exception:
+                _curr_rel = 0.0
+            try:
+                _prev_rel = float(prev_rel_vol) if (prev_rel_vol == prev_rel_vol) else 0.0
+            except Exception:
+                _prev_rel = 0.0
+            origin_vol_x = max(_curr_rel, _prev_rel)
         except Exception:
             vol_last = float("nan")
             vol_avg = float("nan")
+            prev_rel_vol = float("nan")
+            origin_vol_x = float(vol_rel) if (vol_rel == vol_rel) else float("nan")
 
         # BOS heuristic: close breaks prior swing range (lightweight)
         try:
@@ -17563,8 +17529,12 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "macd_hist": macd_hist5,
         "bb": bb_str,
         "rel_vol": vol_rel if (not np.isnan(vol_rel)) else 0.0,
+        "rel_vol_prev": float(prev_rel_vol) if (prev_rel_vol == prev_rel_vol) else 0.0,
+        "origin_vol_x": float(origin_vol_x) if (origin_vol_x == origin_vol_x) else (float(vol_rel) if (vol_rel == vol_rel) else 0.0),
 
         "last_body": float(last_body),
+        "prev_body": float(prev_body),
+        "origin_body": float(origin_body),
         "disp_body_atr": float(disp_body_atr),
         "bos_up_5m": bool(bos_up_5m),
         "bos_down_5m": bool(bos_down_5m),
@@ -28504,6 +28474,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "atr_pct_fast_at_create": float(_atr_pct_fast) if ("_atr_pct_fast" in locals() and _atr_pct_fast is not None) else None,
                                         "atr_pct_slow_at_create": float(_atr_pct_slow) if ("_atr_pct_slow" in locals() and _atr_pct_slow is not None) else None,
                                         "rel_vol_at_create": float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
+                                        "origin_vol_x_at_create": float((base_r.get("origin_vol_x") if ("base_r" in locals() and isinstance(base_r, dict)) else (base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0)) or 0.0),
+                                        "last_body": float((base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
+                                        "origin_body_at_create": float((base_r.get("origin_body") if ("base_r" in locals() and isinstance(base_r, dict)) else (base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0)) or 0.0),
                                         "zone_width_atr": (float(_zone_w_atr) if (_zone_w_atr is not None) else None) if ("_zone_w_atr" in locals()) else None,
                                         "zone_width_atr_raw": (float(_zone_w_atr_raw) if ("_zone_w_atr_raw" in locals() and _zone_w_atr_raw is not None) else None),
                                         "zone_width_atr_fast": (float(_zone_w_atr_fast) if ("_zone_w_atr_fast" in locals() and _zone_w_atr_fast is not None) else None),
@@ -28819,6 +28792,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     dist_to_zone_atr=_dist_now_atr,
                                                     dist_to_zone_pct=float(_dist_now_pct),
                                                     last_body=float((base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("last_body") or 0.0) or 0.0),
+                                                    origin_body=float((base_r.get("origin_body") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("origin_body_at_create") or rec.get("last_body") or 0.0) or 0.0),
+                                                    origin_vol_x=float((base_r.get("origin_vol_x") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("origin_vol_x_at_create") or rec.get("rel_vol_at_create") or 0.0) or 0.0),
                                                     sweep_long=bool((base_r.get("sweep_long") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("sweep_long") or False)),
                                                     sweep_short=bool((base_r.get("sweep_short") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("sweep_short") or False)),
                                                     risk_flags=risk_flags,
@@ -28827,23 +28802,6 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 _origin_fast_ok = False
                                                 _origin_fast_reason = f"origin_fast_error:{type(_origin_exc).__name__}"
                                                 _origin_fast_meta = {"primary_reason": _origin_fast_reason}
-                                            try:
-                                                _smart_setup_log(
-                                                    ("origin_fastpath_pass" if _origin_fast_ok else "origin_fastpath_reject"),
-                                                    sym=sym,
-                                                    market=marketu,
-                                                    dir=diru,
-                                                    conf=int(_conf_now),
-                                                    bo_rt=str(_bo_rt_now or "-"),
-                                                    age_bars=str((_origin_fast_meta or {}).get("breakout_age_bars") if isinstance(_origin_fast_meta, dict) else rec.get("breakout_first_age_bars_create") or "-"),
-                                                    move_atr=str((_origin_fast_meta or {}).get("breakout_move_atr") if isinstance(_origin_fast_meta, dict) else rec.get("breakout_first_move_atr_create") or "-"),
-                                                    atr_pct=f"{float((_origin_fast_meta or {}).get('atr_pct') or ((base_r.get('atr_pct') if ('base_r' in locals() and isinstance(base_r, dict)) else rec.get('atr_pct_at_create') or 0.0) or 0.0)):.3f}",
-                                                    vol=f"{float((_origin_fast_meta or {}).get('vol_x') or ((base_r.get('rel_vol') if ('base_r' in locals() and isinstance(base_r, dict)) else rec.get('rel_vol_at_create') or 0.0) or 0.0)):.2f}",
-                                                    reason=str((_origin_fast_meta or {}).get("primary_reason") or _origin_fast_reason or ("origin_fastpass" if _origin_fast_ok else "origin_fast_reject")),
-                                                    all_reasons=str((_origin_fast_meta or {}).get("all_reasons") or _origin_fast_reason or ("origin_fastpass" if _origin_fast_ok else "origin_fast_reject")),
-                                                )
-                                            except Exception:
-                                                pass
                                             _breakout_fast_ok = False
                                             _breakout_fast_reason = ""
                                             _breakout_fast_meta = {}
@@ -28876,7 +28834,6 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 vol_last=float((base_r.get("vol_last") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("vol_last") or 0.0) or 0.0),
                                                 vol_avg=float((base_r.get("vol_avg") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("vol_avg") or 0.0) or 0.0),
                                                 breakout_fresh_ok=bool(_breakout_fast_ok),
-                                                origin_fast_ok=bool(_origin_fast_ok),
                                                 in_zone_now=bool(_in_zone_now),
                                                 allow_no_zone_breakout=bool(_smart_emit_if_no_zone),
                                                 confidence=float(_conf_now),
@@ -28944,33 +28901,6 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 _can_emit_now = bool(self.can_emit_mid(sym))
                                             except Exception:
                                                 _can_emit_now = True
-
-                                            if _origin_fast_ok and _emit_now and _can_emit_now:
-                                                try:
-                                                    _smart_setup_log(
-                                                        "origin_fastpath_emit",
-                                                        sym=sym,
-                                                        market=marketu,
-                                                        dir=diru,
-                                                        conf=int(_conf_now),
-                                                        reason=str((_emit_meta or {}).get("primary_reason") or _emit_reason or "origin_fast_emit"),
-                                                        all_reasons=str((_emit_meta or {}).get("all_reasons") or _emit_reason or "origin_fast_emit"),
-                                                    )
-                                                except Exception:
-                                                    pass
-                                            elif _origin_fast_ok and (not _emit_now):
-                                                try:
-                                                    _smart_setup_log(
-                                                        "origin_fastpath_gate_block",
-                                                        sym=sym,
-                                                        market=marketu,
-                                                        dir=diru,
-                                                        conf=int(_conf_now),
-                                                        reason=str((_emit_meta or {}).get("primary_reason") or _emit_reason or "origin_fast_block"),
-                                                        all_reasons=str((_emit_meta or {}).get("all_reasons") or _emit_reason or "origin_fast_block"),
-                                                    )
-                                                except Exception:
-                                                    pass
 
                                             _smart_pending_reason = str(_emit_reason or "")
                                             if _emit_now and (not _can_emit_now):
