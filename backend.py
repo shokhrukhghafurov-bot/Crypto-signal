@@ -16049,17 +16049,27 @@ def _ta_signal_grade(ta: Dict[str, Any]) -> str:
 
 
 def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
-    """Human-friendly 0..10 strength score focused on the 5 core TA inputs.
+    """Human-friendly 0..10 strength score.
 
-    Main drivers:
-      - RSI
-      - ADX (30m/1h mix)
-      - MACD histogram
-      - Relative volume
-      - VWAP location / stretch
+    Blend two layers so Telegram users see a score that is both intuitive and
+    aligned with the engine:
+      1) core TA momentum / trend / participation
+         - RSI
+         - ADX (30m/1h mix)
+         - MACD histogram
+         - Relative volume
+         - VWAP location / stretch
+      2) setup quality from the engine itself
+         - TA score total
+         - confidence
 
-    Goal: very strong readings should noticeably raise the score, while weaker
-    but still acceptable readings should only raise it a little.
+    This avoids contradictory cards like:
+      TA score 95/100 + confidence 95/100
+      but Signal strength 0.5/10
+
+    Core TA still matters most for "how strong is the move right now", while
+    setup quality stops very strong confluence setups from being shown as almost
+    dead/invalid only because one live input (usually volume) is temporarily soft.
     """
     try:
         if not ta:
@@ -16095,6 +16105,12 @@ def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
                     return txt
             return ""
 
+        def _clip(v: float, lo: float, hi: float) -> float:
+            try:
+                return float(max(lo, min(hi, float(v))))
+            except Exception:
+                return float(lo)
+
         def _score_rsi(direction: str, rsi: float | None) -> float:
             if rsi is None:
                 return 0.6
@@ -16113,7 +16129,6 @@ def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
                 if r > 58.0:
                     return -0.6
                 return 0.0
-            # LONG / default
             if 58.0 <= r <= 63.0:
                 return 2.0
             if 53.0 <= r < 58.0:
@@ -16132,10 +16147,7 @@ def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
             vals = [float(v) for v in (adx30, adx1h) if v is not None]
             if not vals:
                 return 0.5
-            if len(vals) == 2:
-                mix = vals[0] * 0.45 + vals[1] * 0.55
-            else:
-                mix = vals[0]
+            mix = (vals[0] * 0.45 + vals[1] * 0.55) if len(vals) == 2 else vals[0]
             if mix >= 35.0:
                 return 2.0
             if mix >= 30.0:
@@ -16231,24 +16243,41 @@ def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
             if entry is not None and atr_pct is not None:
                 atr_abs = abs(float(entry)) * abs(float(atr_pct)) / 100.0
 
-        score = 0.0
-        score += _score_rsi(direction, rsi)
-        score += _score_adx(adx30, adx1h)
-        score += _score_macd(direction, macd)
-        score += _score_volume(volx)
-        score += _score_vwap(direction, entry, vwap_val, atr_abs)
+        core_score = 0.0
+        core_score += _score_rsi(direction, rsi)
+        core_score += _score_adx(adx30, adx1h)
+        core_score += _score_macd(direction, macd)
+        core_score += _score_volume(volx)
+        core_score += _score_vwap(direction, entry, vwap_val, atr_abs)
 
-        # Tiny contextual nudges only; the 5 core TA items remain dominant.
         trap_ok = ta.get("trap_ok") if ("trap_ok" in ta) else None
         breakout = sget("breakout_retest", "bo_rt").upper()
         if trap_ok is False:
-            score -= 0.4
+            core_score -= 0.4
         if direction == "LONG" and breakout.startswith("BO↑ + RETEST"):
-            score += 0.2
+            core_score += 0.2
         elif direction == "SHORT" and breakout.startswith("BO↓ + RETEST"):
-            score += 0.2
+            core_score += 0.2
+        core_score = _clip(round(core_score, 1), 0.0, 10.0)
 
-        score = round(max(0.0, min(10.0, score)), 1)
+        ta_score_total = fget("ta_score_total", "ta_score", "score", "total")
+        ta_conf = fget("ta_score_conf", "confidence")
+        if ta_score_total is None and ta_conf is None:
+            setup_score = core_score
+        else:
+            score_norm = _clip((ta_score_total if ta_score_total is not None else ta_conf or 0.0) / 10.0, 0.0, 10.0)
+            conf_norm = _clip((ta_conf if ta_conf is not None else ta_score_total or 0.0) / 10.0, 0.0, 10.0)
+            setup_score = round((score_norm * 0.55) + (conf_norm * 0.45), 1)
+
+        score = round((core_score * 0.50) + (setup_score * 0.50), 1)
+
+        if setup_score >= 9.0 and score < 5.0:
+            score = 5.0
+        elif setup_score >= 8.0 and score < 4.5:
+            score = 4.5
+
+        score = _clip(score, 0.0, 10.0)
+        score = round(score, 1)
         if score >= 8.5:
             label = "VERY STRONG"
         elif score >= 7.0:
@@ -16262,7 +16291,6 @@ def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
         return (score, label)
     except Exception:
         return (0.0, "VERY WEAK")
-
 def _fmt_ta_block(ta: Dict[str, Any]) -> str:
     """
     Format TA snapshot for Telegram/UX. Keep it short but informative.
