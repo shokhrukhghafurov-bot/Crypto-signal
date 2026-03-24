@@ -9755,7 +9755,12 @@ def _mid_smart_setup_origin_fastpath(*,
         reasons.append(f"origin_fast_atr:{atr_v:.3f}<{atr_need:.3f}")
     if vol_v < float(vol_need_eff):
         reasons.append(f"origin_fast_vol:{vol_v:.2f}<{vol_need_eff:.2f}")
-    if body_atr_v < float(body_need_eff):
+    _body_soft_bypass = False
+    try:
+        _body_soft_bypass = bool(bo_ok and age_v is not None and age_v <= 0 and str(meta.get("body_source") or "") == "breakout_meta" and body_atr_v <= 0.0)
+    except Exception:
+        _body_soft_bypass = False
+    if body_atr_v < float(body_need_eff) and not _body_soft_bypass:
         reasons.append(f"origin_fast_body:{body_atr_v:.2f}<{body_need_eff:.2f}")
     if age_v is not None and max_age_bars >= 0 and age_v > max_age_bars:
         reasons.append(f"origin_fast_age:{int(age_v)}>{int(max_age_bars)}")
@@ -28565,6 +28570,55 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         except Exception:
                                             pass
 
+                                    try:
+                                        _bo_body_create = float(_bo_meta.get("breakout_body")) if _bo_meta.get("breakout_body") is not None else None
+                                    except Exception:
+                                        _bo_body_create = None
+                                    try:
+                                        _bo_prev_body_create = float(_bo_meta.get("breakout_prev_body")) if _bo_meta.get("breakout_prev_body") is not None else None
+                                    except Exception:
+                                        _bo_prev_body_create = None
+                                    try:
+                                        _bo_origin_body_create = float(_bo_meta.get("breakout_origin_body")) if _bo_meta.get("breakout_origin_body") is not None else None
+                                    except Exception:
+                                        _bo_origin_body_create = None
+                                    try:
+                                        _bo_rel_vol_create = float(_bo_meta.get("breakout_rel_vol")) if _bo_meta.get("breakout_rel_vol") is not None else None
+                                    except Exception:
+                                        _bo_rel_vol_create = None
+                                    try:
+                                        _bo_prev_rel_vol_create = float(_bo_meta.get("breakout_prev_rel_vol")) if _bo_meta.get("breakout_prev_rel_vol") is not None else None
+                                    except Exception:
+                                        _bo_prev_rel_vol_create = None
+                                    try:
+                                        _bo_origin_vol_create = float(_bo_meta.get("breakout_origin_vol_x")) if _bo_meta.get("breakout_origin_vol_x") is not None else None
+                                    except Exception:
+                                        _bo_origin_vol_create = None
+                                    try:
+                                        _origin_body_create = float((base_r.get("origin_body") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0)
+                                    except Exception:
+                                        _origin_body_create = 0.0
+                                    if (_bo_origin_body_create is not None) and float(_bo_origin_body_create) > float(_origin_body_create or 0.0):
+                                        _origin_body_create = float(_bo_origin_body_create)
+                                        _origin_body_src_create = "breakout_meta"
+                                    else:
+                                        try:
+                                            _origin_body_src_create = str((base_r.get("origin_body_src") if ("base_r" in locals() and isinstance(base_r, dict)) else "origin_body") or "origin_body")
+                                        except Exception:
+                                            _origin_body_src_create = "origin_body"
+                                    try:
+                                        _origin_vol_create = float((base_r.get("origin_vol_x") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0)
+                                    except Exception:
+                                        _origin_vol_create = 0.0
+                                    if (_bo_origin_vol_create is not None) and float(_bo_origin_vol_create) > float(_origin_vol_create or 0.0):
+                                        _origin_vol_create = float(_bo_origin_vol_create)
+                                        _origin_vol_src_create = "breakout_meta"
+                                    else:
+                                        try:
+                                            _origin_vol_src_create = str((base_r.get("origin_vol_src") if ("base_r" in locals() and isinstance(base_r, dict)) else "origin_vol_x") or "origin_vol_x")
+                                        except Exception:
+                                            _origin_vol_src_create = "origin_vol_x"
+
                                     rec = {
                                         "key": key,
                                         "market": marketu,
@@ -28595,6 +28649,12 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "breakout_first_move_pct_create": _bo_move_pct_create,
                                         "breakout_bar_sec": int(_bo_meta.get("bar_sec") or 300),
                                         "breakout_meta_source": _bo_meta_src or ("snapshot" if _bo_meta.get("breakout_age_bars") is not None else ""),
+                                        "breakout_body_at_create": _bo_body_create,
+                                        "breakout_prev_body_at_create": _bo_prev_body_create,
+                                        "breakout_origin_body_at_create": _bo_origin_body_create,
+                                        "breakout_rel_vol_at_create": _bo_rel_vol_create,
+                                        "breakout_prev_rel_vol_at_create": _bo_prev_rel_vol_create,
+                                        "breakout_origin_vol_x_at_create": _bo_origin_vol_create,
                                         "atr_at_create": float(_atr0) if ("_atr0" in locals() and _atr0) else float(entry) * 0.001,
                                         "atr_pct_at_create": float((base_r.get("atr_pct") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
                                         "atr_fast_at_create": float(_atr_fast) if ("_atr_fast" in locals() and _atr_fast is not None) else None,
@@ -28602,11 +28662,11 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "atr_pct_fast_at_create": float(_atr_pct_fast) if ("_atr_pct_fast" in locals() and _atr_pct_fast is not None) else None,
                                         "atr_pct_slow_at_create": float(_atr_pct_slow) if ("_atr_pct_slow" in locals() and _atr_pct_slow is not None) else None,
                                         "rel_vol_at_create": float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
-                                        "origin_vol_x_at_create": float((base_r.get("origin_vol_x") if ("base_r" in locals() and isinstance(base_r, dict)) else (base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0)) or 0.0),
-                                        "origin_vol_src_at_create": str((base_r.get("origin_vol_src") if ("base_r" in locals() and isinstance(base_r, dict)) else "origin_vol_x") or "origin_vol_x"),
+                                        "origin_vol_x_at_create": float(_origin_vol_create or 0.0),
+                                        "origin_vol_src_at_create": str(_origin_vol_src_create or "origin_vol_x"),
                                         "last_body": float((base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
-                                        "origin_body_at_create": float((base_r.get("origin_body") if ("base_r" in locals() and isinstance(base_r, dict)) else (base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0)) or 0.0),
-                                        "origin_body_src_at_create": str((base_r.get("origin_body_src") if ("base_r" in locals() and isinstance(base_r, dict)) else "origin_body") or "origin_body"),
+                                        "origin_body_at_create": float(_origin_body_create or 0.0),
+                                        "origin_body_src_at_create": str(_origin_body_src_create or "origin_body"),
                                         "zone_width_atr": (float(_zone_w_atr) if (_zone_w_atr is not None) else None) if ("_zone_w_atr" in locals()) else None,
                                         "zone_width_atr_raw": (float(_zone_w_atr_raw) if ("_zone_w_atr_raw" in locals() and _zone_w_atr_raw is not None) else None),
                                         "zone_width_atr_fast": (float(_zone_w_atr_fast) if ("_zone_w_atr_fast" in locals() and _zone_w_atr_fast is not None) else None),
@@ -28900,6 +28960,62 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 _bo_rt_now = str((base_r.get("bo_rt") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("bo_rt") or rec.get("breakout_retest") or "") or "")
                                             except Exception:
                                                 _bo_rt_now = ""
+                                            try:
+                                                _origin_body_for_fast = float((base_r.get("origin_body") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0)
+                                            except Exception:
+                                                _origin_body_for_fast = 0.0
+                                            try:
+                                                _origin_body_src_for_fast = str((base_r.get("origin_body_src") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("origin_body_src_at_create") or "origin_body") or "origin_body")
+                                            except Exception:
+                                                _origin_body_src_for_fast = str(rec.get("origin_body_src_at_create") or "origin_body")
+                                            try:
+                                                _rec_bo_origin_body = float(rec.get("breakout_origin_body_at_create")) if rec.get("breakout_origin_body_at_create") is not None else None
+                                            except Exception:
+                                                _rec_bo_origin_body = None
+                                            try:
+                                                _rec_bo_body = float(rec.get("breakout_body_at_create")) if rec.get("breakout_body_at_create") is not None else None
+                                            except Exception:
+                                                _rec_bo_body = None
+                                            try:
+                                                _rec_bo_prev_body = float(rec.get("breakout_prev_body_at_create")) if rec.get("breakout_prev_body_at_create") is not None else None
+                                            except Exception:
+                                                _rec_bo_prev_body = None
+                                            for _cand in (_rec_bo_origin_body, _rec_bo_body, _rec_bo_prev_body, rec.get("origin_body_at_create"), rec.get("last_body")):
+                                                try:
+                                                    _fv = float(_cand or 0.0)
+                                                except Exception:
+                                                    _fv = 0.0
+                                                if _fv > float(_origin_body_for_fast or 0.0):
+                                                    _origin_body_for_fast = _fv
+                                                    _origin_body_src_for_fast = "breakout_meta" if _cand in (_rec_bo_origin_body, _rec_bo_body, _rec_bo_prev_body) else str(rec.get("origin_body_src_at_create") or "origin_body")
+                                            try:
+                                                _origin_vol_for_fast = float((base_r.get("origin_vol_x") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0)
+                                            except Exception:
+                                                _origin_vol_for_fast = 0.0
+                                            try:
+                                                _origin_vol_src_for_fast = str((base_r.get("origin_vol_src") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("origin_vol_src_at_create") or "origin_vol_x") or "origin_vol_x")
+                                            except Exception:
+                                                _origin_vol_src_for_fast = str(rec.get("origin_vol_src_at_create") or "origin_vol_x")
+                                            try:
+                                                _rec_bo_origin_vol = float(rec.get("breakout_origin_vol_x_at_create")) if rec.get("breakout_origin_vol_x_at_create") is not None else None
+                                            except Exception:
+                                                _rec_bo_origin_vol = None
+                                            try:
+                                                _rec_bo_rel_vol = float(rec.get("breakout_rel_vol_at_create")) if rec.get("breakout_rel_vol_at_create") is not None else None
+                                            except Exception:
+                                                _rec_bo_rel_vol = None
+                                            try:
+                                                _rec_bo_prev_rel_vol = float(rec.get("breakout_prev_rel_vol_at_create")) if rec.get("breakout_prev_rel_vol_at_create") is not None else None
+                                            except Exception:
+                                                _rec_bo_prev_rel_vol = None
+                                            for _cand in (_rec_bo_origin_vol, _rec_bo_rel_vol, _rec_bo_prev_rel_vol, rec.get("origin_vol_x_at_create"), rec.get("rel_vol_at_create")):
+                                                try:
+                                                    _fv = float(_cand or 0.0)
+                                                except Exception:
+                                                    _fv = 0.0
+                                                if _fv > float(_origin_vol_for_fast or 0.0):
+                                                    _origin_vol_for_fast = _fv
+                                                    _origin_vol_src_for_fast = "breakout_meta" if _cand in (_rec_bo_origin_vol, _rec_bo_rel_vol, _rec_bo_prev_rel_vol) else str(rec.get("origin_vol_src_at_create") or "origin_vol_x")
                                             _origin_fast_ok = False
                                             _origin_fast_reason = ""
                                             _origin_fast_meta = {}
@@ -28922,10 +29038,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     dist_to_zone_atr=_dist_now_atr,
                                                     dist_to_zone_pct=float(_dist_now_pct),
                                                     last_body=float((base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("last_body") or 0.0) or 0.0),
-                                                    origin_body=float((base_r.get("origin_body") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("origin_body_at_create") or rec.get("last_body") or 0.0) or 0.0),
-                                                    origin_vol_x=float((base_r.get("origin_vol_x") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("origin_vol_x_at_create") or rec.get("rel_vol_at_create") or 0.0) or 0.0),
-                                                    origin_body_src=str((base_r.get("origin_body_src") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("origin_body_src_at_create") or "origin_body") or "origin_body"),
-                                                    origin_vol_src=str((base_r.get("origin_vol_src") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("origin_vol_src_at_create") or "origin_vol_x") or "origin_vol_x"),
+                                                    origin_body=float(_origin_body_for_fast or 0.0),
+                                                    origin_vol_x=float(_origin_vol_for_fast or 0.0),
+                                                    origin_body_src=str(_origin_body_src_for_fast or "origin_body"),
+                                                    origin_vol_src=str(_origin_vol_src_for_fast or "origin_vol_x"),
                                                     sweep_long=bool((base_r.get("sweep_long") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("sweep_long") or False)),
                                                     sweep_short=bool((base_r.get("sweep_short") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("sweep_short") or False)),
                                                     risk_flags=risk_flags,
