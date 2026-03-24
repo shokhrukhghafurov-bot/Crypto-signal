@@ -17329,8 +17329,9 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
                 htf_dir_30m=str(dir_mid),
                 adx_30m=float(adx30) if (adx30 == adx30) else None,
             )
-            if not reason:
-                reason = _mid_macd_hist_emit_block_reason(str(dir_trend), macd_hist5)
+            # Keep MACD histogram as a trigger/emit-time gate only.
+            # Do not convert it into an early TA hard-block here because
+            # pending candidates must be allowed to progress to trigger checks.
             if reason:
                 ta["blocked"] = True
                 ta["block_reason"] = str(reason)
