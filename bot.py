@@ -3219,6 +3219,20 @@ def _signal_text(uid: int, s: Signal, *, autotrade_hint: str = "") -> str:
     autotrade_line = f"{tr(uid, 'sig_autotrade')}: {autotrade_hint}\n" if autotrade_hint else ""
 
     risk_note = _risk_note_for_uid(uid, s.risk_note)
+    strength_line = ""
+    if risk_note:
+        keep_lines: list[str] = []
+        for raw_line in str(risk_note).splitlines():
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            if (not strength_line) and line.startswith("🔥 Signal strength:"):
+                strength_line = line
+                continue
+            keep_lines.append(raw_line.rstrip())
+        risk_note = "\n".join([ln for ln in keep_lines if str(ln).strip()]).strip()
+    if strength_line:
+        confirm_line = f"{confirm_line}\n{strength_line}"
     risk_block = f"\n\n{risk_note}" if risk_note else ""
 
     return trf(uid, "msg_open_card",
