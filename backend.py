@@ -13008,11 +13008,13 @@ def _mid_scan_critical_block_reason(*, side: str, rsi_5m: float | None, macd_his
     """Return a setup-time hard blocker that must not be deferred to TRIGGER.
 
     In MID pending mode with MID_FILTERS_AFTER_SETUP=1 we normally keep setups alive
-    during SCAN and re-check hard filters on TRIGGER. For RSI entry-window violations,
-    clearly wrong-side MACD histogram values, and ADX regime violations this is too
-    permissive: the setup itself is already invalid and should not reach a setup/pending
-    alert. MACD uses the same 4-decimal display rule as the TA block, so values that are
-    shown as -0.0000 / +0.0000 stay neutral and are not hard-blocked.
+    during SCAN and re-check hard filters on TRIGGER. RSI entry-window violations and
+    ADX regime violations are still true setup-time hard blockers.
+
+    IMPORTANT: MACD histogram is intentionally NOT enforced on SCAN anymore.
+    It must only participate at TRIGGER / EMIT time via
+    _mid_macd_hist_emit_block_reason(), otherwise valid setups are cut too early and
+    show up as no_signal/macd_hist in the scan summary.
     """
     try:
         if not _mid_bool_env("MID_SCAN_HARDBLOCK_RSI_ADX", "1"):
@@ -13053,10 +13055,8 @@ def _mid_scan_critical_block_reason(*, side: str, rsi_5m: float | None, macd_his
                 if rsi >= rsi_short_max:
                     return f"rsi_short={rsi:.1f} >= {rsi_short_max:g}"
 
-        if _mid_bool_env("MID_SCAN_HARDBLOCK_MACD", "1"):
-            macd_reason = _mid_macd_hist_emit_block_reason(side_u, macd_hist_5m)
-            if macd_reason:
-                return macd_reason
+        # MACD hist is deferred to TRIGGER / EMIT only.
+        # Do not hard-block on SCAN, even if MID_SCAN_HARDBLOCK_MACD=1 in stale env.
 
         if _mid_bool_env("MID_USE_REGIME", "1"):
             try:
