@@ -22008,6 +22008,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # Normally we wait until price reaches the planned entry zone/price.
                     # For debugging (or "emit on create" behavior), you can bypass this wait:
                     # MID_PENDING_INSTANT_EMIT=1 + MID_PENDING_INSTANT_EMIT_IGNORE_ZONE=1
+                    #
+                    # IMPORTANT:
+                    # pending_skip_checks is also used later in the instant-emit branch,
+                    # but trigger may reach this point before the old assignment block below.
+                    # Keep these flags initialized before the first reference so trigger
+                    # re-check never crashes with NameError.
+                    pending_emit_on_zone = (os.getenv("MID_PENDING_INSTANT_EMIT_ON_ZONE", "0").strip().lower() in ("1","true","yes","on"))
+                    pending_skip_checks = (os.getenv("MID_PENDING_INSTANT_EMIT_SKIP_CHECKS", "0").strip().lower() in ("1","true","yes","on"))
                     _debug_wait_bypass = bool(pending_instant_emit and instant_ignore_zone and (instant_emit_due_to_nofilters or pending_skip_checks))
                     if not _debug_wait_bypass:
                         if use_zone:
