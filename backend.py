@@ -9954,6 +9954,17 @@ def _mid_instant_emit_gate(*,
                 conf_need = min(int(conf_need), int(float(origin_conf_need)))
         except Exception:
             pass
+    def _env_on(name: str, default: str = "1") -> bool:
+        try:
+            return str(os.getenv(name, default) or default).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            return str(default).strip().lower() in ("1", "true", "yes", "on")
+
+    origin_ignore_profit = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_BYPASS_PROFIT", "1"))
+    origin_soft_macd = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_SOFT_MACD", "1"))
+    origin_bypass_trap = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_BYPASS_TRAP", "1"))
+    origin_relax_regime = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_RELAX_REGIME", "1"))
+
     try:
         profit_need = float(os.getenv("MID_INSTANT_EMIT_MIN_PROFIT_PCT", "1.0") or 1.0)
         if _MID_EARLY_ENTRY_GUARD and _mid_soft_blocks_enabled():
@@ -9961,6 +9972,11 @@ def _mid_instant_emit_gate(*,
         profit_need = max(0.0, float(profit_need))
     except Exception:
         profit_need = float(_mid_instant_profit_cap(market)) if _MID_EARLY_ENTRY_GUARD else 1.0
+    if origin_ignore_profit:
+        try:
+            profit_need = min(float(profit_need), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_PROFIT_PCT", "0") or 0.0))
+        except Exception:
+            profit_need = 0.0
 
     flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
     hard_flags = {"far_zone", "scale_mismatch", "blocked", "structure_mismatch", "regime_range_no_breakout", "block:directional_contradiction"}
@@ -9982,6 +9998,10 @@ def _mid_instant_emit_gate(*,
         "vol_need": float(min_vol),
         "profit_pct": float(profit_v),
         "profit_need": float(profit_need),
+        "origin_ignore_profit": bool(origin_ignore_profit),
+        "origin_soft_macd": bool(origin_soft_macd),
+        "origin_bypass_trap": bool(origin_bypass_trap),
+        "origin_relax_regime": bool(origin_relax_regime),
         "rr": float(rr_v),
         "rr_need": float(rr_need),
         "regime": reg_u,
@@ -10036,7 +10056,10 @@ def _mid_instant_emit_gate(*,
 
     _instant_macd_reason = _mid_macd_hist_emit_block_reason(direction, macd_hist)
     if _instant_macd_reason:
-        _add_fail(_instant_macd_reason)
+        if origin_soft_macd:
+            ignored_checks.append(_instant_macd_reason)
+        else:
+            _add_fail(_instant_macd_reason)
 
     # Only keep generic scan-stage flags here when they are still relevant *now*.
     # ATR/VOL have dedicated current-metric checks below, so we do not duplicate them
@@ -10062,9 +10085,15 @@ def _mid_instant_emit_gate(*,
     if applied_risk_flags:
         _add_fail(f"instant_risk_flags:{','.join(applied_risk_flags)}")
     if not smart_setup_trap_ok:
-        _add_fail(str(smart_setup_trap_reason or "smart_setup_trap"))
+        if origin_bypass_trap:
+            ignored_checks.append(str(smart_setup_trap_reason or "smart_setup_trap"))
+        else:
+            _add_fail(str(smart_setup_trap_reason or "smart_setup_trap"))
     if profit_v < float(profit_need):
-        _add_fail(f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}")
+        if origin_ignore_profit:
+            ignored_checks.append(f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}")
+        else:
+            _add_fail(f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}")
     if not rr_ok:
         _add_fail(f"instant_rr_low:{rr_v:.2f}<{rr_need:.2f}")
     if atr_v < float(min_atr):
@@ -10092,7 +10121,10 @@ def _mid_instant_emit_gate(*,
     if (market or "SPOT").upper().strip() == "FUTURES":
         allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_INSTANT_EMIT_ALLOWED_REGIMES_FUTURES", "TREND,TRENDING,EXPANSION")) if str(x).strip()}
         if reg_u not in allowed_regimes:
-            _add_fail(f"instant_regime_block:{reg_u or '-'}")
+            if origin_relax_regime and reg_u in {"", "-", "—"}:
+                ignored_checks.append(f"instant_regime_block:{reg_u or '-'}")
+            else:
+                _add_fail(f"instant_regime_block:{reg_u or '-'}")
 
     if bool(zone_valid):
         if not bool(in_zone_now):
@@ -28802,6 +28834,26 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 _origin_fast_ok = False
                                                 _origin_fast_reason = f"origin_fast_error:{type(_origin_exc).__name__}"
                                                 _origin_fast_meta = {"primary_reason": _origin_fast_reason}
+                                            try:
+                                                _smart_setup_log(
+                                                    "origin_fastpath_pass" if _origin_fast_ok else "origin_fastpath_reject",
+                                                    sym=sym,
+                                                    market=marketu,
+                                                    dir=diru,
+                                                    conf=int(_conf_now),
+                                                    bo_rt=str((_origin_fast_meta or {}).get("bo_rt") or _bo_rt_now or "-"),
+                                                    age_bars=str((_origin_fast_meta or {}).get("breakout_age_bars") if (_origin_fast_meta or {}).get("breakout_age_bars") is not None else "-"),
+                                                    move_atr=("-" if (_origin_fast_meta or {}).get("breakout_move_atr") is None else f"{float((_origin_fast_meta or {}).get('breakout_move_atr')):.2f}"),
+                                                    atr_pct=f"{float((_origin_fast_meta or {}).get('atr_pct') or 0.0):.3f}",
+                                                    vol=f"{float((_origin_fast_meta or {}).get('vol_x') or 0.0):.2f}",
+                                                    body_atr=f"{float((_origin_fast_meta or {}).get('body_atr') or 0.0):.2f}",
+                                                    body_src=str((_origin_fast_meta or {}).get("body_source") or "-"),
+                                                    vol_src=str((_origin_fast_meta or {}).get("vol_source") or "-"),
+                                                    reason=str((_origin_fast_meta or {}).get("primary_reason") or _origin_fast_reason or ("origin_fastpass" if _origin_fast_ok else "origin_fast_reject")),
+                                                    all_reasons=str((_origin_fast_meta or {}).get("all_reasons") or _origin_fast_reason or ("origin_fastpass" if _origin_fast_ok else "origin_fast_reject")),
+                                                )
+                                            except Exception:
+                                                pass
                                             _breakout_fast_ok = False
                                             _breakout_fast_reason = ""
                                             _breakout_fast_meta = {}
@@ -28907,6 +28959,40 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 _smart_pending_reason = _smart_pending_reason or "emit_cooldown"
                                             elif (not _emit_now):
                                                 _smart_pending_reason = _smart_pending_reason or "gate_block"
+
+                                            if _origin_fast_ok and _emit_now and _can_emit_now:
+                                                try:
+                                                    _smart_setup_log(
+                                                        "origin_fastpath_emit",
+                                                        sym=sym,
+                                                        market=marketu,
+                                                        dir=diru,
+                                                        conf=int(_conf_now),
+                                                        zone_valid=1 if _zone_valid else 0,
+                                                        in_zone_now=1 if _in_zone_now else 0,
+                                                        zone_src=_zone_src_l or "-",
+                                                        reason=str((_emit_meta or {}).get("primary_reason") or _emit_reason or "origin_emit"),
+                                                        all_reasons=str((_emit_meta or {}).get("all_reasons") or _emit_reason or "origin_emit"),
+                                                    )
+                                                except Exception:
+                                                    pass
+                                            elif _origin_fast_ok and (not _emit_now):
+                                                try:
+                                                    _smart_setup_log(
+                                                        "origin_fastpath_gate_block",
+                                                        sym=sym,
+                                                        market=marketu,
+                                                        dir=diru,
+                                                        conf=int(_conf_now),
+                                                        zone_valid=1 if _zone_valid else 0,
+                                                        in_zone_now=1 if _in_zone_now else 0,
+                                                        zone_src=_zone_src_l or "-",
+                                                        reason=str((_emit_meta or {}).get("primary_reason") or _emit_reason or "origin_gate_block"),
+                                                        all_reasons=str((_emit_meta or {}).get("all_reasons") or _emit_reason or "origin_gate_block"),
+                                                        ignored_checks=str((_emit_meta or {}).get("ignored_checks_text") or "-"),
+                                                    )
+                                                except Exception:
+                                                    pass
 
                                             if _emit_now and _can_emit_now:
                                                 try:
