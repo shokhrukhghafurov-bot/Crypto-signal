@@ -30624,6 +30624,24 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         except Exception:
             return False
 
+    async def _safe_load_tf(sym_: str, tf_: str, market_: str, *, critical: bool = False):
+        """Best-effort candle loader for institutional analysis.
+
+        5m is critical because it defines the live price / trigger context.
+        Higher timeframes should degrade gracefully instead of killing the whole report.
+        """
+        try:
+            df_ = await self.load_candles(sym_, tf_, market_)
+            try:
+                df_ = _mid_norm_ohlcv(df_) if df_ is not None else df_
+            except Exception:
+                pass
+            if critical and not _df_valid(df_):
+                return None
+            return df_
+        except Exception:
+            return None
+
     # --------- AUTO market selection (SPOT priority -> FUTURES fallback) ---------
     if mkt == "AUTO":
         candidates: list[tuple[str, str]] = [("SPOT", sym), ("FUTURES", sym)]
@@ -30641,22 +30659,13 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
         df4 = None
 
         for cmkt, csym in candidates:
-            try:
-                t5 = await self.load_candles(csym, "5m", cmkt)
-            except Exception:
-                t5 = None
+            t5 = await _safe_load_tf(csym, "5m", cmkt, critical=True)
             if _df_valid(t5):
                 chosen_mkt, chosen_sym = cmkt, csym
                 df5 = t5
                 # load higher TFs best-effort
-                try:
-                    df1 = await self.load_candles(csym, "1h", cmkt)
-                except Exception:
-                    df1 = None
-                try:
-                    df4 = await self.load_candles(csym, "4h", cmkt)
-                except Exception:
-                    df4 = None
+                df1 = await _safe_load_tf(csym, "1h", cmkt)
+                df4 = await _safe_load_tf(csym, "4h", cmkt)
                 break
 
         if chosen_mkt is None or chosen_sym is None or not _df_valid(df5):
@@ -30671,9 +30680,9 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
 
     else:
         # ---------- load candles ----------
-        df5 = await self.load_candles(sym, "5m", mkt)
-        df1 = await self.load_candles(sym, "1h", mkt)
-        df4 = await self.load_candles(sym, "4h", mkt)
+        df5 = await _safe_load_tf(sym, "5m", mkt, critical=True)
+        df1 = await _safe_load_tf(sym, "1h", mkt)
+        df4 = await _safe_load_tf(sym, "4h", mkt)
 
     # Validate candles (avoid fake 0-valued analysis)
     if not _df_valid(df5):
@@ -33030,13 +33039,15 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             return False
         return any(tp > hi_v for tp in _dedupe_levels(tps, direction='asc'))
 
-    scenario_stable_mode = str(os.getenv("SCENARIO_STABLE_5D", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+    # Professional mode: fresh scenario generation must win over stale cache.
+    # Stable reuse is still available, but now disabled by default and much shorter-lived.
+    scenario_stable_mode = str(os.getenv("SCENARIO_STABLE_5D", "0") or "0").strip().lower() not in ("0", "false", "no", "off")
     scenario_use_price_filters = str(os.getenv("SCENARIO_STABLE_USE_PRICE_FILTERS", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
     try:
-        scenario_ttl_sec = int(float(os.getenv("SCENARIO_STABLE_TTL_SEC", str(5 * 24 * 3600))) or (5 * 24 * 3600))
+        scenario_ttl_sec = int(float(os.getenv("SCENARIO_STABLE_TTL_SEC", str(6 * 3600))) or (6 * 3600))
     except Exception:
-        scenario_ttl_sec = 5 * 24 * 3600
-    scenario_ttl_sec = max(3600, min(30 * 24 * 3600, int(scenario_ttl_sec)))
+        scenario_ttl_sec = 6 * 3600
+    scenario_ttl_sec = max(1800, min(7 * 24 * 3600, int(scenario_ttl_sec)))
 
     def _scenario_state_path() -> Path:
         try:
@@ -33310,12 +33321,14 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
     if _scenario_state_can_reuse(prev_scenarios_state):
         prev_short = prev_scenarios_state.get('short_scenarios') if isinstance(prev_scenarios_state, dict) else None
         prev_long = prev_scenarios_state.get('long_scenarios') if isinstance(prev_scenarios_state, dict) else None
-        if isinstance(prev_short, list) and prev_short:
+        # Fresh scenarios always have priority. Reuse cached scenarios only as a fallback
+        # when the current side is empty due to temporary data quality / structure issues.
+        if (not short_scenarios) and isinstance(prev_short, list) and prev_short:
             short_scenarios = prev_short
-        if isinstance(prev_long, list) and prev_long:
+        if (not long_scenarios) and isinstance(prev_long, list) and prev_long:
             long_scenarios = prev_long
-    else:
-        _scenario_state_save(short_scenarios, long_scenarios)
+
+    _scenario_state_save(short_scenarios, long_scenarios)
 
     def _render_side_block(side_key, items):
         if not items:
@@ -33384,6 +33397,12 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
             "symbol": sym,
             "market": mkt_label,
         }
+
+    # Default user-facing mode should include the professional scenario block,
+    # otherwise the analysis silently generates scenarios but never shows them.
+    scenario_enabled = str(os.getenv("ANALYSIS_APPEND_SCENARIOS", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+    if scenario_enabled and scenario_text:
+        return f"{report}\n\n{scenario_text}"
     return report
 
 
