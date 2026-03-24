@@ -8972,32 +8972,7 @@ def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
 async def safe_send(bot, chat_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
     # Never recurse. Send via bot API.
-    try:
-        return await bot.send_message(chat_id, text, **kwargs)
-    except Exception as e:
-        try:
-            from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
-        except Exception:
-            TelegramForbiddenError = type("TelegramForbiddenError", (Exception,), {})
-            TelegramBadRequest = type("TelegramBadRequest", (Exception,), {})
-
-        # User blocked the bot or chat became unavailable: do not crash track_loop.
-        if isinstance(e, TelegramForbiddenError):
-            logger.warning("safe_send: skip blocked chat_id=%s ctx=%s err=%s", chat_id, ctx, e)
-            return None
-
-        # Some Telegram deployments return BadRequest instead of Forbidden for dead chats.
-        if isinstance(e, TelegramBadRequest):
-            msg = str(e).lower()
-            if (
-                "chat not found" in msg
-                or "user is deactivated" in msg
-                or "have no rights to send a message" in msg
-                or "bot was kicked" in msg
-            ):
-                logger.warning("safe_send: skip unavailable chat_id=%s ctx=%s err=%s", chat_id, ctx, e)
-                return None
-        raise
+    return await bot.send_message(chat_id, text, **kwargs)
 
 
 
@@ -16325,80 +16300,6 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
     except Exception:
         return ""
 
-
-def _mid_strip_ta_block_from_risk_note(note: str) -> str:
-    """Remove the previously embedded MID TA block from a risk_note string.
-
-    Trigger-confirmed / instant-revalidated emits must show the *current* TA snapshot,
-    not the stale scan-time one stored in pending risk_note.
-    """
-    try:
-        txt = str(note or "").replace("\r\n", "\n")
-    except Exception:
-        return ""
-    if not txt.strip():
-        return ""
-
-    try:
-        lines = txt.split("\n")
-        start = None
-        for i, line in enumerate(lines):
-            if str(line).strip().startswith("📊 TA score:"):
-                start = i
-                break
-        if start is None:
-            return txt.strip()
-
-        def _is_ta_line(line: str) -> bool:
-            s = str(line or "").strip()
-            if not s:
-                return True
-            if s.startswith((
-                "📊 TA score:",
-                "🎯 Confidence:",
-                "🧱 Trap:",
-                "Ch:",
-                "Liquidity (EQH / EQL):",
-                "Breakout/Retest:",
-                "Pattern:",
-                "➕ Additional TA:",
-                "➕ HTF struct:",
-            )):
-                return True
-            if s.startswith(("✅", "⚠️", "•")) and (
-                "RSI(5m):" in s or
-                "ADX 30m/1h:" in s or
-                "BB:" in s or
-                "VWAP:" in s
-            ):
-                return True
-            return False
-
-        end = start
-        while end < len(lines) and _is_ta_line(lines[end]):
-            end += 1
-        kept = lines[:start] + lines[end:]
-        return "\n".join(x for x in kept if str(x).strip()).strip()
-    except Exception:
-        return txt.strip()
-
-
-def _mid_refresh_signal_risk_note(base_note: str, ta: Dict[str, Any], mode: str = "") -> str:
-    """Replace stale scan-time TA block with the latest trigger-time MID TA block."""
-    try:
-        fresh_block = str(_fmt_ta_block_mid(ta or {}, mode) or "").strip()
-    except Exception:
-        fresh_block = ""
-    try:
-        extra = _mid_strip_ta_block_from_risk_note(base_note)
-    except Exception:
-        extra = str(base_note or "").strip()
-    if fresh_block and extra:
-        return f"{fresh_block}\n{extra}"
-    if fresh_block:
-        return fresh_block
-    return extra
-
 def _confidence(adx4: float, adx1: float, rsi15: float, atr_pct: float) -> int:
     score = 0
     score += 0 if np.isnan(adx4) else int(min(25, max(0, (adx4 - 15) * 1.25)))
@@ -16898,81 +16799,6 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
 
     support, resistance = _nearest_levels(df1hi)
 
-    # Breakout / Retest detection (simple but robust)
-    # IMPORTANT: trigger-time re-evaluation must rebuild this label locally.
-    # The pending trigger hard-block for directional contradiction relies on
-    # `breakout_retest` being present here; otherwise LONG+BO↓ / SHORT+BO↑
-    # silently slips through because the local contradiction check falls back
-    # to an empty block_reason.
-    breakout_retest = "—"
-    try:
-        sup_lvl = float(support) if support is not None else float("nan")
-        res_lvl = float(resistance) if resistance is not None else float("nan")
-        try:
-            tol = max(float(atr5) * 0.25, float(entry) * 0.0015)  # ~0.15% or 0.25 ATR(5m)
-        except Exception:
-            tol = float(entry) * 0.0015
-
-        d5 = df5i.tail(36).copy()  # last ~3h
-        if (not d5.empty) and len(d5) >= 10:
-            highs5 = d5["high"].astype(float).values
-            lows5 = d5["low"].astype(float).values
-            closes5 = d5["close"].astype(float).values
-
-            # Breakout up: close above resistance after being below/at it
-            bo_up_idx = None
-            if (not np.isnan(res_lvl)) and res_lvl > 0:
-                for i in range(1, len(closes5)):
-                    if closes5[i - 1] <= res_lvl and closes5[i] > res_lvl:
-                        bo_up_idx = i
-                        break
-
-            # Breakout down: close below support after being above/at it
-            bo_dn_idx = None
-            if (not np.isnan(sup_lvl)) and sup_lvl > 0:
-                for i in range(1, len(closes5)):
-                    if closes5[i - 1] >= sup_lvl and closes5[i] < sup_lvl:
-                        bo_dn_idx = i
-                        break
-
-            # Retest logic (after breakout)
-            ret_up = False
-            if bo_up_idx is not None:
-                for j in range(bo_up_idx + 1, len(closes5)):
-                    if (lows5[j] <= res_lvl + tol) and (closes5[j] > res_lvl):
-                        ret_up = True
-                        break
-
-            ret_dn = False
-            if bo_dn_idx is not None:
-                for j in range(bo_dn_idx + 1, len(closes5)):
-                    if (highs5[j] >= sup_lvl - tol) and (closes5[j] < sup_lvl):
-                        ret_dn = True
-                        break
-
-            # Prefer breakout in the same direction as the MID signal, but keep
-            # opposite BO/RT visible too so directional contradiction can hard-block.
-            if str(dir_trend).upper() == "LONG":
-                if bo_up_idx is not None and ret_up:
-                    breakout_retest = "BO↑ + Retest"
-                elif bo_up_idx is not None:
-                    breakout_retest = "BO↑"
-                elif bo_dn_idx is not None and ret_dn:
-                    breakout_retest = "BO↓ + Retest"
-                elif bo_dn_idx is not None:
-                    breakout_retest = "BO↓"
-            else:
-                if bo_dn_idx is not None and ret_dn:
-                    breakout_retest = "BO↓ + Retest"
-                elif bo_dn_idx is not None:
-                    breakout_retest = "BO↓"
-                elif bo_up_idx is not None and ret_up:
-                    breakout_retest = "BO↑ + Retest"
-                elif bo_up_idx is not None:
-                    breakout_retest = "BO↑"
-    except Exception:
-        breakout_retest = "—"
-
     # ---------- Liquidity zones + sweep (SMC-lite) ----------
     eq_hi = None
     eq_lo = None
@@ -17133,8 +16959,6 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "total": float(ta_score),
         "vwap": vwap_txt,
         "vwap_val": (float(vwap_val) if (not np.isnan(vwap_val)) else 0.0),
-        "breakout_retest": str(breakout_retest or "—"),
-        "bo_rt": str(breakout_retest or "—"),
         "pattern": pattern,
         "support": support,
         "resistance": resistance,
@@ -22603,7 +22427,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 _touch_entry_ref, _touch_anchor_far, _touch_slip_atr = _mid_pending_entry_ref(it, price=price, ta=ta)
                                 if not _touch_anchor_far:
                                     _touch_entry, _touch_sl, _touch_tp1, _touch_tp2, _touch_rr = _mid_recalc_levels_from_trigger(direction, _touch_entry_ref, ta, it, market)
-                                    _touch_note_base = _mid_refresh_signal_risk_note(str(it.get("risk_note") or ""), ta, mode)
+                                    _touch_note_base = str(it.get("risk_note") or "").strip()
                                     _touch_note = (_touch_note_base + (" | " if _touch_note_base else "") + "zone_touch_alert=1 no_autotrade=1 levels_anchor=1").strip()
                                     sig_zone = Signal(
                                         signal_id=self.next_signal_id(),
@@ -22959,7 +22783,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             confirmations=conf_names,
                             source_exchange=src_ex,
                             available_exchanges=conf_names,
-                            risk_note=_mid_refresh_signal_risk_note(str(it.get("risk_note") or ""), ta, mode) + " | instant_vip=1 | confirmed_entry=1 | levels_anchor=1",
+                            risk_note=str(it.get("risk_note") or "") + " | instant_vip=1 | confirmed_entry=1 | levels_anchor=1",
                             ts=time.time(),
                         )
                         instant_ok, instant_reason, instant_meta = _mid_instant_emit_gate(
@@ -24232,7 +24056,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         confirmations=conf_names,
                         source_exchange=src_ex,
                         available_exchanges=conf_names,
-                        risk_note=((_mid_refresh_signal_risk_note(str(it.get("risk_note") or ""), ta, mode) or "ENTRY CONFIRMED") + " | confirmed_entry=1 | trigger_revalidated=1 | levels_anchor=1"),
+                        risk_note=str(it.get("risk_note") or "ENTRY CONFIRMED") + " | confirmed_entry=1 | trigger_revalidated=1 | levels_anchor=1",
                         ts=time.time(),
                     )
 
