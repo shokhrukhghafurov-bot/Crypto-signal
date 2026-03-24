@@ -8972,7 +8972,32 @@ def _sanitize_template_text(uid: int, text: str, ctx: str = "") -> str:
 async def safe_send(bot, chat_id: int, text: str, *, ctx: str = "", **kwargs):
     text = _sanitize_template_text(chat_id, text, ctx=ctx)
     # Never recurse. Send via bot API.
-    return await bot.send_message(chat_id, text, **kwargs)
+    try:
+        return await bot.send_message(chat_id, text, **kwargs)
+    except Exception as e:
+        try:
+            from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
+        except Exception:
+            TelegramForbiddenError = type("TelegramForbiddenError", (Exception,), {})
+            TelegramBadRequest = type("TelegramBadRequest", (Exception,), {})
+
+        # User blocked the bot or chat became unavailable: do not crash track_loop.
+        if isinstance(e, TelegramForbiddenError):
+            logger.warning("safe_send: skip blocked chat_id=%s ctx=%s err=%s", chat_id, ctx, e)
+            return None
+
+        # Some Telegram deployments return BadRequest instead of Forbidden for dead chats.
+        if isinstance(e, TelegramBadRequest):
+            msg = str(e).lower()
+            if (
+                "chat not found" in msg
+                or "user is deactivated" in msg
+                or "have no rights to send a message" in msg
+                or "bot was kicked" in msg
+            ):
+                logger.warning("safe_send: skip unavailable chat_id=%s ctx=%s err=%s", chat_id, ctx, e)
+                return None
+        raise
 
 
 
