@@ -3046,20 +3046,37 @@ def _private_ta_uids() -> set[int]:
 
 def _uid_can_view_private_ta(uid: int) -> bool:
     try:
-        if int(uid) == 0:
+        uid_i = int(uid)
+    except Exception:
+        return False
+    if uid_i == 0:
+        return True
+    try:
+        if _is_admin(uid_i):
             return True
     except Exception:
         pass
     try:
-        return int(uid) in _private_ta_uids()
+        return uid_i in _private_ta_uids()
     except Exception:
         return False
 
 
 _PRIVATE_TA_LINE_RE = re.compile(
-    r"^(?:📊 TA score:|RSI(?:\([^)]*\))?:|ADX(?: .*?)?:|BB:|🧱 Trap:|Div:|Ch:|Liquidity:|Breakout/Retest:|Pattern:)",
+    r"^(?:TA score:|Signal strength:|Confidence:|RSI(?:\([^)]*\))?:|ADX(?: .*?)?:|BB:|Trap:|Div:|Ch:|Liquidity(?: .*?)?:|Breakout/Retest:|Pattern:|Additional TA:|HTF struct:)",
     re.UNICODE,
 )
+
+_PRIVATE_TA_INLINE_FLAG_RE = re.compile(
+    r"\b(?:trigger_revalidated|levels_recalc|smart_setup_emit|smart_conf|instant_vip|zone_touch_alert|no_autotrade|levels_anchor)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_private_ta_prefix(line: str) -> str:
+    core = str(line or "").strip()
+    core = re.sub(r"^[✅❌⚠️ℹ️🔥🎯📊🧱➕•\s]+", "", core).strip()
+    return core
 
 
 def _risk_note_for_uid(uid: int, risk_note: str) -> str:
@@ -3074,7 +3091,13 @@ def _risk_note_for_uid(uid: int, risk_note: str) -> str:
         line = raw_line.rstrip()
         if not line:
             continue
-        if _PRIVATE_TA_LINE_RE.match(line):
+
+        core = _strip_private_ta_prefix(line)
+        if _PRIVATE_TA_LINE_RE.match(core):
+            continue
+        if core.startswith("Auto-converted:"):
+            continue
+        if _PRIVATE_TA_INLINE_FLAG_RE.search(line):
             continue
 
         # Remove inline internal flags if they leaked outside the TA block.
@@ -3089,7 +3112,6 @@ def _risk_note_for_uid(uid: int, risk_note: str) -> str:
         keep.append(line)
 
     return "\n".join(keep).strip()
-
 
 
 def _signal_text(uid: int, s: Signal, *, autotrade_hint: str = "") -> str:
