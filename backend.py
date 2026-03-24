@@ -16051,25 +16051,9 @@ def _ta_signal_grade(ta: Dict[str, Any]) -> str:
 def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
     """Human-friendly 0..10 strength score.
 
-    Blend two layers so Telegram users see a score that is both intuitive and
-    aligned with the engine:
-      1) core TA momentum / trend / participation
-         - RSI
-         - ADX (30m/1h mix)
-         - MACD histogram
-         - Relative volume
-         - VWAP location / stretch
-      2) setup quality from the engine itself
-         - TA score total
-         - confidence
-
-    This avoids contradictory cards like:
-      TA score 95/100 + confidence 95/100
-      but Signal strength 0.5/10
-
-    Core TA still matters most for "how strong is the move right now", while
-    setup quality stops very strong confluence setups from being shown as almost
-    dead/invalid only because one live input (usually volume) is temporarily soft.
+    Core TA must dominate the output. High setup quality may lift a signal a
+    little, but weak core blockers (especially volume / VWAP / flat MACD)
+    should cap the final score so it does not look deceptively strong.
     """
     try:
         if not ta:
@@ -16105,42 +16089,32 @@ def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
                     return txt
             return ""
 
-        def _clip(v: float, lo: float, hi: float) -> float:
-            try:
-                return float(max(lo, min(hi, float(v))))
-            except Exception:
-                return float(lo)
-
         def _score_rsi(direction: str, rsi: float | None) -> float:
             if rsi is None:
                 return 0.6
             r = float(rsi)
             if direction == "SHORT":
-                if 37.0 <= r <= 42.0:
+                if 38.0 <= r <= 46.0:
                     return 2.0
-                if 42.0 < r <= 47.0:
-                    return 1.6
-                if 32.0 <= r < 37.0:
+                if 46.0 < r <= 50.0:
                     return 1.2
-                if 47.0 < r <= 50.0:
-                    return 0.8
+                if 34.0 <= r < 38.0:
+                    return 1.2
                 if 50.0 < r <= 53.0:
-                    return 0.3
+                    return 0.4
                 if r > 58.0:
-                    return -0.6
+                    return -1.0
                 return 0.0
-            if 58.0 <= r <= 63.0:
+            if 54.0 <= r <= 62.0:
                 return 2.0
-            if 53.0 <= r < 58.0:
-                return 1.6
-            if 63.0 < r <= 68.0:
+            if 50.0 <= r < 54.0:
                 return 1.2
-            if 50.0 <= r < 53.0:
-                return 0.8
+            if 62.0 < r <= 66.0:
+                return 1.2
             if 47.0 <= r < 50.0:
-                return 0.3
+                return 0.4
             if r < 42.0:
-                return -0.6
+                return -1.0
             return 0.0
 
         def _score_adx(adx30: float | None, adx1h: float | None) -> float:
@@ -16154,33 +16128,33 @@ def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
                 return 1.6
             if mix >= 25.0:
                 return 1.2
-            if mix >= 20.0:
-                return 0.8
-            if mix >= 15.0:
-                return 0.3
+            if mix >= 22.0:
+                return 0.9
+            if mix >= 18.0:
+                return 0.4
             return 0.0
 
         def _score_macd(direction: str, macd_hist: float | None) -> float:
             if macd_hist is None:
                 return 0.5
             h = float(macd_hist)
-            correct_side = (direction == "LONG" and h > 0) or (direction == "SHORT" and h < 0)
             ah = abs(h)
+            correct_side = (direction == "LONG" and h > 0) or (direction == "SHORT" and h < 0)
             if correct_side:
                 if ah >= 1e-2:
                     return 2.0
                 if ah >= 1e-3:
                     return 1.6
                 if ah >= 1e-4:
-                    return 1.2
+                    return 1.0
                 if ah >= 1e-5:
-                    return 0.8
-                return 0.3
+                    return 0.5
+                return 0.1
             if ah >= 1e-3:
-                return -0.8
+                return -1.0
             if ah >= 1e-5:
-                return -0.4
-            return 0.0
+                return -0.6
+            return -0.2
 
         def _score_volume(vol_rel: float | None) -> float:
             if vol_rel is None:
@@ -16189,16 +16163,18 @@ def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
             if v >= 2.0:
                 return 2.0
             if v >= 1.6:
-                return 1.6
+                return 1.7
             if v >= 1.3:
-                return 1.2
+                return 1.3
             if v >= 1.1:
-                return 0.8
-            if v >= 0.95:
-                return 0.4
+                return 0.9
             if v >= 0.8:
-                return 0.1
-            return -0.3
+                return 0.4
+            if v >= 0.5:
+                return -0.6
+            if v >= 0.2:
+                return -1.2
+            return -2.0
 
         def _score_vwap(direction: str,
                         entry: float | None,
@@ -16213,17 +16189,17 @@ def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
             stretch = (dist / atr) if atr > 1e-9 else None
             on_right_side = (direction == "LONG" and e >= v) or (direction == "SHORT" and e <= v)
             if not on_right_side:
-                return -0.8
+                return -1.0
             if stretch is None:
-                return 1.0
-            if stretch <= 0.15:
-                return 0.7
+                return 0.9
+            if stretch <= 0.10:
+                return 0.5
             if stretch <= 0.45:
-                return 1.2
+                return 1.0
             if stretch <= 0.90:
-                return 1.8
+                return 1.6
             if stretch <= 1.50:
-                return 1.3
+                return 1.2
             return 0.7
 
         direction = sget("direction", "dir4", "dir1").upper() or "LONG"
@@ -16243,41 +16219,84 @@ def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
             if entry is not None and atr_pct is not None:
                 atr_abs = abs(float(entry)) * abs(float(atr_pct)) / 100.0
 
-        core_score = 0.0
-        core_score += _score_rsi(direction, rsi)
-        core_score += _score_adx(adx30, adx1h)
-        core_score += _score_macd(direction, macd)
-        core_score += _score_volume(volx)
-        core_score += _score_vwap(direction, entry, vwap_val, atr_abs)
+        core = 0.0
+        core += _score_rsi(direction, rsi)
+        core += _score_adx(adx30, adx1h)
+        core += _score_macd(direction, macd)
+        core += _score_volume(volx)
+        core += _score_vwap(direction, entry, vwap_val, atr_abs)
+        core = max(0.0, min(10.0, core))
+
+        ta_total = fget("ta_score_total", "ta_score", "score")
+        conf = fget("ta_score_conf", "confidence")
+        setup_vals = []
+        if ta_total is not None:
+            setup_vals.append(max(0.0, min(10.0, float(ta_total) / 10.0)))
+        if conf is not None:
+            setup_vals.append(max(0.0, min(10.0, float(conf) / 10.0)))
+        setup = (sum(setup_vals) / len(setup_vals)) if setup_vals else core
+
+        score = 0.75 * core + 0.25 * setup
 
         trap_ok = ta.get("trap_ok") if ("trap_ok" in ta) else None
         breakout = sget("breakout_retest", "bo_rt").upper()
         if trap_ok is False:
-            core_score -= 0.4
+            score -= 0.3
         if direction == "LONG" and breakout.startswith("BO↑ + RETEST"):
-            core_score += 0.2
+            score += 0.15
         elif direction == "SHORT" and breakout.startswith("BO↓ + RETEST"):
-            core_score += 0.2
-        core_score = _clip(round(core_score, 1), 0.0, 10.0)
+            score += 0.15
 
-        ta_score_total = fget("ta_score_total", "ta_score", "score", "total")
-        ta_conf = fget("ta_score_conf", "confidence")
-        if ta_score_total is None and ta_conf is None:
-            setup_score = core_score
-        else:
-            score_norm = _clip((ta_score_total if ta_score_total is not None else ta_conf or 0.0) / 10.0, 0.0, 10.0)
-            conf_norm = _clip((ta_conf if ta_conf is not None else ta_score_total or 0.0) / 10.0, 0.0, 10.0)
-            setup_score = round((score_norm * 0.55) + (conf_norm * 0.45), 1)
+        caps: list[float] = []
+        blocker_count = 0
 
-        score = round((core_score * 0.50) + (setup_score * 0.50), 1)
+        if volx is not None:
+            v = float(volx)
+            if v < 0.20:
+                caps.append(3.9)
+                blocker_count += 1
+            elif v < 0.50:
+                caps.append(4.9)
+                blocker_count += 1
+            elif v < 0.80:
+                caps.append(5.9)
 
-        if setup_score >= 9.0 and score < 5.0:
-            score = 5.0
-        elif setup_score >= 8.0 and score < 4.5:
-            score = 4.5
+        if macd is not None:
+            h = float(macd)
+            ah = abs(h)
+            correct_side = (direction == "LONG" and h > 0) or (direction == "SHORT" and h < 0)
+            if ah < 1e-5:
+                caps.append(5.4)
+            elif not correct_side:
+                caps.append(4.9)
+                blocker_count += 1
 
-        score = _clip(score, 0.0, 10.0)
-        score = round(score, 1)
+        if entry is not None and vwap_val is not None and float(vwap_val) != 0.0:
+            on_right_side = (direction == "LONG" and float(entry) >= float(vwap_val)) or (direction == "SHORT" and float(entry) <= float(vwap_val))
+            if not on_right_side:
+                caps.append(4.9)
+                blocker_count += 1
+
+        if rsi is not None:
+            rr = float(rsi)
+            if direction == "LONG":
+                if rr < 47.0:
+                    caps.append(5.4)
+                elif rr < 50.0:
+                    caps.append(5.9)
+            else:
+                if rr > 53.0:
+                    caps.append(5.4)
+                elif rr > 50.0:
+                    caps.append(5.9)
+
+        if blocker_count >= 2:
+            caps.append(3.9)
+
+        if caps:
+            score = min(score, min(caps))
+
+        score = round(max(0.0, min(10.0, score)), 1)
         if score >= 8.5:
             label = "VERY STRONG"
         elif score >= 7.0:
@@ -16291,6 +16310,7 @@ def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
         return (score, label)
     except Exception:
         return (0.0, "VERY WEAK")
+
 def _fmt_ta_block(ta: Dict[str, Any]) -> str:
     """
     Format TA snapshot for Telegram/UX. Keep it short but informative.
