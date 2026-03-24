@@ -9606,6 +9606,8 @@ def _mid_smart_setup_origin_fastpath(*,
                                     last_body: float | None,
                                     origin_body: float | None = None,
                                     origin_vol_x: float | None = None,
+                                    origin_body_src: str | None = None,
+                                    origin_vol_src: str | None = None,
                                     sweep_long: bool = False,
                                     sweep_short: bool = False,
                                     risk_flags=None) -> tuple[bool, str, dict]:
@@ -9698,6 +9700,24 @@ def _mid_smart_setup_origin_fastpath(*,
         body_v = abs(float(last_body or 0.0))
     body_atr_v = (body_v / atr30_v) if atr30_v > 0 else 0.0
 
+    try:
+        body_need_eff = float(min_body_atr)
+    except Exception:
+        body_need_eff = 0.20
+    try:
+        vol_need_eff = float(vol_need)
+    except Exception:
+        vol_need_eff = 0.0
+    if bo_ok and age_v is not None and age_v <= 0:
+        try:
+            body_need_eff = min(body_need_eff, float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR_AGE0", "0.02") or 0.02))
+        except Exception:
+            pass
+        try:
+            vol_need_eff = min(vol_need_eff, float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X_AGE0", "0.00") or 0.00))
+        except Exception:
+            pass
+
     meta.update({
         "enabled": bool(enabled),
         "bo_rt": bo,
@@ -9710,11 +9730,11 @@ def _mid_smart_setup_origin_fastpath(*,
         "atr_pct": float(atr_v),
         "atr_need": float(atr_need),
         "vol_x": float(vol_v),
-        "vol_need": float(vol_need),
+        "vol_need": float(vol_need_eff),
         "body_atr": float(body_atr_v),
-        "body_source": "origin_body" if origin_body is not None else "last_body",
-        "vol_source": "origin_vol_x" if origin_vol_x is not None else "rel_vol",
-        "body_need_atr": float(min_body_atr),
+        "body_source": str(origin_body_src or ("origin_body" if origin_body is not None else "last_body")),
+        "vol_source": str(origin_vol_src or ("origin_vol_x" if origin_vol_x is not None else "rel_vol")),
+        "body_need_atr": float(body_need_eff),
         "breakout_age_bars": age_v,
         "max_age_bars": int(max_age_bars),
         "breakout_move_atr": move_v,
@@ -9733,10 +9753,10 @@ def _mid_smart_setup_origin_fastpath(*,
         reasons.append(f"origin_fast_conf:{int(round(conf_v))}<{int(conf_need)}")
     if atr_v < float(atr_need):
         reasons.append(f"origin_fast_atr:{atr_v:.3f}<{atr_need:.3f}")
-    if vol_v < float(vol_need):
-        reasons.append(f"origin_fast_vol:{vol_v:.2f}<{vol_need:.2f}")
-    if body_atr_v < float(min_body_atr):
-        reasons.append(f"origin_fast_body:{body_atr_v:.2f}<{min_body_atr:.2f}")
+    if vol_v < float(vol_need_eff):
+        reasons.append(f"origin_fast_vol:{vol_v:.2f}<{vol_need_eff:.2f}")
+    if body_atr_v < float(body_need_eff):
+        reasons.append(f"origin_fast_body:{body_atr_v:.2f}<{body_need_eff:.2f}")
     if age_v is not None and max_age_bars >= 0 and age_v > max_age_bars:
         reasons.append(f"origin_fast_age:{int(age_v)}>{int(max_age_bars)}")
     if move_v is not None and max_move_atr > 0 and move_v > max_move_atr:
@@ -13578,6 +13598,12 @@ def _mid_breakout_retest_snapshot(df5i: pd.DataFrame, *, direction: str, support
         "breakout_age_sec": None,
         "breakout_move_atr": None,
         "breakout_move_pct": None,
+        "breakout_body": None,
+        "breakout_prev_body": None,
+        "breakout_origin_body": None,
+        "breakout_rel_vol": None,
+        "breakout_prev_rel_vol": None,
+        "breakout_origin_vol_x": None,
         "bar_sec": 300,
         "has_retest": False,
     }
@@ -13650,6 +13676,40 @@ def _mid_breakout_retest_snapshot(df5i: pd.DataFrame, *, direction: str, support
         anchor_px = float(closes[int(bo_idx)])
         move_atr = None
         move_pct = None
+        bo_body = None
+        prev_body = None
+        bo_rel_vol = None
+        prev_rel_vol = None
+        origin_body = None
+        origin_vol_x = None
+        try:
+            opens = d["open"].astype(float).values
+            vols = d["volume"].astype(float).values
+            vol_ma = d["volume"].astype(float).rolling(20).mean().values
+            bo_body = abs(float(closes[int(bo_idx)]) - float(opens[int(bo_idx)]))
+            if int(bo_idx) >= 1:
+                prev_body = abs(float(closes[int(bo_idx) - 1]) - float(opens[int(bo_idx) - 1]))
+            else:
+                prev_body = 0.0
+            origin_body = max(float(bo_body or 0.0), float(prev_body or 0.0))
+            try:
+                _bo_ma = float(vol_ma[int(bo_idx)])
+                _bo_vol = float(vols[int(bo_idx)])
+                bo_rel_vol = (_bo_vol / _bo_ma) if (_bo_ma and math.isfinite(_bo_ma) and _bo_ma > 0) else None
+            except Exception:
+                bo_rel_vol = None
+            try:
+                if int(bo_idx) >= 1:
+                    _pv_ma = float(vol_ma[int(bo_idx) - 1])
+                    _pv_vol = float(vols[int(bo_idx) - 1])
+                    prev_rel_vol = (_pv_vol / _pv_ma) if (_pv_ma and math.isfinite(_pv_ma) and _pv_ma > 0) else None
+                else:
+                    prev_rel_vol = None
+            except Exception:
+                prev_rel_vol = None
+            origin_vol_x = max(float(bo_rel_vol or 0.0), float(prev_rel_vol or 0.0))
+        except Exception:
+            pass
         try:
             if float(atr5) > 0:
                 move_atr = abs(float(closes[last_idx]) - anchor_px) / float(atr5)
@@ -13672,6 +13732,12 @@ def _mid_breakout_retest_snapshot(df5i: pd.DataFrame, *, direction: str, support
             "breakout_age_sec": float(age_sec) if age_sec is not None else None,
             "breakout_move_atr": float(move_atr) if move_atr is not None else None,
             "breakout_move_pct": float(move_pct) if move_pct is not None else None,
+            "breakout_body": float(bo_body) if bo_body is not None else None,
+            "breakout_prev_body": float(prev_body) if prev_body is not None else None,
+            "breakout_origin_body": float(origin_body) if origin_body is not None else None,
+            "breakout_rel_vol": float(bo_rel_vol) if bo_rel_vol is not None else None,
+            "breakout_prev_rel_vol": float(prev_rel_vol) if prev_rel_vol is not None else None,
+            "breakout_origin_vol_x": float(origin_vol_x) if origin_vol_x is not None else None,
             "has_retest": bool(has_retest),
         })
         return meta
@@ -15074,6 +15140,34 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     except Exception:
         pass
 
+
+    origin_body_src = "micro_pair"
+    origin_vol_src = "micro_pair"
+    try:
+        _bo_meta_age_cap = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_META_MAX_AGE_BARS", "2") or 2))
+    except Exception:
+        _bo_meta_age_cap = 2
+    try:
+        if isinstance(bo_rt_meta, dict) and bool(bo_rt_meta.get("triggered")):
+            _bo_age_meta = bo_rt_meta.get("breakout_age_bars")
+            _bo_age_ok = (_bo_age_meta is None) or (int(_bo_age_meta) <= int(_bo_meta_age_cap))
+            if _bo_age_ok:
+                try:
+                    _bo_origin_body = bo_rt_meta.get("breakout_origin_body")
+                    if _bo_origin_body is not None and float(_bo_origin_body) > 0:
+                        origin_body = max(float(origin_body or 0.0), float(_bo_origin_body))
+                        origin_body_src = "breakout_meta"
+                except Exception:
+                    pass
+                try:
+                    _bo_origin_vol = bo_rt_meta.get("breakout_origin_vol_x")
+                    if _bo_origin_vol is not None and float(_bo_origin_vol) > 0:
+                        origin_vol_x = max(float(origin_vol_x or 0.0), float(_bo_origin_vol))
+                        origin_vol_src = "breakout_meta"
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     ta: Dict[str, Any] = {
         "direction": dir_trend,
@@ -17563,10 +17657,12 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "rel_vol": vol_rel if (not np.isnan(vol_rel)) else 0.0,
         "rel_vol_prev": float(prev_rel_vol) if (prev_rel_vol == prev_rel_vol) else 0.0,
         "origin_vol_x": float(origin_vol_x) if (origin_vol_x == origin_vol_x) else (float(vol_rel) if (vol_rel == vol_rel) else 0.0),
+        "origin_vol_src": str(origin_vol_src),
 
         "last_body": float(last_body),
         "prev_body": float(prev_body),
         "origin_body": float(origin_body),
+        "origin_body_src": str(origin_body_src),
         "disp_body_atr": float(disp_body_atr),
         "bos_up_5m": bool(bos_up_5m),
         "bos_down_5m": bool(bos_down_5m),
@@ -28507,8 +28603,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "atr_pct_slow_at_create": float(_atr_pct_slow) if ("_atr_pct_slow" in locals() and _atr_pct_slow is not None) else None,
                                         "rel_vol_at_create": float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
                                         "origin_vol_x_at_create": float((base_r.get("origin_vol_x") if ("base_r" in locals() and isinstance(base_r, dict)) else (base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0)) or 0.0),
+                                        "origin_vol_src_at_create": str((base_r.get("origin_vol_src") if ("base_r" in locals() and isinstance(base_r, dict)) else "origin_vol_x") or "origin_vol_x"),
                                         "last_body": float((base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
                                         "origin_body_at_create": float((base_r.get("origin_body") if ("base_r" in locals() and isinstance(base_r, dict)) else (base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0)) or 0.0),
+                                        "origin_body_src_at_create": str((base_r.get("origin_body_src") if ("base_r" in locals() and isinstance(base_r, dict)) else "origin_body") or "origin_body"),
                                         "zone_width_atr": (float(_zone_w_atr) if (_zone_w_atr is not None) else None) if ("_zone_w_atr" in locals()) else None,
                                         "zone_width_atr_raw": (float(_zone_w_atr_raw) if ("_zone_w_atr_raw" in locals() and _zone_w_atr_raw is not None) else None),
                                         "zone_width_atr_fast": (float(_zone_w_atr_fast) if ("_zone_w_atr_fast" in locals() and _zone_w_atr_fast is not None) else None),
@@ -28826,6 +28924,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     last_body=float((base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("last_body") or 0.0) or 0.0),
                                                     origin_body=float((base_r.get("origin_body") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("origin_body_at_create") or rec.get("last_body") or 0.0) or 0.0),
                                                     origin_vol_x=float((base_r.get("origin_vol_x") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("origin_vol_x_at_create") or rec.get("rel_vol_at_create") or 0.0) or 0.0),
+                                                    origin_body_src=str((base_r.get("origin_body_src") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("origin_body_src_at_create") or "origin_body") or "origin_body"),
+                                                    origin_vol_src=str((base_r.get("origin_vol_src") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("origin_vol_src_at_create") or "origin_vol_x") or "origin_vol_x"),
                                                     sweep_long=bool((base_r.get("sweep_long") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("sweep_long") or False)),
                                                     sweep_short=bool((base_r.get("sweep_short") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("sweep_short") or False)),
                                                     risk_flags=risk_flags,
