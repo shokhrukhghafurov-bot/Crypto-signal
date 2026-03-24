@@ -1754,7 +1754,69 @@ def _mid_macd_hist_emit_block_reason(direction: str, macd_hist: float | None) ->
         return ""
 
 
-def _mid_zone_touch_guard_reason(ta: dict | None) -> str:
+def _mid_directional_contradiction_reason(*sources: dict | None) -> str:
+    """Infer a directional contradiction from one or more TA/pending payloads.
+
+    Trigger-time paths occasionally carry the contradiction inputs split across
+    multiple objects: the fresh TA can have the pattern while the pending record
+    still holds the BO/RT label. This helper merges the available context so a
+    wrong-way breakout (for example LONG + BO↓ + Retest) remains a hard block.
+    """
+    try:
+        side = ""
+        bo = ""
+        pat = ""
+        for src in sources:
+            if not isinstance(src, dict):
+                continue
+            raw = str(src.get("block_reason") or "").strip()
+            head = raw.split()[0].split("=", 1)[0].strip().lower() if raw else ""
+            if head == "directional_contradiction":
+                return raw or "directional_contradiction"
+            if not side:
+                for key in ("direction", "dir", "side", "dir4", "dir1"):
+                    try:
+                        v = str(src.get(key) or "").strip().upper()
+                    except Exception:
+                        v = ""
+                    if v in ("LONG", "SHORT"):
+                        side = v
+                        break
+            if not bo:
+                try:
+                    bo = str(src.get("breakout_retest") or src.get("bo_rt") or "").strip()
+                except Exception:
+                    bo = ""
+            if not pat:
+                try:
+                    pat = str(src.get("pattern") or "").strip()
+                except Exception:
+                    pat = ""
+
+        if side not in ("LONG", "SHORT"):
+            return ""
+
+        try:
+            pat_norm = " ".join(re.sub(r"[_-]+", " ", pat).split()).casefold()
+        except Exception:
+            pat_norm = ""
+
+        if side == "LONG":
+            if bo.startswith("BO↓"):
+                return f"directional_contradiction breakout={bo}"
+            if pat_norm in {"bearish engulfing", "bear engulf", "shooting star", "evening star"}:
+                return f"directional_contradiction pattern={pat or pat_norm}"
+        elif side == "SHORT":
+            if bo.startswith("BO↑"):
+                return f"directional_contradiction breakout={bo}"
+            if pat_norm in {"bullish engulfing", "bull engulf", "hammer", "morning star"}:
+                return f"directional_contradiction pattern={pat or pat_norm}"
+        return ""
+    except Exception:
+        return ""
+
+
+def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str:
     """Hard veto reasons for early zone-touch alerts.
 
     Zone-touch alerts must stay high-quality: we allow them only when the first
@@ -1796,23 +1858,9 @@ def _mid_zone_touch_guard_reason(ta: dict | None) -> str:
                 side = v
                 break
 
-        bo = str(t.get("breakout_retest") or t.get("bo_rt") or "").strip()
-        pat = str(t.get("pattern") or "").strip()
-        try:
-            pat_norm = " ".join(pat.split()).casefold()
-        except Exception:
-            pat_norm = ""
-
-        if side == "SHORT":
-            if bo.startswith("BO↑"):
-                return f"directional_contradiction breakout={bo}"
-            if pat_norm == "bullish engulfing":
-                return f"directional_contradiction pattern={pat or pat_norm}"
-        elif side == "LONG":
-            if bo.startswith("BO↓"):
-                return f"directional_contradiction breakout={bo}"
-            if pat_norm == "bearish engulfing":
-                return f"directional_contradiction pattern={pat or pat_norm}"
+        _dir_reason = _mid_directional_contradiction_reason(t, it)
+        if _dir_reason:
+            return _dir_reason
 
         try:
             rsi_5m = float(t.get("rsi"))
@@ -16962,6 +17010,8 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "pattern": pattern,
         "support": support,
         "resistance": resistance,
+        "breakout_retest": breakout_retest,
+        "bo_rt": breakout_retest,
         "channel": channel,
         "mstruct": mstruct,
         "eq_hi": eq_hi,
@@ -22416,7 +22466,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 _touch_conf_now = int(float(it.get("confidence") or 0))
                             except Exception:
                                 _touch_conf_now = 0
-                            _touch_guard = _mid_zone_touch_guard_reason(ta)
+                            _touch_guard = _mid_zone_touch_guard_reason(ta, it)
                             if not _touch_guard:
                                 try:
                                     _touch_guard = _mid_macd_hist_emit_block_reason(str(direction), _safe_float(ta.get("macd_hist"), None))
@@ -22591,6 +22641,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # when MID_SOFT_BLOCKS_ENABLED=1; deep cases still hard-block.
                     try:
                         hb_raw_reason = str(ta.get("block_reason") or "").strip()
+                        _dir_contra_now = _mid_directional_contradiction_reason(ta, it)
+                        if _dir_contra_now:
+                            hb_raw_reason = str(_dir_contra_now)
+                            try:
+                                ta["blocked"] = True
+                                ta["block_reason"] = str(_dir_contra_now)
+                            except Exception:
+                                pass
                         hb_log_reason, hb_apply_reason = _mid_trigger_selected_hardblock_reason(hb_raw_reason, it)
                         try:
                             _late_relief_ok, _late_relief_reason, _late_relief_meta = _mid_pending_trigger_breakout_late_relief(
