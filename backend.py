@@ -9348,6 +9348,7 @@ def _mid_smart_setup_trap_eval(*,
                                  vol_last: float | None = None,
                                  vol_avg: float | None = None,
                                  breakout_fresh_ok: bool = False,
+                                 origin_fast_ok: bool = False,
                                  in_zone_now: bool = False,
                                  allow_no_zone_breakout: bool = False,
                                  confidence: float | None = None) -> tuple[bool, str, dict]:
@@ -9369,11 +9370,12 @@ def _mid_smart_setup_trap_eval(*,
         return (True, "smart_setup_trap_disabled", meta)
 
     try:
-        active = bool(breakout_fresh_ok) or bool(allow_no_zone_breakout) or (not bool(in_zone_now))
+        active = bool(breakout_fresh_ok) or bool(origin_fast_ok) or bool(allow_no_zone_breakout) or (not bool(in_zone_now))
     except Exception:
         active = True
     meta["active"] = bool(active)
     meta["breakout_fresh_ok"] = bool(breakout_fresh_ok)
+    meta["origin_fast_ok"] = bool(origin_fast_ok)
     meta["in_zone_now"] = bool(in_zone_now)
     meta["allow_no_zone_breakout"] = bool(allow_no_zone_breakout)
     if not active:
@@ -9708,15 +9710,32 @@ def _mid_smart_setup_origin_fastpath(*,
         vol_need_eff = float(vol_need)
     except Exception:
         vol_need_eff = 0.0
+    try:
+        age0_body_min = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR_AGE0", "0.08") or 0.08)
+    except Exception:
+        age0_body_min = 0.08
+    try:
+        age0_vol_min = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X_AGE0", "0.10") or 0.10)
+    except Exception:
+        age0_vol_min = 0.10
+    try:
+        age0_move_evidence = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_MOVE_ATR_AGE0", "0.18") or 0.18)
+    except Exception:
+        age0_move_evidence = 0.18
+    age0_has_alt_impulse = False
     if bo_ok and age_v is not None and age_v <= 0:
         try:
-            body_need_eff = min(body_need_eff, float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR_AGE0", "0.02") or 0.02))
+            body_need_eff = min(body_need_eff, float(age0_body_min))
         except Exception:
             pass
         try:
-            vol_need_eff = min(vol_need_eff, float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X_AGE0", "0.00") or 0.00))
+            vol_need_eff = min(vol_need_eff, float(age0_vol_min))
         except Exception:
             pass
+        try:
+            age0_has_alt_impulse = bool(sweep_ok) or (move_v is not None and float(move_v) >= float(age0_move_evidence)) or (vol_v >= float(max(vol_need_eff, age0_vol_min)))
+        except Exception:
+            age0_has_alt_impulse = bool(sweep_ok)
 
     meta.update({
         "enabled": bool(enabled),
@@ -9735,6 +9754,10 @@ def _mid_smart_setup_origin_fastpath(*,
         "body_source": str(origin_body_src or ("origin_body" if origin_body is not None else "last_body")),
         "vol_source": str(origin_vol_src or ("origin_vol_x" if origin_vol_x is not None else "rel_vol")),
         "body_need_atr": float(body_need_eff),
+        "age0_body_min": float(age0_body_min),
+        "age0_vol_min": float(age0_vol_min),
+        "age0_move_evidence": float(age0_move_evidence),
+        "age0_alt_impulse": bool(age0_has_alt_impulse),
         "breakout_age_bars": age_v,
         "max_age_bars": int(max_age_bars),
         "breakout_move_atr": move_v,
@@ -9755,11 +9778,27 @@ def _mid_smart_setup_origin_fastpath(*,
         reasons.append(f"origin_fast_atr:{atr_v:.3f}<{atr_need:.3f}")
     if vol_v < float(vol_need_eff):
         reasons.append(f"origin_fast_vol:{vol_v:.2f}<{vol_need_eff:.2f}")
+    if bo_ok and age_v is not None and age_v <= 0 and body_atr_v <= 0.0 and (not age0_has_alt_impulse):
+        _move_disp = "-" if move_v is None else f"{float(move_v):.2f}"
+        reasons.append(f"origin_fast_no_impulse:body={body_atr_v:.2f}|vol={vol_v:.2f}|move={_move_disp}")
     _body_soft_bypass = False
     try:
-        _body_soft_bypass = bool(bo_ok and age_v is not None and age_v <= 0 and str(meta.get("body_source") or "").startswith("breakout_") and body_atr_v <= 0.0)
+        _allow_zero_body_breakout = str(os.getenv("MID_SMART_SETUP_ORIGIN_ALLOW_ZERO_BODY_BREAKOUT_META", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        _allow_zero_body_breakout = True
+    try:
+        _body_soft_bypass = bool(
+            _allow_zero_body_breakout
+            and bo_ok
+            and age_v is not None
+            and age_v <= 0
+            and str(meta.get("body_source") or "").startswith("breakout_")
+            and body_atr_v <= 0.0
+            and age0_has_alt_impulse
+        )
     except Exception:
         _body_soft_bypass = False
+    meta["body_soft_bypass"] = bool(_body_soft_bypass)
     if body_atr_v < float(body_need_eff) and not _body_soft_bypass:
         reasons.append(f"origin_fast_body:{body_atr_v:.2f}<{body_need_eff:.2f}")
     if age_v is not None and max_age_bars >= 0 and age_v > max_age_bars:
@@ -9987,8 +10026,32 @@ def _mid_instant_emit_gate(*,
 
     origin_ignore_profit = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_BYPASS_PROFIT", "1"))
     origin_soft_macd = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_SOFT_MACD", "1"))
-    origin_bypass_trap = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_BYPASS_TRAP", "1"))
+    origin_bypass_trap = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_BYPASS_TRAP", "0"))
     origin_relax_regime = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_RELAX_REGIME", "1"))
+
+    def _origin_trap_bypass_allowed(reason: str, trap_meta: dict | None) -> bool:
+        if not origin_bypass_trap:
+            return False
+        hard_tokens = (
+            "smart_setup_trap_vwap_ext",
+            "smart_setup_trap_impulse",
+            "smart_setup_trap_bb_extreme",
+            "smart_setup_trap_bb_stretch",
+        )
+        try:
+            reason_s = str(reason or "").strip().lower()
+        except Exception:
+            reason_s = ""
+        if any(tok in reason_s for tok in hard_tokens):
+            return False
+        try:
+            for _r in _mid_gate_listify((trap_meta or {}).get("fail_reasons")):
+                _rs = str(_r or "").strip().lower()
+                if any(tok in _rs for tok in hard_tokens):
+                    return False
+        except Exception:
+            pass
+        return True
 
     try:
         profit_need = float(os.getenv("MID_INSTANT_EMIT_MIN_PROFIT_PCT", "1.0") or 1.0)
@@ -10014,6 +10077,8 @@ def _mid_instant_emit_gate(*,
     rr_ok, rr_v, rr_need = signal_rr_gate(sig) if sig is not None else (False, 0.0, 0.0)
     reg_u = str(regime or "").upper().strip()
 
+    _origin_trap_bypass_ok = _origin_trap_bypass_allowed(smart_setup_trap_reason, smart_setup_trap_meta)
+
     meta.update({
         "conf": int(round(conf_v)),
         "conf_need": int(conf_need),
@@ -10026,6 +10091,7 @@ def _mid_instant_emit_gate(*,
         "origin_ignore_profit": bool(origin_ignore_profit),
         "origin_soft_macd": bool(origin_soft_macd),
         "origin_bypass_trap": bool(origin_bypass_trap),
+        "origin_trap_bypass_allowed": bool(_origin_trap_bypass_ok),
         "origin_relax_regime": bool(origin_relax_regime),
         "rr": float(rr_v),
         "rr_need": float(rr_need),
@@ -10110,8 +10176,8 @@ def _mid_instant_emit_gate(*,
     if applied_risk_flags:
         _add_fail(f"instant_risk_flags:{','.join(applied_risk_flags)}")
     if not smart_setup_trap_ok:
-        if origin_bypass_trap:
-            ignored_checks.append(str(smart_setup_trap_reason or "smart_setup_trap"))
+        if _origin_trap_bypass_ok:
+            ignored_checks.append(f"origin_trap_ignored:{str(smart_setup_trap_reason or 'smart_setup_trap')}")
         else:
             _add_fail(str(smart_setup_trap_reason or "smart_setup_trap"))
     if profit_v < float(profit_need):
@@ -29079,6 +29145,14 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 if _fv > float(_origin_vol_for_fast or 0.0):
                                                     _origin_vol_for_fast = _fv
                                                     _origin_vol_src_for_fast = str(_src_vol_fast)
+                                            if float(_origin_vol_for_fast or 0.0) <= 0.0:
+                                                try:
+                                                    _curr_rel_vol_fast = float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("rel_vol_at_create") or 0.0) or 0.0)
+                                                except Exception:
+                                                    _curr_rel_vol_fast = 0.0
+                                                if _curr_rel_vol_fast > 0.0:
+                                                    _origin_vol_for_fast = float(_curr_rel_vol_fast)
+                                                    _origin_vol_src_for_fast = "current_rel_vol"
                                             if (not _fresh_bo_now) and float(_origin_body_for_fast or 0.0) <= 0.0:
                                                 try:
                                                     _origin_body_for_fast = float(rec.get("origin_body_at_create") or rec.get("last_body") or 0.0)
@@ -29177,6 +29251,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 vol_last=float((base_r.get("vol_last") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("vol_last") or 0.0) or 0.0),
                                                 vol_avg=float((base_r.get("vol_avg") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("vol_avg") or 0.0) or 0.0),
                                                 breakout_fresh_ok=bool(_breakout_fast_ok),
+                                                origin_fast_ok=bool(_origin_fast_ok),
                                                 in_zone_now=bool(_in_zone_now),
                                                 allow_no_zone_breakout=bool(_smart_emit_if_no_zone),
                                                 confidence=float(_conf_now),
