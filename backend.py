@@ -33330,28 +33330,54 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
 
     _scenario_state_save(short_scenarios, long_scenarios)
 
+    def _scenario_plan_name(item, idx):
+        if bool(item.get('contingency')):
+            return ('Альтернативный сценарий' if is_ru else 'Alternative scenario')
+        return ('Основной сценарий' if is_ru else 'Main scenario')
+
+    def _scenario_invalidation_text(side_key, item):
+        sl_level = _clean_level(item.get('_sl'))
+        sl_text = str((item.get('sl_ru') if is_ru else item.get('sl_en')) or '').strip()
+        if sl_level is not None:
+            lvl = _fmt_int_space(sl_level)
+            if side_key == 'short':
+                return (f'сценарий отменяется при возврате и закреплении выше {lvl}' if is_ru else f'setup invalidates on reclaim and hold above {lvl}')
+            return (f'сценарий отменяется при потере и закреплении ниже {lvl}' if is_ru else f'setup invalidates on loss and hold below {lvl}')
+        if not sl_text or sl_text == '—':
+            return ('сценарий отменяется при явном сломе структуры против идеи' if is_ru else 'setup invalidates on clear structure break against the idea')
+        if side_key == 'short':
+            return (f'сценарий отменяется при возврате выше {sl_text}' if is_ru else f'setup invalidates on reclaim above {sl_text}')
+        return (f'сценарий отменяется при уходе ниже {sl_text}' if is_ru else f'setup invalidates on move below {sl_text}')
+
+    def _scenario_execution_rules(side_key, item):
+        if is_ru:
+            return 'вход только после триггера; подтверждение желательно на 5m/15m; если цена ушла без ретеста, сценарий пропускается; после invalidation идея не исполняется'
+        return 'enter only after trigger; prefer 5m/15m confirmation; skip the setup if price runs away without retest; do not execute after invalidation'
+
     def _render_side_block(side_key, items):
         if not items:
             return []
         header = 'СЦЕНАРИЙ SHORT' if (is_ru and side_key == 'short') else ('СЦЕНАРИЙ LONG' if is_ru else ('SHORT SCENARIO' if side_key == 'short' else 'LONG SCENARIO'))
-        side_name = 'Short' if side_key == 'short' else 'Long'
         lines = ['', header]
-        letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
         for idx, item in enumerate(items):
-            label = letters[idx] if idx < len(letters) else str(idx + 1)
-            title = item['title_ru'] if is_ru else item['title_en']
-            if item.get('contingency'):
-                title = ((f'запасной сценарий — {title}') if is_ru else (f'contingency — {title}'))
-            trigger = item['trigger_ru'] if is_ru else item['trigger_en']
-            sl_text = item['sl_ru'] if is_ru else item['sl_en']
-            entry_label = 'Вход' if is_ru else 'Entry'
+            title = (item.get('title_ru') if is_ru else item.get('title_en')) or '—'
+            trigger = (item.get('trigger_ru') if is_ru else item.get('trigger_en')) or '—'
+            invalidation = _scenario_invalidation_text(side_key, item)
+            rules_text = _scenario_execution_rules(side_key, item)
+            plan_name = _scenario_plan_name(item, idx)
+            entry_label = 'Зона входа' if is_ru else 'Entry zone'
+            idea_label = 'Идея' if is_ru else 'Setup'
             trigger_label = 'Триггер' if is_ru else 'Trigger'
+            targets_label = 'Цели' if is_ru else 'Targets'
+            rules_label = 'Правила исполнения' if is_ru else 'Execution rules'
             lines.extend([
-                f"{side_name} {label} — {title}",
-                f"{entry_label}: {item['entry']}",
+                plan_name,
+                f"{idea_label}: {title}",
+                f"{entry_label}: {item.get('entry') or '—'}",
                 f"{trigger_label}: {trigger}",
-                f"SL: {sl_text}",
-                f"TP: {item['tp']}",
+                f"Invalidation: {invalidation}",
+                f"{targets_label}: {item.get('tp') or '—'}",
+                f"{rules_label}: {rules_text}",
             ])
             if idx != len(items) - 1:
                 lines.append('')
@@ -33383,8 +33409,10 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
 
     scenario_lines.extend([
         '',
-        ('Правило:' if is_ru else 'Rule:'),
+        ('Общие правила исполнения:' if is_ru else 'General execution rules:'),
         ('• Без триггера = NO TRADE' if is_ru else '• No trigger = NO TRADE'),
+        ('• Основной сценарий исполняется первым; альтернативный — только если основной не реализовался' if is_ru else '• Execute the main scenario first; use the alternative only if the main scenario does not trigger'),
+        ('• При invalidation сценарий отменяется и не доусредняется' if is_ru else '• Once invalidated, the setup is cancelled and must not be averaged into'),
         ('• Файл дополняет основной анализ и не заменяет его' if is_ru else '• This file supplements the main analysis and does not replace it'),
     ])
     scenario_text = "\n".join([x for x in scenario_lines if x is not None])
