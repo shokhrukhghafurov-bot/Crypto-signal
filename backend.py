@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-03-04_institutional_engine_v3_ultimate"
+MID_BUILD_TAG = "MID_BUILD_2026-03-04_institutional_engine_v3_ultimate_origin_vol_src_guard_v2"
 
 import asyncio
 import json
@@ -15240,6 +15240,19 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     except Exception:
         pass
 
+    # Defensive normalization for trigger-time paths: some deployments can reach the TA
+    # payload builder through partially initialized locals after earlier guarded blocks.
+    # Keep both source labels defined so building the TA dict never crashes with
+    # NameError and downstream formatting/logging always gets a stable string.
+    try:
+        origin_body_src = str(locals().get("origin_body_src") or "micro_pair")
+    except Exception:
+        origin_body_src = "micro_pair"
+    try:
+        origin_vol_src = str(locals().get("origin_vol_src") or "micro_pair")
+    except Exception:
+        origin_vol_src = "micro_pair"
+
     ta: Dict[str, Any] = {
         "direction": dir_trend,
         "entry": entry,
@@ -29165,6 +29178,17 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     _origin_vol_src_for_fast = str(rec.get("origin_vol_src_at_create") or "origin_vol_x")
                                                 except Exception:
                                                     pass
+                                            # Defensive fallback for trigger-time smart-setup origin path.
+                                            # If any earlier guarded branch skipped the source-label assignment,
+                                            # keep a stable string instead of crashing on NameError later.
+                                            try:
+                                                _origin_body_src_for_fast = str(locals().get("_origin_body_src_for_fast") or rec.get("origin_body_src_at_create") or "origin_body")
+                                            except Exception:
+                                                _origin_body_src_for_fast = "origin_body"
+                                            try:
+                                                _origin_vol_src_for_fast = str(locals().get("_origin_vol_src_for_fast") or rec.get("origin_vol_src_at_create") or "origin_vol_x")
+                                            except Exception:
+                                                _origin_vol_src_for_fast = "origin_vol_x"
                                             _origin_fast_ok = False
                                             _origin_fast_reason = ""
                                             _origin_fast_meta = {}
