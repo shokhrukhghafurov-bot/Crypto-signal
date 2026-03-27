@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-03-04_institutional_engine_v3_ultimate_origin_vol_src_guard_v2"
+MID_BUILD_TAG = "MID_BUILD_2026-03-04_institutional_engine_v3_ultimate_origin_vol_src_fix_v3"
 
 import asyncio
 import json
@@ -15240,19 +15240,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     except Exception:
         pass
 
-    # Defensive normalization for trigger-time paths: some deployments can reach the TA
-    # payload builder through partially initialized locals after earlier guarded blocks.
-    # Keep both source labels defined so building the TA dict never crashes with
-    # NameError and downstream formatting/logging always gets a stable string.
-    try:
-        origin_body_src = str(locals().get("origin_body_src") or "micro_pair")
-    except Exception:
-        origin_body_src = "micro_pair"
-    try:
-        origin_vol_src = str(locals().get("origin_vol_src") or "micro_pair")
-    except Exception:
-        origin_vol_src = "micro_pair"
-
     ta: Dict[str, Any] = {
         "direction": dir_trend,
         "entry": entry,
@@ -17428,6 +17415,8 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
     vol_avg = float("nan")
     prev_rel_vol = float("nan")
     origin_vol_x = float("nan")
+    origin_body_src = "last_body"
+    origin_vol_src = "current_rel_vol"
     try:
         op = df5i["open"].astype(float)
         hi = df5i["high"].astype(float)
@@ -17449,6 +17438,10 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
             origin_body = max(float(last_body or 0.0), float(prev_body or 0.0))
         except Exception:
             origin_body = float(last_body or 0.0)
+        try:
+            origin_body_src = "prev_body" if float(prev_body or 0.0) > float(last_body or 0.0) else "last_body"
+        except Exception:
+            origin_body_src = "last_body"
 
         try:
             vv = df5i["volume"].astype(float)
@@ -17472,11 +17465,16 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
             except Exception:
                 _prev_rel = 0.0
             origin_vol_x = max(_curr_rel, _prev_rel)
+            try:
+                origin_vol_src = "prev_rel_vol" if float(_prev_rel or 0.0) > float(_curr_rel or 0.0) else "current_rel_vol"
+            except Exception:
+                origin_vol_src = "current_rel_vol"
         except Exception:
             vol_last = float("nan")
             vol_avg = float("nan")
             prev_rel_vol = float("nan")
             origin_vol_x = float(vol_rel) if (vol_rel == vol_rel) else float("nan")
+            origin_vol_src = "current_rel_vol" if (vol_rel == vol_rel) else "rel_vol_missing"
 
         # BOS heuristic: close breaks prior swing range (lightweight)
         try:
@@ -29178,17 +29176,6 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     _origin_vol_src_for_fast = str(rec.get("origin_vol_src_at_create") or "origin_vol_x")
                                                 except Exception:
                                                     pass
-                                            # Defensive fallback for trigger-time smart-setup origin path.
-                                            # If any earlier guarded branch skipped the source-label assignment,
-                                            # keep a stable string instead of crashing on NameError later.
-                                            try:
-                                                _origin_body_src_for_fast = str(locals().get("_origin_body_src_for_fast") or rec.get("origin_body_src_at_create") or "origin_body")
-                                            except Exception:
-                                                _origin_body_src_for_fast = "origin_body"
-                                            try:
-                                                _origin_vol_src_for_fast = str(locals().get("_origin_vol_src_for_fast") or rec.get("origin_vol_src_at_create") or "origin_vol_x")
-                                            except Exception:
-                                                _origin_vol_src_for_fast = "origin_vol_x"
                                             _origin_fast_ok = False
                                             _origin_fast_reason = ""
                                             _origin_fast_meta = {}
