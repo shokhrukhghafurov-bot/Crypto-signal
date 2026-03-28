@@ -1,3 +1,4 @@
+# MID_TRIGGER_ONLY_HARDBLOCK_FIX_20260328
 from __future__ import annotations
 
 MID_BUILD_TAG = "MID_BUILD_2026-03-04_institutional_engine_v3_ultimate_origin_vol_src_fix_v3"
@@ -1819,30 +1820,26 @@ def _mid_directional_contradiction_reason(*sources: dict | None) -> str:
 def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str:
     """Hard veto reasons for early zone-touch alerts.
 
-    Zone-touch alerts must stay high-quality: we allow them only when the first
-    touch of the pending zone is directionally consistent and the local RSI is
-    still inside the preferred entry window. In addition to the existing hard
-    blockers, we explicitly veto zone-touch alerts for the most dangerous local
-    contradictions requested by the user:
-      - SHORT + BO↑ / BO↑ + Retest
-      - LONG  + BO↓ / BO↓ + Retest
-      - SHORT + Bullish Engulfing
-      - LONG  + Bearish Engulfing
-      - LONG / SHORT outside the configured RSI entry window
-      - clearly wrong-side MACD hist(5m) at emit time (but not displayed -0.0000 / +0.0000)
+    Keep zone-touch alerts aligned with the existing smart-setup flow: only the
+    most structural blockers should veto the *pre-trigger* heads-up alert.
+
+    Requested behavior:
+      - wrong-side MACD hist(5m) must stay a hard block only on actual trigger/emit
+      - directional contradiction (wrong-way BO/Retest or reversal pattern) must stay
+        a hard block only on actual trigger/emit
+      - wrong VWAP side / VWAP bias must stay a hard block only on actual trigger/emit
+
+    We still block obviously broken market state here (regime / ADX / RSI / trap),
+    but we do not kill the early alert for the three trigger-only blockers above.
     """
     try:
         t = ta if isinstance(ta, dict) else {}
         raw = str(t.get("block_reason") or "").strip()
         head = raw.split()[0].split("=", 1)[0].strip().lower() if raw else ""
         if head in (
-            "directional_contradiction",
             "regime_block",
             "adx_30m",
             "adx_1h",
-            "wrong_vwap_side",
-            "vwap_bias",
-            "vwap_dist_atr",
             "rsi_long",
             "rsi_short",
         ):
@@ -1857,10 +1854,6 @@ def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str
             if v in ("LONG", "SHORT"):
                 side = v
                 break
-
-        _dir_reason = _mid_directional_contradiction_reason(t, it)
-        if _dir_reason:
-            return _dir_reason
 
         try:
             rsi_5m = float(t.get("rsi"))
@@ -1881,10 +1874,6 @@ def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str
                     return f"rsi_short={rsi_5m:.1f} <= {rsi_short_min:g}"
                 if rsi_5m >= rsi_short_max:
                     return f"rsi_short={rsi_5m:.1f} >= {rsi_short_max:g}"
-
-        _macd_reason = _mid_macd_hist_emit_block_reason(side, t.get("macd_hist"))
-        if _macd_reason:
-            return _macd_reason
 
         if bool(t.get("trap_ok", True)) is False:
             return str(t.get("trap_reason") or "trap_block")
@@ -23277,11 +23266,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 _touch_conf_now = 0
                             _touch_guard = _mid_zone_touch_guard_reason(ta, it)
-                            if not _touch_guard:
-                                try:
-                                    _touch_guard = _mid_macd_hist_emit_block_reason(str(direction), _safe_float(ta.get("macd_hist"), None))
-                                except Exception:
-                                    _touch_guard = _touch_guard or ""
                             try:
                                 _touch_grade = _ta_signal_grade(ta)
                             except Exception:
