@@ -16239,6 +16239,26 @@ def _mid_zone_touch_min_grade() -> str:
     return raw if raw in {"A", "A-", "B-", "C", "C-"} else "B-"
 
 
+def _ta_note_replace_grade(note: str, grade: str) -> str:
+    """Replace the first displayed Grade: token inside a TA note.
+
+    zone_touch_alert may be emitted from a pending created earlier, so the stored
+    risk_note can carry an older scan-time grade. Refreshing the displayed grade
+    keeps the card aligned with the trigger-time quality gate.
+    """
+    try:
+        txt = str(note or "")
+        g = str(grade or "").strip().upper()
+        if not txt or not g:
+            return txt
+        return re.sub(r"(Grade:\s*)(A-|A|B-|C-|C)(\b)", rf"\1{g}", txt, count=1)
+    except Exception:
+        try:
+            return str(note or "")
+        except Exception:
+            return ""
+
+
 def _ta_signal_grade(ta: Dict[str, Any]) -> str:
     """Classify a signal into A / A- / B- / C / C-.
 
@@ -23276,6 +23296,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 if not _touch_anchor_far:
                                     _touch_entry, _touch_sl, _touch_tp1, _touch_tp2, _touch_rr = _mid_recalc_levels_from_trigger(direction, _touch_entry_ref, ta, it, market)
                                     _touch_note_base = str(it.get("risk_note") or "").strip()
+                                    _touch_note_base = _ta_note_replace_grade(_touch_note_base, _touch_grade)
                                     _touch_note = (_touch_note_base + (" | " if _touch_note_base else "") + "zone_touch_alert=1 no_autotrade=1 levels_anchor=1").strip()
                                     sig_zone = Signal(
                                         signal_id=self.next_signal_id(),
