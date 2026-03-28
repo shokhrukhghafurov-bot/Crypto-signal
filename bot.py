@@ -3273,7 +3273,7 @@ def _signal_text(uid: int, s: Signal, *, autotrade_hint: str = "") -> str:
         confirm_line=confirm_line,
         autotrade_line=autotrade_line,
         risk_block=risk_block,
-        open_prompt=tr(uid, 'sig_open_prompt')
+        open_prompt=f"{tr(uid, 'sig_open_prompt')}\n{_symbol_hashtag(s.symbol)}"
     )
 
 def _fmt_hhmm(ts_utc: float) -> str:
@@ -3424,7 +3424,8 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
         f"──────────────\n\n"
         f"{price_block}\n\n"
         f"🕒 Открыта: {opened_time} ({tz_label})\n"
-        f"🕒 Закрыта: {closed_time} ({tz_label})"
+        f"🕒 Закрыта: {closed_time} ({tz_label})\n\n"
+        f"{_symbol_hashtag(symbol)}"
     ).strip()
 
 
@@ -3456,6 +3457,13 @@ def _fmt_symbol(sym: str) -> str:
         a, b = s.split("/", 1)
         return f"{a.strip()} / {b.strip()}"
     return s
+
+def _symbol_hashtag(sym: str) -> str:
+    raw = (sym or "").strip().upper()
+    if not raw:
+        return "#—"
+    tag = re.sub(r"[^A-Z0-9_]+", "", raw.replace("/", ""))
+    return f"#{tag}" if tag else f"#{raw.replace(' ', '')}"
 
 def _fmt_price(v) -> str:
     try:
