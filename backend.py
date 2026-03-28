@@ -16211,6 +16211,34 @@ def _ta_worse_grade(left: str, right: str) -> str:
     return left if _ta_grade_rank(left) >= _ta_grade_rank(right) else right
 
 
+def _ta_grade_meets_min(grade: str, min_grade: str) -> bool:
+    """Return True when grade is at least as strong as min_grade.
+
+    Grade ladder is A / A- / B- / C / C-. For convenience we accept a user
+    env alias of "B" and normalize it to the closest supported gate: "B-".
+    """
+    try:
+        grade_u = str(grade or "").strip().upper()
+        min_u = str(min_grade or "").strip().upper()
+        aliases = {"B": "B-"}
+        grade_u = aliases.get(grade_u, grade_u)
+        min_u = aliases.get(min_u, min_u)
+        return _ta_grade_rank(grade_u) <= _ta_grade_rank(min_u)
+    except Exception:
+        return False
+
+
+def _mid_zone_touch_min_grade() -> str:
+    """Minimum grade required before sending zone-touch alerts."""
+    try:
+        raw = str(os.getenv("MID_ZONE_TOUCH_ALERT_MIN_GRADE", "B-") or "B-").strip().upper()
+    except Exception:
+        raw = "B-"
+    if raw == "B":
+        raw = "B-"
+    return raw if raw in {"A", "A-", "B-", "C", "C-"} else "B-"
+
+
 def _ta_signal_grade(ta: Dict[str, Any]) -> str:
     """Classify a signal into A / A- / B- / C / C-.
 
@@ -23234,6 +23262,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     _touch_guard = _mid_macd_hist_emit_block_reason(str(direction), _safe_float(ta.get("macd_hist"), None))
                                 except Exception:
                                     _touch_guard = _touch_guard or ""
+                            try:
+                                _touch_grade = _ta_signal_grade(ta)
+                            except Exception:
+                                _touch_grade = "C-"
+                            _touch_min_grade = _mid_zone_touch_min_grade()
+                            _touch_grade_ok = _ta_grade_meets_min(_touch_grade, _touch_min_grade)
+                            if (not _touch_guard) and (not _touch_grade_ok):
+                                _touch_guard = f"grade_low:{_touch_grade}<{_touch_min_grade}"
                             _touch_strong = bool(_touch_conf_now >= _touch_conf_need) or _mid_pending_is_fresh_bo_rt(it, now_ts=now)
                             if _touch_strong and (not _touch_guard):
                                 _touch_entry_ref, _touch_anchor_far, _touch_slip_atr = _mid_pending_entry_ref(it, price=price, ta=ta)
