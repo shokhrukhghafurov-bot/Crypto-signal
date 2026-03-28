@@ -1,4 +1,3 @@
-# MID_TRIGGER_ONLY_HARDBLOCK_FIX_20260328
 from __future__ import annotations
 
 MID_BUILD_TAG = "MID_BUILD_2026-03-04_institutional_engine_v3_ultimate_origin_vol_src_fix_v3"
@@ -1820,26 +1819,30 @@ def _mid_directional_contradiction_reason(*sources: dict | None) -> str:
 def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str:
     """Hard veto reasons for early zone-touch alerts.
 
-    Keep zone-touch alerts aligned with the existing smart-setup flow: only the
-    most structural blockers should veto the *pre-trigger* heads-up alert.
-
-    Requested behavior:
-      - wrong-side MACD hist(5m) must stay a hard block only on actual trigger/emit
-      - directional contradiction (wrong-way BO/Retest or reversal pattern) must stay
-        a hard block only on actual trigger/emit
-      - wrong VWAP side / VWAP bias must stay a hard block only on actual trigger/emit
-
-    We still block obviously broken market state here (regime / ADX / RSI / trap),
-    but we do not kill the early alert for the three trigger-only blockers above.
+    Zone-touch alerts must stay high-quality: we allow them only when the first
+    touch of the pending zone is directionally consistent and the local RSI is
+    still inside the preferred entry window. In addition to the existing hard
+    blockers, we explicitly veto zone-touch alerts for the most dangerous local
+    contradictions requested by the user:
+      - SHORT + BO↑ / BO↑ + Retest
+      - LONG  + BO↓ / BO↓ + Retest
+      - SHORT + Bullish Engulfing
+      - LONG  + Bearish Engulfing
+      - LONG / SHORT outside the configured RSI entry window
+      - clearly wrong-side MACD hist(5m) at emit time (but not displayed -0.0000 / +0.0000)
     """
     try:
         t = ta if isinstance(ta, dict) else {}
         raw = str(t.get("block_reason") or "").strip()
         head = raw.split()[0].split("=", 1)[0].strip().lower() if raw else ""
         if head in (
+            "directional_contradiction",
             "regime_block",
             "adx_30m",
             "adx_1h",
+            "wrong_vwap_side",
+            "vwap_bias",
+            "vwap_dist_atr",
             "rsi_long",
             "rsi_short",
         ):
@@ -1854,6 +1857,10 @@ def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str
             if v in ("LONG", "SHORT"):
                 side = v
                 break
+
+        _dir_reason = _mid_directional_contradiction_reason(t, it)
+        if _dir_reason:
+            return _dir_reason
 
         try:
             rsi_5m = float(t.get("rsi"))
@@ -1874,6 +1881,10 @@ def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str
                     return f"rsi_short={rsi_5m:.1f} <= {rsi_short_min:g}"
                 if rsi_5m >= rsi_short_max:
                     return f"rsi_short={rsi_5m:.1f} >= {rsi_short_max:g}"
+
+        _macd_reason = _mid_macd_hist_emit_block_reason(side, t.get("macd_hist"))
+        if _macd_reason:
+            return _macd_reason
 
         if bool(t.get("trap_ok", True)) is False:
             return str(t.get("trap_reason") or "trap_block")
@@ -16200,54 +16211,6 @@ def _ta_worse_grade(left: str, right: str) -> str:
     return left if _ta_grade_rank(left) >= _ta_grade_rank(right) else right
 
 
-def _ta_grade_meets_min(grade: str, min_grade: str) -> bool:
-    """Return True when grade is at least as strong as min_grade.
-
-    Grade ladder is A / A- / B- / C / C-. For convenience we accept a user
-    env alias of "B" and normalize it to the closest supported gate: "B-".
-    """
-    try:
-        grade_u = str(grade or "").strip().upper()
-        min_u = str(min_grade or "").strip().upper()
-        aliases = {"B": "B-"}
-        grade_u = aliases.get(grade_u, grade_u)
-        min_u = aliases.get(min_u, min_u)
-        return _ta_grade_rank(grade_u) <= _ta_grade_rank(min_u)
-    except Exception:
-        return False
-
-
-def _mid_zone_touch_min_grade() -> str:
-    """Minimum grade required before sending zone-touch alerts."""
-    try:
-        raw = str(os.getenv("MID_ZONE_TOUCH_ALERT_MIN_GRADE", "B-") or "B-").strip().upper()
-    except Exception:
-        raw = "B-"
-    if raw == "B":
-        raw = "B-"
-    return raw if raw in {"A", "A-", "B-", "C", "C-"} else "B-"
-
-
-def _ta_note_replace_grade(note: str, grade: str) -> str:
-    """Replace the first displayed Grade: token inside a TA note.
-
-    zone_touch_alert may be emitted from a pending created earlier, so the stored
-    risk_note can carry an older scan-time grade. Refreshing the displayed grade
-    keeps the card aligned with the trigger-time quality gate.
-    """
-    try:
-        txt = str(note or "")
-        g = str(grade or "").strip().upper()
-        if not txt or not g:
-            return txt
-        return re.sub(r"(Grade:\s*)(A-|A|B-|C-|C)(\b)", rf"\1{g}", txt, count=1)
-    except Exception:
-        try:
-            return str(note or "")
-        except Exception:
-            return ""
-
-
 def _ta_signal_grade(ta: Dict[str, Any]) -> str:
     """Classify a signal into A / A- / B- / C / C-.
 
@@ -23266,21 +23229,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 _touch_conf_now = 0
                             _touch_guard = _mid_zone_touch_guard_reason(ta, it)
-                            try:
-                                _touch_grade = _ta_signal_grade(ta)
-                            except Exception:
-                                _touch_grade = "C-"
-                            _touch_min_grade = _mid_zone_touch_min_grade()
-                            _touch_grade_ok = _ta_grade_meets_min(_touch_grade, _touch_min_grade)
-                            if (not _touch_guard) and (not _touch_grade_ok):
-                                _touch_guard = f"grade_low:{_touch_grade}<{_touch_min_grade}"
+                            if not _touch_guard:
+                                try:
+                                    _touch_guard = _mid_macd_hist_emit_block_reason(str(direction), _safe_float(ta.get("macd_hist"), None))
+                                except Exception:
+                                    _touch_guard = _touch_guard or ""
                             _touch_strong = bool(_touch_conf_now >= _touch_conf_need) or _mid_pending_is_fresh_bo_rt(it, now_ts=now)
                             if _touch_strong and (not _touch_guard):
                                 _touch_entry_ref, _touch_anchor_far, _touch_slip_atr = _mid_pending_entry_ref(it, price=price, ta=ta)
                                 if not _touch_anchor_far:
                                     _touch_entry, _touch_sl, _touch_tp1, _touch_tp2, _touch_rr = _mid_recalc_levels_from_trigger(direction, _touch_entry_ref, ta, it, market)
                                     _touch_note_base = str(it.get("risk_note") or "").strip()
-                                    _touch_note_base = _ta_note_replace_grade(_touch_note_base, _touch_grade)
                                     _touch_note = (_touch_note_base + (" | " if _touch_note_base else "") + "zone_touch_alert=1 no_autotrade=1 levels_anchor=1").strip()
                                     sig_zone = Signal(
                                         signal_id=self.next_signal_id(),
