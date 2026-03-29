@@ -23044,6 +23044,36 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
                             try:
+                                # Never let instant-emit bypass a directional contradiction from the pending payload.
+                                # Example: SHORT + BO↑ + Retest must be rejected before any instant emit path.
+                                _instant_dir_contra = _mid_directional_contradiction_reason(
+                                    {
+                                        "direction": direction,
+                                        "bo_rt": it.get("bo_rt"),
+                                        "breakout_retest": it.get("breakout_retest"),
+                                        "pattern": it.get("pattern"),
+                                    },
+                                    it,
+                                )
+                            except Exception:
+                                _instant_dir_contra = ""
+                            if _instant_dir_contra:
+                                try:
+                                    it["instant_emit_guard_reason"] = str(_instant_dir_contra)
+                                except Exception:
+                                    pass
+                                keep_it, outc = _pending_apply_fail(it, "directional_contradiction", now)
+                                _pending_log_trigger(sym, market, direction, outc, str(_instant_dir_contra), it, float(price))
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
+                            try:
                                 entry_ref, _anchor_too_far, _anchor_slip_atr = _mid_pending_entry_ref(it, price=price, ta=None)
                                 if _anchor_too_far:
                                     keep_it, outc = _pending_apply_fail(it, "late_entry", now)
