@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-03-04_institutional_engine_v3_ultimate_origin_vol_src_fix_v3"
+MID_BUILD_TAG = "MID_BUILD_2026-03-29_smart_setup_early_entry_patch_v1"
 
 import asyncio
 import json
@@ -1610,6 +1610,7 @@ def _mid_zone_touch_emit_context_ok(ta: dict | None, it: dict | None = None, *, 
       - very fresh BO/RT pending
       - order-block retest at the touch
       - liquidity sweep in the direction of the idea
+      - narrow trusted supply/demand zone reached while the breakout idea is still fresh
     """
     t = ta if isinstance(ta, dict) else {}
     rec = it if isinstance(it, dict) else {}
@@ -1634,6 +1635,43 @@ def _mid_zone_touch_emit_context_ok(ta: dict | None, it: dict | None = None, *, 
             return True
     except Exception:
         pass
+    try:
+        zone_src = str(rec.get("entry_zone_src") or "").strip().lower()
+    except Exception:
+        zone_src = ""
+    try:
+        trusted_zone = zone_src.startswith("ob") or zone_src.startswith("fvg") or zone_src.startswith("ch1h") or zone_src.startswith("ch4h")
+    except Exception:
+        trusted_zone = False
+    if trusted_zone:
+        try:
+            zone_width_atr = float(rec.get("zone_width_atr")) if rec.get("zone_width_atr") is not None else None
+        except Exception:
+            zone_width_atr = None
+        try:
+            max_zone_width_atr = float(os.getenv("MID_ZONE_TOUCH_EMIT_MAX_ZONE_WIDTH_ATR", "2.20") or 2.20)
+        except Exception:
+            max_zone_width_atr = 2.20
+        try:
+            bo_age_create = int(float(rec.get("breakout_first_age_bars_create"))) if rec.get("breakout_first_age_bars_create") is not None else None
+        except Exception:
+            bo_age_create = None
+        try:
+            max_bo_age = int(float(os.getenv("MID_ZONE_TOUCH_EMIT_MAX_BREAKOUT_AGE_BARS", "3") or 3))
+        except Exception:
+            max_bo_age = 3
+        try:
+            bo_move_create = float(rec.get("breakout_first_move_atr_create")) if rec.get("breakout_first_move_atr_create") is not None else None
+        except Exception:
+            bo_move_create = None
+        try:
+            max_bo_move = float(os.getenv("MID_ZONE_TOUCH_EMIT_MAX_BREAKOUT_MOVE_ATR", "0.90") or 0.90)
+        except Exception:
+            max_bo_move = 0.90
+        narrow_ok = (zone_width_atr is None) or (max_zone_width_atr <= 0) or (float(zone_width_atr) <= float(max_zone_width_atr))
+        fresh_ok = ((bo_age_create is not None) and (int(bo_age_create) <= int(max_bo_age))) or ((bo_move_create is not None) and (float(bo_move_create) <= float(max_bo_move)))
+        if narrow_ok and fresh_ok:
+            return True
     return False
 
 
@@ -9763,14 +9801,42 @@ def _mid_smart_setup_origin_fastpath(*,
     dist_atr_v = None if dist_to_zone_atr is None else float(dist_to_zone_atr)
     dist_pct_v = float(dist_to_zone_pct or 0.0)
     atr30_v = float(atr30_abs or 0.0)
+    vol_v = 0.0
+    body_v = 0.0
+    body_src_eff = "origin_body"
+    vol_src_eff = "origin_vol_x"
     try:
-        vol_v = float(origin_vol_x if origin_vol_x is not None else (vol_x or 0.0))
+        for _src_name, _cand in ((str(origin_vol_src or "origin_vol_x") or "origin_vol_x", origin_vol_x),
+                                 ("current_rel_vol", vol_x)):
+            try:
+                _fv = float(_cand or 0.0)
+            except Exception:
+                _fv = 0.0
+            if _fv > float(vol_v or 0.0):
+                vol_v = float(_fv)
+                vol_src_eff = str(_src_name or "origin_vol_x")
     except Exception:
-        vol_v = float(vol_x or 0.0)
+        try:
+            vol_v = float(vol_x or 0.0)
+        except Exception:
+            vol_v = 0.0
+        vol_src_eff = "current_rel_vol"
     try:
-        body_v = abs(float(origin_body if origin_body is not None else (last_body or 0.0)))
+        for _src_name, _cand in ((str(origin_body_src or "origin_body") or "origin_body", origin_body),
+                                 ("last_body", last_body)):
+            try:
+                _fv = abs(float(_cand or 0.0))
+            except Exception:
+                _fv = 0.0
+            if _fv > float(body_v or 0.0):
+                body_v = float(_fv)
+                body_src_eff = str(_src_name or "origin_body")
     except Exception:
-        body_v = abs(float(last_body or 0.0))
+        try:
+            body_v = abs(float(last_body or 0.0))
+        except Exception:
+            body_v = 0.0
+        body_src_eff = "last_body"
     body_atr_v = (body_v / atr30_v) if atr30_v > 0 else 0.0
 
     try:
@@ -9782,17 +9848,21 @@ def _mid_smart_setup_origin_fastpath(*,
     except Exception:
         vol_need_eff = 0.0
     try:
-        age0_body_min = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR_AGE0", "0.08") or 0.08)
+        age0_body_min = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR_AGE0", "0.04") or 0.04)
     except Exception:
-        age0_body_min = 0.08
+        age0_body_min = 0.04
     try:
-        age0_vol_min = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X_AGE0", "0.10") or 0.10)
+        age0_vol_min = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X_AGE0", "0.05") or 0.05)
     except Exception:
-        age0_vol_min = 0.10
+        age0_vol_min = 0.05
     try:
-        age0_move_evidence = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_MOVE_ATR_AGE0", "0.18") or 0.18)
+        age0_move_evidence = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_MOVE_ATR_AGE0", "0.12") or 0.12)
     except Exception:
-        age0_move_evidence = 0.18
+        age0_move_evidence = 0.12
+    try:
+        age0_live_vol_min = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X_AGE0_LIVE", "0.03") or 0.03)
+    except Exception:
+        age0_live_vol_min = 0.03
     age0_has_alt_impulse = False
     if bo_ok and age_v is not None and age_v <= 0:
         try:
@@ -9822,12 +9892,13 @@ def _mid_smart_setup_origin_fastpath(*,
         "vol_x": float(vol_v),
         "vol_need": float(vol_need_eff),
         "body_atr": float(body_atr_v),
-        "body_source": str(origin_body_src or ("origin_body" if origin_body is not None else "last_body")),
-        "vol_source": str(origin_vol_src or ("origin_vol_x" if origin_vol_x is not None else "rel_vol")),
+        "body_source": str(body_src_eff or (origin_body_src or ("origin_body" if origin_body is not None else "last_body"))),
+        "vol_source": str(vol_src_eff or (origin_vol_src or ("origin_vol_x" if origin_vol_x is not None else "rel_vol"))),
         "body_need_atr": float(body_need_eff),
         "age0_body_min": float(age0_body_min),
         "age0_vol_min": float(age0_vol_min),
         "age0_move_evidence": float(age0_move_evidence),
+        "age0_live_vol_min": float(age0_live_vol_min),
         "age0_alt_impulse": bool(age0_has_alt_impulse),
         "breakout_age_bars": age_v,
         "max_age_bars": int(max_age_bars),
@@ -9858,14 +9929,29 @@ def _mid_smart_setup_origin_fastpath(*,
     except Exception:
         _allow_zero_body_breakout = True
     try:
+        _allow_zero_body_age0_live = str(os.getenv("MID_SMART_SETUP_ORIGIN_ALLOW_ZERO_BODY_AGE0_LIVE", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        _allow_zero_body_age0_live = True
+    try:
         _body_soft_bypass = bool(
-            _allow_zero_body_breakout
-            and bo_ok
-            and age_v is not None
-            and age_v <= 0
-            and str(meta.get("body_source") or "").startswith("breakout_")
-            and body_atr_v <= 0.0
-            and age0_has_alt_impulse
+            (
+                _allow_zero_body_breakout
+                and bo_ok
+                and age_v is not None
+                and age_v <= 0
+                and str(meta.get("body_source") or "").startswith("breakout_")
+                and body_atr_v <= 0.0
+                and age0_has_alt_impulse
+            )
+            or (
+                _allow_zero_body_age0_live
+                and bo_ok
+                and age_v is not None
+                and age_v <= 0
+                and body_atr_v <= 0.0
+                and age0_has_alt_impulse
+                and vol_v >= float(age0_live_vol_min)
+            )
         )
     except Exception:
         _body_soft_bypass = False
