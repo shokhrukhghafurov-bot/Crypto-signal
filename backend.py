@@ -1566,6 +1566,77 @@ def _mid_zone_touch_alert_enabled() -> bool:
         return True
 
 
+def _mid_zone_touch_emit_enabled() -> bool:
+    """Allow a first-touch pending to become a real entry signal.
+
+    This upgrades the existing zone-touch alert path so strong first-touch reclaim /
+    order-block retest setups can emit from the blue-arrow area instead of waiting
+    for a later trigger after the impulse already started.
+    """
+    try:
+        return (os.getenv("MID_ZONE_TOUCH_EMIT_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return True
+
+
+def _mid_zone_touch_emit_min_conf() -> int:
+    """Confidence threshold for real first-touch emits.
+
+    Defaults to the origin-fastpath threshold (usually softer than the generic
+    smart-setup threshold) so we can enter near the demand/supply touch instead of
+    after the displacement candle is already extended.
+    """
+    try:
+        base = int(float(os.getenv("MID_SMART_SETUP_EMIT_CONF", "90") or 90))
+    except Exception:
+        base = 90
+    try:
+        origin_default = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF", str(min(base, 86))) or min(base, 86)))
+    except Exception:
+        origin_default = min(base, 86)
+    try:
+        raw = os.getenv("MID_ZONE_TOUCH_EMIT_MIN_CONF")
+        if raw is None or str(raw).strip() == "":
+            return max(0, int(origin_default))
+        return max(0, int(float(raw)))
+    except Exception:
+        return max(0, int(origin_default))
+
+
+def _mid_zone_touch_emit_context_ok(ta: dict | None, it: dict | None = None, *, now_ts: float | None = None) -> bool:
+    """Whether a first zone touch is contextually strong enough for a live emit.
+
+    Strong context examples:
+      - very fresh BO/RT pending
+      - order-block retest at the touch
+      - liquidity sweep in the direction of the idea
+    """
+    t = ta if isinstance(ta, dict) else {}
+    rec = it if isinstance(it, dict) else {}
+    try:
+        if _mid_pending_is_fresh_bo_rt(rec, now_ts=now_ts):
+            return True
+    except Exception:
+        pass
+    try:
+        if bool(t.get("ob_retest") or rec.get("ob_retest")):
+            return True
+    except Exception:
+        pass
+    try:
+        if bool(t.get("sweep_long") or t.get("sweep_short") or rec.get("sweep_long") or rec.get("sweep_short")):
+            return True
+    except Exception:
+        pass
+    try:
+        bo = str(t.get("bo_rt") or t.get("breakout_retest") or rec.get("bo_rt") or rec.get("breakout_retest") or "").strip().upper()
+        if bo.startswith("BO↑ + RETEST") or bo.startswith("BO↓ + RETEST") or bo.startswith("BO↑+RT") or bo.startswith("BO↓+RT"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _mid_pending_is_fresh_bo_rt(it: dict | None, *, now_ts: float | None = None) -> bool:
     try:
         rec = it if isinstance(it, dict) else {}
@@ -23221,9 +23292,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     try:
                         if _zone_touch_alert_due:
                             try:
-                                _touch_conf_need = int(float(os.getenv("MID_ZONE_TOUCH_ALERT_MIN_CONF", os.getenv("MID_SMART_SETUP_EMIT_CONF", "90")) or 90))
+                                _touch_conf_need = int(_mid_zone_touch_emit_min_conf())
                             except Exception:
-                                _touch_conf_need = 90
+                                try:
+                                    _touch_conf_need = int(float(os.getenv("MID_ZONE_TOUCH_ALERT_MIN_CONF", os.getenv("MID_SMART_SETUP_EMIT_CONF", "90")) or 90))
+                                except Exception:
+                                    _touch_conf_need = 90
                             try:
                                 _touch_conf_now = int(float(it.get("confidence") or 0))
                             except Exception:
@@ -23234,13 +23308,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     _touch_guard = _mid_macd_hist_emit_block_reason(str(direction), _safe_float(ta.get("macd_hist"), None))
                                 except Exception:
                                     _touch_guard = _touch_guard or ""
-                            _touch_strong = bool(_touch_conf_now >= _touch_conf_need) or _mid_pending_is_fresh_bo_rt(it, now_ts=now)
+                            _touch_context_ok = _mid_zone_touch_emit_context_ok(ta, it, now_ts=now)
+                            _touch_strong = bool(_touch_conf_now >= _touch_conf_need) or bool(_touch_context_ok)
                             if _touch_strong and (not _touch_guard):
                                 _touch_entry_ref, _touch_anchor_far, _touch_slip_atr = _mid_pending_entry_ref(it, price=price, ta=ta)
                                 if not _touch_anchor_far:
                                     _touch_entry, _touch_sl, _touch_tp1, _touch_tp2, _touch_rr = _mid_recalc_levels_from_trigger(direction, _touch_entry_ref, ta, it, market)
+                                    _touch_live_emit = bool(_mid_zone_touch_emit_enabled())
                                     _touch_note_base = str(it.get("risk_note") or "").strip()
-                                    _touch_note = (_touch_note_base + (" | " if _touch_note_base else "") + "zone_touch_alert=1 no_autotrade=1 levels_anchor=1").strip()
+                                    _touch_note_suffix = "zone_touch_emit=1 levels_anchor=1" if _touch_live_emit else "zone_touch_alert=1 no_autotrade=1 levels_anchor=1"
+                                    _touch_note = (_touch_note_base + (" | " if _touch_note_base else "") + _touch_note_suffix).strip()
                                     sig_zone = Signal(
                                         signal_id=self.next_signal_id(),
                                         market=market,
@@ -23272,6 +23349,44 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                             if not _profit_ok:
                                                 it["zone_touch_alert_guard_reason"] = f"profit_low:{_profit_pct:.3f}<{_profit_min:.3f}"
                                             else:
+                                                _touch_can_emit = False
+                                                if _touch_live_emit:
+                                                    try:
+                                                        _touch_can_emit = bool(self.can_emit_mid(sym))
+                                                    except Exception:
+                                                        _touch_can_emit = True
+                                                if _touch_live_emit and _touch_can_emit:
+                                                    try:
+                                                        self.mark_emitted_mid(sym, sig_zone.direction, sig_zone.market)
+                                                    except TypeError:
+                                                        try:
+                                                            self.mark_emitted_mid(sym)
+                                                        except Exception:
+                                                            pass
+                                                    except Exception:
+                                                        pass
+                                                    self.last_signal = sig_zone
+                                                    if sig_zone.market == "SPOT":
+                                                        self.last_spot_signal = sig_zone
+                                                    else:
+                                                        self.last_futures_signal = sig_zone
+                                                    await emit_signal_cb(sig_zone)
+                                                    try:
+                                                        _pending_log_trigger(sym, market, direction, "pass", "zone_touch_emit", it, float(price))
+                                                    except Exception:
+                                                        pass
+                                                    try:
+                                                        _mid_metrics_inc("pending_triggered", 1)
+                                                    except Exception:
+                                                        pass
+                                                    try:
+                                                        _mid_stage_add("triggered", 1)
+                                                    except Exception:
+                                                        pass
+                                                    it["zone_touch_emit_sent"] = True
+                                                    it["zone_touch_emit_ts"] = float(now)
+                                                    logger.info("[mid][pending][zone_touch_emit] %s %s %s conf=%s anchor=%.6g px=%.6g slip_atr=%.2f ctx=%s", sym, market, direction, int(_touch_conf_now), float(_touch_entry_ref), float(price), float(_touch_slip_atr), 1 if _touch_context_ok else 0)
+                                                    continue
                                                 await emit_signal_cb(sig_zone)
                                                 it["zone_touch_alert_sent"] = True
                                                 it["zone_touch_alert_ts"] = float(now)
