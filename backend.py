@@ -10114,7 +10114,7 @@ def _mid_smart_setup_origin_fastpath(*,
     except Exception:
         _allow_zero_body_breakout = True
     try:
-        _allow_zero_body_age0_live = str(os.getenv("MID_SMART_SETUP_ORIGIN_ALLOW_ZERO_BODY_AGE0_LIVE", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        _allow_zero_body_age0_live = str(os.getenv("MID_SMART_SETUP_ORIGIN_ALLOW_ZERO_BODY_AGE0_LIVE", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
     except Exception:
         _allow_zero_body_age0_live = True
     try:
@@ -10338,6 +10338,9 @@ def _mid_instant_emit_gate(*,
                            smart_setup_trap_ok: bool = True,
                            smart_setup_trap_reason: str = "",
                            smart_setup_trap_meta: dict | None = None,
+                           zone_src: str | None = None,
+                           origin_body_atr: float | None = None,
+                           origin_body_soft_bypass: bool = False,
                            macd_hist: float | None = None) -> tuple[bool, str, dict]:
     """Strict VIP gate for smart_setup_emit / pending instant emit.
 
@@ -10371,6 +10374,12 @@ def _mid_instant_emit_gate(*,
     origin_bypass_trap = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_BYPASS_TRAP", "0"))
     origin_relax_regime = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_RELAX_REGIME", "1"))
     zone_first_soft_gate = bool(zone_valid and in_zone_now and _env_on("MID_ZONE_FIRST_SOFTEN_INSTANT_GATE", "1"))
+    zone_first_ignore_late = bool(zone_first_soft_gate and _env_on("MID_ZONE_FIRST_IGNORE_LATE_ENTRY_IN_ZONE", "1"))
+    try:
+        zone_src_s = str(zone_src or "").strip().lower()
+    except Exception:
+        zone_src_s = ""
+    zone_first_fallback_guard = bool(zone_first_soft_gate and zone_src_s.startswith("fallback") and _env_on("MID_ZONE_FIRST_BLOCK_FALLBACK_WEAK", "1"))
 
     def _origin_trap_bypass_allowed(reason: str, trap_meta: dict | None) -> bool:
         if not origin_bypass_trap:
@@ -10442,6 +10451,10 @@ def _mid_instant_emit_gate(*,
         "origin_trap_bypass_allowed": bool(_origin_trap_bypass_ok),
         "origin_relax_regime": bool(origin_relax_regime),
         "zone_first_soft_gate": bool(zone_first_soft_gate),
+        "zone_first_ignore_late": bool(zone_first_ignore_late),
+        "zone_src": str(zone_src_s or "-"),
+        "origin_body_atr": float(origin_body_atr or 0.0),
+        "origin_body_soft_bypass": bool(origin_body_soft_bypass),
         "rr": float(rr_v),
         "rr_need": float(rr_need),
         "regime": reg_u,
@@ -10556,15 +10569,44 @@ def _mid_instant_emit_gate(*,
     if not micro_trap_ok:
         _add_fail(str(micro_trap_reason or "instant_micro_trap"))
     if not late_entry_ok:
-        if (breakout_fresh_ok and breakout_bypass_late_entry) or (origin_fast_ok and origin_bypass_late_entry):
-            ignored_checks.append(str(late_entry_reason or "instant_late_entry"))
+        _late_reason_now = str(late_entry_reason or "instant_late_entry")
+        if zone_first_ignore_late and _late_reason_now.startswith("late_entry_atr="):
+            ignored_checks.append(f"zone_first_late_ignored:{_late_reason_now}")
+        elif (breakout_fresh_ok and breakout_bypass_late_entry) or (origin_fast_ok and origin_bypass_late_entry):
+            ignored_checks.append(_late_reason_now)
         else:
-            _add_fail(str(late_entry_reason or "instant_late_entry"))
+            _add_fail(_late_reason_now)
     if not anti_bounce_ok:
         if origin_fast_ok and origin_bypass_anti_bounce:
             ignored_checks.append(str(anti_bounce_reason or "instant_anti_bounce"))
         else:
             _add_fail(str(anti_bounce_reason or "instant_anti_bounce"))
+
+    if zone_first_fallback_guard:
+        fallback_fail = []
+        try:
+            fallback_min_vol = float(os.getenv("MID_ZONE_FIRST_FALLBACK_MIN_VOL_X", "0.20") or 0.20)
+        except Exception:
+            fallback_min_vol = 0.20
+        _fallback_vol_need = max(float(min_vol), float(fallback_min_vol))
+        if ("vol_low" in flags) or (vol_v < float(_fallback_vol_need)):
+            fallback_fail.append(f"vol={vol_v:.2f}<{_fallback_vol_need:.2f}")
+        if _env_on("MID_ZONE_FIRST_BLOCK_FALLBACK_RRLOW", "1") and ("rr_low" in flags):
+            fallback_fail.append("rr_low")
+        if _env_on("MID_ZONE_FIRST_BLOCK_FALLBACK_SCORELOW", "0") and ("score_low" in flags):
+            fallback_fail.append("score_low")
+        try:
+            _zero_body_max_vol = float(os.getenv("MID_ZONE_FIRST_FALLBACK_ZERO_BODY_MAX_VOL_X", "0.30") or 0.30)
+        except Exception:
+            _zero_body_max_vol = 0.30
+        try:
+            zero_body_guard = _env_on("MID_ZONE_FIRST_BLOCK_FALLBACK_ZERO_BODY", "1") and bool(origin_body_soft_bypass) and float(origin_body_atr or 0.0) <= 0.0 and vol_v < float(_zero_body_max_vol)
+        except Exception:
+            zero_body_guard = False
+        if zero_body_guard:
+            fallback_fail.append("zero_body")
+        if fallback_fail:
+            _add_fail("zone_first_fallback_weak:" + ",".join(fallback_fail))
 
     if (market or "SPOT").upper().strip() == "FUTURES":
         allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_INSTANT_EMIT_ALLOWED_REGIMES_FUTURES", "TREND,TRENDING,EXPANSION")) if str(x).strip()}
@@ -24069,6 +24111,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             late_entry_reason=str(late_reason_now or ""),
                             anti_bounce_ok=bool(anti_ok_now),
                             anti_bounce_reason=str(anti_reason_now or ""),
+                            zone_src=str(it.get("entry_zone_src") or ""),
+                            origin_body_atr=float(it.get("origin_body_at_create") or it.get("last_body") or 0.0),
+                            origin_body_soft_bypass=bool(it.get("origin_body_soft_bypass") or False),
                             macd_hist=_safe_float(ta.get("macd_hist"), None),
                         )
                         try:
@@ -29811,6 +29856,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 smart_setup_trap_ok=bool(_smart_trap_ok),
                                                 smart_setup_trap_reason=str(_smart_trap_reason or ""),
                                                 smart_setup_trap_meta=dict(_smart_trap_meta or {}),
+                                                zone_src=str(_zone_src_l or ""),
+                                                origin_body_atr=float((_origin_fast_meta or {}).get("body_atr") or 0.0),
+                                                origin_body_soft_bypass=bool((_origin_fast_meta or {}).get("body_soft_bypass") or False),
                                                 macd_hist=_safe_float((base_r.get("macd_hist") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("macd_hist")), None),
                                             )
 
@@ -29822,6 +29870,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 rec["smart_origin_fast_ok"] = bool(_origin_fast_ok)
                                                 rec["smart_origin_fast_reason"] = str(_origin_fast_reason or "")
                                                 rec["smart_origin_fast_meta"] = dict(_origin_fast_meta or {})
+                                                rec["origin_body_soft_bypass"] = bool((_origin_fast_meta or {}).get("body_soft_bypass") or False)
                                                 rec["smart_breakout_fast_ok"] = bool(_breakout_fast_ok)
                                                 rec["smart_breakout_fast_reason"] = str(_breakout_fast_reason or "")
                                                 rec["smart_breakout_fast_meta"] = dict(_breakout_fast_meta or {})
