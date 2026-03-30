@@ -9764,6 +9764,19 @@ def _mid_smart_setup_trap_eval(*,
     })
 
     reasons: list[str] = []
+    softened_reasons: list[str] = []
+    try:
+        soften_in_zone = str(os.getenv("MID_SMART_SETUP_TRAP_SOFTEN_IN_ZONE", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        soften_in_zone = True
+    try:
+        zone_vwap_hard_mult = float(os.getenv("MID_SMART_SETUP_TRAP_IN_ZONE_VWAP_HARD_MULT", "2.20") or 2.20)
+    except Exception:
+        zone_vwap_hard_mult = 2.20
+    zone_soft_trap = bool(soften_in_zone and in_zone_now and (not allow_no_zone_breakout))
+    zone_vwap_hard_limit = float(max_vwap_dist) * max(1.0, float(zone_vwap_hard_mult))
+    meta["zone_soft_trap"] = bool(zone_soft_trap)
+    meta["zone_vwap_hard_limit"] = float(zone_vwap_hard_limit)
     try:
         block_bb_extreme = str(os.getenv("MID_SMART_SETUP_TRAP_BLOCK_BB_EXTREME", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
     except Exception:
@@ -9776,14 +9789,22 @@ def _mid_smart_setup_trap_eval(*,
     except Exception:
         block_vwap_stretch = True
     if block_vwap_stretch and vwap_dist_atr > float(max_vwap_dist):
-        reasons.append(f"smart_setup_trap_vwap_ext:{vwap_dist_atr:.2f}>{max_vwap_dist:.2f}")
+        _reason = f"smart_setup_trap_vwap_ext:{vwap_dist_atr:.2f}>{max_vwap_dist:.2f}"
+        if zone_soft_trap and vwap_dist_atr <= float(zone_vwap_hard_limit):
+            softened_reasons.append(_reason)
+        else:
+            reasons.append(_reason)
 
     try:
         block_bb_combo = str(os.getenv("MID_SMART_SETUP_TRAP_BLOCK_BB_COMBO", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
     except Exception:
         block_bb_combo = True
     if block_bb_combo and bb_soft and vwap_dist_atr >= float(bb_combo_vwap_min):
-        reasons.append(f"smart_setup_trap_bb_stretch:{bb or '-'}|vwap={vwap_dist_atr:.2f}")
+        _reason = f"smart_setup_trap_bb_stretch:{bb or '-'}|vwap={vwap_dist_atr:.2f}"
+        if zone_soft_trap and vwap_dist_atr <= float(zone_vwap_hard_limit):
+            softened_reasons.append(_reason)
+        else:
+            reasons.append(_reason)
 
     try:
         block_impulse = str(os.getenv("MID_SMART_SETUP_TRAP_BLOCK_IMPULSE", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
@@ -9792,6 +9813,13 @@ def _mid_smart_setup_trap_eval(*,
     if block_impulse and body_atr >= float(impulse_body_min) and vwap_dist_atr >= float(impulse_vwap_min) and float(vol_ratio) >= float(impulse_vol_min):
         if bb_soft or bb_extreme or bool(breakout_fresh_ok):
             reasons.append(f"smart_setup_trap_impulse:body={body_atr:.2f}|vwap={vwap_dist_atr:.2f}|vol={vol_ratio:.2f}")
+
+    if softened_reasons:
+        meta["softened_reasons"] = list(softened_reasons)
+        try:
+            meta["softened_reasons_text"] = "|".join(str(x) for x in softened_reasons if str(x).strip())
+        except Exception:
+            meta["softened_reasons_text"] = ""
 
     if reasons:
         meta["fail_reasons"] = list(reasons)
@@ -9816,8 +9844,16 @@ def _mid_smart_setup_trap_eval(*,
         return (False, str(reasons[0]), meta)
 
     meta["fail_reasons"] = []
-    meta["primary_reason"] = "pass"
-    meta["all_reasons"] = "pass"
+    if softened_reasons:
+        try:
+            meta["primary_reason"] = str(softened_reasons[0])
+            meta["all_reasons"] = "|".join(list(softened_reasons))
+        except Exception:
+            meta["primary_reason"] = "pass"
+            meta["all_reasons"] = "pass"
+    else:
+        meta["primary_reason"] = "pass"
+        meta["all_reasons"] = "pass"
     return (True, "pass", meta)
 
 
@@ -10334,6 +10370,7 @@ def _mid_instant_emit_gate(*,
     origin_soft_macd = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_SOFT_MACD", "1"))
     origin_bypass_trap = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_BYPASS_TRAP", "0"))
     origin_relax_regime = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_RELAX_REGIME", "1"))
+    zone_first_soft_gate = bool(zone_valid and in_zone_now and _env_on("MID_ZONE_FIRST_SOFTEN_INSTANT_GATE", "1"))
 
     def _origin_trap_bypass_allowed(reason: str, trap_meta: dict | None) -> bool:
         if not origin_bypass_trap:
@@ -10371,6 +10408,11 @@ def _mid_instant_emit_gate(*,
             profit_need = min(float(profit_need), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_PROFIT_PCT", "0") or 0.0))
         except Exception:
             profit_need = 0.0
+    if zone_first_soft_gate:
+        try:
+            profit_need = min(float(profit_need), float(os.getenv("MID_ZONE_FIRST_MIN_PROFIT_PCT", "0.25") or 0.25))
+        except Exception:
+            pass
 
     flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
     hard_flags = {"far_zone", "scale_mismatch", "blocked", "structure_mismatch", "regime_range_no_breakout", "block:directional_contradiction"}
@@ -10399,6 +10441,7 @@ def _mid_instant_emit_gate(*,
         "origin_bypass_trap": bool(origin_bypass_trap),
         "origin_trap_bypass_allowed": bool(_origin_trap_bypass_ok),
         "origin_relax_regime": bool(origin_relax_regime),
+        "zone_first_soft_gate": bool(zone_first_soft_gate),
         "rr": float(rr_v),
         "rr_need": float(rr_need),
         "regime": reg_u,
@@ -10482,12 +10525,20 @@ def _mid_instant_emit_gate(*,
     if applied_risk_flags:
         _add_fail(f"instant_risk_flags:{','.join(applied_risk_flags)}")
     if not smart_setup_trap_ok:
-        if _origin_trap_bypass_ok:
-            ignored_checks.append(f"origin_trap_ignored:{str(smart_setup_trap_reason or 'smart_setup_trap')}")
-        else:
-            _add_fail(str(smart_setup_trap_reason or "smart_setup_trap"))
+        _trap_reason_now = str(smart_setup_trap_reason or "smart_setup_trap")
+        _softened_zone_trap = False
+        if zone_first_soft_gate and ("smart_setup_trap_vwap_ext" in _trap_reason_now or "smart_setup_trap_bb_stretch" in _trap_reason_now):
+            try:
+                ignored_checks.append(f"zone_first_trap_soft:{_trap_reason_now}")
+                _softened_zone_trap = True
+            except Exception:
+                _softened_zone_trap = False
+        if (not _softened_zone_trap) and _origin_trap_bypass_ok:
+            ignored_checks.append(f"origin_trap_ignored:{_trap_reason_now}")
+        elif not _softened_zone_trap:
+            _add_fail(_trap_reason_now)
     if profit_v < float(profit_need):
-        if origin_ignore_profit:
+        if origin_ignore_profit or zone_first_soft_gate:
             ignored_checks.append(f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}")
         else:
             _add_fail(f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}")
