@@ -1679,6 +1679,95 @@ def _mid_zone_touch_emit_context_ok(ta: dict | None, it: dict | None = None, *, 
     return False
 
 
+def _mid_zone_execution_v2_enabled() -> bool:
+    """Enable the zone-first execution layer.
+
+    When enabled, a strong pending that returns into the prepared zone can emit on a
+    minimal micro-confirmation instead of needing the old full trigger stack.
+    """
+    try:
+        return (os.getenv("MID_ZONE_EXECUTION_V2", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return True
+
+
+def _mid_zone_first_min_confirmations() -> int:
+    """How many simple micro-confirmations are enough inside the zone."""
+    try:
+        return max(1, int(float(os.getenv("MID_ZONE_FIRST_MIN_CONFIRMATIONS", "1") or 1)))
+    except Exception:
+        return 1
+
+
+def _mid_zone_first_micro_passed(checks: dict | None) -> tuple[int, list[str]]:
+    """Count simple micro-confirmations for zone-first execution."""
+    try:
+        ch = checks if isinstance(checks, dict) else {}
+        keys = ("reclaim", "bos_5m", "sweep", "displacement")
+        passed = []
+        for key in keys:
+            try:
+                val = str(ch.get(key) or "").strip().lower()
+            except Exception:
+                val = ""
+            if val.startswith("pass"):
+                passed.append(str(key))
+        return (len(passed), passed)
+    except Exception:
+        return (0, [])
+
+
+def _mid_zone_first_ready(ta: dict | None, it: dict | None, checks: dict | None = None, *, now_ts: float | None = None) -> tuple[bool, int, list[str]]:
+    """Return whether a zone-first emit override is allowed.
+
+    This is intentionally stricter than a generic smart-trigger pass:
+    - the setup must already be in a strong zone context
+    - only real vetoes may still block it
+    - a small micro-confirmation basket (reclaim / 5m BOS / sweep / displacement)
+      is enough; the old all-or-nothing trigger stack is not required
+    """
+    try:
+        if not _mid_zone_execution_v2_enabled():
+            return (False, 0, [])
+        t = ta if isinstance(ta, dict) else {}
+        rec = it if isinstance(it, dict) else {}
+        ch = checks if isinstance(checks, dict) else {}
+        try:
+            if str(ch.get("zone") or "").strip().lower().startswith("fail"):
+                return (False, 0, [])
+        except Exception:
+            pass
+        if not _mid_zone_touch_emit_context_ok(t, rec, now_ts=now_ts):
+            return (False, 0, [])
+        guard_reason = _mid_zone_touch_guard_reason(t, rec)
+        if guard_reason:
+            return (False, 0, [])
+        conf = 0
+        for cand in (t.get("confidence"), rec.get("confidence"), rec.get("min_confidence"), t.get("score")):
+            try:
+                conf = max(conf, int(float(cand or 0)))
+            except Exception:
+                pass
+        if conf < _mid_zone_touch_emit_min_conf():
+            return (False, 0, [])
+        try:
+            price_now = float(t.get("entry") or t.get("close") or 0.0)
+        except Exception:
+            price_now = 0.0
+        try:
+            _anchor_ref, anchor_too_far, _anchor_slip_atr = _mid_pending_entry_ref(rec, price=price_now, ta=t)
+        except Exception:
+            anchor_too_far = False
+        if anchor_too_far:
+            return (False, 0, [])
+        micro_n, labels = _mid_zone_first_micro_passed(ch)
+        if micro_n < _mid_zone_first_min_confirmations():
+            return (False, micro_n, labels)
+        return (True, micro_n, labels)
+    except Exception:
+        return (False, 0, [])
+
+
 def _mid_pending_is_fresh_bo_rt(it: dict | None, *, now_ts: float | None = None) -> bool:
     try:
         rec = it if isinstance(it, dict) else {}
@@ -13580,16 +13669,20 @@ def _mid_scan_critical_block_reason(*, side: str, rsi_5m: float | None, macd_his
             rsi_long_min = MID_ULTRA_RSI_LONG_MIN if MID_ULTRA_SAFE else MID_RSI_LONG_MIN
             rsi_short_min = MID_ULTRA_RSI_SHORT_MIN if MID_ULTRA_SAFE else MID_RSI_SHORT_MIN
             rsi_short_max = MID_ULTRA_RSI_SHORT_MAX if MID_ULTRA_SAFE else MID_RSI_SHORT_MAX
+            try:
+                scan_rsi_buf = float(os.getenv("MID_SCAN_HARD_RSI_BUFFER", os.getenv("MID_ZONE_TOUCH_HARD_RSI_BUFFER", "6")) or 6)
+            except Exception:
+                scan_rsi_buf = 6.0
             if side_u == "LONG":
-                if rsi >= rsi_long_max:
-                    return f"rsi_long={rsi:.1f} >= {rsi_long_max:g}"
-                if rsi < rsi_long_min:
-                    return f"rsi_long={rsi:.1f} < {rsi_long_min:g}"
+                if rsi >= (float(rsi_long_max) + float(scan_rsi_buf)):
+                    return f"rsi_long_extreme={rsi:.1f} >= {(float(rsi_long_max) + float(scan_rsi_buf)):g}"
+                if rsi < (float(rsi_long_min) - float(scan_rsi_buf)):
+                    return f"rsi_long_extreme={rsi:.1f} < {(float(rsi_long_min) - float(scan_rsi_buf)):g}"
             else:
-                if rsi <= rsi_short_min:
-                    return f"rsi_short={rsi:.1f} <= {rsi_short_min:g}"
-                if rsi >= rsi_short_max:
-                    return f"rsi_short={rsi:.1f} >= {rsi_short_max:g}"
+                if rsi <= (float(rsi_short_min) - float(scan_rsi_buf)):
+                    return f"rsi_short_extreme={rsi:.1f} <= {(float(rsi_short_min) - float(scan_rsi_buf)):g}"
+                if rsi >= (float(rsi_short_max) + float(scan_rsi_buf)):
+                    return f"rsi_short_extreme={rsi:.1f} >= {(float(rsi_short_max) + float(scan_rsi_buf)):g}"
 
         # MACD hist is deferred to TRIGGER / EMIT only.
         # Do not hard-block on SCAN, even if MID_SCAN_HARDBLOCK_MACD=1 in stale env.
@@ -24823,42 +24916,67 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             if vwap_val > 0 and atr30 and atr30 > 0:
                                 if mid_require_vwap_bias:
                                     if direction_u == "SHORT" and not (entry_check < vwap_val):
-                                        keep_it, outc = _pending_apply_fail(it, "vwap_bias", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "vwap_bias", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
+                                        hb_log_reason, hb_apply_reason = _mid_trigger_selected_hardblock_reason("wrong_vwap_side", it)
+                                        if hb_apply_reason:
+                                            keep_it, outc = _pending_apply_fail(it, hb_apply_reason, now)
+                                            _pending_log_trigger(sym, market, direction, outc, str(hb_log_reason or "vwap_bias"), it, float(price))
+                                            if keep_it:
+                                                keep.append(it)
+                                                any_wait = True
+                                            else:
+                                                try:
+                                                    removed_n += 1
+                                                except Exception:
+                                                    pass
+                                            continue
                                         else:
                                             try:
-                                                removed_n += 1
+                                                it["_trig_vwap_soft_reason"] = "wrong_vwap_side"
                                             except Exception:
                                                 pass
-                                        continue
                                     if direction_u == "LONG" and not (entry_check > vwap_val):
-                                        keep_it, outc = _pending_apply_fail(it, "vwap_bias", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "vwap_bias", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
+                                        hb_log_reason, hb_apply_reason = _mid_trigger_selected_hardblock_reason("wrong_vwap_side", it)
+                                        if hb_apply_reason:
+                                            keep_it, outc = _pending_apply_fail(it, hb_apply_reason, now)
+                                            _pending_log_trigger(sym, market, direction, outc, str(hb_log_reason or "vwap_bias"), it, float(price))
+                                            if keep_it:
+                                                keep.append(it)
+                                                any_wait = True
+                                            else:
+                                                try:
+                                                    removed_n += 1
+                                                except Exception:
+                                                    pass
+                                            continue
                                         else:
                                             try:
-                                                removed_n += 1
+                                                it["_trig_vwap_soft_reason"] = "wrong_vwap_side"
                                             except Exception:
                                                 pass
-                                        continue
                                 if mid_min_vwap_dist_atr > 0:
-                                    if abs(entry_check - vwap_val) < (atr30 * mid_min_vwap_dist_atr):
-                                        keep_it, outc = _pending_apply_fail(it, "vwap_dist", now)
-                                        _pending_log_trigger(sym, market, direction, outc, "vwap_dist", it, float(price))
-                                        if keep_it:
-                                            keep.append(it)
-                                            any_wait = True
+                                    vwap_dist_atr_now = abs(entry_check - vwap_val) / max(float(atr30), 1e-9)
+                                    if vwap_dist_atr_now < float(mid_min_vwap_dist_atr):
+                                        hb_log_reason, hb_apply_reason = _mid_trigger_selected_hardblock_reason(
+                                            f"vwap_dist_atr={float(vwap_dist_atr_now):.2f} > {float(mid_min_vwap_dist_atr):.2f}",
+                                            it,
+                                        )
+                                        if hb_apply_reason:
+                                            keep_it, outc = _pending_apply_fail(it, hb_apply_reason, now)
+                                            _pending_log_trigger(sym, market, direction, outc, str(hb_log_reason or "vwap_dist"), it, float(price))
+                                            if keep_it:
+                                                keep.append(it)
+                                                any_wait = True
+                                            else:
+                                                try:
+                                                    removed_n += 1
+                                                except Exception:
+                                                    pass
+                                            continue
                                         else:
                                             try:
-                                                removed_n += 1
+                                                it["_trig_vwap_soft_reason"] = f"vwap_dist_atr={float(vwap_dist_atr_now):.2f} < {float(mid_min_vwap_dist_atr):.2f}"
                                             except Exception:
                                                 pass
-                                        continue
                         except Exception:
                             pass
                         try:
@@ -24973,6 +25091,26 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             elif _sv.startswith("fail"):
                                 required_failed.append(_k)
                         try:
+                            zone_first_ready, zone_first_micro_n, zone_first_micro_labels = _mid_zone_first_ready(ta, it, checks, now_ts=now)
+                        except Exception:
+                            zone_first_ready, zone_first_micro_n, zone_first_micro_labels = (False, 0, [])
+                        if zone_first_ready:
+                            critical_fail_keys = {"direction", "trap", "structure_30m", "structure_1h", "bos_block", "macd_hist"}
+                            required_failed = [k for k in required_failed if k in critical_fail_keys]
+                            if "zone_first" not in enabled_required:
+                                enabled_required.append("zone_first")
+                            if "zone_first" not in required_passed:
+                                required_passed.append("zone_first")
+                            try:
+                                need_passed = min(max(1, int(need_passed)), int(_mid_zone_first_min_confirmations())) if int(need_passed) > 0 else int(_mid_zone_first_min_confirmations())
+                            except Exception:
+                                need_passed = _mid_zone_first_min_confirmations()
+                            try:
+                                it["_trig_zone_first"] = True
+                                it["_trig_zone_first_micro"] = ",".join(zone_first_micro_labels)
+                            except Exception:
+                                pass
+                        try:
                             it["_trig_enabled_count"] = int(len(enabled_required))
                             it["_trig_passed_count"] = int(len(required_passed))
                             it["_trig_need_passed"] = int(need_passed)
@@ -24980,8 +25118,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             pass
 
                         if smart_trigger:
+                            if zone_first_ready:
+                                try:
+                                    it.pop("_trig_fail_reasons", None)
+                                    it["_trig_primary_reason"] = "zone_first_primary"
+                                    it["_trig_term_reason"] = "zone_first_primary"
+                                except Exception:
+                                    pass
                             # Quality-first: even in smart mode we do not allow failed required checks.
-                            if strict_required and required_failed:
+                            if (not zone_first_ready) and strict_required and required_failed:
                                 first_key = str(required_failed[0])
                                 log_reason_base, apply_reason = _reason_map.get(first_key, (first_key, first_key))
                                 log_reason = _resolve_trigger_log_reason(first_key, log_reason_base)
@@ -25004,7 +25149,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 continue
                             # Smart mode counts only enabled trigger filters.
                             # If the user disabled all trigger filters, do not block the signal.
-                            if len(enabled_required) <= 0:
+                            if zone_first_ready:
+                                try:
+                                    it.pop("_trig_fail_reasons", None)
+                                    it["_trig_primary_reason"] = "zone_first_primary"
+                                    it["_trig_term_reason"] = "zone_first_primary"
+                                except Exception:
+                                    pass
+                            elif len(enabled_required) <= 0:
                                 try:
                                     it.pop("_trig_fail_reasons", None)
                                     it["_trig_primary_reason"] = "smart_threshold_pass"
@@ -25040,7 +25192,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     except Exception:
                                         pass
                         else:
-                            if required_failed:
+                            if zone_first_ready:
+                                try:
+                                    it.pop("_trig_fail_reasons", None)
+                                    it["_trig_primary_reason"] = "zone_first_primary"
+                                    it["_trig_term_reason"] = "zone_first_primary"
+                                except Exception:
+                                    pass
+                            elif required_failed:
                                 first_key = str(required_failed[0])
                                 log_reason_base, apply_reason = _reason_map.get(first_key, (first_key, first_key))
                                 log_reason = _resolve_trigger_log_reason(first_key, log_reason_base)
