@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-03-29_smart_setup_early_entry_patch_v1"
+MID_BUILD_TAG = "MID_BUILD_2026-03-30_smart_setup_zone_fix_v4_2"
 
 import asyncio
 import json
@@ -2086,6 +2086,134 @@ def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str
     except Exception:
         return ""
 
+
+
+def _mid_bo_label_is_short(label: str | None) -> bool:
+    try:
+        s = str(label or "").strip().upper().replace(" ", "")
+        return bool(s) and s.startswith("BO↓")
+    except Exception:
+        return False
+
+
+def _mid_futures_short_exec_zone_ok(zone_src: str | None) -> bool:
+    try:
+        zs = str(zone_src or "").strip().lower()
+        return zs.startswith("ob30") or zs.startswith("fvg30:bear")
+    except Exception:
+        return False
+
+
+def _mid_body_atr(body_abs: float | None, atr_abs: float | None) -> float:
+    try:
+        b = abs(float(body_abs or 0.0))
+        a = abs(float(atr_abs or 0.0))
+        if a <= 0:
+            return 0.0
+        return b / a
+    except Exception:
+        return 0.0
+
+
+def _mid_futures_short_anti_bounce_relief_ok(*,
+                                              market: str,
+                                              direction: str,
+                                              in_zone_now: bool,
+                                              zone_src: str | None,
+                                              bo_rt_label: str | None,
+                                              vol_x: float | None) -> bool:
+    """Allow borderline anti-bounce on strong futures SHORT retests inside a real sell zone."""
+    try:
+        if (market or "").upper().strip() != "FUTURES":
+            return False
+        if (direction or "").upper().strip() != "SHORT":
+            return False
+        if not bool(in_zone_now):
+            return False
+        if not _mid_futures_short_exec_zone_ok(zone_src):
+            return False
+        if not _mid_bo_label_is_short(bo_rt_label):
+            return False
+        try:
+            min_vol = float(os.getenv("MID_V42_FUT_SHORT_ANTI_BOUNCE_RELIEF_MIN_VOL_X", "0.25") or 0.25)
+        except Exception:
+            min_vol = 0.25
+        return float(vol_x or 0.0) >= float(min_vol)
+    except Exception:
+        return False
+
+
+def _mid_futures_short_strong_confirm_ok(*,
+                                         bo_rt_label: str | None,
+                                         breakout_fresh_ok: bool,
+                                         micro_trap_ok: bool,
+                                         macd_hist: float | None,
+                                         body_atr: float | None) -> bool:
+    """Return True only for genuinely strong bearish confirmation."""
+    try:
+        bo_down = _mid_bo_label_is_short(bo_rt_label)
+        try:
+            body_need = float(os.getenv("MID_V42_FUT_SHORT_STRONG_BODY_ATR", "0.04") or 0.04)
+        except Exception:
+            body_need = 0.04
+        body_ok = float(body_atr or 0.0) >= float(body_need)
+        disp = _mid_macd_hist_display4(macd_hist)
+        macd_bear = bool(disp) and disp.startswith("-") and disp != "-0.0000"
+        if bo_down and breakout_fresh_ok:
+            return True
+        if bo_down and macd_bear:
+            return True
+        if micro_trap_ok and macd_bear:
+            return True
+        if bo_down and body_ok and micro_trap_ok:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _mid_futures_short_weak_emit_reason(*,
+                                        market: str,
+                                        direction: str,
+                                        risk_flags=None,
+                                        vol_x: float | None,
+                                        body_atr: float | None,
+                                        bo_rt_label: str | None,
+                                        breakout_fresh_ok: bool,
+                                        micro_trap_ok: bool,
+                                        macd_hist: float | None) -> str:
+    """Block weak futures SHORT emits with zero-body + low-volume and no real bearish confirmation."""
+    try:
+        if (market or "").upper().strip() != "FUTURES":
+            return ""
+        if (direction or "").upper().strip() != "SHORT":
+            return ""
+        flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
+        try:
+            weak_min_vol = float(os.getenv("MID_V42_FUT_SHORT_WEAK_MIN_VOL_X", "0.20") or 0.20)
+        except Exception:
+            weak_min_vol = 0.20
+        try:
+            zero_body_max = float(os.getenv("MID_V42_FUT_SHORT_ZERO_BODY_ATR_MAX", "0.02") or 0.02)
+        except Exception:
+            zero_body_max = 0.02
+        vol_v = float(vol_x or 0.0)
+        body_v = float(body_atr or 0.0)
+        vol_low_now = ("vol_low" in flags) or (vol_v < float(weak_min_vol))
+        zero_body_now = body_v <= float(zero_body_max)
+        if not (vol_low_now and zero_body_now):
+            return ""
+        if _mid_futures_short_strong_confirm_ok(
+            bo_rt_label=bo_rt_label,
+            breakout_fresh_ok=bool(breakout_fresh_ok),
+            micro_trap_ok=bool(micro_trap_ok),
+            macd_hist=macd_hist,
+            body_atr=body_v,
+        ):
+            return ""
+        return f"fut_short_weak_emit:vol={vol_v:.2f}|body_atr={body_v:.2f}|confirm=0"
+    except Exception:
+        return ""
 
 def _mid_trigger_selected_hardblock_reason(reason: str, it: dict | None = None) -> tuple[str | None, str | None]:
     """Selectively enforce hard-blocks that must be respected at actual entry / emit.
@@ -10339,7 +10467,9 @@ def _mid_instant_emit_gate(*,
                            smart_setup_trap_reason: str = "",
                            smart_setup_trap_meta: dict | None = None,
                            zone_src: str | None = None,
+                           bo_rt_label: str | None = None,
                            origin_body_atr: float | None = None,
+                           current_body_atr: float | None = None,
                            origin_body_soft_bypass: bool = False,
                            macd_hist: float | None = None) -> tuple[bool, str, dict]:
     """Strict VIP gate for smart_setup_emit / pending instant emit.
@@ -10381,6 +10511,31 @@ def _mid_instant_emit_gate(*,
         zone_src_s = ""
     zone_first_fallback_guard = bool(zone_first_soft_gate and zone_src_s.startswith("fallback") and _env_on("MID_ZONE_FIRST_BLOCK_FALLBACK_WEAK", "1"))
     zone_first_spot_guard = bool(zone_first_soft_gate and (market or "SPOT").upper().strip() == "SPOT" and _env_on("MID_ZONE_FIRST_BLOCK_SPOT_WEAK", "1"))
+    try:
+        bo_rt_s = str(bo_rt_label or "").strip()
+    except Exception:
+        bo_rt_s = ""
+    body_atr_now = max(float(current_body_atr or 0.0), float(origin_body_atr or 0.0))
+    fut_short_anti_bounce_relief = _mid_futures_short_anti_bounce_relief_ok(
+        market=market,
+        direction=direction,
+        in_zone_now=bool(in_zone_now),
+        zone_src=zone_src_s,
+        bo_rt_label=bo_rt_s,
+        vol_x=vol_x,
+    )
+    weak_short_emit_reason = _mid_futures_short_weak_emit_reason(
+        market=market,
+        direction=direction,
+        risk_flags=risk_flags,
+        vol_x=vol_x,
+        body_atr=body_atr_now,
+        bo_rt_label=bo_rt_s,
+        breakout_fresh_ok=bool(breakout_fresh_ok),
+        micro_trap_ok=bool(micro_trap_ok),
+        macd_hist=macd_hist,
+    )
+
 
     def _origin_trap_bypass_allowed(reason: str, trap_meta: dict | None) -> bool:
         if not origin_bypass_trap:
@@ -10454,7 +10609,10 @@ def _mid_instant_emit_gate(*,
         "zone_first_soft_gate": bool(zone_first_soft_gate),
         "zone_first_ignore_late": bool(zone_first_ignore_late),
         "zone_src": str(zone_src_s or "-"),
+        "bo_rt_label": str(bo_rt_s or "-"),
         "origin_body_atr": float(origin_body_atr or 0.0),
+        "current_body_atr": float(body_atr_now or 0.0),
+        "fut_short_anti_bounce_relief": bool(fut_short_anti_bounce_relief),
         "origin_body_soft_bypass": bool(origin_body_soft_bypass),
         "rr": float(rr_v),
         "rr_need": float(rr_need),
@@ -10498,6 +10656,9 @@ def _mid_instant_emit_gate(*,
             s = "instant_gate_unknown"
         if s and s not in fail_reasons:
             fail_reasons.append(s)
+
+    if weak_short_emit_reason:
+        _add_fail(str(weak_short_emit_reason))
 
     if conf_v < float(conf_need):
         _add_fail(f"instant_conf_low:{int(round(conf_v))}<{conf_need}")
@@ -10601,7 +10762,9 @@ def _mid_instant_emit_gate(*,
         else:
             _add_fail(_late_reason_now)
     if not anti_bounce_ok:
-        if origin_fast_ok and origin_bypass_anti_bounce:
+        if fut_short_anti_bounce_relief:
+            ignored_checks.append(f"fut_short_anti_bounce_relief:{str(anti_bounce_reason or 'instant_anti_bounce')}")
+        elif origin_fast_ok and origin_bypass_anti_bounce:
             ignored_checks.append(str(anti_bounce_reason or "instant_anti_bounce"))
         else:
             _add_fail(str(anti_bounce_reason or "instant_anti_bounce"))
@@ -23938,7 +24101,29 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 ta["block_reason"] = str(_dir_contra_now)
                             except Exception:
                                 pass
-                        hb_log_reason, hb_apply_reason = _mid_trigger_selected_hardblock_reason(hb_raw_reason, it)
+                        _anti_relief_ok = False
+                        try:
+                            if hb_raw_reason.startswith("anti_bounce_short"):
+                                _anti_relief_ok = _mid_futures_short_anti_bounce_relief_ok(
+                                    market=market,
+                                    direction=direction,
+                                    in_zone_now=bool(_in_zone_for_trigger or _entered_zone_for_trigger),
+                                    zone_src=str(it.get("entry_zone_src") or ""),
+                                    bo_rt_label=str(it.get("bo_rt") or it.get("breakout_retest") or ""),
+                                    vol_x=float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0),
+                                )
+                        except Exception:
+                            _anti_relief_ok = False
+                        if _anti_relief_ok:
+                            hb_log_reason, hb_apply_reason = (None, None)
+                            try:
+                                if isinstance(it.get("_trig_checks"), dict):
+                                    it["_trig_checks"]["anti_bounce"] = "skip"
+                                it["_trig_anti_bounce_relief"] = "fut_short_zone_relief"
+                            except Exception:
+                                pass
+                        else:
+                            hb_log_reason, hb_apply_reason = _mid_trigger_selected_hardblock_reason(hb_raw_reason, it)
                         try:
                             _late_relief_ok, _late_relief_reason, _late_relief_meta = _mid_pending_trigger_breakout_late_relief(
                                 it,
@@ -24154,7 +24339,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             anti_bounce_ok=bool(anti_ok_now),
                             anti_bounce_reason=str(anti_reason_now or ""),
                             zone_src=str(it.get("entry_zone_src") or ""),
+                            bo_rt_label=str(it.get("bo_rt") or it.get("breakout_retest") or ""),
                             origin_body_atr=float(it.get("origin_body_at_create") or it.get("last_body") or 0.0),
+                            current_body_atr=_mid_body_atr(float(ta.get("last_body") or 0.0), float(ta.get("atr30") or ta.get("atr_abs") or 0.0)),
                             origin_body_soft_bypass=bool(it.get("origin_body_soft_bypass") or False),
                             macd_hist=_safe_float(ta.get("macd_hist"), None),
                         )
@@ -25451,6 +25638,30 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "")
                     if not conf_names:
                         conf_names = str(src_ex)
+
+                    _weak_short_emit_reason = _mid_futures_short_weak_emit_reason(
+                        market=market,
+                        direction=direction,
+                        risk_flags=it.get("risk_flags"),
+                        vol_x=float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0),
+                        body_atr=_mid_body_atr(float(ta.get("last_body") or 0.0), float(ta.get("atr30") or ta.get("atr_abs") or 0.0)),
+                        bo_rt_label=str(it.get("bo_rt") or it.get("breakout_retest") or ""),
+                        breakout_fresh_ok=bool(it.get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(it, now_ts=now)),
+                        micro_trap_ok=bool(ta.get("trap_ok", False)),
+                        macd_hist=_safe_float(ta.get("macd_hist"), None),
+                    )
+                    if _weak_short_emit_reason:
+                        keep_it, outc = _pending_apply_fail(it, "vol_low", now)
+                        _pending_log_trigger(sym, market, direction, outc, _weak_short_emit_reason, it, float(price))
+                        if keep_it:
+                            keep.append(it)
+                            any_wait = True
+                        else:
+                            try:
+                                removed_n += 1
+                            except Exception:
+                                pass
+                        continue
 
                     try:
                         it["confirmed_entry_sent"] = True
@@ -29899,7 +30110,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 smart_setup_trap_reason=str(_smart_trap_reason or ""),
                                                 smart_setup_trap_meta=dict(_smart_trap_meta or {}),
                                                 zone_src=str(_zone_src_l or ""),
+                                                bo_rt_label=str(_bo_rt_now or ""),
                                                 origin_body_atr=float((_origin_fast_meta or {}).get("body_atr") or 0.0),
+                                                current_body_atr=_mid_body_atr(float((base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("last_body") or 0.0) or 0.0), float(_atr_now or 0.0)),
                                                 origin_body_soft_bypass=bool((_origin_fast_meta or {}).get("body_soft_bypass") or False),
                                                 macd_hist=_safe_float((base_r.get("macd_hist") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("macd_hist")), None),
                                             )
