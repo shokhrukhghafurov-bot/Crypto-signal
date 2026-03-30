@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-03-30_smart_setup_zone_fix_v4_2"
+MID_BUILD_TAG = "MID_BUILD_2026-03-31_smart_setup_zone_fix_v4_3"
 
 import asyncio
 import json
@@ -2214,6 +2214,162 @@ def _mid_futures_short_weak_emit_reason(*,
         return f"fut_short_weak_emit:vol={vol_v:.2f}|body_atr={body_v:.2f}|confirm=0"
     except Exception:
         return ""
+
+
+def _mid_final_emit_apply_reason(reason: str) -> str:
+    try:
+        r = str(reason or "").strip().lower()
+    except Exception:
+        r = ""
+    if not r:
+        return "blocked"
+    if "directional_contradiction" in r:
+        return "directional_contradiction"
+    if r.startswith("macd_hist=") or "macd_hist" in r:
+        return "macd_hist"
+    if r.startswith("anti_bounce_short") or r.startswith("anti_bounce_long"):
+        return "anti_bounce"
+    if r.startswith("fut_short_weak_emit"):
+        return "vol_low"
+    if r.startswith("instant_regime_block"):
+        return "regime_block"
+    return "blocked"
+
+
+def _mid_final_emit_gate_reason(*,
+                                sig=None,
+                                ta: dict | None = None,
+                                it: dict | None = None,
+                                risk_flags=None,
+                                vol_x: float | None = None,
+                                body_atr: float | None = None,
+                                bo_rt_label: str | None = None,
+                                breakout_fresh_ok: bool = False,
+                                micro_trap_ok: bool | None = None,
+                                macd_hist: float | None = None,
+                                anti_bounce_reason: str | None = None,
+                                gate_meta: dict | None = None,
+                                zone_src: str | None = None,
+                                in_zone_now: bool = True) -> str:
+    """Unified final veto before any real emit of weak FUTURES SHORT.
+
+    This closes the remaining bypasses where a signal can pass scan/pending gates
+    but still be obviously wrong-way at the final moment of emission.
+    """
+    try:
+        enabled = str(os.getenv("MID_V43_FINAL_EMIT_VETO", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        enabled = True
+    if not enabled:
+        return ""
+    try:
+        market_u = str((getattr(sig, "market", None) if sig is not None else "") or (ta or {}).get("market") or (it or {}).get("market") or "").upper().strip()
+        direction_u = str((getattr(sig, "direction", None) if sig is not None else "") or (ta or {}).get("direction") or (it or {}).get("direction") or "").upper().strip()
+    except Exception:
+        market_u, direction_u = "", ""
+    if market_u != "FUTURES" or direction_u != "SHORT":
+        return ""
+
+    _dir_reason = _mid_directional_contradiction_reason(ta, it)
+    if _dir_reason:
+        return str(_dir_reason)
+
+    try:
+        macd_v = macd_hist if macd_hist is not None else _safe_float((ta or {}).get("macd_hist"), None)
+        if macd_v is None:
+            macd_v = _safe_float((it or {}).get("macd_hist"), None)
+    except Exception:
+        macd_v = None
+    _macd_reason = _mid_macd_hist_emit_block_reason(direction_u, macd_v)
+    if _macd_reason:
+        return str(_macd_reason)
+
+    try:
+        vol_v = vol_x if vol_x is not None else (ta or {}).get("rel_vol")
+        if vol_v is None:
+            vol_v = (ta or {}).get("vol_x")
+        if vol_v is None:
+            vol_v = (gate_meta or {}).get("vol_x")
+        vol_v = float(vol_v or 0.0)
+    except Exception:
+        vol_v = 0.0
+
+    try:
+        body_v = body_atr if body_atr is not None else _mid_body_atr(float((ta or {}).get("last_body") or 0.0), float((ta or {}).get("atr30") or (ta or {}).get("atr_abs") or 0.0))
+        if not body_v:
+            body_v = float((gate_meta or {}).get("current_body_atr") or (gate_meta or {}).get("origin_body_atr") or 0.0)
+    except Exception:
+        body_v = 0.0
+
+    try:
+        bo_s = str(bo_rt_label or (it or {}).get("bo_rt") or (it or {}).get("breakout_retest") or "").strip()
+    except Exception:
+        bo_s = ""
+
+    try:
+        risk_flags_use = risk_flags if risk_flags is not None else (it or {}).get("risk_flags")
+    except Exception:
+        risk_flags_use = risk_flags
+
+    try:
+        micro_ok = bool(micro_trap_ok if micro_trap_ok is not None else bool((ta or {}).get("trap_ok", False)))
+    except Exception:
+        micro_ok = False
+
+    try:
+        breakout_ok = bool(breakout_fresh_ok or bool((it or {}).get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(it)))
+    except Exception:
+        breakout_ok = bool(breakout_fresh_ok)
+
+    _weak_reason = _mid_futures_short_weak_emit_reason(
+        market=market_u,
+        direction=direction_u,
+        risk_flags=risk_flags_use,
+        vol_x=vol_v,
+        body_atr=body_v,
+        bo_rt_label=bo_s,
+        breakout_fresh_ok=bool(breakout_ok),
+        micro_trap_ok=bool(micro_ok),
+        macd_hist=macd_v,
+    )
+    if _weak_reason:
+        return str(_weak_reason)
+
+    try:
+        anti_reason = str(anti_bounce_reason or "").strip()
+    except Exception:
+        anti_reason = ""
+    if not anti_reason:
+        try:
+            if isinstance(gate_meta, dict):
+                for _x in (gate_meta.get("ignored_checks") or []):
+                    _xs = str(_x or "").strip()
+                    if "anti_bounce_short" in _xs or "anti_bounce_long" in _xs:
+                        anti_reason = _xs.split(":", 1)[-1].strip() if ":" in _xs else _xs
+                        break
+        except Exception:
+            anti_reason = anti_reason or ""
+    if anti_reason:
+        try:
+            relief = bool((gate_meta or {}).get("fut_short_anti_bounce_relief"))
+        except Exception:
+            relief = False
+        if not relief:
+            try:
+                relief = _mid_futures_short_anti_bounce_relief_ok(
+                    market=market_u,
+                    direction=direction_u,
+                    in_zone_now=bool(in_zone_now),
+                    zone_src=str(zone_src or (gate_meta or {}).get("zone_src") or (it or {}).get("entry_zone_src") or ""),
+                    bo_rt_label=bo_s,
+                    vol_x=vol_v,
+                )
+            except Exception:
+                relief = False
+        if not relief:
+            return str(anti_reason)
+    return ""
+    
 
 def _mid_trigger_selected_hardblock_reason(reason: str, it: dict | None = None) -> tuple[str | None, str | None]:
     """Selectively enforce hard-blocks that must be respected at actual entry / emit.
@@ -23581,6 +23737,38 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     _pending_log_trigger(sym, market, direction, "skip", f"profit_lt_{float(_profit_min):.2f}", it, float(price))
                                     continue
 
+                                _final_emit_reason = _mid_final_emit_gate_reason(
+                                    sig=sig,
+                                    ta=ta,
+                                    it=it,
+                                    risk_flags=it.get("risk_flags"),
+                                    vol_x=float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0),
+                                    body_atr=_mid_body_atr(float(ta.get("last_body") or 0.0), float(ta.get("atr30") or ta.get("atr_abs") or 0.0)),
+                                    bo_rt_label=str(it.get("bo_rt") or it.get("breakout_retest") or ""),
+                                    breakout_fresh_ok=bool(it.get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(it, now_ts=now)),
+                                    micro_trap_ok=bool(ta.get("trap_ok", False)),
+                                    macd_hist=_safe_float(ta.get("macd_hist"), None),
+                                    zone_src=str(it.get("entry_zone_src") or ""),
+                                    in_zone_now=bool(_in_zone_for_trigger or _entered_zone_for_trigger),
+                                )
+                                if _final_emit_reason:
+                                    _apply_reason = _mid_final_emit_apply_reason(_final_emit_reason)
+                                    keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                                    _pending_log_trigger(sym, market, direction, outc, _final_emit_reason, it, float(price))
+                                    try:
+                                        logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _final_emit_reason)
+                                    except Exception:
+                                        pass
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
+
                                 try:
                                     self.mark_emitted_mid(sym, sig.direction, sig.market)
                                 except TypeError:
@@ -23930,6 +24118,38 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                                         _touch_can_emit = bool(self.can_emit_mid(sym))
                                                     except Exception:
                                                         _touch_can_emit = True
+                                                _touch_final_reason = _mid_final_emit_gate_reason(
+                                                    sig=sig_zone,
+                                                    ta=ta,
+                                                    it=it,
+                                                    risk_flags=it.get("risk_flags"),
+                                                    vol_x=float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0),
+                                                    body_atr=_mid_body_atr(float(ta.get("last_body") or 0.0), float(ta.get("atr30") or ta.get("atr_abs") or 0.0)),
+                                                    bo_rt_label=str(it.get("bo_rt") or it.get("breakout_retest") or ""),
+                                                    breakout_fresh_ok=bool(it.get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(it, now_ts=now)),
+                                                    micro_trap_ok=bool(ta.get("trap_ok", False)),
+                                                    macd_hist=_safe_float(ta.get("macd_hist"), None),
+                                                    zone_src=str(it.get("entry_zone_src") or ""),
+                                                    in_zone_now=bool(_in_zone_for_trigger or _entered_zone_for_trigger),
+                                                )
+                                                if _touch_final_reason:
+                                                    _apply_reason = _mid_final_emit_apply_reason(_touch_final_reason)
+                                                    keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                                                    _pending_log_trigger(sym, market, direction, outc, _touch_final_reason, it, float(price))
+                                                    try:
+                                                        logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _touch_final_reason)
+                                                    except Exception:
+                                                        pass
+                                                    if keep_it:
+                                                        keep.append(it)
+                                                        any_wait = True
+                                                    else:
+                                                        try:
+                                                            removed_n += 1
+                                                        except Exception:
+                                                            pass
+                                                    continue
+
                                                 if _touch_live_emit and _touch_can_emit:
                                                     try:
                                                         self.mark_emitted_mid(sym, sig_zone.direction, sig_zone.market)
@@ -24352,6 +24572,39 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
                         if instant_ok:
+                            _final_emit_reason = _mid_final_emit_gate_reason(
+                                sig=sig_instant,
+                                ta=ta,
+                                it=it,
+                                risk_flags=it.get("risk_flags"),
+                                vol_x=float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0),
+                                body_atr=_mid_body_atr(float(ta.get("last_body") or 0.0), float(ta.get("atr30") or ta.get("atr_abs") or 0.0)),
+                                bo_rt_label=str(it.get("bo_rt") or it.get("breakout_retest") or ""),
+                                breakout_fresh_ok=bool(it.get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(it, now_ts=now)),
+                                micro_trap_ok=bool(ta.get("trap_ok", False)),
+                                macd_hist=_safe_float(ta.get("macd_hist"), None),
+                                anti_bounce_reason=str(anti_reason_now or ""),
+                                gate_meta=instant_meta,
+                                zone_src=str(it.get("entry_zone_src") or ""),
+                                in_zone_now=bool(in_zone_now),
+                            )
+                            if _final_emit_reason:
+                                _apply_reason = _mid_final_emit_apply_reason(_final_emit_reason)
+                                keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                                _pending_log_trigger(sym, market, direction, outc, _final_emit_reason, it, float(price))
+                                try:
+                                    logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _final_emit_reason)
+                                except Exception:
+                                    pass
+                                if keep_it:
+                                    keep.append(it)
+                                    any_wait = True
+                                else:
+                                    try:
+                                        removed_n += 1
+                                    except Exception:
+                                        pass
+                                continue
                             _can_emit_now = True
                             try:
                                 _can_emit_now = bool(self.can_emit_mid(sym))
@@ -25639,9 +25892,10 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     if not conf_names:
                         conf_names = str(src_ex)
 
-                    _weak_short_emit_reason = _mid_futures_short_weak_emit_reason(
-                        market=market,
-                        direction=direction,
+                    _final_emit_reason = _mid_final_emit_gate_reason(
+                        sig=None,
+                        ta=ta,
+                        it=it,
                         risk_flags=it.get("risk_flags"),
                         vol_x=float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0),
                         body_atr=_mid_body_atr(float(ta.get("last_body") or 0.0), float(ta.get("atr30") or ta.get("atr_abs") or 0.0)),
@@ -25649,10 +25903,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         breakout_fresh_ok=bool(it.get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(it, now_ts=now)),
                         micro_trap_ok=bool(ta.get("trap_ok", False)),
                         macd_hist=_safe_float(ta.get("macd_hist"), None),
+                        zone_src=str(it.get("entry_zone_src") or ""),
+                        in_zone_now=bool(it.get("_in_zone") or it.get("_in_zone_tol") or it.get("_entered_zone_now") or False),
                     )
-                    if _weak_short_emit_reason:
-                        keep_it, outc = _pending_apply_fail(it, "vol_low", now)
-                        _pending_log_trigger(sym, market, direction, outc, _weak_short_emit_reason, it, float(price))
+                    if _final_emit_reason:
+                        _apply_reason = _mid_final_emit_apply_reason(_final_emit_reason)
+                        keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                        _pending_log_trigger(sym, market, direction, outc, _final_emit_reason, it, float(price))
+                        try:
+                            logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _final_emit_reason)
+                        except Exception:
+                            pass
                         if keep_it:
                             keep.append(it)
                             any_wait = True
@@ -30117,6 +30378,37 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 macd_hist=_safe_float((base_r.get("macd_hist") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("macd_hist")), None),
                                             )
 
+                                            if _emit_now:
+                                                _final_emit_reason = _mid_final_emit_gate_reason(
+                                                    sig=sig_emit,
+                                                    ta=(base_r if ("base_r" in locals() and isinstance(base_r, dict)) else None),
+                                                    it=rec,
+                                                    risk_flags=risk_flags,
+                                                    vol_x=float(((_emit_meta or {}).get("vol_x") or 0.0)),
+                                                    body_atr=max(
+                                                        float((_emit_meta or {}).get("current_body_atr") or 0.0),
+                                                        float((_emit_meta or {}).get("origin_body_atr") or 0.0),
+                                                    ),
+                                                    bo_rt_label=str(rec.get("bo_rt") or rec.get("breakout_retest") or ""),
+                                                    breakout_fresh_ok=bool(_breakout_fast_ok),
+                                                    micro_trap_ok=bool(_micro_ok_now),
+                                                    macd_hist=_safe_float((base_r.get("macd_hist") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("macd_hist")), None),
+                                                    anti_bounce_reason=str(_anti_reason_now or ""),
+                                                    gate_meta=_emit_meta,
+                                                    zone_src=str(_zone_src_l or ""),
+                                                    in_zone_now=bool(_in_zone_now),
+                                                )
+                                                if _final_emit_reason:
+                                                    _emit_now = False
+                                                    _emit_reason = str(_final_emit_reason)
+                                                    if not isinstance(_emit_meta, dict):
+                                                        _emit_meta = {}
+                                                    _emit_meta["primary_reason"] = str(_final_emit_reason)
+                                                    _emit_meta["all_reasons"] = str(_final_emit_reason)
+                                                    _emit_meta.setdefault("ignored_checks", [])
+                                                    _emit_meta["ignored_checks_text"] = str(_emit_meta.get("ignored_checks_text") or "-")
+                                                    _emit_meta["final_emit_kill"] = str(_final_emit_reason)
+
                                             try:
                                                 rec["smart_setup"] = bool(_strong_now or _origin_fast_ok)
                                                 rec["smart_zone_valid"] = bool(_zone_valid)
@@ -30330,6 +30622,31 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 logger.info("[signal][skip_profit] %s market=%s dir=%s profit=%.3f%% min=%.3f%%", sig.symbol, sig.market, sig.direction, float(_profit_pct), float(_profit_min))
                                 try:
                                     _rej_add(sym, f"profit_lt_{float(_profit_min):.2f}")
+                                except Exception:
+                                    pass
+                                continue
+
+                            _final_emit_reason = _mid_final_emit_gate_reason(
+                                sig=sig,
+                                ta=(base_r if ("base_r" in locals() and isinstance(base_r, dict)) else None),
+                                it=rec if ("rec" in locals() and isinstance(rec, dict)) else None,
+                                risk_flags=(risk_flags if "risk_flags" in locals() else None),
+                                vol_x=float(((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict) and base_r.get("rel_vol") is not None) else ((base_r.get("vol_x") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0))) or 0.0)),
+                                body_atr=_mid_body_atr(float((base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0), float((base_r.get("atr30") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0)),
+                                bo_rt_label=str((rec.get("bo_rt") if ("rec" in locals() and isinstance(rec, dict)) else "") or ""),
+                                breakout_fresh_ok=bool((rec.get("smart_breakout_fast_ok") if ("rec" in locals() and isinstance(rec, dict)) else False) or (("rec" in locals() and isinstance(rec, dict) and _mid_pending_is_fresh_bo_rt(rec)) or False)),
+                                micro_trap_ok=bool((base_r.get("trap_ok") if ("base_r" in locals() and isinstance(base_r, dict)) else False)),
+                                macd_hist=_safe_float((base_r.get("macd_hist") if ("base_r" in locals() and isinstance(base_r, dict)) else None), None),
+                                zone_src=str((rec.get("entry_zone_src") if ("rec" in locals() and isinstance(rec, dict)) else "") or ""),
+                                in_zone_now=True,
+                            )
+                            if _final_emit_reason:
+                                try:
+                                    logger.info("[mid][final_emit_kill] %s market=%s dir=%s reason=%s", sig.symbol, sig.market, sig.direction, _final_emit_reason)
+                                except Exception:
+                                    pass
+                                try:
+                                    _rej_add(sym, _mid_final_emit_apply_reason(_final_emit_reason))
                                 except Exception:
                                     pass
                                 continue
