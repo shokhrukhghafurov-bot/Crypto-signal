@@ -9775,8 +9775,18 @@ def _mid_smart_setup_trap_eval(*,
         zone_vwap_hard_mult = 2.20
     zone_soft_trap = bool(soften_in_zone and in_zone_now and (not allow_no_zone_breakout))
     zone_vwap_hard_limit = float(max_vwap_dist) * max(1.0, float(zone_vwap_hard_mult))
+    try:
+        zone_vwap_soft_mult = float(os.getenv("MID_ZONE_FIRST_SOFT_TRAP_MAX_VWAP_MULT", "1.85") or 1.85)
+    except Exception:
+        zone_vwap_soft_mult = 1.85
+    try:
+        zone_vwap_soft_cap_abs = float(os.getenv("MID_ZONE_FIRST_SOFT_TRAP_MAX_VWAP_ATR_FUTURES" if mkt == "FUTURES" else "MID_ZONE_FIRST_SOFT_TRAP_MAX_VWAP_ATR_SPOT", "2.60" if mkt == "FUTURES" else "2.40") or (2.60 if mkt == "FUTURES" else 2.40))
+    except Exception:
+        zone_vwap_soft_cap_abs = 2.60 if mkt == "FUTURES" else 2.40
+    zone_vwap_soft_limit = min(float(zone_vwap_hard_limit), float(max_vwap_dist) * max(1.0, float(zone_vwap_soft_mult)), float(zone_vwap_soft_cap_abs))
     meta["zone_soft_trap"] = bool(zone_soft_trap)
     meta["zone_vwap_hard_limit"] = float(zone_vwap_hard_limit)
+    meta["zone_vwap_soft_limit"] = float(zone_vwap_soft_limit)
     try:
         block_bb_extreme = str(os.getenv("MID_SMART_SETUP_TRAP_BLOCK_BB_EXTREME", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
     except Exception:
@@ -9790,7 +9800,7 @@ def _mid_smart_setup_trap_eval(*,
         block_vwap_stretch = True
     if block_vwap_stretch and vwap_dist_atr > float(max_vwap_dist):
         _reason = f"smart_setup_trap_vwap_ext:{vwap_dist_atr:.2f}>{max_vwap_dist:.2f}"
-        if zone_soft_trap and vwap_dist_atr <= float(zone_vwap_hard_limit):
+        if zone_soft_trap and vwap_dist_atr <= float(zone_vwap_soft_limit):
             softened_reasons.append(_reason)
         else:
             reasons.append(_reason)
@@ -9801,7 +9811,7 @@ def _mid_smart_setup_trap_eval(*,
         block_bb_combo = True
     if block_bb_combo and bb_soft and vwap_dist_atr >= float(bb_combo_vwap_min):
         _reason = f"smart_setup_trap_bb_stretch:{bb or '-'}|vwap={vwap_dist_atr:.2f}"
-        if zone_soft_trap and vwap_dist_atr <= float(zone_vwap_hard_limit):
+        if zone_soft_trap and vwap_dist_atr <= float(zone_vwap_soft_limit):
             softened_reasons.append(_reason)
         else:
             reasons.append(_reason)
@@ -10537,10 +10547,32 @@ def _mid_instant_emit_gate(*,
 
     if applied_risk_flags:
         _add_fail(f"instant_risk_flags:{','.join(applied_risk_flags)}")
+
+    def _zone_first_trap_soft_allowed(reason_text: str) -> bool:
+        try:
+            if not zone_first_soft_gate:
+                return False
+            rs = str(reason_text or "")
+            if ("smart_setup_trap_vwap_ext" not in rs) and ("smart_setup_trap_bb_stretch" not in rs):
+                return False
+            tmeta = smart_setup_trap_meta if isinstance(smart_setup_trap_meta, dict) else {}
+            trap_v = float(tmeta.get("vwap_dist_atr") or 0.0)
+            trap_soft_limit = float(tmeta.get("zone_vwap_soft_limit") or 0.0)
+            if trap_soft_limit <= 0.0:
+                max_vwap = float(tmeta.get("max_vwap_dist_atr") or 0.0)
+                if max_vwap <= 0.0:
+                    max_vwap = float(os.getenv("MID_SMART_SETUP_TRAP_VWAP_DIST_ATR_MAX_FUT" if (market or "SPOT").upper().strip() == "FUTURES" else "MID_SMART_SETUP_TRAP_VWAP_DIST_ATR_MAX_SPOT", "1.15" if (market or "SPOT").upper().strip() == "FUTURES" else "1.00") or (1.15 if (market or "SPOT").upper().strip() == "FUTURES" else 1.00))
+                soft_mult = float(os.getenv("MID_ZONE_FIRST_SOFT_TRAP_MAX_VWAP_MULT", "1.85") or 1.85)
+                soft_cap_abs = float(os.getenv("MID_ZONE_FIRST_SOFT_TRAP_MAX_VWAP_ATR_FUTURES" if (market or "SPOT").upper().strip() == "FUTURES" else "MID_ZONE_FIRST_SOFT_TRAP_MAX_VWAP_ATR_SPOT", "2.60" if (market or "SPOT").upper().strip() == "FUTURES" else "2.40") or (2.60 if (market or "SPOT").upper().strip() == "FUTURES" else 2.40))
+                trap_soft_limit = min(float(max_vwap) * max(1.0, float(soft_mult)), float(soft_cap_abs))
+            return trap_v > 0.0 and trap_v <= float(trap_soft_limit)
+        except Exception:
+            return False
+
     if not smart_setup_trap_ok:
         _trap_reason_now = str(smart_setup_trap_reason or "smart_setup_trap")
         _softened_zone_trap = False
-        if zone_first_soft_gate and ("smart_setup_trap_vwap_ext" in _trap_reason_now or "smart_setup_trap_bb_stretch" in _trap_reason_now):
+        if _zone_first_trap_soft_allowed(_trap_reason_now):
             try:
                 ignored_checks.append(f"zone_first_trap_soft:{_trap_reason_now}")
                 _softened_zone_trap = True
@@ -10608,7 +10640,28 @@ def _mid_instant_emit_gate(*,
         if fallback_fail:
             _add_fail("zone_first_fallback_weak:" + ",".join(fallback_fail))
 
-    if (market or "SPOT").upper().strip() == "FUTURES":
+    _market_u = (market or "SPOT").upper().strip()
+    _zone_first_in_zone = bool(zone_valid) and bool(in_zone_now)
+    if _zone_first_in_zone and _market_u == "SPOT" and _env_on("MID_ZONE_FIRST_BLOCK_SPOT_WEAK", "1"):
+        spot_fail = []
+        try:
+            spot_min_vol = float(os.getenv("MID_ZONE_FIRST_SPOT_MIN_VOL_X", "0.20") or 0.20)
+        except Exception:
+            spot_min_vol = 0.20
+        _spot_vol_need = max(float(min_vol), float(spot_min_vol))
+        _spot_weak_vol = ("vol_low" in flags) or (vol_v < float(_spot_vol_need))
+        if _spot_weak_vol:
+            spot_fail.append(f"vol={vol_v:.2f}<{_spot_vol_need:.2f}")
+        if _env_on("MID_ZONE_FIRST_BLOCK_SPOT_COMPRESSION_VOLLOW", "1") and reg_u == "COMPRESSION" and _spot_weak_vol:
+            spot_fail.append("compression")
+        if _env_on("MID_ZONE_FIRST_BLOCK_SPOT_RRLOW", "0") and ("rr_low" in flags):
+            spot_fail.append("rr_low")
+        if _env_on("MID_ZONE_FIRST_BLOCK_SPOT_SCORELOW", "0") and ("score_low" in flags):
+            spot_fail.append("score_low")
+        if spot_fail:
+            _add_fail("zone_first_spot_weak:" + ",".join(spot_fail))
+
+    if _market_u == "FUTURES":
         allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_INSTANT_EMIT_ALLOWED_REGIMES_FUTURES", "TREND,TRENDING,EXPANSION")) if str(x).strip()}
         if reg_u not in allowed_regimes:
             if origin_relax_regime and reg_u in {"", "-", "—"}:
