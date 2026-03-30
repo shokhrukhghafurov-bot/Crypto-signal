@@ -1582,25 +1582,29 @@ def _mid_zone_touch_emit_enabled() -> bool:
 def _mid_zone_touch_emit_min_conf() -> int:
     """Confidence threshold for real first-touch emits.
 
-    Defaults to the origin-fastpath threshold (usually softer than the generic
-    smart-setup threshold) so we can enter near the demand/supply touch instead of
-    after the displacement candle is already extended.
+    Defaults to a softer origin-style threshold so MID can behave more like a
+    real discretionary trader: enter from the zone while the idea is still fresh,
+    not only after the impulse candle already expanded.
     """
     try:
         base = int(float(os.getenv("MID_SMART_SETUP_EMIT_CONF", "90") or 90))
     except Exception:
         base = 90
     try:
-        origin_default = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF", str(min(base, 86))) or min(base, 86)))
+        softer_default = int(float(os.getenv("MID_ZONE_TOUCH_EMIT_DEFAULT_CONF", str(min(base, 82))) or min(base, 82)))
     except Exception:
-        origin_default = min(base, 86)
+        softer_default = min(base, 82)
+    try:
+        origin_default = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF", str(softer_default)) or softer_default))
+    except Exception:
+        origin_default = softer_default
     try:
         raw = os.getenv("MID_ZONE_TOUCH_EMIT_MIN_CONF")
         if raw is None or str(raw).strip() == "":
-            return max(0, int(origin_default))
+            return max(0, int(min(origin_default, softer_default)))
         return max(0, int(float(raw)))
     except Exception:
-        return max(0, int(origin_default))
+        return max(0, int(min(origin_default, softer_default)))
 
 
 def _mid_zone_touch_emit_context_ok(ta: dict | None, it: dict | None = None, *, now_ts: float | None = None) -> bool:
@@ -1928,17 +1932,10 @@ def _mid_directional_contradiction_reason(*sources: dict | None) -> str:
 def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str:
     """Hard veto reasons for early zone-touch alerts.
 
-    Zone-touch alerts must stay high-quality: we allow them only when the first
-    touch of the pending zone is directionally consistent and the local RSI is
-    still inside the preferred entry window. In addition to the existing hard
-    blockers, we explicitly veto zone-touch alerts for the most dangerous local
-    contradictions requested by the user:
-      - SHORT + BO↑ / BO↑ + Retest
-      - LONG  + BO↓ / BO↓ + Retest
-      - SHORT + Bullish Engulfing
-      - LONG  + Bearish Engulfing
-      - LONG / SHORT outside the configured RSI entry window
-      - clearly wrong-side MACD hist(5m) at emit time (but not displayed -0.0000 / +0.0000)
+    Zone-touch emits should behave like a real trader entering from a prepared
+    zone: keep only truly dangerous contradictions as hard vetoes, while softer
+    late/vwap/rsi imperfections stay informational and are handled later by score,
+    RR and smart-exit logic.
     """
     try:
         t = ta if isinstance(ta, dict) else {}
@@ -1949,11 +1946,6 @@ def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str
             "regime_block",
             "adx_30m",
             "adx_1h",
-            "wrong_vwap_side",
-            "vwap_bias",
-            "vwap_dist_atr",
-            "rsi_long",
-            "rsi_short",
         ):
             return raw or head
 
@@ -1980,16 +1972,20 @@ def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str
             rsi_long_min = MID_ULTRA_RSI_LONG_MIN if MID_ULTRA_SAFE else MID_RSI_LONG_MIN
             rsi_short_min = MID_ULTRA_RSI_SHORT_MIN if MID_ULTRA_SAFE else MID_RSI_SHORT_MIN
             rsi_short_max = MID_ULTRA_RSI_SHORT_MAX if MID_ULTRA_SAFE else MID_RSI_SHORT_MAX
+            try:
+                rsi_buf = float(os.getenv("MID_ZONE_TOUCH_HARD_RSI_BUFFER", "6") or 6)
+            except Exception:
+                rsi_buf = 6.0
             if side == "LONG":
-                if rsi_5m >= rsi_long_max:
-                    return f"rsi_long={rsi_5m:.1f} >= {rsi_long_max:g}"
-                if rsi_5m < rsi_long_min:
-                    return f"rsi_long={rsi_5m:.1f} < {rsi_long_min:g}"
+                if rsi_5m >= (float(rsi_long_max) + float(rsi_buf)):
+                    return f"rsi_long_extreme={rsi_5m:.1f} >= {(float(rsi_long_max) + float(rsi_buf)):g}"
+                if rsi_5m < (float(rsi_long_min) - float(rsi_buf)):
+                    return f"rsi_long_extreme={rsi_5m:.1f} < {(float(rsi_long_min) - float(rsi_buf)):g}"
             else:
-                if rsi_5m <= rsi_short_min:
-                    return f"rsi_short={rsi_5m:.1f} <= {rsi_short_min:g}"
-                if rsi_5m >= rsi_short_max:
-                    return f"rsi_short={rsi_5m:.1f} >= {rsi_short_max:g}"
+                if rsi_5m <= (float(rsi_short_min) - float(rsi_buf)):
+                    return f"rsi_short_extreme={rsi_5m:.1f} <= {(float(rsi_short_min) - float(rsi_buf)):g}"
+                if rsi_5m >= (float(rsi_short_max) + float(rsi_buf)):
+                    return f"rsi_short_extreme={rsi_5m:.1f} >= {(float(rsi_short_max) + float(rsi_buf)):g}"
 
         _macd_reason = _mid_macd_hist_emit_block_reason(side, t.get("macd_hist"))
         if _macd_reason:
@@ -2005,10 +2001,10 @@ def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str
 def _mid_trigger_selected_hardblock_reason(reason: str, it: dict | None = None) -> tuple[str | None, str | None]:
     """Selectively enforce hard-blocks that must be respected at actual entry / emit.
 
-    Trigger-time logic is stricter than scan-time logic: late confirmations and
-    anti-bounce entries should usually be rejected rather than repriced from the
-    current market. The only intentional relaxation is for genuinely fresh
-    breakout/retest setups, where anti-bounce can remain advisory.
+    Trader-style trigger logic keeps only the truly dangerous blockers as hard vetoes.
+    Late-entry / anti-bounce / VWAP distance remain advisory unless they become extreme.
+    This lets strong setups enter from the prepared zone instead of waiting until the
+    move is already extended.
 
     Returns (log_reason, apply_reason) or (None, None) when the raw reason should
     remain ignored by trigger-time logic.
@@ -2019,7 +2015,24 @@ def _mid_trigger_selected_hardblock_reason(reason: str, it: dict | None = None) 
             return (None, None)
         head = raw.split()[0].split("=", 1)[0].strip().lower()
         fresh_bo_rt = _mid_pending_is_fresh_bo_rt(it)
+        try:
+            trader_mode = (os.getenv("MID_TRIGGER_TRADER_MODE", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            trader_mode = True
         if head in ("rsi_long", "rsi_short"):
+            if trader_mode:
+                m = re.search(r"([<>]=?)\s*([0-9.]+)", raw)
+                if m:
+                    try:
+                        bound = float(m.group(2))
+                        hard_pad = float(os.getenv("MID_TRIGGER_HARD_RSI_PAD", "6") or 6)
+                        valm = re.search(r"=([0-9.]+)", raw)
+                        val = float(valm.group(1)) if valm else None
+                        if val is not None:
+                            if (">" in m.group(1) and val < (bound + hard_pad)) or ("<" in m.group(1) and val > (bound - hard_pad)):
+                                return (None, None)
+                    except Exception:
+                        pass
             return (head, head)
         if head == "macd_hist":
             return ("macd_hist", "macd_hist")
@@ -2028,22 +2041,69 @@ def _mid_trigger_selected_hardblock_reason(reason: str, it: dict | None = None) 
         if head == "regime_block":
             return ("regime_block", "regime_block")
         if head == "vol_x":
+            if trader_mode:
+                return (None, None)
             return ("vol_low", "vol_low")
         if head == "directional_contradiction":
             return ("directional_contradiction", "directional_contradiction")
         if head in ("near_recent_low", "near_recent_high"):
+            if trader_mode and fresh_bo_rt:
+                return (None, None)
             return ("near_recent_extreme", "near_recent_extreme")
         if head in ("vwap_dist_atr", "vwap_bias", "wrong_vwap_side"):
+            if trader_mode:
+                m = re.search(r"vwap_dist_atr=([0-9.]+)\s*>\s*([0-9.]+)", raw)
+                if m:
+                    try:
+                        dist = float(m.group(1))
+                        limit = max(1e-9, float(m.group(2)))
+                        hard_mult = float(os.getenv("MID_TRIGGER_HARD_VWAP_DIST_MULT", "1.40") or 1.40)
+                        if dist <= (limit * hard_mult):
+                            return (None, None)
+                    except Exception:
+                        return (None, None)
+                else:
+                    return (None, None)
             return ("vwap_dist", "vwap_dist")
         if head == "late_entry_atr":
+            if trader_mode:
+                m = re.search(r"late_entry_atr=([0-9.]+)\s*>\s*([0-9.]+)", raw)
+                if m:
+                    try:
+                        move = float(m.group(1))
+                        limit = max(1e-9, float(m.group(2)))
+                        hard_mult = float(os.getenv("MID_TRIGGER_HARD_LATE_ENTRY_MULT", "1.35") or 1.35)
+                        if fresh_bo_rt:
+                            hard_mult = max(hard_mult, float(os.getenv("MID_TRIGGER_HARD_LATE_ENTRY_MULT_FRESH", "1.60") or 1.60))
+                        if move <= (limit * hard_mult):
+                            return (None, None)
+                    except Exception:
+                        return (None, None)
+                else:
+                    return (None, None)
             return ("late_entry", "late_entry")
         if head in ("anti_bounce_short", "anti_bounce_long"):
             try:
                 relax_fresh = (os.getenv("MID_TRIGGER_RELAX_ANTI_BOUNCE_FRESH_BO_RT", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
             except Exception:
                 relax_fresh = True
-            if fresh_bo_rt and relax_fresh:
-                return (None, None)
+            if trader_mode:
+                m = re.search(r"=([0-9.]+)\s*>\s*([0-9.]+)", raw)
+                if m:
+                    try:
+                        dist = float(m.group(1))
+                        limit = max(1e-9, float(m.group(2)))
+                        hard_mult = float(os.getenv("MID_TRIGGER_HARD_ANTI_BOUNCE_MULT", "1.25") or 1.25)
+                        if (fresh_bo_rt and relax_fresh) or dist <= (limit * hard_mult):
+                            return (None, None)
+                    except Exception:
+                        if fresh_bo_rt and relax_fresh:
+                            return (None, None)
+                elif fresh_bo_rt and relax_fresh:
+                    return (None, None)
+            else:
+                if fresh_bo_rt and relax_fresh:
+                    return (None, None)
             return ("anti_bounce", "anti_bounce")
         return (None, None)
     except Exception:
@@ -21001,13 +21061,21 @@ def _mid_quality_first_enabled() -> bool:
 
 
 def _mid_trigger_min_passed() -> int:
-    """Smart-trigger threshold controlled only via MID_TRIGGER_MIN_PASSED env."""
+    """Smart-trigger threshold controlled only via MID_TRIGGER_MIN_PASSED env.
+
+    Default is intentionally non-zero in trader mode so the engine can emit from
+    the zone with a small basket of passed checks instead of waiting for a perfect
+    late trigger stack.
+    """
     try:
         raw_env = os.getenv("MID_TRIGGER_MIN_PASSED", None)
         raw_txt = "" if raw_env is None else str(raw_env).strip()
-        raw = int(float(raw_txt or 0))
+        if raw_txt == "":
+            raw = int(float(os.getenv("MID_TRIGGER_MIN_PASSED_DEFAULT", "2") or 2))
+        else:
+            raw = int(float(raw_txt or 0))
     except Exception:
-        raw = 0
+        raw = 2
     return max(0, raw)
 
 
@@ -23187,7 +23255,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # IMPORTANT: smart trigger must also force full evaluation, otherwise an early
                     # failing filter (score/confidence/structure/...) can short-circuit before the
                     # final pass-threshold gate is reached.
-                    smart_trigger = os.getenv("MID_SMART_TRIGGER", "0").strip().lower() in ("1","true","yes","on")
+                    smart_trigger = os.getenv("MID_SMART_TRIGGER", "1").strip().lower() in ("1","true","yes","on")
                     full_diag = (os.getenv("MID_TRIGGER_FULL_CHECKLIST", "1").strip().lower() in ("1","true","yes","on")) or bool(smart_trigger)
                     # Trigger filter switches (so "filters off" via env truly means no blocking)
                     def _env_true(name: str, default: bool = True) -> bool:
@@ -24881,7 +24949,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             smart_trigger = False
                         if not smart_trigger:
                             try:
-                                smart_trigger = str(os.getenv("MID_SMART_TRIGGER", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+                                smart_trigger = str(os.getenv("MID_SMART_TRIGGER", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
                             except Exception:
                                 smart_trigger = False
                         try:
@@ -24889,7 +24957,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             need_passed = 0
                         try:
-                            strict_required = str(os.getenv("MID_TRIGGER_STRICT_REQUIRED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+                            strict_required = str(os.getenv("MID_TRIGGER_STRICT_REQUIRED", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
                         except Exception:
                             strict_required = True
                         enabled_required = []
@@ -25001,7 +25069,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # IMPORTANT: in smart-trigger mode we do not hard-block on these reasons here;
                     # pass-count threshold above is the deciding gate.
                     try:
-                        _smart_trigger_enabled = str(os.getenv("MID_SMART_TRIGGER", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+                        _smart_trigger_enabled = str(os.getenv("MID_SMART_TRIGGER", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
                         if (not _smart_trigger_enabled) and full_diag and isinstance(trig_state, dict) and trig_state.get("reasons"):
                             reasons = list(trig_state.get("reasons") or [])
                             try:
