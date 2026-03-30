@@ -16873,6 +16873,28 @@ def _signal_strength_10(ta: Dict[str, Any]) -> tuple[float, str]:
     except Exception:
         return (0.0, "VERY WEAK")
 
+def _ta_market_weak_gate(ta: Dict[str, Any]) -> tuple[bool, str, str, float]:
+    """Legacy helper kept for compatibility.
+
+    It still computes the user-facing grade/strength snapshot, but it no longer
+    hard-blocks market entry. Actual blocking is enforced later at EMIT/trigger
+    time by the real trigger filters (late_entry / MACD / volume / structure /
+    trap / confidence / score / etc.).
+    """
+    try:
+        grade = str(_ta_signal_grade(ta) or "").strip().upper()
+    except Exception:
+        grade = "C-"
+    try:
+        strength10, strength_label = _signal_strength_10(ta)
+    except Exception:
+        strength10, strength_label = (0.0, "VERY WEAK")
+    try:
+        strength10 = float(strength10)
+    except Exception:
+        strength10 = 0.0
+    return (False, grade or "C-", str(strength_label or "VERY WEAK").strip().upper(), float(strength10))
+
 def _fmt_ta_block(ta: Dict[str, Any]) -> str:
     """
     Format TA snapshot for Telegram/UX. Keep it short but informative.
@@ -25051,6 +25073,64 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     except Exception:
                         pass
 
+                    # Final EMIT hard gate: even when smart-trigger mode allows a
+                    # setup to survive by pass-count, we still must not send the
+                    # signal to market if any enabled trigger check is explicitly
+                    # failing right now. This keeps pending alive, but makes the
+                    # actual market EMIT strict without touching .env thresholds.
+                    try:
+                        _emit_checks = it.get("_trig_checks") if isinstance(it.get("_trig_checks"), dict) else {}
+                        _emit_reqs = it.get("_trig_reqs") if isinstance(it.get("_trig_reqs"), dict) else {}
+                        _emit_reason_map = {
+                            "direction": ("direction_mismatch", "direction_mismatch"),
+                            "trap": ("trap_block", "trap_block"),
+                            "structure_30m": ("structure_broken_30m", "structure_broken"),
+                            "structure_1h": ("structure_broken_1h", "structure_broken"),
+                            "bos_block": ("bos_block", "blocked"),
+                            "reclaim": ("reclaim_missing", "reclaim_missing"),
+                            "bos_5m": ("bos_5m_missing", "bos_missing"),
+                            "sweep": ("sweep_missing", "liq_sweep_missing"),
+                            "displacement": ("displacement_missing", "displacement_weak"),
+                            "confidence": ("confidence_low", "confidence_low"),
+                            "score": ("score_low", "score_low"),
+                            "vol_x": ("vol_low", "vol_low"),
+                            "late_entry": ("late_entry", "late_entry"),
+                            "macd_hist": ("macd_hist_block", "macd_hist"),
+                        }
+                        _emit_failed = []
+                        for _k, _v in _emit_checks.items():
+                            if not bool(_emit_reqs.get(_k, False)):
+                                continue
+                            _sv = str(_v or "").strip().lower()
+                            if _sv.startswith("fail"):
+                                _emit_failed.append(str(_k))
+                        if _emit_failed:
+                            _first_key = str(_emit_failed[0])
+                            _emit_log_reason_base, _emit_apply_reason = _emit_reason_map.get(_first_key, (_first_key, _first_key))
+                            try:
+                                _emit_log_reason = _resolve_trigger_log_reason(_first_key, _emit_log_reason_base)
+                            except Exception:
+                                _emit_log_reason = str(_emit_log_reason_base)
+                            try:
+                                it["_trig_fail_reasons"] = [(_emit_reason_map.get(k, (k, k))[0]) for k in _emit_failed]
+                                it["_trig_primary_reason"] = str(_emit_log_reason_base)
+                                it["_trig_term_reason"] = str(_emit_log_reason)
+                            except Exception:
+                                pass
+                            keep_it, outc = _pending_apply_fail(it, _emit_apply_reason, now)
+                            _pending_log_trigger(sym, market, direction, outc, _emit_log_reason, it, float(price))
+                            if keep_it:
+                                keep.append(it)
+                                any_wait = True
+                            else:
+                                try:
+                                    removed_n += 1
+                                except Exception:
+                                    pass
+                            continue
+                    except Exception:
+                        pass
+
 # Emit final signal
                     def _mid_pick_scalar(*vals, default=0.0):
                         for _v in vals:
@@ -25082,6 +25162,34 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         continue
                     entry, sl, tp1, tp2, rr = _mid_recalc_levels_from_trigger(direction, entry_ref, ta, it, market)
                     conf = int(_mid_pick_scalar(ta.get("confidence"), it.get("confidence"), default=0.0))
+
+                    try:
+                        _gate_ta = dict(it) if isinstance(it, dict) else {}
+                        if isinstance(ta, dict):
+                            _gate_ta.update(ta)
+                        _emit_weak_blocked, _emit_weak_grade, _emit_weak_label, _emit_weak_score10 = _ta_market_weak_gate(_gate_ta)
+                    except Exception:
+                        _emit_weak_blocked, _emit_weak_grade, _emit_weak_label, _emit_weak_score10 = (True, "C-", "VERY WEAK", 0.0)
+                    if _emit_weak_blocked:
+                        keep_it, outc = _pending_apply_fail(it, "score_low", now)
+                        _pending_log_trigger(
+                            sym,
+                            market,
+                            direction,
+                            outc,
+                            f"weak_gate grade={_emit_weak_grade} strength={_emit_weak_label} strength10={float(_emit_weak_score10):.1f}",
+                            it,
+                            float(price),
+                        )
+                        if keep_it:
+                            keep.append(it)
+                            any_wait = True
+                        else:
+                            try:
+                                removed_n += 1
+                            except Exception:
+                                pass
+                        continue
 
                     conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "")
                     if not conf_names:
@@ -27999,6 +28107,32 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
 
                         best_name, best_r = chosen_name, chosen_r
                         base_r = best_r
+                        try:
+                            _weak_blocked, _weak_grade, _weak_label, _weak_score10 = _ta_market_weak_gate(base_r)
+                        except Exception:
+                            _weak_blocked, _weak_grade, _weak_label, _weak_score10 = (True, "C-", "VERY WEAK", 0.0)
+                        if _weak_blocked:
+                            _mid_f_score += 1
+                            try:
+                                _mid_ta_score_low += 1
+                            except Exception:
+                                pass
+                            _rej_add(sym, "score_low")
+                            try:
+                                self._mid_digest_add(
+                                    self._mid_trap_digest_stats,
+                                    sym,
+                                    str(base_r.get("direction", "")),
+                                    base_r.get("entry"),
+                                    f"weak_gate grade={_weak_grade} strength={_weak_label} strength10={float(_weak_score10):.1f}",
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                _pending_skip(sym, f"weak_gate grade={_weak_grade} strength={_weak_label} strength10={float(_weak_score10):.1f}")
+                            except Exception:
+                                pass
+                            continue
                         # Mode switch: create setups first, apply filters later at trigger.
                         pending_enabled = os.getenv("MID_PENDING_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
                         postsetup_only = os.getenv("MID_FILTERS_AFTER_SETUP", "1").strip().lower() not in ("0", "false", "no", "off")
