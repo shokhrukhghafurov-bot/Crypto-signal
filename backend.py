@@ -1,4 +1,4 @@
-from __future__ import annotations
+ from __future__ import annotations
 
 MID_BUILD_TAG = "MID_BUILD_2026-03-31_smart_setup_zone_fix_v4_3"
 
@@ -23975,13 +23975,27 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                         except Exception:
                                             pass
                                     continue
-
-                                _btc_emit_block = await self.mid_btc_emit_block_reason(symbol=sym, market=sig.market, direction=sig.direction)
-                                if _btc_emit_block:
-                                    keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
-                                    _pending_log_trigger(sym, market, direction, outc, _btc_emit_block, it, float(price))
+                                _pre_emit_reason = await self.mid_pre_emit_block_reason(
+                                    sig=sig,
+                                    ta=ta,
+                                    it=it,
+                                    risk_flags=it.get("risk_flags"),
+                                    vol_x=float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0),
+                                    body_atr=_mid_body_atr(float(ta.get("last_body") or 0.0), float(ta.get("atr30") or ta.get("atr_abs") or 0.0)),
+                                    bo_rt_label=str(it.get("bo_rt") or it.get("breakout_retest") or ""),
+                                    breakout_fresh_ok=bool(it.get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(it, now_ts=now)),
+                                    micro_trap_ok=bool(ta.get("trap_ok", False)),
+                                    macd_hist=_safe_float(ta.get("macd_hist"), None),
+                                    zone_src=str(it.get("entry_zone_src") or ""),
+                                    in_zone_now=bool(_in_zone_for_trigger or _entered_zone_for_trigger),
+                                    route="pending_instant_emit",
+                                )
+                                if _pre_emit_reason:
+                                    _apply_reason = _mid_pre_emit_apply_reason(_pre_emit_reason)
+                                    keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                                    _pending_log_trigger(sym, market, direction, outc, _pre_emit_reason, it, float(price))
                                     try:
-                                        logger.info("[mid][pending][btc_filter] %s %s %s reason=%s", sym, market, direction, _btc_emit_block)
+                                        logger.info("[mid][pending][pre_emit_block] %s %s %s route=%s reason=%s", sym, market, direction, "pending_instant_emit", _pre_emit_reason)
                                     except Exception:
                                         pass
                                     if keep_it:
@@ -24378,12 +24392,27 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                                     continue
 
                                                 if _touch_live_emit and _touch_can_emit:
-                                                    _btc_emit_block = await self.mid_btc_emit_block_reason(symbol=sym, market=sig_zone.market, direction=sig_zone.direction)
-                                                    if _btc_emit_block:
-                                                        keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
-                                                        _pending_log_trigger(sym, market, direction, outc, _btc_emit_block, it, float(price))
+                                                    _pre_emit_reason = await self.mid_pre_emit_block_reason(
+                                                        sig=sig_zone,
+                                                        ta=ta,
+                                                        it=it,
+                                                        risk_flags=it.get("risk_flags"),
+                                                        vol_x=float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0),
+                                                        body_atr=_mid_body_atr(float(ta.get("last_body") or 0.0), float(ta.get("atr30") or ta.get("atr_abs") or 0.0)),
+                                                        bo_rt_label=str(it.get("bo_rt") or it.get("breakout_retest") or ""),
+                                                        breakout_fresh_ok=bool(it.get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(it, now_ts=now)),
+                                                        micro_trap_ok=bool(ta.get("trap_ok", False)),
+                                                        macd_hist=_safe_float(ta.get("macd_hist"), None),
+                                                        zone_src=str(it.get("entry_zone_src") or ""),
+                                                        in_zone_now=bool(_in_zone_for_trigger or _entered_zone_for_trigger),
+                                                        route="zone_touch_emit",
+                                                    )
+                                                    if _pre_emit_reason:
+                                                        _apply_reason = _mid_pre_emit_apply_reason(_pre_emit_reason)
+                                                        keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                                                        _pending_log_trigger(sym, market, direction, outc, _pre_emit_reason, it, float(price))
                                                         try:
-                                                            logger.info("[mid][pending][btc_filter] %s %s %s reason=%s", sym, market, direction, _btc_emit_block)
+                                                            logger.info("[mid][pending][pre_emit_block] %s %s %s route=%s reason=%s", sym, market, direction, "zone_touch_emit", _pre_emit_reason)
                                                         except Exception:
                                                             pass
                                                         if keep_it:
@@ -24865,6 +24894,41 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     _pending_log_trigger(sym, market, direction, outc, _btc_emit_block, it, float(price))
                                     try:
                                         logger.info("[mid][pending][btc_filter] %s %s %s reason=%s", sym, market, direction, _btc_emit_block)
+                                    except Exception:
+                                        pass
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
+
+                                _pre_emit_reason = await self.mid_pre_emit_block_reason(
+                                    sig=sig_instant,
+                                    ta=ta,
+                                    it=it,
+                                    risk_flags=it.get("risk_flags"),
+                                    vol_x=float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0),
+                                    body_atr=_mid_body_atr(float(ta.get("last_body") or 0.0), float(ta.get("atr30") or ta.get("atr_abs") or 0.0)),
+                                    bo_rt_label=str(it.get("bo_rt") or it.get("breakout_retest") or ""),
+                                    breakout_fresh_ok=bool(it.get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(it, now_ts=now)),
+                                    micro_trap_ok=bool(ta.get("trap_ok", False)),
+                                    macd_hist=_safe_float(ta.get("macd_hist"), None),
+                                    anti_bounce_reason=str(anti_reason_now or ""),
+                                    gate_meta=instant_meta,
+                                    zone_src=str(it.get("entry_zone_src") or ""),
+                                    in_zone_now=bool(in_zone_now),
+                                    route="instant_emit_vip",
+                                )
+                                if _pre_emit_reason:
+                                    _apply_reason = _mid_pre_emit_apply_reason(_pre_emit_reason)
+                                    keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                                    _pending_log_trigger(sym, market, direction, outc, _pre_emit_reason, it, float(price))
+                                    try:
+                                        logger.info("[mid][pending][pre_emit_block] %s %s %s route=%s reason=%s", sym, market, direction, "instant_emit_vip", _pre_emit_reason)
                                     except Exception:
                                         pass
                                     if keep_it:
@@ -26178,6 +26242,38 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         _pending_log_trigger(sym, market, direction, outc, _final_emit_reason, it, float(price))
                         try:
                             logger.info("[mid][pending][final_emit_kill] %s %s %s reason=%s", sym, market, direction, _final_emit_reason)
+                        except Exception:
+                            pass
+                        if keep_it:
+                            keep.append(it)
+                            any_wait = True
+                        else:
+                            try:
+                                removed_n += 1
+                            except Exception:
+                                pass
+                        continue
+                    _pre_emit_reason = await self.mid_pre_emit_block_reason(
+                        sig=sig,
+                        ta=ta,
+                        it=it,
+                        risk_flags=it.get("risk_flags"),
+                        vol_x=float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0),
+                        body_atr=_mid_body_atr(float(ta.get("last_body") or 0.0), float(ta.get("atr30") or ta.get("atr_abs") or 0.0)),
+                        bo_rt_label=str(it.get("bo_rt") or it.get("breakout_retest") or ""),
+                        breakout_fresh_ok=bool(it.get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(it, now_ts=now)),
+                        micro_trap_ok=bool(ta.get("trap_ok", False)),
+                        macd_hist=_safe_float(ta.get("macd_hist"), None),
+                        zone_src=str(it.get("entry_zone_src") or ""),
+                        in_zone_now=bool(it.get("_in_zone") or it.get("_in_zone_tol") or it.get("_entered_zone_now") or False),
+                        route="pending_confirmed_emit",
+                    )
+                    if _pre_emit_reason:
+                        _apply_reason = _mid_pre_emit_apply_reason(_pre_emit_reason)
+                        keep_it, outc = _pending_apply_fail(it, _apply_reason, now)
+                        _pending_log_trigger(sym, market, direction, outc, _pre_emit_reason, it, float(price))
+                        try:
+                            logger.info("[mid][pending][pre_emit_block] %s %s %s route=%s reason=%s", sym, market, direction, "pending_confirmed_emit", _pre_emit_reason)
                         except Exception:
                             pass
                         if keep_it:
@@ -30789,14 +30885,30 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     rec["confirmed_entry_ts"] = float(time.time())
                                                 except Exception:
                                                     pass
-                                                _btc_emit_block = await self.mid_btc_emit_block_reason(symbol=sym, market=sig_emit.market, direction=sig_emit.direction)
-                                                if _btc_emit_block:
+                                                _pre_emit_reason = await self.mid_pre_emit_block_reason(
+                                                    sig=sig_emit,
+                                                    ta=(base_r if ("base_r" in locals() and isinstance(base_r, dict)) else None),
+                                                    it=rec,
+                                                    risk_flags=risk_flags,
+                                                    vol_x=float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("rel_vol_at_create") or 0.0) or 0.0),
+                                                    body_atr=_mid_body_atr(float((base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("last_body") or 0.0) or 0.0), float(_atr_now or 0.0)),
+                                                    bo_rt_label=str(_bo_rt_now or ""),
+                                                    breakout_fresh_ok=bool(_breakout_fast_ok),
+                                                    micro_trap_ok=bool(_micro_ok_now),
+                                                    macd_hist=_safe_float((base_r.get("macd_hist") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("macd_hist")), None),
+                                                    anti_bounce_reason=str(_anti_reason_now or ""),
+                                                    gate_meta=_emit_meta,
+                                                    zone_src=str(_zone_src_l or ""),
+                                                    in_zone_now=bool(_in_zone_now),
+                                                    route="smart_emit_now",
+                                                )
+                                                if _pre_emit_reason:
                                                     try:
-                                                        logger.info("[mid][btc_filter] %s market=%s dir=%s reason=%s", sym, sig_emit.market, sig_emit.direction, _btc_emit_block)
+                                                        logger.info("[mid][pre_emit_block] %s market=%s dir=%s route=%s reason=%s", sym, sig_emit.market, sig_emit.direction, "smart_emit_now", _pre_emit_reason)
                                                     except Exception:
                                                         pass
                                                     try:
-                                                        _rej_add(sym, "direction_mismatch")
+                                                        _rej_add(sym, _mid_pre_emit_apply_reason(_pre_emit_reason))
                                                     except Exception:
                                                         pass
                                                     continue
@@ -30969,15 +31081,28 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 except Exception:
                                     pass
                                 continue
-
-                            _btc_emit_block = await self.mid_btc_emit_block_reason(symbol=sym, market=sig.market, direction=sig.direction)
-                            if _btc_emit_block:
+                            _pre_emit_reason = await self.mid_pre_emit_block_reason(
+                                sig=sig,
+                                ta=(base_r if ("base_r" in locals() and isinstance(base_r, dict)) else None),
+                                it=(rec if ("rec" in locals() and isinstance(rec, dict)) else None),
+                                risk_flags=((rec.get("risk_flags") if ("rec" in locals() and isinstance(rec, dict)) else None)),
+                                vol_x=float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
+                                body_atr=_mid_body_atr(float((base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0), float((base_r.get("atr30") if ("base_r" in locals() and isinstance(base_r, dict)) else base_r.get("atr_abs") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0)),
+                                bo_rt_label=str((rec.get("bo_rt") if ("rec" in locals() and isinstance(rec, dict)) else rec.get("breakout_retest") if ("rec" in locals() and isinstance(rec, dict)) else "") or ""),
+                                breakout_fresh_ok=bool((rec.get("smart_breakout_fast_ok") if ("rec" in locals() and isinstance(rec, dict)) else False) or (("rec" in locals() and isinstance(rec, dict) and _mid_pending_is_fresh_bo_rt(rec)) or False)),
+                                micro_trap_ok=bool((base_r.get("trap_ok") if ("base_r" in locals() and isinstance(base_r, dict)) else False)),
+                                macd_hist=_safe_float((base_r.get("macd_hist") if ("base_r" in locals() and isinstance(base_r, dict)) else None), None),
+                                zone_src=str((rec.get("entry_zone_src") if ("rec" in locals() and isinstance(rec, dict)) else "") or ""),
+                                in_zone_now=True,
+                                route="scanner_mid_emit",
+                            )
+                            if _pre_emit_reason:
                                 try:
-                                    logger.info("[mid][btc_filter] %s market=%s dir=%s reason=%s", sym, sig.market, sig.direction, _btc_emit_block)
+                                    logger.info("[mid][pre_emit_block] %s market=%s dir=%s route=%s reason=%s", sym, sig.market, sig.direction, "scanner_mid_emit", _pre_emit_reason)
                                 except Exception:
                                     pass
                                 try:
-                                    _rej_add(sym, "direction_mismatch")
+                                    _rej_add(sym, _mid_pre_emit_apply_reason(_pre_emit_reason))
                                 except Exception:
                                     pass
                                 continue
@@ -35080,6 +35205,84 @@ def _mid_btc_bias_snapshot(df30: pd.DataFrame, df1h: pd.DataFrame) -> dict | Non
         return None
 
 
+def _mid_pre_emit_apply_reason(reason: str) -> str:
+    try:
+        r = str(reason or "").strip().lower()
+    except Exception:
+        r = ""
+    if not r:
+        return "blocked"
+    if r.startswith("btc_filter_block"):
+        return "direction_mismatch"
+    if r.startswith("smart_setup_trap"):
+        return "trap_block"
+    return _mid_final_emit_apply_reason(reason)
+
+
+async def _backend_mid_pre_emit_block_reason(
+    self: "Backend",
+    *,
+    sig: Signal | None,
+    ta: dict | None = None,
+    it: dict | None = None,
+    risk_flags=None,
+    vol_x: float | None = None,
+    body_atr: float | None = None,
+    bo_rt_label: str | None = None,
+    breakout_fresh_ok: bool = False,
+    micro_trap_ok: bool | None = None,
+    macd_hist: float | None = None,
+    anti_bounce_reason: str | None = None,
+    gate_meta: dict | None = None,
+    zone_src: str | None = None,
+    in_zone_now: bool = True,
+    route: str = "",
+) -> str:
+    try:
+        if sig is None:
+            return "pre_emit_missing_signal"
+        sym = str(getattr(sig, "symbol", "") or "").upper().strip()
+        market = str(getattr(sig, "market", "") or "FUTURES").upper().strip()
+        direction = str(getattr(sig, "direction", "") or "").upper().strip()
+
+        rec = it if isinstance(it, dict) else {}
+        if rec.get("smart_setup_trap_ok") is False:
+            return str(rec.get("smart_setup_trap_reason") or "smart_setup_trap")
+        if isinstance(gate_meta, dict) and gate_meta.get("smart_setup_trap_ok") is False:
+            return str(gate_meta.get("smart_setup_trap_reason") or "smart_setup_trap")
+
+        final_reason = _mid_final_emit_gate_reason(
+            sig=sig,
+            ta=ta,
+            it=rec,
+            risk_flags=risk_flags if risk_flags is not None else rec.get("risk_flags"),
+            vol_x=vol_x,
+            body_atr=body_atr,
+            bo_rt_label=bo_rt_label,
+            breakout_fresh_ok=bool(breakout_fresh_ok),
+            micro_trap_ok=micro_trap_ok,
+            macd_hist=macd_hist,
+            anti_bounce_reason=anti_bounce_reason,
+            gate_meta=gate_meta,
+            zone_src=zone_src,
+            in_zone_now=bool(in_zone_now),
+        )
+        if final_reason:
+            return str(final_reason)
+
+        btc_reason = await self.mid_btc_emit_block_reason(symbol=sym, market=market, direction=direction)
+        if btc_reason:
+            return str(btc_reason)
+        return ""
+    except Exception as e:
+        try:
+            logger.info("[mid][pre_emit] route=%s symbol=%s market=%s dir=%s err=%s", str(route or "-"), getattr(sig, "symbol", "-"), getattr(sig, "market", "-"), getattr(sig, "direction", "-"), type(e).__name__)
+        except Exception:
+            pass
+        return ""
+
+
+
 async def _backend_mid_btc_emit_block_reason(self: "Backend", *, symbol: str, market: str, direction: str) -> str:
     try:
         if not _mid_btc_emit_filter_enabled():
@@ -35633,6 +35836,7 @@ if _mid_missing_pending_helpers:
 try:
     Backend.load_candles = _backend_load_candles  # type: ignore[attr-defined]
     Backend.mid_btc_emit_block_reason = _backend_mid_btc_emit_block_reason  # type: ignore[attr-defined]
+    Backend.mid_pre_emit_block_reason = _backend_mid_pre_emit_block_reason  # type: ignore[attr-defined]
 except Exception:
     pass
 
