@@ -1,4 +1,4 @@
- from __future__ import annotations
+from __future__ import annotations
 
 MID_BUILD_TAG = "MID_BUILD_2026-03-31_smart_setup_zone_fix_v4_3"
 
