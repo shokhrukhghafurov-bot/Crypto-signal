@@ -11932,6 +11932,47 @@ def _mid_apply_signal_setup_source(sig: Signal | None, source: str | None) -> st
     return src
 
 
+def _mid_embed_setup_source_in_orig_text(orig_text: str | None, sig: Signal | None = None) -> str:
+    """Persist Smart-setup source in stored orig_text for future report cards.
+
+    This enriches the DB payload only. It does not change the live Telegram message that
+    was already shown to the opener. The report bot later parses this line from orig_text
+    when setup_source/setup_source_label are not available in the track row.
+    """
+    try:
+        text = str(orig_text or "")
+    except Exception:
+        text = ""
+    try:
+        if re.search(r"(?:^|\n)\s*(?:🧭\s*)?Smart-setup:\s*[^\n\r]+", text, flags=re.IGNORECASE):
+            return text
+    except Exception:
+        pass
+    label = ""
+    try:
+        if sig is not None:
+            label = str(getattr(sig, "setup_source_label", "") or "").strip()
+            if not label:
+                raw = _mid_setup_source_normalize(getattr(sig, "setup_source", "") or "")
+                label = _mid_setup_source_label(raw)
+    except Exception:
+        label = ""
+    if not label:
+        return text
+    line = f"🧭 Smart-setup: {label}"
+    if not text.strip():
+        return line
+    try:
+        marker = "Нажми кнопку ниже после того, как открыл сделку:"
+        idx = text.find(marker)
+        if idx >= 0:
+            head = text[:idx].rstrip()
+            tail = text[idx:].lstrip("\n")
+            return f"{head}\n{line}\n\n{tail}".strip()
+    except Exception:
+        pass
+    return f"{text.rstrip()}\n{line}".strip()
+
 def _mid_pick_scan_setup_source(*, origin_fast_ok: bool = False, breakout_fast_ok: bool = False, zone_valid: bool = False, in_zone_now: bool = False) -> str:
     """Smart-setup priority at scan time: origin > breakout > zone-touch/retest."""
     if bool(origin_fast_ok):
@@ -19034,7 +19075,7 @@ class Backend:
                 tp1=(float(getattr(sig, "tp1", 0.0)) if getattr(sig, "tp1", None) is not None else None),
                 tp2=(float(getattr(sig, "tp2", 0.0)) if getattr(sig, "tp2", None) is not None else None),
                 sl=(float(getattr(sig, "sl", 0.0)) if getattr(sig, "sl", None) is not None else None),
-                orig_text=orig_text or "",
+                orig_text=_mid_embed_setup_source_in_orig_text(orig_text or "", sig),
             )
             return bool(inserted)
         except Exception:
@@ -19232,7 +19273,7 @@ class Backend:
             tp1=float(signal.tp1) if signal.tp1 is not None else None,
             tp2=float(signal.tp2) if signal.tp2 is not None else None,
             sl=float(signal.sl) if signal.sl is not None else None,
-            orig_text=orig_text or "",
+            orig_text=_mid_embed_setup_source_in_orig_text(orig_text or "", signal),
         )
         return bool(inserted)
 
