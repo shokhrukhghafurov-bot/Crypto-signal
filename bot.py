@@ -3404,24 +3404,82 @@ def _report_close_reason(final_status: str, *, after_tp1: bool = False, has_tp2:
     return "Сигнал закрыт."
 
 
+def _report_setup_label_human(source: str | None) -> str:
+    raw = str(source or "").strip().lower().replace("_", " ")
+    labels = {
+        "origin": "Начало движения",
+        "breakout": "Пробой",
+        "zone retest": "Возврат в зону",
+        "normal pending trigger": "Обычный trigger",
+    }
+    if raw in labels:
+        return labels[raw]
+    return str(source or "").strip()
+
+
+def _report_setup_label_from_signal(sig) -> str:
+    try:
+        if sig is None:
+            return ""
+        label = str(getattr(sig, "setup_source_label", "") or "").strip()
+        if label:
+            return _report_setup_label_human(label)
+        raw = str(getattr(sig, "setup_source", "") or "").strip()
+        if raw:
+            return _report_setup_label_human(raw)
+    except Exception:
+        pass
+    return ""
+
+
+def _report_extract_setup_label_from_text(text: str) -> str:
+    try:
+        src = str(text or "")
+        if not src:
+            return ""
+        m = re.search(r"(?:^|\n)\s*(?:🧭\s*)?Smart-setup:\s*([^\n\r]+)", src, flags=re.IGNORECASE)
+        if not m:
+            return ""
+        return _report_setup_label_human(str(m.group(1) or "").strip())
+    except Exception:
+        return ""
+
+
 def _report_setup_label_from_row(row: dict) -> str:
     try:
-        label = str(row.get("setup_source_label") or "").strip()
-        if not label:
-            raw = str(row.get("setup_source") or "").strip().lower().replace("_", " ")
-            if raw in ("origin", "breakout", "zone retest", "normal pending trigger"):
-                label = raw
+        label = _report_setup_label_human(row.get("setup_source_label"))
         if label:
             return label
-        orig_text = str(row.get("orig_text") or "")
-        if orig_text:
-            m = re.search(r"(?:^|\n)\s*(?:🧭\s*)?Smart-setup:\s*([^\n\r]+)", orig_text, flags=re.IGNORECASE)
-            if m:
-                found = str(m.group(1) or "").strip()
-                raw = found.lower().replace("_", " ")
-                if raw in ("origin", "breakout", "zone retest", "normal pending trigger"):
-                    return raw
-                return found
+        label = _report_setup_label_human(row.get("setup_source"))
+        if label:
+            return label
+
+        sid = 0
+        try:
+            sid = int(row.get("signal_id") or 0)
+        except Exception:
+            sid = 0
+
+        if sid > 0:
+            try:
+                sig = SIGNALS.get(sid)
+            except Exception:
+                sig = None
+            label = _report_setup_label_from_signal(sig)
+            if label:
+                return label
+
+            try:
+                cached_text = str(ORIGINAL_SIGNAL_TEXT.get((0, sid)) or "")
+            except Exception:
+                cached_text = ""
+            label = _report_extract_setup_label_from_text(cached_text)
+            if label:
+                return label
+
+        label = _report_extract_setup_label_from_text(str(row.get("orig_text") or ""))
+        if label:
+            return label
     except Exception:
         pass
     return ""
@@ -3864,17 +3922,36 @@ async def broadcast_signal(sig: Signal) -> None:
     # If cooldown reservation already inserted the row, this UPSERT only refreshes fields.
     try:
         side_stats = _normalize_side_for_stats(getattr(sig, 'direction', ''))
-        await db_store.upsert_signal_track(
-            signal_id=int(sig.signal_id or 0),
-            sig_key=sig_key,
-            market=str(sig.market).upper(),
-            symbol=str(sig.symbol),
-            side=side_stats,
-            entry=float(sig.entry or 0.0),
-            tp1=(float(sig.tp1) if sig.tp1 is not None else None),
-            tp2=(float(sig.tp2) if sig.tp2 is not None else None),
-            sl=(float(sig.sl) if sig.sl is not None else None),
-        )
+        _track_kwargs = {
+            'signal_id': int(sig.signal_id or 0),
+            'sig_key': sig_key,
+            'market': str(sig.market).upper(),
+            'symbol': str(sig.symbol),
+            'side': side_stats,
+            'entry': float(sig.entry or 0.0),
+            'tp1': (float(sig.tp1) if sig.tp1 is not None else None),
+            'tp2': (float(sig.tp2) if sig.tp2 is not None else None),
+            'sl': (float(sig.sl) if sig.sl is not None else None),
+        }
+        try:
+            _track_kwargs['orig_text'] = _signal_text(0, sig)
+        except Exception:
+            pass
+        try:
+            _track_kwargs['setup_source'] = str(getattr(sig, 'setup_source', '') or '').strip()
+        except Exception:
+            pass
+        try:
+            _track_kwargs['setup_source_label'] = str(getattr(sig, 'setup_source_label', '') or '').strip()
+        except Exception:
+            pass
+        try:
+            await db_store.upsert_signal_track(**_track_kwargs)
+        except TypeError:
+            _track_kwargs.pop('orig_text', None)
+            _track_kwargs.pop('setup_source', None)
+            _track_kwargs.pop('setup_source_label', None)
+            await db_store.upsert_signal_track(**_track_kwargs)
     except Exception:
         pass
     ORIGINAL_SIGNAL_TEXT[(0, sig.signal_id)] = _signal_text(0, sig)
