@@ -3237,6 +3237,16 @@ def _signal_text(uid: int, s: Signal, *, autotrade_hint: str = "") -> str:
     # Confirm line: primary venue that produced the signal.
     src_ex = (getattr(s, 'source_exchange', '') or '').strip()
     confirm_line = f"{tr(uid, 'sig_confirm')}: {src_ex}"
+    try:
+        setup_label = (getattr(s, 'setup_source_label', '') or '').strip()
+        if not setup_label:
+            raw_setup = (getattr(s, 'setup_source', '') or '').strip().lower().replace('_', ' ')
+            if raw_setup in ('origin', 'breakout', 'zone retest', 'normal pending trigger'):
+                setup_label = raw_setup
+        if setup_label:
+            confirm_line = f"{confirm_line}\n🧭 Smart-setup: {setup_label}"
+    except Exception:
+        pass
 
     autotrade_line = f"{tr(uid, 'sig_autotrade')}: {autotrade_hint}\n" if autotrade_hint else ""
 
