@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-03-31_smart_setup_zone_fix_v4_3_zone_touch_pre_emit_pass"
+MID_BUILD_TAG = "MID_BUILD_2026-04-01_long_directional_fix_v4_3a"
 
 import asyncio
 import json
@@ -2325,12 +2325,15 @@ def _mid_final_emit_gate_reason(*,
     if anchor_far and float(anchor_slip_atr or 0.0) > float(hard_anchor_max):
         return f"late_from_anchor:{float(anchor_slip_atr):.2f}>{float(hard_anchor_max):.2f}"
 
-    if market_u != "FUTURES" or direction_u != "SHORT":
-        return ""
-
-    _dir_reason = _mid_directional_contradiction_reason(ta, it)
+    # Directional contradiction must veto ALL real emits, not only FUTURES SHORT.
+    # Trigger-time context can be split across fresh TA, pending record and gate_meta,
+    # so merge all available sources before the short-only branch below.
+    _dir_reason = _mid_directional_contradiction_reason(ta, it, gate_meta)
     if _dir_reason:
         return str(_dir_reason)
+
+    if market_u != "FUTURES" or direction_u != "SHORT":
+        return ""
 
     try:
         macd_v = macd_hist if macd_hist is not None else _safe_float((ta or {}).get("macd_hist"), None)
