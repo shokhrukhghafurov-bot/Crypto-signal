@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-03-31_smart_setup_zone_fix_v4_3"
+MID_BUILD_TAG = "MID_BUILD_2026-03-31_smart_setup_zone_fix_v4_3_zone_touch_pre_emit_pass"
 
 import asyncio
 import json
@@ -24424,6 +24424,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                                             except Exception:
                                                                 pass
                                                         continue
+
+                                                    try:
+                                                        logger.info("[mid][pre_emit_pass] %s market=%s dir=%s route=%s", sym, sig_zone.market, sig_zone.direction, "zone_touch_emit")
+                                                    except Exception:
+                                                        pass
 
                                                     try:
                                                         self.mark_emitted_mid(sym, sig_zone.direction, sig_zone.market)
