@@ -26253,6 +26253,32 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
                         continue
+                    _pending_confirm_source = _mid_pick_pending_setup_source(
+                        it,
+                        zone_first=bool(it.get("_trig_zone_first")),
+                        in_zone_now=bool(it.get("_in_zone") or it.get("_in_zone_tol") or it.get("_entered_zone_now") or False),
+                    )
+                    sig = Signal(
+                        signal_id=self.next_signal_id(),
+                        market=market,
+                        symbol=sym,
+                        direction=direction,
+                        timeframe=str(it.get("timeframe") or "5m/30m/1h"),
+                        entry=entry,
+                        sl=sl,
+                        tp1=tp1,
+                        tp2=tp2,
+                        rr=rr,
+                        confidence=conf,
+                        confirmations=conf_names,
+                        source_exchange=src_ex,
+                        available_exchanges=conf_names,
+                        risk_note=str(it.get("risk_note") or "ENTRY CONFIRMED") + " | confirmed_entry=1 | trigger_revalidated=1 | levels_anchor=1",
+                        ts=time.time(),
+                        setup_source=_pending_confirm_source,
+                        setup_source_label=_mid_setup_source_label(_pending_confirm_source),
+                    )
+
                     _pre_emit_reason = await self.mid_pre_emit_block_reason(
                         sig=sig,
                         ta=ta,
@@ -26291,31 +26317,6 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         it["confirmed_entry_ts"] = float(now)
                     except Exception:
                         pass
-                    _pending_confirm_source = _mid_pick_pending_setup_source(
-                        it,
-                        zone_first=bool(it.get("_trig_zone_first")),
-                        in_zone_now=bool(it.get("_in_zone") or it.get("_in_zone_tol") or it.get("_entered_zone_now") or False),
-                    )
-                    sig = Signal(
-                        signal_id=self.next_signal_id(),
-                        market=market,
-                        symbol=sym,
-                        direction=direction,
-                        timeframe=str(it.get("timeframe") or "5m/30m/1h"),
-                        entry=entry,
-                        sl=sl,
-                        tp1=tp1,
-                        tp2=tp2,
-                        rr=rr,
-                        confidence=conf,
-                        confirmations=conf_names,
-                        source_exchange=src_ex,
-                        available_exchanges=conf_names,
-                        risk_note=str(it.get("risk_note") or "ENTRY CONFIRMED") + " | confirmed_entry=1 | trigger_revalidated=1 | levels_anchor=1",
-                        ts=time.time(),
-                        setup_source=_pending_confirm_source,
-                        setup_source_label=_mid_setup_source_label(_pending_confirm_source),
-                    )
 
                     _rr_ok, _rr_val, _rr_min = signal_rr_gate(sig)
                     if not _rr_ok:
