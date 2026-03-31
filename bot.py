@@ -3063,7 +3063,7 @@ def _uid_can_view_private_ta(uid: int) -> bool:
 
 
 _PRIVATE_TA_LINE_RE = re.compile(
-    r"^(?:TA score:|Signal strength:|Confidence:|RSI(?:\([^)]*\))?:|ADX(?: .*?)?:|BB:|Trap:|Div:|Ch:|Liquidity(?: .*?)?:|Breakout/Retest:|Pattern:|Additional TA:|HTF struct:)",
+    r"^(?:TA score:|Signal strength:|Smart-setup:|Confidence:|RSI(?:\([^)]*\))?:|ADX(?: .*?)?:|BB:|Trap:|Div:|Ch:|Liquidity(?: .*?)?:|Breakout/Retest:|Pattern:|Additional TA:|HTF struct:)",
     re.UNICODE,
 )
 
@@ -3237,20 +3237,35 @@ def _signal_text(uid: int, s: Signal, *, autotrade_hint: str = "") -> str:
     # Confirm line: primary venue that produced the signal.
     src_ex = (getattr(s, 'source_exchange', '') or '').strip()
     confirm_line = f"{tr(uid, 'sig_confirm')}: {src_ex}"
-    try:
-        setup_label = (getattr(s, 'setup_source_label', '') or '').strip()
-        if not setup_label:
-            raw_setup = (getattr(s, 'setup_source', '') or '').strip().lower().replace('_', ' ')
-            if raw_setup in ('origin', 'breakout', 'zone retest', 'normal pending trigger'):
-                setup_label = raw_setup
-        if setup_label:
-            confirm_line = f"{confirm_line}\n🧭 Smart-setup: {setup_label}"
-    except Exception:
-        pass
 
     autotrade_line = f"{tr(uid, 'sig_autotrade')}: {autotrade_hint}\n" if autotrade_hint else ""
 
     risk_note = _risk_note_for_uid(uid, s.risk_note)
+    try:
+        if _uid_can_view_private_ta(uid):
+            setup_label = (getattr(s, 'setup_source_label', '') or '').strip()
+            if not setup_label:
+                raw_setup = (getattr(s, 'setup_source', '') or '').strip().lower().replace('_', ' ')
+                if raw_setup in ('origin', 'breakout', 'zone retest', 'normal pending trigger'):
+                    setup_label = raw_setup
+            if setup_label:
+                setup_line = f"🧭 Smart-setup: {setup_label}"
+                if risk_note:
+                    lines = [ln.rstrip() for ln in str(risk_note).splitlines()]
+                    inserted = False
+                    for idx, raw_line in enumerate(lines):
+                        core = _strip_private_ta_prefix(raw_line)
+                        if core.startswith('TA score:') or core.startswith('Signal strength:'):
+                            lines.insert(idx, setup_line)
+                            inserted = True
+                            break
+                    if not inserted:
+                        lines.append(setup_line)
+                    risk_note = "\n".join([ln for ln in lines if str(ln).strip()]).strip()
+                else:
+                    risk_note = setup_line
+    except Exception:
+        pass
     strength_line = ""
     if risk_note:
         keep_lines: list[str] = []
@@ -3389,6 +3404,29 @@ def _report_close_reason(final_status: str, *, after_tp1: bool = False, has_tp2:
     return "Сигнал закрыт."
 
 
+def _report_setup_label_from_row(row: dict) -> str:
+    try:
+        label = str(row.get("setup_source_label") or "").strip()
+        if not label:
+            raw = str(row.get("setup_source") or "").strip().lower().replace("_", " ")
+            if raw in ("origin", "breakout", "zone retest", "normal pending trigger"):
+                label = raw
+        if label:
+            return label
+        orig_text = str(row.get("orig_text") or "")
+        if orig_text:
+            m = re.search(r"(?:^|\n)\s*(?:🧭\s*)?Smart-setup:\s*([^\n\r]+)", orig_text, flags=re.IGNORECASE)
+            if m:
+                found = str(m.group(1) or "").strip()
+                raw = found.lower().replace("_", " ")
+                if raw in ("origin", "breakout", "zone retest", "normal pending trigger"):
+                    return raw
+                return found
+    except Exception:
+        pass
+    return ""
+
+
 def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pct: float, closed_at: dt.datetime | None = None) -> str:
     row = dict(t or {})
     st = str(final_status or "CLOSED").upper().strip() or "CLOSED"
@@ -3412,6 +3450,8 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
     closed_time = _fmt_dt_msk(closed_dt)
     tz_label = _report_tz_label()
 
+    setup_label = _report_setup_label_from_row(row)
+
     price_lines = []
     if entry > 0:
         price_lines.append(f"💰 Вход: {entry:.6f}")
@@ -3425,11 +3465,14 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
         price_lines.append(f"🛡 BE: {be_price:.6f}")
     price_block = "\n".join(price_lines).strip() or "—"
 
+    setup_block = f"🧭 Smart-setup: {setup_label}\n" if setup_label else ""
+
     return (
         f"{_report_close_emoji(st)} {symbol} | {market} | {side}\n\n"
         f"📌 Статус: {_report_close_status(st, after_tp1=after_tp1)}\n"
         f"📊 Итог PnL: {_report_pnl_pct(pnl_total_pct)}\n"
         f"📊 Risk/Reward: 1 : {rr}\n"
+        f"{setup_block}"
         f"🧠 Причина: {reason}\n\n"
         f"──────────────\n\n"
         f"{price_block}\n\n"
