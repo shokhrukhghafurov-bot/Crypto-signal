@@ -1591,20 +1591,24 @@ def _mid_zone_touch_emit_min_conf() -> int:
     except Exception:
         base = 90
     try:
-        softer_default = int(float(os.getenv("MID_ZONE_TOUCH_EMIT_DEFAULT_CONF", str(min(base, 82))) or min(base, 82)))
+        softer_default = int(float(os.getenv("MID_ZONE_TOUCH_EMIT_DEFAULT_CONF", str(min(base, 80))) or min(base, 80)))
     except Exception:
-        softer_default = min(base, 82)
+        softer_default = min(base, 80)
     try:
         origin_default = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF", str(softer_default)) or softer_default))
     except Exception:
         origin_default = softer_default
     try:
+        fresh_default = int(float(os.getenv("MID_ZONE_TOUCH_EMIT_MIN_CONF_FRESH", str(min(origin_default, 78))) or min(origin_default, 78)))
+    except Exception:
+        fresh_default = min(origin_default, 78)
+    try:
         raw = os.getenv("MID_ZONE_TOUCH_EMIT_MIN_CONF")
         if raw is None or str(raw).strip() == "":
-            return max(0, int(min(origin_default, softer_default)))
+            return max(0, int(min(fresh_default, softer_default, origin_default)))
         return max(0, int(float(raw)))
     except Exception:
-        return max(0, int(min(origin_default, softer_default)))
+        return max(0, int(min(fresh_default, softer_default, origin_default)))
 
 
 def _mid_zone_touch_emit_context_ok(ta: dict | None, it: dict | None = None, *, now_ts: float | None = None) -> bool:
@@ -1618,6 +1622,11 @@ def _mid_zone_touch_emit_context_ok(ta: dict | None, it: dict | None = None, *, 
     """
     t = ta if isinstance(ta, dict) else {}
     rec = it if isinstance(it, dict) else {}
+    try:
+        if bool(rec.get("smart_origin_fast_ok") or rec.get("smart_breakout_fast_ok")):
+            return True
+    except Exception:
+        pass
     try:
         if _mid_pending_is_fresh_bo_rt(rec, now_ts=now_ts):
             return True
@@ -1742,14 +1751,28 @@ def _mid_zone_first_ready(ta: dict | None, it: dict | None, checks: dict | None 
         guard_reason = _mid_zone_touch_guard_reason(t, rec)
         if guard_reason:
             return (False, 0, [])
+        micro_n, labels = _mid_zone_first_micro_passed(ch)
+        fresh_bo_rt = False
+        try:
+            fresh_bo_rt = _mid_pending_is_fresh_bo_rt(rec, now_ts=now_ts)
+        except Exception:
+            fresh_bo_rt = False
         conf = 0
         for cand in (t.get("confidence"), rec.get("confidence"), rec.get("min_confidence"), t.get("score")):
             try:
                 conf = max(conf, int(float(cand or 0)))
             except Exception:
                 pass
-        if conf < _mid_zone_touch_emit_min_conf():
-            return (False, 0, [])
+        conf_need = _mid_zone_touch_emit_min_conf()
+        try:
+            if fresh_bo_rt and micro_n >= 2:
+                conf_need = min(int(conf_need), int(float(os.getenv("MID_ZONE_FIRST_MIN_CONF_FRESH", "76") or 76)))
+            elif ("reclaim" in labels) and ("bos_5m" in labels or "displacement" in labels):
+                conf_need = min(int(conf_need), int(float(os.getenv("MID_ZONE_FIRST_MIN_CONF_RECLAIM", "78") or 78)))
+        except Exception:
+            pass
+        if conf < int(conf_need):
+            return (False, micro_n, labels)
         try:
             price_now = float(t.get("entry") or t.get("close") or 0.0)
         except Exception:
@@ -1758,9 +1781,14 @@ def _mid_zone_first_ready(ta: dict | None, it: dict | None, checks: dict | None 
             _anchor_ref, anchor_too_far, _anchor_slip_atr = _mid_pending_entry_ref(rec, price=price_now, ta=t)
         except Exception:
             anchor_too_far = False
+            _anchor_slip_atr = 0.0
         if anchor_too_far:
-            return (False, 0, [])
-        micro_n, labels = _mid_zone_first_micro_passed(ch)
+            try:
+                anchor_soft_max = float(os.getenv("MID_ZONE_FIRST_MAX_SLIPPAGE_ATR_FRESH", "0.90") if fresh_bo_rt else os.getenv("MID_ZONE_FIRST_MAX_SLIPPAGE_ATR", "0.55"))
+            except Exception:
+                anchor_soft_max = 0.90 if fresh_bo_rt else 0.55
+            if float(_anchor_slip_atr or 0.0) > float(anchor_soft_max):
+                return (False, micro_n, labels)
         if micro_n < _mid_zone_first_min_confirmations():
             return (False, micro_n, labels)
         return (True, micro_n, labels)
@@ -2223,6 +2251,8 @@ def _mid_final_emit_apply_reason(reason: str) -> str:
         r = ""
     if not r:
         return "blocked"
+    if r.startswith("late_from_anchor"):
+        return "late_entry"
     if "directional_contradiction" in r:
         return "directional_contradiction"
     if r.startswith("macd_hist=") or "macd_hist" in r:
@@ -2267,6 +2297,34 @@ def _mid_final_emit_gate_reason(*,
         direction_u = str((getattr(sig, "direction", None) if sig is not None else "") or (ta or {}).get("direction") or (it or {}).get("direction") or "").upper().strip()
     except Exception:
         market_u, direction_u = "", ""
+    try:
+        entry_now = _safe_float((ta or {}).get("entry"), None)
+        if entry_now is None:
+            entry_now = _safe_float((ta or {}).get("close"), None)
+        if entry_now is None and sig is not None:
+            entry_now = _safe_float(getattr(sig, "entry", None), None)
+    except Exception:
+        entry_now = None
+    try:
+        anchor_ref, anchor_far, anchor_slip_atr = _mid_pending_entry_ref(it, price=entry_now, ta=ta)
+    except Exception:
+        anchor_ref, anchor_far, anchor_slip_atr = (0.0, False, 0.0)
+    try:
+        fresh_anchor = bool(breakout_fresh_ok or _mid_pending_is_fresh_bo_rt(it))
+    except Exception:
+        fresh_anchor = bool(breakout_fresh_ok)
+    try:
+        hard_anchor_max = float(os.getenv("MID_FINAL_EMIT_MAX_ANCHOR_SLIP_ATR_FRESH", "0.75") if fresh_anchor else os.getenv("MID_FINAL_EMIT_MAX_ANCHOR_SLIP_ATR", "0.45"))
+    except Exception:
+        hard_anchor_max = 0.75 if fresh_anchor else 0.45
+    try:
+        if bool(in_zone_now):
+            hard_anchor_max += float(os.getenv("MID_FINAL_EMIT_IN_ZONE_SLIP_PAD", "0.10") or 0.10)
+    except Exception:
+        pass
+    if anchor_far and float(anchor_slip_atr or 0.0) > float(hard_anchor_max):
+        return f"late_from_anchor:{float(anchor_slip_atr):.2f}>{float(hard_anchor_max):.2f}"
+
     if market_u != "FUTURES" or direction_u != "SHORT":
         return ""
 
@@ -2389,9 +2447,9 @@ def _mid_trigger_selected_hardblock_reason(reason: str, it: dict | None = None) 
         head = raw.split()[0].split("=", 1)[0].strip().lower()
         fresh_bo_rt = _mid_pending_is_fresh_bo_rt(it)
         try:
-            trader_mode = (os.getenv("MID_TRIGGER_TRADER_MODE", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+            trader_mode = (os.getenv("MID_TRIGGER_TRADER_MODE", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
         except Exception:
-            trader_mode = True
+            trader_mode = False
         if head in ("rsi_long", "rsi_short"):
             if trader_mode:
                 m = re.search(r"([<>]=?)\s*([0-9.]+)", raw)
@@ -10216,9 +10274,9 @@ def _mid_smart_setup_origin_fastpath(*,
     except Exception:
         base_conf_need = 90
     try:
-        conf_need = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF", str(min(base_conf_need, 86))) or min(base_conf_need, 86)))
+        conf_need = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF", str(min(base_conf_need, 82))) or min(base_conf_need, 82)))
     except Exception:
-        conf_need = min(base_conf_need, 86)
+        conf_need = min(base_conf_need, 82)
     conf_need = max(0, int(conf_need))
 
     min_atr, min_vol = _mid_instant_emit_market_thresholds(market)
@@ -10234,17 +10292,17 @@ def _mid_smart_setup_origin_fastpath(*,
         vol_need = max(0.0, float(min_vol) * 0.95)
     atr_need = max(0.0, float(min_atr) * max(0.0, float(atr_mult)))
     try:
-        min_body_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR", "0.20") or 0.20)
+        min_body_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR", "0.16") or 0.16)
     except Exception:
-        min_body_atr = 0.20
+        min_body_atr = 0.16
     try:
-        max_age_bars = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_AGE_BARS", "2") or 2))
+        max_age_bars = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_AGE_BARS", "3") or 3))
     except Exception:
-        max_age_bars = 2
+        max_age_bars = 3
     try:
-        max_move_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_MOVE_ATR", "0.60") or 0.60)
+        max_move_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_MOVE_ATR", "0.90") or 0.90)
     except Exception:
-        max_move_atr = 0.60
+        max_move_atr = 0.90
     try:
         allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_SMART_SETUP_ORIGIN_ALLOWED_REGIMES", "")) if str(x).strip()}
     except Exception:
@@ -10347,8 +10405,30 @@ def _mid_smart_setup_origin_fastpath(*,
         except Exception:
             age0_has_alt_impulse = bool(sweep_ok)
 
+    try:
+        fresh_origin_bias = bool(bo_ok and age_v is not None and age_v <= 1)
+    except Exception:
+        fresh_origin_bias = False
+    if fresh_origin_bias:
+        try:
+            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF_FRESH", "80") or 80)))
+        except Exception:
+            conf_need = min(int(conf_need), 80)
+        try:
+            body_need_eff = min(float(body_need_eff), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR_FRESH", "0.10") or 0.10))
+        except Exception:
+            pass
+        try:
+            vol_need_eff = min(float(vol_need_eff), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X_FRESH", "0.02") or 0.02))
+        except Exception:
+            pass
+        try:
+            max_move_atr = max(float(max_move_atr), float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_MOVE_ATR_FRESH", "1.10") or 1.10))
+        except Exception:
+            pass
     meta.update({
         "enabled": bool(enabled),
+        "fresh_origin_bias": bool(fresh_origin_bias),
         "bo_rt": bo,
         "bo_ok": bool(bo_ok),
         "sweep_ok": bool(sweep_ok),
