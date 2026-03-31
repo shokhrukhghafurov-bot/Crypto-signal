@@ -11865,9 +11865,92 @@ class Signal:
     available_exchanges: str = ""
     risk_note: str = ""
     ts: float = 0.0
+    setup_source: str = ""
+    setup_source_label: str = ""
 
     def __post_init__(self):
+        try:
+            src = _mid_setup_source_normalize(getattr(self, "setup_source", "") or getattr(self, "setup_source_label", ""))
+        except Exception:
+            src = ""
+        try:
+            self.setup_source = src
+        except Exception:
+            pass
+        try:
+            self.setup_source_label = _mid_setup_source_label(src) if src else ""
+        except Exception:
+            pass
         _normalize_signal_levels_inplace(self)
+
+
+def _mid_setup_source_normalize(source: str | None) -> str:
+    try:
+        s = str(source or "").strip().lower().replace('-', '_')
+    except Exception:
+        s = ""
+    aliases = {
+        "origin": "origin",
+        "breakout": "breakout",
+        "zone": "zone_retest",
+        "zone_retest": "zone_retest",
+        "zone retest": "zone_retest",
+        "zone_touch": "zone_retest",
+        "zone touch": "zone_retest",
+        "zone-touch": "zone_retest",
+        "normal_pending_trigger": "normal_pending_trigger",
+        "normal pending trigger": "normal_pending_trigger",
+        "pending": "normal_pending_trigger",
+        "pending_trigger": "normal_pending_trigger",
+    }
+    return aliases.get(s, s if s in {"origin", "breakout", "zone_retest", "normal_pending_trigger"} else "")
+
+
+def _mid_setup_source_label(source: str | None) -> str:
+    src = _mid_setup_source_normalize(source)
+    labels = {
+        "origin": "origin",
+        "breakout": "breakout",
+        "zone_retest": "zone retest",
+        "normal_pending_trigger": "normal pending trigger",
+    }
+    return labels.get(src, "")
+
+
+def _mid_apply_signal_setup_source(sig: Signal | None, source: str | None) -> str:
+    src = _mid_setup_source_normalize(source)
+    if sig is None or not src:
+        return src
+    try:
+        sig.setup_source = src
+    except Exception:
+        pass
+    try:
+        sig.setup_source_label = _mid_setup_source_label(src)
+    except Exception:
+        pass
+    return src
+
+
+def _mid_pick_scan_setup_source(*, origin_fast_ok: bool = False, breakout_fast_ok: bool = False, zone_valid: bool = False, in_zone_now: bool = False) -> str:
+    """Smart-setup priority at scan time: origin > breakout > zone-touch/retest."""
+    if bool(origin_fast_ok):
+        return "origin"
+    if bool(breakout_fast_ok):
+        return "breakout"
+    if bool(zone_valid) and bool(in_zone_now):
+        return "zone_retest"
+    return ""
+
+
+def _mid_pick_pending_setup_source(it: dict | None = None, *, zone_touch: bool = False, zone_first: bool = False, in_zone_now: bool = False) -> str:
+    """Pending priority after scan: zone-touch > normal pending trigger."""
+    rec = it if isinstance(it, dict) else {}
+    if bool(zone_touch) or bool(zone_first) or bool(rec.get("_trig_zone_first")):
+        return "zone_retest"
+    if bool(in_zone_now) and bool(rec.get("entry_zone_src")):
+        return "zone_retest"
+    return "normal_pending_trigger"
 
 @dataclass
 
@@ -23706,6 +23789,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 conf_emit = int(float(it.get("confidence") or it.get("min_confidence") or 0))
                                 conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "") or str(src_ex)
 
+                                _pending_source = _mid_pick_pending_setup_source(it, in_zone_now=bool(it.get("_in_zone") or it.get("_in_zone_tol") or it.get("_entered_zone_now") or False))
                                 sig = Signal(
                                     signal_id=self.next_signal_id(),
                                     market=market,
@@ -23723,6 +23807,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     available_exchanges=conf_names,
                                     risk_note=str(it.get("risk_note") or "INSTANT_EMIT (filters bypassed)") + " | instant_emit_bypass=1 | levels_anchor=1",
                                     ts=time.time(),
+                                    setup_source=_pending_source,
+                                    setup_source_label=_mid_setup_source_label(_pending_source),
                                 )
 
                                 _rr_ok, _rr_val, _rr_min = signal_rr_gate(sig)
@@ -24098,6 +24184,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                         available_exchanges=str(it.get("available_exchanges") or it.get("confirmations") or src_ex),
                                         risk_note=_touch_note,
                                         ts=time.time(),
+                                        setup_source="zone_retest",
+                                        setup_source_label=_mid_setup_source_label("zone_retest"),
                                     )
                                     _normalize_signal_levels_inplace(sig_zone)
                                     _levels_ok, _levels_reason = _signal_levels_sanity_gate(sig_zone)
@@ -24520,6 +24608,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
                         conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "") or str(src_ex)
+                        _instant_pending_source = _mid_pick_pending_setup_source(it, in_zone_now=bool(in_zone_now))
                         sig_instant = Signal(
                             signal_id=self.next_signal_id(),
                             market=market,
@@ -24537,6 +24626,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             available_exchanges=conf_names,
                             risk_note=str(it.get("risk_note") or "") + " | instant_vip=1 | confirmed_entry=1 | levels_anchor=1",
                             ts=time.time(),
+                            setup_source=_instant_pending_source,
+                            setup_source_label=_mid_setup_source_label(_instant_pending_source),
                         )
                         instant_ok, instant_reason, instant_meta = _mid_instant_emit_gate(
                             market=market,
@@ -25929,6 +26020,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         it["confirmed_entry_ts"] = float(now)
                     except Exception:
                         pass
+                    _pending_confirm_source = _mid_pick_pending_setup_source(
+                        it,
+                        zone_first=bool(it.get("_trig_zone_first")),
+                        in_zone_now=bool(it.get("_in_zone") or it.get("_in_zone_tol") or it.get("_entered_zone_now") or False),
+                    )
                     sig = Signal(
                         signal_id=self.next_signal_id(),
                         market=market,
@@ -25946,6 +26042,8 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         available_exchanges=conf_names,
                         risk_note=str(it.get("risk_note") or "ENTRY CONFIRMED") + " | confirmed_entry=1 | trigger_revalidated=1 | levels_anchor=1",
                         ts=time.time(),
+                        setup_source=_pending_confirm_source,
+                        setup_source_label=_mid_setup_source_label(_pending_confirm_source),
                     )
 
                     _rr_ok, _rr_val, _rr_min = signal_rr_gate(sig)
@@ -29861,6 +29959,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "source_exchange": best_name,
                                         "available_exchanges": conf_names,
                                         "risk_note": risk_note,
+                                        "setup_source": "",
+                                        "setup_source_label": "",
                                         "risk_flags": risk_flags,
                                         "ttl_min": float(_ttl_min),
                                         "max_attempts": int(_max_attempts),
@@ -30335,6 +30435,18 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 allow_no_zone_breakout=bool(_smart_emit_if_no_zone),
                                                 confidence=float(_conf_now),
                                             )
+                                            _smart_emit_source = _mid_pick_scan_setup_source(
+                                                origin_fast_ok=bool(_origin_fast_ok),
+                                                breakout_fast_ok=bool(_breakout_fast_ok),
+                                                zone_valid=bool(_zone_valid),
+                                                in_zone_now=bool(_in_zone_now),
+                                            )
+                                            _mid_apply_signal_setup_source(sig_emit, _smart_emit_source)
+                                            try:
+                                                rec["setup_source"] = str(_smart_emit_source or "")
+                                                rec["setup_source_label"] = _mid_setup_source_label(_smart_emit_source)
+                                            except Exception:
+                                                pass
                                             _emit_now, _emit_reason, _emit_meta = _mid_instant_emit_gate(
                                                 market=marketu,
                                                 direction=diru,
@@ -30427,6 +30539,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 rec["smart_emit_now"] = bool(_emit_now)
                                                 rec["smart_emit_reason"] = str(_emit_reason)
                                                 rec["smart_emit_meta"] = dict(_emit_meta or {})
+                                                rec["smart_emit_source"] = str(_smart_emit_source or "")
+                                                rec["smart_emit_source_label"] = _mid_setup_source_label(_smart_emit_source)
                                             except Exception:
                                                 pass
 
