@@ -30912,6 +30912,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     except Exception:
                                                         pass
                                                     continue
+                                                try:
+                                                    logger.info("[mid][pre_emit_pass] %s market=%s dir=%s route=%s", sym, sig_emit.market, sig_emit.direction, "smart_emit_now")
+                                                except Exception:
+                                                    pass
 
                                                 try:
                                                     self.mark_emitted_mid(sym, sig_emit.direction, sig_emit.market)
@@ -31106,6 +31110,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                 except Exception:
                                     pass
                                 continue
+                            try:
+                                logger.info("[mid][pre_emit_pass] %s market=%s dir=%s route=%s", sym, sig.market, sig.direction, "scanner_mid_emit")
+                            except Exception:
+                                pass
 
                             try:
                                 self.mark_emitted_mid(sym, sig.direction, sig.market)
@@ -35246,14 +35254,61 @@ async def _backend_mid_pre_emit_block_reason(
         direction = str(getattr(sig, "direction", "") or "").upper().strip()
 
         rec = it if isinstance(it, dict) else {}
+        ta_d = ta if isinstance(ta, dict) else {}
+        meta = gate_meta if isinstance(gate_meta, dict) else {}
+
+        def _first_reason(*vals) -> str:
+            for v in vals:
+                try:
+                    s = str(v or "").strip()
+                except Exception:
+                    s = ""
+                if s:
+                    return s
+            return ""
+
+        def _selected_hard(raw: str) -> str:
+            try:
+                hb_log_reason, _hb_apply = _mid_trigger_selected_hardblock_reason(str(raw or ""), rec)
+                if hb_log_reason:
+                    return str(raw or "").strip()
+            except Exception:
+                pass
+            return ""
+
+        # 1) Never allow explicit smart-setup trap vetoes to bypass emit.
         if rec.get("smart_setup_trap_ok") is False:
             return str(rec.get("smart_setup_trap_reason") or "smart_setup_trap")
-        if isinstance(gate_meta, dict) and gate_meta.get("smart_setup_trap_ok") is False:
-            return str(gate_meta.get("smart_setup_trap_reason") or "smart_setup_trap")
+        if meta.get("smart_setup_trap_ok") is False:
+            return str(meta.get("smart_setup_trap_reason") or "smart_setup_trap")
 
+        # 2) Respect any explicit hard block already computed upstream.
+        explicit_hard = _first_reason(
+            _selected_hard(_first_reason(ta_d.get("block_reason"), rec.get("block_reason"))),
+            _selected_hard(_first_reason(ta_d.get("trap_reason") if ta_d.get("trap_ok") is False else "", rec.get("trap_reason") if rec.get("trap_ok") is False else "")),
+            _selected_hard(_first_reason(meta.get("block_reason"), meta.get("trap_reason"), meta.get("primary_reason"), meta.get("final_emit_kill"))),
+        )
+        if explicit_hard:
+            return explicit_hard
+
+        # 3) Guard against unit/scale mismatch before any real emit.
+        try:
+            sig_entry = _safe_float(getattr(sig, "entry", None), None)
+            ta_entry = _safe_float(ta_d.get("entry"), None)
+            if ta_entry is None:
+                ta_entry = _safe_float(ta_d.get("close"), None)
+            ratio_max = float(os.getenv("MID_PRE_EMIT_ENTRY_RATIO_MAX", "20") or 20)
+            if sig_entry and ta_entry and sig_entry > 0 and ta_entry > 0 and ratio_max > 1:
+                ratio = max(float(sig_entry), float(ta_entry)) / max(1e-12, min(float(sig_entry), float(ta_entry)))
+                if ratio >= ratio_max:
+                    return f"entry_unit_mismatch:{ratio:.2f}x"
+        except Exception:
+            pass
+
+        # 4) Re-run final emit kill with the latest context.
         final_reason = _mid_final_emit_gate_reason(
             sig=sig,
-            ta=ta,
+            ta=ta_d,
             it=rec,
             risk_flags=risk_flags if risk_flags is not None else rec.get("risk_flags"),
             vol_x=vol_x,
@@ -35263,13 +35318,14 @@ async def _backend_mid_pre_emit_block_reason(
             micro_trap_ok=micro_trap_ok,
             macd_hist=macd_hist,
             anti_bounce_reason=anti_bounce_reason,
-            gate_meta=gate_meta,
+            gate_meta=meta,
             zone_src=zone_src,
             in_zone_now=bool(in_zone_now),
         )
         if final_reason:
             return str(final_reason)
 
+        # 5) BTC leader veto is the last market-wide gate.
         btc_reason = await self.mid_btc_emit_block_reason(symbol=sym, market=market, direction=direction)
         if btc_reason:
             return str(btc_reason)
