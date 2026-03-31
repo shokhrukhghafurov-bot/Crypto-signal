@@ -35149,6 +35149,27 @@ def _mid_btc_filter_cache_ttl_sec() -> float:
         return 20.0
 
 
+def _mid_btc_filter_adx5m_min() -> float:
+    try:
+        return float(os.getenv("MID_BTC_FILTER_ADX5M_MIN", "18") or 18)
+    except Exception:
+        return 18.0
+
+
+def _mid_btc_filter_emergency_5m_enabled() -> bool:
+    try:
+        return (os.getenv("MID_BTC_FILTER_EMERGENCY_5M", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return True
+
+
+def _mid_btc_filter_emergency_5m_cache_ttl_sec() -> float:
+    try:
+        return max(1.0, min(float(os.getenv("MID_BTC_FILTER_EMERGENCY_5M_CACHE_TTL_SEC", "5") or 5), 30.0))
+    except Exception:
+        return 5.0
+
+
 def _mid_btc_filter_same_market() -> bool:
     try:
         return (os.getenv("MID_BTC_FILTER_USE_SIGNAL_MARKET", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
@@ -35198,20 +35219,120 @@ def _mid_btc_bias_snapshot(df30: pd.DataFrame, df1h: pd.DataFrame) -> dict | Non
             and dir1h == "SHORT"
             and adx30 >= _mid_btc_filter_adx30_min()
             and adx1h >= _mid_btc_filter_adx1h_min()
-            and close30 is not None and ema20_30 is not None and ema50_30 is not None and ema200_30 is not None
-            and float(close30) <= float(ema200_30)
-            and float(ema20_30) < float(ema50_30)
         )
         return {
             "dir30": str(dir30),
             "dir1h": str(dir1h),
             "adx30": float(adx30),
             "adx1h": float(adx1h),
+            "close30": float(close30) if close30 is not None else None,
+            "ema20_30": float(ema20_30) if ema20_30 is not None else None,
+            "ema50_30": float(ema50_30) if ema50_30 is not None else None,
+            "ema200_30": float(ema200_30) if ema200_30 is not None else None,
             "bull": bool(bull),
             "bear": bool(bear),
         }
     except Exception:
         return None
+
+
+def _mid_btc_emergency_5m_snapshot(df5: pd.DataFrame) -> dict | None:
+    try:
+        if df5 is None or df5.empty:
+            return None
+        df5i = _add_indicators(df5)
+        if df5i is None or df5i.empty:
+            return None
+        dir5 = _trend_dir(df5i)
+        if not dir5:
+            return None
+        last5 = df5i.iloc[-1]
+        close5 = _safe_float(last5.get("close"), None)
+        ema20_5 = _safe_float(last5.get("ema20"), None)
+        ema50_5 = _safe_float(last5.get("ema50"), None)
+        adx5 = _safe_float(last5.get("adx"), 0.0) or 0.0
+        macd_hist5 = _safe_float(last5.get("macd_hist"), None)
+        bear_fast = bool(
+            dir5 == "SHORT"
+            and adx5 >= _mid_btc_filter_adx5m_min()
+            and (
+                (close5 is not None and ema20_5 is not None and ema50_5 is not None and float(close5) < float(ema20_5) and float(ema20_5) <= float(ema50_5))
+                or (macd_hist5 is not None and float(macd_hist5) < 0.0)
+            )
+        )
+        bull_fast = bool(
+            dir5 == "LONG"
+            and adx5 >= _mid_btc_filter_adx5m_min()
+            and (
+                (close5 is not None and ema20_5 is not None and ema50_5 is not None and float(close5) > float(ema20_5) and float(ema20_5) >= float(ema50_5))
+                or (macd_hist5 is not None and float(macd_hist5) > 0.0)
+            )
+        )
+        return {
+            "dir5": str(dir5),
+            "adx5": float(adx5),
+            "close5": float(close5) if close5 is not None else None,
+            "ema20_5": float(ema20_5) if ema20_5 is not None else None,
+            "ema50_5": float(ema50_5) if ema50_5 is not None else None,
+            "macd_hist5": float(macd_hist5) if macd_hist5 is not None else None,
+            "bull_fast": bool(bull_fast),
+            "bear_fast": bool(bear_fast),
+        }
+    except Exception:
+        return None
+
+
+def _mid_pre_emit_require_bo_rt(sig: Signal | None, route: str, rec: dict | None, ta: dict | None, meta: dict | None) -> bool:
+    try:
+        route_s = str(route or "").strip().lower()
+        if route_s == "scanner_mid_emit":
+            return True
+        note = str(getattr(sig, "risk_note", "") or "")
+        if "smart_setup_emit=1" in note:
+            return True
+        rec_d = rec if isinstance(rec, dict) else {}
+        meta_d = meta if isinstance(meta, dict) else {}
+        if bool(rec_d.get("smart_setup_emit") or meta_d.get("smart_setup_emit")):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _mid_pre_emit_missing_bo_rt_reason(sig: Signal | None, route: str, rec: dict | None, ta: dict | None, meta: dict | None) -> str:
+    try:
+        if not _mid_pre_emit_require_bo_rt(sig, route, rec, ta, meta):
+            return ""
+        rec_d = rec if isinstance(rec, dict) else {}
+        ta_d = ta if isinstance(ta, dict) else {}
+        meta_d = meta if isinstance(meta, dict) else {}
+        bo = ""
+        for src in (ta_d, rec_d, meta_d):
+            try:
+                bo = str(src.get("bo_rt") or src.get("breakout_retest") or "").strip()
+            except Exception:
+                bo = ""
+            if bo:
+                break
+        bo_norm = str(bo or "").strip().upper()
+        if bo_norm not in ("", "-", "—", "NONE"):
+            return ""
+        ob_retest = False
+        sweep = False
+        for src in (ta_d, rec_d, meta_d):
+            try:
+                ob_retest = ob_retest or bool(src.get("ob_retest"))
+            except Exception:
+                pass
+            try:
+                sweep = sweep or bool(src.get("sweep_long") or src.get("sweep_short"))
+            except Exception:
+                pass
+        if ob_retest or sweep:
+            return ""
+        return "smart_setup_no_breakout_retest"
+    except Exception:
+        return ""
 
 
 def _mid_pre_emit_apply_reason(reason: str) -> str:
@@ -35225,6 +35346,8 @@ def _mid_pre_emit_apply_reason(reason: str) -> str:
         return "direction_mismatch"
     if r.startswith("smart_setup_trap"):
         return "trap_block"
+    if r.startswith("smart_setup_no_breakout_retest"):
+        return "structure_fail"
     return _mid_final_emit_apply_reason(reason)
 
 
@@ -35269,12 +35392,18 @@ async def _backend_mid_pre_emit_block_reason(
         if meta.get("smart_setup_trap_ok") is False:
             return str(meta.get("smart_setup_trap_reason") or "smart_setup_trap")
 
-        # 2) Only keep true directional contradiction as a final local veto.
+        # 2) For direct smart-setup emits, empty BO/RT is a hard veto unless
+        # there is an explicit OB retest or liquidity sweep context.
+        bo_rt_reason = _mid_pre_emit_missing_bo_rt_reason(sig, route, rec, ta_d, meta)
+        if bo_rt_reason:
+            return str(bo_rt_reason)
+
+        # 3) Only keep true directional contradiction as a final local veto.
         dir_reason = _mid_directional_contradiction_reason(ta_d, rec, meta)
         if dir_reason:
             return str(dir_reason)
 
-        # 3) BTC leader veto is the last market-wide gate.
+        # 4) BTC leader veto is the last market-wide gate.
         btc_reason = await self.mid_btc_emit_block_reason(symbol=sym, market=market, direction=direction)
         if btc_reason:
             return str(btc_reason)
@@ -35301,6 +35430,7 @@ async def _backend_mid_btc_emit_block_reason(self: "Backend", *, symbol: str, ma
         sig_market = str(market or "FUTURES").upper().strip()
         bias_market = sig_market if _mid_btc_filter_same_market() else "SPOT"
         cache_ttl = _mid_btc_filter_cache_ttl_sec()
+        emergency_ttl = _mid_btc_filter_emergency_5m_cache_ttl_sec()
         cache = getattr(self, "_mid_btc_bias_cache", None)
         if not isinstance(cache, dict):
             cache = {}
@@ -35311,6 +35441,34 @@ async def _backend_mid_btc_emit_block_reason(self: "Backend", *, symbol: str, ma
 
         snap = None
         now_ts = time.time()
+
+        # Fast emergency veto for BTC 5m impulse. This is intentionally earlier than the
+        # 30m/1h leader filter, so alt LONGs are blocked as soon as BTC starts a strong dump.
+        if side == "LONG" and _mid_btc_filter_emergency_5m_enabled():
+            for mkt_try in ([bias_market] + (["SPOT"] if bias_market != "SPOT" else [])):
+                ck = str(mkt_try).upper().strip()
+                em_ck = f"{ck}:5m_emergency"
+                cached = cache.get(em_ck) if isinstance(cache, dict) else None
+                if isinstance(cached, dict) and (now_ts - float(cached.get("ts") or 0.0)) <= emergency_ttl:
+                    em_snap = cached.get("snap")
+                else:
+                    em_snap = None
+                if em_snap is None:
+                    try:
+                        df5 = await self.load_candles("BTCUSDT", "5m", market=ck, limit=180)
+                        em_snap = _mid_btc_emergency_5m_snapshot(df5)
+                    except Exception:
+                        em_snap = None
+                    if em_snap is not None and isinstance(cache, dict):
+                        cache[em_ck] = {"ts": now_ts, "snap": em_snap}
+                if isinstance(em_snap, dict) and bool(em_snap.get("bear_fast")):
+                    return (
+                        f"btc_filter_block_emergency BTC=SHORT_5M dir5={em_snap.get('dir5')} "
+                        f"adx5={float(em_snap.get('adx5') or 0.0):.1f} macd5={float(em_snap.get('macd_hist5') or 0.0):+.4f}"
+                    )
+                if isinstance(em_snap, dict):
+                    break
+
         for mkt_try in ([bias_market] + (["SPOT"] if bias_market != "SPOT" else [])):
             ck = str(mkt_try).upper().strip()
             cached = cache.get(ck) if isinstance(cache, dict) else None
