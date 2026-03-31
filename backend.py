@@ -11989,10 +11989,10 @@ def _mid_setup_source_normalize(source: str | None) -> str:
 def _mid_setup_source_label(source: str | None) -> str:
     src = _mid_setup_source_normalize(source)
     labels = {
-        "origin": "origin",
-        "breakout": "breakout",
-        "zone_retest": "zone retest",
-        "normal_pending_trigger": "normal pending trigger",
+        "origin": "Начало движения",
+        "breakout": "Пробой",
+        "zone_retest": "Возврат в зону",
+        "normal_pending_trigger": "Обычный trigger",
     }
     return labels.get(src, "")
 
@@ -23976,6 +23976,24 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                             pass
                                     continue
 
+                                _btc_emit_block = await self.mid_btc_emit_block_reason(symbol=sym, market=sig.market, direction=sig.direction)
+                                if _btc_emit_block:
+                                    keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
+                                    _pending_log_trigger(sym, market, direction, outc, _btc_emit_block, it, float(price))
+                                    try:
+                                        logger.info("[mid][pending][btc_filter] %s %s %s reason=%s", sym, market, direction, _btc_emit_block)
+                                    except Exception:
+                                        pass
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
+
                                 try:
                                     self.mark_emitted_mid(sym, sig.direction, sig.market)
                                 except TypeError:
@@ -24360,6 +24378,24 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                                     continue
 
                                                 if _touch_live_emit and _touch_can_emit:
+                                                    _btc_emit_block = await self.mid_btc_emit_block_reason(symbol=sym, market=sig_zone.market, direction=sig_zone.direction)
+                                                    if _btc_emit_block:
+                                                        keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
+                                                        _pending_log_trigger(sym, market, direction, outc, _btc_emit_block, it, float(price))
+                                                        try:
+                                                            logger.info("[mid][pending][btc_filter] %s %s %s reason=%s", sym, market, direction, _btc_emit_block)
+                                                        except Exception:
+                                                            pass
+                                                        if keep_it:
+                                                            keep.append(it)
+                                                            any_wait = True
+                                                        else:
+                                                            try:
+                                                                removed_n += 1
+                                                            except Exception:
+                                                                pass
+                                                        continue
+
                                                     try:
                                                         self.mark_emitted_mid(sym, sig_zone.direction, sig_zone.market)
                                                     except TypeError:
@@ -24823,6 +24859,24 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 _can_emit_now = True
                             if _can_emit_now:
+                                _btc_emit_block = await self.mid_btc_emit_block_reason(symbol=sym, market=sig_instant.market, direction=sig_instant.direction)
+                                if _btc_emit_block:
+                                    keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
+                                    _pending_log_trigger(sym, market, direction, outc, _btc_emit_block, it, float(price))
+                                    try:
+                                        logger.info("[mid][pending][btc_filter] %s %s %s reason=%s", sym, market, direction, _btc_emit_block)
+                                    except Exception:
+                                        pass
+                                    if keep_it:
+                                        keep.append(it)
+                                        any_wait = True
+                                    else:
+                                        try:
+                                            removed_n += 1
+                                        except Exception:
+                                            pass
+                                    continue
+
                                 try:
                                     self.mark_emitted_mid(sym, sig_instant.direction, sig_instant.market)
                                 except TypeError:
@@ -26179,6 +26233,24 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         logger.info("[signal][skip_profit] %s market=%s dir=%s profit=%.3f%% min=%.3f%%", sig.symbol, sig.market, sig.direction, float(_profit_pct), float(_profit_min))
                         _pending_log_trigger(sym, market, direction, "skip", f"profit_lt_{float(_profit_min):.2f}", it, float(price))
                         _pending_clear_cooldown(it)
+                        continue
+
+                    _btc_emit_block = await self.mid_btc_emit_block_reason(symbol=sym, market=sig.market, direction=sig.direction)
+                    if _btc_emit_block:
+                        keep_it, outc = _pending_apply_fail(it, "direction_mismatch", now)
+                        _pending_log_trigger(sym, market, direction, outc, _btc_emit_block, it, float(price))
+                        try:
+                            logger.info("[mid][pending][btc_filter] %s %s %s reason=%s", sym, market, direction, _btc_emit_block)
+                        except Exception:
+                            pass
+                        if keep_it:
+                            keep.append(it)
+                            any_wait = True
+                        else:
+                            try:
+                                removed_n += 1
+                            except Exception:
+                                pass
                         continue
 
                     try:
@@ -30717,6 +30789,18 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     rec["confirmed_entry_ts"] = float(time.time())
                                                 except Exception:
                                                     pass
+                                                _btc_emit_block = await self.mid_btc_emit_block_reason(symbol=sym, market=sig_emit.market, direction=sig_emit.direction)
+                                                if _btc_emit_block:
+                                                    try:
+                                                        logger.info("[mid][btc_filter] %s market=%s dir=%s reason=%s", sym, sig_emit.market, sig_emit.direction, _btc_emit_block)
+                                                    except Exception:
+                                                        pass
+                                                    try:
+                                                        _rej_add(sym, "direction_mismatch")
+                                                    except Exception:
+                                                        pass
+                                                    continue
+
                                                 try:
                                                     self.mark_emitted_mid(sym, sig_emit.direction, sig_emit.market)
                                                 except TypeError:
@@ -30882,6 +30966,18 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                     pass
                                 try:
                                     _rej_add(sym, _mid_final_emit_apply_reason(_final_emit_reason))
+                                except Exception:
+                                    pass
+                                continue
+
+                            _btc_emit_block = await self.mid_btc_emit_block_reason(symbol=sym, market=sig.market, direction=sig.direction)
+                            if _btc_emit_block:
+                                try:
+                                    logger.info("[mid][btc_filter] %s market=%s dir=%s reason=%s", sym, sig.market, sig.direction, _btc_emit_block)
+                                except Exception:
+                                    pass
+                                try:
+                                    _rej_add(sym, "direction_mismatch")
                                 except Exception:
                                     pass
                                 continue
@@ -34891,6 +34987,157 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
 # Institutional TA bindings
 # =========================
 
+def _mid_btc_emit_filter_enabled() -> bool:
+    try:
+        return (os.getenv("MID_BTC_FILTER_BEFORE_EMIT", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return True
+
+
+def _mid_btc_filter_adx30_min() -> float:
+    try:
+        return float(os.getenv("MID_BTC_FILTER_ADX30_MIN", "22") or 22)
+    except Exception:
+        return 22.0
+
+
+def _mid_btc_filter_adx1h_min() -> float:
+    try:
+        return float(os.getenv("MID_BTC_FILTER_ADX1H_MIN", "18") or 18)
+    except Exception:
+        return 18.0
+
+
+def _mid_btc_filter_cache_ttl_sec() -> float:
+    try:
+        return max(3.0, min(float(os.getenv("MID_BTC_FILTER_CACHE_TTL_SEC", "20") or 20), 120.0))
+    except Exception:
+        return 20.0
+
+
+def _mid_btc_filter_same_market() -> bool:
+    try:
+        return (os.getenv("MID_BTC_FILTER_USE_SIGNAL_MARKET", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return True
+
+
+def _mid_btc_symbol_skip(symbol: str) -> bool:
+    try:
+        base, _quote = _split_base_quote(_normalize_symbol(symbol or ""))
+        return str(base or "").upper() == "BTC"
+    except Exception:
+        return False
+
+
+def _mid_btc_bias_snapshot(df30: pd.DataFrame, df1h: pd.DataFrame) -> dict | None:
+    try:
+        if df30 is None or df1h is None or df30.empty or df1h.empty:
+            return None
+        df30i = _add_indicators(df30)
+        df1hi = _add_indicators(df1h)
+        if df30i is None or df1hi is None or df30i.empty or df1hi.empty:
+            return None
+        dir30 = _trend_dir(df30i)
+        dir1h = _trend_dir(df1hi)
+        if not dir30 or not dir1h:
+            return None
+        last30 = df30i.iloc[-1]
+        last1h = df1hi.iloc[-1]
+        close30 = _safe_float(last30.get("close"), None)
+        ema20_30 = _safe_float(last30.get("ema20"), None)
+        ema50_30 = _safe_float(last30.get("ema50"), None)
+        ema200_30 = _safe_float(last30.get("ema200"), None)
+        adx30 = _safe_float(last30.get("adx"), 0.0) or 0.0
+        adx1h = _safe_float(last1h.get("adx"), 0.0) or 0.0
+        bull = bool(
+            dir30 == "LONG"
+            and dir1h == "LONG"
+            and adx30 >= _mid_btc_filter_adx30_min()
+            and adx1h >= _mid_btc_filter_adx1h_min()
+            and close30 is not None and ema20_30 is not None and ema50_30 is not None and ema200_30 is not None
+            and float(close30) >= float(ema200_30)
+            and float(ema20_30) > float(ema50_30)
+        )
+        bear = bool(
+            dir30 == "SHORT"
+            and dir1h == "SHORT"
+            and adx30 >= _mid_btc_filter_adx30_min()
+            and adx1h >= _mid_btc_filter_adx1h_min()
+            and close30 is not None and ema20_30 is not None and ema50_30 is not None and ema200_30 is not None
+            and float(close30) <= float(ema200_30)
+            and float(ema20_30) < float(ema50_30)
+        )
+        return {
+            "dir30": str(dir30),
+            "dir1h": str(dir1h),
+            "adx30": float(adx30),
+            "adx1h": float(adx1h),
+            "bull": bool(bull),
+            "bear": bool(bear),
+        }
+    except Exception:
+        return None
+
+
+async def _backend_mid_btc_emit_block_reason(self: "Backend", *, symbol: str, market: str, direction: str) -> str:
+    try:
+        if not _mid_btc_emit_filter_enabled():
+            return ""
+        if _mid_btc_symbol_skip(symbol):
+            return ""
+        side = str(direction or "").upper().strip()
+        if side not in ("LONG", "SHORT"):
+            return ""
+
+        sig_market = str(market or "FUTURES").upper().strip()
+        bias_market = sig_market if _mid_btc_filter_same_market() else "SPOT"
+        cache_ttl = _mid_btc_filter_cache_ttl_sec()
+        cache = getattr(self, "_mid_btc_bias_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            try:
+                setattr(self, "_mid_btc_bias_cache", cache)
+            except Exception:
+                pass
+
+        snap = None
+        now_ts = time.time()
+        for mkt_try in ([bias_market] + (["SPOT"] if bias_market != "SPOT" else [])):
+            ck = str(mkt_try).upper().strip()
+            cached = cache.get(ck) if isinstance(cache, dict) else None
+            if isinstance(cached, dict) and (now_ts - float(cached.get("ts") or 0.0)) <= cache_ttl:
+                snap = cached.get("snap")
+            else:
+                snap = None
+            if snap is None:
+                try:
+                    df30 = await self.load_candles("BTCUSDT", "30m", market=ck, limit=250)
+                    df1h = await self.load_candles("BTCUSDT", "1h", market=ck, limit=250)
+                    snap = _mid_btc_bias_snapshot(df30, df1h)
+                except Exception:
+                    snap = None
+                if snap is not None and isinstance(cache, dict):
+                    cache[ck] = {"ts": now_ts, "snap": snap}
+            if snap is not None:
+                break
+
+        if not isinstance(snap, dict):
+            return ""
+
+        if side == "SHORT" and bool(snap.get("bull")):
+            return f"btc_filter_block BTC=LONG dir30={snap.get('dir30')} dir1h={snap.get('dir1h')} adx30={float(snap.get('adx30') or 0.0):.1f} adx1h={float(snap.get('adx1h') or 0.0):.1f}"
+        if side == "LONG" and bool(snap.get("bear")):
+            return f"btc_filter_block BTC=SHORT dir30={snap.get('dir30')} dir1h={snap.get('dir1h')} adx30={float(snap.get('adx30') or 0.0):.1f} adx1h={float(snap.get('adx1h') or 0.0):.1f}"
+        return ""
+    except Exception as e:
+        try:
+            logger.info("[mid][btc_filter] skip symbol=%s market=%s dir=%s err=%s", symbol, market, direction, type(e).__name__)
+        except Exception:
+            pass
+        return ""
+
+
 async def _backend_load_candles(self: "Backend", symbol: str, tf: str, market: str = "FUTURES", limit: int | None = None) -> pd.DataFrame:
     """Load OHLCV candles for symbol/tf/market using existing MultiExchangeData adapters.
     Returns normalized df with columns: open/high/low/close/(volume).
@@ -35385,6 +35632,7 @@ if _mid_missing_pending_helpers:
 # Bind methods to Backend (non-invasive, avoids moving large blocks inside class)
 try:
     Backend.load_candles = _backend_load_candles  # type: ignore[attr-defined]
+    Backend.mid_btc_emit_block_reason = _backend_mid_btc_emit_block_reason  # type: ignore[attr-defined]
 except Exception:
     pass
 
