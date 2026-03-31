@@ -35340,14 +35340,8 @@ def _mid_pre_emit_missing_bo_rt_reason(sig: Signal | None, route: str, rec: dict
         return ""
 
 
-def _mid_pre_emit_long_3of5_enabled() -> bool:
-    try:
-        return (os.getenv("MID_PRE_EMIT_LONG_3OF5_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-    except Exception:
-        return True
 
-
-def _mid_pre_emit_long_3of5_pre_emit_reason(
+def _mid_long_quality_3of5_pre_emit_reason(
     sig: Signal | None,
     ta: dict | None = None,
     it: dict | None = None,
@@ -35355,32 +35349,33 @@ def _mid_pre_emit_long_3of5_pre_emit_reason(
     vol_x: float | None = None,
     macd_hist: float | None = None,
 ) -> str:
-    """Hard veto for weak LONG emits right before MID emit.
+    """Return a pre-emit veto reason for weak LONG signals.
 
-    Rule of 5 (default): block when >= N of these are true:
-      1) signal strength < threshold
-      2) PA == RANGE or Regime in {COMPRESSION, —}
-      3) Vol xAvg < threshold
-      4) MACD hist <= threshold (display-aware around ±0.0000)
-      5) Entry too close to Resistance
-
-    Everything is env-driven so the operator can tune/disable without code edits.
+    Logic:
+    - optional hard bans:
+        * strength < MID_PRE_EMIT_LONG_MIN_STRENGTH_HARD
+        * vol_x    < MID_PRE_EMIT_LONG_MIN_VOL_X_HARD
+    - optional 3-of-5 quality gate:
+        1) strength < MID_PRE_EMIT_LONG_3OF5_STRENGTH_MAX
+        2) PA == RANGE or Regime in {COMPRESSION, -, —, NONE}
+        3) Vol xAvg < MID_PRE_EMIT_LONG_3OF5_VOL_X_MAX
+        4) MACD hist <= MID_PRE_EMIT_LONG_3OF5_MACD_MAX
+        5) Entry too close to Resistance (<= ATR * MID_PRE_EMIT_LONG_3OF5_NEAR_RES_ATR)
     """
     try:
-        if not _mid_pre_emit_long_3of5_enabled():
-            return ""
         if sig is None:
             return ""
 
-        market = str(getattr(sig, "market", "") or "SPOT").upper().strip()
+        enabled = (os.getenv("MID_PRE_EMIT_LONG_3OF5_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        if not enabled:
+            return ""
+
         direction = str(getattr(sig, "direction", "") or "").upper().strip()
         if direction != "LONG":
             return ""
 
-        try:
-            spot_only = (os.getenv("MID_PRE_EMIT_LONG_3OF5_SPOT_ONLY", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
-        except Exception:
-            spot_only = True
+        market = str(getattr(sig, "market", "") or "SPOT").upper().strip()
+        spot_only = (os.getenv("MID_PRE_EMIT_LONG_3OF5_SPOT_ONLY", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
         if spot_only and market != "SPOT":
             return ""
 
@@ -35409,6 +35404,43 @@ def _mid_pre_emit_long_3of5_pre_emit_reason(
                     return s
             return ""
 
+        strength = _f(
+            ta_d.get("signal_strength_10"),
+            ta_d.get("strength10"),
+            ta_d.get("strength"),
+            rec.get("signal_strength_10"),
+            rec.get("strength10"),
+            rec.get("strength"),
+            getattr(sig, "strength", None),
+        )
+        if strength is None:
+            try:
+                strength = float(_signal_strength_10(ta_d)[0])
+            except Exception:
+                strength = None
+
+        vol_now = _f(
+            vol_x,
+            ta_d.get("rel_vol"),
+            ta_d.get("vol_x"),
+            rec.get("rel_vol"),
+            rec.get("vol_x"),
+        )
+        macd_now = _f(
+            macd_hist,
+            ta_d.get("macd_hist"),
+            rec.get("macd_hist"),
+        )
+
+        # Hard bans (variant 2)
+        hard_strength = _f(os.getenv("MID_PRE_EMIT_LONG_MIN_STRENGTH_HARD", ""), default=None)
+        if hard_strength is not None and strength is not None and float(strength) < float(hard_strength):
+            return f"long_strength_hard:{float(strength):.2f}<{float(hard_strength):.2f}"
+
+        hard_vol = _f(os.getenv("MID_PRE_EMIT_LONG_MIN_VOL_X_HARD", ""), default=None)
+        if hard_vol is not None and vol_now is not None and float(vol_now) < float(hard_vol):
+            return f"long_vol_hard:{float(vol_now):.2f}<{float(hard_vol):.2f}"
+
         try:
             need_n = max(1, int(float(os.getenv("MID_PRE_EMIT_LONG_3OF5_MIN_FLAGS", "3") or 3)))
         except Exception:
@@ -35430,61 +35462,8 @@ def _mid_pre_emit_long_3of5_pre_emit_reason(
         except Exception:
             near_res_atr = 0.35
 
-        # Build a merged snapshot for _signal_strength_10.
-        merged = {}
-        try:
-            merged.update(rec)
-        except Exception:
-            pass
-        try:
-            merged.update(ta_d)
-        except Exception:
-            pass
-        try:
-            merged.setdefault("direction", direction)
-            merged.setdefault("market", market)
-        except Exception:
-            pass
-
-        strength = None
-        try:
-            strength = float(_signal_strength_10(merged)[0])
-        except Exception:
-            strength = _f(
-                ta_d.get("signal_strength_10"),
-                ta_d.get("strength10"),
-                ta_d.get("strength"),
-                rec.get("signal_strength_10"),
-                rec.get("strength10"),
-                rec.get("strength"),
-                getattr(sig, "strength", None),
-            )
-
-        mstruct = _s(ta_d.get("mstruct"), ta_d.get("structure"), rec.get("mstruct"), rec.get("structure")).upper()
+        mstruct = _s(ta_d.get("mstruct"), ta_d.get("pa"), rec.get("mstruct"), rec.get("pa")).upper()
         regime = _s(ta_d.get("regime"), rec.get("regime")).upper()
-        vol_now = _f(vol_x, ta_d.get("rel_vol"), ta_d.get("vol_x"), rec.get("rel_vol"), rec.get("vol_x"))
-        macd_now = _f(macd_hist, ta_d.get("macd_hist"), ta_d.get("macd_hist15"), rec.get("macd_hist"), rec.get("macd_hist15"))
-        entry = _f(ta_d.get("entry"), ta_d.get("close"), rec.get("entry"), getattr(sig, "entry", None))
-        resistance = _f(ta_d.get("resistance"), rec.get("resistance"))
-        atr30 = _f(ta_d.get("atr30"), ta_d.get("atr_abs"), rec.get("atr30"), rec.get("atr_at_create"))
-        if atr30 is None:
-            atr_pct = _f(ta_d.get("atr_pct"), rec.get("atr_pct"))
-            if entry is not None and atr_pct is not None:
-                try:
-                    atr30 = abs(float(entry)) * abs(float(atr_pct)) / 100.0
-                except Exception:
-                    atr30 = None
-
-        flags = []
-
-        if strength is not None and float(strength) < float(strength_max):
-            flags.append("strength")
-
-        if (mstruct == "RANGE") or (regime in ("COMPRESSION", "—", "-", "", "NONE")):
-            flags.append("regime")
-
-        if vol_now is not None and float(vol_now) < float(vol_max):
-            flags.append("vol")
 
         macd_bad = False
         try:
@@ -35495,8 +35474,23 @@ def _mid_pre_emit_long_3of5_pre_emit_reason(
                 macd_bad = float(macd_now) <= float(macd_max)
         except Exception:
             macd_bad = False
-        if macd_bad:
-            flags.append("macd")
+
+        entry = _f(
+            ta_d.get("entry"),
+            ta_d.get("close"),
+            rec.get("entry"),
+            getattr(sig, "entry", None),
+        )
+        resistance = _f(
+            ta_d.get("resistance"),
+            rec.get("resistance"),
+        )
+        atr30 = _f(
+            ta_d.get("atr30"),
+            ta_d.get("atr_abs"),
+            rec.get("atr30"),
+            rec.get("atr_at_create"),
+        )
 
         near_res = False
         try:
@@ -35507,6 +35501,16 @@ def _mid_pre_emit_long_3of5_pre_emit_reason(
                     near_res = True
         except Exception:
             near_res = False
+
+        flags = []
+        if strength is not None and float(strength) < float(strength_max):
+            flags.append("strength")
+        if mstruct == "RANGE" or regime in ("COMPRESSION", "—", "-", "", "NONE"):
+            flags.append("regime")
+        if vol_now is not None and float(vol_now) < float(vol_max):
+            flags.append("vol")
+        if macd_bad:
+            flags.append("macd")
         if near_res:
             flags.append("near_resistance")
 
@@ -35515,7 +35519,6 @@ def _mid_pre_emit_long_3of5_pre_emit_reason(
         return ""
     except Exception:
         return ""
-
 
 def _mid_pre_emit_apply_reason(reason: str) -> str:
     try:
@@ -35530,7 +35533,7 @@ def _mid_pre_emit_apply_reason(reason: str) -> str:
         return "trap_block"
     if r.startswith("smart_setup_no_breakout_retest"):
         return "structure_fail"
-    if r.startswith("long_quality_3of5"):
+    if r.startswith("long_quality_3of5") or r.startswith("long_strength_hard") or r.startswith("long_vol_hard"):
         return "score_low"
     return _mid_final_emit_apply_reason(reason)
 
@@ -35587,16 +35590,16 @@ async def _backend_mid_pre_emit_block_reason(
         if dir_reason:
             return str(dir_reason)
 
-        # 4) Operator-tunable 3-of-5 veto for weak LONG emits.
-        long_q_reason = _mid_pre_emit_long_3of5_pre_emit_reason(
+        # 4) LONG quality veto (optional hard-bans + optional 3-of-5 gate).
+        long_quality_reason = _mid_long_quality_3of5_pre_emit_reason(
             sig,
             ta=ta_d,
             it=rec,
             vol_x=vol_x,
             macd_hist=macd_hist,
         )
-        if long_q_reason:
-            return str(long_q_reason)
+        if long_quality_reason:
+            return str(long_quality_reason)
 
         # 5) BTC leader veto is the last market-wide gate.
         btc_reason = await self.mid_btc_emit_block_reason(symbol=sym, market=market, direction=direction)
