@@ -12068,12 +12068,25 @@ def _mid_pick_scan_setup_source(*, origin_fast_ok: bool = False, breakout_fast_o
 
 
 def _mid_pick_pending_setup_source(it: dict | None = None, *, zone_touch: bool = False, zone_first: bool = False, in_zone_now: bool = False) -> str:
-    """Pending priority after scan: zone-touch > normal pending trigger."""
+    """Pick the display category for a pending-trigger entry.
+
+    Important: a revalidated trigger (for example risk_note contains
+    ``trigger_revalidated=1``) is *not* a setup-type classification.
+    Only explicit zone-first / zone-touch execution should be shown as
+    ``zone_retest``. A generic pending trigger that simply fired while the
+    current price was inside the saved zone must remain
+    ``normal_pending_trigger``.
+    """
     rec = it if isinstance(it, dict) else {}
+
+    # Keep explicit zone-first / zone-touch routes classified as a real retest.
     if bool(zone_touch) or bool(zone_first) or bool(rec.get("_trig_zone_first")):
         return "zone_retest"
-    if bool(in_zone_now) and bool(rec.get("entry_zone_src")):
-        return "zone_retest"
+
+    # Revalidated trigger / in-zone confirmation alone must not rewrite the
+    # setup type to "Возврат в зону". This was causing normal pending triggers
+    # to be mislabeled as zone retests just because they confirmed inside the
+    # stored zone.
     return "normal_pending_trigger"
 
 @dataclass
