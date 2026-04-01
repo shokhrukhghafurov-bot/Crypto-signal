@@ -11968,21 +11968,39 @@ class Signal:
 
 
 def _mid_setup_source_normalize(source: str | None) -> str:
+    """Canonical smart-setup categories used across live cards and report cards.
+
+    Canonical values:
+      - origin
+      - breakout
+      - zone_retest
+      - normal_pending_trigger
+
+    We also accept legacy Russian labels / loose variants so old rows and
+    previously saved orig_text still normalize to the new canonical values.
+    """
     try:
         s = str(source or "").strip().lower().replace('-', '_')
     except Exception:
         s = ""
     aliases = {
         "origin": "origin",
+        "начало движения": "origin",
         "breakout": "breakout",
+        "пробой": "breakout",
         "zone": "zone_retest",
         "zone_retest": "zone_retest",
         "zone retest": "zone_retest",
+        "возврат в зону": "zone_retest",
         "zone_touch": "zone_retest",
         "zone touch": "zone_retest",
+        "zone_touch_retest": "zone_retest",
         "zone-touch": "zone_retest",
         "normal_pending_trigger": "normal_pending_trigger",
         "normal pending trigger": "normal_pending_trigger",
+        "обычный trigger": "normal_pending_trigger",
+        "обычный триггер": "normal_pending_trigger",
+        "обычный pending trigger": "normal_pending_trigger",
         "pending": "normal_pending_trigger",
         "pending_trigger": "normal_pending_trigger",
     }
@@ -11990,12 +12008,20 @@ def _mid_setup_source_normalize(source: str | None) -> str:
 
 
 def _mid_setup_source_label(source: str | None) -> str:
+    """Human-facing Smart-setup label.
+
+    User requested exact English labels:
+      - origin — если вход взят сразу от начала движения
+      - breakout — если вход взят на пробое
+      - zone retest — только если был реальный возврат/ретест зоны
+      - normal pending trigger — для обычного pending trigger без явного retest
+    """
     src = _mid_setup_source_normalize(source)
     labels = {
-        "origin": "Начало движения",
-        "breakout": "Пробой",
-        "zone_retest": "Возврат в зону",
-        "normal_pending_trigger": "Обычный trigger",
+        "origin": "origin",
+        "breakout": "breakout",
+        "zone_retest": "zone retest",
+        "normal_pending_trigger": "normal pending trigger",
     }
     return labels.get(src, "")
 
@@ -12070,23 +12096,22 @@ def _mid_pick_scan_setup_source(*, origin_fast_ok: bool = False, breakout_fast_o
 def _mid_pick_pending_setup_source(it: dict | None = None, *, zone_touch: bool = False, zone_first: bool = False, in_zone_now: bool = False) -> str:
     """Pick the display category for a pending-trigger entry.
 
-    Important: a revalidated trigger (for example risk_note contains
-    ``trigger_revalidated=1``) is *not* a setup-type classification.
-    Only explicit zone-first / zone-touch execution should be shown as
-    ``zone_retest``. A generic pending trigger that simply fired while the
-    current price was inside the saved zone must remain
-    ``normal_pending_trigger``.
+    Rules requested by user:
+      - origin — only when entry is taken from the very start of the move
+      - breakout — only when entry is taken on the breakout itself
+      - zone retest — only when there was an explicit real return / retest of the zone
+      - normal pending trigger — for a regular pending trigger without an explicit retest
+
+    Therefore, a revalidated trigger or an in-zone confirmation by itself is NOT a
+    reason to rewrite the setup into ``zone_retest``.
     """
     rec = it if isinstance(it, dict) else {}
 
-    # Keep explicit zone-first / zone-touch routes classified as a real retest.
+    # A real zone retest must be explicit in the trigger route. Do not infer it
+    # just because price happened to be inside the saved zone when the pending fired.
     if bool(zone_touch) or bool(zone_first) or bool(rec.get("_trig_zone_first")):
         return "zone_retest"
 
-    # Revalidated trigger / in-zone confirmation alone must not rewrite the
-    # setup type to "Возврат в зону". This was causing normal pending triggers
-    # to be mislabeled as zone retests just because they confirmed inside the
-    # stored zone.
     return "normal_pending_trigger"
 
 @dataclass
