@@ -1991,6 +1991,10 @@ def _mid_directional_contradiction_reason(*sources: dict | None) -> str:
     multiple objects: the fresh TA can have the pattern while the pending record
     still holds the BO/RT label. This helper merges the available context so a
     wrong-way breakout (for example LONG + BO↓ + Retest) remains a hard block.
+
+    It also understands optional raw BO/RT fields (breakout_retest_raw/bo_rt_raw)
+    so the formatter can hide opposite-direction labels without weakening the
+    trigger-time veto.
     """
     try:
         side = ""
@@ -2014,7 +2018,13 @@ def _mid_directional_contradiction_reason(*sources: dict | None) -> str:
                         break
             if not bo:
                 try:
-                    bo = str(src.get("breakout_retest") or src.get("bo_rt") or "").strip()
+                    bo = str(
+                        src.get("breakout_retest_raw")
+                        or src.get("bo_rt_raw")
+                        or src.get("breakout_retest")
+                        or src.get("bo_rt")
+                        or ""
+                    ).strip()
                 except Exception:
                     bo = ""
             if not pat:
@@ -2031,20 +2041,24 @@ def _mid_directional_contradiction_reason(*sources: dict | None) -> str:
         except Exception:
             pat_norm = ""
 
+        try:
+            bo_norm = str(bo or "").strip().upper().replace(" ", "")
+        except Exception:
+            bo_norm = ""
+
         if side == "LONG":
-            if bo.startswith("BO↓"):
+            if bo_norm.startswith("BO↓"):
                 return f"directional_contradiction breakout={bo}"
             if pat_norm in {"bearish engulfing", "bear engulf", "shooting star", "evening star"}:
                 return f"directional_contradiction pattern={pat or pat_norm}"
         elif side == "SHORT":
-            if bo.startswith("BO↑"):
+            if bo_norm.startswith("BO↑"):
                 return f"directional_contradiction breakout={bo}"
             if pat_norm in {"bullish engulfing", "bull engulf", "hammer", "morning star"}:
                 return f"directional_contradiction pattern={pat or pat_norm}"
         return ""
     except Exception:
         return ""
-
 
 def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str:
     """Hard veto reasons for early zone-touch alerts.
@@ -15998,7 +16012,14 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
 
     # Breakout / Retest detection (simple but robust)
     # We use 1h swing S/R and confirm on recent 5m candles.
+    #
+    # IMPORTANT:
+    # - breakout_retest_raw keeps the true observed BO/RT even if it is opposite to the setup direction.
+    # - breakout_retest is the user-facing label and shows only same-direction BO/RT.
+    #   This prevents confusing labels like LONG + BO↓ + Retest in the signal card,
+    #   while trigger-time contradiction checks can still veto using the raw field.
     breakout_retest = "—"
+    breakout_retest_raw = "—"
     try:
         sup_lvl = float(support) if support is not None else float("nan")
         res_lvl = float(resistance) if resistance is not None else float("nan")
@@ -16044,27 +16065,40 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
                         ret_dn = True
                         break
 
-            # Prefer breakout in the same direction as the MID signal
+            # Raw BO/RT: keep the true observed breakout, even if opposite-direction.
+            if str(dir_trend).upper() == "LONG":
+                if bo_up_idx is not None and ret_up:
+                    breakout_retest_raw = "BO↑ + Retest"
+                elif bo_up_idx is not None:
+                    breakout_retest_raw = "BO↑"
+                elif bo_dn_idx is not None and ret_dn:
+                    breakout_retest_raw = "BO↓ + Retest"
+                elif bo_dn_idx is not None:
+                    breakout_retest_raw = "BO↓"
+            else:
+                if bo_dn_idx is not None and ret_dn:
+                    breakout_retest_raw = "BO↓ + Retest"
+                elif bo_dn_idx is not None:
+                    breakout_retest_raw = "BO↓"
+                elif bo_up_idx is not None and ret_up:
+                    breakout_retest_raw = "BO↑ + Retest"
+                elif bo_up_idx is not None:
+                    breakout_retest_raw = "BO↑"
+
+            # Display BO/RT: only same-direction labels should be shown in the signal card.
             if str(dir_trend).upper() == "LONG":
                 if bo_up_idx is not None and ret_up:
                     breakout_retest = "BO↑ + Retest"
                 elif bo_up_idx is not None:
                     breakout_retest = "BO↑"
-                elif bo_dn_idx is not None and ret_dn:
-                    breakout_retest = "BO↓ + Retest"
-                elif bo_dn_idx is not None:
-                    breakout_retest = "BO↓"
             else:
                 if bo_dn_idx is not None and ret_dn:
                     breakout_retest = "BO↓ + Retest"
                 elif bo_dn_idx is not None:
                     breakout_retest = "BO↓"
-                elif bo_up_idx is not None and ret_up:
-                    breakout_retest = "BO↑ + Retest"
-                elif bo_up_idx is not None:
-                    breakout_retest = "BO↑"
     except Exception:
         breakout_retest = "—"
+        breakout_retest_raw = "—"
 
     # Directional contradiction is dynamic and should be re-checked at actual entry.
     # In post-setup mode we keep the setup alive on SCAN and enforce the blocker on TRIGGER
@@ -16073,7 +16107,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
     try:
         contradiction_reason = None
         _pat = str(pattern or "—").strip()
-        _bo = str(breakout_retest or "—").strip()
+        _bo = str(breakout_retest_raw or breakout_retest or "—").strip()
         _side_u = str(dir_trend or "").upper()
 
         if _side_u == "LONG":
@@ -16400,6 +16434,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "recent_low": recent_low,
         "recent_high": recent_high,
         "breakout_retest": breakout_retest,
+        "breakout_retest_raw": breakout_retest_raw,
         "regime": mid_regime,
         "structure_hhhl_1h": struct_hhhl_1h,
         "eq_hi": eq_hi,
@@ -16408,6 +16443,7 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "sweep_short": bool(sweep_short),
         "sweep": sweep_txt,
         "bo_rt": bo_rt_label,
+        "bo_rt_raw": breakout_retest_raw,
         "ob_zone": ob_zone,
         "ob_retest": bool(ob_retest),
         "fvg": fvg_kind,
@@ -30359,7 +30395,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                         "entry_high": entry_high,
                                         "entry_zone_src": str(z_src),
                                         "bo_rt": str((base_r.get("bo_rt") if ("base_r" in locals() and isinstance(base_r, dict)) else bo_rt_label) or bo_rt_label or "—"),
+                                        "bo_rt_raw": str((base_r.get("bo_rt_raw") if ("base_r" in locals() and isinstance(base_r, dict)) else base_r.get("breakout_retest_raw") if ("base_r" in locals() and isinstance(base_r, dict)) else bo_rt_label) or bo_rt_label or "—"),
                                         "breakout_retest": str((base_r.get("breakout_retest") if ("base_r" in locals() and isinstance(base_r, dict)) else bo_rt_label) or bo_rt_label or "—"),
+                                        "breakout_retest_raw": str((base_r.get("breakout_retest_raw") if ("base_r" in locals() and isinstance(base_r, dict)) else base_r.get("bo_rt_raw") if ("base_r" in locals() and isinstance(base_r, dict)) else bo_rt_label) or bo_rt_label or "—"),
                                         "breakout_first_ts": int(_bo_meta.get("breakout_ts_ms")) if _bo_meta.get("breakout_ts_ms") is not None else None,
                                         "breakout_first_price": float(_bo_meta.get("breakout_price")) if _bo_meta.get("breakout_price") is not None else None,
                                         "breakout_first_level": float(_bo_meta.get("breakout_level")) if _bo_meta.get("breakout_level") is not None else None,
@@ -35600,21 +35638,35 @@ def _mid_pre_emit_require_bo_rt(sig: Signal | None, route: str, rec: dict | None
         return False
 
 
-def _mid_pre_emit_missing_bo_rt_reason(sig: Signal | None, route: str, rec: dict | None, ta: dict | None, meta: dict | None) -> str:
+def _mid_pre_emit_missing_bo_rt_reason(
+    sig: Signal | None,
+    route: str,
+    rec: dict | None,
+    ta: dict | None,
+    meta: dict | None,
+    bo_rt_label: str | None = None,
+) -> str:
     try:
         if not _mid_pre_emit_require_bo_rt(sig, route, rec, ta, meta):
             return ""
         rec_d = rec if isinstance(rec, dict) else {}
         ta_d = ta if isinstance(ta, dict) else {}
         meta_d = meta if isinstance(meta, dict) else {}
-        bo = ""
-        for src in (ta_d, rec_d, meta_d):
-            try:
-                bo = str(src.get("bo_rt") or src.get("breakout_retest") or "").strip()
-            except Exception:
-                bo = ""
-            if bo:
-                break
+        bo = str(bo_rt_label or "").strip()
+        if not bo:
+            for src in (ta_d, rec_d, meta_d):
+                try:
+                    bo = str(
+                        src.get("bo_rt_raw")
+                        or src.get("breakout_retest_raw")
+                        or src.get("bo_rt")
+                        or src.get("breakout_retest")
+                        or ""
+                    ).strip()
+                except Exception:
+                    bo = ""
+                if bo:
+                    break
         bo_norm = str(bo or "").strip().upper()
         if bo_norm not in ("", "-", "—", "NONE"):
             return ""
@@ -35634,8 +35686,6 @@ def _mid_pre_emit_missing_bo_rt_reason(sig: Signal | None, route: str, rec: dict
         return "smart_setup_no_breakout_retest"
     except Exception:
         return ""
-
-
 
 def _mid_direction_quality_3of5_pre_emit_reason(
     sig: Signal | None,
@@ -35921,7 +35971,25 @@ async def _backend_mid_pre_emit_block_reason(
 
         rec = it if isinstance(it, dict) else {}
         ta_d = ta if isinstance(ta, dict) else {}
-        meta = gate_meta if isinstance(gate_meta, dict) else {}
+        meta = dict(gate_meta) if isinstance(gate_meta, dict) else {}
+        try:
+            _bo_arg = str(bo_rt_label or "").strip()
+        except Exception:
+            _bo_arg = ""
+        if _bo_arg:
+            try:
+                meta.setdefault("bo_rt", _bo_arg)
+            except Exception:
+                pass
+            try:
+                meta.setdefault("breakout_retest", _bo_arg)
+            except Exception:
+                pass
+        try:
+            if direction in ("LONG", "SHORT"):
+                meta.setdefault("direction", direction)
+        except Exception:
+            pass
 
         # pre-emit must stay a narrow final veto only:
         # 1) smart setup trap
@@ -35936,7 +36004,7 @@ async def _backend_mid_pre_emit_block_reason(
 
         # 2) For direct smart-setup emits, empty BO/RT is a hard veto unless
         # there is an explicit OB retest or liquidity sweep context.
-        bo_rt_reason = _mid_pre_emit_missing_bo_rt_reason(sig, route, rec, ta_d, meta)
+        bo_rt_reason = _mid_pre_emit_missing_bo_rt_reason(sig, route, rec, ta_d, meta, bo_rt_label=bo_rt_label)
         if bo_rt_reason:
             return str(bo_rt_reason)
 
