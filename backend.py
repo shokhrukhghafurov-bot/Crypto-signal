@@ -2486,7 +2486,7 @@ def _mid_trigger_selected_hardblock_reason(reason: str, it: dict | None = None) 
             return ("near_recent_extreme", "near_recent_extreme")
         if head in ("vwap_dist_atr", "vwap_bias", "wrong_vwap_side"):
             if trader_mode:
-                m = re.search(r"vwap_dist_atr=([0-9.]+)\s*>\s*([0-9.]+)", raw)
+                m = re.search(r"vwap_dist_atr=([0-9.]+)\s*[<>]\s*([0-9.]+)", raw)
                 if m:
                     try:
                         dist = float(m.group(1))
@@ -25886,7 +25886,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     vwap_dist_atr_now = abs(entry_check - vwap_val) / max(float(atr30), 1e-9)
                                     if vwap_dist_atr_now < float(mid_min_vwap_dist_atr):
                                         hb_log_reason, hb_apply_reason = _mid_trigger_selected_hardblock_reason(
-                                            f"vwap_dist_atr={float(vwap_dist_atr_now):.2f} > {float(mid_min_vwap_dist_atr):.2f}",
+                                            f"vwap_dist_atr={float(vwap_dist_atr_now):.2f} < {float(mid_min_vwap_dist_atr):.2f}",
                                             it,
                                         )
                                         if hb_apply_reason:
@@ -35493,7 +35493,11 @@ def _mid_direction_quality_3of5_pre_emit_reason(
         if direction == "LONG":
             macd_cut = _env_float(f"{pref}_3OF5_MACD_MAX", 0.0, f"{fallback_pref}_3OF5_MACD_MAX")
         else:
-            macd_cut = _env_float(f"{pref}_3OF5_MACD_MIN", 0.0, f"{fallback_pref}_3OF5_MACD_MIN")
+            # IMPORTANT:
+            # - prefer explicit SHORT min threshold when it is set
+            # - otherwise inherit LONG MACD_MAX so SHORT can mirror LONG settings
+            #   without duplicating env values
+            macd_cut = _env_float(f"{pref}_3OF5_MACD_MIN", None)
             if macd_cut is None:
                 macd_cut = _env_float(f"{fallback_pref}_3OF5_MACD_MAX", 0.0)
 
