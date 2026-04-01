@@ -3243,7 +3243,7 @@ def _signal_text(uid: int, s: Signal, *, autotrade_hint: str = "") -> str:
     risk_note = _risk_note_for_uid(uid, s.risk_note)
     try:
         if _uid_can_view_private_ta(uid):
-            setup_label = _report_setup_label_human(getattr(s, 'setup_source_label', '') or getattr(s, 'setup_source', ''))
+            setup_label = _signal_ui_setup_label(s)
             if setup_label:
                 setup_line = f"🧭 Smart-setup: {setup_label}"
                 if risk_note:
@@ -3418,11 +3418,16 @@ def _report_setup_label_human(source: str | None) -> str:
         return labels[raw]
     return str(source or "").strip()
 
-
-def _report_setup_label_from_signal(sig) -> str:
+def _signal_ui_setup_label(sig) -> str:
     try:
         if sig is None:
             return ""
+        label = str(getattr(sig, "ui_setup_label", "") or "").strip()
+        if label:
+            return _report_setup_label_human(label)
+        emit_route = str(getattr(sig, "emit_route", "") or "").strip()
+        if emit_route == "liquidity_reclaim_emit":
+            return "liquidity_reclaim_emit"
         label = str(getattr(sig, "setup_source_label", "") or "").strip()
         if label:
             return _report_setup_label_human(label)
@@ -3431,6 +3436,34 @@ def _report_setup_label_from_signal(sig) -> str:
             return _report_setup_label_human(raw)
     except Exception:
         pass
+    return ""
+
+
+def _row_ui_setup_label(row: dict | None) -> str:
+    try:
+        src = row if isinstance(row, dict) else {}
+        label = _report_setup_label_human(src.get("ui_setup_label"))
+        if label:
+            return label
+        emit_route = str(src.get("emit_route") or "").strip()
+        if emit_route == "liquidity_reclaim_emit":
+            return "liquidity_reclaim_emit"
+        label = _report_setup_label_human(src.get("setup_source_label"))
+        if label:
+            return label
+        label = _report_setup_label_human(src.get("setup_source"))
+        if label:
+            return label
+    except Exception:
+        pass
+    return ""
+
+
+def _report_setup_label_from_signal(sig) -> str:
+    try:
+        return _signal_ui_setup_label(sig)
+    except Exception:
+        return ""
     return ""
 
 
@@ -3449,10 +3482,7 @@ def _report_extract_setup_label_from_text(text: str) -> str:
 
 def _report_setup_label_from_row(row: dict) -> str:
     try:
-        label = _report_setup_label_human(row.get("setup_source_label"))
-        if label:
-            return label
-        label = _report_setup_label_human(row.get("setup_source"))
+        label = _row_ui_setup_label(row)
         if label:
             return label
 
@@ -3948,11 +3978,21 @@ async def broadcast_signal(sig: Signal) -> None:
         except Exception:
             pass
         try:
+            _track_kwargs['ui_setup_label'] = str(getattr(sig, 'ui_setup_label', '') or '').strip()
+        except Exception:
+            pass
+        try:
+            _track_kwargs['emit_route'] = str(getattr(sig, 'emit_route', '') or '').strip()
+        except Exception:
+            pass
+        try:
             await db_store.upsert_signal_track(**_track_kwargs)
         except TypeError:
             _track_kwargs.pop('orig_text', None)
             _track_kwargs.pop('setup_source', None)
             _track_kwargs.pop('setup_source_label', None)
+            _track_kwargs.pop('ui_setup_label', None)
+            _track_kwargs.pop('emit_route', None)
             await db_store.upsert_signal_track(**_track_kwargs)
     except Exception:
         pass
