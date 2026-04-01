@@ -35357,7 +35357,7 @@ def _mid_pre_emit_missing_bo_rt_reason(sig: Signal | None, route: str, rec: dict
 
 
 
-def _mid_long_quality_3of5_pre_emit_reason(
+def _mid_direction_quality_3of5_pre_emit_reason(
     sig: Signal | None,
     ta: dict | None = None,
     it: dict | None = None,
@@ -35365,33 +35365,63 @@ def _mid_long_quality_3of5_pre_emit_reason(
     vol_x: float | None = None,
     macd_hist: float | None = None,
 ) -> str:
-    """Return a pre-emit veto reason for weak LONG signals.
+    """Return a pre-emit veto reason for weak LONG/SHORT signals.
 
-    Logic:
-    - optional hard bans:
-        * strength < MID_PRE_EMIT_LONG_MIN_STRENGTH_HARD
-        * vol_x    < MID_PRE_EMIT_LONG_MIN_VOL_X_HARD
-    - optional 3-of-5 quality gate:
-        1) strength < MID_PRE_EMIT_LONG_3OF5_STRENGTH_MAX
-        2) PA == RANGE or Regime in {COMPRESSION, -, —, NONE}
-        3) Vol xAvg < MID_PRE_EMIT_LONG_3OF5_VOL_X_MAX
-        4) MACD hist <= MID_PRE_EMIT_LONG_3OF5_MACD_MAX
-        5) Entry too close to Resistance (<= ATR * MID_PRE_EMIT_LONG_3OF5_NEAR_RES_ATR)
+    LONG envs keep backward compatibility. SHORT uses its own env names when set,
+    otherwise falls back to LONG thresholds so enabling the same filter for shorts
+    does not require duplicating all settings.
     """
     try:
         if sig is None:
             return ""
 
-        enabled = (os.getenv("MID_PRE_EMIT_LONG_3OF5_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        direction = str(getattr(sig, "direction", "") or "").upper().strip()
+        if direction not in ("LONG", "SHORT"):
+            return ""
+
+        pref = "MID_PRE_EMIT_LONG" if direction == "LONG" else "MID_PRE_EMIT_SHORT"
+        fallback_pref = "MID_PRE_EMIT_LONG"
+        side_label = "long" if direction == "LONG" else "short"
+
+        def _env_raw(name: str, fallback_name: str | None = None):
+            raw = os.getenv(name)
+            if raw is None and fallback_name:
+                raw = os.getenv(fallback_name)
+            return raw
+
+        def _env_bool(name: str, default: bool, fallback_name: str | None = None) -> bool:
+            raw = _env_raw(name, fallback_name)
+            if raw is None or str(raw).strip() == "":
+                return bool(default)
+            return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+        def _env_float(name: str, default=None, fallback_name: str | None = None):
+            raw = _env_raw(name, fallback_name)
+            if raw is None or str(raw).strip() == "":
+                return default
+            try:
+                val = float(raw)
+                if math.isfinite(val):
+                    return val
+            except Exception:
+                pass
+            return default
+
+        def _env_int(name: str, default: int, fallback_name: str | None = None) -> int:
+            raw = _env_raw(name, fallback_name)
+            if raw is None or str(raw).strip() == "":
+                return int(default)
+            try:
+                return int(float(raw))
+            except Exception:
+                return int(default)
+
+        enabled = _env_bool(f"{pref}_3OF5_ENABLED", True, f"{fallback_pref}_3OF5_ENABLED")
         if not enabled:
             return ""
 
-        direction = str(getattr(sig, "direction", "") or "").upper().strip()
-        if direction != "LONG":
-            return ""
-
         market = str(getattr(sig, "market", "") or "SPOT").upper().strip()
-        spot_only = (os.getenv("MID_PRE_EMIT_LONG_3OF5_SPOT_ONLY", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        spot_only = _env_bool(f"{pref}_3OF5_SPOT_ONLY", True, f"{fallback_pref}_3OF5_SPOT_ONLY")
         if spot_only and market != "SPOT":
             return ""
 
@@ -35448,35 +35478,30 @@ def _mid_long_quality_3of5_pre_emit_reason(
             rec.get("macd_hist"),
         )
 
-        # Hard bans (variant 2)
-        hard_strength = _f(os.getenv("MID_PRE_EMIT_LONG_MIN_STRENGTH_HARD", ""), default=None)
+        hard_strength = _env_float(f"{pref}_MIN_STRENGTH_HARD", None, f"{fallback_pref}_MIN_STRENGTH_HARD")
         if hard_strength is not None and strength is not None and float(strength) < float(hard_strength):
-            return f"long_strength_hard:{float(strength):.2f}<{float(hard_strength):.2f}"
+            return f"{side_label}_strength_hard:{float(strength):.2f}<{float(hard_strength):.2f}"
 
-        hard_vol = _f(os.getenv("MID_PRE_EMIT_LONG_MIN_VOL_X_HARD", ""), default=None)
+        hard_vol = _env_float(f"{pref}_MIN_VOL_X_HARD", None, f"{fallback_pref}_MIN_VOL_X_HARD")
         if hard_vol is not None and vol_now is not None and float(vol_now) < float(hard_vol):
-            return f"long_vol_hard:{float(vol_now):.2f}<{float(hard_vol):.2f}"
+            return f"{side_label}_vol_hard:{float(vol_now):.2f}<{float(hard_vol):.2f}"
 
-        try:
-            need_n = max(1, int(float(os.getenv("MID_PRE_EMIT_LONG_3OF5_MIN_FLAGS", "3") or 3)))
-        except Exception:
-            need_n = 3
-        try:
-            strength_max = float(os.getenv("MID_PRE_EMIT_LONG_3OF5_STRENGTH_MAX", "5.5") or 5.5)
-        except Exception:
-            strength_max = 5.5
-        try:
-            vol_max = float(os.getenv("MID_PRE_EMIT_LONG_3OF5_VOL_X_MAX", "0.60") or 0.60)
-        except Exception:
-            vol_max = 0.60
-        try:
-            macd_max = float(os.getenv("MID_PRE_EMIT_LONG_3OF5_MACD_MAX", "0.0") or 0.0)
-        except Exception:
-            macd_max = 0.0
-        try:
-            near_res_atr = float(os.getenv("MID_PRE_EMIT_LONG_3OF5_NEAR_RES_ATR", "0.35") or 0.35)
-        except Exception:
-            near_res_atr = 0.35
+        need_n = max(1, _env_int(f"{pref}_3OF5_MIN_FLAGS", 3, f"{fallback_pref}_3OF5_MIN_FLAGS"))
+        strength_max = _env_float(f"{pref}_3OF5_STRENGTH_MAX", 5.5, f"{fallback_pref}_3OF5_STRENGTH_MAX")
+        vol_max = _env_float(f"{pref}_3OF5_VOL_X_MAX", 0.60, f"{fallback_pref}_3OF5_VOL_X_MAX")
+
+        if direction == "LONG":
+            macd_cut = _env_float(f"{pref}_3OF5_MACD_MAX", 0.0, f"{fallback_pref}_3OF5_MACD_MAX")
+        else:
+            macd_cut = _env_float(f"{pref}_3OF5_MACD_MIN", 0.0, f"{fallback_pref}_3OF5_MACD_MIN")
+            if macd_cut is None:
+                macd_cut = _env_float(f"{fallback_pref}_3OF5_MACD_MAX", 0.0)
+
+        near_atr = _env_float(
+            f"{pref}_3OF5_NEAR_RES_ATR" if direction == "LONG" else f"{pref}_3OF5_NEAR_SUP_ATR",
+            0.35,
+            f"{fallback_pref}_3OF5_NEAR_RES_ATR",
+        )
 
         mstruct = _s(ta_d.get("mstruct"), ta_d.get("pa"), rec.get("mstruct"), rec.get("pa")).upper()
         regime = _s(ta_d.get("regime"), rec.get("regime")).upper()
@@ -35484,10 +35509,12 @@ def _mid_long_quality_3of5_pre_emit_reason(
         macd_bad = False
         try:
             disp = _mid_macd_hist_display4(macd_now)
-            if disp:
-                macd_bad = float(disp) <= float(macd_max)
-            elif macd_now is not None:
-                macd_bad = float(macd_now) <= float(macd_max)
+            macd_cmp = float(disp) if disp else (float(macd_now) if macd_now is not None else None)
+            if macd_cmp is not None:
+                if direction == "LONG":
+                    macd_bad = macd_cmp <= float(macd_cut)
+                else:
+                    macd_bad = macd_cmp >= float(macd_cut)
         except Exception:
             macd_bad = False
 
@@ -35497,10 +35524,8 @@ def _mid_long_quality_3of5_pre_emit_reason(
             rec.get("entry"),
             getattr(sig, "entry", None),
         )
-        resistance = _f(
-            ta_d.get("resistance"),
-            rec.get("resistance"),
-        )
+        resistance = _f(ta_d.get("resistance"), rec.get("resistance"))
+        support = _f(ta_d.get("support"), rec.get("support"))
         atr30 = _f(
             ta_d.get("atr30"),
             ta_d.get("atr_abs"),
@@ -35508,15 +35533,20 @@ def _mid_long_quality_3of5_pre_emit_reason(
             rec.get("atr_at_create"),
         )
 
-        near_res = False
+        near_level = False
         try:
-            if entry is not None and resistance is not None:
+            if direction == "LONG" and entry is not None and resistance is not None:
                 if float(resistance) <= float(entry):
-                    near_res = True
-                elif atr30 is not None and float(atr30) > 0 and (float(resistance) - float(entry)) <= float(atr30) * float(near_res_atr):
-                    near_res = True
+                    near_level = True
+                elif atr30 is not None and float(atr30) > 0 and (float(resistance) - float(entry)) <= float(atr30) * float(near_atr):
+                    near_level = True
+            elif direction == "SHORT" and entry is not None and support is not None:
+                if float(support) >= float(entry):
+                    near_level = True
+                elif atr30 is not None and float(atr30) > 0 and (float(entry) - float(support)) <= float(atr30) * float(near_atr):
+                    near_level = True
         except Exception:
-            near_res = False
+            near_level = False
 
         flags = []
         if strength is not None and float(strength) < float(strength_max):
@@ -35527,14 +35557,36 @@ def _mid_long_quality_3of5_pre_emit_reason(
             flags.append("vol")
         if macd_bad:
             flags.append("macd")
-        if near_res:
-            flags.append("near_resistance")
+        if near_level:
+            flags.append("near_resistance" if direction == "LONG" else "near_support")
 
         if len(flags) >= int(need_n):
-            return f"long_quality_3of5:{'|'.join(flags)}"
+            return f"{side_label}_quality_3of5:{'|'.join(flags)}"
         return ""
     except Exception:
         return ""
+
+
+def _mid_long_quality_3of5_pre_emit_reason(
+    sig: Signal | None,
+    ta: dict | None = None,
+    it: dict | None = None,
+    *,
+    vol_x: float | None = None,
+    macd_hist: float | None = None,
+) -> str:
+    return _mid_direction_quality_3of5_pre_emit_reason(sig, ta=ta, it=it, vol_x=vol_x, macd_hist=macd_hist)
+
+
+def _mid_short_quality_3of5_pre_emit_reason(
+    sig: Signal | None,
+    ta: dict | None = None,
+    it: dict | None = None,
+    *,
+    vol_x: float | None = None,
+    macd_hist: float | None = None,
+) -> str:
+    return _mid_direction_quality_3of5_pre_emit_reason(sig, ta=ta, it=it, vol_x=vol_x, macd_hist=macd_hist)
 
 def _mid_pre_emit_apply_reason(reason: str) -> str:
     try:
@@ -35549,7 +35601,10 @@ def _mid_pre_emit_apply_reason(reason: str) -> str:
         return "trap_block"
     if r.startswith("smart_setup_no_breakout_retest"):
         return "structure_fail"
-    if r.startswith("long_quality_3of5") or r.startswith("long_strength_hard") or r.startswith("long_vol_hard"):
+    if (
+        r.startswith("long_quality_3of5") or r.startswith("long_strength_hard") or r.startswith("long_vol_hard")
+        or r.startswith("short_quality_3of5") or r.startswith("short_strength_hard") or r.startswith("short_vol_hard")
+    ):
         return "score_low"
     return _mid_final_emit_apply_reason(reason)
 
@@ -35606,16 +35661,16 @@ async def _backend_mid_pre_emit_block_reason(
         if dir_reason:
             return str(dir_reason)
 
-        # 4) LONG quality veto (optional hard-bans + optional 3-of-5 gate).
-        long_quality_reason = _mid_long_quality_3of5_pre_emit_reason(
+        # 4) Direction quality veto (optional hard-bans + optional 3-of-5 gate).
+        quality_reason = _mid_direction_quality_3of5_pre_emit_reason(
             sig,
             ta=ta_d,
             it=rec,
             vol_x=vol_x,
             macd_hist=macd_hist,
         )
-        if long_quality_reason:
-            return str(long_quality_reason)
+        if quality_reason:
+            return str(quality_reason)
 
         # 5) BTC leader veto is the last market-wide gate.
         btc_reason = await self.mid_btc_emit_block_reason(symbol=sym, market=market, direction=direction)
