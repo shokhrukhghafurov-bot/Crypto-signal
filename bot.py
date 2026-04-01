@@ -3243,11 +3243,7 @@ def _signal_text(uid: int, s: Signal, *, autotrade_hint: str = "") -> str:
     risk_note = _risk_note_for_uid(uid, s.risk_note)
     try:
         if _uid_can_view_private_ta(uid):
-            setup_label = (getattr(s, 'setup_source_label', '') or '').strip()
-            if not setup_label:
-                raw_setup = (getattr(s, 'setup_source', '') or '').strip().lower().replace('_', ' ')
-                if raw_setup in ('origin', 'breakout', 'zone retest', 'normal pending trigger'):
-                    setup_label = raw_setup
+            setup_label = _report_setup_label_human(getattr(s, 'setup_source_label', '') or getattr(s, 'setup_source', ''))
             if setup_label:
                 setup_line = f"🧭 Smart-setup: {setup_label}"
                 if risk_note:
@@ -3407,10 +3403,16 @@ def _report_close_reason(final_status: str, *, after_tp1: bool = False, has_tp2:
 def _report_setup_label_human(source: str | None) -> str:
     raw = str(source or "").strip().lower().replace("_", " ")
     labels = {
-        "origin": "Начало движения",
-        "breakout": "Пробой",
-        "zone retest": "Возврат в зону",
-        "normal pending trigger": "Обычный trigger",
+        "origin": "origin",
+        "начало движения": "origin",
+        "breakout": "breakout",
+        "пробой": "breakout",
+        "zone retest": "zone retest",
+        "возврат в зону": "zone retest",
+        "normal pending trigger": "normal pending trigger",
+        "обычный trigger": "normal pending trigger",
+        "обычный триггер": "normal pending trigger",
+        "обычный pending trigger": "normal pending trigger",
     }
     if raw in labels:
         return labels[raw]
