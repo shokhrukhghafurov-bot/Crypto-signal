@@ -12060,7 +12060,13 @@ def _mid_embed_setup_source_in_orig_text(orig_text: str | None, sig: Signal | No
     label = ""
     try:
         if sig is not None:
-            label = str(getattr(sig, "setup_source_label", "") or "").strip()
+            label = str(getattr(sig, "ui_setup_label", "") or "").strip()
+            if not label:
+                emit_route = str(getattr(sig, "emit_route", "") or "").strip()
+                if emit_route == "liquidity_reclaim_emit":
+                    label = "liquidity_reclaim_emit"
+            if not label:
+                label = str(getattr(sig, "setup_source_label", "") or "").strip()
             if not label:
                 raw = _mid_setup_source_normalize(getattr(sig, "setup_source", "") or "")
                 label = _mid_setup_source_label(raw)
@@ -12091,6 +12097,111 @@ def _mid_pick_scan_setup_source(*, origin_fast_ok: bool = False, breakout_fast_o
     if bool(zone_valid) and bool(in_zone_now):
         return "zone_retest"
     return ""
+
+
+def _mid_liquidity_reclaim_ready(ta: dict, rec: dict | None = None, *, now_ts: float | None = None) -> tuple[bool, str, dict]:
+    """Best-effort readiness check for standalone liquidity_reclaim_emit sidecar route.
+
+    IMPORTANT:
+    - This route is opportunistic only.
+    - It MUST NOT mutate pending state or reject counters when not ready.
+    - It MUST NOT change canonical setup_source labels.
+    """
+    t = ta if isinstance(ta, dict) else {}
+    r = rec if isinstance(rec, dict) else {}
+    meta: dict[str, object] = {}
+    try:
+        direction = str(t.get("direction") or r.get("direction") or "").upper().strip()
+        if direction not in ("LONG", "SHORT"):
+            return (False, "direction_missing", meta)
+
+        try:
+            entry_low = float(r.get("entry_low")) if r.get("entry_low") is not None else None
+        except Exception:
+            entry_low = None
+        try:
+            entry_high = float(r.get("entry_high")) if r.get("entry_high") is not None else None
+        except Exception:
+            entry_high = None
+        zone_valid = bool(entry_low is not None and entry_high is not None and entry_high >= entry_low and entry_low > 0)
+        meta["zone_valid"] = bool(zone_valid)
+        if not zone_valid:
+            return (False, "zone_missing", meta)
+
+        sweep_ok = bool(t.get("sweep_long")) if direction == "LONG" else bool(t.get("sweep_short"))
+        meta["sweep_ok"] = bool(sweep_ok)
+        if not sweep_ok:
+            return (False, "sweep_missing", meta)
+
+        try:
+            close5 = float(t.get("close") or t.get("c") or t.get("entry") or r.get("entry") or 0.0)
+        except Exception:
+            close5 = float(r.get("entry") or 0.0)
+        try:
+            reclaim_eps = float(os.getenv("MID_LIQ_RECLAIM_RECLAIM_EPS_PCT", os.getenv("MID_INST_RECLAIM_EPS_PCT", "0.0006")) or 0.0006)
+        except Exception:
+            reclaim_eps = 0.0006
+        if direction == "LONG":
+            reclaim_ok = bool(close5 >= float(entry_high) * (1.0 + reclaim_eps))
+        else:
+            reclaim_ok = bool(close5 <= float(entry_low) * (1.0 - reclaim_eps))
+        meta["reclaim_ok"] = bool(reclaim_ok)
+        if not reclaim_ok:
+            return (False, "reclaim_missing", meta)
+
+        bos_ok = bool(t.get("bos_up_5m")) if direction == "LONG" else bool(t.get("bos_down_5m"))
+        try:
+            disp_x = float(t.get("disp_body_atr") or 0.0)
+        except Exception:
+            disp_x = 0.0
+        try:
+            disp_min = float(os.getenv("MID_LIQ_RECLAIM_DISP_MIN", os.getenv("MID_INST_DISP_MIN", "0.25")) or 0.25)
+        except Exception:
+            disp_min = 0.25
+        disp_ok = bool(disp_x >= disp_min)
+        meta["bos_ok"] = bool(bos_ok)
+        meta["disp_ok"] = bool(disp_ok)
+        meta["disp_x"] = float(disp_x)
+        if not (bos_ok or disp_ok):
+            return (False, "bos_or_displacement_missing", meta)
+
+        dir_contra = str(_mid_directional_contradiction_reason(t, r) or "").strip()
+        if dir_contra:
+            meta["directional_contradiction"] = dir_contra
+            return (False, "directional_contradiction", meta)
+
+        trap_reason = ""
+        try:
+            trap_ok = bool(t.get("trap_ok", True))
+            if not trap_ok:
+                trap_reason = str(t.get("trap_reason") or "trap_block")
+        except Exception:
+            trap_ok = True
+        meta["trap_ok"] = bool(trap_ok)
+        if not trap_ok:
+            meta["trap_reason"] = trap_reason
+            return (False, trap_reason or "trap_block", meta)
+
+        try:
+            price_now = float(t.get("entry") or t.get("close") or r.get("entry") or 0.0)
+        except Exception:
+            price_now = float(r.get("entry") or 0.0)
+        try:
+            entry_ref, anchor_too_far, anchor_slip_atr = _mid_pending_entry_ref(r, price=price_now, ta=t)
+        except Exception:
+            entry_ref, anchor_too_far, anchor_slip_atr = (0.0, False, 0.0)
+        meta["entry_ref"] = float(entry_ref or 0.0)
+        meta["anchor_slip_atr"] = float(anchor_slip_atr or 0.0)
+        if anchor_too_far:
+            return (False, "anchor_too_far", meta)
+
+        return (True, "ok", meta)
+    except Exception as e:
+        try:
+            meta["error"] = f"{type(e).__name__}:{e}"
+        except Exception:
+            pass
+        return (False, "error", meta)
 
 
 def _mid_pick_pending_setup_source(it: dict | None = None, *, zone_touch: bool = False, zone_first: bool = False, in_zone_now: bool = False) -> str:
@@ -31045,6 +31156,150 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                             _smart_emit_done = False
                                         if _smart_emit_done:
                                             continue
+
+                                    try:
+                                        _liq_enabled = str(os.getenv("MID_LIQ_RECLAIM_EMIT_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+                                    except Exception:
+                                        _liq_enabled = True
+                                    if _liq_enabled:
+                                        try:
+                                            _liq_ok, _liq_reason, _liq_meta = _mid_liquidity_reclaim_ready(
+                                                (base_r if ("base_r" in locals() and isinstance(base_r, dict)) else {}),
+                                                rec,
+                                                now_ts=time.time(),
+                                            )
+                                        except Exception as _liq_exc:
+                                            _liq_ok, _liq_reason, _liq_meta = (False, f"error:{type(_liq_exc).__name__}", {})
+                                        try:
+                                            logger.info("[mid][liq_reclaim][candidate] %s market=%s dir=%s ok=%s reason=%s meta=%s", sym, marketu, diru, 1 if _liq_ok else 0, str(_liq_reason or "-"), str(_liq_meta or {}))
+                                        except Exception:
+                                            pass
+                                        if _liq_ok:
+                                            try:
+                                                _liq_source = str(rec.get("setup_source") or "").strip() or _mid_pick_scan_setup_source(
+                                                    origin_fast_ok=bool(rec.get("smart_origin_fast_ok") or False),
+                                                    breakout_fast_ok=bool(rec.get("smart_breakout_fast_ok") or False),
+                                                    zone_valid=bool((_liq_meta or {}).get("zone_valid") or False),
+                                                    in_zone_now=bool((_liq_meta or {}).get("reclaim_ok") or False),
+                                                )
+                                            except Exception:
+                                                _liq_source = ""
+                                            _liq_note_prefix = str(risk_note or "").strip()
+                                            _liq_note = (_liq_note_prefix + (" | " if _liq_note_prefix else "") + "liquidity_reclaim_emit=1 | levels_anchor=1").strip()
+                                            sig_lr = Signal(
+                                                signal_id=self.next_signal_id(),
+                                                market=marketu,
+                                                symbol=sym,
+                                                direction=diru,
+                                                timeframe=f"{tf_trigger}/{tf_mid}/{tf_trend}",
+                                                entry=float(entry),
+                                                sl=float(sl),
+                                                tp1=float(tp1),
+                                                tp2=float(tp2),
+                                                rr=float(rr),
+                                                confidence=int(round(conf)),
+                                                confirmations=conf_names,
+                                                source_exchange=best_name,
+                                                available_exchanges=conf_names,
+                                                risk_note=_liq_note,
+                                                ts=time.time(),
+                                                setup_source=_liq_source,
+                                                setup_source_label=_mid_setup_source_label(_liq_source),
+                                            )
+                                            try:
+                                                setattr(sig_lr, "emit_route", "liquidity_reclaim_emit")
+                                                setattr(sig_lr, "ui_setup_label", "liquidity_reclaim_emit")
+                                            except Exception:
+                                                pass
+
+                                            _liq_final_reason = _mid_final_emit_gate_reason(
+                                                sig=sig_lr,
+                                                ta=(base_r if ("base_r" in locals() and isinstance(base_r, dict)) else None),
+                                                it=rec,
+                                                risk_flags=risk_flags,
+                                                vol_x=float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict) and base_r.get("rel_vol") is not None) else base_r.get("vol_x") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
+                                                body_atr=_mid_body_atr(float((base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0), float((base_r.get("atr30") if ("base_r" in locals() and isinstance(base_r, dict)) else base_r.get("atr_abs") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("atr_at_create") or 0.0) or 0.0)),
+                                                bo_rt_label=str(rec.get("bo_rt") or rec.get("breakout_retest") or ""),
+                                                breakout_fresh_ok=bool(rec.get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(rec, now_ts=time.time())),
+                                                micro_trap_ok=bool((base_r.get("trap_ok") if ("base_r" in locals() and isinstance(base_r, dict)) else True)),
+                                                macd_hist=_safe_float((base_r.get("macd_hist") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("macd_hist")), None),
+                                                zone_src=str(rec.get("entry_zone_src") or ""),
+                                                in_zone_now=bool((_liq_meta or {}).get("reclaim_ok") or False),
+                                            )
+                                            if _liq_final_reason:
+                                                try:
+                                                    logger.info("[mid][liq_reclaim][final_emit_block] %s market=%s dir=%s route=%s reason=%s", sym, marketu, diru, "liquidity_reclaim_emit", _liq_final_reason)
+                                                except Exception:
+                                                    pass
+                                            else:
+                                                try:
+                                                    _liq_can_emit = bool(self.can_emit_mid(sym))
+                                                except Exception:
+                                                    _liq_can_emit = True
+                                                if not _liq_can_emit:
+                                                    try:
+                                                        logger.info("[mid][liq_reclaim][skip] %s market=%s dir=%s reason=%s", sym, marketu, diru, "emit_cooldown")
+                                                    except Exception:
+                                                        pass
+                                                else:
+                                                    _liq_pre_reason = await self.mid_pre_emit_block_reason(
+                                                        sig=sig_lr,
+                                                        ta=(base_r if ("base_r" in locals() and isinstance(base_r, dict)) else None),
+                                                        it=rec,
+                                                        risk_flags=risk_flags,
+                                                        vol_x=float((base_r.get("rel_vol") if ("base_r" in locals() and isinstance(base_r, dict) and base_r.get("rel_vol") is not None) else base_r.get("vol_x") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0),
+                                                        body_atr=_mid_body_atr(float((base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else 0.0) or 0.0), float((base_r.get("atr30") if ("base_r" in locals() and isinstance(base_r, dict)) else base_r.get("atr_abs") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("atr_at_create") or 0.0) or 0.0)),
+                                                        bo_rt_label=str(rec.get("bo_rt") or rec.get("breakout_retest") or ""),
+                                                        breakout_fresh_ok=bool(rec.get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(rec, now_ts=time.time())),
+                                                        micro_trap_ok=bool((base_r.get("trap_ok") if ("base_r" in locals() and isinstance(base_r, dict)) else True)),
+                                                        macd_hist=_safe_float((base_r.get("macd_hist") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("macd_hist")), None),
+                                                        zone_src=str(rec.get("entry_zone_src") or ""),
+                                                        in_zone_now=bool((_liq_meta or {}).get("reclaim_ok") or False),
+                                                        route="liquidity_reclaim_emit",
+                                                    )
+                                                    if _liq_pre_reason:
+                                                        try:
+                                                            logger.info("[mid][liq_reclaim][pre_emit_block] %s market=%s dir=%s route=%s reason=%s", sym, marketu, diru, "liquidity_reclaim_emit", _liq_pre_reason)
+                                                        except Exception:
+                                                            pass
+                                                    else:
+                                                        try:
+                                                            self.mark_emitted_mid(sym, sig_lr.direction, sig_lr.market)
+                                                        except TypeError:
+                                                            try:
+                                                                self.mark_emitted_mid(sym)
+                                                            except Exception:
+                                                                pass
+                                                        except Exception:
+                                                            pass
+                                                        self.last_signal = sig_lr
+                                                        if sig_lr.market == "SPOT":
+                                                            self.last_spot_signal = sig_lr
+                                                        else:
+                                                            self.last_futures_signal = sig_lr
+                                                        _mid_stage_add("passed_ta", 1)
+                                                        _mid_stage_add("triggered", 1)
+                                                        await emit_signal_cb(sig_lr)
+                                                        _mid_emitted += 1
+                                                        try:
+                                                            _mid_metrics_inc("setups_found", 1)
+                                                        except Exception:
+                                                            pass
+                                                        try:
+                                                            logger.info("[mid][liq_reclaim][emit] %s market=%s dir=%s route=%s entry=%.8f", sym, sig_lr.market, sig_lr.direction, "liquidity_reclaim_emit", float(sig_lr.entry))
+                                                        except Exception:
+                                                            pass
+                                                        try:
+                                                            _rej_ok(sym, "emitted")
+                                                        except Exception:
+                                                            pass
+                                                        await asyncio.sleep(2)
+                                                        continue
+                                        else:
+                                            try:
+                                                logger.info("[mid][liq_reclaim][skip] %s market=%s dir=%s reason=%s", sym, marketu, diru, str(_liq_reason or "not_ready"))
+                                            except Exception:
+                                                pass
 
                                     await self.add_mid_pending(rec)
                                     try:
