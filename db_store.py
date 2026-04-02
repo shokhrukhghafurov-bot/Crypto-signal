@@ -2337,7 +2337,8 @@ async def signal_report_window_summary(*, since: dt.datetime, until: dt.datetime
     """Aggregate a daily signal report for the given time window.
 
     Sent counters use signal_tracks.opened_at in [since, until).
-    Outcome counters use signal_tracks.closed_at in [since, until).
+    Outcome counters are calculated for the SAME sent cohort, not for everything
+    that happened to close in the window.
     """
     try:
         pool = get_pool()
@@ -2355,7 +2356,7 @@ async def signal_report_window_summary(*, since: dt.datetime, until: dt.datetime
         try:
             rows = await conn.fetch(
                 """
-                SELECT market, side, orig_text, setup_source, setup_source_label, ui_setup_label, emit_route
+                SELECT signal_id, market, side, orig_text, setup_source, setup_source_label, ui_setup_label, emit_route
                 FROM signal_tracks
                 WHERE opened_at IS NOT NULL
                   AND opened_at >= $1 AND opened_at < $2;
@@ -2365,18 +2366,20 @@ async def signal_report_window_summary(*, since: dt.datetime, until: dt.datetime
             sent_rows = [dict(r) for r in (rows or [])]
         except Exception:
             logger.exception('signal_report_window_summary sent_rows failed')
+        signal_ids = [int(r.get("signal_id") or 0) for r in sent_rows if int(r.get("signal_id") or 0) > 0]
         try:
-            rows = await conn.fetch(
-                """
-                SELECT market, side, status, pnl_total_pct, orig_text, setup_source, setup_source_label, ui_setup_label, emit_route
-                FROM signal_tracks
-                WHERE closed_at IS NOT NULL
-                  AND closed_at >= $1 AND closed_at < $2
-                  AND status IN ('WIN','LOSS','BE','CLOSED');
-                """,
-                since, until,
-            )
-            closed_rows = [dict(r) for r in (rows or [])]
+            if signal_ids:
+                rows = await conn.fetch(
+                    """
+                    SELECT market, side, status, pnl_total_pct, orig_text, setup_source, setup_source_label, ui_setup_label, emit_route
+                    FROM signal_tracks
+                    WHERE signal_id = ANY($1::BIGINT[])
+                      AND closed_at IS NOT NULL
+                      AND status IN ('WIN','LOSS','BE','CLOSED');
+                    """,
+                    signal_ids,
+                )
+                closed_rows = [dict(r) for r in (rows or [])]
         except Exception:
             logger.exception('signal_report_window_summary closed_rows failed')
 
@@ -2429,7 +2432,23 @@ async def signal_report_window_summary(*, since: dt.datetime, until: dt.datetime
 
 
 async def signal_report_window_dataset(*, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
-    """Return raw sent/closed rows needed to build the verbose daily report."""
+    """Return raw rows needed to build the verbose daily report.
+
+    Report logic for the signal bot:
+      - include signals SENT in the current window;
+      - also include carry-over signals from previous days if they CLOSED in the
+        current window.
+
+    This matches the desired operator workflow: if yesterday's signal did not
+    close yesterday, it should fall into the next daily report once it closes.
+
+    To keep counters coherent we return:
+      - sent_rows = current-window sent rows + carry-over rows that closed now;
+      - closed_rows = rows that actually closed in the current window.
+
+    `sent_rows` therefore means "signals included in this report", not strictly
+    "opened today only".
+    """
     try:
         pool = get_pool()
     except Exception:
@@ -2438,6 +2457,7 @@ async def signal_report_window_dataset(*, since: dt.datetime, until: dt.datetime
     sent_rows: List[dict] = []
     closed_rows: List[dict] = []
     async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        sent_by_id: Dict[int, dict] = {}
         try:
             rows = await conn.fetch(
                 """
@@ -2453,6 +2473,10 @@ async def signal_report_window_dataset(*, since: dt.datetime, until: dt.datetime
                 since, until,
             )
             sent_rows = [dict(r) for r in (rows or [])]
+            for row in sent_rows:
+                sid = int(row.get('signal_id') or 0)
+                if sid > 0 and sid not in sent_by_id:
+                    sent_by_id[sid] = dict(row)
         except Exception:
             logger.exception('signal_report_window_dataset sent_rows failed')
 
@@ -2468,7 +2492,7 @@ async def signal_report_window_dataset(*, since: dt.datetime, until: dt.datetime
                 WHERE closed_at IS NOT NULL
                   AND closed_at >= $1 AND closed_at < $2
                   AND status IN ('WIN','LOSS','BE','CLOSED')
-                ORDER BY closed_at ASC, signal_id ASC;
+                ORDER BY closed_at ASC NULLS LAST, signal_id ASC;
                 """,
                 since, until,
             )
@@ -2476,6 +2500,23 @@ async def signal_report_window_dataset(*, since: dt.datetime, until: dt.datetime
         except Exception:
             logger.exception('signal_report_window_dataset closed_rows failed')
 
+        if closed_rows:
+            for row in closed_rows:
+                sid = int(row.get('signal_id') or 0)
+                if sid <= 0 or sid in sent_by_id:
+                    continue
+                # carry-over signal from an earlier day that closed in this window:
+                # include it in the current report base dataset.
+                sent_like = dict(row)
+                sent_like.pop('status', None)
+                sent_like.pop('tp1_hit', None)
+                sent_like.pop('pnl_total_pct', None)
+                sent_like.pop('closed_at', None)
+                sent_by_id[sid] = sent_like
+                sent_rows.append(sent_like)
+
+    sent_rows.sort(key=lambda r: (str(r.get('opened_at') or ''), int(r.get('signal_id') or 0)))
+    closed_rows.sort(key=lambda r: (str(r.get('closed_at') or ''), int(r.get('signal_id') or 0)))
     return {
         "sent_rows": sent_rows,
         "closed_rows": closed_rows,
