@@ -4055,10 +4055,55 @@ def _daily_report_row_confirmations(row: dict) -> int:
     return _loss_diag_count_confirmations(row.get("confirmations") or row.get("source_exchange"))
 
 
+def _daily_report_rr_from_row(row: dict) -> float:
+    rr = _daily_report_float(row.get("rr"))
+    if rr > 0:
+        return rr
+    try:
+        entry = float(row.get("entry") or 0.0)
+        sl = float(row.get("sl") or 0.0)
+        tp1 = float(row.get("tp1") or 0.0)
+        tp2 = float(row.get("tp2") or 0.0)
+        if entry <= 0 or sl <= 0:
+            return 0.0
+        risk = abs(entry - sl)
+        if risk <= 0:
+            return 0.0
+        target = tp2 if tp2 > 0 and abs(tp2 - tp1) > 1e-12 else tp1
+        if target <= 0:
+            return 0.0
+        reward = abs(target - entry)
+        if reward <= 0:
+            return 0.0
+        return reward / risk
+    except Exception:
+        return 0.0
+
+
+def _daily_report_enrich_row(row: dict) -> dict:
+    src = dict(row or {})
+    status = str(src.get("status") or "").upper().strip()
+    if status in {"LOSS", "CLOSED", "WIN", "BE"}:
+        try:
+            diag = _build_loss_diagnostics_from_row(src, final_status=status)
+        except Exception:
+            diag = {}
+        if diag:
+            if not str(src.get("close_reason_code") or "").strip():
+                src["close_reason_code"] = str(diag.get("reason_code") or "")
+            if not str(src.get("close_reason_text") or "").strip():
+                src["close_reason_text"] = str(diag.get("reason_text") or "")
+            if not str(src.get("weak_filters") or "").strip():
+                src["weak_filters"] = ",".join(list(diag.get("weak_filter_keys") or []))
+            if not str(src.get("improve_note") or "").strip():
+                src["improve_note"] = "; ".join(list(diag.get("improve_keys") or []))
+    return src
+
+
 def _daily_report_add_sent(bucket: dict, row: dict) -> None:
     bucket["sent"] = _daily_report_int(bucket.get("sent")) + 1
     conf = _daily_report_int(row.get("confidence"))
-    rr = _daily_report_float(row.get("rr"))
+    rr = _daily_report_rr_from_row(row)
     if conf > 0:
         bucket["conf_values"].append(conf)
     if rr > 0:
@@ -4301,6 +4346,7 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
             merged = dict(sent_by_id[signal_id])
             merged.update({k: v for k, v in row.items() if v is not None and v != ""})
             row = merged
+        row = _daily_report_enrich_row(row)
         market = str(row.get("market") or "").upper().strip()
         side = str(row.get("side") or "").upper().strip()
         setup = _daily_report_setup_key_from_row(row)
