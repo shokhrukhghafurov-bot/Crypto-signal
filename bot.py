@@ -3459,33 +3459,128 @@ def _loss_diag_count_confirmations(raw: str | None) -> int:
 
 
 def _loss_diag_setup_key_from_row(row: dict) -> str:
-    label = str(_report_setup_label_from_row(row) or '').strip().lower().replace(' ', '_')
+    label = str(_report_setup_label_from_row(row) or '').strip().lower().replace('-', '_').replace(' ', '_')
     mapping = {
         'origin': 'origin',
+        'origin_fast': 'origin',
+        'origin_fastpass': 'origin',
         'breakout': 'breakout',
+        'breakout_fast': 'breakout',
+        'breakout_fastpass': 'breakout',
+        'zone': 'zone_retest',
         'zone_retest': 'zone_retest',
-        'zone_retest': 'zone_retest',
-        'zone_retest': 'zone_retest',
-        'zone_retest': 'zone_retest',
-        'zone_retest': 'zone_retest',
-        'zone_retest': 'zone_retest',
-        'zone_retest': 'zone_retest',
-        'zone_retest': 'zone_retest',
-        'zone_retest': 'zone_retest',
+        'zone_touch': 'zone_retest',
+        'zone_touch_retest': 'zone_retest',
+        'normal_pending': 'normal_pending_trigger',
         'normal_pending_trigger': 'normal_pending_trigger',
-        'normal_pending_trigger': 'normal_pending_trigger',
-        'normal_pending_trigger': 'normal_pending_trigger',
+        'pending': 'normal_pending_trigger',
+        'pending_trigger': 'normal_pending_trigger',
         'liquidity_reclaim': 'liquidity_reclaim',
+        'liquidity_reclaim_emit': 'liquidity_reclaim',
     }
     if label in mapping:
         return mapping[label]
-    if label in ('zone retest', 'zone_retest'):
-        return 'zone_retest'
-    if label in ('normal pending trigger', 'normal_pending_trigger'):
-        return 'normal_pending_trigger'
-    if label in ('liquidity reclaim', 'liquidity_reclaim'):
-        return 'liquidity_reclaim'
     return label
+
+
+def _loss_diag_ta_filter_keys(*values: str, direction: str = "", setup_key: str = "") -> list[str]:
+    text = "\n".join([str(v or "") for v in values if str(v or "").strip()])
+    if not text:
+        return []
+    out: list[str] = []
+
+    def _push(key: str) -> None:
+        key = str(key or "").strip()
+        if key and key not in out:
+            out.append(key)
+
+    for raw_line in text.splitlines():
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        core = _strip_private_ta_prefix(line)
+        core_l = core.lower()
+
+        if "ta score:" in core_l:
+            m = re.search(r"TA score:\s*([0-9]+(?:\.[0-9]+)?)\/100.*?need\s*[≥>=]*\s*([0-9]+(?:\.[0-9]+)?)", core, flags=re.IGNORECASE)
+            if m:
+                try:
+                    if float(m.group(1)) < float(m.group(2)):
+                        _push("low_ta_score")
+                except Exception:
+                    pass
+            if "grade: c" in core_l or "grade: d" in core_l:
+                _push("low_ta_score")
+
+        if "signal strength:" in core_l and ("(weak)" in core_l or "(medium)" in core_l or "слаб" in core_l):
+            _push("weak_signal_strength")
+
+        if "confidence:" in core_l:
+            m = re.search(r"Confidence:\s*([0-9]+(?:\.[0-9]+)?)\/100.*?need\s*[≥>=]*\s*([0-9]+(?:\.[0-9]+)?)", core, flags=re.IGNORECASE)
+            if m:
+                try:
+                    if float(m.group(1)) < float(m.group(2)):
+                        _push("low_confidence")
+                except Exception:
+                    pass
+
+        if "macd hist" in core_l and ("⚠️" in line or "❌" in line):
+            _push("macd_momentum_weak")
+
+        if "adx 30m/1h" in core_l and ("⚠️" in line or "❌" in line):
+            _push("weak_trend_context")
+
+        if "vwap:" in core_l and ("⚠️" in line or "❌" in line):
+            _push("vwap_side_weak")
+
+        if "breakout/retest:" in core_l and setup_key in ("breakout", "zone_retest"):
+            if "—" in core or re.search(r"breakout/retest:\s*[-—]+", core_l):
+                _push("breakout_retest_weak" if setup_key == "breakout" else "zone_hold_weak")
+
+        if "ob retest:" in core_l and setup_key == "zone_retest" and "—" in core:
+            _push("zone_hold_weak")
+
+        if "sweep(5m):" in core_l and setup_key == "liquidity_reclaim" and "—" in core:
+            _push("reclaim_confirmation_weak")
+
+        if "ch:" in core_l:
+            dir_u = str(direction or "").upper().strip()
+            if (dir_u == "LONG" and "desc@lower" in core_l) or (dir_u == "SHORT" and "asc@upper" in core_l):
+                _push("weak_trend_context")
+
+    return out
+
+
+def _loss_diag_improve_from_weak_filter(key: str, *, market: str = "", side: str = "", setup_key: str = "") -> str:
+    k = str(key or "").strip()
+    mkt = str(market or "").upper().strip()
+    side_u = str(side or "").upper().strip()
+    setup_u = str(setup_key or "").strip()
+    mapping = {
+        "low_confidence": "raise_min_confidence",
+        "few_confirmations": "require_more_confirmations",
+        "low_ta_score": "raise_min_ta_score",
+        "weak_signal_strength": "raise_min_ta_score",
+        "macd_momentum_weak": "tighten_trend_alignment",
+        "vwap_side_weak": "tighten_trend_alignment",
+        "weak_trend_context": "tighten_trend_alignment",
+        "trigger_reconfirm_weak": "tighten_trigger_reconfirm",
+        "tp1_protection": "tighten_tp1_protection",
+        "reclaim_confirmation_weak": "tighten_liquidity_reclaim",
+    }
+    if k == "low_rr":
+        return "tighten_rr_spot" if mkt == "SPOT" else "raise_min_rr"
+    if k == "breakout_retest_weak":
+        return "tighten_breakout_retest"
+    if k == "zone_hold_weak":
+        return "tighten_zone_retest_long" if side_u == "LONG" else "tighten_zone_retest"
+    if k == "origin_entry_early":
+        return "tighten_origin_entry"
+    if k in mapping:
+        return mapping[k]
+    if setup_u == "normal_pending_trigger":
+        return "tighten_trigger_reconfirm"
+    return ""
 
 
 def _loss_diag_reason_text(reason_code: str, fallback: str) -> str:
@@ -3502,12 +3597,15 @@ def _loss_diag_reason_text(reason_code: str, fallback: str) -> str:
 def _loss_diag_weak_filter_label(key: str) -> str:
     mapping = {
         'low_confidence': 'низкий confidence',
-        'low_rr': 'низкий RR',
+        'low_rr': 'слабый RR',
         'few_confirmations': 'мало подтверждений',
         'low_ta_score': 'низкий TA score',
         'weak_signal_strength': 'слабая сила сигнала',
+        'weak_trend_context': 'слабый тренд / ADX контекст',
+        'macd_momentum_weak': 'MACD не подтвердил импульс',
+        'vwap_side_weak': 'цена по слабую сторону VWAP',
         'breakout_retest_weak': 'слабый breakout / retest',
-        'zone_hold_weak': 'слабое удержание зоны',
+        'zone_hold_weak': 'слабый retest зоны',
         'origin_entry_early': 'слишком ранний origin entry',
         'trigger_reconfirm_weak': 'слабый pending trigger',
         'reclaim_confirmation_weak': 'слабый liquidity reclaim',
@@ -3518,15 +3616,18 @@ def _loss_diag_weak_filter_label(key: str) -> str:
 
 def _loss_diag_improve_label(key: str) -> str:
     mapping = {
-        'raise_min_confidence': 'поднять minimum confidence',
+        'raise_min_confidence': 'поднять minimum confidence для breakout-входов',
         'raise_min_rr': 'поднять minimum RR',
-        'require_more_confirmations': 'требовать 2+ подтверждения',
+        'tighten_rr_spot': 'снизить допуск на слабый RR в SPOT',
+        'require_more_confirmations': 'добавить 1 дополнительное подтверждение для normal_pending_trigger',
         'raise_min_ta_score': 'поднять minimum TA score',
-        'tighten_breakout_retest': 'ужесточить breakout retest',
-        'tighten_zone_retest': 'сузить zone retest',
+        'tighten_breakout_retest': 'поднять minimum confidence для breakout-входов',
+        'tighten_zone_retest': 'усилить retest-фильтр перед входом',
+        'tighten_zone_retest_long': 'усилить retest-фильтр перед LONG входом',
         'tighten_origin_entry': 'ужесточить origin entry',
-        'tighten_trigger_reconfirm': 'усилить trigger reconfirmation',
+        'tighten_trigger_reconfirm': 'добавить 1 дополнительное подтверждение для normal_pending_trigger',
         'tighten_liquidity_reclaim': 'усилить reclaim confirmation',
+        'tighten_trend_alignment': 'жёстче отсеивать входы против слабого тренда',
         'tighten_tp1_protection': 'усилить TP1 → SL защиту',
     }
     return mapping.get(str(key or '').strip(), str(key or '').strip())
@@ -3618,7 +3719,7 @@ def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str) -> 
             improve_keys.append('tighten_breakout_retest')
         elif setup_key == 'zone_retest':
             weak_keys.append('zone_hold_weak')
-            improve_keys.append('tighten_zone_retest')
+            improve_keys.append('tighten_zone_retest_long' if str(src.get('side') or '').upper().strip() == 'LONG' else 'tighten_zone_retest')
         elif setup_key == 'origin':
             weak_keys.append('origin_entry_early')
             improve_keys.append('tighten_origin_entry')
@@ -3630,6 +3731,16 @@ def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str) -> 
             improve_keys.append('tighten_liquidity_reclaim')
     else:
         reason_code = 'timeout_closed'
+
+    for item in _loss_diag_ta_filter_keys(src.get('risk_note'), src.get('orig_text'), direction=str(src.get('side') or ''), setup_key=setup_key):
+        weak_keys.append(item)
+
+    market_u = str(src.get('market') or '').upper().strip()
+    side_u = str(src.get('side') or '').upper().strip()
+    for item in list(weak_keys):
+        improve = _loss_diag_improve_from_weak_filter(item, market=market_u, side=side_u, setup_key=setup_key)
+        if improve:
+            improve_keys.append(improve)
 
     weak_keys = list(dict.fromkeys([x for x in weak_keys if x]))
     improve_keys = list(dict.fromkeys([x for x in improve_keys if x]))
@@ -3647,19 +3758,33 @@ def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str) -> 
 
 
 def _report_setup_label_human(source: str | None) -> str:
-    raw = str(source or "").strip().lower().replace("_", " ")
+    raw = str(source or "").strip().lower().replace("-", " ").replace("_", " ")
+    raw = re.sub(r"\s+", " ", raw).strip()
     labels = {
         "origin": "origin",
+        "origin fast": "origin",
+        "origin fastpass": "origin",
         "начало движения": "origin",
         "breakout": "breakout",
+        "breakout fast": "breakout",
+        "breakout fastpass": "breakout",
         "пробой": "breakout",
+        "zone": "zone retest",
         "zone retest": "zone retest",
+        "zone touch": "zone retest",
+        "zone touch retest": "zone retest",
         "возврат в зону": "zone retest",
+        "normal pending": "normal pending trigger",
         "normal pending trigger": "normal pending trigger",
+        "pending": "normal pending trigger",
+        "pending trigger": "normal pending trigger",
         "обычный trigger": "normal pending trigger",
         "обычный триггер": "normal pending trigger",
         "обычный pending trigger": "normal pending trigger",
         "liquidity reclaim": "liquidity_reclaim",
+        "liquidity reclaim emit": "liquidity_reclaim",
+        "liquidity reclaim entry": "liquidity_reclaim",
+        "liquidity reclaim ready": "liquidity_reclaim",
         "liquidity_reclaim": "liquidity_reclaim",
         "liquidity_reclaim_emit": "liquidity_reclaim",
     }
@@ -3758,9 +3883,10 @@ def _report_setup_label_from_row(row: dict) -> str:
             if label:
                 return label
 
-        label = _report_extract_setup_label_from_text(str(row.get("orig_text") or ""))
-        if label:
-            return label
+        for candidate in (row.get("risk_note"), row.get("orig_text")):
+            label = _report_extract_setup_label_from_text(str(candidate or ""))
+            if label:
+                return label
     except Exception:
         pass
     return ""
@@ -3967,6 +4093,23 @@ def _daily_report_quality(bucket: dict) -> int:
     )
     raw = (0.38 * conf_score) + (0.24 * rr_score) + (0.22 * success) + (0.16 * confirm_score) - (penalty / max(1, sent))
     return max(35, min(99, int(round(raw))))
+
+
+def _daily_report_setup_has_data(bucket: dict) -> bool:
+    b = dict(bucket or {})
+    return (_daily_report_int(b.get("sent")) > 0) or ((_daily_report_int(b.get("win")) + _daily_report_int(b.get("loss")) + _daily_report_int(b.get("be")) + _daily_report_int(b.get("manual_close"))) > 0)
+
+
+def _daily_report_render_quality(bucket: dict) -> str:
+    return f"{_daily_report_quality(bucket)}/100" if _daily_report_setup_has_data(bucket) else "—"
+
+
+def _daily_report_weak_label(key: str) -> str:
+    return _loss_diag_weak_filter_label(key)
+
+
+def _daily_report_improve_label(key: str) -> str:
+    return _loss_diag_improve_label(key)
 
 
 def _daily_report_reason_label(code: str, text_value: str = "") -> str:
@@ -4216,28 +4359,36 @@ def _daily_report_filter_scores(*, overall_bucket: dict, setups: dict, all_loss_
     loss_count = max(1, len(all_loss_rows))
     penalty_unit = 8.0 / loss_count
 
-    def penalized(base: float, *keys: str) -> int:
+    def penalized(base: float | None, *keys: str) -> int | None:
+        if base is None:
+            return None
         penalty = 0.0
         for key in keys:
             penalty += penalty_unit * _daily_report_int(weak_total.get(key))
         return max(35, min(99, int(round(base - penalty))))
 
-    confidence_base = 0.72 * avg_conf + 0.28 * overall_quality
-    rr_base = 0.60 * (min(max(avg_rr, 0.0), 3.0) / 3.0 * 100.0) + 0.40 * overall_quality
+    def setup_base(key: str) -> float | None:
+        bucket = setups.get(key) or _daily_report_bucket_template()
+        if not _daily_report_setup_has_data(bucket):
+            return None
+        return 0.55 * _daily_report_quality(bucket) + 0.45 * overall_quality
+
+    confidence_base = 0.72 * avg_conf + 0.28 * overall_quality if avg_conf > 0 else None
+    rr_base = 0.60 * (min(max(avg_rr, 0.0), 3.0) / 3.0 * 100.0) + 0.40 * overall_quality if avg_rr > 0 else None
     trend_base = 0.70 * overall_quality + 0.30 * _daily_report_winrate(overall_bucket, overall=False)
-    retest_base = 0.55 * _daily_report_quality(setups.get("zone_retest") or _daily_report_bucket_template()) + 0.45 * overall_quality
-    breakout_base = 0.55 * _daily_report_quality(setups.get("breakout") or _daily_report_bucket_template()) + 0.45 * overall_quality
-    reclaim_base = 0.55 * _daily_report_quality(setups.get("liquidity_reclaim") or overall_bucket) + 0.45 * overall_quality
-    trigger_base = 0.55 * _daily_report_quality(setups.get("normal_pending_trigger") or overall_bucket) + 0.45 * overall_quality
+    retest_base = setup_base("zone_retest")
+    breakout_base = setup_base("breakout")
+    reclaim_base = setup_base("liquidity_reclaim")
+    trigger_base = setup_base("normal_pending_trigger")
 
     return {
         "confidence": penalized(confidence_base, "low_confidence"),
         "rr": penalized(rr_base, "low_rr", "weak_rr"),
-        "trend": penalized(trend_base, "weak_trend_context", "low_ta_score", "weak_signal_strength"),
-        "retest": penalized(retest_base, "weak_retest_confirmation", "breakout_retest_weak"),
-        "breakout": penalized(breakout_base, "false_breakout_after_entry", "breakout_retest_weak"),
+        "trend": penalized(trend_base, "weak_trend_context", "low_ta_score", "weak_signal_strength", "macd_momentum_weak", "vwap_side_weak"),
+        "retest": penalized(retest_base, "weak_retest_confirmation", "breakout_retest_weak", "zone_hold_weak"),
+        "breakout": penalized(breakout_base, "false_breakout_after_entry", "breakout_retest_weak", "low_confidence"),
         "reclaim": penalized(reclaim_base, "reclaim_confirmation_weak"),
-        "trigger": penalized(trigger_base, "trigger_reconfirm_weak"),
+        "trigger": penalized(trigger_base, "trigger_reconfirm_weak", "few_confirmations"),
     }
 
 
@@ -4245,14 +4396,14 @@ def _daily_report_pick_best_setup(setups: dict) -> str:
     best_key = ""
     best_score = None
     for key, bucket in dict(setups or {}).items():
-        sent = _daily_report_int(bucket.get("sent"))
-        if sent <= 0:
+        resolved = _daily_report_int(bucket.get("win")) + _daily_report_int(bucket.get("loss")) + _daily_report_int(bucket.get("be")) + _daily_report_int(bucket.get("manual_close"))
+        if resolved <= 0:
             continue
         score = (
             _daily_report_quality(bucket),
             round(_daily_report_winrate(bucket), 4),
             _daily_report_float(bucket.get("sum_pnl_pct")),
-            sent,
+            _daily_report_int(bucket.get("sent")),
         )
         if best_score is None or score > best_score:
             best_key = str(key)
@@ -4264,15 +4415,15 @@ def _daily_report_pick_worst_setup(setups: dict) -> str:
     worst_key = ""
     worst_score = None
     for key, bucket in dict(setups or {}).items():
-        sent = _daily_report_int(bucket.get("sent"))
-        if sent <= 0:
+        resolved = _daily_report_int(bucket.get("win")) + _daily_report_int(bucket.get("loss")) + _daily_report_int(bucket.get("be")) + _daily_report_int(bucket.get("manual_close"))
+        if resolved <= 0:
             continue
         score = (
             _daily_report_int(bucket.get("loss")) == 0,
             _daily_report_quality(bucket),
             round(_daily_report_winrate(bucket), 4),
             _daily_report_float(bucket.get("sum_pnl_pct")),
-            -sent,
+            -_daily_report_int(bucket.get("sent")),
         )
         if worst_score is None or score < worst_score:
             worst_key = str(key)
@@ -4287,8 +4438,9 @@ def _daily_report_render_loss_example(idx: int, row: dict) -> list[str]:
     pnl = _report_pnl_pct(_daily_report_float(row.get("pnl_total_pct")))
     setup = str(_daily_report_setup_key_from_row(row) or "unknown")
     reason = str(row.get("close_reason_text") or "").strip() or _daily_report_reason_label(row.get("close_reason_code"))
-    weak_filters = ", ".join(_daily_report_split_multi(row.get("weak_filters"))) or "—"
-    improve_text = str(row.get("improve_note") or "").strip() or "усилить фильтрацию входа"
+    weak_filters = ", ".join([_daily_report_weak_label(x) for x in _daily_report_split_multi(row.get("weak_filters"))]) or "—"
+    improve_items = [_daily_report_improve_label(x) for x in _daily_report_split_multi(row.get("improve_note"))]
+    improve_text = "; ".join([x for x in improve_items if x]).strip() or "усилить фильтрацию входа"
     return [
         f"{idx}. {symbol} | {market} | {side}",
         f"   PnL: {pnl}",
@@ -4373,8 +4525,9 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
     worst_setup_bucket = setups.get(worst_setup_key) or _daily_report_bucket_template()
 
     filter_scores = _daily_report_filter_scores(overall_bucket=overall, setups=setups, all_loss_rows=all_loss_rows)
-    if filter_scores:
-        overall_quality = int(round(sum(filter_scores.values()) / len(filter_scores)))
+    valid_filter_values = [float(v) for v in list(filter_scores.values()) if v is not None]
+    if valid_filter_values:
+        overall_quality = int(round(sum(valid_filter_values) / len(valid_filter_values)))
 
     reason_counter = {}
     weak_counter = {}
@@ -4414,7 +4567,8 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
             side_best = key
             side_best_score = score
 
-    weakest_filter_key = min(filter_scores.items(), key=lambda kv: kv[1])[0] if filter_scores else "retest"
+    weakest_items = [(k, v) for k, v in dict(filter_scores or {}).items() if v is not None]
+    weakest_filter_key = min(weakest_items, key=lambda kv: kv[1])[0] if weakest_items else "retest"
     weakest_filter_label = {
         "confidence": "confidence логика",
         "rr": "RR логика",
@@ -4517,7 +4671,7 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
             lines.append(f"🟡/⚪ Без результата: {no_result}")
         if _daily_report_int(bucket.get('win')) + _daily_report_int(bucket.get('loss')) > 0:
             lines.append(f"📈 Winrate: {_daily_report_pct(_daily_report_winrate(bucket), digits=1, strip_zero=True)}")
-        lines.append(f"🛡 Качество: {_daily_report_quality(bucket)}/100")
+        lines.append(f"🛡 Качество: {_daily_report_render_quality(bucket)}")
         lines.append("")
 
     lines.extend([sep, "🏆 Лучший сетап дня", "", f"🥇 {best_setup_key or '—'}", "Почему лучший:"])
@@ -4551,13 +4705,13 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
     lines.extend(["", "Слабые фильтры:"])
     if top_weak:
         for key, value in top_weak:
-            lines.append(f"• {key} — {value}")
+            lines.append(f"• {_daily_report_weak_label(key)} — {value}")
     else:
         lines.append("• —")
     lines.extend(["", "Главные зоны улучшения:"])
     if top_zones:
         for key, _ in top_zones:
-            lines.append(f"• {key}")
+            lines.append(f"• {_daily_report_improve_label(key)}")
     else:
         lines.append("• —")
 
@@ -4566,13 +4720,13 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         sep,
         "🛡 Оценка фильтров в %",
         "",
-        f"Confidence filter: {filter_scores.get('confidence', 0)}%",
-        f"RR filter: {filter_scores.get('rr', 0)}%",
-        f"Trend filter: {filter_scores.get('trend', 0)}%",
-        f"Retest filter: {filter_scores.get('retest', 0)}%",
-        f"Breakout filter: {filter_scores.get('breakout', 0)}%",
-        f"Liquidity reclaim filter: {filter_scores.get('reclaim', 0)}%",
-        f"Pending trigger quality: {filter_scores.get('trigger', 0)}%",
+        f"Confidence filter: {str(filter_scores.get('confidence')) + "%" if filter_scores.get('confidence') is not None else "—"}",
+        f"RR filter: {str(filter_scores.get('rr')) + "%" if filter_scores.get('rr') is not None else "—"}",
+        f"Trend filter: {str(filter_scores.get('trend')) + "%" if filter_scores.get('trend') is not None else "—"}",
+        f"Retest filter: {str(filter_scores.get('retest')) + "%" if filter_scores.get('retest') is not None else "—"}",
+        f"Breakout filter: {str(filter_scores.get('breakout')) + "%" if filter_scores.get('breakout') is not None else "—"}",
+        f"Liquidity reclaim filter: {str(filter_scores.get('reclaim')) + "%" if filter_scores.get('reclaim') is not None else "—"}",
+        f"Pending trigger quality: {str(filter_scores.get('trigger')) + "%" if filter_scores.get('trigger') is not None else "—"}",
         "",
         "Вывод:",
         f"самая слабая часть сейчас — {weakest_filter_label}",
@@ -9740,5 +9894,4 @@ if __name__ == "__main__":
 # ===============================
 # AUTO SYMBOL ANALYSIS HANDLER
 # ===============================
-
 
