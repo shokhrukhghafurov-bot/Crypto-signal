@@ -666,7 +666,22 @@ ON CONFLICT (id) DO NOTHING;
           opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           closed_at TIMESTAMPTZ,
-          pnl_total_pct NUMERIC(10,4)
+          pnl_total_pct NUMERIC(10,4),
+          orig_text TEXT,
+          setup_source TEXT,
+          setup_source_label TEXT,
+          ui_setup_label TEXT,
+          emit_route TEXT,
+          timeframe TEXT,
+          confidence INT,
+          rr NUMERIC(10,4),
+          confirmations TEXT,
+          source_exchange TEXT,
+          risk_note TEXT,
+          close_reason_code TEXT,
+          close_reason_text TEXT,
+          weak_filters TEXT,
+          improve_note TEXT
         );
         """)
 
@@ -678,6 +693,21 @@ ON CONFLICT (id) DO NOTHING;
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();")
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS pnl_total_pct NUMERIC(10,4);")
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS tp1_pnl_pct NUMERIC(10,4);")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS orig_text TEXT;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS setup_source TEXT;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS setup_source_label TEXT;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS ui_setup_label TEXT;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS emit_route TEXT;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS timeframe TEXT;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS confidence INT;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS rr NUMERIC(10,4);")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS confirmations TEXT;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS source_exchange TEXT;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS risk_note TEXT;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS close_reason_code TEXT;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS close_reason_text TEXT;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS weak_filters TEXT;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS improve_note TEXT;")
         except Exception:
             pass
 
@@ -1776,6 +1806,17 @@ async def upsert_signal_track(
     tp1: float | None,
     tp2: float | None,
     sl: float | None,
+    orig_text: str | None = None,
+    setup_source: str | None = None,
+    setup_source_label: str | None = None,
+    ui_setup_label: str | None = None,
+    emit_route: str | None = None,
+    timeframe: str | None = None,
+    confidence: int | None = None,
+    rr: float | None = None,
+    confirmations: str | None = None,
+    source_exchange: str | None = None,
+    risk_note: str | None = None,
 ) -> None:
     """Create/update a bot-level signal tracking row.
 
@@ -1802,6 +1843,17 @@ async def upsert_signal_track(
             tp1=(float(tp1) if tp1 is not None else None),
             tp2=(float(tp2) if tp2 is not None else None),
             sl=(float(sl) if sl is not None else None),
+            orig_text=(str(orig_text or "") if orig_text is not None else None),
+            setup_source=(str(setup_source or "") if setup_source is not None else None),
+            setup_source_label=(str(setup_source_label or "") if setup_source_label is not None else None),
+            ui_setup_label=(str(ui_setup_label or "") if ui_setup_label is not None else None),
+            emit_route=(str(emit_route or "") if emit_route is not None else None),
+            timeframe=(str(timeframe or "") if timeframe is not None else None),
+            confidence=(int(confidence) if confidence is not None else None),
+            rr=(float(rr) if rr is not None else None),
+            confirmations=(str(confirmations or "") if confirmations is not None else None),
+            source_exchange=(str(source_exchange or "") if source_exchange is not None else None),
+            risk_note=(str(risk_note or "") if risk_note is not None else None),
         )
         if not inserted:
             logger.info(
@@ -1822,6 +1874,17 @@ async def _upsert_signal_track_conn(
     tp1: float | None,
     tp2: float | None,
     sl: float | None,
+    orig_text: str | None = None,
+    setup_source: str | None = None,
+    setup_source_label: str | None = None,
+    ui_setup_label: str | None = None,
+    emit_route: str | None = None,
+    timeframe: str | None = None,
+    confidence: int | None = None,
+    rr: float | None = None,
+    confirmations: str | None = None,
+    source_exchange: str | None = None,
+    risk_note: str | None = None,
 ) -> bool:
     """Insert/update signal_tracks safely.
 
@@ -1831,8 +1894,12 @@ async def _upsert_signal_track_conn(
     try:
         await conn.execute(
             """
-            INSERT INTO signal_tracks (signal_id, sig_key, market, symbol, side, entry, tp1, tp2, sl, status, opened_at, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'ACTIVE', NOW(), NOW())
+            INSERT INTO signal_tracks (
+              signal_id, sig_key, market, symbol, side, entry, tp1, tp2, sl,
+              status, opened_at, updated_at, orig_text, setup_source, setup_source_label, ui_setup_label, emit_route,
+              timeframe, confidence, rr, confirmations, source_exchange, risk_note
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'ACTIVE', NOW(), NOW(), $10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
             ON CONFLICT (signal_id)
             DO UPDATE SET
               sig_key=EXCLUDED.sig_key,
@@ -1843,6 +1910,17 @@ async def _upsert_signal_track_conn(
               tp1=EXCLUDED.tp1,
               tp2=EXCLUDED.tp2,
               sl=EXCLUDED.sl,
+              orig_text=COALESCE(EXCLUDED.orig_text, signal_tracks.orig_text),
+              setup_source=COALESCE(NULLIF(EXCLUDED.setup_source, ''), signal_tracks.setup_source),
+              setup_source_label=COALESCE(NULLIF(EXCLUDED.setup_source_label, ''), signal_tracks.setup_source_label),
+              ui_setup_label=COALESCE(NULLIF(EXCLUDED.ui_setup_label, ''), signal_tracks.ui_setup_label),
+              emit_route=COALESCE(NULLIF(EXCLUDED.emit_route, ''), signal_tracks.emit_route),
+              timeframe=COALESCE(NULLIF(EXCLUDED.timeframe, ''), signal_tracks.timeframe),
+              confidence=COALESCE(EXCLUDED.confidence, signal_tracks.confidence),
+              rr=COALESCE(EXCLUDED.rr, signal_tracks.rr),
+              confirmations=COALESCE(NULLIF(EXCLUDED.confirmations, ''), signal_tracks.confirmations),
+              source_exchange=COALESCE(NULLIF(EXCLUDED.source_exchange, ''), signal_tracks.source_exchange),
+              risk_note=COALESCE(NULLIF(EXCLUDED.risk_note, ''), signal_tracks.risk_note),
               updated_at=NOW();
             """,
             int(signal_id),
@@ -1854,6 +1932,17 @@ async def _upsert_signal_track_conn(
             (float(tp1) if tp1 is not None else None),
             (float(tp2) if tp2 is not None else None),
             (float(sl) if sl is not None else None),
+            (str(orig_text) if orig_text is not None else None),
+            (str(setup_source) if setup_source is not None else None),
+            (str(setup_source_label) if setup_source_label is not None else None),
+            (str(ui_setup_label) if ui_setup_label is not None else None),
+            (str(emit_route) if emit_route is not None else None),
+            (str(timeframe) if timeframe is not None else None),
+            (int(confidence) if confidence is not None else None),
+            (float(rr) if rr is not None else None),
+            (str(confirmations) if confirmations is not None else None),
+            (str(source_exchange) if source_exchange is not None else None),
+            (str(risk_note) if risk_note is not None else None),
         )
         return True
     except asyncpg.UniqueViolationError:
@@ -1869,6 +1958,17 @@ async def _upsert_signal_track_conn(
                 tp1=$7,
                 tp2=$8,
                 sl=$9,
+                orig_text=COALESCE($10, orig_text),
+                setup_source=COALESCE(NULLIF($11, ''), setup_source),
+                setup_source_label=COALESCE(NULLIF($12, ''), setup_source_label),
+                ui_setup_label=COALESCE(NULLIF($13, ''), ui_setup_label),
+                emit_route=COALESCE(NULLIF($14, ''), emit_route),
+                timeframe=COALESCE(NULLIF($15, ''), timeframe),
+                confidence=COALESCE($16, confidence),
+                rr=COALESCE($17, rr),
+                confirmations=COALESCE(NULLIF($18, ''), confirmations),
+                source_exchange=COALESCE(NULLIF($19, ''), source_exchange),
+                risk_note=COALESCE(NULLIF($20, ''), risk_note),
                 updated_at=NOW()
             WHERE sig_key=$2;
             """,
@@ -1881,6 +1981,17 @@ async def _upsert_signal_track_conn(
             (float(tp1) if tp1 is not None else None),
             (float(tp2) if tp2 is not None else None),
             (float(sl) if sl is not None else None),
+            (str(orig_text) if orig_text is not None else None),
+            (str(setup_source) if setup_source is not None else None),
+            (str(setup_source_label) if setup_source_label is not None else None),
+            (str(ui_setup_label) if ui_setup_label is not None else None),
+            (str(emit_route) if emit_route is not None else None),
+            (str(timeframe) if timeframe is not None else None),
+            (int(confidence) if confidence is not None else None),
+            (float(rr) if rr is not None else None),
+            (str(confirmations) if confirmations is not None else None),
+            (str(source_exchange) if source_exchange is not None else None),
+            (str(risk_note) if risk_note is not None else None),
         )
         return False
 
@@ -1959,7 +2070,16 @@ async def clear_signal_be_crossed(*, signal_id: int) -> None:
         )
 
 
-async def close_signal_track(*, signal_id: int, status: str, pnl_total_pct: float | None = None) -> bool:
+async def close_signal_track(
+    *,
+    signal_id: int,
+    status: str,
+    pnl_total_pct: float | None = None,
+    close_reason_code: str | None = None,
+    close_reason_text: str | None = None,
+    weak_filters: str | None = None,
+    improve_note: str | None = None,
+) -> bool:
     """Close an ACTIVE/TP1 signal track exactly once and store pnl.
 
     Returns True only when this call transitioned the row from ACTIVE/TP1 to a final
@@ -1999,7 +2119,11 @@ async def close_signal_track(*, signal_id: int, status: str, pnl_total_pct: floa
             SET status=$2,
                 closed_at=NOW(),
                 updated_at=NOW(),
-                pnl_total_pct=$3
+                pnl_total_pct=$3,
+                close_reason_code=COALESCE($4, close_reason_code),
+                close_reason_text=COALESCE($5, close_reason_text),
+                weak_filters=COALESCE($6, weak_filters),
+                improve_note=COALESCE($7, improve_note)
             WHERE signal_id=$1
               AND status IN ('ACTIVE','TP1')
             RETURNING signal_id;
@@ -2007,6 +2131,10 @@ async def close_signal_track(*, signal_id: int, status: str, pnl_total_pct: floa
             int(signal_id),
             st,
             norm_pnl,
+            (str(close_reason_code or "") or None),
+            (str(close_reason_text or "") or None),
+            (str(weak_filters or "") or None),
+            (str(improve_note or "") or None),
         )
     return bool(row)
 
@@ -2107,6 +2235,289 @@ async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: d
     }
 
 
+
+
+
+# ----------------------
+# Daily signal report helpers
+# ----------------------
+
+_SIGNAL_REPORT_SETUP_KEYS = (
+    "origin",
+    "breakout",
+    "zone_retest",
+    "normal_pending_trigger",
+    "liquidity_reclaim",
+)
+
+
+def _signal_report_extract_setup_from_text(text: str | None) -> str:
+    try:
+        src = str(text or "")
+        if not src:
+            return ""
+        m = re.search(r"(?:^|\n)\s*(?:🧭\s*)?Smart-setup:\s*([^\n\r]+)", src, flags=re.IGNORECASE)
+        if not m:
+            return ""
+        return str(m.group(1) or "").strip()
+    except Exception:
+        return ""
+
+
+def _signal_report_normalize_setup_label(*, ui_setup_label: str | None = None, emit_route: str | None = None, setup_source_label: str | None = None, setup_source: str | None = None, orig_text: str | None = None) -> str:
+    raw = ""
+    for candidate in (ui_setup_label, emit_route, setup_source_label, setup_source, _signal_report_extract_setup_from_text(orig_text)):
+        try:
+            c = str(candidate or "").strip()
+        except Exception:
+            c = ""
+        if c:
+            raw = c
+            break
+    s = str(raw or "").strip().lower().replace('-', '_').replace(' ', '_')
+    aliases = {
+        "origin": "origin",
+        "начало_движения": "origin",
+        "breakout": "breakout",
+        "пробой": "breakout",
+        "zone": "zone_retest",
+        "zone_retest": "zone_retest",
+        "zone_touch": "zone_retest",
+        "zone_touch_retest": "zone_retest",
+        "возврат_в_зону": "zone_retest",
+        "normal_pending_trigger": "normal_pending_trigger",
+        "normal_pending": "normal_pending_trigger",
+        "pending": "normal_pending_trigger",
+        "pending_trigger": "normal_pending_trigger",
+        "обычный_trigger": "normal_pending_trigger",
+        "обычный_триггер": "normal_pending_trigger",
+        "обычный_pending_trigger": "normal_pending_trigger",
+        "liquidity_reclaim": "liquidity_reclaim",
+        "liquidity_reclaim_emit": "liquidity_reclaim",
+        "liquidity_reclaim_entry": "liquidity_reclaim",
+        "liquidity_reclaim_ready": "liquidity_reclaim",
+    }
+    return aliases.get(s, s if s in _SIGNAL_REPORT_SETUP_KEYS else "")
+
+
+def _signal_report_empty_bucket() -> Dict[str, Any]:
+    return {
+        "sent": 0,
+        "closed": 0,
+        "win": 0,
+        "loss": 0,
+        "be": 0,
+        "manual_close": 0,
+        "sum_pnl_pct": 0.0,
+    }
+
+
+def _signal_report_bucket_add_sent(bucket: Dict[str, Any]) -> None:
+    bucket["sent"] = int(bucket.get("sent") or 0) + 1
+
+
+def _signal_report_bucket_add_close(bucket: Dict[str, Any], status: str, pnl_total_pct: float | None) -> None:
+    st = str(status or "").upper().strip()
+    bucket["closed"] = int(bucket.get("closed") or 0) + 1
+    if st == "WIN":
+        bucket["win"] = int(bucket.get("win") or 0) + 1
+    elif st == "LOSS":
+        bucket["loss"] = int(bucket.get("loss") or 0) + 1
+    elif st == "BE":
+        bucket["be"] = int(bucket.get("be") or 0) + 1
+    elif st == "CLOSED":
+        bucket["manual_close"] = int(bucket.get("manual_close") or 0) + 1
+    try:
+        bucket["sum_pnl_pct"] = float(bucket.get("sum_pnl_pct") or 0.0) + float(pnl_total_pct or 0.0)
+    except Exception:
+        pass
+
+
+async def signal_report_window_summary(*, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
+    """Aggregate a daily signal report for the given time window.
+
+    Sent counters use signal_tracks.opened_at in [since, until).
+    Outcome counters use signal_tracks.closed_at in [since, until).
+    """
+    try:
+        pool = get_pool()
+    except Exception:
+        return {
+            "overall": _signal_report_empty_bucket(),
+            "markets": {"SPOT": _signal_report_empty_bucket(), "FUTURES": _signal_report_empty_bucket()},
+            "sides": {"LONG": _signal_report_empty_bucket(), "SHORT": _signal_report_empty_bucket()},
+            "setups": {k: _signal_report_empty_bucket() for k in _SIGNAL_REPORT_SETUP_KEYS},
+        }
+
+    sent_rows: List[dict] = []
+    closed_rows: List[dict] = []
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT market, side, orig_text, setup_source, setup_source_label, ui_setup_label, emit_route
+                FROM signal_tracks
+                WHERE opened_at IS NOT NULL
+                  AND opened_at >= $1 AND opened_at < $2;
+                """,
+                since, until,
+            )
+            sent_rows = [dict(r) for r in (rows or [])]
+        except Exception:
+            logger.exception('signal_report_window_summary sent_rows failed')
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT market, side, status, pnl_total_pct, orig_text, setup_source, setup_source_label, ui_setup_label, emit_route
+                FROM signal_tracks
+                WHERE closed_at IS NOT NULL
+                  AND closed_at >= $1 AND closed_at < $2
+                  AND status IN ('WIN','LOSS','BE','CLOSED');
+                """,
+                since, until,
+            )
+            closed_rows = [dict(r) for r in (rows or [])]
+        except Exception:
+            logger.exception('signal_report_window_summary closed_rows failed')
+
+    out = {
+        "overall": _signal_report_empty_bucket(),
+        "markets": {"SPOT": _signal_report_empty_bucket(), "FUTURES": _signal_report_empty_bucket()},
+        "sides": {"LONG": _signal_report_empty_bucket(), "SHORT": _signal_report_empty_bucket()},
+        "setups": {k: _signal_report_empty_bucket() for k in _SIGNAL_REPORT_SETUP_KEYS},
+    }
+
+    for row in sent_rows:
+        market = str(row.get("market") or "").upper().strip()
+        side = str(row.get("side") or "").upper().strip()
+        setup = _signal_report_normalize_setup_label(
+            ui_setup_label=row.get("ui_setup_label"),
+            emit_route=row.get("emit_route"),
+            setup_source_label=row.get("setup_source_label"),
+            setup_source=row.get("setup_source"),
+            orig_text=row.get("orig_text"),
+        )
+        _signal_report_bucket_add_sent(out["overall"])
+        if market in out["markets"]:
+            _signal_report_bucket_add_sent(out["markets"][market])
+        if side in out["sides"]:
+            _signal_report_bucket_add_sent(out["sides"][side])
+        if setup in out["setups"]:
+            _signal_report_bucket_add_sent(out["setups"][setup])
+
+    for row in closed_rows:
+        market = str(row.get("market") or "").upper().strip()
+        side = str(row.get("side") or "").upper().strip()
+        status = str(row.get("status") or "").upper().strip()
+        pnl_total_pct = row.get("pnl_total_pct")
+        setup = _signal_report_normalize_setup_label(
+            ui_setup_label=row.get("ui_setup_label"),
+            emit_route=row.get("emit_route"),
+            setup_source_label=row.get("setup_source_label"),
+            setup_source=row.get("setup_source"),
+            orig_text=row.get("orig_text"),
+        )
+        _signal_report_bucket_add_close(out["overall"], status, pnl_total_pct)
+        if market in out["markets"]:
+            _signal_report_bucket_add_close(out["markets"][market], status, pnl_total_pct)
+        if side in out["sides"]:
+            _signal_report_bucket_add_close(out["sides"][side], status, pnl_total_pct)
+        if setup in out["setups"]:
+            _signal_report_bucket_add_close(out["setups"][setup], status, pnl_total_pct)
+
+    return out
+
+def _signal_loss_diag_empty() -> Dict[str, Any]:
+    return {
+        "reasons": {},
+        "weak_filters": {},
+        "improvements": {},
+        "examples": [],
+    }
+
+
+def _signal_loss_diag_inc(counter: Dict[str, int], key: str) -> None:
+    k = str(key or "").strip()
+    if not k:
+        return
+    counter[k] = int(counter.get(k) or 0) + 1
+
+
+def _signal_loss_diag_split(text_value: str | None) -> List[str]:
+    raw = str(text_value or "")
+    if not raw:
+        return []
+    parts = re.split(r"[,;|]+", raw)
+    out: List[str] = []
+    for part in parts:
+        item = str(part or "").strip()
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+async def signal_loss_diagnostics_window(*, since: dt.datetime, until: dt.datetime, limit: int = 5) -> Dict[str, Any]:
+    try:
+        pool = get_pool()
+    except Exception:
+        return _signal_loss_diag_empty()
+
+    out = _signal_loss_diag_empty()
+    rows: List[dict] = []
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        try:
+            fetched = await conn.fetch(
+                """
+                SELECT signal_id, symbol, market, side, pnl_total_pct, closed_at,
+                       status, tp1_hit, setup_source, setup_source_label, ui_setup_label, emit_route,
+                       close_reason_code, close_reason_text, weak_filters, improve_note
+                FROM signal_tracks
+                WHERE closed_at IS NOT NULL
+                  AND closed_at >= $1 AND closed_at < $2
+                  AND status = 'LOSS'
+                ORDER BY closed_at DESC;
+                """,
+                since, until,
+            )
+            rows = [dict(r) for r in (fetched or [])]
+        except Exception:
+            logger.exception('signal_loss_diagnostics_window failed')
+            return out
+
+    for idx, row in enumerate(rows):
+        reason_code = str(row.get('close_reason_code') or '').strip() or 'loss_sl'
+        reason_text = str(row.get('close_reason_text') or '').strip()
+        improve_note = str(row.get('improve_note') or '').strip()
+        weak_filters = _signal_loss_diag_split(row.get('weak_filters'))
+
+        _signal_loss_diag_inc(out['reasons'], reason_code)
+        for item in weak_filters:
+            _signal_loss_diag_inc(out['weak_filters'], item)
+        for item in _signal_loss_diag_split(improve_note):
+            _signal_loss_diag_inc(out['improvements'], item)
+
+        if idx < max(0, int(limit or 0)):
+            out['examples'].append({
+                'signal_id': int(row.get('signal_id') or 0),
+                'symbol': str(row.get('symbol') or '').upper(),
+                'market': str(row.get('market') or '').upper(),
+                'side': str(row.get('side') or '').upper(),
+                'pnl_total_pct': float(row.get('pnl_total_pct') or 0.0),
+                'closed_at': row.get('closed_at'),
+                'reason_code': reason_code,
+                'reason_text': reason_text,
+                'weak_filters': weak_filters,
+                'improve_note': improve_note,
+                'setup': _signal_report_normalize_setup_label(
+                    ui_setup_label=row.get('ui_setup_label'),
+                    emit_route=row.get('emit_route'),
+                    setup_source_label=row.get('setup_source_label'),
+                    setup_source=row.get('setup_source'),
+                    orig_text=None,
+                ),
+            })
+
+    return out
 
 async def trade_perf_bucket_global(market: str, *, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
     """Aggregate AUTO-TRADE outcomes in [since, until) across ALL users.
