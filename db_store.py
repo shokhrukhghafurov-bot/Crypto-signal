@@ -2264,9 +2264,9 @@ def _signal_report_extract_setup_from_text(text: str | None) -> str:
         return ""
 
 
-def _signal_report_normalize_setup_label(*, ui_setup_label: str | None = None, emit_route: str | None = None, setup_source_label: str | None = None, setup_source: str | None = None, orig_text: str | None = None) -> str:
+def _signal_report_normalize_setup_label(*, ui_setup_label: str | None = None, emit_route: str | None = None, setup_source_label: str | None = None, setup_source: str | None = None, orig_text: str | None = None, risk_note: str | None = None) -> str:
     raw = ""
-    for candidate in (ui_setup_label, emit_route, setup_source_label, setup_source, _signal_report_extract_setup_from_text(orig_text)):
+    for candidate in (ui_setup_label, emit_route, setup_source_label, setup_source, _signal_report_extract_setup_from_text(risk_note), _signal_report_extract_setup_from_text(orig_text)):
         try:
             c = str(candidate or "").strip()
         except Exception:
@@ -2277,8 +2277,12 @@ def _signal_report_normalize_setup_label(*, ui_setup_label: str | None = None, e
     s = str(raw or "").strip().lower().replace('-', '_').replace(' ', '_')
     aliases = {
         "origin": "origin",
+        "origin_fast": "origin",
+        "origin_fastpass": "origin",
         "начало_движения": "origin",
         "breakout": "breakout",
+        "breakout_fast": "breakout",
+        "breakout_fastpass": "breakout",
         "пробой": "breakout",
         "zone": "zone_retest",
         "zone_retest": "zone_retest",
@@ -2399,6 +2403,7 @@ async def signal_report_window_summary(*, since: dt.datetime, until: dt.datetime
             setup_source_label=row.get("setup_source_label"),
             setup_source=row.get("setup_source"),
             orig_text=row.get("orig_text"),
+            risk_note=row.get("risk_note"),
         )
         _signal_report_bucket_add_sent(out["overall"])
         if market in out["markets"]:
@@ -2419,6 +2424,7 @@ async def signal_report_window_summary(*, since: dt.datetime, until: dt.datetime
             setup_source_label=row.get("setup_source_label"),
             setup_source=row.get("setup_source"),
             orig_text=row.get("orig_text"),
+            risk_note=row.get("risk_note"),
         )
         _signal_report_bucket_add_close(out["overall"], status, pnl_total_pct)
         if market in out["markets"]:
