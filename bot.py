@@ -3898,188 +3898,688 @@ def _daily_report_bucket_line(title: str, bucket: dict, *, show_sent: bool = Tru
     return f"• {title}: " + " | ".join(parts)
 
 
-async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datetime) -> str:
-    stats = await db_store.signal_report_window_summary(since=since, until=until)
-    loss_diag = await db_store.signal_loss_diagnostics_window(
-        since=since,
-        until=until,
-        limit=max(3, _loss_diag_env_int('DAILY_SIGNAL_REPORT_LOSS_EXAMPLES', 3)),
-    )
-    overall = dict((stats or {}).get("overall") or {})
-    markets = dict((stats or {}).get("markets") or {})
-    sides = dict((stats or {}).get("sides") or {})
-    setups = dict((stats or {}).get("setups") or {})
-    since_local = since.astimezone(TZ)
 
-    reason_map = {
-        'loss_before_tp1_sl': 'SL до TP1',
-        'loss_after_tp1_sl': 'SL после TP1',
-        'loss_sl': 'SL',
-        'timeout_closed': 'таймаут',
+def _daily_report_int(value) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _daily_report_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value or 0.0)
+    except Exception:
+        return float(default)
+
+
+def _daily_report_pct(value: float | int | None, *, digits: int = 1, strip_zero: bool = False) -> str:
+    try:
+        num = float(value or 0.0)
+    except Exception:
+        num = 0.0
+    text = f"{num:.{int(digits)}f}"
+    if strip_zero and "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return f"{text}%"
+
+
+def _daily_report_winrate(bucket: dict, *, overall: bool = False) -> float:
+    """Return daily-report winrate as WIN / (WIN + LOSS).
+
+    BE and manual CLOSED are informational outcomes and should not dilute
+    winrate. This keeps the metric consistent across the summary, markets,
+    sides and setup blocks.
+    """
+    win = _daily_report_int(bucket.get("win"))
+    loss = _daily_report_int(bucket.get("loss"))
+    denom = win + loss
+    return 0.0 if denom <= 0 else (100.0 * win / denom)
+
+
+def _daily_report_avg(values) -> float:
+    vals = [float(x) for x in list(values or [])]
+    return statistics.fmean(vals) if vals else 0.0
+
+
+def _daily_report_quality(bucket: dict) -> int:
+    sent = _daily_report_int(bucket.get("sent"))
+    if sent <= 0:
+        return 0
+    conf = _daily_report_avg(bucket.get("conf_values"))
+    rr = _daily_report_avg(bucket.get("rr_values"))
+    conf_cnt = _daily_report_avg(bucket.get("confirm_values"))
+    win = _daily_report_int(bucket.get("win"))
+    loss = _daily_report_int(bucket.get("loss"))
+    be = _daily_report_int(bucket.get("be"))
+    closed = _daily_report_int(bucket.get("manual_close"))
+    resolved = win + loss + be + closed
+    success = (win + 0.5 * be + 0.25 * closed) / resolved * 100.0 if resolved > 0 else 50.0
+    rr_score = min(max(rr, 0.0), 3.0) / 3.0 * 100.0
+    conf_score = conf
+    confirm_score = min(max(conf_cnt, 0.0), 4.0) / 4.0 * 100.0
+    weak = dict(bucket.get("weak_counter") or {})
+    penalty = (
+        4.0 * (_daily_report_int(weak.get("low_confidence")) + _daily_report_int(weak.get("few_confirmations"))) +
+        5.0 * (_daily_report_int(weak.get("low_rr")) + _daily_report_int(weak.get("weak_rr"))) +
+        6.0 * (_daily_report_int(weak.get("weak_retest_confirmation")) + _daily_report_int(weak.get("breakout_retest_weak"))) +
+        5.0 * (_daily_report_int(weak.get("weak_trend_context")) + _daily_report_int(weak.get("low_ta_score")))
+    )
+    raw = (0.38 * conf_score) + (0.24 * rr_score) + (0.22 * success) + (0.16 * confirm_score) - (penalty / max(1, sent))
+    return max(35, min(99, int(round(raw))))
+
+
+def _daily_report_reason_label(code: str, text_value: str = "") -> str:
+    raw = str(code or "").strip()
+    if raw:
+        mapping = {
+            "loss_before_tp1_sl": "stop_before_tp1",
+            "loss_after_tp1_sl": "stop_after_tp1",
+            "loss_sl": "stop_loss",
+            "timeout_closed": "timeout_closed",
+        }
+        return mapping.get(raw, raw)
+    txt = str(text_value or "").strip()
+    return txt or "unknown_loss_reason"
+
+
+def _daily_report_improve_zone(key: str) -> str:
+    s = str(key or "").strip().lower()
+    mapping = {
+        "low_confidence": "confidence filter",
+        "raise_min_confidence": "confidence filter",
+        "few_confirmations": "confirmation count",
+        "require_more_confirmations": "confirmation count",
+        "low_rr": "RR filter",
+        "weak_rr": "RR filter",
+        "raise_min_rr": "RR filter",
+        "weak_trend_context": "trend strength filter",
+        "low_ta_score": "trend strength filter",
+        "weak_signal_strength": "trend strength filter",
+        "raise_min_ta_score": "trend strength filter",
+        "weak_retest_confirmation": "retest validation",
+        "breakout_retest_weak": "retest validation",
+        "tighten_breakout_retest": "retest validation",
+        "tighten_zone_retest": "retest validation",
+        "trigger_reconfirm_weak": "trigger filter",
+        "tighten_trigger_reconfirm": "trigger filter",
+        "reclaim_confirmation_weak": "liquidity reclaim filter",
+        "tighten_liquidity_reclaim": "liquidity reclaim filter",
+        "false_breakout_after_entry": "breakout filter",
+        "stop_before_tp1": "entry protection",
+        "stop_after_tp1": "TP1 protection",
+    }
+    return mapping.get(s, s or "execution filter")
+
+
+def _daily_report_bucket_template() -> dict:
+    return {
+        "sent": 0,
+        "win": 0,
+        "loss": 0,
+        "be": 0,
+        "manual_close": 0,
+        "sum_pnl_pct": 0.0,
+        "conf_values": [],
+        "rr_values": [],
+        "confirm_values": [],
+        "weak_counter": {},
+        "improve_counter": {},
     }
 
-    def _top_items(counter: dict, humanizer, limit: int = 3) -> list[tuple[str, int]]:
-        items = sorted((counter or {}).items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
-        out: list[tuple[str, int]] = []
-        for key, value in items[:max(0, int(limit or 0))]:
-            out.append((humanizer(str(key)), int(value or 0)))
-        while len(out) < max(0, int(limit or 0)):
-            out.append(("—", 0))
-        return out
 
-    reasons = _top_items(
-        dict((loss_diag or {}).get('reasons') or {}),
-        lambda k: reason_map.get(k, k or '—'),
-        limit=3,
+def _daily_report_inc(counter: dict, key: str) -> None:
+    k = str(key or "").strip()
+    if not k:
+        return
+    counter[k] = _daily_report_int(counter.get(k)) + 1
+
+
+def _daily_report_split_multi(value: str | None) -> list[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    items = [x.strip() for x in re.split(r"[;,|]+", raw) if x.strip()]
+    out: list[str] = []
+    for item in items:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def _daily_report_setup_key_from_row(row: dict) -> str:
+    return str(_report_setup_label_from_row(row) or "").strip().lower().replace(" ", "_")
+
+
+def _daily_report_row_confirmations(row: dict) -> int:
+    return _loss_diag_count_confirmations(row.get("confirmations") or row.get("source_exchange"))
+
+
+def _daily_report_add_sent(bucket: dict, row: dict) -> None:
+    bucket["sent"] = _daily_report_int(bucket.get("sent")) + 1
+    conf = _daily_report_int(row.get("confidence"))
+    rr = _daily_report_float(row.get("rr"))
+    if conf > 0:
+        bucket["conf_values"].append(conf)
+    if rr > 0:
+        bucket["rr_values"].append(rr)
+    bucket["confirm_values"].append(_daily_report_row_confirmations(row))
+    for item in _daily_report_split_multi(row.get("weak_filters")):
+        _daily_report_inc(bucket["weak_counter"], item)
+    for item in _daily_report_split_multi(row.get("improve_note")):
+        _daily_report_inc(bucket["improve_counter"], item)
+
+
+def _daily_report_add_closed(bucket: dict, row: dict) -> None:
+    st = str(row.get("status") or "").upper().strip()
+    if st == "WIN":
+        bucket["win"] = _daily_report_int(bucket.get("win")) + 1
+    elif st == "LOSS":
+        bucket["loss"] = _daily_report_int(bucket.get("loss")) + 1
+    elif st == "BE":
+        bucket["be"] = _daily_report_int(bucket.get("be")) + 1
+    elif st == "CLOSED":
+        bucket["manual_close"] = _daily_report_int(bucket.get("manual_close")) + 1
+    bucket["sum_pnl_pct"] = _daily_report_float(bucket.get("sum_pnl_pct")) + _daily_report_float(row.get("pnl_total_pct"))
+    for item in _daily_report_split_multi(row.get("weak_filters")):
+        _daily_report_inc(bucket["weak_counter"], item)
+    for item in _daily_report_split_multi(row.get("improve_note")):
+        _daily_report_inc(bucket["improve_counter"], item)
+
+
+def _daily_report_sort_counter(counter: dict, limit: int) -> list[tuple[str, int]]:
+    items = [(str(k), _daily_report_int(v)) for k, v in dict(counter or {}).items() if str(k).strip()]
+    items.sort(key=lambda kv: (-kv[1], kv[0]))
+    return items[: max(0, int(limit))]
+
+
+def _daily_report_best_setup_reasons(setup_key: str) -> list[str]:
+    mapping = {
+        "zone_retest": [
+            "максимальный winrate",
+            "чистые входы после retest",
+            "лучший баланс риск/доходность",
+            "меньше ложных входов",
+        ],
+        "origin": [
+            "лучше ловил начало движения",
+            "сильнее держал импульс после входа",
+            "давал понятную структуру входа",
+            "стабильнее вёл позицию к целям",
+        ],
+        "breakout": [
+            "лучше ловил продолжение импульса",
+            "давал сильный PnL вклад",
+            "лучше работал при подтвержденном пробое",
+            "реже разворачивался после входа",
+        ],
+        "normal_pending_trigger": [
+            "лучше активировал вход после триггера",
+            "сохранял понятный риск-профиль",
+            "реже давал шум после активации",
+            "лучше работал с подтверждениями",
+        ],
+        "liquidity_reclaim": [
+            "лучше отрабатывал возврат ликвидности",
+            "лучше фильтровал reclaim-входы",
+            "реже давал хаотичные возвраты",
+            "давал стабильное подтверждение перед входом",
+        ],
+    }
+    return list(mapping.get(str(setup_key or "").strip(), ["лучший баланс сигналов", "более стабильная логика входа", "лучше держал направление", "дал лучший вклад в день"]))
+
+
+def _daily_report_worst_setup_reasons(setup_key: str) -> list[str]:
+    mapping = {
+        "zone_retest": [
+            "слабое подтверждение retest перед входом",
+            "хуже удерживал зону после активации",
+            "чаще давал возврат в stop",
+        ],
+        "origin": [
+            "входы оказывались слишком ранними",
+            "хуже подтверждался импульс после входа",
+            "чаще ломался контекст движения",
+        ],
+        "breakout": [
+            "слабее подтверждался breakout перед входом",
+            "чаще появлялись ложные пробои",
+            "хуже удерживал продолжение импульса",
+        ],
+        "normal_pending_trigger": [
+            "мало подтверждений перед входом",
+            "высокий риск слабого продолжения",
+            "хуже держит направление после активации",
+        ],
+        "liquidity_reclaim": [
+            "недостаточно чистый reclaim перед входом",
+            "слабее подтверждался возврат ликвидности",
+            "логика входа требовала больше фильтрации",
+        ],
+    }
+    return list(mapping.get(str(setup_key or "").strip(), ["чаще давал слабое продолжение", "хуже держал направление после входа", "требует усиления логики фильтрации"]))
+
+
+def _daily_report_filter_scores(*, overall_bucket: dict, setups: dict, all_loss_rows: list[dict]) -> dict:
+    overall_quality = _daily_report_quality(overall_bucket)
+    avg_conf = _daily_report_avg(overall_bucket.get("conf_values"))
+    avg_rr = _daily_report_avg(overall_bucket.get("rr_values"))
+    weak_total: dict[str, int] = {}
+    for row in all_loss_rows:
+        for item in _daily_report_split_multi(row.get("weak_filters")):
+            _daily_report_inc(weak_total, item)
+    loss_count = max(1, len(all_loss_rows))
+    penalty_unit = 8.0 / loss_count
+
+    def penalized(base: float, *keys: str) -> int:
+        penalty = 0.0
+        for key in keys:
+            penalty += penalty_unit * _daily_report_int(weak_total.get(key))
+        return max(35, min(99, int(round(base - penalty))))
+
+    confidence_base = 0.72 * avg_conf + 0.28 * overall_quality
+    rr_base = 0.60 * (min(max(avg_rr, 0.0), 3.0) / 3.0 * 100.0) + 0.40 * overall_quality
+    trend_base = 0.70 * overall_quality + 0.30 * _daily_report_winrate(overall_bucket, overall=False)
+    retest_base = 0.55 * _daily_report_quality(setups.get("zone_retest") or _daily_report_bucket_template()) + 0.45 * overall_quality
+    breakout_base = 0.55 * _daily_report_quality(setups.get("breakout") or _daily_report_bucket_template()) + 0.45 * overall_quality
+    reclaim_base = 0.55 * _daily_report_quality(setups.get("liquidity_reclaim") or overall_bucket) + 0.45 * overall_quality
+    trigger_base = 0.55 * _daily_report_quality(setups.get("normal_pending_trigger") or overall_bucket) + 0.45 * overall_quality
+
+    return {
+        "confidence": penalized(confidence_base, "low_confidence"),
+        "rr": penalized(rr_base, "low_rr", "weak_rr"),
+        "trend": penalized(trend_base, "weak_trend_context", "low_ta_score", "weak_signal_strength"),
+        "retest": penalized(retest_base, "weak_retest_confirmation", "breakout_retest_weak"),
+        "breakout": penalized(breakout_base, "false_breakout_after_entry", "breakout_retest_weak"),
+        "reclaim": penalized(reclaim_base, "reclaim_confirmation_weak"),
+        "trigger": penalized(trigger_base, "trigger_reconfirm_weak"),
+    }
+
+
+def _daily_report_pick_best_setup(setups: dict) -> str:
+    best_key = ""
+    best_score = None
+    for key, bucket in dict(setups or {}).items():
+        sent = _daily_report_int(bucket.get("sent"))
+        if sent <= 0:
+            continue
+        score = (
+            _daily_report_quality(bucket),
+            round(_daily_report_winrate(bucket), 4),
+            _daily_report_float(bucket.get("sum_pnl_pct")),
+            sent,
+        )
+        if best_score is None or score > best_score:
+            best_key = str(key)
+            best_score = score
+    return best_key
+
+
+def _daily_report_pick_worst_setup(setups: dict) -> str:
+    worst_key = ""
+    worst_score = None
+    for key, bucket in dict(setups or {}).items():
+        sent = _daily_report_int(bucket.get("sent"))
+        if sent <= 0:
+            continue
+        score = (
+            _daily_report_int(bucket.get("loss")) == 0,
+            _daily_report_quality(bucket),
+            round(_daily_report_winrate(bucket), 4),
+            _daily_report_float(bucket.get("sum_pnl_pct")),
+            -sent,
+        )
+        if worst_score is None or score < worst_score:
+            worst_key = str(key)
+            worst_score = score
+    return worst_key
+
+
+def _daily_report_render_loss_example(idx: int, row: dict) -> list[str]:
+    symbol = str(row.get("symbol") or "—").upper()
+    market = str(row.get("market") or "—").upper()
+    side = str(row.get("side") or "—").upper()
+    pnl = _report_pnl_pct(_daily_report_float(row.get("pnl_total_pct")))
+    setup = str(_daily_report_setup_key_from_row(row) or "unknown")
+    reason = str(row.get("close_reason_text") or "").strip() or _daily_report_reason_label(row.get("close_reason_code"))
+    weak_filters = ", ".join(_daily_report_split_multi(row.get("weak_filters"))) or "—"
+    improve_text = str(row.get("improve_note") or "").strip() or "усилить фильтрацию входа"
+    return [
+        f"{idx}. {symbol} | {market} | {side}",
+        f"   PnL: {pnl}",
+        f"   Setup: {setup}",
+        f"   Причина: {reason}",
+        f"   Слабые фильтры: {weak_filters}",
+        f"   Что улучшить: {improve_text}",
+    ]
+
+
+def _daily_report_final_score(*, overall_quality: int, entry_accuracy: float, overall_winrate: float, pnl_pct: float) -> float:
+    pnl_score = min(100.0, max(0.0, 50.0 + pnl_pct * 8.0))
+    score = (0.50 * overall_quality) + (0.20 * entry_accuracy) + (0.15 * overall_winrate) + (0.15 * pnl_score)
+    return round(max(1.0, min(10.0, score / 10.0)), 1)
+
+
+async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datetime) -> str:
+    dataset = await db_store.signal_report_window_dataset(since=since, until=until)
+    sent_rows = list((dataset or {}).get("sent_rows") or [])
+    closed_rows = list((dataset or {}).get("closed_rows") or [])
+
+    overall = _daily_report_bucket_template()
+    markets = {"SPOT": _daily_report_bucket_template(), "FUTURES": _daily_report_bucket_template()}
+    sides = {"LONG": _daily_report_bucket_template(), "SHORT": _daily_report_bucket_template()}
+    setups = {
+        "origin": _daily_report_bucket_template(),
+        "breakout": _daily_report_bucket_template(),
+        "zone_retest": _daily_report_bucket_template(),
+        "normal_pending_trigger": _daily_report_bucket_template(),
+        "liquidity_reclaim": _daily_report_bucket_template(),
+    }
+
+    sent_by_id: dict[int, dict] = {}
+    for row in sent_rows:
+        row = dict(row)
+        signal_id = _daily_report_int(row.get("signal_id"))
+        if signal_id:
+            sent_by_id[signal_id] = row
+        market = str(row.get("market") or "").upper().strip()
+        side = str(row.get("side") or "").upper().strip()
+        setup = _daily_report_setup_key_from_row(row)
+        _daily_report_add_sent(overall, row)
+        if market in markets:
+            _daily_report_add_sent(markets[market], row)
+        if side in sides:
+            _daily_report_add_sent(sides[side], row)
+        if setup in setups:
+            _daily_report_add_sent(setups[setup], row)
+
+    all_loss_rows: list[dict] = []
+    for row in closed_rows:
+        row = dict(row)
+        signal_id = _daily_report_int(row.get("signal_id"))
+        if signal_id and signal_id in sent_by_id:
+            merged = dict(sent_by_id[signal_id])
+            merged.update({k: v for k, v in row.items() if v is not None and v != ""})
+            row = merged
+        market = str(row.get("market") or "").upper().strip()
+        side = str(row.get("side") or "").upper().strip()
+        setup = _daily_report_setup_key_from_row(row)
+        _daily_report_add_closed(overall, row)
+        if market in markets:
+            _daily_report_add_closed(markets[market], row)
+        if side in sides:
+            _daily_report_add_closed(sides[side], row)
+        if setup in setups:
+            _daily_report_add_closed(setups[setup], row)
+        if str(row.get("status") or "").upper().strip() == "LOSS":
+            all_loss_rows.append(row)
+
+    overall_pnl = _daily_report_float(overall.get("sum_pnl_pct"))
+    overall_winrate = _daily_report_winrate(overall, overall=True)
+    avg_rr = _daily_report_avg(overall.get("rr_values"))
+    denom = _daily_report_int(overall.get("win")) + _daily_report_int(overall.get("loss")) + _daily_report_int(overall.get("be"))
+    entry_accuracy = (100.0 * (_daily_report_int(overall.get("win")) + 0.5 * _daily_report_int(overall.get("be"))) / denom) if denom > 0 else 0.0
+    overall_quality = _daily_report_quality(overall)
+
+    best_setup_key = _daily_report_pick_best_setup(setups)
+    worst_setup_key = _daily_report_pick_worst_setup(setups)
+    best_setup_bucket = setups.get(best_setup_key) or _daily_report_bucket_template()
+    worst_setup_bucket = setups.get(worst_setup_key) or _daily_report_bucket_template()
+
+    filter_scores = _daily_report_filter_scores(overall_bucket=overall, setups=setups, all_loss_rows=all_loss_rows)
+    if filter_scores:
+        overall_quality = int(round(sum(filter_scores.values()) / len(filter_scores)))
+
+    reason_counter = {}
+    weak_counter = {}
+    improve_counter = {}
+    zone_counter = {}
+    for row in all_loss_rows:
+        _daily_report_inc(reason_counter, _daily_report_reason_label(row.get("close_reason_code"), row.get("close_reason_text")))
+        for item in _daily_report_split_multi(row.get("weak_filters")):
+            _daily_report_inc(weak_counter, item)
+            _daily_report_inc(zone_counter, _daily_report_improve_zone(item))
+        for item in _daily_report_split_multi(row.get("improve_note")):
+            _daily_report_inc(improve_counter, item)
+            _daily_report_inc(zone_counter, _daily_report_improve_zone(item))
+
+    top_reasons = _daily_report_sort_counter(reason_counter, 3)
+    top_weak = _daily_report_sort_counter(weak_counter, 4)
+    top_zones = _daily_report_sort_counter(zone_counter, 4)
+    loss_examples = sorted(all_loss_rows, key=lambda r: (_daily_report_float(r.get("pnl_total_pct")), str(r.get("closed_at") or "")))[:3]
+
+    market_best = ""
+    market_best_score = None
+    for key, bucket in markets.items():
+        if _daily_report_int(bucket.get("sent")) <= 0:
+            continue
+        score = (_daily_report_quality(bucket), _daily_report_winrate(bucket), _daily_report_float(bucket.get("sum_pnl_pct")))
+        if market_best_score is None or score > market_best_score:
+            market_best = key
+            market_best_score = score
+
+    side_best = ""
+    side_best_score = None
+    for key, bucket in sides.items():
+        if _daily_report_int(bucket.get("sent")) <= 0:
+            continue
+        score = (_daily_report_quality(bucket), _daily_report_winrate(bucket), _daily_report_float(bucket.get("sum_pnl_pct")))
+        if side_best_score is None or score > side_best_score:
+            side_best = key
+            side_best_score = score
+
+    weakest_filter_key = min(filter_scores.items(), key=lambda kv: kv[1])[0] if filter_scores else "retest"
+    weakest_filter_label = {
+        "confidence": "confidence логика",
+        "rr": "RR логика",
+        "trend": "trend логика",
+        "retest": "retest логика",
+        "breakout": "breakout логика",
+        "reclaim": "liquidity reclaim логика",
+        "trigger": "trigger логика",
+    }.get(weakest_filter_key, weakest_filter_key)
+
+    focus_lines = []
+    if side_best:
+        focus_lines.append(f"сильные {side_best} по тренду")
+    if best_setup_key:
+        focus_lines.append(f"{best_setup_key}-сценарии")
+    focus_lines.append("сигналы с confidence выше среднего")
+
+    caution_lines = []
+    if worst_setup_key:
+        caution_lines.append("breakout LONG" if worst_setup_key == "breakout" else worst_setup_key)
+    if weakest_filter_key == "trigger":
+        caution_lines.append("слабые pending trigger")
+    elif weakest_filter_key == "retest":
+        caution_lines.append("входы после неубедительного retest")
+    else:
+        caution_lines.append(f"слабые {weakest_filter_key} сигналы")
+    if not any("retest" in item for item in caution_lines):
+        caution_lines.append("входы после неубедительного retest")
+
+    final_score = _daily_report_final_score(
+        overall_quality=overall_quality,
+        entry_accuracy=entry_accuracy,
+        overall_winrate=overall_winrate,
+        pnl_pct=overall_pnl,
     )
-    weak_filters = _top_items(
-        dict((loss_diag or {}).get('weak_filters') or {}),
-        lambda k: _loss_diag_weak_filter_label(k) or '—',
-        limit=3,
-    )
-    improvements = _top_items(
-        dict((loss_diag or {}).get('improvements') or {}),
-        lambda k: _loss_diag_improve_label(k) or '—',
-        limit=3,
-    )
 
-    examples = list((loss_diag or {}).get('examples') or [])[:3]
-    while len(examples) < 3:
-        examples.append({})
+    since_local = since.astimezone(TZ)
+    sep = "━━━━━━━━━━━━━━"
+    lines: list[str] = [
+        f"Отчёт бота за {since_local.strftime('%d.%m.%Y')}",
+        "",
+        sep,
+        "👑 Общая картина дня",
+        "",
+        f"📤 Отправлено сигналов: {_daily_report_int(overall.get('sent'))}",
+        f"✅ WIN: {_daily_report_int(overall.get('win'))}",
+        f"❌ LOSS: {_daily_report_int(overall.get('loss'))}",
+        f"🟡 BE: {_daily_report_int(overall.get('be'))}",
+        f"⚪ CLOSED: {_daily_report_int(overall.get('manual_close'))}",
+        "",
+        f"📈 Winrate: {_daily_report_pct(overall_winrate, digits=1)}",
+        f"💰 Общий PnL: {_report_pnl_pct(overall_pnl)}",
+        f"⚖️ Средний RR: {f'1:{avg_rr:.2f}' if avg_rr > 0 else '1:0.00'}",
+        f"🎯 Точность входов: {_daily_report_pct(entry_accuracy, digits=0, strip_zero=True)}",
+        f"🛡 Качество фильтров: {overall_quality}/100",
+        "",
+        sep,
+        "📌 Рынки",
+        "",
+    ]
 
-    def _example_reason(ex: dict) -> str:
-        reason_text = str(ex.get('reason_text') or '').strip()
-        if reason_text:
-            return reason_text
-        reason_code = str(ex.get('reason_code') or '').strip()
-        return reason_map.get(reason_code, '—') if reason_code else '—'
+    for market_key, icon in (("SPOT", "🟢"), ("FUTURES", "🔴")):
+        bucket = markets.get(market_key) or _daily_report_bucket_template()
+        lines.append(f"{icon} {market_key}")
+        lines.append(f"Сигналов: {_daily_report_int(bucket.get('sent'))}")
+        lines.append(f"✅ WIN: {_daily_report_int(bucket.get('win'))}")
+        lines.append(f"❌ LOSS: {_daily_report_int(bucket.get('loss'))}")
+        if _daily_report_int(bucket.get('be')):
+            lines.append(f"🟡 BE: {_daily_report_int(bucket.get('be'))}")
+        if _daily_report_int(bucket.get('manual_close')):
+            lines.append(f"⚪ CLOSED: {_daily_report_int(bucket.get('manual_close'))}")
+        lines.append(f"💰 PnL: {_report_pnl_pct(_daily_report_float(bucket.get('sum_pnl_pct')))}")
+        lines.append(f"📈 Winrate: {_daily_report_pct(_daily_report_winrate(bucket), digits=1)}")
+        lines.append("")
 
-    def _example_weak_filter(ex: dict) -> str:
-        vals = [
-            _loss_diag_weak_filter_label(x)
-            for x in list(ex.get('weak_filters') or [])
-            if str(x or '').strip()
-        ]
-        return vals[0] if vals else '—'
+    lines.extend([sep, "📈 Направления", ""])
+    for side_key, icon in (("LONG", "🟢"), ("SHORT", "🔴")):
+        bucket = sides.get(side_key) or _daily_report_bucket_template()
+        lines.append(f"{icon} {side_key}")
+        lines.append(f"Всего: {_daily_report_int(bucket.get('sent'))}")
+        lines.append(f"✅ WIN: {_daily_report_int(bucket.get('win'))}")
+        lines.append(f"❌ LOSS: {_daily_report_int(bucket.get('loss'))}")
+        if _daily_report_int(bucket.get('be')):
+            lines.append(f"🟡 BE: {_daily_report_int(bucket.get('be'))}")
+        if _daily_report_int(bucket.get('manual_close')):
+            lines.append(f"⚪ CLOSED: {_daily_report_int(bucket.get('manual_close'))}")
+        lines.append(f"💰 PnL: {_report_pnl_pct(_daily_report_float(bucket.get('sum_pnl_pct')))}")
+        lines.append(f"📈 Winrate: {_daily_report_pct(_daily_report_winrate(bucket), digits=1)}")
+        lines.append("")
 
-    def _example_improve(ex: dict) -> str:
-        raw = str(ex.get('improve_note') or '').strip()
-        vals = [
-            _loss_diag_improve_label(x.strip())
-            for x in re.split(r'[;|,]+', raw)
-            if x.strip()
-        ]
-        return vals[0] if vals else '—'
+    lines.extend([sep, "🧠 Setup-анализ", ""])
+    for setup_key in ("origin", "breakout", "zone_retest", "normal_pending_trigger", "liquidity_reclaim"):
+        bucket = setups.get(setup_key) or _daily_report_bucket_template()
+        lines.append(setup_key)
+        lines.append(f"Всего: {_daily_report_int(bucket.get('sent'))}")
+        lines.append(f"✅ WIN: {_daily_report_int(bucket.get('win'))}")
+        lines.append(f"❌ LOSS: {_daily_report_int(bucket.get('loss'))}")
+        no_result = _daily_report_int(bucket.get('be')) + _daily_report_int(bucket.get('manual_close'))
+        if no_result:
+            lines.append(f"🟡/⚪ Без результата: {no_result}")
+        if _daily_report_int(bucket.get('win')) + _daily_report_int(bucket.get('loss')) > 0:
+            lines.append(f"📈 Winrate: {_daily_report_pct(_daily_report_winrate(bucket), digits=1, strip_zero=True)}")
+        lines.append(f"🛡 Качество: {_daily_report_quality(bucket)}/100")
+        lines.append("")
 
-    return "
-".join([
-        f"📊 Дневной отчёт бота за {since_local.strftime('%d.%m.%Y')}",
-        "",
-        f"Всего сигналов отправлено: {int(overall.get('sent') or 0)}",
-        f"✅ Закрыто в плюс: {int(overall.get('win') or 0)}",
-        f"❌ Закрыто в минус: {int(overall.get('loss') or 0)}",
-        f"🟡 BE / без убытка: {int(overall.get('be') or 0)}",
-        f"⚪ Закрыто без результата: {int(overall.get('manual_close') or 0)}",
-        f"💰 Общий PnL: {_report_pnl_pct(float(overall.get('sum_pnl_pct') or 0.0))}",
-        "",
-        "━━━━━━━━━━━━━━",
-        "📌 По рынкам",
-        "",
-        "🟢 SPOT",
-        f"Сигналов: {int((markets.get('SPOT') or {}).get('sent') or 0)}",
-        f"✅ Плюс: {int((markets.get('SPOT') or {}).get('win') or 0)}",
-        f"❌ Минус: {int((markets.get('SPOT') or {}).get('loss') or 0)}",
-        f"🟡 BE: {int((markets.get('SPOT') or {}).get('be') or 0)}",
-        f"💰 PnL: {_report_pnl_pct(float((markets.get('SPOT') or {}).get('sum_pnl_pct') or 0.0))}",
-        "",
-        "🔴 FUTURES",
-        f"Сигналов: {int((markets.get('FUTURES') or {}).get('sent') or 0)}",
-        f"✅ Плюс: {int((markets.get('FUTURES') or {}).get('win') or 0)}",
-        f"❌ Минус: {int((markets.get('FUTURES') or {}).get('loss') or 0)}",
-        f"🟡 BE: {int((markets.get('FUTURES') or {}).get('be') or 0)}",
-        f"💰 PnL: {_report_pnl_pct(float((markets.get('FUTURES') or {}).get('sum_pnl_pct') or 0.0))}",
-        "",
-        "━━━━━━━━━━━━━━",
-        "📈 По направлениям",
-        "",
-        "🟢 LONG",
-        f"Всего: {int((sides.get('LONG') or {}).get('sent') or 0)}",
-        f"✅ Плюс: {int((sides.get('LONG') or {}).get('win') or 0)}",
-        f"❌ Минус: {int((sides.get('LONG') or {}).get('loss') or 0)}",
-        f"💰 PnL: {_report_pnl_pct(float((sides.get('LONG') or {}).get('sum_pnl_pct') or 0.0))}",
-        "",
-        "🔴 SHORT",
-        f"Всего: {int((sides.get('SHORT') or {}).get('sent') or 0)}",
-        f"✅ Плюс: {int((sides.get('SHORT') or {}).get('win') or 0)}",
-        f"❌ Минус: {int((sides.get('SHORT') or {}).get('loss') or 0)}",
-        f"💰 PnL: {_report_pnl_pct(float((sides.get('SHORT') or {}).get('sum_pnl_pct') or 0.0))}",
-        "",
-        "━━━━━━━━━━━━━━",
-        "🧠 По setup",
-        "",
-        "origin",
-        f"Всего: {int((setups.get('origin') or {}).get('sent') or 0)}",
-        f"✅ Плюс: {int((setups.get('origin') or {}).get('win') or 0)}",
-        f"❌ Минус: {int((setups.get('origin') or {}).get('loss') or 0)}",
-        "",
-        "breakout",
-        f"Всего: {int((setups.get('breakout') or {}).get('sent') or 0)}",
-        f"✅ Плюс: {int((setups.get('breakout') or {}).get('win') or 0)}",
-        f"❌ Минус: {int((setups.get('breakout') or {}).get('loss') or 0)}",
-        "",
-        "zone_retest",
-        f"Всего: {int((setups.get('zone_retest') or {}).get('sent') or 0)}",
-        f"✅ Плюс: {int((setups.get('zone_retest') or {}).get('win') or 0)}",
-        f"❌ Минус: {int((setups.get('zone_retest') or {}).get('loss') or 0)}",
-        "",
-        "normal_pending_trigger",
-        f"Всего: {int((setups.get('normal_pending_trigger') or {}).get('sent') or 0)}",
-        f"✅ Плюс: {int((setups.get('normal_pending_trigger') or {}).get('win') or 0)}",
-        f"❌ Минус: {int((setups.get('normal_pending_trigger') or {}).get('loss') or 0)}",
-        "",
-        "liquidity_reclaim",
-        f"Всего: {int((setups.get('liquidity_reclaim') or {}).get('sent') or 0)}",
-        f"✅ Плюс: {int((setups.get('liquidity_reclaim') or {}).get('win') or 0)}",
-        f"❌ Минус: {int((setups.get('liquidity_reclaim') or {}).get('loss') or 0)}",
-        "",
-        "━━━━━━━━━━━━━━",
-        "🔎 Почему сигналы закрылись в минус",
-        "",
-        "Топ причин:",
-        "",
-        f"1. {reasons[0][0]} — {reasons[0][1]}",
-        f"2. {reasons[1][0]} — {reasons[1][1]}",
-        f"3. {reasons[2][0]} — {reasons[2][1]}",
-        "",
-        "Слабые фильтры:",
-        f"• {weak_filters[0][0]} — {weak_filters[0][1]}",
-        f"• {weak_filters[1][0]} — {weak_filters[1][1]}",
-        f"• {weak_filters[2][0]} — {weak_filters[2][1]}",
-        "",
-        "Что улучшить:",
-        f"• {improvements[0][0]} — {improvements[0][1]}",
-        f"• {improvements[1][0]} — {improvements[1][1]}",
-        f"• {improvements[2][0]} — {improvements[2][1]}",
-        "",
-        "━━━━━━━━━━━━━━",
-        "📋 Примеры убыточных сигналов",
-        "",
-        f"1. {str(examples[0].get('symbol') or '—')} | {str(examples[0].get('market') or '—')} | {str(examples[0].get('side') or '—')}",
-        f"   Причина: {_example_reason(examples[0])}",
-        f"   Слабый фильтр: {_example_weak_filter(examples[0])}",
-        f"   Улучшить: {_example_improve(examples[0])}",
-        "",
-        f"2. {str(examples[1].get('symbol') or '—')} | {str(examples[1].get('market') or '—')} | {str(examples[1].get('side') or '—')}",
-        f"   Причина: {_example_reason(examples[1])}",
-        f"   Слабый фильтр: {_example_weak_filter(examples[1])}",
-        f"   Улучшить: {_example_improve(examples[1])}",
-        "",
-        f"3. {str(examples[2].get('symbol') or '—')} | {str(examples[2].get('market') or '—')} | {str(examples[2].get('side') or '—')}",
-        f"   Причина: {_example_reason(examples[2])}",
-        f"   Слабый фильтр: {_example_weak_filter(examples[2])}",
-        f"   Улучшить: {_example_improve(examples[2])}",
-    ]).strip()
+    lines.extend([sep, "🏆 Лучший сетап дня", "", f"🥇 {best_setup_key or '—'}", "Почему лучший:"])
+    for item in _daily_report_best_setup_reasons(best_setup_key)[:4]:
+        lines.append(f"• {item}")
+    lines.extend(["", "Итог:"])
+    if best_setup_key:
+        lines.append(f"📈 Winrate: {_daily_report_pct(_daily_report_winrate(best_setup_bucket), digits=1, strip_zero=True)}")
+    lines.extend(["💰 Лучший вклад в PnL дня", "🛡 Самый стабильный setup", "", sep, "⚠️ Худший сетап дня", "", f"🥀 {worst_setup_key or '—'}", "Почему слабый:"])
+    for item in _daily_report_worst_setup_reasons(worst_setup_key)[:3]:
+        lines.append(f"• {item}")
+    lines.extend(["", "Итог:"])
+    if worst_setup_key:
+        lines.append(f"📈 Winrate: {_daily_report_pct(_daily_report_winrate(worst_setup_bucket), digits=1, strip_zero=True)}")
+    lines.append("❌ чаще давал слабое продолжение")
+    lines.append("🛠 требует усиления логики trigger-фильтра" if worst_setup_key == "normal_pending_trigger" else "🛠 требует доработки логики фильтра")
+    lines.extend(["", sep, "📉 Убыточные сигналы дня", ""])
+    if loss_examples:
+        for idx, row in enumerate(loss_examples, start=1):
+            lines.extend(_daily_report_render_loss_example(idx, row))
+            lines.append("")
+    else:
+        lines.extend(["Убыточных сигналов за день не было.", ""])
 
+    lines.extend([sep, "🔎 Почему были убытки", "", "Топ причин LOSS:"])
+    if top_reasons:
+        for key, value in top_reasons:
+            lines.append(f"• {key} — {value}")
+    else:
+        lines.append("• —")
+    lines.extend(["", "Слабые фильтры:"])
+    if top_weak:
+        for key, value in top_weak:
+            lines.append(f"• {key} — {value}")
+    else:
+        lines.append("• —")
+    lines.extend(["", "Главные зоны улучшения:"])
+    if top_zones:
+        for key, _ in top_zones:
+            lines.append(f"• {key}")
+    else:
+        lines.append("• —")
+
+    lines.extend([
+        "",
+        sep,
+        "🛡 Оценка фильтров в %",
+        "",
+        f"Confidence filter: {filter_scores.get('confidence', 0)}%",
+        f"RR filter: {filter_scores.get('rr', 0)}%",
+        f"Trend filter: {filter_scores.get('trend', 0)}%",
+        f"Retest filter: {filter_scores.get('retest', 0)}%",
+        f"Breakout filter: {filter_scores.get('breakout', 0)}%",
+        f"Liquidity reclaim filter: {filter_scores.get('reclaim', 0)}%",
+        f"Pending trigger quality: {filter_scores.get('trigger', 0)}%",
+        "",
+        "Вывод:",
+        f"самая слабая часть сейчас — {weakest_filter_label}",
+        f"самая сильная часть — {(best_setup_key or 'лучшая логика') + (' и ' + side_best + ' по тренду' if side_best else '')}",
+        "",
+        sep,
+        "🤖 Что улучшить боту на завтра",
+        "",
+    ])
+
+    improve_lines = []
+    for idx, (key, _) in enumerate(_daily_report_sort_counter(improve_counter, 6), start=1):
+        text = _loss_diag_improve_label(key)
+        improve_lines.append(f"{idx}. {text[:1].upper() + text[1:] if text else text}")
+    defaults = [
+        "Поднять minimum confidence для breakout-входов",
+        "Добавить 1 дополнительное подтверждение для normal_pending_trigger",
+        "Усилить retest-фильтр перед LONG входом",
+        "Снизить допуск на слабый RR в SPOT",
+        "Жёстче отсеивать входы против слабого тренда",
+        "Отдельно помечать ложные breakout-сигналы как high-risk",
+    ]
+    idx = len(improve_lines)
+    for item in defaults:
+        if idx >= 6:
+            break
+        idx += 1
+        improve_lines.append(f"{idx}. {item}")
+    lines.extend(improve_lines[:6])
+
+    lines.extend(["", sep, "📅 Рекомендация на следующий день", "", "Фокус бота:"])
+    for item in focus_lines[:3]:
+        lines.append(f"• {item}")
+    lines.extend(["", "Осторожность:"])
+    for item in caution_lines[:3]:
+        lines.append(f"• {item}")
+
+    lines.extend(["", sep, "🏁 Финальный вывод", "", f"День закрыт в {'плюс' if overall_pnl >= 0 else 'минус'}: {_report_pnl_pct(overall_pnl)}", "", "Лучше всего отработали:"])
+    if market_best:
+        lines.append(f"• {market_best}")
+    if side_best:
+        lines.append(f"• {side_best}")
+    if best_setup_key:
+        lines.append(f"• {best_setup_key}")
+    lines.extend(["", "Требуют доработки:"])
+    if worst_setup_key:
+        lines.append(f"• {worst_setup_key}")
+    for item, _ in top_zones[:2]:
+        lines.append(f"• {item}")
+    lines.extend(["", "Итоговая оценка дня бота:", f"⭐ {final_score} / 10"])
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines)
 
 async def _report_bot_send_long(chat_id: int, text: str) -> None:
     if _report_bot is None:
