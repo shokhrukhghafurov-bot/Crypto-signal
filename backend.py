@@ -18110,12 +18110,12 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
         if direction == "LONG":
             rsi_thr_txt = f"{rsi_long_min:g}-{rsi_long_max:g}"
             rsi_ok = (rsi >= rsi_long_min) and (rsi < rsi_long_max)
-            macd_thr_txt = "> 0"
+            macd_thr_txt = "> 0 (±0.0000 neutral)"
             macd_ok = (_mid_macd_hist_emit_block_reason(direction, macd_hist) == "")
         elif direction == "SHORT":
             rsi_thr_txt = f"{rsi_short_min:g}-{rsi_short_max:g}"
             rsi_ok = (rsi > rsi_short_min) and (rsi <= rsi_short_max)
-            macd_thr_txt = "< 0"
+            macd_thr_txt = "< 0 (±0.0000 neutral)"
             macd_ok = (_mid_macd_hist_emit_block_reason(direction, macd_hist) == "")
         else:
             rsi_thr_txt = "—"
