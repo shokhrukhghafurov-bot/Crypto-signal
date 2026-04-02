@@ -3400,6 +3400,252 @@ def _report_close_reason(final_status: str, *, after_tp1: bool = False, has_tp2:
     return "Сигнал закрыт."
 
 
+def _loss_diag_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)) or default)
+    except Exception:
+        return float(default)
+
+
+def _loss_diag_env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.getenv(name, str(default)) or default))
+    except Exception:
+        return int(default)
+
+
+def _loss_diag_parse_ta_score(*values: str) -> float | None:
+    for value in values:
+        src = str(value or '')
+        if not src:
+            continue
+        m = re.search(r'TA score:\s*([0-9]+(?:\.[0-9]+)?)', src, flags=re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                pass
+    return None
+
+
+def _loss_diag_parse_strength(*values: str) -> str:
+    for value in values:
+        src = str(value or '')
+        if not src:
+            continue
+        m = re.search(r'Signal strength:\s*([^\n\r]+)', src, flags=re.IGNORECASE)
+        if m:
+            raw = str(m.group(1) or '').strip().lower()
+            if 'weak' in raw:
+                return 'weak'
+            if 'medium' in raw or 'mid' in raw:
+                return 'medium'
+            if 'strong' in raw:
+                return 'strong'
+    return ''
+
+
+def _loss_diag_count_confirmations(raw: str | None) -> int:
+    src = str(raw or '').strip()
+    if not src:
+        return 0
+    items = [x.strip() for x in re.split(r'[,+|/]+', src) if x.strip()]
+    uniq = []
+    for item in items:
+        key = item.lower()
+        if key not in uniq:
+            uniq.append(key)
+    return len(uniq)
+
+
+def _loss_diag_setup_key_from_row(row: dict) -> str:
+    label = str(_report_setup_label_from_row(row) or '').strip().lower().replace(' ', '_')
+    mapping = {
+        'origin': 'origin',
+        'breakout': 'breakout',
+        'zone_retest': 'zone_retest',
+        'zone_retest': 'zone_retest',
+        'zone_retest': 'zone_retest',
+        'zone_retest': 'zone_retest',
+        'zone_retest': 'zone_retest',
+        'zone_retest': 'zone_retest',
+        'zone_retest': 'zone_retest',
+        'zone_retest': 'zone_retest',
+        'zone_retest': 'zone_retest',
+        'normal_pending_trigger': 'normal_pending_trigger',
+        'normal_pending_trigger': 'normal_pending_trigger',
+        'normal_pending_trigger': 'normal_pending_trigger',
+        'liquidity_reclaim': 'liquidity_reclaim',
+    }
+    if label in mapping:
+        return mapping[label]
+    if label in ('zone retest', 'zone_retest'):
+        return 'zone_retest'
+    if label in ('normal pending trigger', 'normal_pending_trigger'):
+        return 'normal_pending_trigger'
+    if label in ('liquidity reclaim', 'liquidity_reclaim'):
+        return 'liquidity_reclaim'
+    return label
+
+
+def _loss_diag_reason_text(reason_code: str, fallback: str) -> str:
+    key = str(reason_code or '').strip()
+    mapping = {
+        'loss_before_tp1_sl': 'SL сработал до TP1.',
+        'loss_after_tp1_sl': 'После TP1 остаток позиции вернулся в SL.',
+        'loss_sl': 'Цена дошла до SL — сигнал закрылся в минус.',
+        'timeout_closed': 'Сигнал закрыт по времени.',
+    }
+    return mapping.get(key, fallback or 'Сигнал закрылся в минус.')
+
+
+def _loss_diag_weak_filter_label(key: str) -> str:
+    mapping = {
+        'low_confidence': 'низкий confidence',
+        'low_rr': 'низкий RR',
+        'few_confirmations': 'мало подтверждений',
+        'low_ta_score': 'низкий TA score',
+        'weak_signal_strength': 'слабая сила сигнала',
+        'breakout_retest_weak': 'слабый breakout / retest',
+        'zone_hold_weak': 'слабое удержание зоны',
+        'origin_entry_early': 'слишком ранний origin entry',
+        'trigger_reconfirm_weak': 'слабый pending trigger',
+        'reclaim_confirmation_weak': 'слабый liquidity reclaim',
+        'tp1_protection': 'слабая защита после TP1',
+    }
+    return mapping.get(str(key or '').strip(), str(key or '').strip())
+
+
+def _loss_diag_improve_label(key: str) -> str:
+    mapping = {
+        'raise_min_confidence': 'поднять minimum confidence',
+        'raise_min_rr': 'поднять minimum RR',
+        'require_more_confirmations': 'требовать 2+ подтверждения',
+        'raise_min_ta_score': 'поднять minimum TA score',
+        'tighten_breakout_retest': 'ужесточить breakout retest',
+        'tighten_zone_retest': 'сузить zone retest',
+        'tighten_origin_entry': 'ужесточить origin entry',
+        'tighten_trigger_reconfirm': 'усилить trigger reconfirmation',
+        'tighten_liquidity_reclaim': 'усилить reclaim confirmation',
+        'tighten_tp1_protection': 'усилить TP1 → SL защиту',
+    }
+    return mapping.get(str(key or '').strip(), str(key or '').strip())
+
+
+def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str) -> dict:
+    src = dict(row or {})
+    st = str(final_status or '').upper().strip()
+    pre_status = str(src.get('status') or 'ACTIVE').upper().strip()
+    after_tp1 = bool(src.get('tp1_hit')) or pre_status == 'TP1'
+    fallback_reason = _report_close_reason(st, after_tp1=after_tp1, has_tp2=bool(float(src.get('tp2') or 0.0) > 0 if src.get('tp2') is not None else False))
+
+    reason_code = str(src.get('close_reason_code') or '').strip()
+    reason_text = str(src.get('close_reason_text') or '').strip()
+    weak_filters_raw = str(src.get('weak_filters') or '').strip()
+    improve_note_raw = str(src.get('improve_note') or '').strip()
+
+    if reason_code or reason_text or weak_filters_raw or improve_note_raw:
+        weak_keys = [x.strip() for x in re.split(r'[,;|]+', weak_filters_raw) if x.strip()]
+        improve_keys = [x.strip() for x in re.split(r'[,;|]+', improve_note_raw) if x.strip()]
+        return {
+            'reason_code': reason_code or ('loss_after_tp1_sl' if after_tp1 and st == 'LOSS' else 'loss_before_tp1_sl' if st == 'LOSS' else ''),
+            'reason_text': reason_text or _loss_diag_reason_text(reason_code, fallback_reason),
+            'weak_filter_keys': weak_keys,
+            'weak_filter_labels': [_loss_diag_weak_filter_label(x) for x in weak_keys],
+            'improve_keys': improve_keys,
+            'improve_labels': [_loss_diag_improve_label(x) for x in improve_keys],
+            'improve_note': improve_note_raw,
+        }
+
+    if st not in ('LOSS', 'CLOSED'):
+        return {
+            'reason_code': '',
+            'reason_text': fallback_reason,
+            'weak_filter_keys': [],
+            'weak_filter_labels': [],
+            'improve_keys': [],
+            'improve_labels': [],
+            'improve_note': '',
+        }
+
+    conf = 0
+    try:
+        conf = int(src.get('confidence') or 0)
+    except Exception:
+        conf = 0
+    rr_val = 0.0
+    try:
+        rr_val = float(src.get('rr') or 0.0)
+    except Exception:
+        rr_val = 0.0
+    conf_cnt = _loss_diag_count_confirmations(src.get('confirmations') or src.get('source_exchange'))
+    ta_score = _loss_diag_parse_ta_score(src.get('risk_note'), src.get('orig_text'))
+    strength = _loss_diag_parse_strength(src.get('risk_note'), src.get('orig_text'))
+    setup_key = _loss_diag_setup_key_from_row(src)
+
+    weak_keys = []
+    improve_keys = []
+
+    min_conf = _loss_diag_env_int('LOSS_DIAG_WEAK_CONFIDENCE_MAX', 80)
+    min_rr = _loss_diag_env_float('LOSS_DIAG_WEAK_RR_MAX', 1.8)
+    min_confirms = _loss_diag_env_int('LOSS_DIAG_MIN_CONFIRMATIONS', 1)
+    min_ta_score = _loss_diag_env_float('LOSS_DIAG_WEAK_TA_SCORE_MAX', 70.0)
+
+    if conf > 0 and conf <= min_conf:
+        weak_keys.append('low_confidence')
+        improve_keys.append('raise_min_confidence')
+    if rr_val > 0 and rr_val <= min_rr:
+        weak_keys.append('low_rr')
+        improve_keys.append('raise_min_rr')
+    if conf_cnt and conf_cnt <= min_confirms:
+        weak_keys.append('few_confirmations')
+        improve_keys.append('require_more_confirmations')
+    if ta_score is not None and ta_score <= min_ta_score:
+        weak_keys.append('low_ta_score')
+        improve_keys.append('raise_min_ta_score')
+    if strength == 'weak':
+        weak_keys.append('weak_signal_strength')
+        improve_keys.append('raise_min_ta_score')
+
+    if st == 'LOSS' and after_tp1:
+        weak_keys.append('tp1_protection')
+        improve_keys.append('tighten_tp1_protection')
+        reason_code = 'loss_after_tp1_sl'
+    elif st == 'LOSS':
+        reason_code = 'loss_before_tp1_sl'
+        if setup_key == 'breakout':
+            weak_keys.append('breakout_retest_weak')
+            improve_keys.append('tighten_breakout_retest')
+        elif setup_key == 'zone_retest':
+            weak_keys.append('zone_hold_weak')
+            improve_keys.append('tighten_zone_retest')
+        elif setup_key == 'origin':
+            weak_keys.append('origin_entry_early')
+            improve_keys.append('tighten_origin_entry')
+        elif setup_key == 'normal_pending_trigger':
+            weak_keys.append('trigger_reconfirm_weak')
+            improve_keys.append('tighten_trigger_reconfirm')
+        elif setup_key == 'liquidity_reclaim':
+            weak_keys.append('reclaim_confirmation_weak')
+            improve_keys.append('tighten_liquidity_reclaim')
+    else:
+        reason_code = 'timeout_closed'
+
+    weak_keys = list(dict.fromkeys([x for x in weak_keys if x]))
+    improve_keys = list(dict.fromkeys([x for x in improve_keys if x]))
+    improve_note = '; '.join([_loss_diag_improve_label(x) for x in improve_keys])
+
+    return {
+        'reason_code': reason_code,
+        'reason_text': _loss_diag_reason_text(reason_code, fallback_reason),
+        'weak_filter_keys': weak_keys,
+        'weak_filter_labels': [_loss_diag_weak_filter_label(x) for x in weak_keys],
+        'improve_keys': improve_keys,
+        'improve_labels': [_loss_diag_improve_label(x) for x in improve_keys],
+        'improve_note': improve_note,
+    }
+
+
 def _report_setup_label_human(source: str | None) -> str:
     raw = str(source or "").strip().lower().replace("_", " ")
     labels = {
@@ -3413,6 +3659,9 @@ def _report_setup_label_human(source: str | None) -> str:
         "обычный trigger": "normal pending trigger",
         "обычный триггер": "normal pending trigger",
         "обычный pending trigger": "normal pending trigger",
+        "liquidity reclaim": "liquidity_reclaim",
+        "liquidity_reclaim": "liquidity_reclaim",
+        "liquidity_reclaim_emit": "liquidity_reclaim",
     }
     if raw in labels:
         return labels[raw]
@@ -3541,6 +3790,7 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
     tz_label = _report_tz_label()
 
     setup_label = _report_setup_label_from_row(row)
+    loss_diag = _build_loss_diagnostics_from_row(row, final_status=st)
 
     price_lines = []
     if entry > 0:
@@ -3556,6 +3806,15 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
     price_block = "\n".join(price_lines).strip() or "—"
 
     setup_block = f"🧭 Smart-setup: {setup_label}\n" if setup_label else ""
+    weak_block = ""
+    improve_block = ""
+    if st == 'LOSS':
+        weak_labels = list(loss_diag.get('weak_filter_labels') or [])
+        improve_labels = list(loss_diag.get('improve_labels') or [])
+        if weak_labels:
+            weak_block = f"⚠️ Слабые фильтры: {', '.join(weak_labels)}\n"
+        if improve_labels:
+            improve_block = f"🛠 Улучшить: {'; '.join(improve_labels)}\n"
 
     return (
         f"{_report_close_emoji(st)} {symbol} | {market} | {side}\n\n"
@@ -3563,7 +3822,9 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
         f"📊 Итог PnL: {_report_pnl_pct(pnl_total_pct)}\n"
         f"📊 Risk/Reward: 1 : {rr}\n"
         f"{setup_block}"
-        f"🧠 Причина: {reason}\n\n"
+        f"🧠 Причина: {loss_diag.get('reason_text') or reason}\n"
+        f"{weak_block}"
+        f"{improve_block}\n"
         f"──────────────\n\n"
         f"{price_block}\n\n"
         f"🕒 Открыта: {opened_time} ({tz_label})\n"
@@ -3593,6 +3854,316 @@ async def _send_closed_signal_report_card(t: dict, *, final_status: str, pnl_tot
             logger.warning("[report-bot] send failed chat_id=%s err=%s", chat_id, e)
         except Exception:
             logger.exception("[report-bot] send failed chat_id=%s", chat_id)
+
+
+
+# ---------------- Daily report bot summary ----------------
+
+_DAILY_SIGNAL_REPORT_ENABLED = str(os.getenv("DAILY_SIGNAL_REPORT_ENABLED", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+_DAILY_SIGNAL_REPORT_HOUR = max(0, min(23, int(float(os.getenv("DAILY_SIGNAL_REPORT_HOUR", "0") or 0))))
+_DAILY_SIGNAL_REPORT_MINUTE = max(0, min(59, int(float(os.getenv("DAILY_SIGNAL_REPORT_MINUTE", "0") or 0))))
+_DAILY_SIGNAL_REPORT_STATE_KEY = "daily_signal_report_state"
+
+
+def _daily_report_setup_title(key: str) -> str:
+    raw = str(key or "").strip().lower()
+    mapping = {
+        "origin": "origin",
+        "breakout": "breakout",
+        "zone_retest": "zone_retest",
+        "normal_pending_trigger": "normal_pending_trigger",
+        "liquidity_reclaim": "liquidity_reclaim",
+    }
+    return mapping.get(raw, raw or "other")
+
+
+def _daily_report_bucket_line(title: str, bucket: dict, *, show_sent: bool = True) -> str:
+    b = dict(bucket or {})
+    sent = int(b.get("sent") or 0)
+    win = int(b.get("win") or 0)
+    loss = int(b.get("loss") or 0)
+    be = int(b.get("be") or 0)
+    manual_close = int(b.get("manual_close") or 0)
+    pnl = float(b.get("sum_pnl_pct") or 0.0)
+    parts = []
+    if show_sent:
+        parts.append(f"sent {sent}")
+    parts.append(f"+ {win}")
+    parts.append(f"- {loss}")
+    if be:
+        parts.append(f"BE {be}")
+    if manual_close:
+        parts.append(f"CLOSED {manual_close}")
+    parts.append(f"PnL {_report_pnl_pct(pnl)}")
+    return f"• {title}: " + " | ".join(parts)
+
+
+async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datetime) -> str:
+    stats = await db_store.signal_report_window_summary(since=since, until=until)
+    loss_diag = await db_store.signal_loss_diagnostics_window(
+        since=since,
+        until=until,
+        limit=max(3, _loss_diag_env_int('DAILY_SIGNAL_REPORT_LOSS_EXAMPLES', 3)),
+    )
+    overall = dict((stats or {}).get("overall") or {})
+    markets = dict((stats or {}).get("markets") or {})
+    sides = dict((stats or {}).get("sides") or {})
+    setups = dict((stats or {}).get("setups") or {})
+    since_local = since.astimezone(TZ)
+
+    reason_map = {
+        'loss_before_tp1_sl': 'SL до TP1',
+        'loss_after_tp1_sl': 'SL после TP1',
+        'loss_sl': 'SL',
+        'timeout_closed': 'таймаут',
+    }
+
+    def _top_items(counter: dict, humanizer, limit: int = 3) -> list[tuple[str, int]]:
+        items = sorted((counter or {}).items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0])))
+        out: list[tuple[str, int]] = []
+        for key, value in items[:max(0, int(limit or 0))]:
+            out.append((humanizer(str(key)), int(value or 0)))
+        while len(out) < max(0, int(limit or 0)):
+            out.append(("—", 0))
+        return out
+
+    reasons = _top_items(
+        dict((loss_diag or {}).get('reasons') or {}),
+        lambda k: reason_map.get(k, k or '—'),
+        limit=3,
+    )
+    weak_filters = _top_items(
+        dict((loss_diag or {}).get('weak_filters') or {}),
+        lambda k: _loss_diag_weak_filter_label(k) or '—',
+        limit=3,
+    )
+    improvements = _top_items(
+        dict((loss_diag or {}).get('improvements') or {}),
+        lambda k: _loss_diag_improve_label(k) or '—',
+        limit=3,
+    )
+
+    examples = list((loss_diag or {}).get('examples') or [])[:3]
+    while len(examples) < 3:
+        examples.append({})
+
+    def _example_reason(ex: dict) -> str:
+        reason_text = str(ex.get('reason_text') or '').strip()
+        if reason_text:
+            return reason_text
+        reason_code = str(ex.get('reason_code') or '').strip()
+        return reason_map.get(reason_code, '—') if reason_code else '—'
+
+    def _example_weak_filter(ex: dict) -> str:
+        vals = [
+            _loss_diag_weak_filter_label(x)
+            for x in list(ex.get('weak_filters') or [])
+            if str(x or '').strip()
+        ]
+        return vals[0] if vals else '—'
+
+    def _example_improve(ex: dict) -> str:
+        raw = str(ex.get('improve_note') or '').strip()
+        vals = [
+            _loss_diag_improve_label(x.strip())
+            for x in re.split(r'[;|,]+', raw)
+            if x.strip()
+        ]
+        return vals[0] if vals else '—'
+
+    return "
+".join([
+        f"📊 Дневной отчёт бота за {since_local.strftime('%d.%m.%Y')}",
+        "",
+        f"Всего сигналов отправлено: {int(overall.get('sent') or 0)}",
+        f"✅ Закрыто в плюс: {int(overall.get('win') or 0)}",
+        f"❌ Закрыто в минус: {int(overall.get('loss') or 0)}",
+        f"🟡 BE / без убытка: {int(overall.get('be') or 0)}",
+        f"⚪ Закрыто без результата: {int(overall.get('manual_close') or 0)}",
+        f"💰 Общий PnL: {_report_pnl_pct(float(overall.get('sum_pnl_pct') or 0.0))}",
+        "",
+        "━━━━━━━━━━━━━━",
+        "📌 По рынкам",
+        "",
+        "🟢 SPOT",
+        f"Сигналов: {int((markets.get('SPOT') or {}).get('sent') or 0)}",
+        f"✅ Плюс: {int((markets.get('SPOT') or {}).get('win') or 0)}",
+        f"❌ Минус: {int((markets.get('SPOT') or {}).get('loss') or 0)}",
+        f"🟡 BE: {int((markets.get('SPOT') or {}).get('be') or 0)}",
+        f"💰 PnL: {_report_pnl_pct(float((markets.get('SPOT') or {}).get('sum_pnl_pct') or 0.0))}",
+        "",
+        "🔴 FUTURES",
+        f"Сигналов: {int((markets.get('FUTURES') or {}).get('sent') or 0)}",
+        f"✅ Плюс: {int((markets.get('FUTURES') or {}).get('win') or 0)}",
+        f"❌ Минус: {int((markets.get('FUTURES') or {}).get('loss') or 0)}",
+        f"🟡 BE: {int((markets.get('FUTURES') or {}).get('be') or 0)}",
+        f"💰 PnL: {_report_pnl_pct(float((markets.get('FUTURES') or {}).get('sum_pnl_pct') or 0.0))}",
+        "",
+        "━━━━━━━━━━━━━━",
+        "📈 По направлениям",
+        "",
+        "🟢 LONG",
+        f"Всего: {int((sides.get('LONG') or {}).get('sent') or 0)}",
+        f"✅ Плюс: {int((sides.get('LONG') or {}).get('win') or 0)}",
+        f"❌ Минус: {int((sides.get('LONG') or {}).get('loss') or 0)}",
+        f"💰 PnL: {_report_pnl_pct(float((sides.get('LONG') or {}).get('sum_pnl_pct') or 0.0))}",
+        "",
+        "🔴 SHORT",
+        f"Всего: {int((sides.get('SHORT') or {}).get('sent') or 0)}",
+        f"✅ Плюс: {int((sides.get('SHORT') or {}).get('win') or 0)}",
+        f"❌ Минус: {int((sides.get('SHORT') or {}).get('loss') or 0)}",
+        f"💰 PnL: {_report_pnl_pct(float((sides.get('SHORT') or {}).get('sum_pnl_pct') or 0.0))}",
+        "",
+        "━━━━━━━━━━━━━━",
+        "🧠 По setup",
+        "",
+        "origin",
+        f"Всего: {int((setups.get('origin') or {}).get('sent') or 0)}",
+        f"✅ Плюс: {int((setups.get('origin') or {}).get('win') or 0)}",
+        f"❌ Минус: {int((setups.get('origin') or {}).get('loss') or 0)}",
+        "",
+        "breakout",
+        f"Всего: {int((setups.get('breakout') or {}).get('sent') or 0)}",
+        f"✅ Плюс: {int((setups.get('breakout') or {}).get('win') or 0)}",
+        f"❌ Минус: {int((setups.get('breakout') or {}).get('loss') or 0)}",
+        "",
+        "zone_retest",
+        f"Всего: {int((setups.get('zone_retest') or {}).get('sent') or 0)}",
+        f"✅ Плюс: {int((setups.get('zone_retest') or {}).get('win') or 0)}",
+        f"❌ Минус: {int((setups.get('zone_retest') or {}).get('loss') or 0)}",
+        "",
+        "normal_pending_trigger",
+        f"Всего: {int((setups.get('normal_pending_trigger') or {}).get('sent') or 0)}",
+        f"✅ Плюс: {int((setups.get('normal_pending_trigger') or {}).get('win') or 0)}",
+        f"❌ Минус: {int((setups.get('normal_pending_trigger') or {}).get('loss') or 0)}",
+        "",
+        "liquidity_reclaim",
+        f"Всего: {int((setups.get('liquidity_reclaim') or {}).get('sent') or 0)}",
+        f"✅ Плюс: {int((setups.get('liquidity_reclaim') or {}).get('win') or 0)}",
+        f"❌ Минус: {int((setups.get('liquidity_reclaim') or {}).get('loss') or 0)}",
+        "",
+        "━━━━━━━━━━━━━━",
+        "🔎 Почему сигналы закрылись в минус",
+        "",
+        "Топ причин:",
+        "",
+        f"1. {reasons[0][0]} — {reasons[0][1]}",
+        f"2. {reasons[1][0]} — {reasons[1][1]}",
+        f"3. {reasons[2][0]} — {reasons[2][1]}",
+        "",
+        "Слабые фильтры:",
+        f"• {weak_filters[0][0]} — {weak_filters[0][1]}",
+        f"• {weak_filters[1][0]} — {weak_filters[1][1]}",
+        f"• {weak_filters[2][0]} — {weak_filters[2][1]}",
+        "",
+        "Что улучшить:",
+        f"• {improvements[0][0]} — {improvements[0][1]}",
+        f"• {improvements[1][0]} — {improvements[1][1]}",
+        f"• {improvements[2][0]} — {improvements[2][1]}",
+        "",
+        "━━━━━━━━━━━━━━",
+        "📋 Примеры убыточных сигналов",
+        "",
+        f"1. {str(examples[0].get('symbol') or '—')} | {str(examples[0].get('market') or '—')} | {str(examples[0].get('side') or '—')}",
+        f"   Причина: {_example_reason(examples[0])}",
+        f"   Слабый фильтр: {_example_weak_filter(examples[0])}",
+        f"   Улучшить: {_example_improve(examples[0])}",
+        "",
+        f"2. {str(examples[1].get('symbol') or '—')} | {str(examples[1].get('market') or '—')} | {str(examples[1].get('side') or '—')}",
+        f"   Причина: {_example_reason(examples[1])}",
+        f"   Слабый фильтр: {_example_weak_filter(examples[1])}",
+        f"   Улучшить: {_example_improve(examples[1])}",
+        "",
+        f"3. {str(examples[2].get('symbol') or '—')} | {str(examples[2].get('market') or '—')} | {str(examples[2].get('side') or '—')}",
+        f"   Причина: {_example_reason(examples[2])}",
+        f"   Слабый фильтр: {_example_weak_filter(examples[2])}",
+        f"   Улучшить: {_example_improve(examples[2])}",
+    ]).strip()
+
+
+async def _report_bot_send_long(chat_id: int, text: str) -> None:
+    if _report_bot is None:
+        return
+    payload = _sanitize_template_text(int(chat_id), text, ctx='daily_report')
+    if not (payload or '').strip():
+        return
+    try:
+        await _report_bot.send_message(int(chat_id), payload)
+        return
+    except TelegramBadRequest as e:
+        msg = str(e).lower()
+        if 'message is too long' not in msg:
+            raise
+
+    max_len = 3800
+    parts: list[str] = []
+    cur = ''
+    for line in payload.splitlines(True):
+        if len(cur) + len(line) > max_len and cur:
+            parts.append(cur)
+            cur = ''
+        cur += line
+    if cur:
+        parts.append(cur)
+
+    for part in parts or [payload[:max_len]]:
+        await _report_bot.send_message(int(chat_id), part)
+
+
+async def _send_daily_signal_report(*, since: dt.datetime, until: dt.datetime) -> None:
+    if _report_bot is None:
+        return
+    chat_ids = [int(x) for x in (REPORT_BOT_CHAT_IDS or []) if int(x)]
+    if not chat_ids:
+        return
+    text = await _build_daily_signal_report_text(since=since, until=until)
+    for chat_id in chat_ids:
+        try:
+            await _report_bot_send_long(int(chat_id), text)
+        except TelegramForbiddenError:
+            logger.warning("[report-bot] daily report bot is blocked by chat_id=%s", chat_id)
+        except TelegramBadRequest as e:
+            logger.warning("[report-bot] daily report send failed chat_id=%s err=%s", chat_id, e)
+        except Exception:
+            logger.exception("[report-bot] daily report send failed chat_id=%s", chat_id)
+
+
+async def daily_signal_report_loop() -> None:
+    if not _DAILY_SIGNAL_REPORT_ENABLED:
+        logger.info("[report-bot] daily signal report disabled")
+        return
+    if _report_bot is None:
+        logger.info("[report-bot] daily signal report skipped: REPORT_BOT_TOKEN is not set")
+        return
+    if not REPORT_BOT_CHAT_IDS:
+        logger.info("[report-bot] daily signal report skipped: REPORT_BOT_CHAT_IDS is empty")
+        return
+
+    logger.info("[report-bot] daily signal report loop started at %02d:%02d %s", _DAILY_SIGNAL_REPORT_HOUR, _DAILY_SIGNAL_REPORT_MINUTE, TZ_NAME)
+    await asyncio.sleep(5)
+    while True:
+        try:
+            now_utc = dt.datetime.now(dt.timezone.utc)
+            now_local = now_utc.astimezone(TZ)
+            target_local = now_local.replace(hour=_DAILY_SIGNAL_REPORT_HOUR, minute=_DAILY_SIGNAL_REPORT_MINUTE, second=0, microsecond=0)
+            report_key = target_local.date().isoformat()
+            st = await db_store.kv_get_json(_DAILY_SIGNAL_REPORT_STATE_KEY) or {}
+            last_sent = str(st.get("last_sent_for") or "").strip()
+            if now_local >= target_local and last_sent != report_key:
+                since_local = target_local - dt.timedelta(days=1)
+                until_local = target_local
+                since_utc = since_local.astimezone(dt.timezone.utc)
+                until_utc = until_local.astimezone(dt.timezone.utc)
+                await _send_daily_signal_report(since=since_utc, until=until_utc)
+                await db_store.kv_set_json(_DAILY_SIGNAL_REPORT_STATE_KEY, {
+                    "last_sent_for": report_key,
+                    "sent_at": now_utc.isoformat(),
+                    "tz": TZ_NAME,
+                })
+                logger.info("[report-bot] daily signal report sent for %s", report_key)
+        except Exception:
+            logger.exception("[report-bot] daily signal report loop error")
+        await asyncio.sleep(30)
 
 def _fmt_symbol(sym: str) -> str:
     s = (sym or "").strip().upper()
@@ -3986,6 +4557,30 @@ async def broadcast_signal(sig: Signal) -> None:
         except Exception:
             pass
         try:
+            _track_kwargs['timeframe'] = str(getattr(sig, 'timeframe', '') or '').strip()
+        except Exception:
+            pass
+        try:
+            _track_kwargs['confidence'] = int(getattr(sig, 'confidence', 0) or 0)
+        except Exception:
+            pass
+        try:
+            _track_kwargs['rr'] = float(getattr(sig, 'rr', 0.0) or 0.0)
+        except Exception:
+            pass
+        try:
+            _track_kwargs['confirmations'] = str(getattr(sig, 'confirmations', '') or '').strip()
+        except Exception:
+            pass
+        try:
+            _track_kwargs['source_exchange'] = str(getattr(sig, 'source_exchange', '') or '').strip()
+        except Exception:
+            pass
+        try:
+            _track_kwargs['risk_note'] = str(getattr(sig, 'risk_note', '') or '').strip()
+        except Exception:
+            pass
+        try:
             await db_store.upsert_signal_track(**_track_kwargs)
         except TypeError:
             _track_kwargs.pop('orig_text', None)
@@ -3993,6 +4588,12 @@ async def broadcast_signal(sig: Signal) -> None:
             _track_kwargs.pop('setup_source_label', None)
             _track_kwargs.pop('ui_setup_label', None)
             _track_kwargs.pop('emit_route', None)
+            _track_kwargs.pop('timeframe', None)
+            _track_kwargs.pop('confidence', None)
+            _track_kwargs.pop('rr', None)
+            _track_kwargs.pop('confirmations', None)
+            _track_kwargs.pop('source_exchange', None)
+            _track_kwargs.pop('risk_note', None)
             await db_store.upsert_signal_track(**_track_kwargs)
     except Exception:
         pass
@@ -6864,7 +7465,16 @@ async def signal_outcome_loop() -> None:
                             if crossed:
                                 if sig_sl_confirm_sec == 0 or (since is not None and (_time.time() - since) >= sig_sl_confirm_sec):
                                     pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
-                                    closed_now = await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
+                                    _loss_diag = _build_loss_diagnostics_from_row(t, final_status="LOSS")
+                                    closed_now = await db_store.close_signal_track(
+                                        signal_id=sid,
+                                        status="LOSS",
+                                        pnl_total_pct=float(pnl),
+                                        close_reason_code=str(_loss_diag.get('reason_code') or ''),
+                                        close_reason_text=str(_loss_diag.get('reason_text') or ''),
+                                        weak_filters=",".join(list(_loss_diag.get('weak_filter_keys') or [])),
+                                        improve_note="; ".join(list(_loss_diag.get('improve_keys') or [])),
+                                    )
                                     _SIG_SL_BREACH_SINCE.pop(sid, None)
                                     if not closed_now:
                                         continue
@@ -6937,7 +7547,16 @@ async def signal_outcome_loop() -> None:
                             if crossed:
                                 if sig_sl_confirm_sec == 0 or (since is not None and (_time.time() - since) >= sig_sl_confirm_sec):
                                     pnl = _sig_net_pnl_tp1_then_sl(market=market, side=side, entry=entry, tp1=eff_tp1, sl=sl, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
-                                    closed_now = await db_store.close_signal_track(signal_id=sid, status="LOSS", pnl_total_pct=float(pnl))
+                                    _loss_diag = _build_loss_diagnostics_from_row(t, final_status="LOSS")
+                                    closed_now = await db_store.close_signal_track(
+                                        signal_id=sid,
+                                        status="LOSS",
+                                        pnl_total_pct=float(pnl),
+                                        close_reason_code=str(_loss_diag.get('reason_code') or ''),
+                                        close_reason_text=str(_loss_diag.get('reason_text') or ''),
+                                        weak_filters=",".join(list(_loss_diag.get('weak_filter_keys') or [])),
+                                        improve_note="; ".join(list(_loss_diag.get('improve_keys') or [])),
+                                    )
                                     _SIG_SL_BREACH_SINCE.pop(sid, None)
                                     if not closed_now:
                                         continue
@@ -8501,6 +9120,9 @@ async def main() -> None:
             logger.info("Starting signal_outcome_loop")
             _start_signal_outcome_task()
 
+            TASKS["daily-signal-report"] = asyncio.create_task(daily_signal_report_loop(), name="daily-signal-report")
+            _attach_task_monitor("daily-signal-report", TASKS["daily-signal-report"])
+
         # Auto-trade manager can run on all replicas (cluster-safe via DB lease/locks)
         TASKS["autotrade-manager"] = asyncio.create_task(
             autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend),
@@ -8555,6 +9177,9 @@ async def main() -> None:
 
     logger.info("Starting signal_outcome_loop")
     _start_signal_outcome_task()
+
+    TASKS["daily-signal-report"] = asyncio.create_task(daily_signal_report_loop(), name="daily-signal-report")
+    _attach_task_monitor("daily-signal-report", TASKS["daily-signal-report"])
 
     # Auto-trade manager (SL/TP/BE) - runs in background.
     asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend))
