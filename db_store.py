@@ -2427,6 +2427,62 @@ async def signal_report_window_summary(*, since: dt.datetime, until: dt.datetime
 
     return out
 
+
+async def signal_report_window_dataset(*, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
+    """Return raw sent/closed rows needed to build the verbose daily report."""
+    try:
+        pool = get_pool()
+    except Exception:
+        return {"sent_rows": [], "closed_rows": []}
+
+    sent_rows: List[dict] = []
+    closed_rows: List[dict] = []
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT signal_id, market, symbol, side, entry, tp1, tp2, sl,
+                       opened_at, orig_text, setup_source, setup_source_label, ui_setup_label, emit_route,
+                       timeframe, confidence, rr, confirmations, source_exchange, risk_note,
+                       close_reason_code, close_reason_text, weak_filters, improve_note
+                FROM signal_tracks
+                WHERE opened_at IS NOT NULL
+                  AND opened_at >= $1 AND opened_at < $2
+                ORDER BY opened_at ASC, signal_id ASC;
+                """,
+                since, until,
+            )
+            sent_rows = [dict(r) for r in (rows or [])]
+        except Exception:
+            logger.exception('signal_report_window_dataset sent_rows failed')
+
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT signal_id, market, symbol, side, entry, tp1, tp2, sl,
+                       status, tp1_hit, pnl_total_pct, opened_at, closed_at,
+                       orig_text, setup_source, setup_source_label, ui_setup_label, emit_route,
+                       timeframe, confidence, rr, confirmations, source_exchange, risk_note,
+                       close_reason_code, close_reason_text, weak_filters, improve_note
+                FROM signal_tracks
+                WHERE closed_at IS NOT NULL
+                  AND closed_at >= $1 AND closed_at < $2
+                  AND status IN ('WIN','LOSS','BE','CLOSED')
+                ORDER BY closed_at ASC, signal_id ASC;
+                """,
+                since, until,
+            )
+            closed_rows = [dict(r) for r in (rows or [])]
+        except Exception:
+            logger.exception('signal_report_window_dataset closed_rows failed')
+
+    return {
+        "sent_rows": sent_rows,
+        "closed_rows": closed_rows,
+    }
+
+
+
 def _signal_loss_diag_empty() -> Dict[str, Any]:
     return {
         "reasons": {},
