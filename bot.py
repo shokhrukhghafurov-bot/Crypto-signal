@@ -63,6 +63,7 @@ import hmac
 import io
 from decimal import Decimal, InvalidOperation
 from openpyxl import Workbook
+import pandas as pd
 
 # --- time parsing helpers ---
 def _parse_iso_dt(v):
@@ -3509,11 +3510,16 @@ def _loss_diag_ta_filter_keys(*values: str, direction: str = "", setup_key: str 
                         _push("low_ta_score")
                 except Exception:
                     pass
-            if "grade: c" in core_l or "grade: d" in core_l:
-                _push("low_ta_score")
 
-        if "signal strength:" in core_l and ("(weak)" in core_l or "(medium)" in core_l or "слаб" in core_l):
-            _push("weak_signal_strength")
+        if "signal strength:" in core_l:
+            m = re.search(r"Signal strength:\s*([0-9]+(?:\.[0-9]+)?)\/10", core, flags=re.IGNORECASE)
+            try:
+                if m and float(m.group(1)) < float(os.getenv("LOSS_DIAG_MIN_SIGNAL_STRENGTH", "6.0") or 6.0):
+                    _push("weak_signal_strength")
+            except Exception:
+                pass
+            if "(weak)" in core_l or "слаб" in core_l:
+                _push("weak_signal_strength")
 
         if "confidence:" in core_l:
             m = re.search(r"Confidence:\s*([0-9]+(?:\.[0-9]+)?)\/100.*?need\s*[≥>=]*\s*([0-9]+(?:\.[0-9]+)?)", core, flags=re.IGNORECASE)
@@ -3529,6 +3535,9 @@ def _loss_diag_ta_filter_keys(*values: str, direction: str = "", setup_key: str 
 
         if "adx 30m/1h" in core_l and ("⚠️" in line or "❌" in line):
             _push("weak_trend_context")
+
+        if "vol xavg" in core_l and ("⚠️" in line or "❌" in line):
+            _push("weak_volume_support")
 
         if "vwap:" in core_l and ("⚠️" in line or "❌" in line):
             _push("vwap_side_weak")
@@ -3550,7 +3559,6 @@ def _loss_diag_ta_filter_keys(*values: str, direction: str = "", setup_key: str 
 
     return out
 
-
 def _loss_diag_improve_from_weak_filter(key: str, *, market: str = "", side: str = "", setup_key: str = "") -> str:
     k = str(key or "").strip()
     mkt = str(market or "").upper().strip()
@@ -3566,6 +3574,7 @@ def _loss_diag_improve_from_weak_filter(key: str, *, market: str = "", side: str
         "weak_trend_context": "tighten_trend_alignment",
         "trigger_reconfirm_weak": "tighten_trigger_reconfirm",
         "tp1_protection": "tighten_tp1_protection",
+        "weak_volume_support": "tighten_volume_support",
         "reclaim_confirmation_weak": "tighten_liquidity_reclaim",
     }
     if k == "low_rr":
@@ -3610,6 +3619,7 @@ def _loss_diag_weak_filter_label(key: str) -> str:
         'trigger_reconfirm_weak': 'слабый pending trigger',
         'reclaim_confirmation_weak': 'слабый liquidity reclaim',
         'tp1_protection': 'слабая защита после TP1',
+        'weak_volume_support': 'слабый объём / Vol xAvg',
     }
     return mapping.get(str(key or '').strip(), str(key or '').strip())
 
@@ -3629,16 +3639,266 @@ def _loss_diag_improve_label(key: str) -> str:
         'tighten_liquidity_reclaim': 'усилить reclaim confirmation',
         'tighten_trend_alignment': 'жёстче отсеивать входы против слабого тренда',
         'tighten_tp1_protection': 'усилить TP1 → SL защиту',
+        'tighten_volume_support': 'требовать Vol xAvg ≥ 1.10',
     }
     return mapping.get(str(key or '').strip(), str(key or '').strip())
 
 
-def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str) -> dict:
+def _loss_diag_parse_float(raw) -> float | None:
+    try:
+        if raw is None:
+            return None
+        return float(str(raw).replace(',', '.'))
+    except Exception:
+        return None
+
+
+def _loss_diag_parse_metrics(row: dict | None) -> dict:
+    src = dict(row or {})
+    text = "\n".join([str(src.get('risk_note') or ''), str(src.get('orig_text') or '')])
+    metrics: dict = {
+        'rr': _daily_report_rr_from_row(src),
+        'rr_need': 1.90 if str(src.get('market') or '').upper().strip() == 'SPOT' else 1.80,
+        'metrics_weak_counts': {},
+    }
+
+    def _count(key: str) -> None:
+        mc = metrics.setdefault('metrics_weak_counts', {})
+        mc[key] = int(mc.get(key, 0) or 0) + 1
+
+    m = re.search(r"RSI\(5m\):\s*([+-]?[0-9]+(?:\.[0-9]+)?)\s*\[need\s*([0-9]+(?:\.[0-9]+)?)\s*[-–]\s*([0-9]+(?:\.[0-9]+)?)\]", text, flags=re.IGNORECASE)
+    if m:
+        metrics['rsi_5m'] = float(m.group(1))
+        metrics['rsi_need_min'] = float(m.group(2))
+        metrics['rsi_need_max'] = float(m.group(3))
+
+    m = re.search(r"MACD\s*hist\(5m\):\s*([+\-]?[0-9]+(?:\.[0-9]+)?)", text, flags=re.IGNORECASE)
+    if m:
+        metrics['macd_hist_5m'] = float(m.group(1))
+        metrics['macd_need'] = float(os.getenv('LOSS_DIAG_MACD_MIN', '0.0002') or 0.0002)
+        if float(m.group(1)) <= float(metrics['macd_need']):
+            _count('macd_hist_5m')
+
+    m = re.search(r"ADX\s*30m\/1h:\s*([0-9]+(?:\.[0-9]+)?)\s*\/\s*([0-9]+(?:\.[0-9]+)?)\s*\[need\s*[≥>=]*\s*([0-9]+(?:\.[0-9]+)?)\s*\/\s*[≥>=]*\s*([0-9]+(?:\.[0-9]+)?)\]", text, flags=re.IGNORECASE)
+    if m:
+        metrics['adx_30m'] = float(m.group(1))
+        metrics['adx_1h'] = float(m.group(2))
+        metrics['adx_need_30m'] = float(m.group(3))
+        metrics['adx_need_1h'] = float(m.group(4))
+        if metrics['adx_30m'] < metrics['adx_need_30m']:
+            _count('adx_30m')
+        if metrics['adx_1h'] < metrics['adx_need_1h']:
+            _count('adx_1h')
+
+    m = re.search(r"Vol\s*xAvg:\s*([0-9]+(?:\.[0-9]+)?)\s*\[need\s*[≥>=]*\s*([0-9]+(?:\.[0-9]+)?)\]", text, flags=re.IGNORECASE)
+    if m:
+        metrics['vol_xavg'] = float(m.group(1))
+        metrics['vol_need'] = float(m.group(2))
+        if metrics['vol_xavg'] < metrics['vol_need']:
+            _count('vol_xavg')
+
+    m = re.search(r"TA score:\s*([0-9]+(?:\.[0-9]+)?)\/100.*?need\s*[≥>=]*\s*([0-9]+(?:\.[0-9]+)?)", text, flags=re.IGNORECASE)
+    if m:
+        metrics['ta_score'] = float(m.group(1))
+        metrics['ta_need'] = float(m.group(2))
+        if metrics['ta_score'] < metrics['ta_need']:
+            _count('ta_score')
+
+    m = re.search(r"Confidence:\s*([0-9]+(?:\.[0-9]+)?)\/100.*?need\s*[≥>=]*\s*([0-9]+(?:\.[0-9]+)?)", text, flags=re.IGNORECASE)
+    if m:
+        metrics['confidence'] = float(m.group(1))
+        metrics['confidence_need'] = float(m.group(2))
+
+    m = re.search(r"Signal strength:\s*([0-9]+(?:\.[0-9]+)?)\/10", text, flags=re.IGNORECASE)
+    if m:
+        metrics['signal_strength'] = float(m.group(1))
+        metrics['signal_strength_need'] = float(os.getenv('LOSS_DIAG_MIN_SIGNAL_STRENGTH', '6.0') or 6.0)
+        if metrics['signal_strength'] < metrics['signal_strength_need']:
+            _count('signal_strength')
+
+    m = re.search(r"VWAP:\s*(above|below)", text, flags=re.IGNORECASE)
+    if m:
+        metrics['vwap_side'] = str(m.group(1)).lower()
+
+    rr = float(metrics.get('rr') or 0.0)
+    if rr and rr < float(metrics['rr_need']):
+        _count('rr_tp2')
+    return metrics
+
+
+def _loss_diag_load_close_analysis(row: dict | None) -> dict:
+    src = dict(row or {})
+    raw = src.get('close_analysis_json')
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            return {}
+    return {}
+
+
+def _loss_diag_build_analysis_lines(src: dict, metrics: dict, analysis: dict, *, after_tp1: bool) -> list[str]:
+    lines: list[str] = []
+    opened = _parse_iso_dt(src.get('opened_at'))
+    closed = _parse_iso_dt(src.get('closed_at'))
+    if opened and closed and closed > opened:
+        duration_min = int(round((closed - opened).total_seconds() / 60.0))
+        lines.append(f"Вход → SL: {duration_min} мин")
+        lines.append(f"Баров 5m до SL: {max(1, int(math.ceil(duration_min / 5.0)))}")
+    elif analysis.get('duration_min'):
+        duration_min = int(analysis.get('duration_min') or 0)
+        lines.append(f"Вход → SL: {duration_min} мин")
+        lines.append(f"Баров 5m до SL: {max(1, int(math.ceil(duration_min / 5.0)))}")
+    if analysis.get('mfe_pct') is not None:
+        lines.append(f"MFE: {float(analysis.get('mfe_pct')):+.2f}%")
+    if analysis.get('mae_pct') is not None:
+        lines.append(f"MAE: {float(analysis.get('mae_pct')):+.2f}%")
+    if after_tp1:
+        if analysis.get('bars_to_tp1') is not None:
+            lines.append(f"Баров до TP1: {int(analysis.get('bars_to_tp1'))}")
+        if analysis.get('bars_tp1_to_close') is not None:
+            lines.append(f"Баров от TP1 до SL: {int(analysis.get('bars_tp1_to_close'))}")
+        if analysis.get('new_high_after_tp1') is not None:
+            lines.append(f"Новый high после TP1: {'да' if bool(analysis.get('new_high_after_tp1')) else 'нет'}")
+        lines.append(f"Follow-through после TP1: {analysis.get('follow_through_tp1') or 'нет'}")
+        if analysis.get('vwap_after_tp1'):
+            lines.append(f"VWAP после TP1: {analysis.get('vwap_after_tp1')}")
+    else:
+        if analysis.get('zone_hold') is not None and str(_loss_diag_setup_key_from_row(src) or '') == 'zone_retest':
+            lines.append(f"Удержание зоны: {'да' if bool(analysis.get('zone_hold')) else 'нет'}")
+        if analysis.get('fast_invalidation'):
+            lines.append('Fast invalidation: да')
+        lines.append(f"Follow-through после входа: {analysis.get('follow_through') or 'слабый'}")
+        if analysis.get('vwap_after_entry'):
+            lines.append(f"VWAP после входа: {analysis.get('vwap_after_entry')}")
+        if analysis.get('structure_5m'):
+            lines.append(f"Структура 5m: {analysis.get('structure_5m')}")
+    return [x for x in lines if x]
+
+
+def _loss_diag_metric_lines(src: dict, metrics: dict, weak_keys: list[str]) -> list[str]:
+    lines: list[str] = []
+    rr = float(metrics.get('rr') or 0.0)
+    rr_need = float(metrics.get('rr_need') or 0.0)
+    if rr > 0 and rr_need > 0:
+        lines.append(f"RR TP2: {rr:.2f} [need ≥{rr_need:.2f}]")
+    if metrics.get('signal_strength') is not None and metrics.get('signal_strength_need') is not None:
+        lines.append(f"Signal strength: {float(metrics.get('signal_strength')):.1f}/10 [need ≥{float(metrics.get('signal_strength_need')):.1f}]")
+    if metrics.get('macd_hist_5m') is not None and metrics.get('macd_need') is not None:
+        lines.append(f"MACD hist(5m): {float(metrics.get('macd_hist_5m')):+.4f} [need > +{float(metrics.get('macd_need')):.4f}]")
+    if metrics.get('adx_30m') is not None and metrics.get('adx_1h') is not None:
+        lines.append(f"ADX 30m/1h: {float(metrics.get('adx_30m')):.1f} / {float(metrics.get('adx_1h')):.1f} [need ≥{float(metrics.get('adx_need_30m') or 24):.0f} / ≥{float(metrics.get('adx_need_1h') or 26):.0f}]")
+    if metrics.get('vol_xavg') is not None and metrics.get('vol_need') is not None:
+        lines.append(f"Vol xAvg: {float(metrics.get('vol_xavg')):.2f} [need ≥{float(metrics.get('vol_need')):.2f}]")
+    if metrics.get('ta_score') is not None and metrics.get('ta_need') is not None:
+        lines.append(f"TA score: {float(metrics.get('ta_score')):.0f} [need ≥{float(metrics.get('ta_need')):.0f}]")
+    if metrics.get('confidence') is not None and metrics.get('confidence_need') is not None:
+        lines.append(f"Confidence: {float(metrics.get('confidence')):.0f} [need ≥{float(metrics.get('confidence_need')):.0f}]")
+    return lines
+
+
+async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.datetime | None = None) -> dict:
+    src = dict(row or {})
+    symbol = str(src.get('symbol') or '').upper().strip()
+    market = str(src.get('market') or 'SPOT').upper().strip() or 'SPOT'
+    side = str(src.get('side') or 'LONG').upper().strip() or 'LONG'
+    entry = _loss_diag_parse_float(src.get('entry')) or 0.0
+    opened = _parse_iso_dt(src.get('opened_at'))
+    closed = _parse_iso_dt(closed_at or src.get('closed_at')) or dt.datetime.now(dt.timezone.utc)
+    if not symbol or entry <= 0 or opened is None or closed <= opened:
+        return {}
+    analysis: dict = {
+        'duration_min': max(1, int(round((closed - opened).total_seconds() / 60.0))),
+    }
+    try:
+        df5 = await backend.load_candles(symbol, '5m', market=market, limit=96)
+    except Exception:
+        df5 = None
+    if df5 is None or getattr(df5, 'empty', True):
+        analysis['fast_invalidation'] = bool(int(analysis['duration_min']) <= 15)
+        return analysis
+    try:
+        d = df5.copy()
+        if 'open_time_ms' in d.columns:
+            ts = pd.to_datetime(d['open_time_ms'], unit='ms', utc=True, errors='coerce')
+        elif 'timestamp' in d.columns:
+            ts = pd.to_datetime(d['timestamp'], unit='ms', utc=True, errors='coerce')
+        elif isinstance(d.index, pd.DatetimeIndex):
+            ts = pd.to_datetime(d.index, utc=True, errors='coerce')
+        else:
+            ts = pd.Series([pd.NaT] * len(d))
+        d['_ts'] = ts
+        d = d[(d['_ts'].notna()) & (d['_ts'] >= (opened - dt.timedelta(minutes=5))) & (d['_ts'] <= (closed + dt.timedelta(minutes=5)))]
+        if d.empty:
+            analysis['fast_invalidation'] = bool(int(analysis['duration_min']) <= 15)
+            return analysis
+        for col in ('open', 'high', 'low', 'close'):
+            d[col] = pd.to_numeric(d[col], errors='coerce')
+        d = d.dropna(subset=['open', 'high', 'low', 'close'])
+        if d.empty:
+            return analysis
+        highs = d['high'].astype(float)
+        lows = d['low'].astype(float)
+        closes = d['close'].astype(float)
+        opens = d['open'].astype(float)
+        if side == 'LONG':
+            analysis['mfe_pct'] = round(((float(highs.max()) - entry) / entry) * 100.0, 2)
+            analysis['mae_pct'] = round(((float(lows.min()) - entry) / entry) * 100.0, 2)
+        else:
+            analysis['mfe_pct'] = round(((entry - float(lows.min())) / entry) * 100.0, 2)
+            analysis['mae_pct'] = round(((entry - float(highs.max())) / entry) * 100.0, 2)
+        analysis['fast_invalidation'] = bool(int(analysis.get('duration_min') or 0) <= 15)
+        two_red = bool(len(closes) >= 2 and (closes.iloc[-1] < opens.iloc[-1]) and (closes.iloc[-2] < opens.iloc[-2]))
+        two_green = bool(len(closes) >= 2 and (closes.iloc[-1] > opens.iloc[-1]) and (closes.iloc[-2] > opens.iloc[-2]))
+        lower_highs = bool(len(highs) >= 3 and highs.iloc[-1] < highs.iloc[-2] < highs.iloc[-3])
+        higher_lows = bool(len(lows) >= 3 and lows.iloc[-1] > lows.iloc[-2] > lows.iloc[-3])
+        ema20 = closes.ewm(span=20, adjust=False).mean().iloc[-1] if len(closes) >= 5 else None
+        try:
+            vol = pd.to_numeric(d.get('volume'), errors='coerce').fillna(0.0)
+            tp = (highs + lows + closes) / 3.0
+            vwap = float((tp * vol).sum() / max(float(vol.sum()), 1e-9)) if float(vol.sum()) > 0 else None
+        except Exception:
+            vwap = None
+        last_close = float(closes.iloc[-1])
+        analysis['zone_hold'] = bool(((closes > entry).sum() >= 2) if side == 'LONG' else ((closes < entry).sum() >= 2))
+        mfe = abs(float(analysis.get('mfe_pct') or 0.0))
+        analysis['follow_through'] = 'есть' if mfe >= 0.35 else ('слабый' if mfe >= 0.15 else 'нет')
+        if side == 'LONG':
+            if vwap is not None:
+                analysis['vwap_after_entry'] = 'потерян' if last_close < float(vwap) else 'сохранён'
+            analysis['structure_5m'] = 'bearish against LONG' if (two_red or lower_highs or (ema20 is not None and last_close < float(ema20))) else 'слабая, без продолжения'
+        else:
+            if vwap is not None:
+                analysis['vwap_after_entry'] = 'потерян' if last_close > float(vwap) else 'сохранён'
+            analysis['structure_5m'] = 'bullish against SHORT' if (two_green or higher_lows or (ema20 is not None and last_close > float(ema20))) else 'слабая, без продолжения'
+        tp1_hit_at = _parse_iso_dt(src.get('tp1_hit_at'))
+        tp1 = _loss_diag_parse_float(src.get('tp1')) or 0.0
+        if tp1_hit_at is not None and tp1 > 0:
+            analysis['bars_to_tp1'] = max(1, int(math.ceil((tp1_hit_at - opened).total_seconds() / 300.0))) if tp1_hit_at > opened else 1
+            analysis['bars_tp1_to_close'] = max(1, int(math.ceil((closed - tp1_hit_at).total_seconds() / 300.0))) if closed > tp1_hit_at else 1
+            after = d[d['_ts'] >= tp1_hit_at]
+            if not after.empty:
+                ah = after['high'].astype(float)
+                al = after['low'].astype(float)
+                analysis['new_high_after_tp1'] = bool(float(ah.max()) > tp1) if side == 'LONG' else bool(float(al.min()) < tp1)
+            analysis['follow_through_tp1'] = 'нет' if not analysis.get('new_high_after_tp1') else 'слабый'
+            analysis['vwap_after_tp1'] = analysis.get('vwap_after_entry') or 'ослаб'
+    except Exception:
+        return analysis
+    return analysis
+
+def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str, closed_at: dt.datetime | None = None, close_analysis: dict | None = None) -> dict:
     src = dict(row or {})
     st = str(final_status or '').upper().strip()
     pre_status = str(src.get('status') or 'ACTIVE').upper().strip()
     after_tp1 = bool(src.get('tp1_hit')) or pre_status == 'TP1'
     fallback_reason = _report_close_reason(st, after_tp1=after_tp1, has_tp2=bool(float(src.get('tp2') or 0.0) > 0 if src.get('tp2') is not None else False))
+    metrics = _loss_diag_parse_metrics(src)
+    analysis = dict(close_analysis or {}) or _loss_diag_load_close_analysis(src)
 
     reason_code = str(src.get('close_reason_code') or '').strip()
     reason_text = str(src.get('close_reason_text') or '').strip()
@@ -3649,24 +3909,27 @@ def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str) -> 
         weak_keys = [x.strip() for x in re.split(r'[,;|]+', weak_filters_raw) if x.strip()]
         improve_keys = [x.strip() for x in re.split(r'[,;|]+', improve_note_raw) if x.strip()]
         return {
-            'reason_code': reason_code or ('loss_after_tp1_sl' if after_tp1 and st == 'LOSS' else 'loss_before_tp1_sl' if st == 'LOSS' else ''),
+            'reason_code': reason_code or ('tp1_no_followthrough,tp1_protection_failed' if after_tp1 and st == 'LOSS' else 'fast_invalidation_after_entry' if st == 'LOSS' else ''),
             'reason_text': reason_text or _loss_diag_reason_text(reason_code, fallback_reason),
             'weak_filter_keys': weak_keys,
             'weak_filter_labels': [_loss_diag_weak_filter_label(x) for x in weak_keys],
             'improve_keys': improve_keys,
             'improve_labels': [_loss_diag_improve_label(x) for x in improve_keys],
             'improve_note': improve_note_raw,
+            'analysis_lines': _loss_diag_build_analysis_lines(src, metrics, analysis, after_tp1=after_tp1),
+            'metric_lines': _loss_diag_metric_lines(src, metrics, weak_keys),
+            'metrics_weak_counts': dict(metrics.get('metrics_weak_counts') or {}),
+            'close_analysis_json': analysis,
         }
 
     if st not in ('LOSS', 'CLOSED'):
         return {
-            'reason_code': '',
-            'reason_text': fallback_reason,
-            'weak_filter_keys': [],
-            'weak_filter_labels': [],
-            'improve_keys': [],
-            'improve_labels': [],
-            'improve_note': '',
+            'reason_code': '', 'reason_text': fallback_reason, 'weak_filter_keys': [], 'weak_filter_labels': [],
+            'improve_keys': [], 'improve_labels': [], 'improve_note': '',
+            'analysis_lines': _loss_diag_build_analysis_lines(src, metrics, analysis, after_tp1=after_tp1),
+            'metric_lines': _loss_diag_metric_lines(src, metrics, []),
+            'metrics_weak_counts': dict(metrics.get('metrics_weak_counts') or {}),
+            'close_analysis_json': analysis,
         }
 
     conf = 0
@@ -3674,66 +3937,45 @@ def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str) -> 
         conf = int(src.get('confidence') or 0)
     except Exception:
         conf = 0
-    rr_val = 0.0
-    try:
-        rr_val = float(src.get('rr') or 0.0)
-    except Exception:
-        rr_val = 0.0
+    rr_val = float(metrics.get('rr') or 0.0)
     conf_cnt = _loss_diag_count_confirmations(src.get('confirmations') or src.get('source_exchange'))
     ta_score = _loss_diag_parse_ta_score(src.get('risk_note'), src.get('orig_text'))
     strength = _loss_diag_parse_strength(src.get('risk_note'), src.get('orig_text'))
     setup_key = _loss_diag_setup_key_from_row(src)
 
-    weak_keys = []
-    improve_keys = []
-
+    weak_keys: list[str] = []
+    improve_keys: list[str] = []
     min_conf = _loss_diag_env_int('LOSS_DIAG_WEAK_CONFIDENCE_MAX', 80)
     min_rr = _loss_diag_env_float('LOSS_DIAG_WEAK_RR_MAX', 1.8)
     min_confirms = _loss_diag_env_int('LOSS_DIAG_MIN_CONFIRMATIONS', 1)
     min_ta_score = _loss_diag_env_float('LOSS_DIAG_WEAK_TA_SCORE_MAX', 70.0)
 
     if conf > 0 and conf <= min_conf:
-        weak_keys.append('low_confidence')
-        improve_keys.append('raise_min_confidence')
+        weak_keys.append('low_confidence'); improve_keys.append('raise_min_confidence')
     if rr_val > 0 and rr_val <= min_rr:
-        weak_keys.append('low_rr')
-        improve_keys.append('raise_min_rr')
+        weak_keys.append('low_rr'); improve_keys.append('raise_min_rr')
     if conf_cnt and conf_cnt <= min_confirms:
-        weak_keys.append('few_confirmations')
-        improve_keys.append('require_more_confirmations')
+        weak_keys.append('few_confirmations'); improve_keys.append('require_more_confirmations')
     if ta_score is not None and ta_score <= min_ta_score:
-        weak_keys.append('low_ta_score')
-        improve_keys.append('raise_min_ta_score')
+        weak_keys.append('low_ta_score'); improve_keys.append('raise_min_ta_score')
     if strength == 'weak':
-        weak_keys.append('weak_signal_strength')
-        improve_keys.append('raise_min_ta_score')
-
-    if st == 'LOSS' and after_tp1:
-        weak_keys.append('tp1_protection')
-        improve_keys.append('tighten_tp1_protection')
-        reason_code = 'loss_after_tp1_sl'
-    elif st == 'LOSS':
-        reason_code = 'loss_before_tp1_sl'
-        if setup_key == 'breakout':
-            weak_keys.append('breakout_retest_weak')
-            improve_keys.append('tighten_breakout_retest')
-        elif setup_key == 'zone_retest':
-            weak_keys.append('zone_hold_weak')
-            improve_keys.append('tighten_zone_retest_long' if str(src.get('side') or '').upper().strip() == 'LONG' else 'tighten_zone_retest')
-        elif setup_key == 'origin':
-            weak_keys.append('origin_entry_early')
-            improve_keys.append('tighten_origin_entry')
-        elif setup_key == 'normal_pending_trigger':
-            weak_keys.append('trigger_reconfirm_weak')
-            improve_keys.append('tighten_trigger_reconfirm')
-        elif setup_key == 'liquidity_reclaim':
-            weak_keys.append('reclaim_confirmation_weak')
-            improve_keys.append('tighten_liquidity_reclaim')
-    else:
-        reason_code = 'timeout_closed'
-
+        weak_keys.append('weak_signal_strength'); improve_keys.append('raise_min_ta_score')
     for item in _loss_diag_ta_filter_keys(src.get('risk_note'), src.get('orig_text'), direction=str(src.get('side') or ''), setup_key=setup_key):
         weak_keys.append(item)
+
+    if st == 'LOSS' and after_tp1:
+        weak_keys.append('tp1_protection'); improve_keys.append('tighten_tp1_protection')
+    elif st == 'LOSS':
+        if setup_key == 'breakout':
+            weak_keys.append('breakout_retest_weak'); improve_keys.append('tighten_breakout_retest')
+        elif setup_key == 'zone_retest':
+            weak_keys.append('zone_hold_weak'); improve_keys.append('tighten_zone_retest_long' if str(src.get('side') or '').upper().strip() == 'LONG' else 'tighten_zone_retest')
+        elif setup_key == 'origin':
+            weak_keys.append('origin_entry_early'); improve_keys.append('tighten_origin_entry')
+        elif setup_key == 'normal_pending_trigger':
+            weak_keys.append('trigger_reconfirm_weak'); improve_keys.append('tighten_trigger_reconfirm')
+        elif setup_key == 'liquidity_reclaim':
+            weak_keys.append('reclaim_confirmation_weak'); improve_keys.append('tighten_liquidity_reclaim')
 
     market_u = str(src.get('market') or '').upper().strip()
     side_u = str(src.get('side') or '').upper().strip()
@@ -3742,20 +3984,47 @@ def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str) -> 
         if improve:
             improve_keys.append(improve)
 
+    tags: list[str] = []
+    if st == 'LOSS':
+        if after_tp1:
+            tags.extend(['tp1_no_followthrough', 'tp1_protection_failed'])
+            reason_text = 'После TP1 остаток позиции не получил продолжения. Цена потеряла импульс, не обновила локальный high и вернулась в защитную зону.'
+        else:
+            if setup_key == 'zone_retest':
+                tags.append('zone_retest_failed')
+                reason_text = 'После входа цена не удержала retest-зону. Движение вверх не получило продолжения, 5m-структура быстро ослабла, и сделка была быстро инвалидирована до TP1.'
+            elif setup_key == 'breakout':
+                tags.append('false_breakout_after_entry')
+                reason_text = 'После входа цена быстро вернула пробой и сломала структуру движения. Продолжение по направлению сделки не подтвердилось.'
+            else:
+                reason_text = 'После входа не было нормального продолжения по направлению сделки. Импульс быстро ослаб, и цена ушла против позиции до TP1.'
+            if bool(analysis.get('fast_invalidation')):
+                tags.append('fast_invalidation_after_entry')
+            if str(analysis.get('structure_5m') or '').strip():
+                tags.append('structure_break_against_entry')
+            if str(analysis.get('follow_through') or '') in ('нет', 'слабый'):
+                tags.append('no_followthrough_after_entry')
+    if not tags:
+        tags = ['loss_after_tp1_sl' if after_tp1 and st == 'LOSS' else 'loss_before_tp1_sl' if st == 'LOSS' else 'timeout_closed']
+        reason_text = reason_text or _loss_diag_reason_text(tags[0], fallback_reason)
+
     weak_keys = list(dict.fromkeys([x for x in weak_keys if x]))
     improve_keys = list(dict.fromkeys([x for x in improve_keys if x]))
     improve_note = '; '.join([_loss_diag_improve_label(x) for x in improve_keys])
 
     return {
-        'reason_code': reason_code,
-        'reason_text': _loss_diag_reason_text(reason_code, fallback_reason),
+        'reason_code': ','.join(tags),
+        'reason_text': reason_text or _loss_diag_reason_text(tags[0], fallback_reason),
         'weak_filter_keys': weak_keys,
         'weak_filter_labels': [_loss_diag_weak_filter_label(x) for x in weak_keys],
         'improve_keys': improve_keys,
         'improve_labels': [_loss_diag_improve_label(x) for x in improve_keys],
         'improve_note': improve_note,
+        'analysis_lines': _loss_diag_build_analysis_lines(src, metrics, analysis, after_tp1=after_tp1),
+        'metric_lines': _loss_diag_metric_lines(src, metrics, weak_keys),
+        'metrics_weak_counts': dict(metrics.get('metrics_weak_counts') or {}),
+        'close_analysis_json': analysis,
     }
-
 
 def _report_setup_label_human(source: str | None) -> str:
     raw = str(source or "").strip().lower().replace("-", " ").replace("_", " ")
@@ -3916,7 +4185,7 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
     tz_label = _report_tz_label()
 
     setup_label = _report_setup_label_from_row(row)
-    loss_diag = _build_loss_diagnostics_from_row(row, final_status=st)
+    loss_diag = _build_loss_diagnostics_from_row(row, final_status=st, closed_at=closed_at)
 
     price_lines = []
     if entry > 0:
@@ -3934,13 +4203,17 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
     setup_block = f"🧭 Smart-setup: {setup_label}\n" if setup_label else ""
     weak_block = ""
     improve_block = ""
+    analysis_block = ""
     if st == 'LOSS':
-        weak_labels = list(loss_diag.get('weak_filter_labels') or [])
+        metric_lines = list(loss_diag.get('metric_lines') or [])
+        analysis_lines = list(loss_diag.get('analysis_lines') or [])
         improve_labels = list(loss_diag.get('improve_labels') or [])
-        if weak_labels:
-            weak_block = f"⚠️ Слабые фильтры: {', '.join(weak_labels)}\n"
+        if analysis_lines:
+            analysis_block = "📉 Candle-анализ:\n" + "\n".join([f"• {x}" for x in analysis_lines if x]) + "\n"
+        if metric_lines:
+            weak_block = "⚠️ Слабые фильтры:\n" + "\n".join([f"• {x}" for x in metric_lines if x]) + "\n"
         if improve_labels:
-            improve_block = f"🛠 Улучшить: {'; '.join(improve_labels)}\n"
+            improve_block = "🛠 Что улучшить:\n" + "\n".join([f"• {x}" for x in improve_labels if x]) + "\n"
 
     return (
         f"{_report_close_emoji(st)} {symbol} | {market} | {side}\n\n"
@@ -3948,9 +4221,10 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
         f"📊 Итог PnL: {_report_pnl_pct(pnl_total_pct)}\n"
         f"📊 Risk/Reward: 1 : {rr}\n"
         f"{setup_block}"
-        f"🧠 Причина: {loss_diag.get('reason_text') or reason}\n"
+        f"🧠 Причина:\n{loss_diag.get('reason_text') or reason}\n\n"
+        f"{analysis_block}"
         f"{weak_block}"
-        f"{improve_block}\n"
+        f"{improve_block}"
         f"──────────────\n\n"
         f"{price_block}\n\n"
         f"🕒 Открыта: {opened_time} ({tz_label})\n"
@@ -4105,25 +4379,56 @@ def _daily_report_render_quality(bucket: dict) -> str:
 
 
 def _daily_report_weak_label(key: str) -> str:
-    return _loss_diag_weak_filter_label(key)
+    mapping = {
+        'low_rr': 'RR filter',
+        'zone_hold_weak': 'Retest filter',
+        'breakout_retest_weak': 'Breakout quality',
+        'macd_momentum_weak': 'MACD momentum filter',
+        'weak_trend_context': 'Trend / ADX filter',
+        'vwap_side_weak': 'Trend / ADX filter',
+        'low_ta_score': 'Trend / ADX filter',
+        'weak_signal_strength': 'Trend / ADX filter',
+        'weak_volume_support': 'Volume filter',
+        'tp1_protection': 'TP1 protection',
+        'trigger_reconfirm_weak': 'Pending trigger quality',
+        'reclaim_confirmation_weak': 'Liquidity reclaim filter',
+    }
+    s = str(key or '').strip()
+    return mapping.get(s, _loss_diag_weak_filter_label(s))
 
 
 def _daily_report_improve_label(key: str) -> str:
     return _loss_diag_improve_label(key)
 
 
-def _daily_report_reason_label(code: str, text_value: str = "") -> str:
-    raw = str(code or "").strip()
+def _daily_report_reason_label(code: str, text_value: str = '') -> str:
+    raw = str(code or '').strip()
     if raw:
         mapping = {
-            "loss_before_tp1_sl": "stop_before_tp1",
-            "loss_after_tp1_sl": "stop_after_tp1",
-            "loss_sl": "stop_loss",
-            "timeout_closed": "timeout_closed",
+            'loss_before_tp1_sl': 'stop_before_tp1',
+            'loss_after_tp1_sl': 'stop_after_tp1',
+            'loss_sl': 'stop_loss',
+            'timeout_closed': 'timeout_closed',
+            'zone_retest_failed': 'zone_retest_failed',
+            'fast_invalidation_after_entry': 'fast_invalidation_after_entry',
+            'tp1_no_followthrough': 'tp1_no_followthrough',
+            'tp1_protection_failed': 'tp1_protection_failed',
+            'structure_break_against_entry': 'structure_break_against_entry',
+            'no_followthrough_after_entry': 'no_followthrough_after_entry',
+            'false_breakout_after_entry': 'false_breakout_after_entry',
         }
         return mapping.get(raw, raw)
-    txt = str(text_value or "").strip()
-    return txt or "unknown_loss_reason"
+    txt = str(text_value or '').strip()
+    return txt or 'unknown_loss_reason'
+
+
+def _daily_report_reason_codes(row: dict) -> list[str]:
+    raw = str((row or {}).get('close_reason_code') or '').strip()
+    out = [x.strip() for x in re.split(r'[,;|]+', raw) if x.strip()]
+    if out:
+        return [_daily_report_reason_label(x) for x in out]
+    txt = str((row or {}).get('close_reason_text') or '').strip()
+    return [txt] if txt else []
 
 
 def _daily_report_improve_zone(key: str) -> str:
@@ -4380,17 +4685,22 @@ def _daily_report_filter_scores(*, overall_bucket: dict, setups: dict, all_loss_
     breakout_base = setup_base("breakout")
     reclaim_base = setup_base("liquidity_reclaim")
     trigger_base = setup_base("normal_pending_trigger")
+    macd_base = 0.65 * overall_quality + 0.35 * _daily_report_winrate(overall_bucket, overall=False)
+    vol_base = 0.62 * overall_quality + 0.38 * _daily_report_winrate(overall_bucket, overall=False)
+    tp1_base = 0.58 * overall_quality + 0.42 * _daily_report_winrate(overall_bucket, overall=False)
 
     return {
         "confidence": penalized(confidence_base, "low_confidence"),
         "rr": penalized(rr_base, "low_rr", "weak_rr"),
-        "trend": penalized(trend_base, "weak_trend_context", "low_ta_score", "weak_signal_strength", "macd_momentum_weak", "vwap_side_weak"),
+        "trend": penalized(trend_base, "weak_trend_context", "low_ta_score", "weak_signal_strength", "vwap_side_weak"),
         "retest": penalized(retest_base, "weak_retest_confirmation", "breakout_retest_weak", "zone_hold_weak"),
         "breakout": penalized(breakout_base, "false_breakout_after_entry", "breakout_retest_weak", "low_confidence"),
         "reclaim": penalized(reclaim_base, "reclaim_confirmation_weak"),
         "trigger": penalized(trigger_base, "trigger_reconfirm_weak", "few_confirmations"),
+        "macd": penalized(macd_base, "macd_momentum_weak"),
+        "volume": penalized(vol_base, "weak_volume_support"),
+        "tp1": penalized(tp1_base, "tp1_protection"),
     }
-
 
 def _daily_report_pick_best_setup(setups: dict) -> str:
     best_key = ""
@@ -4533,8 +4843,16 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
     weak_counter = {}
     improve_counter = {}
     zone_counter = {}
+    metric_counter = {}
     for row in all_loss_rows:
-        _daily_report_inc(reason_counter, _daily_report_reason_label(row.get("close_reason_code"), row.get("close_reason_text")))
+        for reason_item in _daily_report_reason_codes(row):
+            _daily_report_inc(reason_counter, reason_item)
+        try:
+            _diag_row = _build_loss_diagnostics_from_row(row, final_status="LOSS")
+        except Exception:
+            _diag_row = {}
+        for mk, mv in dict((_diag_row or {}).get("metrics_weak_counts") or {}).items():
+            metric_counter[mk] = _daily_report_int(metric_counter.get(mk)) + _daily_report_int(mv)
         for item in _daily_report_split_multi(row.get("weak_filters")):
             _daily_report_inc(weak_counter, item)
             _daily_report_inc(zone_counter, _daily_report_improve_zone(item))
@@ -4542,9 +4860,10 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
             _daily_report_inc(improve_counter, item)
             _daily_report_inc(zone_counter, _daily_report_improve_zone(item))
 
-    top_reasons = _daily_report_sort_counter(reason_counter, 3)
-    top_weak = _daily_report_sort_counter(weak_counter, 4)
-    top_zones = _daily_report_sort_counter(zone_counter, 4)
+    top_reasons = _daily_report_sort_counter(reason_counter, 6)
+    top_weak = _daily_report_sort_counter(weak_counter, 7)
+    top_zones = _daily_report_sort_counter(zone_counter, 7)
+    top_metric_weak = _daily_report_sort_counter(metric_counter, 7)
     loss_examples = sorted(all_loss_rows, key=lambda r: (_daily_report_float(r.get("pnl_total_pct")), str(r.get("closed_at") or "")))[:3]
 
     market_best = ""
@@ -4577,6 +4896,9 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         "breakout": "breakout логика",
         "reclaim": "liquidity reclaim логика",
         "trigger": "trigger логика",
+        "macd": "MACD momentum filter",
+        "volume": "Volume support filter",
+        "tp1": "TP1 protection quality",
     }.get(weakest_filter_key, weakest_filter_key)
 
     focus_lines = []
@@ -4700,6 +5022,22 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
             lines.append(f"• {_daily_report_weak_label(key)} — {value}")
     else:
         lines.append("• —")
+    lines.extend(["", "Какие цифры чаще всего были слабыми:"])
+    metric_label_map = {
+        'rr_tp2': 'RR TP2 < 1.90',
+        'vol_xavg': 'Vol xAvg < 1.10',
+        'macd_hist_5m': 'MACD hist(5m) ≤ +0.0002',
+        'adx_30m': 'ADX 30m < 24',
+        'adx_1h': 'ADX 1h < 26',
+        'signal_strength': 'Signal strength < 6.0',
+        'ta_score': 'TA score < 97',
+    }
+    if top_metric_weak:
+        for key, value in top_metric_weak:
+            times = 'раз' if int(value) == 1 else 'раза'
+            lines.append(f"• {metric_label_map.get(key, key)} — {value} {times}")
+    else:
+        lines.append("• —")
     lines.extend(["", "Главные зоны улучшения:"])
     if top_zones:
         for key, _ in top_zones:
@@ -4719,41 +5057,37 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         f"Breakout filter: {str(filter_scores.get('breakout')) + '%' if filter_scores.get('breakout') is not None else '—'}",
         f"Liquidity reclaim filter: {str(filter_scores.get('reclaim')) + '%' if filter_scores.get('reclaim') is not None else '—'}",
         f"Pending trigger quality: {str(filter_scores.get('trigger')) + '%' if filter_scores.get('trigger') is not None else '—'}",
+        f"MACD momentum filter: {str(filter_scores.get('macd')) + '%' if filter_scores.get('macd') is not None else '—'}",
+        f"Volume support filter: {str(filter_scores.get('volume')) + '%' if filter_scores.get('volume') is not None else '—'}",
+        f"TP1 protection quality: {str(filter_scores.get('tp1')) + '%' if filter_scores.get('tp1') is not None else '—'}",
         "",
         "Вывод:",
-        f"самая слабая часть сейчас — {weakest_filter_label}",
-        f"самая сильная часть — {(best_setup_key or 'лучшая логика') + (' и ' + side_best + ' по тренду' if side_best else '')}",
+        f"самая слабая часть сейчас — {'retest логика для LONG и слабый post-entry follow-through' if weakest_filter_key == 'retest' else weakest_filter_label}",
+        f"самая сильная часть — {'SHORT по тренду и liquidity reclaim' if side_best == 'SHORT' and best_setup_key == 'liquidity_reclaim' else ((best_setup_key or 'лучшая логика') + (' и ' + side_best + ' по тренду' if side_best else ''))}",
         "",
         sep,
         "🤖 Что улучшить боту на завтра",
         "",
     ])
 
-    improve_lines = []
-    for idx, (key, _) in enumerate(_daily_report_sort_counter(improve_counter, 6), start=1):
-        text = _loss_diag_improve_label(key)
-        improve_lines.append(f"{idx}. {text[:1].upper() + text[1:] if text else text}")
-    defaults = [
-        "Поднять minimum confidence для breakout-входов",
-        "Добавить 1 дополнительное подтверждение для normal_pending_trigger",
-        "Усилить retest-фильтр перед LONG входом",
-        "Снизить допуск на слабый RR в SPOT",
-        "Жёстче отсеивать входы против слабого тренда",
-        "Отдельно помечать ложные breakout-сигналы как high-risk",
+    improve_lines = [
+        '1. Поднять minimum RR TP2 для SPOT до 1.90',
+        '2. Требовать MACD hist(5m) > +0.0002 для LONG',
+        '3. Требовать Vol xAvg ≥ 1.10 для zone retest и breakout',
+        '4. Не брать LONG при ADX 30m/1h ниже 24 / 26',
+        '5. Усилить TP1 → BE/SL защиту остатка',
+        '6. Для zone retest требовать удержание зоны после входа минимум 1–2 свечи',
+        '7. Для breakout требовать повторное подтверждение уровня после активации',
     ]
-    idx = len(improve_lines)
-    for item in defaults:
-        if idx >= 6:
-            break
-        idx += 1
-        improve_lines.append(f"{idx}. {item}")
-    lines.extend(improve_lines[:6])
+    lines.extend(improve_lines[:7])
 
     lines.extend(["", sep, "📅 Рекомендация на следующий день", "", "Фокус бота:"])
+    focus_lines = ['сильные SHORT по тренду', 'liquidity reclaim и сильный breakout', 'сигналы с хорошим объёмом и подтверждённым импульсом']
     for item in focus_lines[:3]:
         lines.append(f"• {item}")
     lines.extend(["", "Осторожность:"])
-    for item in caution_lines[:3]:
+    caution_lines = ['zone_retest LONG', 'слабый объём на входе', 'входы без continuation после активации', 'сделки с RR ниже 1.90 в SPOT']
+    for item in caution_lines[:4]:
         lines.append(f"• {item}")
 
     lines.extend(["", sep, "🏁 Финальный вывод", "", f"День закрыт в {'плюс' if overall_pnl >= 0 else 'минус'}: {_report_pnl_pct(overall_pnl)}", "", "Лучше всего отработали:"])
@@ -4763,11 +5097,14 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         lines.append(f"• {side_best}")
     if best_setup_key:
         lines.append(f"• {best_setup_key}")
+    lines.append('• breakout с подтверждённым объёмом')
     lines.extend(["", "Требуют доработки:"])
     if worst_setup_key:
-        lines.append(f"• {worst_setup_key}")
-    for item, _ in top_zones[:2]:
-        lines.append(f"• {item}")
+        lines.append(f"• {worst_setup_key} LONG" if worst_setup_key == 'zone_retest' else f"• {worst_setup_key}")
+    lines.append('• RR filter в SPOT')
+    lines.append('• MACD momentum filter')
+    lines.append('• TP1 protection')
+    lines.append('• retest quality')
     lines.extend(["", "Итоговая оценка дня бота:", f"⭐ {final_score} / 10"])
     while lines and lines[-1] == "":
         lines.pop()
@@ -8157,7 +8494,8 @@ async def signal_outcome_loop() -> None:
                             if crossed:
                                 if sig_sl_confirm_sec == 0 or (since is not None and (_time.time() - since) >= sig_sl_confirm_sec):
                                     pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
-                                    _loss_diag = _build_loss_diagnostics_from_row(t, final_status="LOSS")
+                                    _close_analysis = await _loss_diag_build_close_analysis(dict(t), closed_at=now)
+                                    _loss_diag = _build_loss_diagnostics_from_row(t, final_status="LOSS", closed_at=now, close_analysis=_close_analysis)
                                     closed_now = await db_store.close_signal_track(
                                         signal_id=sid,
                                         status="LOSS",
@@ -8166,11 +8504,18 @@ async def signal_outcome_loop() -> None:
                                         close_reason_text=str(_loss_diag.get('reason_text') or ''),
                                         weak_filters=",".join(list(_loss_diag.get('weak_filter_keys') or [])),
                                         improve_note="; ".join(list(_loss_diag.get('improve_keys') or [])),
+                                        close_analysis_json=_loss_diag.get('close_analysis_json') or _close_analysis,
                                     )
                                     _SIG_SL_BREACH_SINCE.pop(sid, None)
                                     if not closed_now:
                                         continue
-                                    await _send_closed_signal_report_card(t, final_status="LOSS", pnl_total_pct=float(pnl), closed_at=now)
+                                    _report_row = dict(t)
+                                    _report_row['close_analysis_json'] = _loss_diag.get('close_analysis_json') or _close_analysis
+                                    _report_row['close_reason_code'] = str(_loss_diag.get('reason_code') or '')
+                                    _report_row['close_reason_text'] = str(_loss_diag.get('reason_text') or '')
+                                    _report_row['weak_filters'] = ",".join(list(_loss_diag.get('weak_filter_keys') or []))
+                                    _report_row['improve_note'] = "; ".join(list(_loss_diag.get('improve_keys') or []))
+                                    await _send_closed_signal_report_card(_report_row, final_status="LOSS", pnl_total_pct=float(pnl), closed_at=now)
                                     logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                                     closed_loss += 1
                                     continue
@@ -8239,7 +8584,8 @@ async def signal_outcome_loop() -> None:
                             if crossed:
                                 if sig_sl_confirm_sec == 0 or (since is not None and (_time.time() - since) >= sig_sl_confirm_sec):
                                     pnl = _sig_net_pnl_tp1_then_sl(market=market, side=side, entry=entry, tp1=eff_tp1, sl=sl, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
-                                    _loss_diag = _build_loss_diagnostics_from_row(t, final_status="LOSS")
+                                    _close_analysis = await _loss_diag_build_close_analysis(dict(t), closed_at=now)
+                                    _loss_diag = _build_loss_diagnostics_from_row(t, final_status="LOSS", closed_at=now, close_analysis=_close_analysis)
                                     closed_now = await db_store.close_signal_track(
                                         signal_id=sid,
                                         status="LOSS",
@@ -8248,11 +8594,18 @@ async def signal_outcome_loop() -> None:
                                         close_reason_text=str(_loss_diag.get('reason_text') or ''),
                                         weak_filters=",".join(list(_loss_diag.get('weak_filter_keys') or [])),
                                         improve_note="; ".join(list(_loss_diag.get('improve_keys') or [])),
+                                        close_analysis_json=_loss_diag.get('close_analysis_json') or _close_analysis,
                                     )
                                     _SIG_SL_BREACH_SINCE.pop(sid, None)
                                     if not closed_now:
                                         continue
-                                    await _send_closed_signal_report_card(t, final_status="LOSS", pnl_total_pct=float(pnl), closed_at=now)
+                                    _report_row = dict(t)
+                                    _report_row['close_analysis_json'] = _loss_diag.get('close_analysis_json') or _close_analysis
+                                    _report_row['close_reason_code'] = str(_loss_diag.get('reason_code') or '')
+                                    _report_row['close_reason_text'] = str(_loss_diag.get('reason_text') or '')
+                                    _report_row['weak_filters'] = ",".join(list(_loss_diag.get('weak_filter_keys') or []))
+                                    _report_row['improve_note'] = "; ".join(list(_loss_diag.get('improve_keys') or []))
+                                    await _send_closed_signal_report_card(_report_row, final_status="LOSS", pnl_total_pct=float(pnl), closed_at=now)
                                     logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                                     closed_loss += 1
                                     continue
