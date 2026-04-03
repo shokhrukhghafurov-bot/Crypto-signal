@@ -681,7 +681,8 @@ ON CONFLICT (id) DO NOTHING;
           close_reason_code TEXT,
           close_reason_text TEXT,
           weak_filters TEXT,
-          improve_note TEXT
+          improve_note TEXT,
+          close_analysis_json JSONB
         );
         """)
 
@@ -708,6 +709,7 @@ ON CONFLICT (id) DO NOTHING;
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS close_reason_text TEXT;")
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS weak_filters TEXT;")
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS improve_note TEXT;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS close_analysis_json JSONB;")
         except Exception:
             pass
 
@@ -2079,6 +2081,7 @@ async def close_signal_track(
     close_reason_text: str | None = None,
     weak_filters: str | None = None,
     improve_note: str | None = None,
+    close_analysis_json: dict | str | None = None,
 ) -> bool:
     """Close an ACTIVE/TP1 signal track exactly once and store pnl.
 
@@ -2123,7 +2126,8 @@ async def close_signal_track(
                 close_reason_code=COALESCE($4, close_reason_code),
                 close_reason_text=COALESCE($5, close_reason_text),
                 weak_filters=COALESCE($6, weak_filters),
-                improve_note=COALESCE($7, improve_note)
+                improve_note=COALESCE($7, improve_note),
+                close_analysis_json=COALESCE($8::jsonb, close_analysis_json)
             WHERE signal_id=$1
               AND status IN ('ACTIVE','TP1')
             RETURNING signal_id;
@@ -2135,6 +2139,7 @@ async def close_signal_track(
             (str(close_reason_text or "") or None),
             (str(weak_filters or "") or None),
             (str(improve_note or "") or None),
+            (json.dumps(close_analysis_json, ensure_ascii=False) if isinstance(close_analysis_json, dict) else (str(close_analysis_json or "") or None)),
         )
     return bool(row)
 
@@ -2470,7 +2475,7 @@ async def signal_report_window_dataset(*, since: dt.datetime, until: dt.datetime
                 SELECT signal_id, market, symbol, side, entry, tp1, tp2, sl,
                        opened_at, orig_text, setup_source, setup_source_label, ui_setup_label, emit_route,
                        timeframe, confidence, rr, confirmations, source_exchange, risk_note,
-                       close_reason_code, close_reason_text, weak_filters, improve_note
+                       close_reason_code, close_reason_text, weak_filters, improve_note, close_analysis_json
                 FROM signal_tracks
                 WHERE opened_at IS NOT NULL
                   AND opened_at >= $1 AND opened_at < $2
@@ -2493,7 +2498,7 @@ async def signal_report_window_dataset(*, since: dt.datetime, until: dt.datetime
                        status, tp1_hit, pnl_total_pct, opened_at, closed_at,
                        orig_text, setup_source, setup_source_label, ui_setup_label, emit_route,
                        timeframe, confidence, rr, confirmations, source_exchange, risk_note,
-                       close_reason_code, close_reason_text, weak_filters, improve_note
+                       close_reason_code, close_reason_text, weak_filters, improve_note, close_analysis_json
                 FROM signal_tracks
                 WHERE closed_at IS NOT NULL
                   AND closed_at >= $1 AND closed_at < $2
@@ -2573,7 +2578,7 @@ async def signal_loss_diagnostics_window(*, since: dt.datetime, until: dt.dateti
                 """
                 SELECT signal_id, symbol, market, side, pnl_total_pct, closed_at,
                        status, tp1_hit, setup_source, setup_source_label, ui_setup_label, emit_route,
-                       close_reason_code, close_reason_text, weak_filters, improve_note
+                       close_reason_code, close_reason_text, weak_filters, improve_note, close_analysis_json
                 FROM signal_tracks
                 WHERE closed_at IS NOT NULL
                   AND closed_at >= $1 AND closed_at < $2
