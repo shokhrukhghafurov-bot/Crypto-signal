@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-04-01_long_directional_fix_v4_3a"
+MID_BUILD_TAG = "MID_BUILD_2026-04-05_macd_threshold_zone_hold_v1"
 
 import asyncio
 import json
@@ -1840,6 +1840,72 @@ def _mid_pending_is_fresh_bo_rt(it: dict | None, *, now_ts: float | None = None)
         return False
 
 
+def _mid_retest_hold_bars() -> int:
+    """How many 5m bars price must stay inside the zone before emit.
+
+    0 disables the hold requirement.
+    """
+    try:
+        return max(0, int(float(os.getenv("MID_RETEST_HOLD_BARS", "0") or 0)))
+    except Exception:
+        return 0
+
+
+def _mid_retest_hold_seconds() -> float:
+    """Return hold requirement in seconds.
+
+    MID_RETEST_HOLD_SEC wins when set explicitly. Otherwise we translate bars into
+    5m candle time so 1 bar = 300 seconds.
+    """
+    try:
+        raw = os.getenv("MID_RETEST_HOLD_SEC")
+        if raw is not None and str(raw).strip() != "":
+            return max(0.0, float(raw))
+    except Exception:
+        pass
+    try:
+        bars = _mid_retest_hold_bars()
+        if bars <= 0:
+            return 0.0
+        return float(bars) * 300.0
+    except Exception:
+        return 0.0
+
+
+def _mid_pending_zone_hold_ready(it: dict | None, *, now_ts: float | None = None, in_zone_now: bool = False) -> tuple[bool, str]:
+    """Return whether a pending setup has held its zone long enough for emit.
+
+    This is a WAIT gate, not a fail gate. It should delay emit while the retest is
+    still fresh instead of consuming pending fails.
+    """
+    try:
+        need_sec = _mid_retest_hold_seconds()
+        if need_sec <= 0:
+            return (True, "")
+        rec = it if isinstance(it, dict) else {}
+        has_zone = False
+        try:
+            lo = rec.get("entry_low")
+            hi = rec.get("entry_high")
+            has_zone = (lo is not None) and (hi is not None) and (float(hi) > float(lo) > 0)
+        except Exception:
+            has_zone = False
+        if not has_zone:
+            return (True, "")
+        if not bool(in_zone_now):
+            return (True, "")
+        since = rec.get("_in_zone_since_ts")
+        if since is None:
+            return (False, f"zone_hold=0s<{int(round(need_sec))}s")
+        ts_now = float(now_ts if now_ts is not None else time.time())
+        elapsed = max(0.0, ts_now - float(since))
+        if elapsed + 1e-9 < float(need_sec):
+            return (False, f"zone_hold={int(elapsed)}s<{int(round(need_sec))}s")
+        return (True, "")
+    except Exception:
+        return (True, "")
+
+
 def _mid_pending_entry_ref(it: dict | None, *, price: float | None = None, ta: dict | None = None) -> tuple[float, bool, float]:
     """Prefer the original pending anchor over the current market price.
 
@@ -1954,15 +2020,12 @@ def _mid_macd_hist_display4(val: float | None) -> str:
 
 
 def _mid_macd_hist_emit_block_reason(direction: str, macd_hist: float | None) -> str:
-    """Hard-block emit only when MACD hist is *clearly* on the wrong side.
+    """Hard-block emit when MACD hist is on the wrong side or too weak.
 
-    We intentionally use the same 4-decimal representation shown in the TA block so
-    values displayed as -0.0000 / +0.0000 are treated as neutral and do NOT block.
-    Example:
-      - LONG + -0.0152  -> block
-      - LONG + -0.0000  -> allow
-      - SHORT + +0.0152 -> block
-      - SHORT + +0.0000 -> allow
+    The comparison intentionally uses the same 4-decimal representation shown in the
+    TA block, so values displayed as -0.0000 / +0.0000 remain neutral. A minimum
+    absolute threshold can be configured with MID_TRIGGER_MIN_MACD_H (fallback:
+    TA_MIN_MACD_H).
     """
     try:
         side = str(direction or "").strip().upper()
@@ -1975,9 +2038,21 @@ def _mid_macd_hist_emit_block_reason(direction: str, macd_hist: float | None) ->
             disp_val = float(disp)
         except Exception:
             return ""
-        if side == "LONG" and disp_val < 0.0:
+        try:
+            thr_raw = os.getenv("MID_TRIGGER_MIN_MACD_H")
+            if thr_raw is None or str(thr_raw).strip() == "":
+                thr_raw = os.getenv("TA_MIN_MACD_H", "0")
+            thr = max(0.0, float(thr_raw or 0.0))
+        except Exception:
+            thr = 0.0
+        thr_disp = f"{thr:.4f}"
+        if side == "LONG" and disp_val < thr:
+            if thr > 0.0:
+                return f"macd_hist={disp} [need >= +{thr_disp}]"
             return f"macd_hist={disp} [need > 0]"
-        if side == "SHORT" and disp_val > 0.0:
+        if side == "SHORT" and disp_val > (-thr):
+            if thr > 0.0:
+                return f"macd_hist={disp} [need <= -{thr_disp}]"
             return f"macd_hist={disp} [need < 0]"
         return ""
     except Exception:
@@ -23856,6 +23931,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             it["_entered_zone_now"] = bool(_in_zone_now and (not _prev_in_zone))
                         except Exception:
                             pass
+                        try:
+                            if _in_zone_now:
+                                if (not _prev_in_zone) or (it.get("_in_zone_since_ts") is None):
+                                    it["_in_zone_since_ts"] = float(now)
+                            else:
+                                it.pop("_in_zone_since_ts", None)
+                        except Exception:
+                            pass
                         if _in_zone_now:
                             in_zone_n += 1
 
@@ -24130,6 +24213,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 if not _profit_ok:
                                     logger.info("[signal][skip_profit] %s market=%s dir=%s profit=%.3f%% min=%.3f%%", sig.symbol, sig.market, sig.direction, float(_profit_pct), float(_profit_min))
                                     _pending_log_trigger(sym, market, direction, "skip", f"profit_lt_{float(_profit_min):.2f}", it, float(price))
+                                    continue
+
+                                _hold_ready, _hold_reason = _mid_pending_zone_hold_ready(
+                                    it,
+                                    now_ts=now,
+                                    in_zone_now=bool(_in_zone_for_trigger or _entered_zone_for_trigger),
+                                )
+                                if not _hold_ready:
+                                    keep.append(it)
+                                    any_wait = True
+                                    _pending_log_trigger(sym, market, direction, "wait", _hold_reason, it, float(price))
                                     continue
 
                                 _final_emit_reason = _mid_final_emit_gate_reason(
@@ -24547,6 +24641,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                                         _touch_can_emit = bool(self.can_emit_mid(sym))
                                                     except Exception:
                                                         _touch_can_emit = True
+                                                _hold_ready, _hold_reason = _mid_pending_zone_hold_ready(
+                                                    it,
+                                                    now_ts=now,
+                                                    in_zone_now=bool(_in_zone_for_trigger or _entered_zone_for_trigger),
+                                                )
+                                                if not _hold_ready:
+                                                    keep.append(it)
+                                                    any_wait = True
+                                                    _pending_log_trigger(sym, market, direction, "wait", _hold_reason, it, float(price))
+                                                    continue
                                                 _touch_final_reason = _mid_final_emit_gate_reason(
                                                     sig=sig_zone,
                                                     ta=ta,
@@ -25042,6 +25146,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         except Exception:
                             pass
                         if instant_ok:
+                            _hold_ready, _hold_reason = _mid_pending_zone_hold_ready(
+                                it,
+                                now_ts=now,
+                                in_zone_now=bool(in_zone_now),
+                            )
+                            if not _hold_ready:
+                                keep.append(it)
+                                any_wait = True
+                                _pending_log_trigger(sym, market, direction, "wait", _hold_reason, it, float(price))
+                                continue
                             _final_emit_reason = _mid_final_emit_gate_reason(
                                 sig=sig_instant,
                                 ta=ta,
@@ -26414,6 +26528,17 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "")
                     if not conf_names:
                         conf_names = str(src_ex)
+
+                    _hold_ready, _hold_reason = _mid_pending_zone_hold_ready(
+                        it,
+                        now_ts=now,
+                        in_zone_now=bool(it.get("_in_zone") or it.get("_in_zone_tol") or it.get("_entered_zone_now") or False),
+                    )
+                    if not _hold_ready:
+                        keep.append(it)
+                        any_wait = True
+                        _pending_log_trigger(sym, market, direction, "wait", _hold_reason, it, float(price))
+                        continue
 
                     _final_emit_reason = _mid_final_emit_gate_reason(
                         sig=None,
