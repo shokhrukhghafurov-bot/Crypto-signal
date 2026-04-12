@@ -12616,22 +12616,91 @@ def _mid_setup_source_normalize(source: str | None) -> str:
 def _mid_setup_source_label(source: str | None) -> str:
     """Human-facing Smart-setup label.
 
-    User requested exact English labels:
-      - origin — если вход взят сразу от начала движения
-      - breakout — если вход взят на пробое
-      - zone retest — только если был реальный возврат/ретест зоны
-      - normal pending trigger — для обычного pending trigger без явного retest
-      - liquidity reclaim — отдельный reclaim-setup после съёма ликвидности
+    User requested exact English labels in signal cards.
+    Keep these title-cased so Telegram messages preserve the intended final label.
     """
     src = _mid_setup_source_normalize(source)
     labels = {
-        "origin": "origin",
-        "breakout": "breakout",
-        "zone_retest": "zone retest",
-        "normal_pending_trigger": "normal pending trigger",
-        "liquidity_reclaim": "liquidity reclaim",
+        "origin": "Origin",
+        "breakout": "Breakout",
+        "zone_retest": "Zone retest",
+        "normal_pending_trigger": "Normal pending trigger",
+        "liquidity_reclaim": "Liquidity reclaim",
     }
     return labels.get(src, "")
+
+
+def _mid_resolve_signal_setup_label(ta: dict | None = None, sig: object | None = None) -> str:
+    """Best-effort resolver for the final Smart-setup label shown in signal cards.
+
+    Priority:
+      1) explicit UI label stored on TA/signal
+      2) explicit route + setup_source
+      3) infer route from TA snapshot when only generic setup_source survived
+      4) fall back to canonical setup_source label
+    """
+    t = ta if isinstance(ta, dict) else {}
+
+    def _get_attr(name: str):
+        try:
+            return getattr(sig, name, "") if sig is not None else ""
+        except Exception:
+            return ""
+
+    for key in ("ui_setup_label", "smc_setup_label"):
+        try:
+            val = str(t.get(key) or _get_attr(key) or "").strip()
+        except Exception:
+            val = ""
+        if val:
+            return val
+
+    try:
+        setup_source = str(t.get("setup_source") or t.get("smart_emit_source") or _get_attr("setup_source") or "").strip()
+    except Exception:
+        setup_source = ""
+    try:
+        setup_route = str(
+            t.get("smc_setup_route")
+            or t.get("emit_route")
+            or _get_attr("smc_setup_route")
+            or _get_attr("emit_route")
+            or ""
+        ).strip()
+    except Exception:
+        setup_route = ""
+
+    if setup_route:
+        composed = _mid_compose_setup_label(setup_source, setup_route)
+        if composed:
+            return composed
+
+    try:
+        direction = str(t.get("direction") or t.get("dir") or "").upper().strip()
+        source_norm = _mid_setup_source_normalize(setup_source or t.get("setup_source_label") or _get_attr("setup_source_label") or "")
+        smc_snapshot = _mid_collect_smc_snapshot(
+            direction=direction,
+            ta=t,
+            rec=t,
+            bo_rt_label=(t.get("bo_rt") or t.get("breakout_retest") or ""),
+        )
+        inferred = _mid_pick_smc_emit_route(
+            direction=direction,
+            smc_snapshot=smc_snapshot,
+            origin_fast_ok=bool(source_norm == "origin"),
+            breakout_fast_ok=bool(source_norm == "breakout"),
+            zone_valid=bool(source_norm in {"zone_retest", "liquidity_reclaim"} or t.get("ob_retest") or t.get("entry_low") is not None or t.get("entry_high") is not None),
+            in_zone_now=bool(source_norm == "zone_retest"),
+            liquidity_reclaim_ok=bool(source_norm == "liquidity_reclaim"),
+        )
+        inferred_label = str((inferred or {}).get("setup_label") or "").strip()
+        if inferred_label:
+            return inferred_label
+    except Exception:
+        pass
+
+    fallback = _mid_setup_source_label(setup_source or t.get("setup_source_label") or _get_attr("setup_source_label") or "")
+    return str(fallback or "").strip()
 
 
 def _mid_apply_signal_setup_source(sig: Signal | None, source: str | None) -> str:
@@ -18772,10 +18841,7 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
             ])
 
         try:
-            _setup_label = str(ta.get("ui_setup_label") or ta.get("smc_setup_label") or ta.get("setup_source_label") or "").strip()
-            _setup_route = str(ta.get("smc_setup_route") or ta.get("emit_route") or "").strip()
-            if _setup_route and (_setup_route.startswith("smc_") or _setup_route == "liquidity_reclaim_emit") and not _setup_label:
-                _setup_label = _mid_compose_setup_label(ta.get("setup_source"), _setup_route)
+            _setup_label = _mid_resolve_signal_setup_label(ta)
             if _setup_label:
                 lines.append(f"🧭 Smart-setup: {_setup_label}")
         except Exception:
