@@ -4068,9 +4068,33 @@ def _signal_ui_setup_label(sig) -> str:
         label = str(getattr(sig, "ui_setup_label", "") or "").strip()
         if label:
             return _report_setup_label_human(label)
+
+        setup_source = str(getattr(sig, "setup_source", "") or "").strip()
+        setup_route = str(getattr(sig, "smc_setup_route", "") or getattr(sig, "emit_route", "") or "").strip()
+        smc_label = str(getattr(sig, "smc_setup_label", "") or "").strip()
+        if setup_source and (setup_route or smc_label):
+            try:
+                from backend import _mid_compose_setup_label
+                composed = _mid_compose_setup_label(setup_source, setup_route, smc_label)
+            except Exception:
+                composed = ""
+            if composed:
+                return _report_setup_label_human(composed)
+
         emit_route = str(getattr(sig, "emit_route", "") or "").strip()
         if emit_route == "liquidity_reclaim_emit":
             return "liquidity_reclaim_emit"
+        label = str(getattr(sig, "smc_setup_label", "") or "").strip()
+        if label:
+            if setup_source:
+                try:
+                    from backend import _mid_compose_setup_label
+                    composed = _mid_compose_setup_label(setup_source, "", label)
+                except Exception:
+                    composed = ""
+                if composed:
+                    return _report_setup_label_human(composed)
+            return _report_setup_label_human(label)
         label = str(getattr(sig, "setup_source_label", "") or "").strip()
         if label:
             return _report_setup_label_human(label)
@@ -4088,9 +4112,32 @@ def _row_ui_setup_label(row: dict | None) -> str:
         label = _report_setup_label_human(src.get("ui_setup_label"))
         if label:
             return label
+
+        setup_source = str(src.get("setup_source") or src.get("smart_emit_source") or "").strip()
+        setup_route = str(src.get("smc_setup_route") or src.get("emit_route") or "").strip()
+        smc_label = str(src.get("smc_setup_label") or "").strip()
+        if setup_source and (setup_route or smc_label):
+            try:
+                from backend import _mid_compose_setup_label
+                composed = _mid_compose_setup_label(setup_source, setup_route, smc_label)
+            except Exception:
+                composed = ""
+            if composed:
+                return _report_setup_label_human(composed)
+
         emit_route = str(src.get("emit_route") or "").strip()
         if emit_route == "liquidity_reclaim_emit":
             return "liquidity_reclaim_emit"
+        if smc_label:
+            if setup_source:
+                try:
+                    from backend import _mid_compose_setup_label
+                    composed = _mid_compose_setup_label(setup_source, "", smc_label)
+                except Exception:
+                    composed = ""
+                if composed:
+                    return _report_setup_label_human(composed)
+            return _report_setup_label_human(smc_label)
         label = _report_setup_label_human(src.get("setup_source_label"))
         if label:
             return label
