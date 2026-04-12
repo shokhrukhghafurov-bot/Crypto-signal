@@ -2369,7 +2369,8 @@ def _mid_final_emit_gate_reason(*,
                                 anti_bounce_reason: str | None = None,
                                 gate_meta: dict | None = None,
                                 zone_src: str | None = None,
-                                in_zone_now: bool = True) -> str:
+                                in_zone_now: bool = True,
+                                route: str | None = None) -> str:
     """Unified final veto before any real emit of weak FUTURES SHORT.
 
     This closes the remaining bypasses where a signal can pass scan/pending gates
@@ -2403,17 +2404,6 @@ def _mid_final_emit_gate_reason(*,
     except Exception:
         fresh_anchor = bool(breakout_fresh_ok)
     try:
-        emit_route = str((getattr(sig, "emit_route", None) if sig is not None else "") or (gate_meta or {}).get("route") or (it or {}).get("smc_setup_route") or "").strip()
-    except Exception:
-        emit_route = ""
-    smc_direct_route = bool(emit_route.startswith("smc_"))
-    try:
-        gate_kind = str((gate_meta or {}).get("gate") or "").strip().lower()
-    except Exception:
-        gate_kind = ""
-    smc_direct_route = bool(smc_direct_route or gate_kind == "smc_direct_emit")
-
-    try:
         hard_anchor_max = float(os.getenv("MID_FINAL_EMIT_MAX_ANCHOR_SLIP_ATR_FRESH", "0.75") if fresh_anchor else os.getenv("MID_FINAL_EMIT_MAX_ANCHOR_SLIP_ATR", "0.45"))
     except Exception:
         hard_anchor_max = 0.75 if fresh_anchor else 0.45
@@ -2422,19 +2412,10 @@ def _mid_final_emit_gate_reason(*,
             hard_anchor_max += float(os.getenv("MID_FINAL_EMIT_IN_ZONE_SLIP_PAD", "0.10") or 0.10)
     except Exception:
         pass
-    if smc_direct_route:
-        try:
-            smc_anchor_max = float(os.getenv("MID_SMC_FINAL_MAX_ANCHOR_SLIP_ATR_FRESH", "2.20") if fresh_anchor else os.getenv("MID_SMC_FINAL_MAX_ANCHOR_SLIP_ATR", "1.80"))
-        except Exception:
-            smc_anchor_max = 2.20 if fresh_anchor else 1.80
-        try:
-            if bool(in_zone_now):
-                smc_anchor_max += float(os.getenv("MID_SMC_FINAL_IN_ZONE_SLIP_PAD", "0.20") or 0.20)
-        except Exception:
-            pass
-        hard_anchor_max = max(float(hard_anchor_max), float(smc_anchor_max))
     if anchor_far and float(anchor_slip_atr or 0.0) > float(hard_anchor_max):
         return f"late_from_anchor:{float(anchor_slip_atr):.2f}>{float(hard_anchor_max):.2f}"
+
+    smc_direct_route = _mid_is_direct_smc_route(route=route, sig=sig, ta=ta, rec=it, meta=gate_meta)
 
     # Directional contradiction must veto ALL real emits, not only FUTURES SHORT.
     # Trigger-time context can be split across fresh TA, pending record and gate_meta,
@@ -2442,6 +2423,9 @@ def _mid_final_emit_gate_reason(*,
     _dir_reason = _mid_directional_contradiction_reason(ta, it, gate_meta)
     if _dir_reason:
         return str(_dir_reason)
+
+    if smc_direct_route:
+        return ""
 
     if market_u != "FUTURES" or direction_u != "SHORT":
         return ""
@@ -2493,19 +2477,17 @@ def _mid_final_emit_gate_reason(*,
     except Exception:
         breakout_ok = bool(breakout_fresh_ok)
 
-    _weak_reason = ""
-    if not smc_direct_route:
-        _weak_reason = _mid_futures_short_weak_emit_reason(
-            market=market_u,
-            direction=direction_u,
-            risk_flags=risk_flags_use,
-            vol_x=vol_v,
-            body_atr=body_v,
-            bo_rt_label=bo_s,
-            breakout_fresh_ok=bool(breakout_ok),
-            micro_trap_ok=bool(micro_ok),
-            macd_hist=macd_v,
-        )
+    _weak_reason = _mid_futures_short_weak_emit_reason(
+        market=market_u,
+        direction=direction_u,
+        risk_flags=risk_flags_use,
+        vol_x=vol_v,
+        body_atr=body_v,
+        bo_rt_label=bo_s,
+        breakout_fresh_ok=bool(breakout_ok),
+        micro_trap_ok=bool(micro_ok),
+        macd_hist=macd_v,
+    )
     if _weak_reason:
         return str(_weak_reason)
 
@@ -2523,7 +2505,7 @@ def _mid_final_emit_gate_reason(*,
                         break
         except Exception:
             anti_reason = anti_reason or ""
-    if anti_reason and (not smc_direct_route):
+    if anti_reason:
         try:
             relief = bool((gate_meta or {}).get("fut_short_anti_bounce_relief"))
         except Exception:
@@ -10494,12 +10476,56 @@ def _mid_smc_emit_route_priority_label(route: str | None) -> str:
 def _mid_compose_setup_label(setup_source: str | None, smc_route: str | None = None, smc_label: str | None = None) -> str:
     base = _mid_setup_source_label(setup_source)
     extra = str(smc_label or _mid_smc_emit_route_label(smc_route) or '').strip()
-    prio = _mid_smc_emit_route_priority_label(smc_route)
-    if extra and prio and prio not in extra:
-        extra = f"{extra} [{prio}]"
     if base and extra:
         return f"{base} | {extra}"
     return base or extra
+
+
+def _mid_is_direct_smc_route(*,
+                             route: str | None = None,
+                             sig=None,
+                             ta: dict | None = None,
+                             rec: dict | None = None,
+                             meta: dict | None = None) -> bool:
+    """Return True when the signal belongs to a strong SMC direct-emit route.
+
+    This helper intentionally looks across explicit route arg, signal attrs, TA payload,
+    pending record and gate meta so direct SMC emits never fall back into generic
+    soft-block pre/final gates by accident.
+    """
+    direct_routes = {
+        'smc_liquidity_reclaim',
+        'smc_ob_fvg_overlap',
+        'smc_htf_ob_ltf_fvg',
+        'smc_bos_retest_confirm',
+        'smc_displacement_origin',
+        'smc_dual_fvg_origin',
+    }
+
+    def _cand(v):
+        try:
+            s = str(v or '').strip()
+        except Exception:
+            s = ''
+        return s
+
+    try:
+        for src in (route,
+                    getattr(sig, 'emit_route', ''),
+                    getattr(sig, 'smc_setup_route', ''),
+                    (ta or {}).get('emit_route'),
+                    (ta or {}).get('smc_setup_route'),
+                    (rec or {}).get('emit_route'),
+                    (rec or {}).get('smc_setup_route'),
+                    (meta or {}).get('route'),
+                    (meta or {}).get('emit_route'),
+                    (meta or {}).get('smc_setup_route')):
+            s = _cand(src)
+            if s in direct_routes:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _mid_pick_smc_emit_route(*,
@@ -11158,7 +11184,7 @@ def _mid_smc_route_emit_gate(*,
             macd_hist=macd_hist,
         )
 
-    meta: dict[str, object] = {"route": route_s, "gate": "smc_direct_emit"}
+    meta: dict[str, object] = {"route": route_s, "gate": "smc_direct_emit", "smc_direct_route": True}
     blocks: list[str] = []
     flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
     diru = str(direction or "").upper().strip()
@@ -11196,7 +11222,7 @@ def _mid_smc_route_emit_gate(*,
 
     if blocks:
         meta['blocked_by'] = list(blocks)
-        meta['soft_bypassed'] = ['score', 'confidence', 'vol_x', 'atr_pct', 'late_entry', 'near_extreme', 'anti_bounce']
+        meta['soft_bypassed'] = ['score', 'confidence', 'vol_x', 'atr_pct', 'late_entry', 'near_extreme', 'anti_bounce', 'macd_hist', 'regime', 'generic_trap']
         return (False, f"smc_hard_block:{route_s}", meta)
 
     try:
@@ -18748,12 +18774,8 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
         try:
             _setup_label = str(ta.get("ui_setup_label") or ta.get("smc_setup_label") or ta.get("setup_source_label") or "").strip()
             _setup_route = str(ta.get("smc_setup_route") or ta.get("emit_route") or "").strip()
-            if _setup_route and (_setup_route.startswith("smc_") or _setup_route == "liquidity_reclaim_emit"):
-                _prio = _mid_smc_emit_route_priority_label(_setup_route)
-                if _setup_label and _prio and _prio not in _setup_label:
-                    _setup_label = f"{_setup_label} [{_prio}]"
-                elif not _setup_label:
-                    _setup_label = _mid_compose_setup_label(ta.get("setup_source"), _setup_route)
+            if _setup_route and (_setup_route.startswith("smc_") or _setup_route == "liquidity_reclaim_emit") and not _setup_label:
+                _setup_label = _mid_compose_setup_label(ta.get("setup_source"), _setup_route)
             if _setup_label:
                 lines.append(f"🧭 Smart-setup: {_setup_label}")
         except Exception:
@@ -24749,6 +24771,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     macd_hist=_safe_float(ta.get("macd_hist"), None),
                                     zone_src=str(it.get("entry_zone_src") or ""),
                                     in_zone_now=bool(_in_zone_for_trigger or _entered_zone_for_trigger),
+                                    route=str(it.get("smc_setup_route") or it.get("emit_route") or "pending_instant_emit"),
                                 )
                                 if _final_emit_reason:
                                     _apply_reason = _mid_final_emit_apply_reason(_final_emit_reason)
@@ -31658,6 +31681,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     gate_meta=_emit_meta,
                                                     zone_src=str(_zone_src_l or ""),
                                                     in_zone_now=bool(_in_zone_now),
+                                                    route=str(_smart_emit_route or rec.get("smc_setup_route") or rec.get("emit_route") or "smart_emit_now"),
                                                 )
                                                 if _final_emit_reason:
                                                     _emit_now = False
@@ -36309,6 +36333,8 @@ def _mid_pre_emit_missing_bo_rt_reason(
     bo_rt_label: str | None = None,
 ) -> str:
     try:
+        if _mid_is_direct_smc_route(route=route, sig=sig, ta=ta, rec=rec, meta=meta):
+            return ""
         if not _mid_pre_emit_require_bo_rt(sig, route, rec, ta, meta):
             return ""
         rec_d = rec if isinstance(rec, dict) else {}
@@ -36356,6 +36382,8 @@ def _mid_direction_quality_3of5_pre_emit_reason(
     *,
     vol_x: float | None = None,
     macd_hist: float | None = None,
+    route: str | None = None,
+    gate_meta: dict | None = None,
 ) -> str:
     """Return a pre-emit veto reason for weak LONG/SHORT signals.
 
@@ -36365,6 +36393,8 @@ def _mid_direction_quality_3of5_pre_emit_reason(
     """
     try:
         if sig is None:
+            return ""
+        if _mid_is_direct_smc_route(route=route, sig=sig, ta=ta, rec=it, meta=gate_meta):
             return ""
 
         direction = str(getattr(sig, "direction", "") or "").upper().strip()
@@ -36570,8 +36600,10 @@ def _mid_long_quality_3of5_pre_emit_reason(
     *,
     vol_x: float | None = None,
     macd_hist: float | None = None,
+    route: str | None = None,
+    gate_meta: dict | None = None,
 ) -> str:
-    return _mid_direction_quality_3of5_pre_emit_reason(sig, ta=ta, it=it, vol_x=vol_x, macd_hist=macd_hist)
+    return _mid_direction_quality_3of5_pre_emit_reason(sig, ta=ta, it=it, vol_x=vol_x, macd_hist=macd_hist, route=route, gate_meta=gate_meta)
 
 
 def _mid_short_quality_3of5_pre_emit_reason(
@@ -36581,8 +36613,10 @@ def _mid_short_quality_3of5_pre_emit_reason(
     *,
     vol_x: float | None = None,
     macd_hist: float | None = None,
+    route: str | None = None,
+    gate_meta: dict | None = None,
 ) -> str:
-    return _mid_direction_quality_3of5_pre_emit_reason(sig, ta=ta, it=it, vol_x=vol_x, macd_hist=macd_hist)
+    return _mid_direction_quality_3of5_pre_emit_reason(sig, ta=ta, it=it, vol_x=vol_x, macd_hist=macd_hist, route=route, gate_meta=gate_meta)
 
 def _mid_pre_emit_apply_reason(reason: str) -> str:
     try:
@@ -36658,11 +36692,19 @@ async def _backend_mid_pre_emit_block_reason(
         # 2) directional contradiction
         # 3) BTC leader veto
 
+        smc_direct_route = _mid_is_direct_smc_route(route=route, sig=sig, ta=ta_d, rec=rec, meta=meta)
+
         # 1) Never allow explicit smart-setup trap vetoes to bypass emit.
-        if rec.get("smart_setup_trap_ok") is False:
-            return str(rec.get("smart_setup_trap_reason") or "smart_setup_trap")
-        if meta.get("smart_setup_trap_ok") is False:
-            return str(meta.get("smart_setup_trap_reason") or "smart_setup_trap")
+        _trap_reason_pre = str(rec.get("smart_setup_trap_reason") or meta.get("smart_setup_trap_reason") or "smart_setup_trap")
+        _trap_is_hard = any(k in _trap_reason_pre.lower() for k in ("hard", "invalid", "conflict", "against"))
+        if not smc_direct_route:
+            if rec.get("smart_setup_trap_ok") is False:
+                return _trap_reason_pre
+            if meta.get("smart_setup_trap_ok") is False:
+                return _trap_reason_pre
+        else:
+            if (rec.get("smart_setup_trap_ok") is False or meta.get("smart_setup_trap_ok") is False) and _trap_is_hard:
+                return _trap_reason_pre
 
         # 2) For direct smart-setup emits, empty BO/RT is a hard veto unless
         # there is an explicit OB retest or liquidity sweep context.
@@ -36682,6 +36724,8 @@ async def _backend_mid_pre_emit_block_reason(
             it=rec,
             vol_x=vol_x,
             macd_hist=macd_hist,
+            route=route,
+            gate_meta=meta,
         )
         if quality_reason:
             return str(quality_reason)
