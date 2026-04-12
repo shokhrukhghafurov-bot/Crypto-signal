@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-04-13_smc_emit_engine_v2"
+MID_BUILD_TAG = "MID_BUILD_2026-04-13_smc_emit_engine_v8_label_fix"
 
 import asyncio
 import json
@@ -12549,6 +12549,10 @@ class Signal:
     ts: float = 0.0
     setup_source: str = ""
     setup_source_label: str = ""
+    ui_setup_label: str = ""
+    smc_setup_label: str = ""
+    emit_route: str = ""
+    smc_setup_route: str = ""
 
     def __post_init__(self):
         try:
@@ -12561,6 +12565,41 @@ class Signal:
             pass
         try:
             self.setup_source_label = _mid_setup_source_label(src) if src else ""
+        except Exception:
+            pass
+        try:
+            route = str(getattr(self, "smc_setup_route", "") or getattr(self, "emit_route", "") or "").strip()
+        except Exception:
+            route = ""
+        try:
+            smc_label = str(getattr(self, "smc_setup_label", "") or "").strip()
+        except Exception:
+            smc_label = ""
+        try:
+            ui_label = str(getattr(self, "ui_setup_label", "") or "").strip()
+        except Exception:
+            ui_label = ""
+        try:
+            if route and not getattr(self, "emit_route", ""):
+                self.emit_route = route
+        except Exception:
+            pass
+        try:
+            if route and not getattr(self, "smc_setup_route", ""):
+                self.smc_setup_route = route
+        except Exception:
+            pass
+        try:
+            if route and not smc_label:
+                smc_label = _mid_smc_emit_route_label(route)
+                self.smc_setup_label = smc_label
+        except Exception:
+            pass
+        try:
+            if not ui_label:
+                ui_label = _mid_compose_setup_label(src, route, smc_label)
+                if ui_label:
+                    self.ui_setup_label = ui_label
         except Exception:
             pass
         _normalize_signal_levels_inplace(self)
@@ -12647,18 +12686,20 @@ def _mid_resolve_signal_setup_label(ta: dict | None = None, sig: object | None =
         except Exception:
             return ""
 
-    for key in ("ui_setup_label", "smc_setup_label"):
-        try:
-            val = str(t.get(key) or _get_attr(key) or "").strip()
-        except Exception:
-            val = ""
-        if val:
-            return val
-
     try:
         setup_source = str(t.get("setup_source") or t.get("smart_emit_source") or _get_attr("setup_source") or "").strip()
     except Exception:
         setup_source = ""
+    try:
+        ui_label = str(t.get("ui_setup_label") or _get_attr("ui_setup_label") or "").strip()
+    except Exception:
+        ui_label = ""
+    if ui_label:
+        return ui_label
+    try:
+        smc_label = str(t.get("smc_setup_label") or _get_attr("smc_setup_label") or "").strip()
+    except Exception:
+        smc_label = ""
     try:
         setup_route = str(
             t.get("smc_setup_route")
@@ -12671,9 +12712,14 @@ def _mid_resolve_signal_setup_label(ta: dict | None = None, sig: object | None =
         setup_route = ""
 
     if setup_route:
-        composed = _mid_compose_setup_label(setup_source, setup_route)
+        composed = _mid_compose_setup_label(setup_source, setup_route, smc_label)
         if composed:
             return composed
+    if smc_label:
+        composed = _mid_compose_setup_label(setup_source, "", smc_label)
+        if composed:
+            return composed
+        return smc_label
 
     try:
         direction = str(t.get("direction") or t.get("dir") or "").upper().strip()
