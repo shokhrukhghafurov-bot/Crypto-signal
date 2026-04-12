@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-04-05_macd_threshold_zone_hold_v1"
+MID_BUILD_TAG = "MID_BUILD_2026-04-13_origin_fast_early_move_v1"
 
 import asyncio
 import json
@@ -10366,35 +10366,37 @@ def _mid_smart_setup_origin_fastpath(*,
     except Exception:
         base_conf_need = 90
     try:
-        conf_need = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF", str(min(base_conf_need, 82))) or min(base_conf_need, 82)))
+        conf_need = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF", str(min(base_conf_need, 76))) or min(base_conf_need, 76)))
     except Exception:
-        conf_need = min(base_conf_need, 82)
+        conf_need = min(base_conf_need, 76)
     conf_need = max(0, int(conf_need))
 
     min_atr, min_vol = _mid_instant_emit_market_thresholds(market)
     try:
-        atr_mult = float(os.getenv("MID_SMART_SETUP_ORIGIN_ATR_MULT", "0.90") or 0.90)
+        atr_mult = float(os.getenv("MID_SMART_SETUP_ORIGIN_ATR_MULT", "0.75") or 0.75)
     except Exception:
-        atr_mult = 0.90
+        atr_mult = 0.75
     try:
         vol_need = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X", "0") or 0)
     except Exception:
         vol_need = 0.0
     if vol_need <= 0:
-        vol_need = max(0.0, float(min_vol) * 0.95)
+        # Origin fast is allowed to fire at the *start* of a real move, before
+        # volume/relative-volume fully expands on the current bar.
+        vol_need = 0.0
     atr_need = max(0.0, float(min_atr) * max(0.0, float(atr_mult)))
     try:
-        min_body_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR", "0.16") or 0.16)
+        min_body_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR", "0.08") or 0.08)
     except Exception:
-        min_body_atr = 0.16
+        min_body_atr = 0.08
     try:
         max_age_bars = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_AGE_BARS", "3") or 3))
     except Exception:
         max_age_bars = 3
     try:
-        max_move_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_MOVE_ATR", "0.90") or 0.90)
+        max_move_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_MOVE_ATR", "1.20") or 1.20)
     except Exception:
-        max_move_atr = 0.90
+        max_move_atr = 1.20
     try:
         allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_SMART_SETUP_ORIGIN_ALLOWED_REGIMES", "")) if str(x).strip()}
     except Exception:
@@ -10503,19 +10505,19 @@ def _mid_smart_setup_origin_fastpath(*,
         fresh_origin_bias = False
     if fresh_origin_bias:
         try:
-            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF_FRESH", "80") or 80)))
+            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF_FRESH", "72") or 72)))
         except Exception:
-            conf_need = min(int(conf_need), 80)
+            conf_need = min(int(conf_need), 72)
         try:
-            body_need_eff = min(float(body_need_eff), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR_FRESH", "0.10") or 0.10))
-        except Exception:
-            pass
-        try:
-            vol_need_eff = min(float(vol_need_eff), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X_FRESH", "0.02") or 0.02))
+            body_need_eff = min(float(body_need_eff), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR_FRESH", "0.05") or 0.05))
         except Exception:
             pass
         try:
-            max_move_atr = max(float(max_move_atr), float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_MOVE_ATR_FRESH", "1.10") or 1.10))
+            vol_need_eff = min(float(vol_need_eff), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X_FRESH", "0.00") or 0.00))
+        except Exception:
+            pass
+        try:
+            max_move_atr = max(float(max_move_atr), float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_MOVE_ATR_FRESH", "1.30") or 1.30))
         except Exception:
             pass
     meta.update({
@@ -10829,6 +10831,8 @@ def _mid_instant_emit_gate(*,
 
     origin_ignore_profit = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_BYPASS_PROFIT", "1"))
     origin_soft_macd = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_SOFT_MACD", "1"))
+    origin_soft_vol = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_SOFT_VOL", "1"))
+    origin_soft_atr = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_SOFT_ATR", "1"))
     origin_bypass_trap = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_BYPASS_TRAP", "0"))
     origin_relax_regime = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_RELAX_REGIME", "1"))
     zone_first_soft_gate = bool(zone_valid and in_zone_now and _env_on("MID_ZONE_FIRST_SOFTEN_INSTANT_GATE", "1"))
@@ -10931,6 +10935,8 @@ def _mid_instant_emit_gate(*,
         "profit_need": float(profit_need),
         "origin_ignore_profit": bool(origin_ignore_profit),
         "origin_soft_macd": bool(origin_soft_macd),
+        "origin_soft_vol": bool(origin_soft_vol),
+        "origin_soft_atr": bool(origin_soft_atr),
         "origin_bypass_trap": bool(origin_bypass_trap),
         "origin_trap_bypass_allowed": bool(_origin_trap_bypass_ok),
         "origin_relax_regime": bool(origin_relax_regime),
@@ -11015,7 +11021,9 @@ def _mid_instant_emit_gate(*,
             ignored_risk_flags.append(_flag)
             continue
         if _flag == "regime_range_no_breakout":
-            if reg_u in {"RANGE", "CHOPPY", "COMPRESSION", "SIDEWAYS", "-", ""}:
+            if origin_fast_ok and origin_relax_regime:
+                ignored_risk_flags.append(_flag)
+            elif reg_u in {"RANGE", "CHOPPY", "COMPRESSION", "SIDEWAYS", "-", ""}:
                 applied_risk_flags.append(_flag)
             else:
                 ignored_risk_flags.append(_flag)
@@ -11070,10 +11078,22 @@ def _mid_instant_emit_gate(*,
             _add_fail(f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}")
     if not rr_ok:
         _add_fail(f"instant_rr_low:{rr_v:.2f}<{rr_need:.2f}")
-    if atr_v < float(min_atr):
-        _add_fail(f"instant_atr_low:{atr_v:.3f}<{min_atr:.3f}")
-    if vol_v < float(min_vol):
-        _add_fail(f"instant_vol_low:{vol_v:.2f}<{min_vol:.2f}")
+    _instant_atr_need = float(min_atr)
+    if origin_fast_ok and origin_soft_atr:
+        try:
+            _instant_atr_need = min(float(_instant_atr_need), float(os.getenv("MID_SMART_SETUP_ORIGIN_INSTANT_MIN_ATR", "0.0") or 0.0))
+        except Exception:
+            _instant_atr_need = 0.0
+    if atr_v < float(_instant_atr_need):
+        _add_fail(f"instant_atr_low:{atr_v:.3f}<{_instant_atr_need:.3f}")
+    _instant_vol_need = float(min_vol)
+    if origin_fast_ok and origin_soft_vol:
+        try:
+            _instant_vol_need = min(float(_instant_vol_need), float(os.getenv("MID_SMART_SETUP_ORIGIN_INSTANT_MIN_VOL_X", "0.0") or 0.0))
+        except Exception:
+            _instant_vol_need = 0.0
+    if vol_v < float(_instant_vol_need):
+        _add_fail(f"instant_vol_low:{vol_v:.2f}<{_instant_vol_need:.2f}")
     if not near_extreme_ok:
         if (breakout_fresh_ok and breakout_bypass_near_extreme) or (origin_fast_ok and origin_bypass_near_extreme):
             ignored_checks.append(str(near_extreme_reason or "instant_near_extreme"))
