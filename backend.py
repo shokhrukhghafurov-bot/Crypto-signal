@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-04-13_origin_fast_early_move_v1"
+MID_BUILD_TAG = "MID_BUILD_2026-04-13_smc_emit_engine_v2"
 
 import asyncio
 import json
@@ -10320,6 +10320,219 @@ def _mid_instant_emit_reason_priority(reason: str) -> tuple[int, str]:
     return (500, key)
 
 
+def _mid_smc_confluence_snapshot(*,
+                                direction: str,
+                                ta: dict | None = None,
+                                rec: dict | None = None,
+                                bo_rt_label: str | None = None) -> dict:
+    """Summarize SMC confluence so emit gates can prioritize real OB/FVG/BOS setups.
+
+    The goal is no longer just "score influence". We collect enough evidence to allow
+    dedicated emit routes for the classic SMC combinations the user asked for:
+      - OB + FVG overlap priority emit
+      - HTF OB + LTF FVG retest emit
+      - BOS -> retest POI -> confirm emit
+      - displacement / dual-FVG origin emit
+      - liquidity sweep -> reclaim -> continuation emit
+    """
+    t = ta if isinstance(ta, dict) else {}
+    r = rec if isinstance(rec, dict) else {}
+    diru = str(direction or '').upper().strip()
+    bo = str(bo_rt_label or t.get('bo_rt') or t.get('breakout_retest') or r.get('bo_rt') or r.get('breakout_retest') or '').upper().strip()
+    ob_zone = str(t.get('ob_zone') or r.get('ob_zone') or '').strip()
+    fvg_kind = str(t.get('fvg') or r.get('fvg') or '').upper().strip()
+    fvg_active = bool(t.get('fvg_active') if t.get('fvg_active') is not None else r.get('fvg_active'))
+    ob_retest = bool(t.get('ob_retest') if t.get('ob_retest') is not None else r.get('ob_retest'))
+    sweep_long = bool(t.get('sweep_long') if t.get('sweep_long') is not None else r.get('sweep_long'))
+    sweep_short = bool(t.get('sweep_short') if t.get('sweep_short') is not None else r.get('sweep_short'))
+    sweep_ok = sweep_long if diru == 'LONG' else (sweep_short if diru == 'SHORT' else False)
+    bos_up_5m = bool(t.get('bos_up_5m') if t.get('bos_up_5m') is not None else r.get('bos_up_5m'))
+    bos_down_5m = bool(t.get('bos_down_5m') if t.get('bos_down_5m') is not None else r.get('bos_down_5m'))
+    bos_ok = bos_up_5m if diru == 'LONG' else (bos_down_5m if diru == 'SHORT' else False)
+    bo_ok = False
+    if diru == 'LONG':
+        bo_ok = bo.startswith('BO↑') or bo.startswith('BOUP') or bo.startswith('BO+')
+        fvg_dir_ok = fvg_kind.startswith('BULL')
+    elif diru == 'SHORT':
+        bo_ok = bo.startswith('BO↓') or bo.startswith('BODN') or bo.startswith('BO-')
+        fvg_dir_ok = fvg_kind.startswith('BEAR')
+    else:
+        fvg_dir_ok = False
+    ob_ok = bool(ob_zone and ob_zone != '—')
+    entry_kind = str(t.get('entry_kind') or r.get('entry_kind') or '').upper().strip()
+    try:
+        entry_confluence = int(float(t.get('entry_confluence') if t.get('entry_confluence') is not None else r.get('entry_confluence') or 0) or 0)
+    except Exception:
+        entry_confluence = 0
+    try:
+        disp_body_atr = float(t.get('disp_body_atr') if t.get('disp_body_atr') is not None else r.get('disp_body_atr') or 0.0)
+    except Exception:
+        disp_body_atr = 0.0
+    try:
+        disp_min = float(os.getenv('MID_SMC_DISPLACEMENT_MIN', os.getenv('MID_INST_DISP_MIN', '0.25')) or 0.25)
+    except Exception:
+        disp_min = 0.25
+    overlap = bool('OB+FVG' in entry_kind)
+    if not overlap and ob_ok and fvg_active and fvg_dir_ok:
+        overlap = bool(ob_retest or entry_confluence >= 3)
+    htf_ltf = bool((ob_ok and fvg_active and fvg_dir_ok) and (overlap or ob_retest or entry_confluence >= 2))
+    confirm_ok = bool(bos_ok or bo_ok or ob_retest or disp_body_atr >= disp_min)
+    breakout_retest_poi = bool((bo_ok or bos_ok) and (overlap or ob_retest or fvg_active or ob_ok) and confirm_ok)
+    liquidity_reclaim = bool(sweep_ok and confirm_ok and (ob_retest or fvg_active or ob_ok))
+    displacement_hint = bool((disp_body_atr >= disp_min) and (bo_ok or bos_ok) and (fvg_active or ob_ok))
+    dual_fvg_hint = False
+    stacked_fvg_hint = False
+    try:
+        mbp = t.get('mid_bonus_parts') if isinstance(t.get('mid_bonus_parts'), dict) else {}
+        fvg_bonus = float(mbp.get('fvg', 0.0) or 0.0)
+    except Exception:
+        fvg_bonus = 0.0
+    for _src in (t, r):
+        try:
+            if bool(_src.get('dual_fvg')) or bool(_src.get('dual_fvg_hint')):
+                dual_fvg_hint = True
+            if bool(_src.get('stacked_fvg')) or bool(_src.get('stacked_imbalance')) or bool(_src.get('stacked_fvg_hint')):
+                stacked_fvg_hint = True
+            _fc = _src.get('fvg_count')
+            if _fc is not None and float(_fc) >= 2:
+                dual_fvg_hint = True
+        except Exception:
+            pass
+    if not dual_fvg_hint:
+        dual_fvg_hint = bool(fvg_active and (bo_ok or bos_ok) and fvg_bonus >= 4.0)
+    if not stacked_fvg_hint:
+        stacked_fvg_hint = bool(dual_fvg_hint and fvg_bonus >= 5.0)
+    priority = 0
+    if overlap:
+        priority += 4
+    if htf_ltf:
+        priority += 3
+    if breakout_retest_poi:
+        priority += 3
+    if liquidity_reclaim:
+        priority += 4
+    if displacement_hint:
+        priority += 3
+    if dual_fvg_hint:
+        priority += 2
+    if stacked_fvg_hint:
+        priority += 1
+    if sweep_ok:
+        priority += 1
+    if entry_confluence >= 3:
+        priority += 1
+    return {
+        'bo_ok': bool(bo_ok),
+        'bos_ok': bool(bos_ok),
+        'confirm_ok': bool(confirm_ok),
+        'ob_ok': bool(ob_ok),
+        'fvg_ok': bool(fvg_active and fvg_dir_ok),
+        'fvg_active': bool(fvg_active),
+        'overlap': bool(overlap),
+        'htf_ltf': bool(htf_ltf),
+        'breakout_retest_poi': bool(breakout_retest_poi),
+        'liquidity_reclaim': bool(liquidity_reclaim),
+        'displacement_hint': bool(displacement_hint),
+        'dual_fvg_hint': bool(dual_fvg_hint),
+        'stacked_fvg_hint': bool(stacked_fvg_hint),
+        'disp_body_atr': float(disp_body_atr),
+        'disp_min': float(disp_min),
+        'entry_kind': entry_kind or '—',
+        'entry_confluence': int(entry_confluence),
+        'priority': int(priority),
+    }
+
+
+def _mid_smc_emit_route_label(route: str | None) -> str:
+    labels = {
+        'smc_ob_fvg_overlap': 'OB+FVG priority emit',
+        'smc_htf_ob_ltf_fvg': 'HTF OB + LTF FVG retest emit',
+        'smc_bos_retest_confirm': 'BOS → FVG/OB retest → confirm',
+        'smc_displacement_origin': 'displacement origin fast-path',
+        'smc_dual_fvg_origin': 'dual/stacked FVG origin',
+        'smc_liquidity_reclaim': 'liquidity sweep → reclaim → BOS continuation',
+    }
+    return labels.get(str(route or '').strip(), '')
+
+
+def _mid_smc_emit_route_priority_label(route: str | None) -> str:
+    labels = {
+        'smc_liquidity_reclaim': 'priority #1',
+        'smc_ob_fvg_overlap': 'priority #2',
+        'smc_htf_ob_ltf_fvg': 'priority #3',
+        'smc_bos_retest_confirm': 'priority #4',
+        'smc_displacement_origin': 'priority #5',
+        'smc_dual_fvg_origin': 'priority #6',
+    }
+    return labels.get(str(route or '').strip(), '')
+
+
+def _mid_compose_setup_label(setup_source: str | None, smc_route: str | None = None, smc_label: str | None = None) -> str:
+    base = _mid_setup_source_label(setup_source)
+    extra = str(smc_label or _mid_smc_emit_route_label(smc_route) or '').strip()
+    prio = _mid_smc_emit_route_priority_label(smc_route)
+    if extra and prio and prio not in extra:
+        extra = f"{extra} [{prio}]"
+    if base and extra:
+        return f"{base} | {extra}"
+    return base or extra
+
+
+def _mid_pick_smc_emit_route(*,
+                             direction: str,
+                             smc_snapshot: dict | None = None,
+                             origin_fast_ok: bool = False,
+                             breakout_fast_ok: bool = False,
+                             zone_valid: bool = False,
+                             in_zone_now: bool = False,
+                             liquidity_reclaim_ok: bool = False) -> dict:
+    smc = dict(smc_snapshot or {})
+    route = ''
+    setup_source = ''
+    priority = 0
+    if bool(liquidity_reclaim_ok or smc.get('liquidity_reclaim')):
+        route = 'smc_liquidity_reclaim'
+        setup_source = 'liquidity_reclaim'
+        priority = 130
+    elif bool(smc.get('overlap')) and (bool(origin_fast_ok) or bool(zone_valid and in_zone_now) or bool(breakout_fast_ok)):
+        route = 'smc_ob_fvg_overlap'
+        setup_source = 'origin' if origin_fast_ok else ('zone_retest' if (zone_valid and in_zone_now) else 'breakout')
+        priority = 120
+    elif bool(smc.get('htf_ltf')) and (bool(zone_valid and in_zone_now) or bool(origin_fast_ok) or bool(breakout_fast_ok)):
+        route = 'smc_htf_ob_ltf_fvg'
+        setup_source = 'zone_retest' if (zone_valid and in_zone_now) else ('origin' if origin_fast_ok else 'breakout')
+        priority = 110
+    elif bool(smc.get('breakout_retest_poi')) and bool(smc.get('confirm_ok')) and (bool(breakout_fast_ok) or bool(zone_valid and in_zone_now)):
+        route = 'smc_bos_retest_confirm'
+        setup_source = 'breakout' if breakout_fast_ok else 'zone_retest'
+        priority = 100
+    elif bool(origin_fast_ok) and bool(smc.get('displacement_hint')):
+        route = 'smc_displacement_origin'
+        setup_source = 'origin'
+        priority = 95
+    elif bool(origin_fast_ok) and bool(smc.get('dual_fvg_hint') or smc.get('stacked_fvg_hint')):
+        route = 'smc_dual_fvg_origin'
+        setup_source = 'origin'
+        priority = 92
+    elif bool(origin_fast_ok):
+        setup_source = 'origin'
+        priority = 60
+    elif bool(breakout_fast_ok):
+        setup_source = 'breakout'
+        priority = 55
+    elif bool(zone_valid and in_zone_now):
+        setup_source = 'zone_retest'
+        priority = 50
+    label = _mid_smc_emit_route_label(route)
+    return {
+        'route': str(route or ''),
+        'route_label': str(label or ''),
+        'setup_source': str(setup_source or ''),
+        'setup_label': _mid_compose_setup_label(setup_source, route, label),
+        'priority': int(priority),
+    }
+
+
 def _mid_smart_setup_origin_fastpath(*,
                                     market: str,
                                     direction: str,
@@ -10340,7 +10553,8 @@ def _mid_smart_setup_origin_fastpath(*,
                                     origin_vol_src: str | None = None,
                                     sweep_long: bool = False,
                                     sweep_short: bool = False,
-                                    risk_flags=None) -> tuple[bool, str, dict]:
+                                    risk_flags=None,
+                                    smc_snapshot: dict | None = None) -> tuple[bool, str, dict]:
     """Allow smart-setup to emit from the origin / first reclaim before retest.
 
     This fast-path is intentionally earlier than breakout_fastpath. It targets the
@@ -10360,6 +10574,13 @@ def _mid_smart_setup_origin_fastpath(*,
     bo = str(bo_rt_label or "").strip().upper()
     reg_u = str(regime or "").upper().strip()
     flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
+    smc = dict(smc_snapshot or {})
+    smc_priority = int(smc.get("priority") or 0)
+    smc_overlap = bool(smc.get("overlap"))
+    smc_htf_ltf = bool(smc.get("htf_ltf"))
+    smc_breakout_poi = bool(smc.get("breakout_retest_poi"))
+    smc_displacement = bool(smc.get("displacement_hint"))
+    smc_dual_fvg = bool(smc.get("dual_fvg_hint"))
 
     try:
         base_conf_need = int(float(os.getenv("MID_SMART_SETUP_EMIT_CONF", "90") or 90))
@@ -10401,6 +10622,25 @@ def _mid_smart_setup_origin_fastpath(*,
         allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_SMART_SETUP_ORIGIN_ALLOWED_REGIMES", "")) if str(x).strip()}
     except Exception:
         allowed_regimes = set()
+
+    if smc_priority >= 2:
+        try:
+            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMC_ORIGIN_CONF", "74") or 74)))
+        except Exception:
+            conf_need = min(int(conf_need), 74)
+        try:
+            min_body_atr = min(float(min_body_atr), float(os.getenv("MID_SMC_ORIGIN_MIN_BODY_ATR", "0.05") or 0.05))
+        except Exception:
+            pass
+        try:
+            max_move_atr = max(float(max_move_atr), float(os.getenv("MID_SMC_ORIGIN_MAX_MOVE_ATR", "1.35") or 1.35))
+        except Exception:
+            pass
+    if smc_overlap or smc_htf_ltf or smc_displacement or smc_dual_fvg:
+        try:
+            vol_need = min(float(vol_need), float(os.getenv("MID_SMC_ORIGIN_MIN_VOL_X", "0.0") or 0.0))
+        except Exception:
+            vol_need = 0.0
 
     hard_flags = {"scale_mismatch", "blocked", "structure_mismatch", "block:directional_contradiction"}
     active_hard_flags = sorted([x for x in flags if x in hard_flags])
@@ -10550,6 +10790,14 @@ def _mid_smart_setup_origin_fastpath(*,
         "dist_to_zone_atr": dist_atr_v,
         "dist_to_zone_pct": float(dist_pct_v),
         "hard_flags": list(active_hard_flags),
+        "smc_priority": int(smc_priority),
+        "smc_overlap": bool(smc_overlap),
+        "smc_htf_ltf": bool(smc_htf_ltf),
+        "smc_breakout_poi": bool(smc_breakout_poi),
+        "smc_displacement": bool(smc_displacement),
+        "smc_dual_fvg": bool(smc_dual_fvg),
+        "smc_entry_kind": str(smc.get("entry_kind") or "—"),
+        "smc_entry_confluence": int(smc.get("entry_confluence") or 0),
     })
 
     reasons: list[str] = []
@@ -10563,7 +10811,7 @@ def _mid_smart_setup_origin_fastpath(*,
         reasons.append(f"origin_fast_atr:{atr_v:.3f}<{atr_need:.3f}")
     if vol_v < float(vol_need_eff):
         reasons.append(f"origin_fast_vol:{vol_v:.2f}<{vol_need_eff:.2f}")
-    if bo_ok and age_v is not None and age_v <= 0 and body_atr_v <= 0.0 and (not age0_has_alt_impulse):
+    if bo_ok and age_v is not None and age_v <= 0 and body_atr_v <= 0.0 and (not age0_has_alt_impulse) and smc_priority < 2:
         _move_disp = "-" if move_v is None else f"{float(move_v):.2f}"
         reasons.append(f"origin_fast_no_impulse:body={body_atr_v:.2f}|vol={vol_v:.2f}|move={_move_disp}")
     _body_soft_bypass = False
@@ -10637,7 +10885,8 @@ def _mid_smart_setup_breakout_fastpath(*,
                                       bo_rt_label: str | None,
                                       dist_to_zone_atr: float | None,
                                       dist_to_zone_pct: float | None,
-                                      risk_flags=None) -> tuple[bool, str, dict]:
+                                      risk_flags=None,
+                                      smc_snapshot: dict | None = None) -> tuple[bool, str, dict]:
     """Allow smart-setup to emit on a fresh breakout before the retest.
 
     Default behavior is conservative: only fresh directional BO labels with adequate
@@ -10693,8 +10942,29 @@ def _mid_smart_setup_breakout_fastpath(*,
         allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_SMART_SETUP_BREAKOUT_ALLOWED_REGIMES", "TREND,TRENDING,EXPANSION")) if str(x).strip()}
     except Exception:
         allowed_regimes = {"TREND", "TRENDING", "EXPANSION"}
+    smc = dict(smc_snapshot or {})
+    smc_priority = int(smc.get("priority") or 0)
+    smc_overlap = bool(smc.get("overlap"))
+    smc_breakout_poi = bool(smc.get("breakout_retest_poi"))
+    smc_htf_ltf = bool(smc.get("htf_ltf"))
+    smc_dual_fvg = bool(smc.get("dual_fvg_hint"))
     hard_flags = {"far_zone", "scale_mismatch", "blocked", "structure_mismatch", "regime_range_no_breakout"}
     active_hard_flags = sorted([x for x in flags if x in hard_flags])
+    if (smc_overlap or smc_breakout_poi or smc_htf_ltf or smc_dual_fvg) and ("regime_range_no_breakout" in active_hard_flags):
+        active_hard_flags = [x for x in active_hard_flags if x != "regime_range_no_breakout"]
+    if smc_priority >= 2:
+        try:
+            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMC_BREAKOUT_CONF", "82") or 82)))
+        except Exception:
+            conf_need = min(int(conf_need), 82)
+        try:
+            vol_mult = min(float(vol_mult), float(os.getenv("MID_SMC_BREAKOUT_VOL_MULT", "0.70") or 0.70))
+        except Exception:
+            pass
+        try:
+            max_dist_atr = max(float(max_dist_atr), float(os.getenv("MID_SMC_BREAKOUT_MAX_ZONE_DIST_ATR", "0.75") or 0.75))
+        except Exception:
+            pass
 
     bo_ok = False
     if diru == "LONG":
@@ -10729,6 +10999,13 @@ def _mid_smart_setup_breakout_fastpath(*,
         "max_dist_atr": float(max_dist_atr),
         "max_dist_pct": float(max_dist_pct),
         "hard_flags": list(active_hard_flags),
+        "smc_priority": int(smc_priority),
+        "smc_overlap": bool(smc_overlap),
+        "smc_breakout_poi": bool(smc_breakout_poi),
+        "smc_htf_ltf": bool(smc_htf_ltf),
+        "smc_dual_fvg": bool(smc_dual_fvg),
+        "smc_entry_kind": str(smc.get("entry_kind") or "—"),
+        "smc_entry_confluence": int(smc.get("entry_confluence") or 0),
     })
 
     reasons: list[str] = []
@@ -10760,6 +11037,169 @@ def _mid_smart_setup_breakout_fastpath(*,
     meta["all_reasons"] = "breakout_fastpass"
     return (True, "breakout_fastpass", meta)
 
+
+
+
+def _mid_smc_route_emit_gate(*,
+                              route: str | None = None,
+                              market: str,
+                              direction: str,
+                              confidence: float,
+                              sig: "Signal" | None,
+                              atr_pct: float | None,
+                              vol_x: float | None,
+                              regime: str | None,
+                              risk_flags=None,
+                              zone_valid: bool,
+                              in_zone_now: bool,
+                              allow_no_zone_breakout: bool,
+                              near_extreme_ok: bool,
+                              near_extreme_reason: str = "",
+                              micro_trap_ok: bool = False,
+                              micro_trap_reason: str = "",
+                              late_entry_ok: bool = True,
+                              late_entry_reason: str = "",
+                              anti_bounce_ok: bool = True,
+                              anti_bounce_reason: str = "",
+                              breakout_fresh_ok: bool = False,
+                              breakout_fresh_reason: str = "",
+                              breakout_bypass_zone: bool = False,
+                              breakout_bypass_near_extreme: bool = False,
+                              breakout_bypass_late_entry: bool = False,
+                              origin_fast_ok: bool = False,
+                              origin_fast_reason: str = "",
+                              origin_bypass_zone: bool = False,
+                              origin_bypass_near_extreme: bool = False,
+                              origin_bypass_late_entry: bool = False,
+                              origin_bypass_anti_bounce: bool = False,
+                              origin_conf_need: float | None = None,
+                              smart_setup_trap_ok: bool = True,
+                              smart_setup_trap_reason: str = "",
+                              smart_setup_trap_meta: dict | None = None,
+                              zone_src: str | None = None,
+                              bo_rt_label: str | None = None,
+                              origin_body_atr: float | None = None,
+                              current_body_atr: float | None = None,
+                              origin_body_soft_bypass: bool = False,
+                              macd_hist: float | None = None) -> tuple[bool, str, dict]:
+    """Direct SMC emit gate.
+
+    High-priority SMC routes must not be reduced to a score bonus only.
+    For recognized SMC routes we keep only hard safety blocks and bypass the
+    generic instant gate. If no SMC route is present, we fall back to the
+    legacy _mid_instant_emit_gate.
+    """
+    route_s = str(route or "").strip()
+    if not route_s:
+        return _mid_instant_emit_gate(
+            market=market,
+            direction=direction,
+            confidence=confidence,
+            sig=sig,
+            atr_pct=atr_pct,
+            vol_x=vol_x,
+            regime=regime,
+            risk_flags=risk_flags,
+            zone_valid=zone_valid,
+            in_zone_now=in_zone_now,
+            allow_no_zone_breakout=allow_no_zone_breakout,
+            near_extreme_ok=near_extreme_ok,
+            near_extreme_reason=near_extreme_reason,
+            micro_trap_ok=micro_trap_ok,
+            micro_trap_reason=micro_trap_reason,
+            late_entry_ok=late_entry_ok,
+            late_entry_reason=late_entry_reason,
+            anti_bounce_ok=anti_bounce_ok,
+            anti_bounce_reason=anti_bounce_reason,
+            breakout_fresh_ok=breakout_fresh_ok,
+            breakout_fresh_reason=breakout_fresh_reason,
+            breakout_bypass_zone=breakout_bypass_zone,
+            breakout_bypass_near_extreme=breakout_bypass_near_extreme,
+            breakout_bypass_late_entry=breakout_bypass_late_entry,
+            origin_fast_ok=origin_fast_ok,
+            origin_fast_reason=origin_fast_reason,
+            origin_bypass_zone=origin_bypass_zone,
+            origin_bypass_near_extreme=origin_bypass_near_extreme,
+            origin_bypass_late_entry=origin_bypass_late_entry,
+            origin_bypass_anti_bounce=origin_bypass_anti_bounce,
+            origin_conf_need=origin_conf_need,
+            smart_setup_trap_ok=smart_setup_trap_ok,
+            smart_setup_trap_reason=smart_setup_trap_reason,
+            smart_setup_trap_meta=smart_setup_trap_meta,
+            zone_src=zone_src,
+            bo_rt_label=bo_rt_label,
+            origin_body_atr=origin_body_atr,
+            current_body_atr=current_body_atr,
+            origin_body_soft_bypass=origin_body_soft_bypass,
+            macd_hist=macd_hist,
+        )
+
+    meta: dict[str, object] = {"route": route_s, "gate": "smc_direct_emit"}
+    blocks: list[str] = []
+    flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
+    diru = str(direction or "").upper().strip()
+    rr_val = None
+    try:
+        rr_val = float(getattr(sig, 'rr', None) if sig is not None else None)
+    except Exception:
+        rr_val = None
+    if diru not in ("LONG", "SHORT"):
+        blocks.append("direction_missing")
+    if rr_val is not None and rr_val < 1.15:
+        blocks.append("rr_too_low")
+    if not smart_setup_trap_ok and any(k in str(smart_setup_trap_reason or '').lower() for k in ('hard', 'invalid', 'conflict', 'against')):
+        blocks.append(f"trap:{smart_setup_trap_reason}")
+    if not micro_trap_ok and any(k in str(micro_trap_reason or '').lower() for k in ('hard', 'invalid', 'conflict', 'against')):
+        blocks.append(f"micro_trap:{micro_trap_reason}")
+    if 'direction_conflict' in flags or 'directional_contradiction' in flags or 'structure_mismatch' in flags:
+        blocks.append('direction_conflict')
+    if 'invalid_zone' in flags or 'dead_zone' in flags:
+        blocks.append('invalid_zone')
+
+    route_need_origin = route_s in ('smc_displacement_origin', 'smc_dual_fvg_origin')
+    route_need_zone = route_s in ('smc_ob_fvg_overlap', 'smc_htf_ob_ltf_fvg')
+    route_need_breakout = route_s == 'smc_bos_retest_confirm'
+    route_liq = route_s == 'smc_liquidity_reclaim'
+
+    if route_need_origin and not bool(origin_fast_ok):
+        blocks.append('origin_not_ready')
+    if route_need_breakout and not bool(breakout_fresh_ok or (zone_valid and in_zone_now)):
+        blocks.append('breakout_not_ready')
+    if route_need_zone and not bool((zone_valid and in_zone_now) or origin_fast_ok or breakout_fresh_ok):
+        blocks.append('zone_not_ready')
+    if route_liq and not bool((zone_valid and in_zone_now) or breakout_fresh_ok or origin_fast_ok or allow_no_zone_breakout):
+        blocks.append('liquidity_reclaim_not_ready')
+
+    if blocks:
+        meta['blocked_by'] = list(blocks)
+        meta['soft_bypassed'] = ['score', 'confidence', 'vol_x', 'atr_pct', 'late_entry', 'near_extreme', 'anti_bounce']
+        return (False, f"smc_hard_block:{route_s}", meta)
+
+    try:
+        if sig is not None:
+            setattr(sig, 'emit_route', route_s)
+            if not getattr(sig, 'smc_setup_route', ''):
+                setattr(sig, 'smc_setup_route', route_s)
+            if not getattr(sig, 'smc_setup_label', ''):
+                setattr(sig, 'smc_setup_label', _mid_smc_emit_route_label(route_s))
+            if not getattr(sig, 'ui_setup_label', ''):
+                setattr(sig, 'ui_setup_label', _mid_compose_setup_label(getattr(sig, 'setup_source', ''), route_s))
+    except Exception:
+        pass
+
+    if route_need_origin:
+        meta['fast_path'] = 'origin'
+        return (True, f"smc_direct_emit:{route_s}", meta)
+    if route_liq:
+        meta['fast_path'] = 'liquidity_reclaim'
+        return (True, f"smc_direct_emit:{route_s}", meta)
+    if route_need_breakout:
+        meta['fast_path'] = 'breakout'
+        return (True, f"smc_direct_emit:{route_s}", meta)
+    if route_need_zone:
+        meta['fast_path'] = 'zone_retest'
+        return (True, f"smc_direct_emit:{route_s}", meta)
+    return (True, f"smc_direct_emit:{route_s}", meta)
 
 def _mid_instant_emit_gate(*,
                            market: str,
@@ -12181,8 +12621,8 @@ def _mid_embed_setup_source_in_orig_text(orig_text: str | None, sig: Signal | No
             label = str(getattr(sig, "ui_setup_label", "") or "").strip()
             if not label:
                 emit_route = str(getattr(sig, "emit_route", "") or "").strip()
-                if emit_route == "liquidity_reclaim_emit":
-                    label = _mid_setup_source_label("liquidity_reclaim")
+                if emit_route in {"liquidity_reclaim_emit", "smc_liquidity_reclaim"}:
+                    label = _mid_compose_setup_label("liquidity_reclaim", "smc_liquidity_reclaim")
             if not label:
                 label = str(getattr(sig, "setup_source_label", "") or "").strip()
             if not label:
@@ -12206,15 +12646,18 @@ def _mid_embed_setup_source_in_orig_text(orig_text: str | None, sig: Signal | No
         pass
     return f"{text.rstrip()}\n{line}".strip()
 
-def _mid_pick_scan_setup_source(*, origin_fast_ok: bool = False, breakout_fast_ok: bool = False, zone_valid: bool = False, in_zone_now: bool = False) -> str:
-    """Smart-setup priority at scan time: origin > breakout > zone-touch/retest."""
-    if bool(origin_fast_ok):
-        return "origin"
-    if bool(breakout_fast_ok):
-        return "breakout"
-    if bool(zone_valid) and bool(in_zone_now):
-        return "zone_retest"
-    return ""
+def _mid_pick_scan_setup_source(*, origin_fast_ok: bool = False, breakout_fast_ok: bool = False, zone_valid: bool = False, in_zone_now: bool = False, smc_snapshot: dict | None = None) -> str:
+    """Return canonical setup_source while SMC details are preserved separately."""
+    info = _mid_pick_smc_emit_route(
+        direction='',
+        smc_snapshot=smc_snapshot,
+        origin_fast_ok=origin_fast_ok,
+        breakout_fast_ok=breakout_fast_ok,
+        zone_valid=zone_valid,
+        in_zone_now=in_zone_now,
+        liquidity_reclaim_ok=False,
+    )
+    return str(info.get('setup_source') or '')
 
 
 def _mid_liquidity_reclaim_ready(ta: dict, rec: dict | None = None, *, now_ts: float | None = None) -> tuple[bool, str, dict]:
@@ -18277,6 +18720,20 @@ def _fmt_ta_block_mid(ta: Dict[str, Any], mode: str = "") -> str:
                 f"➕ Additional TA: BO/RT: {bo_rt} | OB zone: {ob_zone_txt} | FVG: {fvg_txt}",
                 f"➕ HTF struct: {htf_struct} | Range pos: {range_pos} | RSI div: {rsi_div}",
             ])
+
+        try:
+            _setup_label = str(ta.get("ui_setup_label") or ta.get("smc_setup_label") or ta.get("setup_source_label") or "").strip()
+            _setup_route = str(ta.get("smc_setup_route") or ta.get("emit_route") or "").strip()
+            if _setup_route and (_setup_route.startswith("smc_") or _setup_route == "liquidity_reclaim_emit"):
+                _prio = _mid_smc_emit_route_priority_label(_setup_route)
+                if _setup_label and _prio and _prio not in _setup_label:
+                    _setup_label = f"{_setup_label} [{_prio}]"
+                elif not _setup_label:
+                    _setup_label = _mid_compose_setup_label(ta.get("setup_source"), _setup_route)
+            if _setup_label:
+                lines.append(f"🧭 Smart-setup: {_setup_label}")
+        except Exception:
+            pass
 
         return "\n".join(lines)
     except Exception:
@@ -30987,6 +31444,15 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                             _origin_fast_reason = ""
                                             _origin_fast_meta = {}
                                             try:
+                                                _smc_snapshot = _mid_smc_confluence_snapshot(
+                                                    direction=diru,
+                                                    ta=(base_r if ("base_r" in locals() and isinstance(base_r, dict)) else {}),
+                                                    rec=rec,
+                                                    bo_rt_label=str(_bo_rt_now),
+                                                )
+                                            except Exception:
+                                                _smc_snapshot = {}
+                                            try:
                                                 _origin_conf_need = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF", str(min(int(_smart_conf_need), 86))) or min(int(_smart_conf_need), 86)))
                                             except Exception:
                                                 _origin_conf_need = min(int(_smart_conf_need), 86)
@@ -31012,6 +31478,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     sweep_long=bool((base_r.get("sweep_long") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("sweep_long") or False)),
                                                     sweep_short=bool((base_r.get("sweep_short") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("sweep_short") or False)),
                                                     risk_flags=risk_flags,
+                                                    smc_snapshot=_smc_snapshot,
                                                 )
                                             except Exception as _origin_exc:
                                                 _origin_fast_ok = False
@@ -31052,6 +31519,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                     dist_to_zone_atr=_dist_now_atr,
                                                     dist_to_zone_pct=float(_dist_now_pct),
                                                     risk_flags=risk_flags,
+                                                    smc_snapshot=_smc_snapshot,
                                                 )
                                             except Exception as _bo_exc:
                                                 _breakout_fast_ok = False
@@ -31074,19 +31542,37 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 allow_no_zone_breakout=bool(_smart_emit_if_no_zone),
                                                 confidence=float(_conf_now),
                                             )
-                                            _smart_emit_source = _mid_pick_scan_setup_source(
+                                            _smc_route_info = _mid_pick_smc_emit_route(
+                                                direction=diru,
+                                                smc_snapshot=_smc_snapshot,
                                                 origin_fast_ok=bool(_origin_fast_ok),
                                                 breakout_fast_ok=bool(_breakout_fast_ok),
                                                 zone_valid=bool(_zone_valid),
                                                 in_zone_now=bool(_in_zone_now),
+                                                liquidity_reclaim_ok=False,
                                             )
+                                            _smart_emit_source = str((_smc_route_info or {}).get("setup_source") or "")
+                                            _smart_emit_route = str((_smc_route_info or {}).get("route") or "")
+                                            _smart_emit_route_label = str((_smc_route_info or {}).get("route_label") or "")
+                                            _smart_emit_setup_label = str((_smc_route_info or {}).get("setup_label") or _mid_setup_source_label(_smart_emit_source) or "")
                                             _mid_apply_signal_setup_source(sig_emit, _smart_emit_source)
+                                            try:
+                                                setattr(sig_emit, "emit_route", _smart_emit_route or getattr(sig_emit, "emit_route", "") or "")
+                                                setattr(sig_emit, "smc_setup_route", _smart_emit_route)
+                                                setattr(sig_emit, "smc_setup_label", _smart_emit_route_label)
+                                                setattr(sig_emit, "ui_setup_label", _smart_emit_setup_label)
+                                            except Exception:
+                                                pass
                                             try:
                                                 rec["setup_source"] = str(_smart_emit_source or "")
                                                 rec["setup_source_label"] = _mid_setup_source_label(_smart_emit_source)
+                                                rec["smc_setup_route"] = _smart_emit_route
+                                                rec["smc_setup_label"] = _smart_emit_route_label
+                                                rec["ui_setup_label"] = _smart_emit_setup_label
                                             except Exception:
                                                 pass
-                                            _emit_now, _emit_reason, _emit_meta = _mid_instant_emit_gate(
+                                            _emit_now, _emit_reason, _emit_meta = _mid_smc_route_emit_gate(
+                                                route=_smart_emit_route,
                                                 market=marketu,
                                                 direction=diru,
                                                 confidence=float(_conf_now),
@@ -31180,6 +31666,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 rec["smart_emit_meta"] = dict(_emit_meta or {})
                                                 rec["smart_emit_source"] = str(_smart_emit_source or "")
                                                 rec["smart_emit_source_label"] = _mid_setup_source_label(_smart_emit_source)
+                                                rec["smc_snapshot"] = dict(_smc_snapshot or {})
                                             except Exception:
                                                 pass
 
@@ -31394,8 +31881,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 setup_source_label=_mid_setup_source_label(_liq_source),
                                             )
                                             try:
-                                                setattr(sig_lr, "emit_route", "liquidity_reclaim_emit")
-                                                setattr(sig_lr, "ui_setup_label", _mid_setup_source_label("liquidity_reclaim"))
+                                                setattr(sig_lr, "emit_route", "smc_liquidity_reclaim")
+                                                setattr(sig_lr, "smc_setup_route", "smc_liquidity_reclaim")
+                                                setattr(sig_lr, "smc_setup_label", _mid_smc_emit_route_label("smc_liquidity_reclaim"))
+                                                setattr(sig_lr, "ui_setup_label", _mid_compose_setup_label("liquidity_reclaim", "smc_liquidity_reclaim"))
                                             except Exception:
                                                 pass
 
