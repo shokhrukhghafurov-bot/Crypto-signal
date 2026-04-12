@@ -2403,6 +2403,17 @@ def _mid_final_emit_gate_reason(*,
     except Exception:
         fresh_anchor = bool(breakout_fresh_ok)
     try:
+        emit_route = str((getattr(sig, "emit_route", None) if sig is not None else "") or (gate_meta or {}).get("route") or (it or {}).get("smc_setup_route") or "").strip()
+    except Exception:
+        emit_route = ""
+    smc_direct_route = bool(emit_route.startswith("smc_"))
+    try:
+        gate_kind = str((gate_meta or {}).get("gate") or "").strip().lower()
+    except Exception:
+        gate_kind = ""
+    smc_direct_route = bool(smc_direct_route or gate_kind == "smc_direct_emit")
+
+    try:
         hard_anchor_max = float(os.getenv("MID_FINAL_EMIT_MAX_ANCHOR_SLIP_ATR_FRESH", "0.75") if fresh_anchor else os.getenv("MID_FINAL_EMIT_MAX_ANCHOR_SLIP_ATR", "0.45"))
     except Exception:
         hard_anchor_max = 0.75 if fresh_anchor else 0.45
@@ -2411,6 +2422,17 @@ def _mid_final_emit_gate_reason(*,
             hard_anchor_max += float(os.getenv("MID_FINAL_EMIT_IN_ZONE_SLIP_PAD", "0.10") or 0.10)
     except Exception:
         pass
+    if smc_direct_route:
+        try:
+            smc_anchor_max = float(os.getenv("MID_SMC_FINAL_MAX_ANCHOR_SLIP_ATR_FRESH", "2.20") if fresh_anchor else os.getenv("MID_SMC_FINAL_MAX_ANCHOR_SLIP_ATR", "1.80"))
+        except Exception:
+            smc_anchor_max = 2.20 if fresh_anchor else 1.80
+        try:
+            if bool(in_zone_now):
+                smc_anchor_max += float(os.getenv("MID_SMC_FINAL_IN_ZONE_SLIP_PAD", "0.20") or 0.20)
+        except Exception:
+            pass
+        hard_anchor_max = max(float(hard_anchor_max), float(smc_anchor_max))
     if anchor_far and float(anchor_slip_atr or 0.0) > float(hard_anchor_max):
         return f"late_from_anchor:{float(anchor_slip_atr):.2f}>{float(hard_anchor_max):.2f}"
 
@@ -2471,17 +2493,19 @@ def _mid_final_emit_gate_reason(*,
     except Exception:
         breakout_ok = bool(breakout_fresh_ok)
 
-    _weak_reason = _mid_futures_short_weak_emit_reason(
-        market=market_u,
-        direction=direction_u,
-        risk_flags=risk_flags_use,
-        vol_x=vol_v,
-        body_atr=body_v,
-        bo_rt_label=bo_s,
-        breakout_fresh_ok=bool(breakout_ok),
-        micro_trap_ok=bool(micro_ok),
-        macd_hist=macd_v,
-    )
+    _weak_reason = ""
+    if not smc_direct_route:
+        _weak_reason = _mid_futures_short_weak_emit_reason(
+            market=market_u,
+            direction=direction_u,
+            risk_flags=risk_flags_use,
+            vol_x=vol_v,
+            body_atr=body_v,
+            bo_rt_label=bo_s,
+            breakout_fresh_ok=bool(breakout_ok),
+            micro_trap_ok=bool(micro_ok),
+            macd_hist=macd_v,
+        )
     if _weak_reason:
         return str(_weak_reason)
 
@@ -2499,7 +2523,7 @@ def _mid_final_emit_gate_reason(*,
                         break
         except Exception:
             anti_reason = anti_reason or ""
-    if anti_reason:
+    if anti_reason and (not smc_direct_route):
         try:
             relief = bool((gate_meta or {}).get("fut_short_anti_bounce_relief"))
         except Exception:
