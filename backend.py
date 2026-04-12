@@ -12064,6 +12064,7 @@ def _mid_setup_source_normalize(source: str | None) -> str:
       - breakout
       - zone_retest
       - normal_pending_trigger
+      - liquidity_reclaim
 
     We also accept legacy Russian labels / loose variants so old rows and
     previously saved orig_text still normalize to the new canonical values.
@@ -12092,8 +12093,14 @@ def _mid_setup_source_normalize(source: str | None) -> str:
         "обычный pending trigger": "normal_pending_trigger",
         "pending": "normal_pending_trigger",
         "pending_trigger": "normal_pending_trigger",
+        "liquidity_reclaim": "liquidity_reclaim",
+        "liquidity reclaim": "liquidity_reclaim",
+        "liquidity_reclaim_emit": "liquidity_reclaim",
+        "reclaim": "liquidity_reclaim",
+        "liquidity sweep reclaim": "liquidity_reclaim",
+        "возврат после снятия ликвидности": "liquidity_reclaim",
     }
-    return aliases.get(s, s if s in {"origin", "breakout", "zone_retest", "normal_pending_trigger"} else "")
+    return aliases.get(s, s if s in {"origin", "breakout", "zone_retest", "normal_pending_trigger", "liquidity_reclaim"} else "")
 
 
 def _mid_setup_source_label(source: str | None) -> str:
@@ -12104,6 +12111,7 @@ def _mid_setup_source_label(source: str | None) -> str:
       - breakout — если вход взят на пробое
       - zone retest — только если был реальный возврат/ретест зоны
       - normal pending trigger — для обычного pending trigger без явного retest
+      - liquidity reclaim — отдельный reclaim-setup после съёма ликвидности
     """
     src = _mid_setup_source_normalize(source)
     labels = {
@@ -12111,6 +12119,7 @@ def _mid_setup_source_label(source: str | None) -> str:
         "breakout": "breakout",
         "zone_retest": "zone retest",
         "normal_pending_trigger": "normal pending trigger",
+        "liquidity_reclaim": "liquidity reclaim",
     }
     return labels.get(src, "")
 
@@ -12153,7 +12162,7 @@ def _mid_embed_setup_source_in_orig_text(orig_text: str | None, sig: Signal | No
             if not label:
                 emit_route = str(getattr(sig, "emit_route", "") or "").strip()
                 if emit_route == "liquidity_reclaim_emit":
-                    label = "liquidity_reclaim_emit"
+                    label = _mid_setup_source_label("liquidity_reclaim")
             if not label:
                 label = str(getattr(sig, "setup_source_label", "") or "").strip()
             if not label:
@@ -31339,14 +31348,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                             pass
                                         if _liq_ok:
                                             try:
-                                                _liq_source = str(rec.get("setup_source") or "").strip() or _mid_pick_scan_setup_source(
-                                                    origin_fast_ok=bool(rec.get("smart_origin_fast_ok") or False),
-                                                    breakout_fast_ok=bool(rec.get("smart_breakout_fast_ok") or False),
-                                                    zone_valid=bool((_liq_meta or {}).get("zone_valid") or False),
-                                                    in_zone_now=bool((_liq_meta or {}).get("reclaim_ok") or False),
-                                                )
+                                                _liq_source = "liquidity_reclaim"
                                             except Exception:
-                                                _liq_source = ""
+                                                _liq_source = "liquidity_reclaim"
                                             _liq_note_prefix = str(risk_note or "").strip()
                                             _liq_note = (_liq_note_prefix + (" | " if _liq_note_prefix else "") + "liquidity_reclaim_emit=1 | levels_anchor=1").strip()
                                             sig_lr = Signal(
@@ -31371,7 +31375,7 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                             )
                                             try:
                                                 setattr(sig_lr, "emit_route", "liquidity_reclaim_emit")
-                                                setattr(sig_lr, "ui_setup_label", "liquidity_reclaim_emit")
+                                                setattr(sig_lr, "ui_setup_label", _mid_setup_source_label("liquidity_reclaim"))
                                             except Exception:
                                                 pass
 
