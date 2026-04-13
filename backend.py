@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-04-13_smc_emit_engine_v8_label_fix"
+MID_BUILD_TAG = "MID_BUILD_2026-04-13_institutional_trigger_v3_fix"
 
 import asyncio
 import json
@@ -10427,6 +10427,32 @@ def _mid_smc_confluence_snapshot(*,
         priority += 1
     if entry_confluence >= 3:
         priority += 1
+    choch_up = bool(t.get('choch_up_5m') if t.get('choch_up_5m') is not None else (t.get('choch_up') if t.get('choch_up') is not None else (r.get('choch_up_5m') if r.get('choch_up_5m') is not None else r.get('choch_up'))))
+    choch_down = bool(t.get('choch_down_5m') if t.get('choch_down_5m') is not None else (t.get('choch_down') if t.get('choch_down') is not None else (r.get('choch_down_5m') if r.get('choch_down_5m') is not None else r.get('choch_down'))))
+    mss_up = bool(t.get('mss_up_5m') if t.get('mss_up_5m') is not None else (t.get('mss_up') if t.get('mss_up') is not None else (r.get('mss_up_5m') if r.get('mss_up_5m') is not None else r.get('mss_up'))))
+    mss_down = bool(t.get('mss_down_5m') if t.get('mss_down_5m') is not None else (t.get('mss_down') if t.get('mss_down') is not None else (r.get('mss_down_5m') if r.get('mss_down_5m') is not None else r.get('mss_down'))))
+    mss_ok = (bos_ok or choch_up or mss_up) if diru == 'LONG' else (bos_ok or choch_down or mss_down if diru == 'SHORT' else False)
+    smt_bull = bool(t.get('smt_bull') if t.get('smt_bull') is not None else (t.get('smt_long') if t.get('smt_long') is not None else (r.get('smt_bull') if r.get('smt_bull') is not None else r.get('smt_long'))))
+    smt_bear = bool(t.get('smt_bear') if t.get('smt_bear') is not None else (t.get('smt_short') if t.get('smt_short') is not None else (r.get('smt_bear') if r.get('smt_bear') is not None else r.get('smt_short'))))
+    smt_ok_raw = t.get('smt_ok') if t.get('smt_ok') is not None else r.get('smt_ok')
+    smt_present = any((
+        t.get('smt_ok') is not None,
+        r.get('smt_ok') is not None,
+        t.get('smt_bull') is not None,
+        t.get('smt_bear') is not None,
+        t.get('smt_long') is not None,
+        t.get('smt_short') is not None,
+        r.get('smt_bull') is not None,
+        r.get('smt_bear') is not None,
+        r.get('smt_long') is not None,
+        r.get('smt_short') is not None,
+    ))
+    if smt_ok_raw is not None:
+        smt_ok = bool(smt_ok_raw)
+        smt_present = True
+    else:
+        smt_ok = smt_bull if diru == 'LONG' else (smt_bear if diru == 'SHORT' else False)
+        smt_present = bool(smt_present or smt_ok)
     return {
         'bo_ok': bool(bo_ok),
         'bos_ok': bool(bos_ok),
@@ -10443,6 +10469,10 @@ def _mid_smc_confluence_snapshot(*,
         'stacked_fvg_hint': bool(stacked_fvg_hint),
         'disp_body_atr': float(disp_body_atr),
         'disp_min': float(disp_min),
+        'mss_ok': bool(mss_ok),
+        'choch_ok': bool(mss_ok),
+        'smt_ok': bool(smt_ok),
+        'smt_present': bool(smt_present),
         'entry_kind': entry_kind or '—',
         'entry_confluence': int(entry_confluence),
         'priority': int(priority),
@@ -10474,7 +10504,14 @@ def _mid_smc_emit_route_priority_label(route: str | None) -> str:
 
 
 def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = None) -> dict:
-    """Route-specific institutional confirmation profile."""
+    """Route-specific institutional confirmation profile.
+
+    v3 adds stricter institutional confirmations:
+      - MSS / CHOCH quality check on confirmation routes
+      - optional SMT confluence when the feed provides it
+      - reclaim hold inside the zone before emit
+      - fake-BOS protection via minimum displacement body/ATR
+    """
     route_s = str(route or "").strip()
     reg_u = str(regime or "").upper().strip()
     is_range_like = ("CHOPPY" in reg_u) or ("RANGE" in reg_u)
@@ -10484,17 +10521,59 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
         "require_bos": False,
         "require_sweep": False,
         "require_displacement": False,
+        "require_retest": False,
+        "require_mss": False,
+        "prefer_smt": False,
+        "require_reclaim_hold": False,
+        "require_fake_bos_filter": False,
         "allow_direct_emit": True,
         "min_conf_direct": 0,
     }
     if route_s == "smc_liquidity_reclaim":
-        prof.update({"require_reclaim": True, "require_bos": True, "require_sweep": True, "min_conf_direct": 78})
+        prof.update({
+            "require_reclaim": True,
+            "require_bos": True,
+            "require_sweep": True,
+            "require_retest": True,
+            "require_mss": True,
+            "prefer_smt": True,
+            "require_reclaim_hold": True,
+            "require_fake_bos_filter": True,
+            "min_conf_direct": 78,
+        })
     elif route_s in ("smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg"):
-        prof.update({"require_reclaim": True, "require_bos": True, "require_sweep": bool(is_range_like), "min_conf_direct": 80 if is_range_like else 78})
+        prof.update({
+            "require_reclaim": True,
+            "require_bos": True,
+            "require_sweep": bool(is_range_like),
+            "require_retest": True,
+            "require_mss": True,
+            "prefer_smt": True,
+            "require_reclaim_hold": True,
+            "require_fake_bos_filter": True,
+            "min_conf_direct": 80 if is_range_like else 78,
+        })
     elif route_s == "smc_bos_retest_confirm":
-        prof.update({"require_reclaim": bool(is_range_like), "require_bos": True, "require_sweep": bool(is_range_like), "min_conf_direct": 80 if is_range_like else 76})
+        prof.update({
+            "require_reclaim": bool(is_range_like),
+            "require_bos": True,
+            "require_sweep": bool(is_range_like),
+            "require_retest": True,
+            "require_mss": True,
+            "require_reclaim_hold": True,
+            "require_fake_bos_filter": True,
+            "min_conf_direct": 80 if is_range_like else 76,
+        })
     elif route_s in ("smc_displacement_origin", "smc_dual_fvg_origin"):
-        prof.update({"require_reclaim": True, "require_bos": True, "require_sweep": bool(is_range_like), "require_displacement": True, "allow_direct_emit": False, "min_conf_direct": 84 if is_range_like else 82})
+        prof.update({
+            "require_reclaim": True,
+            "require_bos": True,
+            "require_sweep": bool(is_range_like),
+            "require_displacement": True,
+            "require_fake_bos_filter": True,
+            "allow_direct_emit": False,
+            "min_conf_direct": 84 if is_range_like else 82,
+        })
     return prof
 
 
@@ -10566,21 +10645,21 @@ def _mid_pick_smc_emit_route(*,
     route = ''
     setup_source = ''
     priority = 0
-    if bool(liquidity_reclaim_ok or smc.get('liquidity_reclaim')):
+    if bool(liquidity_reclaim_ok or smc.get('liquidity_reclaim')) and bool(zone_valid and in_zone_now):
         route = 'smc_liquidity_reclaim'
         setup_source = 'liquidity_reclaim'
         priority = 130
-    elif bool(smc.get('overlap')) and (bool(origin_fast_ok) or bool(zone_valid and in_zone_now) or bool(breakout_fast_ok)):
+    elif bool(smc.get('overlap')) and bool(zone_valid and in_zone_now):
         route = 'smc_ob_fvg_overlap'
-        setup_source = 'origin' if origin_fast_ok else ('zone_retest' if (zone_valid and in_zone_now) else 'breakout')
+        setup_source = 'zone_retest'
         priority = 120
-    elif bool(smc.get('htf_ltf')) and (bool(zone_valid and in_zone_now) or bool(origin_fast_ok) or bool(breakout_fast_ok)):
+    elif bool(smc.get('htf_ltf')) and bool(zone_valid and in_zone_now):
         route = 'smc_htf_ob_ltf_fvg'
-        setup_source = 'zone_retest' if (zone_valid and in_zone_now) else ('origin' if origin_fast_ok else 'breakout')
+        setup_source = 'zone_retest'
         priority = 110
-    elif bool(smc.get('breakout_retest_poi')) and bool(smc.get('confirm_ok')) and (bool(breakout_fast_ok) or bool(zone_valid and in_zone_now)):
+    elif bool(smc.get('breakout_retest_poi')) and bool(smc.get('confirm_ok')) and bool(zone_valid and in_zone_now):
         route = 'smc_bos_retest_confirm'
-        setup_source = 'breakout' if breakout_fast_ok else 'zone_retest'
+        setup_source = 'zone_retest'
         priority = 100
     elif bool(origin_fast_ok) and bool(smc.get('displacement_hint')):
         route = 'smc_displacement_origin'
@@ -11251,12 +11330,12 @@ def _mid_smc_route_emit_gate(*,
         blocks.append('origin_wait_confirm')
     if route_need_origin and (("CHOPPY" in reg_u) or ("RANGE" in reg_u)):
         blocks.append('origin_range_block')
-    if route_need_breakout and not bool(breakout_fresh_ok or (zone_valid and in_zone_now)):
-        blocks.append('breakout_not_ready')
-    if route_need_zone and not bool((zone_valid and in_zone_now) or origin_fast_ok or breakout_fresh_ok):
-        blocks.append('zone_not_ready')
-    if route_liq and not bool((zone_valid and in_zone_now) or breakout_fresh_ok or origin_fast_ok or allow_no_zone_breakout):
-        blocks.append('liquidity_reclaim_not_ready')
+    if route_need_breakout and not bool(zone_valid and in_zone_now):
+        blocks.append('breakout_retest_not_ready')
+    if route_need_zone and not bool(zone_valid and in_zone_now):
+        blocks.append('zone_retest_not_ready')
+    if route_liq and not bool(zone_valid and in_zone_now):
+        blocks.append('liquidity_retest_not_ready')
 
     if blocks:
         meta['blocked_by'] = list(blocks)
@@ -26171,7 +26250,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 reclaim_eps = 0.0006
                             # Reclaim only makes sense when we have a real zone (entry_low/entry_high).
-                            reclaim_ok = True
+                            # Do not default to True here: otherwise raw OB/FVG touches can pass as
+                            # institutional reclaims without a real reclaim above/below the zone.
+                            reclaim_ok = False
                             try:
                                 _lo = float(entry_low) if (entry_low is not None) else 0.0
                                 _hi = float(entry_high) if (entry_high is not None) else 0.0
@@ -26181,7 +26262,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     elif diru == "SHORT":
                                         reclaim_ok = bool(close5 <= (_lo * (1.0 - reclaim_eps)))
                             except Exception:
-                                reclaim_ok = True
+                                reclaim_ok = False
 
                             try:
                                 it["_trig_checks"]["reclaim"] = "pass" if reclaim_ok else "fail"
@@ -26355,6 +26436,99 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             # Save regime/disp for downstream volume filter + logs
                             it["_trig_inst_regime"] = reg
                             it["_trig_inst_disp_x"] = float(disp_x)
+                            # v3 institutional confirmations: MSS/CHOCH, SMT, reclaim hold and fake-BOS filter.
+                            try:
+                                smc_snap = it.get("smc_snapshot") if isinstance(it.get("smc_snapshot"), dict) else {}
+                            except Exception:
+                                smc_snap = {}
+                            choch_up = bool(ta.get("choch_up_5m") if ta.get("choch_up_5m") is not None else (ta.get("choch_up") if ta.get("choch_up") is not None else smc_snap.get("choch_ok")))
+                            choch_down = bool(ta.get("choch_down_5m") if ta.get("choch_down_5m") is not None else (ta.get("choch_down") if ta.get("choch_down") is not None else smc_snap.get("choch_ok")))
+                            mss_up = bool(ta.get("mss_up_5m") if ta.get("mss_up_5m") is not None else (ta.get("mss_up") if ta.get("mss_up") is not None else smc_snap.get("mss_ok")))
+                            mss_down = bool(ta.get("mss_down_5m") if ta.get("mss_down_5m") is not None else (ta.get("mss_down") if ta.get("mss_down") is not None else smc_snap.get("mss_ok")))
+                            mss_ok = bool(bos_ok or (mss_up or choch_up) if diru == "LONG" else (bos_ok or mss_down or choch_down))
+                            try:
+                                _v = os.getenv("MID_INST_REQUIRE_MSS")
+                                req_mss_base = str(_v or "0").strip().lower() in ("1","true","yes","on") if _v is not None and str(_v).strip() != "" else False
+                            except Exception:
+                                req_mss_base = False
+                            req_mss = bool(req_mss_base or route_prof.get("require_mss"))
+                            try:
+                                it["_trig_reqs"]["mss"] = bool(req_mss)
+                                it["_trig_checks"]["mss"] = ("skip" if (not req_mss) else ("pass" if mss_ok else "fail"))
+                            except Exception:
+                                pass
+
+                            smt_present = False
+                            try:
+                                smt_present = bool((ta.get("smt_ok") is not None) or (ta.get("smt_bull") is not None) or (ta.get("smt_bear") is not None) or (ta.get("smt_long") is not None) or (ta.get("smt_short") is not None) or smc_snap.get("smt_present"))
+                            except Exception:
+                                smt_present = bool(smc_snap.get("smt_present"))
+                            if ta.get("smt_ok") is not None:
+                                smt_ok = bool(ta.get("smt_ok"))
+                            elif diru == "LONG":
+                                smt_ok = bool(ta.get("smt_bull") if ta.get("smt_bull") is not None else (ta.get("smt_long") if ta.get("smt_long") is not None else smc_snap.get("smt_ok")))
+                            else:
+                                smt_ok = bool(ta.get("smt_bear") if ta.get("smt_bear") is not None else (ta.get("smt_short") if ta.get("smt_short") is not None else smc_snap.get("smt_ok")))
+                            try:
+                                _v = os.getenv("MID_INST_REQUIRE_SMT")
+                                req_smt_force = str(_v or "0").strip().lower() in ("1","true","yes","on") if _v is not None and str(_v).strip() != "" else False
+                            except Exception:
+                                req_smt_force = False
+                            req_smt = bool(req_smt_force or (route_prof.get("prefer_smt") and smt_present))
+                            try:
+                                it["_trig_reqs"]["smt"] = bool(req_smt)
+                                it["_trig_checks"]["smt"] = ("skip" if (not req_smt) else ("pass" if smt_ok else "fail"))
+                            except Exception:
+                                pass
+
+                            try:
+                                reclaim_hold_bars = int(float(os.getenv("MID_INST_RECLAIM_HOLD_BARS", "1") or 1))
+                            except Exception:
+                                reclaim_hold_bars = 1
+                            if reclaim_hold_bars < 0:
+                                reclaim_hold_bars = 0
+                            req_reclaim_hold = bool(route_prof.get("require_reclaim_hold")) and reclaim_hold_bars > 0
+                            reclaim_hold_ok = True
+                            reclaim_hold_reason = ""
+                            if req_reclaim_hold:
+                                try:
+                                    _in_zone_now_hold = bool(it.get("_in_zone") or it.get("_in_zone_tol") or it.get("_entered_zone_now") or False)
+                                    _since = it.get("_in_zone_since_ts")
+                                    if (not _in_zone_now_hold) or (_since is None):
+                                        reclaim_hold_ok = False
+                                        reclaim_hold_reason = f"reclaim_hold=0<{reclaim_hold_bars}bars"
+                                    else:
+                                        elapsed = max(0.0, float(now) - float(_since))
+                                        need_sec_hold = float(reclaim_hold_bars) * 300.0
+                                        reclaim_hold_ok = elapsed + 1e-9 >= need_sec_hold
+                                        if not reclaim_hold_ok:
+                                            reclaim_hold_reason = f"reclaim_hold={int(elapsed)}s<{int(need_sec_hold)}s"
+                                except Exception:
+                                    reclaim_hold_ok = False
+                                    reclaim_hold_reason = f"reclaim_hold=0<{reclaim_hold_bars}bars"
+                            try:
+                                it["_trig_reqs"]["reclaim_hold"] = bool(req_reclaim_hold)
+                                it["_trig_checks"]["reclaim_hold"] = ("skip" if (not req_reclaim_hold) else ("pass" if reclaim_hold_ok else "fail"))
+                            except Exception:
+                                pass
+
+                            try:
+                                fake_bos_min = float(os.getenv("MID_INST_FAKE_BOS_MIN_DISP", os.getenv("MID_INST_BOS_DISP_MIN", "0.18")) or 0.18)
+                            except Exception:
+                                fake_bos_min = 0.18
+                            try:
+                                _v = os.getenv("MID_INST_REQUIRE_FAKE_BOS_FILTER")
+                                req_fake_bos = str(_v or "1").strip().lower() in ("1","true","yes","on")
+                            except Exception:
+                                req_fake_bos = True
+                            req_fake_bos = bool(req_fake_bos and route_prof.get("require_fake_bos_filter") and req_bos)
+                            fake_bos_ok = True if (not req_fake_bos) else bool((not bos_ok) or (disp_x >= fake_bos_min) or disp_ok)
+                            try:
+                                it["_trig_reqs"]["fake_bos_filter"] = bool(req_fake_bos)
+                                it["_trig_checks"]["fake_bos_filter"] = ("skip" if (not req_fake_bos) else ("pass" if fake_bos_ok else "fail"))
+                            except Exception:
+                                pass
+
                             try:
                                 it["_trig_smc_route"] = str(smc_route_now or "")
                                 it["_trig_smc_req_profile"] = {
@@ -26362,9 +26536,25 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     "bos_5m": bool(req_bos),
                                     "sweep": bool(req_liq),
                                     "displacement": bool(req_disp),
+                                    "mss": bool(req_mss),
+                                    "smt": bool(req_smt),
+                                    "reclaim_hold": bool(req_reclaim_hold),
+                                    "fake_bos_filter": bool(req_fake_bos),
                                 }
                             except Exception:
                                 pass
+
+                            if req_mss and (not mss_ok):
+                                _trig_add("mss_missing", "mss_missing")
+
+                            if req_smt and (not smt_ok):
+                                _trig_add("smt_missing", "smt_missing")
+
+                            if req_reclaim_hold and (not reclaim_hold_ok):
+                                _trig_add("reclaim_hold_missing", "reclaim_hold_missing")
+
+                            if req_fake_bos and (not fake_bos_ok):
+                                _trig_add("fake_bos_filter_fail", "fake_bos_filter_fail")
 
                             if req_reclaim and (not reclaim_ok):
                                 _trig_add("reclaim_missing", "reclaim_missing")
@@ -31806,6 +31996,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 setattr(sig_emit, "smc_setup_route", _smart_emit_route)
                                                 setattr(sig_emit, "smc_setup_label", _smart_emit_route_label)
                                                 setattr(sig_emit, "ui_setup_label", _smart_emit_setup_label)
+                                                setattr(sig_emit, "smc_snapshot", dict(_smc_snapshot or {}))
+                                                setattr(sig_emit, "smc_mss_ok", bool((_smc_snapshot or {}).get("mss_ok")))
+                                                setattr(sig_emit, "smc_smt_ok", bool((_smc_snapshot or {}).get("smt_ok")))
+                                                setattr(sig_emit, "smc_smt_present", bool((_smc_snapshot or {}).get("smt_present")))
                                             except Exception:
                                                 pass
                                             try:
