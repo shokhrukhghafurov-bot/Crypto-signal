@@ -10473,6 +10473,32 @@ def _mid_smc_emit_route_priority_label(route: str | None) -> str:
     return labels.get(str(route or '').strip(), '')
 
 
+def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = None) -> dict:
+    """Route-specific institutional confirmation profile."""
+    route_s = str(route or "").strip()
+    reg_u = str(regime or "").upper().strip()
+    is_range_like = ("CHOPPY" in reg_u) or ("RANGE" in reg_u)
+    prof = {
+        "route": route_s,
+        "require_reclaim": False,
+        "require_bos": False,
+        "require_sweep": False,
+        "require_displacement": False,
+        "allow_direct_emit": True,
+        "min_conf_direct": 0,
+    }
+    if route_s == "smc_liquidity_reclaim":
+        prof.update({"require_reclaim": True, "require_bos": True, "require_sweep": True, "min_conf_direct": 78})
+    elif route_s in ("smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg"):
+        prof.update({"require_reclaim": True, "require_bos": True, "require_sweep": bool(is_range_like), "min_conf_direct": 80 if is_range_like else 78})
+    elif route_s == "smc_bos_retest_confirm":
+        prof.update({"require_reclaim": bool(is_range_like), "require_bos": True, "require_sweep": bool(is_range_like), "min_conf_direct": 80 if is_range_like else 76})
+    elif route_s in ("smc_displacement_origin", "smc_dual_fvg_origin"):
+        prof.update({"require_reclaim": True, "require_bos": True, "require_sweep": bool(is_range_like), "require_displacement": True, "allow_direct_emit": False, "min_conf_direct": 84 if is_range_like else 82})
+    return prof
+
+
+
 def _mid_compose_setup_label(setup_source: str | None, smc_route: str | None = None, smc_label: str | None = None) -> str:
     base = _mid_setup_source_label(setup_source)
     extra = str(smc_label or _mid_smc_emit_route_label(smc_route) or '').strip()
@@ -11188,6 +11214,8 @@ def _mid_smc_route_emit_gate(*,
     blocks: list[str] = []
     flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
     diru = str(direction or "").upper().strip()
+    reg_u = str(regime or "").upper().strip()
+    route_prof = _mid_smc_route_requirement_profile(route_s, reg_u)
     rr_val = None
     try:
         rr_val = float(getattr(sig, 'rr', None) if sig is not None else None)
@@ -11213,6 +11241,16 @@ def _mid_smc_route_emit_gate(*,
 
     if route_need_origin and not bool(origin_fast_ok):
         blocks.append('origin_not_ready')
+    try:
+        conf_need_direct = int(float(route_prof.get("min_conf_direct", 0) or 0))
+    except Exception:
+        conf_need_direct = 0
+    if conf_need_direct > 0 and float(confidence or 0.0) < float(conf_need_direct):
+        blocks.append(f"direct_conf_low:{int(conf_need_direct)}")
+    if route_need_origin and (not bool(route_prof.get("allow_direct_emit", True))):
+        blocks.append('origin_wait_confirm')
+    if route_need_origin and (("CHOPPY" in reg_u) or ("RANGE" in reg_u)):
+        blocks.append('origin_range_block')
     if route_need_breakout and not bool(breakout_fresh_ok or (zone_valid and in_zone_now)):
         blocks.append('breakout_not_ready')
     if route_need_zone and not bool((zone_valid and in_zone_now) or origin_fast_ok or breakout_fresh_ok):
@@ -26167,6 +26205,21 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 req_liq_trend = False
                             req_liq = req_liq_trend if (reg == "TREND") else req_liq_range
 
+                            try:
+                                smc_route_now = str(it.get("smc_setup_route") or it.get("emit_route") or "").strip()
+                            except Exception:
+                                smc_route_now = ""
+                            try:
+                                route_prof = _mid_smc_route_requirement_profile(smc_route_now, reg)
+                            except Exception:
+                                route_prof = {}
+
+                            try:
+                                if route_prof.get("require_sweep"):
+                                    req_liq = True
+                            except Exception:
+                                pass
+
                             liq_ok = True
                             if req_liq:
                                 if diru == "LONG":
@@ -26200,6 +26253,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 req_bos_trend = False
                             req_bos = req_bos_trend if (reg == "TREND") else req_bos_range
+                            try:
+                                if route_prof.get("require_bos"):
+                                    req_bos = True
+                            except Exception:
+                                pass
 
                             bos_ok = True
                             if req_bos:
@@ -26234,6 +26292,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 req_disp_trend = False
                             req_disp = req_disp_trend if (reg == "TREND") else req_disp_range
+                            try:
+                                if route_prof.get("require_displacement"):
+                                    req_disp = True
+                            except Exception:
+                                pass
                             try:
                                 _v = os.getenv("MID_INST_DISP_MIN_X_RANGE")
                                 if _v is None or str(_v).strip() == "":
@@ -26277,6 +26340,11 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 req_reclaim_trend = False
                             req_reclaim = req_reclaim_trend if (reg == "TREND") else req_reclaim_range
                             try:
+                                if route_prof.get("require_reclaim"):
+                                    req_reclaim = True
+                            except Exception:
+                                pass
+                            try:
                                 it["_trig_reqs"]["reclaim"] = bool(req_reclaim)
                                 if not bool(req_reclaim):
                                     # env=0 => fully skipped (must not block)
@@ -26287,6 +26355,16 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             # Save regime/disp for downstream volume filter + logs
                             it["_trig_inst_regime"] = reg
                             it["_trig_inst_disp_x"] = float(disp_x)
+                            try:
+                                it["_trig_smc_route"] = str(smc_route_now or "")
+                                it["_trig_smc_req_profile"] = {
+                                    "reclaim": bool(req_reclaim),
+                                    "bos_5m": bool(req_bos),
+                                    "sweep": bool(req_liq),
+                                    "displacement": bool(req_disp),
+                                }
+                            except Exception:
+                                pass
 
                             if req_reclaim and (not reclaim_ok):
                                 _trig_add("reclaim_missing", "reclaim_missing")
@@ -26300,6 +26378,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                             if req_disp and (not disp_ok):
                                 _trig_add("displacement_missing", "displacement_weak")
+
+                            try:
+                                if smc_route_now in ("smc_displacement_origin", "smc_dual_fvg_origin") and (not (reclaim_ok and bos_ok and disp_ok)):
+                                    _trig_add("origin_confirm_missing", "origin_confirm_missing")
+                                elif smc_route_now in ("smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg") and (not (reclaim_ok and bos_ok)):
+                                    _trig_add("zone_confirm_missing", "zone_confirm_missing")
+                            except Exception:
+                                pass
 
                             # Compact institutional trigger score for debugging only (doesn't replace TA score).
                             try:
