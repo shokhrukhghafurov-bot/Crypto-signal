@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-04-13_institutional_trigger_v3_fix"
+MID_BUILD_TAG = "MID_BUILD_2026-04-14_institutional_analysis_v4"
 
 import asyncio
 import json
@@ -10506,11 +10506,9 @@ def _mid_smc_emit_route_priority_label(route: str | None) -> str:
 def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = None) -> dict:
     """Route-specific institutional confirmation profile.
 
-    v3 adds stricter institutional confirmations:
-      - MSS / CHOCH quality check on confirmation routes
-      - optional SMT confluence when the feed provides it
-      - reclaim hold inside the zone before emit
-      - fake-BOS protection via minimum displacement body/ATR
+    v4 keeps the SMC route labels, but only liquidity reclaim is allowed
+    to direct-emit. All other routes become context-aware POI / pending
+    routes and must wait for confirmation in-zone.
     """
     route_s = str(route or "").strip()
     reg_u = str(regime or "").upper().strip()
@@ -10526,7 +10524,7 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
         "prefer_smt": False,
         "require_reclaim_hold": False,
         "require_fake_bos_filter": False,
-        "allow_direct_emit": True,
+        "allow_direct_emit": False,
         "min_conf_direct": 0,
     }
     if route_s == "smc_liquidity_reclaim":
@@ -10539,7 +10537,8 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
             "prefer_smt": True,
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
-            "min_conf_direct": 78,
+            "allow_direct_emit": True,
+            "min_conf_direct": 82 if is_range_like else 80,
         })
     elif route_s in ("smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg"):
         prof.update({
@@ -10551,7 +10550,8 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
             "prefer_smt": True,
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
-            "min_conf_direct": 80 if is_range_like else 78,
+            "allow_direct_emit": False,
+            "min_conf_direct": 84 if is_range_like else 82,
         })
     elif route_s == "smc_bos_retest_confirm":
         prof.update({
@@ -10562,7 +10562,8 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
             "require_mss": True,
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
-            "min_conf_direct": 80 if is_range_like else 76,
+            "allow_direct_emit": False,
+            "min_conf_direct": 84 if is_range_like else 82,
         })
     elif route_s in ("smc_displacement_origin", "smc_dual_fvg_origin"):
         prof.update({
@@ -10572,10 +10573,9 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
             "require_displacement": True,
             "require_fake_bos_filter": True,
             "allow_direct_emit": False,
-            "min_conf_direct": 84 if is_range_like else 82,
+            "min_conf_direct": 86 if is_range_like else 84,
         })
     return prof
-
 
 
 def _mid_compose_setup_label(setup_source: str | None, smc_route: str | None = None, smc_label: str | None = None) -> str:
@@ -10592,19 +10592,9 @@ def _mid_is_direct_smc_route(*,
                              ta: dict | None = None,
                              rec: dict | None = None,
                              meta: dict | None = None) -> bool:
-    """Return True when the signal belongs to a strong SMC direct-emit route.
-
-    This helper intentionally looks across explicit route arg, signal attrs, TA payload,
-    pending record and gate meta so direct SMC emits never fall back into generic
-    soft-block pre/final gates by accident.
-    """
+    """Return True only for SMC routes that are allowed to direct-emit in v4."""
     direct_routes = {
         'smc_liquidity_reclaim',
-        'smc_ob_fvg_overlap',
-        'smc_htf_ob_ltf_fvg',
-        'smc_bos_retest_confirm',
-        'smc_displacement_origin',
-        'smc_dual_fvg_origin',
     }
 
     def _cand(v):
@@ -11239,10 +11229,12 @@ def _mid_smc_route_emit_gate(*,
                               macd_hist: float | None = None) -> tuple[bool, str, dict]:
     """Direct SMC emit gate.
 
-    High-priority SMC routes must not be reduced to a score bonus only.
-    For recognized SMC routes we keep only hard safety blocks and bypass the
-    generic instant gate. If no SMC route is present, we fall back to the
-    legacy _mid_instant_emit_gate.
+    v4 institutional policy:
+      - only smc_liquidity_reclaim may direct-emit
+      - all other SMC routes remain valuable setup labels, but must pass through
+        the pending/confirmation pipeline rather than bypass it
+      - timing/context protections (late entry, near-extreme, anti-bounce,
+        range/choppy regime) are NOT bypassed for the direct route
     """
     route_s = str(route or "").strip()
     if not route_s:
@@ -11289,21 +11281,39 @@ def _mid_smc_route_emit_gate(*,
             macd_hist=macd_hist,
         )
 
-    meta: dict[str, object] = {"route": route_s, "gate": "smc_direct_emit", "smc_direct_route": True}
+    meta: dict[str, object] = {"route": route_s, "gate": "smc_direct_emit", "smc_direct_route": False}
     blocks: list[str] = []
     flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
     diru = str(direction or "").upper().strip()
     reg_u = str(regime or "").upper().strip()
     route_prof = _mid_smc_route_requirement_profile(route_s, reg_u)
-    rr_val = None
+    route_liq = route_s == 'smc_liquidity_reclaim'
+
     try:
         rr_val = float(getattr(sig, 'rr', None) if sig is not None else None)
     except Exception:
         rr_val = None
+
+    if not bool(route_prof.get("allow_direct_emit", False)):
+        meta['blocked_by'] = [f'pending_confirm_only:{route_s}']
+        meta['soft_bypassed'] = ['score', 'vol_x', 'atr_pct']
+        return (False, f"smc_pending_confirm:{route_s}", meta)
+
+    meta['smc_direct_route'] = True
     if diru not in ("LONG", "SHORT"):
         blocks.append("direction_missing")
-    if rr_val is not None and rr_val < 1.15:
+    if rr_val is not None and rr_val < 1.35:
         blocks.append("rr_too_low")
+    if ("CHOPPY" in reg_u) or ("RANGE" in reg_u):
+        blocks.append("regime_wait_confirm")
+    if not bool(zone_valid and in_zone_now):
+        blocks.append("liquidity_retest_not_ready")
+    if not late_entry_ok:
+        blocks.append(str(late_entry_reason or 'late_entry'))
+    if not near_extreme_ok:
+        blocks.append(str(near_extreme_reason or 'near_extreme'))
+    if not anti_bounce_ok:
+        blocks.append(str(anti_bounce_reason or 'anti_bounce'))
     if not smart_setup_trap_ok and any(k in str(smart_setup_trap_reason or '').lower() for k in ('hard', 'invalid', 'conflict', 'against')):
         blocks.append(f"trap:{smart_setup_trap_reason}")
     if not micro_trap_ok and any(k in str(micro_trap_reason or '').lower() for k in ('hard', 'invalid', 'conflict', 'against')):
@@ -11312,34 +11322,19 @@ def _mid_smc_route_emit_gate(*,
         blocks.append('direction_conflict')
     if 'invalid_zone' in flags or 'dead_zone' in flags:
         blocks.append('invalid_zone')
+    if 'trend_conflict' in flags or 'htf_conflict' in flags or 'htf_misaligned' in flags:
+        blocks.append('htf_conflict')
 
-    route_need_origin = route_s in ('smc_displacement_origin', 'smc_dual_fvg_origin')
-    route_need_zone = route_s in ('smc_ob_fvg_overlap', 'smc_htf_ob_ltf_fvg')
-    route_need_breakout = route_s == 'smc_bos_retest_confirm'
-    route_liq = route_s == 'smc_liquidity_reclaim'
-
-    if route_need_origin and not bool(origin_fast_ok):
-        blocks.append('origin_not_ready')
     try:
         conf_need_direct = int(float(route_prof.get("min_conf_direct", 0) or 0))
     except Exception:
         conf_need_direct = 0
     if conf_need_direct > 0 and float(confidence or 0.0) < float(conf_need_direct):
         blocks.append(f"direct_conf_low:{int(conf_need_direct)}")
-    if route_need_origin and (not bool(route_prof.get("allow_direct_emit", True))):
-        blocks.append('origin_wait_confirm')
-    if route_need_origin and (("CHOPPY" in reg_u) or ("RANGE" in reg_u)):
-        blocks.append('origin_range_block')
-    if route_need_breakout and not bool(zone_valid and in_zone_now):
-        blocks.append('breakout_retest_not_ready')
-    if route_need_zone and not bool(zone_valid and in_zone_now):
-        blocks.append('zone_retest_not_ready')
-    if route_liq and not bool(zone_valid and in_zone_now):
-        blocks.append('liquidity_retest_not_ready')
 
     if blocks:
         meta['blocked_by'] = list(blocks)
-        meta['soft_bypassed'] = ['score', 'confidence', 'vol_x', 'atr_pct', 'late_entry', 'near_extreme', 'anti_bounce', 'macd_hist', 'regime', 'generic_trap']
+        meta['soft_bypassed'] = ['score', 'vol_x', 'atr_pct']
         return (False, f"smc_hard_block:{route_s}", meta)
 
     try:
@@ -11354,19 +11349,11 @@ def _mid_smc_route_emit_gate(*,
     except Exception:
         pass
 
-    if route_need_origin:
-        meta['fast_path'] = 'origin'
-        return (True, f"smc_direct_emit:{route_s}", meta)
     if route_liq:
         meta['fast_path'] = 'liquidity_reclaim'
+        meta['soft_bypassed'] = ['score', 'vol_x', 'atr_pct']
         return (True, f"smc_direct_emit:{route_s}", meta)
-    if route_need_breakout:
-        meta['fast_path'] = 'breakout'
-        return (True, f"smc_direct_emit:{route_s}", meta)
-    if route_need_zone:
-        meta['fast_path'] = 'zone_retest'
-        return (True, f"smc_direct_emit:{route_s}", meta)
-    return (True, f"smc_direct_emit:{route_s}", meta)
+    return (False, f"smc_pending_confirm:{route_s}", meta)
 
 def _mid_instant_emit_gate(*,
                            market: str,
