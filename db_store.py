@@ -2253,6 +2253,12 @@ _SIGNAL_REPORT_SETUP_KEYS = (
     "zone_retest",
     "normal_pending_trigger",
     "liquidity_reclaim",
+    "smc_ob_fvg_overlap",
+    "smc_htf_ob_ltf_fvg",
+    "smc_bos_retest_confirm",
+    "smc_displacement_origin",
+    "smc_dual_fvg_origin",
+    "smc_liquidity_reclaim",
 )
 
 
@@ -2279,7 +2285,7 @@ def _signal_report_normalize_setup_label(*, ui_setup_label: str | None = None, e
         if c:
             raw = c
             break
-    s = str(raw or "").strip().lower().replace('-', '_').replace(' ', '_')
+    s = str(raw or "").strip().lower().replace('-', '_').replace(' ', '_').replace('|', '_|_').replace('+', '_+_').replace('/', '/').replace('→', '→')
     aliases = {
         "origin": "origin",
         "origin_fast": "origin",
@@ -2305,6 +2311,22 @@ def _signal_report_normalize_setup_label(*, ui_setup_label: str | None = None, e
         "liquidity_reclaim_emit": "liquidity_reclaim",
         "liquidity_reclaim_entry": "liquidity_reclaim",
         "liquidity_reclaim_ready": "liquidity_reclaim",
+        "smc_ob_fvg_overlap": "smc_ob_fvg_overlap",
+        "ob+fvg_priority_emit": "smc_ob_fvg_overlap",
+        "zone_retest_|_ob+fvg_priority_emit": "smc_ob_fvg_overlap",
+        "smc_htf_ob_ltf_fvg": "smc_htf_ob_ltf_fvg",
+        "htf_ob_+_ltf_fvg_retest_emit": "smc_htf_ob_ltf_fvg",
+        "zone_retest_|_htf_ob_+_ltf_fvg_retest_emit": "smc_htf_ob_ltf_fvg",
+        "smc_bos_retest_confirm": "smc_bos_retest_confirm",
+        "bos_→_fvg/ob_retest_→_confirm": "smc_bos_retest_confirm",
+        "zone_retest_|_bos_→_fvg/ob_retest_→_confirm": "smc_bos_retest_confirm",
+        "smc_displacement_origin": "smc_displacement_origin",
+        "origin_|_displacement_origin_fast_path": "smc_displacement_origin",
+        "smc_dual_fvg_origin": "smc_dual_fvg_origin",
+        "origin_|_dual/stacked_fvg_origin": "smc_dual_fvg_origin",
+        "smc_liquidity_reclaim": "smc_liquidity_reclaim",
+        "liquidity_reclaim_|_liquidity_sweep_→_reclaim_→_bos_continuation": "smc_liquidity_reclaim",
+        "liquidity_sweep_→_reclaim_→_bos_continuation": "smc_liquidity_reclaim",
     }
     return aliases.get(s, s if s in _SIGNAL_REPORT_SETUP_KEYS else "")
 
