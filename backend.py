@@ -10382,10 +10382,10 @@ def _mid_smc_confluence_snapshot(*,
     if not overlap and ob_ok and fvg_active and fvg_dir_ok:
         overlap = bool(ob_retest or entry_confluence >= 3)
     htf_ltf = bool((ob_ok and fvg_active and fvg_dir_ok) and (overlap or ob_retest or entry_confluence >= 2))
-    confirm_ok = bool(bos_ok or bo_ok or ob_retest or disp_body_atr >= disp_min)
-    breakout_retest_poi = bool((bo_ok or bos_ok) and (overlap or ob_retest or fvg_active or ob_ok) and confirm_ok)
-    liquidity_reclaim = bool(sweep_ok and confirm_ok and (ob_retest or fvg_active or ob_ok))
-    displacement_hint = bool((disp_body_atr >= disp_min) and (bo_ok or bos_ok) and (fvg_active or ob_ok))
+    confirm_ok = bool((bos_ok or bo_ok or disp_body_atr >= disp_min) and (ob_retest or entry_confluence >= 2))
+    breakout_retest_poi = bool((bo_ok or bos_ok) and (overlap or ob_retest or fvg_active or ob_ok) and confirm_ok and ob_retest)
+    liquidity_reclaim = bool(sweep_ok and (bos_ok or bo_ok or disp_body_atr >= disp_min) and ob_retest and (fvg_active or ob_ok))
+    displacement_hint = bool((disp_body_atr >= max(disp_min, float(os.getenv('MID_SMC_DISPLACEMENT_ORIGIN_MIN', '0.35') or 0.35))) and (bo_ok or bos_ok) and (fvg_active or ob_ok) and entry_confluence >= 2)
     dual_fvg_hint = False
     stacked_fvg_hint = False
     try:
@@ -10539,7 +10539,7 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
             "prefer_smt": True,
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
-            "min_conf_direct": 78,
+            "min_conf_direct": 82,
         })
     elif route_s in ("smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg"):
         prof.update({
@@ -10551,7 +10551,7 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
             "prefer_smt": True,
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
-            "min_conf_direct": 80 if is_range_like else 78,
+            "min_conf_direct": 84 if is_range_like else 82,
         })
     elif route_s == "smc_bos_retest_confirm":
         prof.update({
@@ -10562,7 +10562,7 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
             "require_mss": True,
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
-            "min_conf_direct": 80 if is_range_like else 76,
+            "min_conf_direct": 84 if is_range_like else 82,
         })
     elif route_s in ("smc_displacement_origin", "smc_dual_fvg_origin"):
         prof.update({
@@ -10661,11 +10661,11 @@ def _mid_pick_smc_emit_route(*,
         route = 'smc_bos_retest_confirm'
         setup_source = 'zone_retest'
         priority = 100
-    elif bool(origin_fast_ok) and bool(smc.get('displacement_hint')):
+    elif bool(origin_fast_ok) and bool(smc.get('displacement_hint')) and str(os.getenv('MID_SMART_SETUP_ALLOW_DISPLACEMENT_ORIGIN', '0') or '0').strip().lower() in ('1','true','yes','on'):
         route = 'smc_displacement_origin'
         setup_source = 'origin'
         priority = 95
-    elif bool(origin_fast_ok) and bool(smc.get('dual_fvg_hint') or smc.get('stacked_fvg_hint')):
+    elif bool(origin_fast_ok) and bool(smc.get('dual_fvg_hint') or smc.get('stacked_fvg_hint')) and str(os.getenv('MID_SMART_SETUP_ALLOW_DUAL_FVG_ORIGIN', '0') or '0').strip().lower() in ('1','true','yes','on'):
         route = 'smc_dual_fvg_origin'
         setup_source = 'origin'
         priority = 92
@@ -10742,7 +10742,7 @@ def _mid_smart_setup_origin_fastpath(*,
     except Exception:
         base_conf_need = 90
     try:
-        conf_need = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF", str(min(base_conf_need, 76))) or min(base_conf_need, 76)))
+        conf_need = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF", str(max(min(base_conf_need, 84), 84))) or max(min(base_conf_need, 84), 84)))
     except Exception:
         conf_need = min(base_conf_need, 76)
     conf_need = max(0, int(conf_need))
@@ -10753,16 +10753,16 @@ def _mid_smart_setup_origin_fastpath(*,
     except Exception:
         atr_mult = 0.75
     try:
-        vol_need = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X", "0") or 0)
+        vol_need = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X", "0.30") or 0.30)
     except Exception:
-        vol_need = 0.0
+        vol_need = 0.30
     if vol_need <= 0:
         # Origin fast is allowed to fire at the *start* of a real move, before
         # volume/relative-volume fully expands on the current bar.
-        vol_need = 0.0
+        vol_need = 0.30
     atr_need = max(0.0, float(min_atr) * max(0.0, float(atr_mult)))
     try:
-        min_body_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR", "0.08") or 0.08)
+        min_body_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR", "0.12") or 0.12)
     except Exception:
         min_body_atr = 0.08
     try:
@@ -10780,11 +10780,11 @@ def _mid_smart_setup_origin_fastpath(*,
 
     if smc_priority >= 2:
         try:
-            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMC_ORIGIN_CONF", "74") or 74)))
+            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMC_ORIGIN_CONF", "82") or 82)))
         except Exception:
             conf_need = min(int(conf_need), 74)
         try:
-            min_body_atr = min(float(min_body_atr), float(os.getenv("MID_SMC_ORIGIN_MIN_BODY_ATR", "0.05") or 0.05))
+            min_body_atr = min(float(min_body_atr), float(os.getenv("MID_SMC_ORIGIN_MIN_BODY_ATR", "0.10") or 0.10))
         except Exception:
             pass
         try:
@@ -10793,9 +10793,9 @@ def _mid_smart_setup_origin_fastpath(*,
             pass
     if smc_overlap or smc_htf_ltf or smc_displacement or smc_dual_fvg:
         try:
-            vol_need = min(float(vol_need), float(os.getenv("MID_SMC_ORIGIN_MIN_VOL_X", "0.0") or 0.0))
+            vol_need = min(float(vol_need), float(os.getenv("MID_SMC_ORIGIN_MIN_VOL_X", "0.35") or 0.35))
         except Exception:
-            vol_need = 0.0
+            vol_need = 0.30
 
     hard_flags = {"scale_mismatch", "blocked", "structure_mismatch", "block:directional_contradiction"}
     active_hard_flags = sorted([x for x in flags if x in hard_flags])
@@ -10900,15 +10900,15 @@ def _mid_smart_setup_origin_fastpath(*,
         fresh_origin_bias = False
     if fresh_origin_bias:
         try:
-            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF_FRESH", "72") or 72)))
+            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF_FRESH", "80") or 80)))
         except Exception:
             conf_need = min(int(conf_need), 72)
         try:
-            body_need_eff = min(float(body_need_eff), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR_FRESH", "0.05") or 0.05))
+            body_need_eff = min(float(body_need_eff), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR_FRESH", "0.10") or 0.10))
         except Exception:
             pass
         try:
-            vol_need_eff = min(float(vol_need_eff), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X_FRESH", "0.00") or 0.00))
+            vol_need_eff = min(float(vol_need_eff), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X_FRESH", "0.25") or 0.25))
         except Exception:
             pass
         try:
@@ -11698,7 +11698,7 @@ def _mid_instant_emit_gate(*,
         try:
             _instant_vol_need = min(float(_instant_vol_need), float(os.getenv("MID_SMART_SETUP_ORIGIN_INSTANT_MIN_VOL_X", "0.0") or 0.0))
         except Exception:
-            _instant_vol_need = 0.0
+            _instant_vol_need = 0.30
     if vol_v < float(_instant_vol_need):
         _add_fail(f"instant_vol_low:{vol_v:.2f}<{_instant_vol_need:.2f}")
     if not near_extreme_ok:
