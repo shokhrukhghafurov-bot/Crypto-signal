@@ -4056,6 +4056,22 @@ def _report_setup_label_human(source: str | None) -> str:
         "liquidity reclaim ready": "liquidity_reclaim",
         "liquidity_reclaim": "liquidity_reclaim",
         "liquidity_reclaim_emit": "liquidity_reclaim",
+        "smc_ob_fvg_overlap": "OB+FVG priority emit",
+        "ob+fvg priority emit": "OB+FVG priority emit",
+        "zone retest | ob+fvg priority emit": "OB+FVG priority emit",
+        "smc_htf_ob_ltf_fvg": "HTF OB + LTF FVG retest emit",
+        "htf ob + ltf fvg retest emit": "HTF OB + LTF FVG retest emit",
+        "zone retest | htf ob + ltf fvg retest emit": "HTF OB + LTF FVG retest emit",
+        "smc_bos_retest_confirm": "BOS → FVG/OB retest → confirm",
+        "bos → fvg/ob retest → confirm": "BOS → FVG/OB retest → confirm",
+        "zone retest | bos → fvg/ob retest → confirm": "BOS → FVG/OB retest → confirm",
+        "smc_displacement_origin": "displacement origin fast-path",
+        "origin | displacement origin fast-path": "displacement origin fast-path",
+        "smc_dual_fvg_origin": "dual/stacked FVG origin",
+        "origin | dual/stacked fvg origin": "dual/stacked FVG origin",
+        "smc_liquidity_reclaim": "liquidity sweep → reclaim → BOS continuation",
+        "liquidity reclaim | liquidity sweep → reclaim → bos continuation": "liquidity sweep → reclaim → BOS continuation",
+        "liquidity sweep → reclaim → bos continuation": "liquidity sweep → reclaim → BOS continuation",
     }
     if raw in labels:
         return labels[raw]
@@ -4665,6 +4681,42 @@ def _daily_report_best_setup_reasons(setup_key: str) -> list[str]:
             "реже давал хаотичные возвраты",
             "давал стабильное подтверждение перед входом",
         ],
+        "smc_ob_fvg_overlap": [
+            "лучше работал на сильном OB+FVG confluence",
+            "реже входил без качественного retest",
+            "лучше держал continuation после входа",
+            "давал чище institutional entry",
+        ],
+        "smc_htf_ob_ltf_fvg": [
+            "лучше сочетал HTF зону и LTF подтверждение",
+            "входы были чище после retest",
+            "лучше фильтровал слабые импульсы",
+            "давал стабильнее follow-through",
+        ],
+        "smc_bos_retest_confirm": [
+            "лучше работал после подтверждённого BOS",
+            "меньше ложных breakout-входов",
+            "лучше подтверждал структуру перед входом",
+            "давал понятный continuation",
+        ],
+        "smc_liquidity_reclaim": [
+            "лучше работал после sweep → reclaim → BOS",
+            "лучше фильтровал хаотичные возвраты",
+            "давал сильнее подтверждённый continuation",
+            "реже ломался сразу после входа",
+        ],
+        "smc_displacement_origin": [
+            "показывал силу раннего displacement только в лучших случаях",
+            "ловил резкий старт движения",
+            "иногда давал быстрый continuation",
+            "полезен только при очень сильном импульсе",
+        ],
+        "smc_dual_fvg_origin": [
+            "работал только при очень сильной stacked FVG структуре",
+            "ловил редкие сильные origin-сценарии",
+            "мог дать быстрый continuation",
+            "полезен только в исключительных случаях",
+        ],
     }
     return list(mapping.get(str(setup_key or "").strip(), ["лучший баланс сигналов", "более стабильная логика входа", "лучше держал направление", "дал лучший вклад в день"]))
 
@@ -5029,9 +5081,9 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         lines.append("")
 
     lines.extend([sep, "🧠 Setup-анализ", ""])
-    for setup_key in ("origin", "breakout", "zone_retest", "normal_pending_trigger", "liquidity_reclaim"):
+    for setup_key in ("smc_liquidity_reclaim", "smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg", "smc_bos_retest_confirm", "origin", "breakout", "zone_retest", "normal_pending_trigger", "liquidity_reclaim", "smc_displacement_origin", "smc_dual_fvg_origin"):
         bucket = setups.get(setup_key) or _daily_report_bucket_template()
-        lines.append(setup_key)
+        lines.append(_report_setup_label_human(setup_key))
         lines.append(f"Всего: {_daily_report_int(bucket.get('sent'))}")
         lines.append(f"✅ WIN: {_daily_report_int(bucket.get('win'))}")
         lines.append(f"❌ LOSS: {_daily_report_int(bucket.get('loss'))}")
@@ -5043,13 +5095,13 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         lines.append(f"🛡 Качество: {_daily_report_render_quality(bucket)}")
         lines.append("")
 
-    lines.extend([sep, "🏆 Лучший сетап дня", "", f"🥇 {best_setup_key or '—'}", "Почему лучший:"])
+    lines.extend([sep, "🏆 Лучший сетап дня", "", f"🥇 {_report_setup_label_human(best_setup_key) if best_setup_key else '—'}", "Почему лучший:"])
     for item in _daily_report_best_setup_reasons(best_setup_key)[:4]:
         lines.append(f"• {item}")
     lines.extend(["", "Итог:"])
     if best_setup_key:
         lines.append(f"📈 Winrate: {_daily_report_pct(_daily_report_winrate(best_setup_bucket), digits=1, strip_zero=True)}")
-    lines.extend(["💰 Лучший вклад в PnL дня", "🛡 Самый стабильный setup", "", sep, "⚠️ Худший сетап дня", "", f"🥀 {worst_setup_key or '—'}", "Почему слабый:"])
+    lines.extend(["💰 Лучший вклад в PnL дня", "🛡 Самый стабильный setup", "", sep, "⚠️ Худший сетап дня", "", f"🥀 {_report_setup_label_human(worst_setup_key) if worst_setup_key else '—'}", "Почему слабый:"])
     for item in _daily_report_worst_setup_reasons(worst_setup_key)[:3]:
         lines.append(f"• {item}")
     lines.extend(["", "Итог:"])
@@ -5110,7 +5162,7 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         "",
         "Вывод:",
         f"самая слабая часть сейчас — {'retest логика для LONG и слабый post-entry follow-through' if weakest_filter_key == 'retest' else weakest_filter_label}",
-        f"самая сильная часть — {'SHORT по тренду и liquidity reclaim' if side_best == 'SHORT' and best_setup_key == 'liquidity_reclaim' else ((best_setup_key or 'лучшая логика') + (' и ' + side_best + ' по тренду' if side_best else ''))}",
+        f"самая сильная часть — {'SHORT по тренду и liquidity reclaim' if side_best == 'SHORT' and best_setup_key == 'liquidity_reclaim' else ((_report_setup_label_human(best_setup_key) if best_setup_key else 'лучшая логика') + (' и ' + side_best + ' по тренду' if side_best else ''))}",
         "",
         sep,
         "🤖 Что улучшить боту на завтра",
@@ -5143,11 +5195,11 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
     if side_best:
         lines.append(f"• {side_best}")
     if best_setup_key:
-        lines.append(f"• {best_setup_key}")
+        lines.append(f"• {_report_setup_label_human(best_setup_key)}")
     lines.append('• breakout с подтверждённым объёмом')
     lines.extend(["", "Требуют доработки:"])
     if worst_setup_key:
-        lines.append(f"• {worst_setup_key} LONG" if worst_setup_key == 'zone_retest' else f"• {worst_setup_key}")
+        lines.append(f"• {_report_setup_label_human(worst_setup_key)} LONG" if worst_setup_key == 'zone_retest' else f"• {_report_setup_label_human(worst_setup_key)}")
     lines.append('• RR filter в SPOT')
     lines.append('• MACD momentum filter')
     lines.append('• TP1 protection')
