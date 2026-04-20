@@ -4310,6 +4310,99 @@ _DAILY_SIGNAL_REPORT_ENABLED = str(os.getenv("DAILY_SIGNAL_REPORT_ENABLED", "1")
 _DAILY_SIGNAL_REPORT_HOUR = max(0, min(23, int(float(os.getenv("DAILY_SIGNAL_REPORT_HOUR", "0") or 0))))
 _DAILY_SIGNAL_REPORT_MINUTE = max(0, min(59, int(float(os.getenv("DAILY_SIGNAL_REPORT_MINUTE", "0") or 0))))
 _DAILY_SIGNAL_REPORT_STATE_KEY = "daily_signal_report_state"
+_MID_ADAPTIVE_V3_PATH = Path(os.getenv("MID_ADAPTIVE_V3_PATH", str(Path(__file__).with_name("mid_adaptive_v3.json"))))
+
+
+def _adaptive_v3_slug(value: str | None) -> str:
+    raw = str(value or '').strip().lower()
+    if not raw:
+        return ''
+    raw = raw.replace('→', ' to ').replace('|', ' ')
+    raw = re.sub(r"[^a-z0-9_\-\s]+", ' ', raw)
+    raw = re.sub(r"[\s\-]+", '_', raw).strip('_')
+    return raw
+
+
+def _adaptive_v3_load() -> dict:
+    try:
+        if _MID_ADAPTIVE_V3_PATH.exists():
+            data = json.loads(_MID_ADAPTIVE_V3_PATH.read_text(encoding='utf-8'))
+            if isinstance(data, dict):
+                data.setdefault('markets', {})
+                data.setdefault('setups', {})
+                data.setdefault('setup_side', {})
+                return data
+    except Exception:
+        pass
+    return {'markets': {}, 'setups': {}, 'setup_side': {}}
+
+
+def _adaptive_v3_save(data: dict) -> None:
+    try:
+        _MID_ADAPTIVE_V3_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _MID_ADAPTIVE_V3_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception:
+        logger.exception('[adaptive-v3] save failed')
+
+
+def _adaptive_v3_bucket(parent: dict, key: str) -> dict:
+    b = parent.get(key)
+    if not isinstance(b, dict):
+        b = {'resolved': 0, 'win': 0, 'loss': 0, 'be': 0, 'closed': 0, 'pnl_sum': 0.0, 'updated_at': ''}
+        parent[key] = b
+    return b
+
+
+def _adaptive_v3_setup_key_from_row(row: dict) -> str:
+    src = dict(row or {})
+    for cand in (
+        src.get('emit_route'),
+        src.get('smc_setup_route'),
+        src.get('ui_setup_label'),
+        src.get('smc_setup_label'),
+        _report_setup_label_from_row(src),
+        src.get('setup_source'),
+        src.get('setup_source_label'),
+    ):
+        slug = _adaptive_v3_slug(cand)
+        if slug:
+            return slug
+    return 'unknown'
+
+
+async def _adaptive_v3_update_from_outcome(row: dict, *, final_status: str, pnl_total_pct: float = 0.0, closed_at: dt.datetime | None = None) -> None:
+    try:
+        status = str(final_status or '').upper().strip()
+        if status not in {'WIN', 'LOSS', 'BE', 'CLOSED'}:
+            return
+        market = str((row or {}).get('market') or 'SPOT').upper().strip()
+        side = str((row or {}).get('side') or 'LONG').upper().strip()
+        if market not in {'SPOT', 'FUTURES'} or side not in {'LONG', 'SHORT'}:
+            return
+        setup_key = _adaptive_v3_setup_key_from_row(row)
+        now_iso = (closed_at or dt.datetime.now(dt.timezone.utc)).isoformat()
+        data = _adaptive_v3_load()
+        market_b = _adaptive_v3_bucket(data.setdefault('markets', {}).setdefault(market, {}), side)
+        setup_b = _adaptive_v3_bucket(data.setdefault('setups', {}), setup_key)
+        setup_side_parent = data.setdefault('setup_side', {}).setdefault(setup_key, {})
+        setup_side_b = _adaptive_v3_bucket(setup_side_parent, side)
+        for bucket in (market_b, setup_b, setup_side_b):
+            bucket['resolved'] = int(bucket.get('resolved') or 0) + 1
+            if status == 'WIN':
+                bucket['win'] = int(bucket.get('win') or 0) + 1
+            elif status == 'LOSS':
+                bucket['loss'] = int(bucket.get('loss') or 0) + 1
+            elif status == 'BE':
+                bucket['be'] = int(bucket.get('be') or 0) + 1
+            elif status == 'CLOSED':
+                bucket['closed'] = int(bucket.get('closed') or 0) + 1
+            bucket['pnl_sum'] = float(bucket.get('pnl_sum') or 0.0) + float(pnl_total_pct or 0.0)
+            bucket['updated_at'] = now_iso
+        data['updated_at'] = now_iso
+        _adaptive_v3_save(data)
+    except Exception:
+        logger.exception('[adaptive-v3] update failed')
+
 
 
 def _daily_report_setup_title(key: str) -> str:
@@ -4829,6 +4922,7 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         "normal_pending_trigger": _daily_report_bucket_template(),
         "liquidity_reclaim": _daily_report_bucket_template(),
     }
+    smart_routes: dict[str, dict] = {}
 
     sent_by_id: dict[int, dict] = {}
     for row in sent_rows:
@@ -4846,6 +4940,8 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
             _daily_report_add_sent(sides[side], row)
         if setup in setups:
             _daily_report_add_sent(setups[setup], row)
+        route_key = _adaptive_v3_setup_key_from_row(row)
+        _daily_report_add_sent(smart_routes.setdefault(route_key, _daily_report_bucket_template()), row)
 
     all_loss_rows: list[dict] = []
     for row in closed_rows:
@@ -4866,6 +4962,8 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
             _daily_report_add_closed(sides[side], row)
         if setup in setups:
             _daily_report_add_closed(setups[setup], row)
+        route_key = _adaptive_v3_setup_key_from_row(row)
+        _daily_report_add_closed(smart_routes.setdefault(route_key, _daily_report_bucket_template()), row)
         if str(row.get("status") or "").upper().strip() == "LOSS":
             all_loss_rows.append(row)
 
@@ -5042,6 +5140,42 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
             lines.append(f"📈 Winrate: {_daily_report_pct(_daily_report_winrate(bucket), digits=1, strip_zero=True)}")
         lines.append(f"🛡 Качество: {_daily_report_render_quality(bucket)}")
         lines.append("")
+
+    exact_route_rows = []
+    for route_key, bucket in dict(smart_routes or {}).items():
+        sent_n = _daily_report_int(bucket.get('sent'))
+        resolved_n = _daily_report_int(bucket.get('win')) + _daily_report_int(bucket.get('loss'))
+        if sent_n <= 0:
+            continue
+        exact_route_rows.append((
+            route_key,
+            bucket,
+            sent_n,
+            resolved_n,
+            _daily_report_winrate(bucket),
+            _daily_report_float(bucket.get('sum_pnl_pct')),
+        ))
+    exact_route_rows.sort(key=lambda item: (item[2], item[4], item[5]), reverse=True)
+
+    lines.extend([sep, "🧭 Точные smart-setup route", ""])
+    if exact_route_rows:
+        for route_key, bucket, sent_n, resolved_n, wr, pnl_sum in exact_route_rows[:12]:
+            sample_row = next((r for r in list(sent_rows) + list(closed_rows) if _adaptive_v3_setup_key_from_row(dict(r)) == route_key), None)
+            human_label = _row_ui_setup_label(dict(sample_row or {})) if sample_row else ""
+            title = human_label or route_key or 'unknown'
+            lines.append(title)
+            lines.append(f"Route key: {route_key}")
+            lines.append(f"Всего: {sent_n}")
+            lines.append(f"✅ WIN: {_daily_report_int(bucket.get('win'))}")
+            lines.append(f"❌ LOSS: {_daily_report_int(bucket.get('loss'))}")
+            be_closed = _daily_report_int(bucket.get('be')) + _daily_report_int(bucket.get('manual_close'))
+            if be_closed:
+                lines.append(f"🟡/⚪ Без результата: {be_closed}")
+            lines.append(f"📈 Winrate: {_daily_report_pct(wr, digits=1, strip_zero=True)}" if resolved_n > 0 else "📈 Winrate: —")
+            lines.append(f"💰 PnL: {_report_pnl_pct(pnl_sum)}")
+            lines.append("")
+    else:
+        lines.extend(["—", ""])
 
     lines.extend([sep, "🏆 Лучший сетап дня", "", f"🥇 {best_setup_key or '—'}", "Почему лучший:"])
     for item in _daily_report_best_setup_reasons(best_setup_key)[:4]:
@@ -8480,6 +8614,7 @@ async def signal_outcome_loop() -> None:
                             if not closed_now:
                                 continue
                             await _send_closed_signal_report_card(t, final_status="CLOSED", pnl_total_pct=float(pnl_to), closed_at=now)
+                            await _adaptive_v3_update_from_outcome(dict(t), final_status="CLOSED", pnl_total_pct=float(pnl_to), closed_at=now)
                             closed_timeout += 1
                             continue
 
@@ -8502,6 +8637,7 @@ async def signal_outcome_loop() -> None:
                             if not closed_now:
                                 continue
                             await _send_closed_signal_report_card(t, final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
+                            await _adaptive_v3_update_from_outcome(dict(t), final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
                             logger.info("[sig-outcome] WIN sid=%s %s %s px=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                             closed_win += 1
                             continue
@@ -8513,6 +8649,7 @@ async def signal_outcome_loop() -> None:
                             if not closed_now:
                                 continue
                             await _send_closed_signal_report_card(t, final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
+                            await _adaptive_v3_update_from_outcome(dict(t), final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
                             logger.info("[sig-outcome] WIN sid=%s %s %s px=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                             closed_win += 1
                             continue
@@ -8563,6 +8700,7 @@ async def signal_outcome_loop() -> None:
                                     _report_row['weak_filters'] = ",".join(list(_loss_diag.get('weak_filter_keys') or []))
                                     _report_row['improve_note'] = "; ".join(list(_loss_diag.get('improve_keys') or []))
                                     await _send_closed_signal_report_card(_report_row, final_status="LOSS", pnl_total_pct=float(pnl), closed_at=now)
+                                    await _adaptive_v3_update_from_outcome(dict(_report_row), final_status="LOSS", pnl_total_pct=float(pnl), closed_at=now)
                                     logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                                     closed_loss += 1
                                     continue
@@ -8593,6 +8731,7 @@ async def signal_outcome_loop() -> None:
                             pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp1, part_entry_to_close=1.0)
                             await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
                             await _send_closed_signal_report_card(t, final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
+                            await _adaptive_v3_update_from_outcome(dict(t), final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
                             logger.info("[sig-outcome] WIN sid=%s %s %s legacy_tp1_finalize tp1=%s src=%s", sid, market, symbol, _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
                             _SIG_SL_BREACH_SINCE.pop(sid, None)
                             closed_win += 1
@@ -8606,6 +8745,7 @@ async def signal_outcome_loop() -> None:
                             if not closed_now:
                                 continue
                             await _send_closed_signal_report_card(t, final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
+                            await _adaptive_v3_update_from_outcome(dict(t), final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
                             logger.info("[sig-outcome] WIN sid=%s %s %s px=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                             closed_win += 1
                             continue
@@ -8653,6 +8793,7 @@ async def signal_outcome_loop() -> None:
                                     _report_row['weak_filters'] = ",".join(list(_loss_diag.get('weak_filter_keys') or []))
                                     _report_row['improve_note'] = "; ".join(list(_loss_diag.get('improve_keys') or []))
                                     await _send_closed_signal_report_card(_report_row, final_status="LOSS", pnl_total_pct=float(pnl), closed_at=now)
+                                    await _adaptive_v3_update_from_outcome(dict(_report_row), final_status="LOSS", pnl_total_pct=float(pnl), closed_at=now)
                                     logger.info("[sig-outcome] LOSS sid=%s %s %s px=%s sl=%s tp1=%s tp2=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(sl if sl>0 else None), _fmt_price(eff_tp1 if eff_tp1>0 else None), _fmt_price(eff_tp2 if eff_tp2>0 else None), _src)
                                     closed_loss += 1
                                     continue
@@ -8684,6 +8825,7 @@ async def signal_outcome_loop() -> None:
                                 if not closed_now:
                                     continue
                                 await _send_closed_signal_report_card(t, final_status="BE", pnl_total_pct=float(pnl), closed_at=now)
+                                await _adaptive_v3_update_from_outcome(dict(t), final_status="BE", pnl_total_pct=float(pnl), closed_at=now)
                                 logger.info("[sig-outcome] BE sid=%s %s %s px=%s be=%s tp1=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(entry), _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
                                 closed_be += 1
                                 continue
@@ -8694,6 +8836,7 @@ async def signal_outcome_loop() -> None:
                             if not closed_now:
                                 continue
                             await _send_closed_signal_report_card(t, final_status="BE", pnl_total_pct=float(pnl), closed_at=now)
+                            await _adaptive_v3_update_from_outcome(dict(t), final_status="BE", pnl_total_pct=float(pnl), closed_at=now)
                             logger.info("[sig-outcome] BE sid=%s %s %s px=%s be=%s tp1=%s src=%s", sid, market, symbol, _fmt_price(px), _fmt_price(entry), _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
                             closed_be += 1
                             continue
