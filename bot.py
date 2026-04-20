@@ -4056,22 +4056,6 @@ def _report_setup_label_human(source: str | None) -> str:
         "liquidity reclaim ready": "liquidity_reclaim",
         "liquidity_reclaim": "liquidity_reclaim",
         "liquidity_reclaim_emit": "liquidity_reclaim",
-        "smc_ob_fvg_overlap": "OB+FVG priority emit",
-        "ob+fvg priority emit": "OB+FVG priority emit",
-        "zone retest | ob+fvg priority emit": "OB+FVG priority emit",
-        "smc_htf_ob_ltf_fvg": "HTF OB + LTF FVG retest emit",
-        "htf ob + ltf fvg retest emit": "HTF OB + LTF FVG retest emit",
-        "zone retest | htf ob + ltf fvg retest emit": "HTF OB + LTF FVG retest emit",
-        "smc_bos_retest_confirm": "BOS → FVG/OB retest → confirm",
-        "bos → fvg/ob retest → confirm": "BOS → FVG/OB retest → confirm",
-        "zone retest | bos → fvg/ob retest → confirm": "BOS → FVG/OB retest → confirm",
-        "smc_displacement_origin": "displacement origin fast-path",
-        "origin | displacement origin fast-path": "displacement origin fast-path",
-        "smc_dual_fvg_origin": "dual/stacked FVG origin",
-        "origin | dual/stacked fvg origin": "dual/stacked FVG origin",
-        "smc_liquidity_reclaim": "liquidity sweep → reclaim → BOS continuation",
-        "liquidity reclaim | liquidity sweep → reclaim → bos continuation": "liquidity sweep → reclaim → BOS continuation",
-        "liquidity sweep → reclaim → bos continuation": "liquidity sweep → reclaim → BOS continuation",
     }
     if raw in labels:
         return labels[raw]
@@ -4328,22 +4312,6 @@ _DAILY_SIGNAL_REPORT_MINUTE = max(0, min(59, int(float(os.getenv("DAILY_SIGNAL_R
 _DAILY_SIGNAL_REPORT_STATE_KEY = "daily_signal_report_state"
 
 
-_AUTO_SETUP_OPT_ENABLED = str(os.getenv("AUTO_SETUP_OPT_ENABLED", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
-_AUTO_SETUP_LOOKBACK_DAYS = max(3, int(float(os.getenv("AUTO_SETUP_LOOKBACK_DAYS", "7") or 7)))
-_AUTO_SETUP_MIN_RESOLVED = max(3, int(float(os.getenv("AUTO_SETUP_MIN_RESOLVED", "5") or 5)))
-_AUTO_SETUP_BLOCK_WINRATE = max(0.0, min(100.0, float(os.getenv("AUTO_SETUP_BLOCK_WINRATE", "34") or 34.0)))
-_AUTO_SETUP_PENALIZE_WINRATE = max(0.0, min(100.0, float(os.getenv("AUTO_SETUP_PENALIZE_WINRATE", "48") or 48.0)))
-_AUTO_SETUP_BLOCK_MAX_PNL = float(os.getenv("AUTO_SETUP_BLOCK_MAX_PNL", "-0.20") or -0.20)
-_AUTO_SETUP_CONF_STEP = max(0, int(float(os.getenv("AUTO_SETUP_CONF_STEP", "4") or 4)))
-_AUTO_SETUP_RR_STEP = max(0.0, float(os.getenv("AUTO_SETUP_RR_STEP", "0.15") or 0.15))
-_AUTO_SETUP_MAX_CONF_ADD = max(0, int(float(os.getenv("AUTO_SETUP_MAX_CONF_ADD", "8") or 8)))
-_AUTO_SETUP_MIN_RR_FLOOR = max(0.0, float(os.getenv("AUTO_SETUP_MIN_RR_FLOOR", "1.90") or 1.90))
-_AUTO_SETUP_POLICY_CACHE_SEC = max(60, int(float(os.getenv("AUTO_SETUP_POLICY_CACHE_SEC", "600") or 600)))
-_AUTO_SETUP_POLICY_KEY = "signal_setup_auto_policy"
-_AUTO_SETUP_POLICY_CACHE: dict | None = None
-_AUTO_SETUP_POLICY_CACHE_TS: float = 0.0
-
-
 def _daily_report_setup_title(key: str) -> str:
     raw = str(key or "").strip().lower()
     mapping = {
@@ -4574,30 +4542,8 @@ def _daily_report_split_multi(value: str | None) -> list[str]:
     return out
 
 
-def _canonical_setup_key(value: str | None) -> str:
-    raw_src = str(value or "").strip()
-    human = str(_report_setup_label_human(raw_src) or raw_src).strip()
-    raw = human.lower().replace('-', ' ').replace('_', ' ')
-    raw = re.sub(r"\s+", " ", raw).strip()
-    mapping = {
-        "ob+fvg priority emit": "smc_ob_fvg_overlap",
-        "htf ob + ltf fvg retest emit": "smc_htf_ob_ltf_fvg",
-        "bos → fvg/ob retest → confirm": "smc_bos_retest_confirm",
-        "liquidity sweep → reclaim → bos continuation": "smc_liquidity_reclaim",
-        "displacement origin fast path": "smc_displacement_origin",
-        "displacement origin fast-path": "smc_displacement_origin",
-        "dual/stacked fvg origin": "smc_dual_fvg_origin",
-        "liquidity reclaim": "liquidity_reclaim",
-        "normal pending trigger": "normal_pending_trigger",
-        "zone retest": "zone_retest",
-    }
-    if raw in mapping:
-        return mapping[raw]
-    return raw.replace(" ", "_")
-
-
 def _daily_report_setup_key_from_row(row: dict) -> str:
-    return _canonical_setup_key(_report_setup_label_from_row(row))
+    return str(_report_setup_label_from_row(row) or "").strip().lower().replace(" ", "_")
 
 
 def _daily_report_row_confirmations(row: dict) -> int:
@@ -4718,42 +4664,6 @@ def _daily_report_best_setup_reasons(setup_key: str) -> list[str]:
             "лучше фильтровал reclaim-входы",
             "реже давал хаотичные возвраты",
             "давал стабильное подтверждение перед входом",
-        ],
-        "smc_ob_fvg_overlap": [
-            "лучше работал на сильном OB+FVG confluence",
-            "реже входил без качественного retest",
-            "лучше держал continuation после входа",
-            "давал чище institutional entry",
-        ],
-        "smc_htf_ob_ltf_fvg": [
-            "лучше сочетал HTF зону и LTF подтверждение",
-            "входы были чище после retest",
-            "лучше фильтровал слабые импульсы",
-            "давал стабильнее follow-through",
-        ],
-        "smc_bos_retest_confirm": [
-            "лучше работал после подтверждённого BOS",
-            "меньше ложных breakout-входов",
-            "лучше подтверждал структуру перед входом",
-            "давал понятный continuation",
-        ],
-        "smc_liquidity_reclaim": [
-            "лучше работал после sweep → reclaim → BOS",
-            "лучше фильтровал хаотичные возвраты",
-            "давал сильнее подтверждённый continuation",
-            "реже ломался сразу после входа",
-        ],
-        "smc_displacement_origin": [
-            "показывал силу раннего displacement только в лучших случаях",
-            "ловил резкий старт движения",
-            "иногда давал быстрый continuation",
-            "полезен только при очень сильном импульсе",
-        ],
-        "smc_dual_fvg_origin": [
-            "работал только при очень сильной stacked FVG структуре",
-            "ловил редкие сильные origin-сценарии",
-            "мог дать быстрый continuation",
-            "полезен только в исключительных случаях",
         ],
     }
     return list(mapping.get(str(setup_key or "").strip(), ["лучший баланс сигналов", "более стабильная логика входа", "лучше держал направление", "дал лучший вклад в день"]))
@@ -4904,183 +4814,6 @@ def _daily_report_final_score(*, overall_quality: int, entry_accuracy: float, ov
     return round(max(1.0, min(10.0, score / 10.0)), 1)
 
 
-
-
-def _auto_setup_policy_lines(policy: dict | None) -> list[str]:
-    src = dict(policy or {})
-    entries = dict(src.get("setups") or {})
-    blocked = []
-    penalized = []
-    for key, item in entries.items():
-        mode = str((item or {}).get("mode") or "allow").strip().lower()
-        if mode == "block":
-            blocked.append((key, item))
-        elif mode == "penalize":
-            penalized.append((key, item))
-    lines = [sep, "⚙️ Авто-оптимизация сетапов", ""]
-    lines.append(f"Период анализа: последние {int(src.get('lookback_days') or _AUTO_SETUP_LOOKBACK_DAYS)} дн.")
-    if blocked:
-        lines.append("")
-        lines.append("⛔ Временно отключить:")
-        for key, item in blocked[:5]:
-            wr = _daily_report_pct((item or {}).get('winrate'), digits=1, strip_zero=True)
-            res = _daily_report_int((item or {}).get('resolved'))
-            lines.append(f"• {_report_setup_label_human(key)} — WR {wr}, закрытых {res}")
-    if penalized:
-        lines.append("")
-        lines.append("🟡 Ужесточить фильтр:")
-        for key, item in penalized[:6]:
-            wr = _daily_report_pct((item or {}).get('winrate'), digits=1, strip_zero=True)
-            add_conf = _daily_report_int((item or {}).get('add_conf'))
-            min_rr = _daily_report_float((item or {}).get('min_rr'))
-            parts = []
-            if add_conf > 0:
-                parts.append(f"+{add_conf} confidence")
-            if min_rr > 0:
-                parts.append(f"min RR {min_rr:.2f}")
-            tune = ", ".join(parts) or "усилить входной фильтр"
-            lines.append(f"• {_report_setup_label_human(key)} — WR {wr}, {tune}")
-    if not blocked and not penalized:
-        lines.append("")
-        lines.append("• Слабых сетапов для авто-блокировки не найдено")
-    return lines
-
-
-async def _auto_setup_build_policy() -> dict:
-    now_utc = dt.datetime.now(dt.timezone.utc)
-    since_utc = now_utc - dt.timedelta(days=_AUTO_SETUP_LOOKBACK_DAYS)
-    dataset = await db_store.signal_report_window_dataset(since=since_utc, until=now_utc)
-    closed_rows = list((dataset or {}).get("closed_rows") or [])
-    buckets: dict[str, dict] = {}
-    for src in closed_rows:
-        row = _daily_report_enrich_row(dict(src or {}))
-        key = _daily_report_setup_key_from_row(row)
-        if not key:
-            continue
-        bucket = buckets.setdefault(key, _daily_report_bucket_template())
-        _daily_report_add_closed(bucket, row)
-    setups: dict[str, dict] = {}
-    for key, bucket in buckets.items():
-        resolved = _daily_report_int(bucket.get('win')) + _daily_report_int(bucket.get('loss')) + _daily_report_int(bucket.get('be')) + _daily_report_int(bucket.get('manual_close'))
-        if resolved < _AUTO_SETUP_MIN_RESOLVED:
-            continue
-        winrate = _daily_report_winrate(bucket)
-        pnl = _daily_report_float(bucket.get('sum_pnl_pct'))
-        quality = _daily_report_quality(bucket)
-        losses = _daily_report_int(bucket.get('loss'))
-        wins = _daily_report_int(bucket.get('win'))
-        mode = 'allow'
-        add_conf = 0
-        min_rr = 0.0
-        reasons: list[str] = []
-        if losses >= max(3, wins + 2) and winrate <= _AUTO_SETUP_BLOCK_WINRATE and pnl <= _AUTO_SETUP_BLOCK_MAX_PNL:
-            mode = 'block'
-            reasons.append('low_winrate')
-            reasons.append('negative_pnl')
-        elif winrate < _AUTO_SETUP_PENALIZE_WINRATE or pnl < 0 or quality < 60:
-            mode = 'penalize'
-            severity = 0
-            if winrate < _AUTO_SETUP_PENALIZE_WINRATE:
-                severity += 1
-                reasons.append('low_winrate')
-            if pnl < 0:
-                severity += 1
-                reasons.append('negative_pnl')
-            if quality < 60:
-                severity += 1
-                reasons.append('low_quality')
-            severity = max(1, severity)
-            add_conf = min(_AUTO_SETUP_MAX_CONF_ADD, _AUTO_SETUP_CONF_STEP * severity)
-            min_rr = max(_AUTO_SETUP_MIN_RR_FLOOR, round(_AUTO_SETUP_MIN_RR_FLOOR + (_AUTO_SETUP_RR_STEP * max(0, severity - 1)), 2))
-        setups[key] = {
-            'mode': mode,
-            'resolved': resolved,
-            'win': _daily_report_int(bucket.get('win')),
-            'loss': _daily_report_int(bucket.get('loss')),
-            'be': _daily_report_int(bucket.get('be')),
-            'manual_close': _daily_report_int(bucket.get('manual_close')),
-            'winrate': round(winrate, 2),
-            'sum_pnl_pct': round(pnl, 4),
-            'quality': quality,
-            'add_conf': add_conf,
-            'min_rr': min_rr,
-            'reasons': reasons,
-        }
-    return {
-        'generated_at': now_utc.isoformat(),
-        'lookback_days': _AUTO_SETUP_LOOKBACK_DAYS,
-        'setups': setups,
-    }
-
-
-async def _auto_setup_get_policy(*, force_refresh: bool = False) -> dict:
-    global _AUTO_SETUP_POLICY_CACHE, _AUTO_SETUP_POLICY_CACHE_TS
-    now_ts = time.time()
-    if (not force_refresh) and isinstance(_AUTO_SETUP_POLICY_CACHE, dict) and (now_ts - float(_AUTO_SETUP_POLICY_CACHE_TS or 0.0) <= _AUTO_SETUP_POLICY_CACHE_SEC):
-        return dict(_AUTO_SETUP_POLICY_CACHE)
-    cached = await db_store.kv_get_json(_AUTO_SETUP_POLICY_KEY) or {}
-    cached_ts = 0.0
-    try:
-        cached_ts = dt.datetime.fromisoformat(str(cached.get('generated_at') or '').replace('Z', '+00:00')).timestamp()
-    except Exception:
-        cached_ts = 0.0
-    if (not force_refresh) and cached and cached_ts > 0 and (time.time() - cached_ts <= _AUTO_SETUP_POLICY_CACHE_SEC):
-        _AUTO_SETUP_POLICY_CACHE = dict(cached)
-        _AUTO_SETUP_POLICY_CACHE_TS = now_ts
-        return dict(cached)
-    try:
-        fresh = await _auto_setup_build_policy()
-        await db_store.kv_set_json(_AUTO_SETUP_POLICY_KEY, fresh)
-        _AUTO_SETUP_POLICY_CACHE = dict(fresh)
-        _AUTO_SETUP_POLICY_CACHE_TS = now_ts
-        return fresh
-    except Exception:
-        logger.exception('[auto-setup] build policy failed')
-        _AUTO_SETUP_POLICY_CACHE = dict(cached) if isinstance(cached, dict) else {}
-        _AUTO_SETUP_POLICY_CACHE_TS = now_ts
-        return dict(_AUTO_SETUP_POLICY_CACHE)
-
-
-def _signal_setup_key(sig) -> str:
-    try:
-        return _canonical_setup_key(_signal_ui_setup_label(sig))
-    except Exception:
-        return ""
-
-
-async def _apply_auto_setup_optimization(sig: Signal) -> tuple[Signal | None, str]:
-    if not _AUTO_SETUP_OPT_ENABLED:
-        return sig, "disabled"
-    setup_key = _signal_setup_key(sig)
-    if not setup_key:
-        return sig, "no_setup"
-    policy = await _auto_setup_get_policy()
-    entry = dict((policy.get('setups') or {}).get(setup_key) or {})
-    mode = str(entry.get('mode') or 'allow').strip().lower()
-    if mode == 'block':
-        return None, f"blocked:{setup_key}"
-    if mode != 'penalize':
-        return sig, 'allow'
-    try:
-        cur_conf = int(getattr(sig, 'confidence', 0) or 0)
-    except Exception:
-        cur_conf = 0
-    try:
-        cur_rr = float(getattr(sig, 'rr', 0.0) or 0.0)
-    except Exception:
-        cur_rr = 0.0
-    add_conf = _daily_report_int(entry.get('add_conf'))
-    min_rr = _daily_report_float(entry.get('min_rr'))
-    new_conf = max(cur_conf, min(99, cur_conf + add_conf)) if add_conf > 0 else cur_conf
-    new_rr = max(cur_rr, min_rr) if min_rr > 0 else cur_rr
-    if new_conf != cur_conf or abs(new_rr - cur_rr) > 1e-12:
-        try:
-            sig = replace(sig, confidence=new_conf, rr=new_rr)
-        except Exception:
-            pass
-    return sig, f"penalize:{setup_key}:conf={new_conf}:rr={new_rr:.2f}"
-
-
 async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datetime) -> str:
     dataset = await db_store.signal_report_window_dataset(since=since, until=until)
     sent_rows = list((dataset or {}).get("sent_rows") or [])
@@ -5090,17 +4823,11 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
     markets = {"SPOT": _daily_report_bucket_template(), "FUTURES": _daily_report_bucket_template()}
     sides = {"LONG": _daily_report_bucket_template(), "SHORT": _daily_report_bucket_template()}
     setups = {
-        "smc_liquidity_reclaim": _daily_report_bucket_template(),
-        "smc_ob_fvg_overlap": _daily_report_bucket_template(),
-        "smc_htf_ob_ltf_fvg": _daily_report_bucket_template(),
-        "smc_bos_retest_confirm": _daily_report_bucket_template(),
         "origin": _daily_report_bucket_template(),
         "breakout": _daily_report_bucket_template(),
         "zone_retest": _daily_report_bucket_template(),
         "normal_pending_trigger": _daily_report_bucket_template(),
         "liquidity_reclaim": _daily_report_bucket_template(),
-        "smc_displacement_origin": _daily_report_bucket_template(),
-        "smc_dual_fvg_origin": _daily_report_bucket_template(),
     }
 
     sent_by_id: dict[int, dict] = {}
@@ -5302,9 +5029,9 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         lines.append("")
 
     lines.extend([sep, "🧠 Setup-анализ", ""])
-    for setup_key in ("smc_liquidity_reclaim", "smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg", "smc_bos_retest_confirm", "origin", "breakout", "zone_retest", "normal_pending_trigger", "liquidity_reclaim", "smc_displacement_origin", "smc_dual_fvg_origin"):
+    for setup_key in ("origin", "breakout", "zone_retest", "normal_pending_trigger", "liquidity_reclaim"):
         bucket = setups.get(setup_key) or _daily_report_bucket_template()
-        lines.append(_report_setup_label_human(setup_key))
+        lines.append(setup_key)
         lines.append(f"Всего: {_daily_report_int(bucket.get('sent'))}")
         lines.append(f"✅ WIN: {_daily_report_int(bucket.get('win'))}")
         lines.append(f"❌ LOSS: {_daily_report_int(bucket.get('loss'))}")
@@ -5316,13 +5043,13 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         lines.append(f"🛡 Качество: {_daily_report_render_quality(bucket)}")
         lines.append("")
 
-    lines.extend([sep, "🏆 Лучший сетап дня", "", f"🥇 {_report_setup_label_human(best_setup_key) if best_setup_key else '—'}", "Почему лучший:"])
+    lines.extend([sep, "🏆 Лучший сетап дня", "", f"🥇 {best_setup_key or '—'}", "Почему лучший:"])
     for item in _daily_report_best_setup_reasons(best_setup_key)[:4]:
         lines.append(f"• {item}")
     lines.extend(["", "Итог:"])
     if best_setup_key:
         lines.append(f"📈 Winrate: {_daily_report_pct(_daily_report_winrate(best_setup_bucket), digits=1, strip_zero=True)}")
-    lines.extend(["💰 Лучший вклад в PnL дня", "🛡 Самый стабильный setup", "", sep, "⚠️ Худший сетап дня", "", f"🥀 {_report_setup_label_human(worst_setup_key) if worst_setup_key else '—'}", "Почему слабый:"])
+    lines.extend(["💰 Лучший вклад в PnL дня", "🛡 Самый стабильный setup", "", sep, "⚠️ Худший сетап дня", "", f"🥀 {worst_setup_key or '—'}", "Почему слабый:"])
     for item in _daily_report_worst_setup_reasons(worst_setup_key)[:3]:
         lines.append(f"• {item}")
     lines.extend(["", "Итог:"])
@@ -5383,7 +5110,7 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         "",
         "Вывод:",
         f"самая слабая часть сейчас — {'retest логика для LONG и слабый post-entry follow-through' if weakest_filter_key == 'retest' else weakest_filter_label}",
-        f"самая сильная часть — {'SHORT по тренду и liquidity reclaim' if side_best == 'SHORT' and best_setup_key == 'liquidity_reclaim' else ((_report_setup_label_human(best_setup_key) if best_setup_key else 'лучшая логика') + (' и ' + side_best + ' по тренду' if side_best else ''))}",
+        f"самая сильная часть — {'SHORT по тренду и liquidity reclaim' if side_best == 'SHORT' and best_setup_key == 'liquidity_reclaim' else ((best_setup_key or 'лучшая логика') + (' и ' + side_best + ' по тренду' if side_best else ''))}",
         "",
         sep,
         "🤖 Что улучшить боту на завтра",
@@ -5410,23 +5137,17 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
     for item in caution_lines[:4]:
         lines.append(f"• {item}")
 
-    try:
-        auto_policy = await _auto_setup_get_policy(force_refresh=True)
-    except Exception:
-        auto_policy = {}
-    lines.extend(["", *_auto_setup_policy_lines(auto_policy), ""])
-
-    lines.extend([sep, "🏁 Финальный вывод", "", f"День закрыт в {'плюс' if overall_pnl >= 0 else 'минус'}: {_report_pnl_pct(overall_pnl)}", "", "Лучше всего отработали:"])
+    lines.extend(["", sep, "🏁 Финальный вывод", "", f"День закрыт в {'плюс' if overall_pnl >= 0 else 'минус'}: {_report_pnl_pct(overall_pnl)}", "", "Лучше всего отработали:"])
     if market_best:
         lines.append(f"• {market_best}")
     if side_best:
         lines.append(f"• {side_best}")
     if best_setup_key:
-        lines.append(f"• {_report_setup_label_human(best_setup_key)}")
+        lines.append(f"• {best_setup_key}")
     lines.append('• breakout с подтверждённым объёмом')
     lines.extend(["", "Требуют доработки:"])
     if worst_setup_key:
-        lines.append(f"• {_report_setup_label_human(worst_setup_key)} LONG" if worst_setup_key == 'zone_retest' else f"• {_report_setup_label_human(worst_setup_key)}")
+        lines.append(f"• {worst_setup_key} LONG" if worst_setup_key == 'zone_retest' else f"• {worst_setup_key}")
     lines.append('• RR filter в SPOT')
     lines.append('• MACD momentum filter')
     lines.append('• TP1 protection')
@@ -5510,10 +5231,6 @@ async def daily_signal_report_loop() -> None:
                 since_utc = since_local.astimezone(dt.timezone.utc)
                 until_utc = until_local.astimezone(dt.timezone.utc)
                 await _send_daily_signal_report(since=since_utc, until=until_utc)
-                try:
-                    await _auto_setup_get_policy(force_refresh=True)
-                except Exception:
-                    logger.exception('[auto-setup] refresh after daily report failed')
                 await db_store.kv_set_json(_DAILY_SIGNAL_REPORT_STATE_KEY, {
                     "last_sent_for": report_key,
                     "sent_at": now_utc.isoformat(),
@@ -5748,16 +5465,6 @@ async def broadcast_signal(sig: Signal) -> None:
     except Exception:
         # best effort: if settings table not ready, don't block
         pass
-
-    try:
-        sig, auto_opt_status = await _apply_auto_setup_optimization(sig)
-        if sig is None:
-            logger.info("[auto-setup] skip weak setup signal market=%s symbol=%s status=%s", getattr(sig, 'market', '?') if sig else '?', getattr(sig, 'symbol', '?') if sig else '?', auto_opt_status)
-            return
-        if auto_opt_status not in ('allow', 'disabled', 'no_setup'):
-            logger.info("[auto-setup] applied %s market=%s symbol=%s", auto_opt_status, getattr(sig, 'market', '?'), getattr(sig, 'symbol', '?'))
-    except Exception:
-        logger.exception('[auto-setup] failed to apply optimization')
 
     # Deduplicate: avoid sending the same signal twice (common when scanner emits duplicates).
     import time, hashlib
