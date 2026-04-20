@@ -10382,10 +10382,10 @@ def _mid_smc_confluence_snapshot(*,
     if not overlap and ob_ok and fvg_active and fvg_dir_ok:
         overlap = bool(ob_retest or entry_confluence >= 3)
     htf_ltf = bool((ob_ok and fvg_active and fvg_dir_ok) and (overlap or ob_retest or entry_confluence >= 2))
-    confirm_ok = bool((bos_ok or bo_ok or disp_body_atr >= disp_min) and (ob_retest or entry_confluence >= 2))
-    breakout_retest_poi = bool((bo_ok or bos_ok) and (overlap or ob_retest or fvg_active or ob_ok) and confirm_ok and ob_retest)
-    liquidity_reclaim = bool(sweep_ok and (bos_ok or bo_ok or disp_body_atr >= disp_min) and ob_retest and (fvg_active or ob_ok))
-    displacement_hint = bool((disp_body_atr >= max(disp_min, float(os.getenv('MID_SMC_DISPLACEMENT_ORIGIN_MIN', '0.35') or 0.35))) and (bo_ok or bos_ok) and (fvg_active or ob_ok) and entry_confluence >= 2)
+    confirm_ok = bool(bos_ok or bo_ok or ob_retest or disp_body_atr >= disp_min)
+    breakout_retest_poi = bool((bo_ok or bos_ok) and (overlap or ob_retest or fvg_active or ob_ok) and confirm_ok)
+    liquidity_reclaim = bool(sweep_ok and confirm_ok and (ob_retest or fvg_active or ob_ok))
+    displacement_hint = bool((disp_body_atr >= disp_min) and (bo_ok or bos_ok) and (fvg_active or ob_ok))
     dual_fvg_hint = False
     stacked_fvg_hint = False
     try:
@@ -10453,6 +10453,10 @@ def _mid_smc_confluence_snapshot(*,
     else:
         smt_ok = smt_bull if diru == 'LONG' else (smt_bear if diru == 'SHORT' else False)
         smt_present = bool(smt_present or smt_ok)
+    try:
+        bo_move_atr = float(t.get('bo_move_atr') if t.get('bo_move_atr') is not None else (t.get('breakout_move_atr') if t.get('breakout_move_atr') is not None else (r.get('bo_move_atr') if r.get('bo_move_atr') is not None else (r.get('breakout_move_atr') if r.get('breakout_move_atr') is not None else r.get('breakout_first_move_atr_create')))) or 0.0)
+    except Exception:
+        bo_move_atr = 0.0
     return {
         'bo_ok': bool(bo_ok),
         'bos_ok': bool(bos_ok),
@@ -10476,6 +10480,8 @@ def _mid_smc_confluence_snapshot(*,
         'entry_kind': entry_kind or '—',
         'entry_confluence': int(entry_confluence),
         'priority': int(priority),
+        'sweep_ok': bool(sweep_ok),
+        'bo_move_atr': float(bo_move_atr),
     }
 
 
@@ -10503,6 +10509,227 @@ def _mid_smc_emit_route_priority_label(route: str | None) -> str:
     return labels.get(str(route or '').strip(), '')
 
 
+def _mid_smc_env_on(name: str, default: bool = False) -> bool:
+    try:
+        raw = os.getenv(name)
+        if raw is None or str(raw).strip() == '':
+            return bool(default)
+        return str(raw).strip().lower() in ('1', 'true', 'yes', 'on')
+    except Exception:
+        return bool(default)
+
+
+def _mid_smc_route_enabled(route: str | None) -> bool:
+    route_s = str(route or '').strip()
+    defaults = {
+        'smc_liquidity_reclaim': True,
+        'smc_ob_fvg_overlap': True,
+        'smc_htf_ob_ltf_fvg': True,
+        'smc_bos_retest_confirm': False,
+        'smc_displacement_origin': False,
+        'smc_dual_fvg_origin': False,
+    }
+    env_map = {
+        'smc_liquidity_reclaim': 'MID_SMC_ENABLE_LIQUIDITY_RECLAIM',
+        'smc_ob_fvg_overlap': 'MID_SMC_ENABLE_OB_FVG_OVERLAP',
+        'smc_htf_ob_ltf_fvg': 'MID_SMC_ENABLE_HTF_OB_LTF_FVG',
+        'smc_bos_retest_confirm': 'MID_SMC_ENABLE_BOS_RETEST_CONFIRM',
+        'smc_displacement_origin': 'MID_SMC_ENABLE_DISPLACEMENT_ORIGIN',
+        'smc_dual_fvg_origin': 'MID_SMC_ENABLE_DUAL_FVG_ORIGIN',
+    }
+    return _mid_smc_env_on(env_map.get(route_s, ''), defaults.get(route_s, True))
+
+
+def _mid_smc_reaction_candle_ok(direction: str, ta: dict | None = None, rec: dict | None = None) -> tuple[bool, str]:
+    t = ta if isinstance(ta, dict) else {}
+    r = rec if isinstance(rec, dict) else {}
+    direction = str(direction or '').upper().strip()
+    pat = str(t.get('pattern') or r.get('pattern') or '').strip().lower()
+    bull_ok = {
+        'bullish engulfing', 'bull engulf', 'hammer', 'morning star',
+        'bullish rejection', 'rejection up', 'reclaim up'
+    }
+    bear_ok = {
+        'bearish engulfing', 'bear engulf', 'shooting star', 'evening star',
+        'bearish rejection', 'rejection down', 'reclaim down'
+    }
+    if direction == 'LONG' and pat in bull_ok:
+        return (True, pat)
+    if direction == 'SHORT' and pat in bear_ok:
+        return (True, pat)
+    try:
+        last_body = float(t.get('last_body') if t.get('last_body') is not None else (r.get('last_body') if r.get('last_body') is not None else 0.0) or 0.0)
+    except Exception:
+        last_body = 0.0
+    try:
+        atr5 = float(t.get('atr5') if t.get('atr5') is not None else (r.get('atr5') if r.get('atr5') is not None else (t.get('atr30') if t.get('atr30') is not None else r.get('atr30') or 0.0)) or 0.0)
+    except Exception:
+        atr5 = 0.0
+    try:
+        close_v = float(t.get('close') if t.get('close') is not None else (t.get('entry') if t.get('entry') is not None else (r.get('close') if r.get('close') is not None else r.get('entry') or 0.0)) or 0.0)
+    except Exception:
+        close_v = 0.0
+    try:
+        open_v = float(t.get('open') if t.get('open') is not None else (r.get('open') if r.get('open') is not None else close_v) or close_v)
+    except Exception:
+        open_v = close_v
+    body_atr = abs(last_body) / max(atr5, 1e-12)
+    if direction == 'LONG' and close_v > open_v and body_atr >= 0.12:
+        return (True, f'body_up:{body_atr:.2f}atr')
+    if direction == 'SHORT' and close_v < open_v and body_atr >= 0.12:
+        return (True, f'body_down:{body_atr:.2f}atr')
+    return (False, pat or 'no_reaction_candle')
+
+
+def _mid_smc_v2_hard_filter(*,
+                            route: str | None,
+                            direction: str,
+                            ta: dict | None = None,
+                            rec: dict | None = None,
+                            smc_snapshot: dict | None = None) -> tuple[bool, str, dict]:
+    t = ta if isinstance(ta, dict) else {}
+    r = rec if isinstance(rec, dict) else {}
+    smc = smc_snapshot if isinstance(smc_snapshot, dict) else {}
+    route_s = str(route or '').strip()
+    diru = str(direction or '').upper().strip()
+    meta: dict[str, object] = {'route': route_s, 'guard': 'smart_setup_v2'}
+
+    if route_s and not _mid_smc_route_enabled(route_s):
+        meta['route_enabled'] = False
+        return (False, 'route_disabled_v2', meta)
+    meta['route_enabled'] = True
+
+    def _f(*vals, default=None):
+        for v in vals:
+            try:
+                if v is None:
+                    continue
+                fv = float(v)
+                if math.isfinite(fv):
+                    return fv
+            except Exception:
+                pass
+        return default
+
+    def _s(*vals):
+        for v in vals:
+            try:
+                sv = str(v or '').strip()
+            except Exception:
+                sv = ''
+            if sv:
+                return sv
+        return ''
+
+    def _norm_dir(*vals):
+        raw = _s(*vals).upper()
+        mapping = {
+            'BUY': 'LONG',
+            'BULL': 'LONG',
+            'UP': 'LONG',
+            'LONG': 'LONG',
+            'SELL': 'SHORT',
+            'BEAR': 'SHORT',
+            'DOWN': 'SHORT',
+            'SHORT': 'SHORT',
+        }
+        return mapping.get(raw, raw)
+
+    strength_min = _f(os.getenv('MID_SMC_MIN_SIGNAL_STRENGTH'), default=5.0)
+    strength = _f(
+        t.get('signal_strength_10'), t.get('strength10'), t.get('strength'),
+        r.get('signal_strength_10'), r.get('strength10'), r.get('strength'),
+    )
+    if strength is None:
+        try:
+            strength = float(_signal_strength_10(t or r)[0])
+        except Exception:
+            strength = None
+    meta['strength'] = strength
+    meta['strength_min'] = strength_min
+    if strength is not None and strength < strength_min:
+        return (False, f'strength_lt_min:{strength:.2f}<{strength_min:.2f}', meta)
+
+    trend_hint = _norm_dir(
+        t.get('htf_dir_1h'), t.get('dir_trend'), t.get('trend_dir'), t.get('direction_trend'),
+        t.get('dir4'), t.get('dir1'), r.get('htf_dir_1h'), r.get('dir_trend'), r.get('trend_dir'), r.get('dir4'), r.get('dir1')
+    )
+    if trend_hint in ('LONG', 'SHORT') and diru in ('LONG', 'SHORT') and trend_hint != diru:
+        meta['trend_hint'] = trend_hint
+        return (False, f'trend_mismatch:{trend_hint}!={diru}', meta)
+    meta['trend_hint'] = trend_hint or '—'
+
+    bo_move_atr = _f(
+        t.get('bo_move_atr'), t.get('breakout_move_atr'), t.get('breakout_first_move_atr_create'),
+        r.get('bo_move_atr'), r.get('breakout_move_atr'), r.get('breakout_first_move_atr_create'),
+        smc.get('bo_move_atr')
+    )
+    bos_move_min = _f(os.getenv('MID_SMC_MIN_BOS_MOVE_ATR'), default=1.2)
+    meta['bo_move_atr'] = bo_move_atr
+    meta['bos_move_min'] = bos_move_min
+    if route_s in ('smc_liquidity_reclaim', 'smc_ob_fvg_overlap', 'smc_htf_ob_ltf_fvg', 'smc_bos_retest_confirm'):
+        if bo_move_atr is not None and bo_move_atr < bos_move_min:
+            return (False, f'fake_bos_move:{bo_move_atr:.2f}<{bos_move_min:.2f}', meta)
+
+    sweep_ok = bool(smc.get('sweep_ok'))
+    if not sweep_ok:
+        sweep_long = bool(t.get('sweep_long') if t.get('sweep_long') is not None else r.get('sweep_long'))
+        sweep_short = bool(t.get('sweep_short') if t.get('sweep_short') is not None else r.get('sweep_short'))
+        sweep_ok = sweep_long if diru == 'LONG' else (sweep_short if diru == 'SHORT' else False)
+    meta['sweep_ok'] = bool(sweep_ok)
+    if route_s in ('smc_liquidity_reclaim', 'smc_ob_fvg_overlap', 'smc_htf_ob_ltf_fvg', 'smc_bos_retest_confirm') and not sweep_ok:
+        return (False, 'sweep_missing_v2', meta)
+
+    entry = _f(t.get('entry'), t.get('close'), r.get('entry'), r.get('close'))
+    resistance = _f(
+        t.get('resistance'), r.get('resistance'),
+        t.get('recent_high'), r.get('recent_high'),
+        t.get('eq_hi'), r.get('eq_hi'),
+        smc.get('resistance')
+    )
+    support = _f(
+        t.get('support'), r.get('support'),
+        t.get('recent_low'), r.get('recent_low'),
+        t.get('eq_lo'), r.get('eq_lo'),
+        smc.get('support')
+    )
+    atr30 = _f(t.get('atr30'), t.get('atr_abs'), t.get('atr5'), r.get('atr30'), r.get('atr_at_create'), r.get('atr5'))
+    near_atr = _f(os.getenv('MID_SMC_NEAR_LEVEL_ATR_HARD'), default=0.5)
+    meta['near_level_atr_hard'] = near_atr
+    if diru == 'LONG' and entry is not None and resistance is not None and atr30 is not None and atr30 > 0:
+        dist_res_atr = (float(resistance) - float(entry)) / float(atr30)
+        meta['dist_res_atr'] = dist_res_atr
+        if dist_res_atr < near_atr:
+            return (False, f'near_resistance:{dist_res_atr:.2f}atr<{near_atr:.2f}', meta)
+    if diru == 'SHORT' and entry is not None and support is not None and atr30 is not None and atr30 > 0:
+        dist_sup_atr = (float(entry) - float(support)) / float(atr30)
+        meta['dist_sup_atr'] = dist_sup_atr
+        if dist_sup_atr < near_atr:
+            return (False, f'near_support:{dist_sup_atr:.2f}atr<{near_atr:.2f}', meta)
+
+    reaction_required = _mid_smc_env_on('MID_SMC_REQUIRE_REACTION_CANDLE', True)
+    reaction_ok, reaction_reason = _mid_smc_reaction_candle_ok(diru, t, r)
+    meta['reaction_ok'] = bool(reaction_ok)
+    meta['reaction_reason'] = str(reaction_reason)
+    if reaction_required and route_s in ('smc_liquidity_reclaim', 'smc_ob_fvg_overlap', 'smc_htf_ob_ltf_fvg', 'smc_bos_retest_confirm') and not reaction_ok:
+        return (False, f'reaction_candle_missing:{reaction_reason}', meta)
+
+    ob_ok = bool(smc.get('ob_ok'))
+    fvg_ok = bool(smc.get('fvg_ok'))
+    bos_ok = bool(smc.get('bos_ok'))
+    disp_ok = bool(smc.get('displacement_hint'))
+    meta['ob_ok'] = ob_ok
+    meta['fvg_ok'] = fvg_ok
+    meta['bos_ok'] = bos_ok
+    meta['disp_ok'] = disp_ok
+    if route_s == 'smc_ob_fvg_overlap' and not (ob_ok and fvg_ok and bos_ok and disp_ok):
+        return (False, 'ob_fvg_confirm_missing', meta)
+    if route_s == 'smc_htf_ob_ltf_fvg' and not (sweep_ok and disp_ok and bos_ok and ob_ok and fvg_ok):
+        return (False, 'htf_ltf_confirm_missing', meta)
+
+    return (True, 'ok', meta)
+
+
 def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = None) -> dict:
     """Route-specific institutional confirmation profile.
 
@@ -10521,6 +10748,7 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
         "require_bos": False,
         "require_sweep": False,
         "require_displacement": False,
+        "require_reaction_candle": False,
         "require_retest": False,
         "require_mss": False,
         "prefer_smt": False,
@@ -10540,39 +10768,46 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
             "min_conf_direct": 82,
+            "require_reaction_candle": True,
         })
     elif route_s in ("smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg"):
         prof.update({
             "require_reclaim": True,
             "require_bos": True,
-            "require_sweep": bool(is_range_like),
+            "require_sweep": True,
+            "require_displacement": True,
             "require_retest": True,
             "require_mss": True,
             "prefer_smt": True,
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
-            "min_conf_direct": 84 if is_range_like else 82,
+            "min_conf_direct": 86 if is_range_like else 84,
+            "require_reaction_candle": True,
         })
     elif route_s == "smc_bos_retest_confirm":
         prof.update({
-            "require_reclaim": bool(is_range_like),
+            "require_reclaim": True,
             "require_bos": True,
-            "require_sweep": bool(is_range_like),
+            "require_sweep": True,
+            "require_displacement": True,
             "require_retest": True,
             "require_mss": True,
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
-            "min_conf_direct": 84 if is_range_like else 82,
+            "allow_direct_emit": False,
+            "min_conf_direct": 88 if is_range_like else 84,
+            "require_reaction_candle": True,
         })
     elif route_s in ("smc_displacement_origin", "smc_dual_fvg_origin"):
         prof.update({
             "require_reclaim": True,
             "require_bos": True,
-            "require_sweep": bool(is_range_like),
+            "require_sweep": True,
             "require_displacement": True,
             "require_fake_bos_filter": True,
             "allow_direct_emit": False,
-            "min_conf_direct": 84 if is_range_like else 82,
+            "min_conf_direct": 90 if is_range_like else 88,
+            "require_reaction_candle": True,
         })
     return prof
 
@@ -10645,27 +10880,27 @@ def _mid_pick_smc_emit_route(*,
     route = ''
     setup_source = ''
     priority = 0
-    if bool(liquidity_reclaim_ok or smc.get('liquidity_reclaim')) and bool(zone_valid and in_zone_now):
+    if _mid_smc_route_enabled('smc_liquidity_reclaim') and bool(liquidity_reclaim_ok or smc.get('liquidity_reclaim')) and bool(zone_valid and in_zone_now):
         route = 'smc_liquidity_reclaim'
         setup_source = 'liquidity_reclaim'
         priority = 130
-    elif bool(smc.get('overlap')) and bool(zone_valid and in_zone_now):
+    elif _mid_smc_route_enabled('smc_ob_fvg_overlap') and bool(smc.get('overlap')) and bool(zone_valid and in_zone_now):
         route = 'smc_ob_fvg_overlap'
         setup_source = 'zone_retest'
         priority = 120
-    elif bool(smc.get('htf_ltf')) and bool(zone_valid and in_zone_now):
+    elif _mid_smc_route_enabled('smc_htf_ob_ltf_fvg') and bool(smc.get('htf_ltf')) and bool(zone_valid and in_zone_now):
         route = 'smc_htf_ob_ltf_fvg'
         setup_source = 'zone_retest'
         priority = 110
-    elif bool(smc.get('breakout_retest_poi')) and bool(smc.get('confirm_ok')) and bool(zone_valid and in_zone_now):
+    elif _mid_smc_route_enabled('smc_bos_retest_confirm') and bool(smc.get('breakout_retest_poi')) and bool(smc.get('confirm_ok')) and bool(zone_valid and in_zone_now):
         route = 'smc_bos_retest_confirm'
         setup_source = 'zone_retest'
         priority = 100
-    elif bool(origin_fast_ok) and bool(smc.get('displacement_hint')) and str(os.getenv('MID_SMART_SETUP_ALLOW_DISPLACEMENT_ORIGIN', '0') or '0').strip().lower() in ('1','true','yes','on'):
+    elif _mid_smc_route_enabled('smc_displacement_origin') and bool(origin_fast_ok) and bool(smc.get('displacement_hint')):
         route = 'smc_displacement_origin'
         setup_source = 'origin'
         priority = 95
-    elif bool(origin_fast_ok) and bool(smc.get('dual_fvg_hint') or smc.get('stacked_fvg_hint')) and str(os.getenv('MID_SMART_SETUP_ALLOW_DUAL_FVG_ORIGIN', '0') or '0').strip().lower() in ('1','true','yes','on'):
+    elif _mid_smc_route_enabled('smc_dual_fvg_origin') and bool(origin_fast_ok) and bool(smc.get('dual_fvg_hint') or smc.get('stacked_fvg_hint')):
         route = 'smc_dual_fvg_origin'
         setup_source = 'origin'
         priority = 92
@@ -10742,7 +10977,7 @@ def _mid_smart_setup_origin_fastpath(*,
     except Exception:
         base_conf_need = 90
     try:
-        conf_need = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF", str(max(min(base_conf_need, 84), 84))) or max(min(base_conf_need, 84), 84)))
+        conf_need = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF", str(min(base_conf_need, 76))) or min(base_conf_need, 76)))
     except Exception:
         conf_need = min(base_conf_need, 76)
     conf_need = max(0, int(conf_need))
@@ -10753,16 +10988,16 @@ def _mid_smart_setup_origin_fastpath(*,
     except Exception:
         atr_mult = 0.75
     try:
-        vol_need = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X", "0.30") or 0.30)
+        vol_need = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X", "0") or 0)
     except Exception:
-        vol_need = 0.30
+        vol_need = 0.0
     if vol_need <= 0:
         # Origin fast is allowed to fire at the *start* of a real move, before
         # volume/relative-volume fully expands on the current bar.
-        vol_need = 0.30
+        vol_need = 0.0
     atr_need = max(0.0, float(min_atr) * max(0.0, float(atr_mult)))
     try:
-        min_body_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR", "0.12") or 0.12)
+        min_body_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR", "0.08") or 0.08)
     except Exception:
         min_body_atr = 0.08
     try:
@@ -10780,11 +11015,11 @@ def _mid_smart_setup_origin_fastpath(*,
 
     if smc_priority >= 2:
         try:
-            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMC_ORIGIN_CONF", "82") or 82)))
+            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMC_ORIGIN_CONF", "74") or 74)))
         except Exception:
             conf_need = min(int(conf_need), 74)
         try:
-            min_body_atr = min(float(min_body_atr), float(os.getenv("MID_SMC_ORIGIN_MIN_BODY_ATR", "0.10") or 0.10))
+            min_body_atr = min(float(min_body_atr), float(os.getenv("MID_SMC_ORIGIN_MIN_BODY_ATR", "0.05") or 0.05))
         except Exception:
             pass
         try:
@@ -10793,9 +11028,9 @@ def _mid_smart_setup_origin_fastpath(*,
             pass
     if smc_overlap or smc_htf_ltf or smc_displacement or smc_dual_fvg:
         try:
-            vol_need = min(float(vol_need), float(os.getenv("MID_SMC_ORIGIN_MIN_VOL_X", "0.35") or 0.35))
+            vol_need = min(float(vol_need), float(os.getenv("MID_SMC_ORIGIN_MIN_VOL_X", "0.0") or 0.0))
         except Exception:
-            vol_need = 0.30
+            vol_need = 0.0
 
     hard_flags = {"scale_mismatch", "blocked", "structure_mismatch", "block:directional_contradiction"}
     active_hard_flags = sorted([x for x in flags if x in hard_flags])
@@ -10900,15 +11135,15 @@ def _mid_smart_setup_origin_fastpath(*,
         fresh_origin_bias = False
     if fresh_origin_bias:
         try:
-            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF_FRESH", "80") or 80)))
+            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMART_SETUP_ORIGIN_CONF_FRESH", "72") or 72)))
         except Exception:
             conf_need = min(int(conf_need), 72)
         try:
-            body_need_eff = min(float(body_need_eff), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR_FRESH", "0.10") or 0.10))
+            body_need_eff = min(float(body_need_eff), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR_FRESH", "0.05") or 0.05))
         except Exception:
             pass
         try:
-            vol_need_eff = min(float(vol_need_eff), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X_FRESH", "0.25") or 0.25))
+            vol_need_eff = min(float(vol_need_eff), float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_VOL_X_FRESH", "0.00") or 0.00))
         except Exception:
             pass
         try:
@@ -11236,7 +11471,10 @@ def _mid_smc_route_emit_gate(*,
                               origin_body_atr: float | None = None,
                               current_body_atr: float | None = None,
                               origin_body_soft_bypass: bool = False,
-                              macd_hist: float | None = None) -> tuple[bool, str, dict]:
+                              macd_hist: float | None = None,
+                              ta: dict | None = None,
+                              rec: dict | None = None,
+                              smc_snapshot: dict | None = None) -> tuple[bool, str, dict]:
     """Direct SMC emit gate.
 
     High-priority SMC routes must not be reduced to a score bonus only.
@@ -11336,6 +11574,17 @@ def _mid_smc_route_emit_gate(*,
         blocks.append('zone_retest_not_ready')
     if route_liq and not bool(zone_valid and in_zone_now):
         blocks.append('liquidity_retest_not_ready')
+
+    v2_ok, v2_reason, v2_meta = _mid_smc_v2_hard_filter(
+        route=route_s,
+        direction=diru,
+        ta=ta,
+        rec=rec,
+        smc_snapshot=smc_snapshot,
+    )
+    meta['v2_guard'] = dict(v2_meta or {})
+    if not v2_ok:
+        blocks.append(str(v2_reason or 'smart_setup_v2_block'))
 
     if blocks:
         meta['blocked_by'] = list(blocks)
@@ -11698,7 +11947,7 @@ def _mid_instant_emit_gate(*,
         try:
             _instant_vol_need = min(float(_instant_vol_need), float(os.getenv("MID_SMART_SETUP_ORIGIN_INSTANT_MIN_VOL_X", "0.0") or 0.0))
         except Exception:
-            _instant_vol_need = 0.30
+            _instant_vol_need = 0.0
     if vol_v < float(_instant_vol_need):
         _add_fail(f"instant_vol_low:{vol_v:.2f}<{_instant_vol_need:.2f}")
     if not near_extreme_ok:
@@ -26529,6 +26778,14 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             except Exception:
                                 pass
 
+                            req_reaction = bool(route_prof.get("require_reaction_candle"))
+                            reaction_ok, reaction_reason = _mid_smc_reaction_candle_ok(diru, ta, it)
+                            try:
+                                it["_trig_reqs"]["reaction_candle"] = bool(req_reaction)
+                                it["_trig_checks"]["reaction_candle"] = ("skip" if (not req_reaction) else ("pass" if reaction_ok else "fail"))
+                            except Exception:
+                                pass
+
                             try:
                                 it["_trig_smc_route"] = str(smc_route_now or "")
                                 it["_trig_smc_req_profile"] = {
@@ -26540,6 +26797,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     "smt": bool(req_smt),
                                     "reclaim_hold": bool(req_reclaim_hold),
                                     "fake_bos_filter": bool(req_fake_bos),
+                                    "reaction_candle": bool(req_reaction),
                                 }
                             except Exception:
                                 pass
@@ -26555,6 +26813,9 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                             if req_fake_bos and (not fake_bos_ok):
                                 _trig_add("fake_bos_filter_fail", "fake_bos_filter_fail")
+
+                            if req_reaction and (not reaction_ok):
+                                _trig_add("reaction_candle_missing", "reaction_candle_missing")
 
                             if req_reclaim and (not reclaim_ok):
                                 _trig_add("reclaim_missing", "reclaim_missing")
@@ -32052,6 +32313,9 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 current_body_atr=_mid_body_atr(float((base_r.get("last_body") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("last_body") or 0.0) or 0.0), float(_atr_now or 0.0)),
                                                 origin_body_soft_bypass=bool((_origin_fast_meta or {}).get("body_soft_bypass") or False),
                                                 macd_hist=_safe_float((base_r.get("macd_hist") if ("base_r" in locals() and isinstance(base_r, dict)) else rec.get("macd_hist")), None),
+                                                ta=(base_r if ("base_r" in locals() and isinstance(base_r, dict)) else rec),
+                                                rec=rec,
+                                                smc_snapshot=_smc_snapshot,
                                             )
 
                                             if _emit_now:
@@ -36892,7 +37156,7 @@ def _mid_direction_quality_3of5_pre_emit_reason(
             rec.get("macd_hist"),
         )
 
-        hard_strength = _env_float(f"{pref}_MIN_STRENGTH_HARD", None, f"{fallback_pref}_MIN_STRENGTH_HARD")
+        hard_strength = _env_float(f"{pref}_MIN_STRENGTH_HARD", 5.0, f"{fallback_pref}_MIN_STRENGTH_HARD")
         if hard_strength is not None and strength is not None and float(strength) < float(hard_strength):
             return f"{side_label}_strength_hard:{float(strength):.2f}<{float(hard_strength):.2f}"
 
