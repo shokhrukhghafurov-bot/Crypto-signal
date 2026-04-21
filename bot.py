@@ -4354,20 +4354,68 @@ def _adaptive_v3_bucket(parent: dict, key: str) -> dict:
 
 
 def _adaptive_v3_setup_key_from_row(row: dict) -> str:
+    """Return only canonical exact SMC route keys for adaptive/report route stats.
+
+    Important: this function is used for the exact route block in the daily report
+    and for adaptive-v3 route statistics. It must not fall back to generic setup
+    source labels like ``origin`` / ``zone_retest`` / ``normal_pending_trigger``,
+    otherwise the exact-route section becomes polluted with non-route categories.
+    """
     src = dict(row or {})
+
+    direct_routes = {
+        'smc_liquidity_reclaim',
+        'smc_ob_fvg_overlap',
+        'smc_htf_ob_ltf_fvg',
+        'smc_bos_retest_confirm',
+        'smc_displacement_origin',
+        'smc_dual_fvg_origin',
+    }
+    aliases = {
+        'liquidity_reclaim_emit': 'smc_liquidity_reclaim',
+    }
+
+    def _normalize_exact_route(value) -> str:
+        raw = str(value or '').strip()
+        if not raw:
+            return ''
+        if raw in direct_routes:
+            return raw
+        if raw in aliases:
+            return aliases[raw]
+
+        slug = _adaptive_v3_slug(raw)
+        if slug in direct_routes:
+            return slug
+        if slug in aliases:
+            return aliases[slug]
+
+        low = raw.lower()
+        if ('liquidity' in low and 'reclaim' in low) or ('sweep' in low and 'reclaim' in low):
+            return 'smc_liquidity_reclaim'
+        if 'ob+fvg priority emit' in low or ('ob+fvg' in low and 'priority' in low):
+            return 'smc_ob_fvg_overlap'
+        if 'htf ob + ltf fvg retest emit' in low or ('htf ob' in low and 'ltf fvg' in low):
+            return 'smc_htf_ob_ltf_fvg'
+        if ('bos' in low and 'retest' in low) or ('fvg/ob retest' in low):
+            return 'smc_bos_retest_confirm'
+        if 'displacement origin fast-path' in low or ('displacement' in low and 'origin' in low):
+            return 'smc_displacement_origin'
+        if 'dual/stacked fvg origin' in low or ('dual' in low and 'fvg' in low and 'origin' in low) or ('stacked' in low and 'fvg' in low and 'origin' in low):
+            return 'smc_dual_fvg_origin'
+        return ''
+
     for cand in (
         src.get('emit_route'),
         src.get('smc_setup_route'),
         src.get('ui_setup_label'),
         src.get('smc_setup_label'),
         _report_setup_label_from_row(src),
-        src.get('setup_source'),
-        src.get('setup_source_label'),
     ):
-        slug = _adaptive_v3_slug(cand)
-        if slug:
-            return slug
-    return 'unknown'
+        route = _normalize_exact_route(cand)
+        if route:
+            return route
+    return ''
 
 
 async def _adaptive_v3_update_from_outcome(row: dict, *, final_status: str, pnl_total_pct: float = 0.0, closed_at: dt.datetime | None = None) -> None:
@@ -4941,7 +4989,8 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         if setup in setups:
             _daily_report_add_sent(setups[setup], row)
         route_key = _adaptive_v3_setup_key_from_row(row)
-        _daily_report_add_sent(smart_routes.setdefault(route_key, _daily_report_bucket_template()), row)
+        if route_key:
+            _daily_report_add_sent(smart_routes.setdefault(route_key, _daily_report_bucket_template()), row)
 
     all_loss_rows: list[dict] = []
     for row in closed_rows:
@@ -4963,7 +5012,8 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         if setup in setups:
             _daily_report_add_closed(setups[setup], row)
         route_key = _adaptive_v3_setup_key_from_row(row)
-        _daily_report_add_closed(smart_routes.setdefault(route_key, _daily_report_bucket_template()), row)
+        if route_key:
+            _daily_report_add_closed(smart_routes.setdefault(route_key, _daily_report_bucket_template()), row)
         if str(row.get("status") or "").upper().strip() == "LOSS":
             all_loss_rows.append(row)
 
