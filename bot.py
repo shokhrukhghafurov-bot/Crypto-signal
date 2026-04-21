@@ -4379,6 +4379,22 @@ def _adaptive_v3_setup_key_from_row(row: dict) -> str:
     return 'unknown'
 
 
+_EXACT_SMART_ROUTE_ORDER = [
+    'smc_liquidity_reclaim',
+    'smc_ob_fvg_overlap',
+    'smc_htf_ob_ltf_fvg',
+    'smc_bos_retest_confirm',
+    'smc_displacement_origin',
+    'smc_dual_fvg_origin',
+]
+
+_EXACT_SMART_ROUTE_SET = set(_EXACT_SMART_ROUTE_ORDER)
+
+
+def _exact_smart_route_is_valid(route_key: str) -> bool:
+    return str(route_key or '').strip() in _EXACT_SMART_ROUTE_SET
+
+
 def _exact_smart_route_title(route_key: str, sample_row: dict | None = None) -> str:
     canonical = {
         'smc_liquidity_reclaim': 'Liquidity reclaim | liquidity sweep → reclaim → BOS continuation',
@@ -4965,7 +4981,8 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         if setup in setups:
             _daily_report_add_sent(setups[setup], row)
         route_key = _adaptive_v3_setup_key_from_row(row)
-        _daily_report_add_sent(smart_routes.setdefault(route_key, _daily_report_bucket_template()), row)
+        if _exact_smart_route_is_valid(route_key):
+            _daily_report_add_sent(smart_routes.setdefault(route_key, _daily_report_bucket_template()), row)
 
     all_loss_rows: list[dict] = []
     for row in closed_rows:
@@ -4987,7 +5004,8 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         if setup in setups:
             _daily_report_add_closed(setups[setup], row)
         route_key = _adaptive_v3_setup_key_from_row(row)
-        _daily_report_add_closed(smart_routes.setdefault(route_key, _daily_report_bucket_template()), row)
+        if _exact_smart_route_is_valid(route_key):
+            _daily_report_add_closed(smart_routes.setdefault(route_key, _daily_report_bucket_template()), row)
         if str(row.get("status") or "").upper().strip() == "LOSS":
             all_loss_rows.append(row)
 
@@ -5167,6 +5185,8 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
 
     exact_route_rows = []
     for route_key, bucket in dict(smart_routes or {}).items():
+        if not _exact_smart_route_is_valid(route_key):
+            continue
         sent_n = _daily_report_int(bucket.get('sent'))
         resolved_n = _daily_report_int(bucket.get('win')) + _daily_report_int(bucket.get('loss'))
         if sent_n <= 0:
@@ -5180,14 +5200,7 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
             _daily_report_float(bucket.get('sum_pnl_pct')),
         ))
 
-    preferred_route_order = {
-        'smc_liquidity_reclaim': 0,
-        'smc_ob_fvg_overlap': 1,
-        'smc_htf_ob_ltf_fvg': 2,
-        'smc_bos_retest_confirm': 3,
-        'smc_displacement_origin': 4,
-        'smc_dual_fvg_origin': 5,
-    }
+    preferred_route_order = {key: idx for idx, key in enumerate(_EXACT_SMART_ROUTE_ORDER)}
     exact_route_rows.sort(
         key=lambda item: (
             preferred_route_order.get(item[0], 999),
