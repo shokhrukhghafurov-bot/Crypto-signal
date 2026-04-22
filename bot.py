@@ -4355,18 +4355,9 @@ def _adaptive_v3_bucket(parent: dict, key: str) -> dict:
 
 def _adaptive_v3_setup_key_from_row(row: dict) -> str:
     src = dict(row or {})
-    alias_map = {
-        'liquidity_reclaim_emit': 'smc_liquidity_reclaim',
-        'smc_liquidity_reclaim': 'smc_liquidity_reclaim',
-        'smc_ob_fvg_overlap': 'smc_ob_fvg_overlap',
-        'smc_htf_ob_ltf_fvg': 'smc_htf_ob_ltf_fvg',
-        'smc_bos_retest_confirm': 'smc_bos_retest_confirm',
-        'smc_displacement_origin': 'smc_displacement_origin',
-        'smc_dual_fvg_origin': 'smc_dual_fvg_origin',
-    }
     for cand in (
-        src.get('smc_setup_route'),
         src.get('emit_route'),
+        src.get('smc_setup_route'),
         src.get('ui_setup_label'),
         src.get('smc_setup_label'),
         _report_setup_label_from_row(src),
@@ -4375,39 +4366,8 @@ def _adaptive_v3_setup_key_from_row(row: dict) -> str:
     ):
         slug = _adaptive_v3_slug(cand)
         if slug:
-            return alias_map.get(slug, slug)
+            return slug
     return 'unknown'
-
-
-_EXACT_SMART_ROUTE_ORDER = [
-    'smc_liquidity_reclaim',
-    'smc_ob_fvg_overlap',
-    'smc_htf_ob_ltf_fvg',
-    'smc_bos_retest_confirm',
-    'smc_displacement_origin',
-    'smc_dual_fvg_origin',
-]
-
-_EXACT_SMART_ROUTE_SET = set(_EXACT_SMART_ROUTE_ORDER)
-
-
-def _exact_smart_route_is_valid(route_key: str) -> bool:
-    return str(route_key or '').strip() in _EXACT_SMART_ROUTE_SET
-
-
-def _exact_smart_route_title(route_key: str, sample_row: dict | None = None) -> str:
-    canonical = {
-        'smc_liquidity_reclaim': 'Liquidity reclaim | liquidity sweep → reclaim → BOS continuation',
-        'smc_ob_fvg_overlap': 'Origin | OB+FVG priority emit',
-        'smc_htf_ob_ltf_fvg': 'Zone retest | HTF OB + LTF FVG retest emit',
-        'smc_bos_retest_confirm': 'Breakout | BOS → FVG/OB retest → confirm',
-        'smc_displacement_origin': 'Origin | displacement origin fast-path',
-        'smc_dual_fvg_origin': 'Origin | dual/stacked FVG origin',
-    }
-    if route_key in canonical:
-        return canonical[route_key]
-    human_label = _row_ui_setup_label(dict(sample_row or {})) if sample_row else ''
-    return human_label or route_key or 'unknown'
 
 
 async def _adaptive_v3_update_from_outcome(row: dict, *, final_status: str, pnl_total_pct: float = 0.0, closed_at: dt.datetime | None = None) -> None:
@@ -4981,8 +4941,7 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         if setup in setups:
             _daily_report_add_sent(setups[setup], row)
         route_key = _adaptive_v3_setup_key_from_row(row)
-        if _exact_smart_route_is_valid(route_key):
-            _daily_report_add_sent(smart_routes.setdefault(route_key, _daily_report_bucket_template()), row)
+        _daily_report_add_sent(smart_routes.setdefault(route_key, _daily_report_bucket_template()), row)
 
     all_loss_rows: list[dict] = []
     for row in closed_rows:
@@ -5004,8 +4963,7 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         if setup in setups:
             _daily_report_add_closed(setups[setup], row)
         route_key = _adaptive_v3_setup_key_from_row(row)
-        if _exact_smart_route_is_valid(route_key):
-            _daily_report_add_closed(smart_routes.setdefault(route_key, _daily_report_bucket_template()), row)
+        _daily_report_add_closed(smart_routes.setdefault(route_key, _daily_report_bucket_template()), row)
         if str(row.get("status") or "").upper().strip() == "LOSS":
             all_loss_rows.append(row)
 
@@ -5183,51 +5141,40 @@ async def _build_daily_signal_report_text(*, since: dt.datetime, until: dt.datet
         lines.append(f"🛡 Качество: {_daily_report_render_quality(bucket)}")
         lines.append("")
 
-    exact_route_rows = []
-    for route_key, bucket in dict(smart_routes or {}).items():
-        if not _exact_smart_route_is_valid(route_key):
-            continue
-        sent_n = _daily_report_int(bucket.get('sent'))
-        resolved_n = _daily_report_int(bucket.get('win')) + _daily_report_int(bucket.get('loss'))
-        if sent_n <= 0:
-            continue
-        exact_route_rows.append((
-            route_key,
-            bucket,
-            sent_n,
-            resolved_n,
-            _daily_report_winrate(bucket),
-            _daily_report_float(bucket.get('sum_pnl_pct')),
-        ))
-
-    preferred_route_order = {key: idx for idx, key in enumerate(_EXACT_SMART_ROUTE_ORDER)}
-    exact_route_rows.sort(
-        key=lambda item: (
-            preferred_route_order.get(item[0], 999),
-            -item[2],
-            -item[4],
-            -item[5],
-            item[0],
-        )
-    )
+    exact_route_specs = [
+        ("smc_liquidity_reclaim", "Liquidity reclaim | liquidity sweep → reclaim → BOS continuation"),
+        ("smc_ob_fvg_overlap", "Origin | OB+FVG priority emit"),
+        ("smc_htf_ob_ltf_fvg", "Zone retest | HTF OB + LTF FVG retest emit"),
+        ("smc_bos_retest_confirm", "Breakout | BOS → FVG/OB retest → confirm"),
+        ("smc_displacement_origin", "Origin | displacement origin fast-path"),
+        ("smc_dual_fvg_origin", "Origin | dual/stacked FVG origin"),
+    ]
 
     lines.extend([sep, "🧭 Точные smart-setup route", ""])
-    if exact_route_rows:
-        for route_key, bucket, sent_n, resolved_n, wr, pnl_sum in exact_route_rows[:12]:
-            sample_row = next((r for r in list(sent_rows) + list(closed_rows) if _adaptive_v3_setup_key_from_row(dict(r)) == route_key), None)
-            title = _exact_smart_route_title(route_key, dict(sample_row or {}))
-            lines.append(title)
-            lines.append(f"Route key: {route_key}")
-            lines.append(f"Всего: {sent_n}")
-            lines.append(f"✅ WIN: {_daily_report_int(bucket.get('win'))}")
-            lines.append(f"❌ LOSS: {_daily_report_int(bucket.get('loss'))}")
-            be_closed = _daily_report_int(bucket.get('be')) + _daily_report_int(bucket.get('manual_close'))
-            if be_closed:
-                lines.append(f"🟡/⚪️ Без результата: {be_closed}")
-            lines.append(f"📈 Winrate: {_daily_report_pct(wr, digits=1, strip_zero=True)}" if resolved_n > 0 else "📈 Winrate: —")
-            lines.append(f"💰 PnL: {_report_pnl_pct(pnl_sum)}")
-            lines.append("")
-    else:
+    exact_route_has_data = False
+    smart_routes_map = dict(smart_routes or {})
+    for route_key, route_title in exact_route_specs:
+        bucket = smart_routes_map.get(route_key) or _daily_report_bucket_template()
+        sent_n = _daily_report_int(bucket.get('sent'))
+        if sent_n <= 0:
+            continue
+        exact_route_has_data = True
+        resolved_n = _daily_report_int(bucket.get('win')) + _daily_report_int(bucket.get('loss'))
+        wr = _daily_report_winrate(bucket)
+        pnl_sum = _daily_report_float(bucket.get('sum_pnl_pct'))
+        be_closed = _daily_report_int(bucket.get('be')) + _daily_report_int(bucket.get('manual_close'))
+
+        lines.append(route_title)
+        lines.append(f"Route key: {route_key}")
+        lines.append(f"Всего: {sent_n}")
+        lines.append(f"✅ WIN: {_daily_report_int(bucket.get('win'))}")
+        lines.append(f"❌ LOSS: {_daily_report_int(bucket.get('loss'))}")
+        lines.append(f"🟡/⚪️ Без результата: {be_closed}")
+        lines.append(f"📈 Winrate: {_daily_report_pct(wr, digits=1)}" if resolved_n > 0 else "📈 Winrate: —")
+        lines.append(f"💰 PnL: {_report_pnl_pct(pnl_sum)}")
+        lines.append("")
+
+    if not exact_route_has_data:
         lines.extend(["—", ""])
 
     lines.extend([sep, "🏆 Лучший сетап дня", "", f"🥇 {best_setup_key or '—'}", "Почему лучший:"])
