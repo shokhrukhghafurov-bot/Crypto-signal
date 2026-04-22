@@ -10781,40 +10781,43 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
             "prefer_smt": True,
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
-            "min_conf_direct": 78,
+            "min_conf_direct": 82 if is_range_like else 80,
         })
     elif route_s in ("smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg"):
         prof.update({
             "require_reclaim": True,
             "require_bos": True,
-            "require_sweep": bool(is_range_like),
+            "require_sweep": True,
             "require_retest": True,
             "require_mss": True,
             "prefer_smt": True,
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
-            "min_conf_direct": 80 if is_range_like else 78,
+            "min_conf_direct": 86 if is_range_like else 84,
         })
     elif route_s == "smc_bos_retest_confirm":
         prof.update({
-            "require_reclaim": bool(is_range_like),
+            "require_reclaim": True,
             "require_bos": True,
-            "require_sweep": bool(is_range_like),
+            "require_sweep": True,
             "require_retest": True,
             "require_mss": True,
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
-            "min_conf_direct": 80 if is_range_like else 76,
+            "min_conf_direct": 86 if is_range_like else 84,
         })
     elif route_s in ("smc_displacement_origin", "smc_dual_fvg_origin"):
         prof.update({
             "require_reclaim": True,
             "require_bos": True,
-            "require_sweep": bool(is_range_like),
+            "require_sweep": True,
             "require_displacement": True,
+            "require_retest": True,
+            "require_mss": True,
+            "prefer_smt": True,
             "require_fake_bos_filter": True,
             "allow_direct_emit": False,
-            "min_conf_direct": 84 if is_range_like else 82,
+            "min_conf_direct": 88 if is_range_like else 86,
         })
     return prof
 
@@ -11559,6 +11562,58 @@ def _mid_smc_route_emit_gate(*,
     route_need_zone = route_s in ('smc_ob_fvg_overlap', 'smc_htf_ob_ltf_fvg')
     route_need_breakout = route_s == 'smc_bos_retest_confirm'
     route_liq = route_s == 'smc_liquidity_reclaim'
+
+    try:
+        keep_late_entry = str(os.getenv('MID_SMC_DIRECT_KEEP_LATE_ENTRY', '1') or '1').strip().lower() in ('1', 'true', 'yes', 'on')
+    except Exception:
+        keep_late_entry = True
+    try:
+        keep_anti_bounce = str(os.getenv('MID_SMC_DIRECT_KEEP_ANTI_BOUNCE', '1') or '1').strip().lower() in ('1', 'true', 'yes', 'on')
+    except Exception:
+        keep_anti_bounce = True
+    try:
+        keep_near_extreme = str(os.getenv('MID_SMC_DIRECT_KEEP_NEAR_EXTREME', '1') or '1').strip().lower() in ('1', 'true', 'yes', 'on')
+    except Exception:
+        keep_near_extreme = True
+    try:
+        keep_volatility = str(os.getenv('MID_SMC_DIRECT_KEEP_VOLATILITY', '1') or '1').strip().lower() in ('1', 'true', 'yes', 'on')
+    except Exception:
+        keep_volatility = True
+
+    if keep_late_entry and (not late_entry_ok) and (not (route_liq and bool(origin_bypass_late_entry))):
+        blocks.append(f'late_entry:{str(late_entry_reason or "late_entry")}')
+    if keep_anti_bounce and (not anti_bounce_ok) and (not bool(origin_bypass_anti_bounce)):
+        blocks.append(f'anti_bounce:{str(anti_bounce_reason or "anti_bounce")}')
+    if keep_near_extreme and (not near_extreme_ok) and (not bool(breakout_bypass_near_extreme or origin_bypass_near_extreme)):
+        blocks.append(f'near_extreme:{str(near_extreme_reason or "near_extreme")}')
+    if keep_volatility:
+        try:
+            min_atr, min_vol = _mid_instant_emit_market_thresholds(market)
+        except Exception:
+            min_atr, min_vol = (0.0, 0.0)
+        try:
+            atr_mult_direct = float(os.getenv('MID_SMC_DIRECT_ATR_MULT', '1.00') or 1.00)
+        except Exception:
+            atr_mult_direct = 1.00
+        try:
+            vol_mult_direct = float(os.getenv('MID_SMC_DIRECT_VOL_MULT', '0.85') or 0.85)
+        except Exception:
+            vol_mult_direct = 0.85
+        atr_need_direct = max(0.0, float(min_atr) * max(0.0, float(atr_mult_direct)))
+        vol_need_direct = max(0.0, float(min_vol) * max(0.0, float(vol_mult_direct)))
+        try:
+            atr_v_direct = float(atr_pct or 0.0)
+        except Exception:
+            atr_v_direct = 0.0
+        try:
+            vol_v_direct = float(vol_x or 0.0)
+        except Exception:
+            vol_v_direct = 0.0
+        if atr_need_direct > 0 and atr_v_direct < atr_need_direct:
+            blocks.append(f'direct_atr_low:{atr_v_direct:.3f}<{atr_need_direct:.3f}')
+        if vol_need_direct > 0 and vol_v_direct < vol_need_direct:
+            blocks.append(f'direct_vol_low:{vol_v_direct:.2f}<{vol_need_direct:.2f}')
+
 
     if route_need_origin and not bool(origin_fast_ok):
         blocks.append('origin_not_ready')
