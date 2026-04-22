@@ -10781,43 +10781,40 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
             "prefer_smt": True,
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
-            "min_conf_direct": 82 if is_range_like else 80,
+            "min_conf_direct": 78,
         })
     elif route_s in ("smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg"):
         prof.update({
             "require_reclaim": True,
             "require_bos": True,
-            "require_sweep": True,
+            "require_sweep": bool(is_range_like),
             "require_retest": True,
             "require_mss": True,
             "prefer_smt": True,
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
-            "min_conf_direct": 86 if is_range_like else 84,
+            "min_conf_direct": 80 if is_range_like else 78,
         })
     elif route_s == "smc_bos_retest_confirm":
         prof.update({
-            "require_reclaim": True,
+            "require_reclaim": bool(is_range_like),
             "require_bos": True,
-            "require_sweep": True,
+            "require_sweep": bool(is_range_like),
             "require_retest": True,
             "require_mss": True,
             "require_reclaim_hold": True,
             "require_fake_bos_filter": True,
-            "min_conf_direct": 86 if is_range_like else 84,
+            "min_conf_direct": 80 if is_range_like else 76,
         })
     elif route_s in ("smc_displacement_origin", "smc_dual_fvg_origin"):
         prof.update({
             "require_reclaim": True,
             "require_bos": True,
-            "require_sweep": True,
+            "require_sweep": bool(is_range_like),
             "require_displacement": True,
-            "require_retest": True,
-            "require_mss": True,
-            "prefer_smt": True,
             "require_fake_bos_filter": True,
             "allow_direct_emit": False,
-            "min_conf_direct": 88 if is_range_like else 86,
+            "min_conf_direct": 84 if is_range_like else 82,
         })
     return prof
 
@@ -10906,14 +10903,14 @@ def _mid_pick_smc_emit_route(*,
         route = 'smc_bos_retest_confirm'
         setup_source = 'zone_retest'
         priority = 100
+    elif bool(origin_fast_ok) and bool(smc.get('dual_fvg_hint') or smc.get('stacked_fvg_hint')):
+        route = 'smc_dual_fvg_origin'
+        setup_source = 'origin'
+        priority = 96
     elif bool(origin_fast_ok) and bool(smc.get('displacement_hint')):
         route = 'smc_displacement_origin'
         setup_source = 'origin'
         priority = 95
-    elif bool(origin_fast_ok) and bool(smc.get('dual_fvg_hint') or smc.get('stacked_fvg_hint')):
-        route = 'smc_dual_fvg_origin'
-        setup_source = 'origin'
-        priority = 92
     elif bool(origin_fast_ok):
         setup_source = 'origin'
         priority = 60
@@ -11563,58 +11560,6 @@ def _mid_smc_route_emit_gate(*,
     route_need_breakout = route_s == 'smc_bos_retest_confirm'
     route_liq = route_s == 'smc_liquidity_reclaim'
 
-    try:
-        keep_late_entry = str(os.getenv('MID_SMC_DIRECT_KEEP_LATE_ENTRY', '1') or '1').strip().lower() in ('1', 'true', 'yes', 'on')
-    except Exception:
-        keep_late_entry = True
-    try:
-        keep_anti_bounce = str(os.getenv('MID_SMC_DIRECT_KEEP_ANTI_BOUNCE', '1') or '1').strip().lower() in ('1', 'true', 'yes', 'on')
-    except Exception:
-        keep_anti_bounce = True
-    try:
-        keep_near_extreme = str(os.getenv('MID_SMC_DIRECT_KEEP_NEAR_EXTREME', '1') or '1').strip().lower() in ('1', 'true', 'yes', 'on')
-    except Exception:
-        keep_near_extreme = True
-    try:
-        keep_volatility = str(os.getenv('MID_SMC_DIRECT_KEEP_VOLATILITY', '1') or '1').strip().lower() in ('1', 'true', 'yes', 'on')
-    except Exception:
-        keep_volatility = True
-
-    if keep_late_entry and (not late_entry_ok) and (not (route_liq and bool(origin_bypass_late_entry))):
-        blocks.append(f'late_entry:{str(late_entry_reason or "late_entry")}')
-    if keep_anti_bounce and (not anti_bounce_ok) and (not bool(origin_bypass_anti_bounce)):
-        blocks.append(f'anti_bounce:{str(anti_bounce_reason or "anti_bounce")}')
-    if keep_near_extreme and (not near_extreme_ok) and (not bool(breakout_bypass_near_extreme or origin_bypass_near_extreme)):
-        blocks.append(f'near_extreme:{str(near_extreme_reason or "near_extreme")}')
-    if keep_volatility:
-        try:
-            min_atr, min_vol = _mid_instant_emit_market_thresholds(market)
-        except Exception:
-            min_atr, min_vol = (0.0, 0.0)
-        try:
-            atr_mult_direct = float(os.getenv('MID_SMC_DIRECT_ATR_MULT', '1.00') or 1.00)
-        except Exception:
-            atr_mult_direct = 1.00
-        try:
-            vol_mult_direct = float(os.getenv('MID_SMC_DIRECT_VOL_MULT', '0.85') or 0.85)
-        except Exception:
-            vol_mult_direct = 0.85
-        atr_need_direct = max(0.0, float(min_atr) * max(0.0, float(atr_mult_direct)))
-        vol_need_direct = max(0.0, float(min_vol) * max(0.0, float(vol_mult_direct)))
-        try:
-            atr_v_direct = float(atr_pct or 0.0)
-        except Exception:
-            atr_v_direct = 0.0
-        try:
-            vol_v_direct = float(vol_x or 0.0)
-        except Exception:
-            vol_v_direct = 0.0
-        if atr_need_direct > 0 and atr_v_direct < atr_need_direct:
-            blocks.append(f'direct_atr_low:{atr_v_direct:.3f}<{atr_need_direct:.3f}')
-        if vol_need_direct > 0 and vol_v_direct < vol_need_direct:
-            blocks.append(f'direct_vol_low:{vol_v_direct:.2f}<{vol_need_direct:.2f}')
-
-
     if route_need_origin and not bool(origin_fast_ok):
         blocks.append('origin_not_ready')
     try:
@@ -11623,10 +11568,17 @@ def _mid_smc_route_emit_gate(*,
         conf_need_direct = 0
     if conf_need_direct > 0 and float(confidence or 0.0) < float(conf_need_direct):
         blocks.append(f"direct_conf_low:{int(conf_need_direct)}")
+    route_strength, route_parts = _mid_compute_route_strength(route_s, diru, ta=ta, it=it, confidence=confidence, regime=reg_u)
+    meta['route_strength'] = int(route_strength)
+    meta['route_strength_parts'] = dict(route_parts)
+    try:
+        min_route_strength = int(route_parts.get('threshold') or _mid_route_min_strength(route_s, reg_u))
+    except Exception:
+        min_route_strength = _mid_route_min_strength(route_s, reg_u)
+    if route_strength < int(min_route_strength):
+        blocks.append(f"smc_strength_low:{int(route_strength)}<{int(min_route_strength)}")
     if route_need_origin and (not bool(route_prof.get("allow_direct_emit", True))):
         blocks.append('origin_wait_confirm')
-    if route_need_origin and (("CHOPPY" in reg_u) or ("RANGE" in reg_u)):
-        blocks.append('origin_range_block')
     if route_need_breakout and not bool(zone_valid and in_zone_now):
         blocks.append('breakout_retest_not_ready')
     if route_need_zone and not bool(zone_valid and in_zone_now):
@@ -17791,6 +17743,364 @@ def _mid_struct_zone_bounds(ta: dict | None = None, it: dict | None = None) -> t
     return (None, None)
 
 
+
+
+def _mid_detect_smc_route(ta: dict | None = None, it: dict | None = None) -> str:
+    ta = ta or {}
+    it = it or {}
+    exact_routes = {
+        "smc_liquidity_reclaim",
+        "smc_ob_fvg_overlap",
+        "smc_htf_ob_ltf_fvg",
+        "smc_bos_retest_confirm",
+        "smc_displacement_origin",
+        "smc_dual_fvg_origin",
+    }
+    for src in (it, ta):
+        try:
+            route = str(src.get("smc_setup_route") or src.get("emit_route") or src.get("_trig_smc_route") or "").strip()
+        except Exception:
+            route = ""
+        if route in exact_routes:
+            return route
+    return ""
+
+
+def _mid_route_min_strength(route: str | None, regime: str | None = None) -> int:
+    route_s = str(route or "").strip()
+    reg_u = str(regime or "").upper().strip()
+    is_range_like = ("CHOPPY" in reg_u) or ("RANGE" in reg_u)
+    defaults = {
+        "smc_liquidity_reclaim": 80,
+        "smc_ob_fvg_overlap": 78,
+        "smc_htf_ob_ltf_fvg": 80,
+        "smc_bos_retest_confirm": 76,
+        "smc_displacement_origin": 84,
+        "smc_dual_fvg_origin": 85,
+    }
+    base = int(defaults.get(route_s, 75))
+    if is_range_like and route_s in {"smc_bos_retest_confirm", "smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg"}:
+        base += 2
+    env_key = f"MID_ROUTE_MIN_STRENGTH_{route_s.upper()}" if route_s else ""
+    try:
+        if env_key:
+            env_v = os.getenv(env_key)
+            if env_v is not None and str(env_v).strip() != "":
+                return int(float(env_v))
+    except Exception:
+        pass
+    try:
+        env_v = os.getenv("MID_ROUTE_MIN_STRENGTH")
+        if env_v is not None and str(env_v).strip() != "":
+            return int(float(env_v))
+    except Exception:
+        pass
+    return int(base)
+
+
+def _mid_compute_route_strength(route: str | None,
+                                direction: str,
+                                ta: dict | None = None,
+                                it: dict | None = None,
+                                *,
+                                confidence: float | None = None,
+                                regime: str | None = None) -> tuple[int, dict]:
+    ta = ta or {}
+    it = it or {}
+    route_s = str(route or _mid_detect_smc_route(ta, it) or "").strip()
+    diru = str(direction or "").upper().strip()
+    reg_u = str(regime or ta.get("regime") or it.get("regime") or "").upper().strip()
+    zlo, zhi = _mid_struct_zone_bounds(ta, it)
+    zone_valid = bool(zlo is not None and zhi is not None and zhi > zlo > 0)
+    in_zone = False
+    try:
+        px = float(it.get("last_price") or it.get("price") or ta.get("last_price") or ta.get("entry") or it.get("entry") or 0.0)
+        if zone_valid and px > 0:
+            tol = max(abs(px) * 0.001, abs(float(zhi) - float(zlo)) * 0.20)
+            in_zone = (float(zlo) - tol) <= px <= (float(zhi) + tol)
+    except Exception:
+        in_zone = bool(it.get("_in_zone") or it.get("_in_zone_tol") or it.get("_entered_zone_now"))
+    ob_retest = bool(ta.get("ob_retest") if ta.get("ob_retest") is not None else it.get("ob_retest"))
+    fvg_active = bool(ta.get("fvg_active") if ta.get("fvg_active") is not None else it.get("fvg_active"))
+    dual_fvg = bool(ta.get("dual_fvg") or ta.get("dual_fvg_hint") or it.get("dual_fvg") or it.get("dual_fvg_hint") or ta.get("stacked_fvg_hint") or it.get("stacked_fvg_hint"))
+    if diru == "LONG":
+        sweep_ok = bool(ta.get("sweep_long") if ta.get("sweep_long") is not None else it.get("sweep_long"))
+        bos_ok = bool(ta.get("bos_up_5m") if ta.get("bos_up_5m") is not None else (ta.get("bo_up") if ta.get("bo_up") is not None else it.get("bos_up_5m")))
+        mss_ok = bool(ta.get("choch_up_5m") if ta.get("choch_up_5m") is not None else (ta.get("mss_up") if ta.get("mss_up") is not None else it.get("mss_up")))
+    else:
+        sweep_ok = bool(ta.get("sweep_short") if ta.get("sweep_short") is not None else it.get("sweep_short"))
+        bos_ok = bool(ta.get("bos_dn_5m") if ta.get("bos_dn_5m") is not None else (ta.get("bo_dn") if ta.get("bo_dn") is not None else it.get("bos_dn_5m")))
+        mss_ok = bool(ta.get("choch_dn_5m") if ta.get("choch_dn_5m") is not None else (ta.get("mss_dn") if ta.get("mss_dn") is not None else it.get("mss_dn")))
+    reclaim_ok = False
+    try:
+        reclaim_ok = bool(it.get("_trig_checks", {}).get("reclaim") == "pass" or it.get("reclaim_ok") or ta.get("reclaim_ok"))
+    except Exception:
+        reclaim_ok = bool(it.get("reclaim_ok") or ta.get("reclaim_ok"))
+    disp_x = 0.0
+    for cand in (it.get("_trig_inst_disp_x"), ta.get("disp_body_atr"), ta.get("disp_x"), it.get("disp_x"), ta.get("bo_move_atr"), it.get("bo_move_atr")):
+        try:
+            fv = float(cand or 0.0)
+            if fv > disp_x:
+                disp_x = fv
+        except Exception:
+            pass
+    conf_v = None
+    for cand in (confidence, ta.get("confidence"), it.get("confidence"), it.get("min_confidence")):
+        try:
+            if cand is None or cand == "":
+                continue
+            fv = float(cand)
+            conf_v = fv
+            break
+        except Exception:
+            pass
+    score = 0.0
+    parts = {}
+    def add(name, pts, ok=True):
+        nonlocal score
+        val = float(pts if ok else 0.0)
+        if val > 0:
+            score += val
+        parts[name] = int(round(val))
+    add("zone", 10, zone_valid)
+    add("retest", 10, in_zone or ob_retest)
+    add("ob_fvg", 12, ob_retest or fvg_active)
+    add("bos", 18, bos_ok)
+    add("mss", 10, mss_ok)
+    add("reclaim", 16, reclaim_ok)
+    add("sweep", 14, sweep_ok)
+    add("displacement", min(18.0, max(0.0, disp_x * 18.0)), disp_x > 0)
+    add("stacked_fvg", 8, dual_fvg)
+    if conf_v is not None:
+        add("confidence", min(12.0, max(0.0, (conf_v - 60.0) / 3.0)), conf_v >= 60.0)
+    route_bonus = 0.0
+    if route_s == "smc_liquidity_reclaim":
+        route_bonus = 6.0 if (sweep_ok and reclaim_ok and bos_ok) else 0.0
+    elif route_s in ("smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg"):
+        route_bonus = 8.0 if ((ob_retest or fvg_active) and bos_ok and (in_zone or zone_valid)) else 0.0
+    elif route_s == "smc_bos_retest_confirm":
+        route_bonus = 8.0 if (bos_ok and (in_zone or ob_retest)) else 0.0
+    elif route_s == "smc_displacement_origin":
+        route_bonus = 10.0 if (bos_ok and disp_x >= 0.35 and zone_valid) else 0.0
+    elif route_s == "smc_dual_fvg_origin":
+        route_bonus = 10.0 if (bos_ok and disp_x >= 0.35 and dual_fvg) else 0.0
+    score += route_bonus
+    parts["route_bonus"] = int(round(max(0.0, route_bonus)))
+    regime_penalty = 0.0
+    if "CHOPPY" in reg_u or "RANGE" in reg_u:
+        if route_s in ("smc_displacement_origin", "smc_dual_fvg_origin"):
+            regime_penalty = 6.0
+        elif route_s == "smc_bos_retest_confirm" and not sweep_ok:
+            regime_penalty = 4.0
+    if regime_penalty > 0:
+        score -= regime_penalty
+    parts["regime_penalty"] = -int(round(max(0.0, regime_penalty))) if regime_penalty > 0 else 0
+    score_i = max(0, min(100, int(round(score))))
+    parts["score"] = score_i
+    parts["threshold"] = int(_mid_route_min_strength(route_s, reg_u))
+    return score_i, parts
+
+
+def _mid_try_float(v):
+    try:
+        fv = float(v)
+        if math.isfinite(fv):
+            return fv
+    except Exception:
+        return None
+    return None
+
+
+def _mid_route_specific_sl_anchor(route: str | None,
+                                  direction: str,
+                                  entry: float,
+                                  atr: float,
+                                  ta: dict | None = None,
+                                  it: dict | None = None) -> float | None:
+    route_s = str(route or "").strip()
+    d = str(direction or "").upper().strip()
+    entry_f = float(entry or 0.0)
+    atr_f = abs(float(atr or 0.0))
+    ta = ta or {}
+    it = it or {}
+    if route_s == "" or d not in ("LONG", "SHORT") or entry_f <= 0:
+        return None
+    buf_atr = float(os.getenv("MID_STRUCT_SL_BUFFER_ATR", "0.25") or 0.25)
+    buf_pct = float(os.getenv("MID_STRUCT_SL_BUFFER_PCT", "0.0010") or 0.0010)
+    buf = max(atr_f * max(0.0, buf_atr), abs(entry_f) * max(0.0, buf_pct), 1e-12)
+    zlo, zhi = _mid_struct_zone_bounds(ta, it)
+    ob_zone = ta.get("ob_zone") if ta.get("ob_zone") is not None else it.get("ob_zone")
+    ob_lo = ob_hi = None
+    try:
+        if isinstance(ob_zone, (list, tuple)) and len(ob_zone) >= 2:
+            ob_lo = _mid_try_float(ob_zone[0])
+            ob_hi = _mid_try_float(ob_zone[1])
+    except Exception:
+        ob_lo = ob_hi = None
+
+    lows = [x for x in [_mid_try_float(zlo), _mid_try_float(ob_lo), _mid_try_float(ta.get("entry_low")), _mid_try_float(it.get("entry_low")), _mid_try_float(ta.get("support")), _mid_try_float(it.get("support")), _mid_try_float(ta.get("eq_lo")), _mid_try_float(it.get("eq_lo")), _mid_try_float(ta.get("recent_low")), _mid_try_float(it.get("recent_low")), _mid_try_float(ta.get("sl")), _mid_try_float(it.get("sl"))] if x and x > 0 and x < entry_f]
+    highs = [x for x in [_mid_try_float(zhi), _mid_try_float(ob_hi), _mid_try_float(ta.get("entry_high")), _mid_try_float(it.get("entry_high")), _mid_try_float(ta.get("resistance")), _mid_try_float(it.get("resistance")), _mid_try_float(ta.get("eq_hi")), _mid_try_float(it.get("eq_hi")), _mid_try_float(ta.get("recent_high")), _mid_try_float(it.get("recent_high")), _mid_try_float(ta.get("sl")), _mid_try_float(it.get("sl"))] if x and x > entry_f]
+
+    def _deepest_valid_below(*vals):
+        cand = [x for x in (_mid_try_float(v) for v in vals) if x and x > 0 and x < entry_f]
+        return min(cand) if cand else None
+
+    def _deepest_valid_above(*vals):
+        cand = [x for x in (_mid_try_float(v) for v in vals) if x and x > entry_f]
+        return max(cand) if cand else None
+
+    def _nearest_valid_below(*vals):
+        cand = [x for x in (_mid_try_float(v) for v in vals) if x and x > 0 and x < entry_f]
+        return max(cand) if cand else None
+
+    def _nearest_valid_above(*vals):
+        cand = [x for x in (_mid_try_float(v) for v in vals) if x and x > entry_f]
+        return min(cand) if cand else None
+
+    anchor = None
+    if d == "LONG":
+        if route_s == "smc_liquidity_reclaim":
+            anchor = _deepest_valid_below(
+                ta.get("sweep_extreme_low"), it.get("sweep_extreme_low"),
+                ta.get("reclaim_low"), it.get("reclaim_low"),
+                ta.get("swing_low"), it.get("swing_low"),
+                ta.get("entry_low"), it.get("entry_low"),
+            ) or (min(lows) if lows else None)
+        elif route_s in ("smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg"):
+            anchor = _deepest_valid_below(zlo, ob_lo, ta.get("entry_low"), it.get("entry_low"), ta.get("htf_ob_low"), it.get("htf_ob_low")) or (min(lows) if lows else None)
+        elif route_s == "smc_bos_retest_confirm":
+            anchor = _nearest_valid_below(
+                ta.get("retest_low"), it.get("retest_low"),
+                ta.get("swing_low"), it.get("swing_low"),
+                ta.get("entry_low"), it.get("entry_low"),
+            ) or (max(lows) if lows else None)
+        elif route_s == "smc_displacement_origin":
+            anchor = _deepest_valid_below(
+                ta.get("origin_base_low"), it.get("origin_base_low"),
+                ta.get("origin_low"), it.get("origin_low"),
+                ta.get("base_low"), it.get("base_low"),
+                ta.get("impulse_base_low"), it.get("impulse_base_low"),
+                zlo, ob_lo,
+            ) or (min(lows) if lows else None)
+        elif route_s == "smc_dual_fvg_origin":
+            anchor = _deepest_valid_below(
+                ta.get("deepest_zone_low"), it.get("deepest_zone_low"),
+                ta.get("deepest_fvg_low"), it.get("deepest_fvg_low"),
+                ta.get("stacked_fvg_low"), it.get("stacked_fvg_low"),
+                ta.get("fvg_cluster_low"), it.get("fvg_cluster_low"),
+                ta.get("origin_base_low"), it.get("origin_base_low"),
+                zlo, ob_lo,
+            ) or (min(lows) if lows else None)
+        if anchor is not None:
+            return max(1e-12, float(anchor) - buf)
+    else:
+        if route_s == "smc_liquidity_reclaim":
+            anchor = _deepest_valid_above(
+                ta.get("sweep_extreme_high"), it.get("sweep_extreme_high"),
+                ta.get("reclaim_high"), it.get("reclaim_high"),
+                ta.get("swing_high"), it.get("swing_high"),
+                ta.get("entry_high"), it.get("entry_high"),
+            ) or (max(highs) if highs else None)
+        elif route_s in ("smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg"):
+            anchor = _deepest_valid_above(zhi, ob_hi, ta.get("entry_high"), it.get("entry_high"), ta.get("htf_ob_high"), it.get("htf_ob_high")) or (max(highs) if highs else None)
+        elif route_s == "smc_bos_retest_confirm":
+            anchor = _nearest_valid_above(
+                ta.get("retest_high"), it.get("retest_high"),
+                ta.get("swing_high"), it.get("swing_high"),
+                ta.get("entry_high"), it.get("entry_high"),
+            ) or (min(highs) if highs else None)
+        elif route_s == "smc_displacement_origin":
+            anchor = _deepest_valid_above(
+                ta.get("origin_base_high"), it.get("origin_base_high"),
+                ta.get("origin_high"), it.get("origin_high"),
+                ta.get("base_high"), it.get("base_high"),
+                ta.get("impulse_base_high"), it.get("impulse_base_high"),
+                zhi, ob_hi,
+            ) or (max(highs) if highs else None)
+        elif route_s == "smc_dual_fvg_origin":
+            anchor = _deepest_valid_above(
+                ta.get("deepest_zone_high"), it.get("deepest_zone_high"),
+                ta.get("deepest_fvg_high"), it.get("deepest_fvg_high"),
+                ta.get("stacked_fvg_high"), it.get("stacked_fvg_high"),
+                ta.get("fvg_cluster_high"), it.get("fvg_cluster_high"),
+                ta.get("origin_base_high"), it.get("origin_base_high"),
+                zhi, ob_hi,
+            ) or (max(highs) if highs else None)
+        if anchor is not None:
+            return float(anchor) + buf
+    return None
+
+
+def _mid_collect_route_target_levels(route: str | None,
+                                     direction: str,
+                                     entry: float,
+                                     sl: float,
+                                     atr: float,
+                                     ta: dict | None = None,
+                                     it: dict | None = None) -> list[float]:
+    route_s = str(route or "").strip()
+    d = str(direction or "").upper().strip()
+    entry_f = float(entry or 0.0)
+    sl_f = float(sl or 0.0)
+    atr_f = abs(float(atr or 0.0))
+    ta = ta or {}
+    it = it or {}
+    out = []
+    def push(v):
+        fv = _mid_try_float(v)
+        if fv is None or fv <= 0:
+            return
+        if d == "LONG" and fv <= entry_f:
+            return
+        if d == "SHORT" and fv >= entry_f:
+            return
+        if out and any(abs(fv - x) <= max(abs(entry_f) * 0.001, atr_f * 0.10, 1e-12) for x in out):
+            return
+        out.append(float(fv))
+
+    risk = abs(entry_f - sl_f)
+    zlo, zhi = _mid_struct_zone_bounds(ta, it)
+    zone_w = 0.0
+    try:
+        if zlo is not None and zhi is not None and float(zhi) > float(zlo):
+            zone_w = float(zhi) - float(zlo)
+    except Exception:
+        zone_w = 0.0
+    impulse_ext = max(risk * 1.6, atr_f * 1.2, zone_w * 1.25)
+    ext_tp = entry_f + impulse_ext if d == "LONG" else entry_f - impulse_ext
+    ext_tp2 = entry_f + max(risk * 2.4, atr_f * 2.0, zone_w * 1.8) if d == "LONG" else entry_f - max(risk * 2.4, atr_f * 2.0, zone_w * 1.8)
+
+    if route_s == "smc_liquidity_reclaim":
+        if d == "LONG":
+            for v in (ta.get("resistance"), it.get("resistance"), ta.get("eq_hi"), it.get("eq_hi"), ta.get("recent_high"), it.get("recent_high"), ext_tp2):
+                push(v)
+        else:
+            for v in (ta.get("support"), it.get("support"), ta.get("eq_lo"), it.get("eq_lo"), ta.get("recent_low"), it.get("recent_low"), ext_tp2):
+                push(v)
+    elif route_s in ("smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg"):
+        if d == "LONG":
+            for v in (ta.get("eq_hi"), it.get("eq_hi"), ta.get("recent_high"), it.get("recent_high"), ta.get("resistance"), it.get("resistance"), ext_tp2):
+                push(v)
+        else:
+            for v in (ta.get("eq_lo"), it.get("eq_lo"), ta.get("recent_low"), it.get("recent_low"), ta.get("support"), it.get("support"), ext_tp2):
+                push(v)
+    elif route_s == "smc_bos_retest_confirm":
+        push(ext_tp)
+        if d == "LONG":
+            for v in (ta.get("recent_high"), it.get("recent_high"), ta.get("resistance"), it.get("resistance"), ext_tp2):
+                push(v)
+        else:
+            for v in (ta.get("recent_low"), it.get("recent_low"), ta.get("support"), it.get("support"), ext_tp2):
+                push(v)
+    elif route_s in ("smc_displacement_origin", "smc_dual_fvg_origin"):
+        push(ext_tp)
+        if d == "LONG":
+            for v in (ta.get("recent_high"), it.get("recent_high"), ta.get("resistance"), it.get("resistance"), ta.get("eq_hi"), it.get("eq_hi"), ext_tp2):
+                push(v)
+        else:
+            for v in (ta.get("recent_low"), it.get("recent_low"), ta.get("support"), it.get("support"), ta.get("eq_lo"), it.get("eq_lo"), ext_tp2):
+                push(v)
+    return sorted(out) if d == "LONG" else sorted(out, reverse=True)
 def _mid_pick_entry_anchor(direction: str,
                            trigger_price: float,
                            atr: float,
@@ -17861,6 +18171,11 @@ def _mid_anchor_sl_to_structure(direction: str,
     buf_atr = float(os.getenv("MID_STRUCT_SL_BUFFER_ATR", "0.25") or 0.25)
     buf_pct = float(os.getenv("MID_STRUCT_SL_BUFFER_PCT", "0.0010") or 0.0010)
     buf = max(atr_f * max(0.0, buf_atr), abs(entry_f) * max(0.0, buf_pct), 1e-12)
+
+    route_s = _mid_detect_smc_route(ta, it)
+    route_sl = _mid_route_specific_sl_anchor(route_s, d, entry_f, atr_f, ta, it)
+    if route_sl is not None and route_sl > 0:
+        return float(route_sl)
 
     zlo, zhi = _mid_struct_zone_bounds(ta, it)
     anchors: list[float] = []
@@ -18010,7 +18325,20 @@ def _mid_pick_structural_targets(direction: str,
     if entry_f <= 0 or risk <= 1e-12:
         return (0.0, 0.0, 0.0)
 
-    candidates = _mid_collect_structural_target_levels(d, entry_f, ta=ta, it=it)
+    route_s = _mid_detect_smc_route(ta, it)
+    route_candidates = _mid_collect_route_target_levels(route_s, d, entry_f, sl_f, atr_f, ta=ta, it=it)
+    generic_candidates = _mid_collect_structural_target_levels(d, entry_f, ta=ta, it=it)
+    candidates = []
+    for lv in list(route_candidates) + list(generic_candidates):
+        try:
+            fv = float(lv)
+        except Exception:
+            continue
+        if not math.isfinite(fv) or fv <= 0:
+            continue
+        if candidates and any(abs(fv - x) <= max(abs(entry_f) * 0.001, atr_f * 0.10, 1e-12) for x in candidates):
+            continue
+        candidates.append(float(fv))
     min_first = max(atr_f * 0.15, risk * 0.15, abs(entry_f) * 0.001)
     min_gap = max(atr_f * 0.20, risk * 0.20, abs(entry_f) * 0.0015)
 
@@ -26867,9 +27195,12 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 _trig_add("displacement_missing", "displacement_weak")
 
                             try:
-                                if smc_route_now in ("smc_displacement_origin", "smc_dual_fvg_origin") and (not (reclaim_ok and bos_ok and disp_ok)):
+                                ob_retest_now = bool(ta.get("ob_retest") if ta.get("ob_retest") is not None else it.get("ob_retest"))
+                                fvg_active_now = bool(ta.get("fvg_active") if ta.get("fvg_active") is not None else it.get("fvg_active"))
+                                zone_valid_now = bool(it.get("_in_zone") or it.get("_in_zone_tol") or it.get("_entered_zone_now") or ob_retest_now or fvg_active_now)
+                                if smc_route_now in ("smc_displacement_origin", "smc_dual_fvg_origin") and (not (bos_ok and disp_ok and zone_valid_now)):
                                     _trig_add("origin_confirm_missing", "origin_confirm_missing")
-                                elif smc_route_now in ("smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg") and (not (reclaim_ok and bos_ok)):
+                                elif smc_route_now in ("smc_ob_fvg_overlap", "smc_htf_ob_ltf_fvg") and (not (bos_ok and (ob_retest_now or fvg_active_now or zone_valid_now))):
                                     _trig_add("zone_confirm_missing", "zone_confirm_missing")
                             except Exception:
                                 pass
@@ -26882,6 +27213,23 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 inst_score += 20 if bos_ok else 0
                                 inst_score += int(min(15, max(0, round(disp_x * 10))))  # 0..15
                                 it["_trig_inst_score"] = int(inst_score)
+                            except Exception:
+                                pass
+
+                            try:
+                                route_strength, route_parts = _mid_compute_route_strength(
+                                    smc_route_now,
+                                    diru,
+                                    ta=ta,
+                                    it=it,
+                                    confidence=_conf_chk if not _conf_missing else None,
+                                    regime=reg,
+                                )
+                                it["_trig_route_strength"] = int(route_strength)
+                                it["_trig_route_strength_parts"] = dict(route_parts)
+                                min_route_strength = int(route_parts.get("threshold") or _mid_route_min_strength(smc_route_now, reg))
+                                if str(smc_route_now or "").strip() and route_strength < min_route_strength:
+                                    _trig_add("smc_strength_low", f"smc_strength_low:{int(route_strength)}<{int(min_route_strength)}")
                             except Exception:
                                 pass
                         except Exception:
