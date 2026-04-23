@@ -4854,13 +4854,17 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
         if improve_labels:
             improve_block = "🛠 Что улучшить:\n" + "\n".join([f"• {x}" for x in improve_labels if x]) + "\n\n"
 
+    fallback_primary_block = primary_block or (
+        "🧠 Причина:\n" + (loss_diag.get('reason_text') or reason) + "\n\n"
+    )
+
     return (
         f"{_report_close_emoji(st)} {symbol} | {market} | {side}\n\n"
         f"📌 Статус: {_report_close_status(st, after_tp1=after_tp1)}\n"
         f"📊 Итог PnL: {_report_pnl_pct(pnl_total_pct)}\n"
         f"📊 Risk/Reward: 1 : {rr}\n"
         f"{setup_block}"
-        f"{primary_block if primary_block else '🧠 Причина:\n' + (loss_diag.get('reason_text') or reason) + '\n\n'}"
+        f"{fallback_primary_block}"
         f"{scenario_block}"
         f"{analysis_block}"
         f"{happened_block}"
