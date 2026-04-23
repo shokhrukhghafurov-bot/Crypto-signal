@@ -2593,6 +2593,57 @@ def _mid_final_emit_apply_reason(reason: str) -> str:
     return "blocked"
 
 
+def _mid_level_quality_veto_reason(sig=None, ta: dict | None = None, it: dict | None = None) -> str:
+    """Hard veto for malformed or noise-level SL/TP layouts right before emit."""
+    try:
+        if sig is None:
+            return ""
+        ok, reason = _signal_levels_sanity_gate(sig)
+        if not ok:
+            return f"levels:{reason}"
+
+        entry = float(getattr(sig, "entry", 0.0) or 0.0)
+        sl = float(getattr(sig, "sl", 0.0) or 0.0)
+        tp1 = float(getattr(sig, "tp1", 0.0) or 0.0) or float(getattr(sig, "tp2", 0.0) or 0.0)
+        tp2 = float(getattr(sig, "tp2", 0.0) or 0.0)
+        market = str(getattr(sig, "market", "") or (ta or {}).get("market") or (it or {}).get("market") or "FUTURES")
+
+        atr = 0.0
+        for cand in ((ta or {}).get("atr30"), (ta or {}).get("atr_abs"), (it or {}).get("atr_at_create")):
+            try:
+                v = float(cand or 0.0)
+                if v > 0:
+                    atr = v
+                    break
+            except Exception:
+                pass
+        risk = abs(entry - sl)
+        min_risk = _mid_min_stop_distance(entry, atr, ta, it)
+        if entry > 0 and risk > 0 and min_risk > 0 and risk + 1e-12 < min_risk:
+            return f"sl_too_tight:{risk / max(min_risk, 1e-12):.2f}x"
+
+        try:
+            min_rr_hard = float(os.getenv("MID_FINAL_HARD_MIN_RR", "1.20" if str(market).upper() == "FUTURES" else "1.00") or 1.20)
+        except Exception:
+            min_rr_hard = 1.20 if str(market).upper() == "FUTURES" else 1.00
+        target = tp2 if tp2 > 0 else tp1
+        rr = (abs(target - entry) / risk) if (entry > 0 and target > 0 and risk > 1e-12) else 0.0
+        if target > 0 and risk > 1e-12 and rr + 1e-12 < min_rr_hard:
+            return f"rr_too_low:{rr:.2f}<{min_rr_hard:.2f}"
+
+        try:
+            min_tp1_rr = float(os.getenv("MID_FINAL_MIN_TP1_RR", "0.90") or 0.90)
+        except Exception:
+            min_tp1_rr = 0.90
+        if tp1 > 0 and risk > 1e-12:
+            rr1 = abs(tp1 - entry) / risk
+            if rr1 + 1e-12 < min_tp1_rr:
+                return f"tp1_too_close:{rr1:.2f}<{min_tp1_rr:.2f}"
+        return ""
+    except Exception:
+        return ""
+
+
 def _mid_final_emit_gate_reason(*,
                                 sig=None,
                                 ta: dict | None = None,
@@ -2665,6 +2716,10 @@ def _mid_final_emit_gate_reason(*,
     _adaptive_reason = _mid_adaptive_veto_reason(sig=sig, ta=ta, it=it, gate_meta=gate_meta, route=route)
     if _adaptive_reason:
         return str(_adaptive_reason)
+
+    _levels_reason = _mid_level_quality_veto_reason(sig=sig, ta=ta, it=it)
+    if _levels_reason:
+        return str(_levels_reason)
 
     if smc_direct_route:
         return ""
@@ -17781,6 +17836,37 @@ def _mid_pick_entry_anchor(direction: str,
     return float(px)
 
 
+def _mid_min_stop_distance(entry: float,
+                           atr: float,
+                           ta: dict | None = None,
+                           it: dict | None = None) -> float:
+    """Minimum entry→SL distance to avoid noise stops inside the zone.
+
+    We keep structure-first behavior, but if the nearest structural invalidation is
+    too close to entry, widen the stop to at least a volatility/zone-aware floor.
+    """
+    try:
+        entry_f = float(entry or 0.0)
+        atr_f = abs(float(atr or 0.0))
+        ta = ta or {}
+        it = it or {}
+        zlo, zhi = _mid_struct_zone_bounds(ta, it)
+        zone_w = 0.0
+        if zlo is not None and zhi is not None and zhi > zlo:
+            zone_w = float(zhi - zlo)
+        min_atr = float(os.getenv("MID_MIN_SL_ATR", "0.55") or 0.55)
+        min_pct = float(os.getenv("MID_MIN_SL_PCT", "0.0018") or 0.0018)
+        zone_mult = float(os.getenv("MID_MIN_SL_ZONE_MULT", "1.10") or 1.10)
+        return max(
+            atr_f * max(0.0, min_atr),
+            abs(entry_f) * max(0.0, min_pct),
+            zone_w * max(0.0, zone_mult),
+            1e-12,
+        )
+    except Exception:
+        return max(abs(float(entry or 0.0)) * 0.0018, 1e-12)
+
+
 def _mid_anchor_sl_to_structure(direction: str,
                                 entry: float,
                                 raw_sl: float,
@@ -17792,6 +17878,7 @@ def _mid_anchor_sl_to_structure(direction: str,
     Important behavior:
     - raw ATR SL is only the fallback envelope / raw-risk reference
     - if a closer structural invalidation exists, SL is *moved to that structure*
+    - ultra-tight structure stops are widened to a minimum volatility/zone floor
     - final 10% cap is applied later by _mid_clamp_sl(...)
     """
     d = str(direction or "").upper().strip()
@@ -17806,6 +17893,7 @@ def _mid_anchor_sl_to_structure(direction: str,
     buf_atr = float(os.getenv("MID_STRUCT_SL_BUFFER_ATR", "0.25") or 0.25)
     buf_pct = float(os.getenv("MID_STRUCT_SL_BUFFER_PCT", "0.0010") or 0.0010)
     buf = max(atr_f * max(0.0, buf_atr), abs(entry_f) * max(0.0, buf_pct), 1e-12)
+    min_risk = _mid_min_stop_distance(entry_f, atr_f, ta, it)
 
     zlo, zhi = _mid_struct_zone_bounds(ta, it)
     anchors: list[float] = []
@@ -17833,8 +17921,9 @@ def _mid_anchor_sl_to_structure(direction: str,
         if below:
             nearest = max(below)
             structural_sl = max(1e-12, float(nearest) - buf)
-            return float(structural_sl)
-        return float(sl_f)
+            max_close_sl = max(1e-12, entry_f - min_risk)
+            return float(min(structural_sl, max_close_sl))
+        return float(min(sl_f, max(1e-12, entry_f - min_risk)))
 
     if d == "SHORT":
         _push(zhi)
@@ -17850,8 +17939,9 @@ def _mid_anchor_sl_to_structure(direction: str,
         if above:
             nearest = min(above)
             structural_sl = float(nearest) + buf
-            return float(structural_sl)
-        return float(sl_f)
+            min_far_sl = entry_f + min_risk
+            return float(max(structural_sl, min_far_sl))
+        return float(max(sl_f, entry_f + min_risk))
 
     return float(sl_f)
 
