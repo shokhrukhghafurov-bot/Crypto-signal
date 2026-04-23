@@ -710,6 +710,7 @@ ON CONFLICT (id) DO NOTHING;
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS weak_filters TEXT;")
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS improve_note TEXT;")
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS close_analysis_json JSONB;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS entry_snapshot_json JSONB;")
         except Exception:
             pass
 
@@ -1856,6 +1857,7 @@ async def upsert_signal_track(
             confirmations=(str(confirmations or "") if confirmations is not None else None),
             source_exchange=(str(source_exchange or "") if source_exchange is not None else None),
             risk_note=(str(risk_note or "") if risk_note is not None else None),
+            entry_snapshot_json=entry_snapshot_json,
         )
         if not inserted:
             logger.info(
@@ -1887,6 +1889,7 @@ async def _upsert_signal_track_conn(
     confirmations: str | None = None,
     source_exchange: str | None = None,
     risk_note: str | None = None,
+    entry_snapshot_json: dict | str | None = None,
 ) -> bool:
     """Insert/update signal_tracks safely.
 
@@ -1899,9 +1902,9 @@ async def _upsert_signal_track_conn(
             INSERT INTO signal_tracks (
               signal_id, sig_key, market, symbol, side, entry, tp1, tp2, sl,
               status, opened_at, updated_at, orig_text, setup_source, setup_source_label, ui_setup_label, emit_route,
-              timeframe, confidence, rr, confirmations, source_exchange, risk_note
+              timeframe, confidence, rr, confirmations, source_exchange, risk_note, entry_snapshot_json
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'ACTIVE', NOW(), NOW(), $10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'ACTIVE', NOW(), NOW(), $10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::jsonb)
             ON CONFLICT (signal_id)
             DO UPDATE SET
               sig_key=EXCLUDED.sig_key,
@@ -1923,6 +1926,7 @@ async def _upsert_signal_track_conn(
               confirmations=COALESCE(NULLIF(EXCLUDED.confirmations, ''), signal_tracks.confirmations),
               source_exchange=COALESCE(NULLIF(EXCLUDED.source_exchange, ''), signal_tracks.source_exchange),
               risk_note=COALESCE(NULLIF(EXCLUDED.risk_note, ''), signal_tracks.risk_note),
+              entry_snapshot_json=COALESCE(EXCLUDED.entry_snapshot_json, signal_tracks.entry_snapshot_json),
               updated_at=NOW();
             """,
             int(signal_id),
@@ -1945,6 +1949,7 @@ async def _upsert_signal_track_conn(
             (str(confirmations) if confirmations is not None else None),
             (str(source_exchange) if source_exchange is not None else None),
             (str(risk_note) if risk_note is not None else None),
+            (json.dumps(entry_snapshot_json, ensure_ascii=False) if isinstance(entry_snapshot_json, dict) else (str(entry_snapshot_json or "") or None)),
         )
         return True
     except asyncpg.UniqueViolationError:
@@ -1971,6 +1976,7 @@ async def _upsert_signal_track_conn(
                 confirmations=COALESCE(NULLIF($18, ''), confirmations),
                 source_exchange=COALESCE(NULLIF($19, ''), source_exchange),
                 risk_note=COALESCE(NULLIF($20, ''), risk_note),
+                entry_snapshot_json=COALESCE($21::jsonb, entry_snapshot_json),
                 updated_at=NOW()
             WHERE sig_key=$2;
             """,
@@ -1994,6 +2000,7 @@ async def _upsert_signal_track_conn(
             (str(confirmations) if confirmations is not None else None),
             (str(source_exchange) if source_exchange is not None else None),
             (str(risk_note) if risk_note is not None else None),
+            (json.dumps(entry_snapshot_json, ensure_ascii=False) if isinstance(entry_snapshot_json, dict) else (str(entry_snapshot_json or "") or None)),
         )
         return False
 
