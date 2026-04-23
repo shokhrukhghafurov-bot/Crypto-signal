@@ -3484,6 +3484,129 @@ def _loss_diag_setup_key_from_row(row: dict) -> str:
     return label
 
 
+EXACT_SMC_ROUTE_KEYS = {
+    'smc_ob_fvg_overlap',
+    'smc_htf_ob_ltf_fvg',
+    'smc_bos_retest_confirm',
+    'smc_displacement_origin',
+    'smc_dual_fvg_origin',
+    'smc_liquidity_reclaim',
+}
+
+
+def _loss_diag_is_exact_smc_route(row: dict | None) -> bool:
+    try:
+        return str(_loss_diag_route_key_from_row(dict(row or {})) or '').strip() in EXACT_SMC_ROUTE_KEYS
+    except Exception:
+        return False
+
+
+def _loss_diag_route_title(route_key: str) -> str:
+    mapping = {
+        'smc_ob_fvg_overlap': 'OB+FVG priority emit',
+        'smc_htf_ob_ltf_fvg': 'HTF OB + LTF FVG retest',
+        'smc_bos_retest_confirm': 'BOS → retest → confirm',
+        'smc_displacement_origin': 'displacement origin',
+        'smc_dual_fvg_origin': 'dual/stacked FVG origin',
+        'smc_liquidity_reclaim': 'liquidity reclaim',
+    }
+    return mapping.get(str(route_key or '').strip(), str(route_key or '').strip())
+
+
+def _loss_diag_route_key_from_row(row: dict) -> str:
+    for candidate in (
+        row.get('emit_route'),
+        row.get('smc_setup_route'),
+        row.get('setup_route'),
+        row.get('route_key'),
+    ):
+        raw = str(candidate or '').strip()
+        if raw.startswith('smc_'):
+            return raw
+    label = str(_report_setup_label_from_row(row) or '').strip().lower()
+    route_map = {
+        'origin | ob+fvg priority emit': 'smc_ob_fvg_overlap',
+        'zone retest | htf ob + ltf fvg retest emit': 'smc_htf_ob_ltf_fvg',
+        'breakout | bos → fvg/ob retest → confirm': 'smc_bos_retest_confirm',
+        'origin | displacement origin fast-path': 'smc_displacement_origin',
+        'origin | dual/stacked fvg origin': 'smc_dual_fvg_origin',
+        'liquidity reclaim | liquidity sweep → reclaim → bos continuation': 'smc_liquidity_reclaim',
+    }
+    return route_map.get(label, '')
+
+
+def _loss_diag_primary_reason(src: dict, analysis: dict, *, after_tp1: bool, st: str) -> tuple[str, str]:
+    route_key = _loss_diag_route_key_from_row(src)
+    side = str(src.get('side') or '').upper().strip() or 'LONG'
+    zone_hold = analysis.get('zone_hold')
+    fast_invalidation = bool(analysis.get('fast_invalidation'))
+    struct = str(analysis.get('structure_5m') or '').strip()
+    follow = str((analysis.get('follow_through_tp1') if after_tp1 else analysis.get('follow_through')) or '').strip().lower()
+    vwap_state = str((analysis.get('vwap_after_tp1') if after_tp1 else analysis.get('vwap_after_entry')) or '').strip().lower()
+
+    if st != 'LOSS':
+        return ('timeout_closed', 'Сделка закрыта без фиксации типового LOSS-паттерна.')
+
+    if after_tp1:
+        mapping = {
+            'smc_ob_fvg_overlap': ('tp1_ob_fvg_no_followthrough', 'После TP1 сетап OB+FVG не дал продолжения: приоритетная зона уже не толкала цену по сделке, и остаток позиции вернулся в защиту.'),
+            'smc_htf_ob_ltf_fvg': ('tp1_htf_ob_ltf_no_followthrough', 'После TP1 HTF OB + LTF FVG retest не дал второй волны: цена не продолжила движение и вернулась в защитную зону.'),
+            'smc_bos_retest_confirm': ('tp1_bos_retest_no_followthrough', 'После TP1 breakout не развился дальше: retest не перешёл в продолжение, и остаток позиции вернулся в защиту.'),
+            'smc_displacement_origin': ('tp1_displacement_origin_no_followthrough', 'После TP1 displacement-origin импульс затух: продолжения от origin не было, и остаток позиции вернулся в защиту.'),
+            'smc_dual_fvg_origin': ('tp1_dual_fvg_origin_no_followthrough', 'После TP1 dual/stacked FVG origin не дал следующую волну: цена потеряла импульс и вернулась в защиту.'),
+            'smc_liquidity_reclaim': ('tp1_liquidity_reclaim_no_followthrough', 'После TP1 reclaim не продолжился в полноценный BOS continuation: цена потеряла импульс и вернулась в защиту.'),
+        }
+        if route_key in mapping:
+            return mapping[route_key]
+        return ('tp1_no_followthrough', 'После TP1 остаток позиции не получил продолжения и вернулся в защитную зону.')
+
+    if route_key == 'smc_ob_fvg_overlap':
+        if zone_hold is False:
+            return ('ob_fvg_zone_lost', 'Сетап OB+FVG сломался после входа: цена не удержала приоритетную OB/FVG-зону и быстро ушла против позиции до TP1.')
+        if fast_invalidation or 'against' in struct.lower():
+            return ('ob_fvg_structure_failed', f'Сетап OB+FVG сломался по структуре: после входа цена быстро пошла против {side}, и продолжение от приоритетной зоны не подтвердилось.')
+        return ('ob_fvg_no_followthrough', 'После входа сетап OB+FVG не дал ожидаемого импульсного продолжения от приоритетной зоны до TP1.')
+
+    if route_key == 'smc_htf_ob_ltf_fvg':
+        if zone_hold is False:
+            return ('htf_ob_ltf_retest_failed', 'Сетап HTF OB + LTF FVG сломался на retest: цена не удержала зону возврата после входа и ушла в стоп до TP1.')
+        if fast_invalidation:
+            return ('htf_ob_ltf_fast_invalidation', 'Сетап HTF OB + LTF FVG был быстро инвалидирован после входа: retest не подтвердился, и цена сразу пошла против позиции.')
+        return ('htf_ob_ltf_no_followthrough', 'После входа HTF OB + LTF FVG retest не дал продолжения по направлению сделки до TP1.')
+
+    if route_key == 'smc_bos_retest_confirm':
+        if fast_invalidation or 'against' in struct.lower():
+            return ('bos_retest_failed', 'Сетап BOS → retest → confirm сломался после входа: пробой не удержался, retest не подтвердил продолжение, и цена вернулась против позиции до TP1.')
+        return ('bos_retest_no_followthrough', 'После входа breakout не дал нормального continuation: подтверждение BOS оказалось слабым, и цена не дошла до TP1.')
+
+    if route_key == 'smc_displacement_origin':
+        if fast_invalidation:
+            return ('displacement_origin_fast_fail', 'Сетап displacement origin сломался сразу после входа: начальный импульс не удержался, и цена быстро инвалидировала origin-идею.')
+        return ('displacement_origin_no_followthrough', 'Сетап displacement origin не дал продолжения: стартовый импульс быстро затух, и цена ушла против позиции до TP1.')
+
+    if route_key == 'smc_dual_fvg_origin':
+        if fast_invalidation:
+            return ('dual_fvg_origin_fast_fail', 'Сетап dual/stacked FVG origin сломался сразу после входа: stacked FVG не удержал движение, и цена быстро пошла против позиции.')
+        return ('dual_fvg_origin_no_followthrough', 'Сетап dual/stacked FVG origin не дал продолжения: после входа не появилось нормального impulse continuation до TP1.')
+
+    if route_key == 'smc_liquidity_reclaim':
+        if zone_hold is False:
+            return ('liquidity_reclaim_not_held', 'Сетап liquidity reclaim сломался после входа: reclaim-зона не удержалась, и цена ушла обратно против позиции до TP1.')
+        if fast_invalidation:
+            return ('liquidity_reclaim_fast_fail', 'Сетап liquidity reclaim был быстро инвалидирован: после reclaim не появилось устойчивого BOS continuation, и цена резко пошла против позиции.')
+        return ('liquidity_reclaim_no_followthrough', 'После входа liquidity reclaim не перешёл в ожидаемое continuation-движение до TP1.')
+
+    if zone_hold is False:
+        return ('zone_retest_failed', 'После входа цена не удержала retest-зону и ушла в стоп до TP1.')
+    if fast_invalidation:
+        return ('fast_invalidation_after_entry', 'После входа сделка была быстро инвалидирована: цена почти сразу пошла против позиции до TP1.')
+    if follow in ('нет', 'слабый'):
+        return ('no_followthrough_after_entry', 'После входа не было нормального продолжения по направлению сделки до TP1.')
+    if vwap_state == 'потерян':
+        return ('vwap_lost_after_entry', 'После входа цена потеряла VWAP-опору и ушла против позиции до TP1.')
+    return ('loss_before_tp1_sl', 'Цена дошла до SL до TP1 без подтверждённого continuation после входа.')
+
+
 def _loss_diag_ta_filter_keys(*values: str, direction: str = "", setup_key: str = "") -> list[str]:
     text = "\n".join([str(v or "") for v in values if str(v or "").strip()])
     if not text:
@@ -3595,10 +3718,18 @@ def _loss_diag_improve_from_weak_filter(key: str, *, market: str = "", side: str
 def _loss_diag_reason_text(reason_code: str, fallback: str) -> str:
     key = str(reason_code or '').strip()
     mapping = {
-        'loss_before_tp1_sl': 'SL сработал до TP1.',
+        'loss_before_tp1_sl': 'Цена дошла до SL до TP1.',
         'loss_after_tp1_sl': 'После TP1 остаток позиции вернулся в SL.',
         'loss_sl': 'Цена дошла до SL — сигнал закрылся в минус.',
         'timeout_closed': 'Сигнал закрыт по времени.',
+        'zone_retest_failed': 'После входа цена не удержала retest-зону и ушла в стоп до TP1.',
+        'fast_invalidation_after_entry': 'После входа сделка была быстро инвалидирована и ушла в стоп до TP1.',
+        'tp1_no_followthrough': 'После TP1 не было продолжения по направлению сделки, и остаток позиции вернулся в защиту.',
+        'tp1_protection_failed': 'После TP1 защитная логика не удержала остаток позиции от возврата в стоп.',
+        'structure_break_against_entry': 'После входа структура быстро сломалась против направления сделки.',
+        'no_followthrough_after_entry': 'После входа не было нормального continuation по направлению сделки до TP1.',
+        'false_breakout_after_entry': 'После входа пробой быстро вернулся обратно и сломал идею continuation.',
+        'vwap_lost_after_entry': 'После входа цена потеряла VWAP-опору и ушла против позиции до TP1.',
     }
     return mapping.get(key, fallback or 'Сигнал закрылся в минус.')
 
@@ -3640,6 +3771,9 @@ def _loss_diag_improve_label(key: str) -> str:
         'tighten_trend_alignment': 'жёстче отсеивать входы против слабого тренда',
         'tighten_tp1_protection': 'усилить TP1 → SL защиту',
         'tighten_volume_support': 'требовать Vol xAvg ≥ 1.10',
+        'avoid_late_entry': 'жёстче отсекать поздний вход внутри уже идущего движения',
+        'tighten_retest_depth': 'жёстче фильтровать слишком глубокий retest',
+        'raise_min_confirm_strength': 'поднять минимум силы confirm-candle перед входом',
     }
     return mapping.get(str(key or '').strip(), str(key or '').strip())
 
@@ -3653,13 +3787,279 @@ def _loss_diag_parse_float(raw) -> float | None:
         return None
 
 
+def _loss_diag_reason_human_label(code: str) -> str:
+    mapping = {
+        'ob_fvg_zone_failed': 'OB/FVG priority zone failed',
+        'ob_fvg_reaction_weak': 'Weak reaction from OB/FVG zone',
+        'ob_fvg_invalidation_fast': 'Fast invalidation of OB/FVG setup',
+        'ob_fvg_no_continuation': 'OB/FVG setup gave no continuation',
+        'htf_ob_ltf_retest_failed': 'HTF OB + LTF retest failed',
+        'htf_zone_not_held': 'HTF zone was not held',
+        'ltf_confirm_weak': 'LTF confirm was weak',
+        'no_continuation_after_retest': 'No continuation after retest',
+        'bos_retest_failed': 'BOS retest confirm failed',
+        'bos_confirm_weak': 'BOS confirm was weak',
+        'bos_level_reclaimed_back': 'BOS level was reclaimed back',
+        'fake_breakout_no_continuation': 'Breakout trap / no continuation',
+        'displacement_failed': 'Displacement failed',
+        'origin_not_held': 'Origin did not hold',
+        'impulse_died_fast': 'Impulse died fast',
+        'displacement_too_weak': 'Displacement was too weak',
+        'dual_fvg_failed': 'Dual / stacked FVG failed',
+        'stacked_fvg_not_held': 'Stacked FVG was not held',
+        'confluence_failed': 'Confluence failed',
+        'reaction_from_dual_fvg_weak': 'Weak reaction from dual FVG',
+        'liquidity_reclaim_failed': 'Liquidity reclaim failed',
+        'reclaim_not_confirmed': 'Reclaim was not confirmed',
+        'reclaim_lost_back': 'Reclaim level was lost back',
+        'sweep_without_continuation': 'Sweep without continuation',
+        'immediate_invalidation': 'Immediate invalidation after entry',
+        'weak_reaction_then_fade': 'Weak reaction then fade',
+        'fake_confirm': 'Fake confirm',
+        'failed_reclaim_hold': 'Failed reclaim hold',
+        'breakout_trap': 'Breakout trap',
+        'weak_followthrough': 'Weak follow-through',
+        'no_post_entry_expansion': 'No post-entry expansion',
+        'continuation_missing': 'Continuation missing',
+        'zone_reaction_too_weak': 'Zone reaction too weak',
+        'level_reclaimed_back': 'Key level reclaimed back',
+        'invalidation_too_fast': 'Invalidation happened too fast',
+        'counter_move_stronger_than_expected': 'Counter-move was too strong',
+        'range_trap_behavior': 'Range trap behavior',
+        'post_entry_volume_faded': 'Volume faded after entry',
+        'entry_too_deep_into_zone': 'Entry was too deep into zone',
+        'late_entry_inside_expansion': 'Entry was too late inside expansion',
+        'structure_shift_against_trade': 'Structure shifted against trade',
+        'multiple_failed_pushes': 'Multiple failed pushes after entry',
+        'tp1_never_threatened': 'TP1 was never threatened',
+        'sl_hit_without_meaningful_excursion': 'SL hit without meaningful excursion',
+        'confirm_too_weak': 'Confirm candle was too weak',
+        'retest_too_deep': 'Retest was too deep',
+        'reclaim_without_acceptance': 'Reclaim had no acceptance',
+        'origin_impulse_not_clean': 'Origin impulse was not clean',
+    }
+    return mapping.get(str(code or '').strip(), str(code or '').strip().replace('_', ' '))
+
+
+def _loss_diag_format_reason_text(code: str, fallback: str = '') -> str:
+    mapping = {
+        'ob_fvg_zone_failed': 'OB/FVG priority zone failed: цена вошла в приоритетную OB/FVG зону, но реакция была слабой, зона не удержалась и сетап быстро инвалидировался.',
+        'ob_fvg_reaction_weak': 'Weak reaction from OB/FVG zone: цена зашла в OB/FVG, но не дала сильной реакции, поэтому continuation не появился.',
+        'ob_fvg_invalidation_fast': 'Fast invalidation of OB/FVG setup: после входа цена почти сразу пошла против сделки и быстро сломала идею OB/FVG priority hold.',
+        'ob_fvg_no_continuation': 'OB/FVG setup gave no continuation: зона формально отработала касание, но не дала импульсного продолжения по направлению сделки.',
+        'htf_ob_ltf_retest_failed': 'HTF OB + LTF retest failed: HTF зона не удержала цену, LTF retest не дал подтверждения, continuation после retest не появился.',
+        'htf_zone_not_held': 'HTF zone was not held: цена слишком глубоко вернулась в HTF область и не смогла удержаться по сценарию сделки.',
+        'ltf_confirm_weak': 'LTF confirm was weak: локальное подтверждение после retest выглядело слишком слабым и не дало нормального продолжения.',
+        'no_continuation_after_retest': 'No continuation after retest: retest был, но после него цена не перешла в нормальное continuation-движение.',
+        'bos_retest_failed': 'BOS retest confirm failed: BOS был, но retest/confirm не удержался, цена вернулась обратно за уровень и continuation сломался.',
+        'bos_confirm_weak': 'BOS confirm was weak: после пробоя confirm-candle оказалась слабой, и breakout не получил нормального continuation.',
+        'bos_level_reclaimed_back': 'BOS level was reclaimed back: после входа цена быстро вернулась за BOS-уровень и сломала breakout-сценарий.',
+        'fake_breakout_no_continuation': 'Breakout trap / no continuation: пробой выглядел рабочим, но не дал реального продолжения и превратился в trap-сценарий.',
+        'displacement_failed': 'Displacement failed: displacement оказался слабым, origin не дал продолжения, импульс быстро умер после входа.',
+        'origin_not_held': 'Origin did not hold: ключевая origin-зона не удержала цену после входа и сценарий развалился.',
+        'impulse_died_fast': 'Impulse died fast: после входа стартовый импульс быстро затух и цена не смогла продолжить движение по сделке.',
+        'displacement_too_weak': 'Displacement was too weak: стартовый displacement не выглядел достаточно сильным для continuation.',
+        'dual_fvg_failed': 'Dual / stacked FVG failed: stacked FVG не удержался, confluence не сработал, зона быстро инвалидировалась.',
+        'stacked_fvg_not_held': 'Stacked FVG was not held: цена быстро прошла dual/stacked FVG область без нормального удержания.',
+        'confluence_failed': 'Confluence failed: совпадение факторов в dual FVG зоне не дало ожидаемой сильной реакции.',
+        'reaction_from_dual_fvg_weak': 'Weak reaction from dual FVG: реакция из stacked FVG была слишком слабой для continuation.',
+        'liquidity_reclaim_failed': 'Liquidity reclaim failed: после sweep reclaim не закрепился, цена ушла обратно против идеи reclaim и continuation не появился.',
+        'reclaim_not_confirmed': 'Reclaim was not confirmed: касание reclaim-level было, но закрепления по правильную сторону уровня не произошло.',
+        'reclaim_lost_back': 'Reclaim level was lost back: после краткого reclaim цена снова ушла обратно за уровень и идея сделки сломалась.',
+        'sweep_without_continuation': 'Sweep without continuation: sweep случился, но после него рынок не перешёл в ожидаемое continuation-движение.',
+        'immediate_invalidation': 'Immediate invalidation after entry: сразу после входа цена почти без реакции пошла к SL — сетап был слабым уже в момент входа.',
+        'weak_reaction_then_fade': 'Weak reaction then fade: после входа была локальная реакция, но она быстро затухла и не перешла в continuation.',
+        'fake_confirm': 'Fake confirm: подтверждение выглядело валидным, но за ним не последовало реального расширения движения.',
+        'failed_reclaim_hold': 'Failed reclaim hold: reclaim был показан, но рынок не смог закрепиться по правильную сторону уровня.',
+        'breakout_trap': 'Breakout trap: пробой быстро вернулся обратно за уровень, поэтому continuation оказался ложным.',
+    }
+    return mapping.get(str(code or '').strip(), fallback or _loss_diag_reason_human_label(code))
+
+
+def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_tp1: bool, st: str) -> dict:
+    route_key = _loss_diag_route_key_from_row(src)
+    exact_route = route_key in EXACT_SMC_ROUTE_KEYS
+    if st != 'LOSS':
+        return {
+            'primary_reason_code': '', 'primary_reason_text': '', 'scenario_code': '', 'scenario_text': '',
+            'secondary_reason_codes': [], 'secondary_reason_texts': [], 'missed_codes': [], 'missed_texts': [],
+            'what_happened_lines': [],
+        }
+
+    mfe_pct = abs(float(analysis.get('mfe_pct') or 0.0))
+    mae_pct = abs(float(analysis.get('mae_pct') or 0.0))
+    bars_to_failure = int(analysis.get('bars_to_failure') or analysis.get('bars_to_sl') or 0)
+    fast_invalidation = bool(analysis.get('fast_invalidation'))
+    immediate = bool(analysis.get('immediate_invalidation')) or (bars_to_failure and bars_to_failure <= 2 and mfe_pct < 0.15)
+    weak_follow = bool(analysis.get('weak_followthrough')) or mfe_pct < 0.35
+    no_expansion = bool(analysis.get('no_post_entry_expansion')) or mfe_pct < 0.20
+    tp1_threatened = bool(analysis.get('tp1_threatened'))
+    structure_against = bool(analysis.get('structure_against_trade'))
+    zone_hold = analysis.get('zone_hold')
+    reclaim_lost = bool(analysis.get('reclaim_lost_back'))
+    confirm_weak = bool(analysis.get('confirm_too_weak'))
+    retest_deep = bool(analysis.get('retest_too_deep'))
+    volume_faded = bool(analysis.get('post_entry_volume_faded'))
+    multiple_failed_pushes = bool(analysis.get('multiple_failed_pushes'))
+
+    secondary = []
+    missed = []
+    happened = []
+
+    if immediate:
+        secondary.append('immediate_invalidation')
+        happened.append('сразу после входа цена почти без реакции пошла к SL')
+    if weak_follow:
+        secondary.append('weak_followthrough')
+        happened.append('нормального импульса в сторону сделки не появилось')
+    if no_expansion:
+        secondary.append('no_post_entry_expansion')
+    if not tp1_threatened:
+        secondary.append('tp1_never_threatened')
+        happened.append('TP1 не был даже нормально поставлен под угрозу')
+    if structure_against:
+        secondary.append('structure_shift_against_trade')
+        happened.append('после входа структура 5m сместилась против сделки')
+    if fast_invalidation:
+        secondary.append('invalidation_too_fast')
+    if volume_faded:
+        secondary.append('post_entry_volume_faded')
+        happened.append('объём после входа ослаб и не поддержал continuation')
+    if multiple_failed_pushes:
+        secondary.append('multiple_failed_pushes')
+        happened.append('после входа было несколько слабых попыток продолжения без результата')
+    if mae_pct >= max(0.45, mfe_pct * 1.2):
+        secondary.append('counter_move_stronger_than_expected')
+    if mfe_pct < 0.12:
+        secondary.append('sl_hit_without_meaningful_excursion')
+    if not bool(analysis.get('continuation_seen')):
+        secondary.append('continuation_missing')
+    if bool(analysis.get('range_trap_behavior')):
+        secondary.append('range_trap_behavior')
+
+    if exact_route:
+        if route_key == 'smc_ob_fvg_overlap':
+            if immediate or zone_hold is False:
+                primary = 'ob_fvg_zone_failed'
+            elif bool(analysis.get('zone_reaction_too_weak')):
+                primary = 'ob_fvg_reaction_weak'
+            elif fast_invalidation:
+                primary = 'ob_fvg_invalidation_fast'
+            else:
+                primary = 'ob_fvg_no_continuation'
+            scenario = 'immediate_invalidation' if immediate else 'weak_reaction_then_fade'
+            if bool(analysis.get('zone_reaction_too_weak')):
+                secondary.append('zone_reaction_too_weak')
+            if retest_deep:
+                secondary.append('entry_too_deep_into_zone'); missed.append('entry_too_deep_into_zone')
+        elif route_key == 'smc_htf_ob_ltf_fvg':
+            if zone_hold is False:
+                primary = 'htf_ob_ltf_retest_failed'
+            elif confirm_weak:
+                primary = 'ltf_confirm_weak'
+            elif bool(analysis.get('htf_zone_not_held')):
+                primary = 'htf_zone_not_held'
+            else:
+                primary = 'no_continuation_after_retest'
+            scenario = 'weak_reaction_then_fade'
+            if retest_deep:
+                secondary.append('level_reclaimed_back'); missed.append('retest_too_deep')
+        elif route_key == 'smc_bos_retest_confirm':
+            if bool(analysis.get('level_reclaimed_back')) or structure_against:
+                primary = 'bos_retest_failed'
+            elif confirm_weak:
+                primary = 'bos_confirm_weak'
+            elif bool(analysis.get('level_reclaimed_back')):
+                primary = 'bos_level_reclaimed_back'
+            else:
+                primary = 'fake_breakout_no_continuation'
+            scenario = 'breakout_trap' if bool(analysis.get('level_reclaimed_back')) else 'fake_confirm'
+            secondary.extend(['level_reclaimed_back'] if bool(analysis.get('level_reclaimed_back')) else [])
+            if confirm_weak:
+                missed.append('confirm_too_weak')
+            if retest_deep:
+                missed.append('retest_too_deep')
+        elif route_key == 'smc_displacement_origin':
+            if immediate:
+                primary = 'displacement_failed'
+            elif bool(analysis.get('origin_not_held')):
+                primary = 'origin_not_held'
+            elif bool(analysis.get('displacement_too_weak')):
+                primary = 'displacement_too_weak'
+            else:
+                primary = 'impulse_died_fast'
+            scenario = 'immediate_invalidation' if immediate else 'weak_reaction_then_fade'
+            if bool(analysis.get('origin_not_held')):
+                secondary.append('level_reclaimed_back')
+            if bool(analysis.get('displacement_too_weak')):
+                missed.append('origin_impulse_not_clean')
+        elif route_key == 'smc_dual_fvg_origin':
+            if immediate:
+                primary = 'dual_fvg_failed'
+            elif bool(analysis.get('stacked_fvg_not_held')):
+                primary = 'stacked_fvg_not_held'
+            elif bool(analysis.get('confluence_failed')):
+                primary = 'confluence_failed'
+            else:
+                primary = 'reaction_from_dual_fvg_weak'
+            scenario = 'weak_reaction_then_fade'
+            if bool(analysis.get('zone_reaction_too_weak')):
+                secondary.append('zone_reaction_too_weak')
+        elif route_key == 'smc_liquidity_reclaim':
+            if reclaim_lost:
+                primary = 'liquidity_reclaim_failed'
+            elif bool(analysis.get('reclaim_not_confirmed')):
+                primary = 'reclaim_not_confirmed'
+            elif reclaim_lost:
+                primary = 'reclaim_lost_back'
+            else:
+                primary = 'sweep_without_continuation'
+            scenario = 'failed_reclaim_hold' if reclaim_lost or bool(analysis.get('reclaim_not_confirmed')) else 'weak_reaction_then_fade'
+            if bool(analysis.get('reclaim_not_confirmed')):
+                missed.append('reclaim_without_acceptance')
+            if reclaim_lost:
+                secondary.append('level_reclaimed_back')
+        else:
+            primary = 'continuation_missing'
+            scenario = 'weak_reaction_then_fade'
+    else:
+        primary = 'immediate_invalidation' if immediate else 'continuation_missing'
+        scenario = 'weak_reaction_then_fade' if weak_follow else ''
+
+    if late := bool(analysis.get('late_entry_inside_expansion')):
+        secondary.append('late_entry_inside_expansion'); missed.append('late_entry_inside_expansion')
+    if confirm_weak:
+        secondary.append('fake_confirm')
+    if retest_deep and 'retest_too_deep' not in missed:
+        missed.append('retest_too_deep')
+
+    secondary = [x for x in dict.fromkeys([x for x in secondary if x and x != primary])]
+    missed = [x for x in dict.fromkeys([x for x in missed if x])]
+    happened = [x for x in dict.fromkeys([x for x in happened if x])]
+    primary_text = _loss_diag_format_reason_text(primary)
+    scenario_text = _loss_diag_format_reason_text(scenario, _loss_diag_reason_human_label(scenario)) if scenario else ''
+    return {
+        'primary_reason_code': primary,
+        'primary_reason_text': primary_text,
+        'scenario_code': scenario,
+        'scenario_text': scenario_text,
+        'secondary_reason_codes': secondary,
+        'secondary_reason_texts': [_loss_diag_reason_human_label(x) for x in secondary],
+        'missed_codes': missed,
+        'missed_texts': [_loss_diag_reason_human_label(x) for x in missed],
+        'what_happened_lines': happened,
+    }
+
+
 def _loss_diag_parse_metrics(row: dict | None) -> dict:
     src = dict(row or {})
     text = "\n".join([str(src.get('risk_note') or ''), str(src.get('orig_text') or '')])
+    side = str(src.get('side') or '').upper().strip() or 'LONG'
     metrics: dict = {
         'rr': _daily_report_rr_from_row(src),
         'rr_need': 1.90 if str(src.get('market') or '').upper().strip() == 'SPOT' else 1.80,
         'metrics_weak_counts': {},
+        'side': side,
     }
 
     def _count(key: str) -> None:
@@ -3676,7 +4076,8 @@ def _loss_diag_parse_metrics(row: dict | None) -> dict:
     if m:
         metrics['macd_hist_5m'] = float(m.group(1))
         metrics['macd_need'] = float(os.getenv('LOSS_DIAG_MACD_MIN', '0.0002') or 0.0002)
-        if float(m.group(1)) <= float(metrics['macd_need']):
+        macd_val = float(m.group(1))
+        if (side == 'LONG' and macd_val <= float(metrics['macd_need'])) or (side == 'SHORT' and macd_val >= -float(metrics['macd_need'])):
             _count('macd_hist_5m')
 
     m = re.search(r"ADX\s*30m\/1h:\s*([0-9]+(?:\.[0-9]+)?)\s*\/\s*([0-9]+(?:\.[0-9]+)?)\s*\[need\s*[≥>=]*\s*([0-9]+(?:\.[0-9]+)?)\s*\/\s*[≥>=]*\s*([0-9]+(?:\.[0-9]+)?)\]", text, flags=re.IGNORECASE)
@@ -3708,6 +4109,8 @@ def _loss_diag_parse_metrics(row: dict | None) -> dict:
     if m:
         metrics['confidence'] = float(m.group(1))
         metrics['confidence_need'] = float(m.group(2))
+        if metrics['confidence'] < metrics['confidence_need']:
+            _count('confidence')
 
     m = re.search(r"Signal strength:\s*([0-9]+(?:\.[0-9]+)?)\/10", text, flags=re.IGNORECASE)
     if m:
@@ -3724,6 +4127,112 @@ def _loss_diag_parse_metrics(row: dict | None) -> dict:
     if rr and rr < float(metrics['rr_need']):
         _count('rr_tp2')
     return metrics
+
+
+def _loss_diag_load_entry_snapshot(row: dict | None) -> dict:
+    src = dict(row or {})
+    raw = src.get('entry_snapshot_json')
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            return {}
+    return {}
+
+
+def _loss_diag_pick_nested_value(obj, *paths):
+    for path in paths:
+        cur = obj
+        ok = True
+        for key in path:
+            if isinstance(cur, dict) and key in cur:
+                cur = cur.get(key)
+            else:
+                ok = False
+                break
+        if ok and cur is not None and str(cur).strip() != '':
+            return cur
+    return None
+
+
+def _signal_forensics_entry_snapshot(sig) -> dict:
+    snap: dict = {}
+    if sig is None:
+        return snap
+
+    def _get(name: str, default=None):
+        try:
+            val = getattr(sig, name, default)
+            return default if val is None else val
+        except Exception:
+            return default
+
+    def _maybe_float(v):
+        try:
+            if v is None or v == '':
+                return None
+            return float(v)
+        except Exception:
+            return None
+
+    snap['route_key'] = str(_get('smc_setup_route', '') or _get('emit_route', '') or '').strip()
+    snap['direction'] = str(_get('direction', '') or '').upper().strip()
+    snap['entry'] = _maybe_float(_get('entry'))
+    snap['sl'] = _maybe_float(_get('sl'))
+    snap['tp1'] = _maybe_float(_get('tp1'))
+    snap['signal_tf'] = str(_get('timeframe', '') or '').strip()
+    snap['confidence'] = _get('confidence')
+    snap['rr'] = _maybe_float(_get('rr'))
+    snap['entry_bar_time'] = _get('entry_bar_time')
+
+    for fld in (
+        'bos_level', 'retest_level', 'ob_top', 'ob_bottom', 'fvg_top', 'fvg_bottom',
+        'reclaim_level', 'origin_level', 'sweep_level', 'displacement_start', 'displacement_end',
+        'range_high', 'range_low', 'atr_at_entry', 'volume_at_entry', 'trend_context', 'liquidity_side',
+        'stacked_fvg_top', 'stacked_fvg_bottom', 'stacked_fvg_bounds'
+    ):
+        val = _get(fld)
+        if val not in (None, '', [], {}):
+            snap[fld] = val
+
+    raw_sources = []
+    for fld in ('forensics', 'forensic', 'smc_snapshot', 'smart_snapshot', 'debug', 'meta', 'ta_meta', 'risk_meta'):
+        val = _get(fld)
+        if isinstance(val, dict):
+            raw_sources.append(val)
+
+    for src in raw_sources:
+        for key, paths in {
+            'bos_level': [('bos_level',), ('structure', 'bos_level')],
+            'retest_level': [('retest_level',), ('structure', 'retest_level')],
+            'ob_top': [('ob_top',), ('ob', 'top')],
+            'ob_bottom': [('ob_bottom',), ('ob', 'bottom')],
+            'fvg_top': [('fvg_top',), ('fvg', 'top')],
+            'fvg_bottom': [('fvg_bottom',), ('fvg', 'bottom')],
+            'reclaim_level': [('reclaim_level',)],
+            'origin_level': [('origin_level',)],
+            'sweep_level': [('sweep_level',)],
+            'displacement_start': [('displacement_start',)],
+            'displacement_end': [('displacement_end',)],
+            'range_high': [('range_high',)],
+            'range_low': [('range_low',)],
+            'atr_at_entry': [('atr_at_entry',), ('atr', 'entry')],
+            'volume_at_entry': [('volume_at_entry',), ('volume', 'entry')],
+            'trend_context': [('trend_context',), ('trend', 'context')],
+            'liquidity_side': [('liquidity_side',)],
+            'stacked_fvg_bounds': [('stacked_fvg_bounds',)],
+        }.items():
+            if key in snap:
+                continue
+            val = _loss_diag_pick_nested_value(src, *paths)
+            if val not in (None, '', [], {}):
+                snap[key] = val
+
+    return {k: v for k, v in snap.items() if v not in (None, '', [], {})}
 
 
 def _loss_diag_load_close_analysis(row: dict | None) -> dict:
@@ -3747,56 +4256,55 @@ def _loss_diag_build_analysis_lines(src: dict, metrics: dict, analysis: dict, *,
     closed = _parse_iso_dt(src.get('closed_at'))
     if opened and closed and closed > opened:
         duration_min = int(round((closed - opened).total_seconds() / 60.0))
-        lines.append(f"Вход → SL: {duration_min} мин")
-        lines.append(f"Баров 5m до SL: {max(1, int(math.ceil(duration_min / 5.0)))}")
+        lines.append(f"вход → SL: {duration_min} мин")
     elif analysis.get('duration_min'):
-        duration_min = int(analysis.get('duration_min') or 0)
-        lines.append(f"Вход → SL: {duration_min} мин")
-        lines.append(f"Баров 5m до SL: {max(1, int(math.ceil(duration_min / 5.0)))}")
+        lines.append(f"вход → SL: {int(analysis.get('duration_min') or 0)} мин")
+    if analysis.get('bars_to_failure') is not None:
+        lines.append(f"баров до слома: {int(analysis.get('bars_to_failure') or 0)}")
     if analysis.get('mfe_pct') is not None:
-        lines.append(f"MFE: {float(analysis.get('mfe_pct')):+.2f}%")
+        lines.append(f"макс. ход в сторону сделки: {float(analysis.get('mfe_pct')):+.2f}%")
     if analysis.get('mae_pct') is not None:
-        lines.append(f"MAE: {float(analysis.get('mae_pct')):+.2f}%")
+        lines.append(f"макс. ход против сделки: {float(analysis.get('mae_pct')):+.2f}%")
+    if analysis.get('tp1_threatened') is not None:
+        lines.append(f"TP1 под угрозой: {'да' if bool(analysis.get('tp1_threatened')) else 'нет'}")
     if after_tp1:
-        if analysis.get('bars_to_tp1') is not None:
-            lines.append(f"Баров до TP1: {int(analysis.get('bars_to_tp1'))}")
         if analysis.get('bars_tp1_to_close') is not None:
-            lines.append(f"Баров от TP1 до SL: {int(analysis.get('bars_tp1_to_close'))}")
-        if analysis.get('new_high_after_tp1') is not None:
-            lines.append(f"Новый high после TP1: {'да' if bool(analysis.get('new_high_after_tp1')) else 'нет'}")
-        lines.append(f"Follow-through после TP1: {analysis.get('follow_through_tp1') or 'нет'}")
-        if analysis.get('vwap_after_tp1'):
-            lines.append(f"VWAP после TP1: {analysis.get('vwap_after_tp1')}")
+            lines.append(f"баров от TP1 до SL: {int(analysis.get('bars_tp1_to_close') or 0)}")
+        lines.append(f"follow-through после TP1: {analysis.get('follow_through_tp1') or 'нет'}")
     else:
-        if analysis.get('zone_hold') is not None and str(_loss_diag_setup_key_from_row(src) or '') == 'zone_retest':
-            lines.append(f"Удержание зоны: {'да' if bool(analysis.get('zone_hold')) else 'нет'}")
-        if analysis.get('fast_invalidation'):
-            lines.append('Fast invalidation: да')
-        lines.append(f"Follow-through после входа: {analysis.get('follow_through') or 'слабый'}")
+        lines.append(f"follow-through после входа: {analysis.get('follow_through') or 'слабый'}")
+        if analysis.get('structure_5m'):
+            lines.append(f"структура 5m: {analysis.get('structure_5m')}")
         if analysis.get('vwap_after_entry'):
             lines.append(f"VWAP после входа: {analysis.get('vwap_after_entry')}")
-        if analysis.get('structure_5m'):
-            lines.append(f"Структура 5m: {analysis.get('structure_5m')}")
     return [x for x in lines if x]
 
 
 def _loss_diag_metric_lines(src: dict, metrics: dict, weak_keys: list[str]) -> list[str]:
     lines: list[str] = []
+    weak_set = set([str(x or '').strip() for x in (weak_keys or []) if str(x or '').strip()])
+    metric_weak = dict(metrics.get('metrics_weak_counts') or {})
+    side = str(metrics.get('side') or src.get('side') or '').upper().strip() or 'LONG'
+
     rr = float(metrics.get('rr') or 0.0)
     rr_need = float(metrics.get('rr_need') or 0.0)
-    if rr > 0 and rr_need > 0:
+    if rr > 0 and rr_need > 0 and metric_weak.get('rr_tp2'):
         lines.append(f"RR TP2: {rr:.2f} [need ≥{rr_need:.2f}]")
-    if metrics.get('signal_strength') is not None and metrics.get('signal_strength_need') is not None:
+    if metrics.get('signal_strength') is not None and metrics.get('signal_strength_need') is not None and metric_weak.get('signal_strength'):
         lines.append(f"Signal strength: {float(metrics.get('signal_strength')):.1f}/10 [need ≥{float(metrics.get('signal_strength_need')):.1f}]")
-    if metrics.get('macd_hist_5m') is not None and metrics.get('macd_need') is not None:
-        lines.append(f"MACD hist(5m): {float(metrics.get('macd_hist_5m')):+.4f} [need > +{float(metrics.get('macd_need')):.4f}]")
-    if metrics.get('adx_30m') is not None and metrics.get('adx_1h') is not None:
+    if metrics.get('macd_hist_5m') is not None and metrics.get('macd_need') is not None and metric_weak.get('macd_hist_5m'):
+        need = float(metrics.get('macd_need'))
+        if side == 'SHORT':
+            lines.append(f"MACD hist(5m): {float(metrics.get('macd_hist_5m')):+.4f} [need < -{need:.4f}]")
+        else:
+            lines.append(f"MACD hist(5m): {float(metrics.get('macd_hist_5m')):+.4f} [need > +{need:.4f}]")
+    if metrics.get('adx_30m') is not None and metrics.get('adx_1h') is not None and (metric_weak.get('adx_30m') or metric_weak.get('adx_1h') or 'weak_trend_context' in weak_set):
         lines.append(f"ADX 30m/1h: {float(metrics.get('adx_30m')):.1f} / {float(metrics.get('adx_1h')):.1f} [need ≥{float(metrics.get('adx_need_30m') or 24):.0f} / ≥{float(metrics.get('adx_need_1h') or 26):.0f}]")
-    if metrics.get('vol_xavg') is not None and metrics.get('vol_need') is not None:
+    if metrics.get('vol_xavg') is not None and metrics.get('vol_need') is not None and (metric_weak.get('vol_xavg') or 'weak_volume_support' in weak_set):
         lines.append(f"Vol xAvg: {float(metrics.get('vol_xavg')):.2f} [need ≥{float(metrics.get('vol_need')):.2f}]")
-    if metrics.get('ta_score') is not None and metrics.get('ta_need') is not None:
+    if metrics.get('ta_score') is not None and metrics.get('ta_need') is not None and metric_weak.get('ta_score'):
         lines.append(f"TA score: {float(metrics.get('ta_score')):.0f} [need ≥{float(metrics.get('ta_need')):.0f}]")
-    if metrics.get('confidence') is not None and metrics.get('confidence_need') is not None:
+    if metrics.get('confidence') is not None and metrics.get('confidence_need') is not None and metric_weak.get('confidence'):
         lines.append(f"Confidence: {float(metrics.get('confidence')):.0f} [need ≥{float(metrics.get('confidence_need')):.0f}]")
     return lines
 
@@ -3806,21 +4314,33 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
     symbol = str(src.get('symbol') or '').upper().strip()
     market = str(src.get('market') or 'SPOT').upper().strip() or 'SPOT'
     side = str(src.get('side') or 'LONG').upper().strip() or 'LONG'
+    route_key = _loss_diag_route_key_from_row(src)
     entry = _loss_diag_parse_float(src.get('entry')) or 0.0
+    sl = _loss_diag_parse_float(src.get('sl')) or 0.0
+    tp1 = _loss_diag_parse_float(src.get('tp1')) or 0.0
     opened = _parse_iso_dt(src.get('opened_at'))
     closed = _parse_iso_dt(closed_at or src.get('closed_at')) or dt.datetime.now(dt.timezone.utc)
     if not symbol or entry <= 0 or opened is None or closed <= opened:
         return {}
+    snapshot = _loss_diag_load_entry_snapshot(src)
     analysis: dict = {
+        'route_key': route_key,
         'duration_min': max(1, int(round((closed - opened).total_seconds() / 60.0))),
+        'entry_snapshot_present': bool(snapshot),
     }
+    if snapshot:
+        analysis['entry_snapshot_fields'] = sorted(list(snapshot.keys()))
+        for key in ('bos_level', 'retest_level', 'ob_top', 'ob_bottom', 'fvg_top', 'fvg_bottom', 'reclaim_level', 'origin_level', 'sweep_level', 'displacement_start', 'displacement_end', 'range_high', 'range_low', 'atr_at_entry', 'volume_at_entry', 'trend_context', 'liquidity_side', 'stacked_fvg_bounds'):
+            if key in snapshot and key not in analysis:
+                analysis[key] = snapshot.get(key)
     try:
-        df5 = await backend.load_candles(symbol, '5m', market=market, limit=96)
+        df5 = await backend.load_candles(symbol, '5m', market=market, limit=160)
     except Exception:
         df5 = None
     if df5 is None or getattr(df5, 'empty', True):
         analysis['fast_invalidation'] = bool(int(analysis['duration_min']) <= 15)
         return analysis
+
     try:
         d = df5.copy()
         if 'open_time_ms' in d.columns:
@@ -3832,60 +4352,176 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
         else:
             ts = pd.Series([pd.NaT] * len(d))
         d['_ts'] = ts
-        d = d[(d['_ts'].notna()) & (d['_ts'] >= (opened - dt.timedelta(minutes=5))) & (d['_ts'] <= (closed + dt.timedelta(minutes=5)))]
+        d = d[(d['_ts'].notna()) & (d['_ts'] >= (opened - dt.timedelta(minutes=15))) & (d['_ts'] <= (closed + dt.timedelta(minutes=10)))].copy()
         if d.empty:
             analysis['fast_invalidation'] = bool(int(analysis['duration_min']) <= 15)
             return analysis
         for col in ('open', 'high', 'low', 'close'):
             d[col] = pd.to_numeric(d[col], errors='coerce')
-        d = d.dropna(subset=['open', 'high', 'low', 'close'])
+        if 'volume' in d.columns:
+            d['volume'] = pd.to_numeric(d['volume'], errors='coerce').fillna(0.0)
+        else:
+            d['volume'] = 0.0
+        d = d.dropna(subset=['open', 'high', 'low', 'close']).sort_values('_ts')
         if d.empty:
             return analysis
-        highs = d['high'].astype(float)
-        lows = d['low'].astype(float)
-        closes = d['close'].astype(float)
-        opens = d['open'].astype(float)
+
+        post = d[d['_ts'] >= opened].copy()
+        if post.empty:
+            post = d.copy()
+        highs = post['high'].astype(float)
+        lows = post['low'].astype(float)
+        closes = post['close'].astype(float)
+        opens = post['open'].astype(float)
+        vols = post['volume'].astype(float)
+        bars = len(post)
+        analysis['bars_to_failure'] = bars
+        analysis['bars_to_sl'] = bars
+        analysis['fast_invalidation'] = bool(int(analysis.get('duration_min') or 0) <= 15 or bars <= 3)
+
+        risk_pct = abs((entry - sl) / entry) * 100.0 if sl > 0 and entry > 0 else 0.0
         if side == 'LONG':
-            analysis['mfe_pct'] = round(((float(highs.max()) - entry) / entry) * 100.0, 2)
-            analysis['mae_pct'] = round(((float(lows.min()) - entry) / entry) * 100.0, 2)
+            best_px = float(highs.max())
+            worst_px = float(lows.min())
+            analysis['mfe_pct'] = round(((best_px - entry) / entry) * 100.0, 2)
+            analysis['mae_pct'] = round(((worst_px - entry) / entry) * 100.0, 2)
+            analysis['tp1_threatened'] = bool(tp1 > 0 and best_px >= (entry + max(tp1 - entry, 0.0) * 0.8))
+            analysis['zone_hold'] = bool((closes.iloc[:min(3, bars)] >= entry).sum() >= max(1, min(3, bars) - 1))
+            analysis['level_reclaimed_back'] = bool((closes < entry).sum() >= 2)
+            analysis['reclaim_lost_back'] = bool((closes < entry).sum() >= 2)
         else:
-            analysis['mfe_pct'] = round(((entry - float(lows.min())) / entry) * 100.0, 2)
-            analysis['mae_pct'] = round(((entry - float(highs.max())) / entry) * 100.0, 2)
-        analysis['fast_invalidation'] = bool(int(analysis.get('duration_min') or 0) <= 15)
-        two_red = bool(len(closes) >= 2 and (closes.iloc[-1] < opens.iloc[-1]) and (closes.iloc[-2] < opens.iloc[-2]))
-        two_green = bool(len(closes) >= 2 and (closes.iloc[-1] > opens.iloc[-1]) and (closes.iloc[-2] > opens.iloc[-2]))
-        lower_highs = bool(len(highs) >= 3 and highs.iloc[-1] < highs.iloc[-2] < highs.iloc[-3])
-        higher_lows = bool(len(lows) >= 3 and lows.iloc[-1] > lows.iloc[-2] > lows.iloc[-3])
-        ema20 = closes.ewm(span=20, adjust=False).mean().iloc[-1] if len(closes) >= 5 else None
-        try:
-            vol = pd.to_numeric(d.get('volume'), errors='coerce').fillna(0.0)
-            tp = (highs + lows + closes) / 3.0
-            vwap = float((tp * vol).sum() / max(float(vol.sum()), 1e-9)) if float(vol.sum()) > 0 else None
-        except Exception:
-            vwap = None
+            best_px = float(lows.min())
+            worst_px = float(highs.max())
+            analysis['mfe_pct'] = round(((entry - best_px) / entry) * 100.0, 2)
+            analysis['mae_pct'] = round(((entry - worst_px) / entry) * 100.0, 2)
+            analysis['tp1_threatened'] = bool(tp1 > 0 and best_px <= (entry - max(entry - tp1, 0.0) * 0.8))
+            analysis['zone_hold'] = bool((closes.iloc[:min(3, bars)] <= entry).sum() >= max(1, min(3, bars) - 1))
+            analysis['level_reclaimed_back'] = bool((closes > entry).sum() >= 2)
+            analysis['reclaim_lost_back'] = bool((closes > entry).sum() >= 2)
+
+        analysis['risk_pct_to_sl'] = round(risk_pct, 4)
+        if risk_pct > 0:
+            analysis['mfe_r'] = round(abs(float(analysis['mfe_pct'])) / risk_pct, 2)
+            analysis['mae_r'] = round(abs(float(analysis['mae_pct'])) / risk_pct, 2)
+
+        first3 = post.head(min(3, bars))
+        first6 = post.head(min(6, bars))
+        first3_high = float(first3['high'].max())
+        first3_low = float(first3['low'].min())
+        first6_high = float(first6['high'].max())
+        first6_low = float(first6['low'].min())
+
+        if side == 'LONG':
+            first_push_pct = ((first3_high - entry) / entry) * 100.0
+            against_move_pct = ((entry - first3_low) / entry) * 100.0
+            continuation_seen = bool(first6_high > entry)
+            bullish_count = int((first6['close'] > first6['open']).sum())
+            against_count = int((first6['close'] < first6['open']).sum())
+        else:
+            first_push_pct = ((entry - first3_low) / entry) * 100.0
+            against_move_pct = ((first3_high - entry) / entry) * 100.0
+            continuation_seen = bool(first6_low < entry)
+            bullish_count = int((first6['close'] < first6['open']).sum())
+            against_count = int((first6['close'] > first6['open']).sum())
+
+        analysis['first_push_pct'] = round(first_push_pct, 2)
+        analysis['against_move_first3_pct'] = round(against_move_pct, 2)
+        analysis['continuation_seen'] = continuation_seen
+        analysis['immediate_invalidation'] = bool(bars <= 2 or (against_move_pct > max(first_push_pct * 1.2, 0.12) and first_push_pct < 0.12))
+        analysis['weak_followthrough'] = bool(abs(float(analysis['mfe_pct'])) < 0.35)
+        analysis['no_post_entry_expansion'] = bool(abs(float(analysis['mfe_pct'])) < 0.20)
+        analysis['multiple_failed_pushes'] = bool(bars >= 5 and bullish_count >= 2 and against_count >= 2 and abs(float(analysis['mfe_pct'])) < 0.45)
+
+        vol_mean = float(vols.mean()) if len(vols) else 0.0
+        vol_tail = float(vols.tail(min(3, len(vols))).mean()) if len(vols) else 0.0
+        analysis['post_entry_volume_faded'] = bool(vol_mean > 0 and vol_tail < vol_mean * 0.85)
+
+        ema20 = closes.ewm(span=20, adjust=False).mean()
+        ema_last = float(ema20.iloc[-1]) if len(ema20) else 0.0
+        two_last = post.tail(min(3, bars))
+        if side == 'LONG':
+            structure_against = bool(((two_last['close'] < two_last['open']).sum() >= 2) or (float(closes.iloc[-1]) < ema_last))
+        else:
+            structure_against = bool(((two_last['close'] > two_last['open']).sum() >= 2) or (float(closes.iloc[-1]) > ema_last))
+        analysis['structure_against_trade'] = structure_against
+        analysis['structure_5m'] = ('bearish against LONG' if side == 'LONG' else 'bullish against SHORT') if structure_against else 'neutral / no clean continuation'
+
+        tp = (post['high'].astype(float) + post['low'].astype(float) + post['close'].astype(float)) / 3.0
+        vol_sum = float(vols.sum())
+        vwap = float((tp * vols).sum() / max(vol_sum, 1e-9)) if vol_sum > 0 else None
         last_close = float(closes.iloc[-1])
-        analysis['zone_hold'] = bool(((closes > entry).sum() >= 2) if side == 'LONG' else ((closes < entry).sum() >= 2))
-        mfe = abs(float(analysis.get('mfe_pct') or 0.0))
-        analysis['follow_through'] = 'есть' if mfe >= 0.35 else ('слабый' if mfe >= 0.15 else 'нет')
-        if side == 'LONG':
-            if vwap is not None:
-                analysis['vwap_after_entry'] = 'потерян' if last_close < float(vwap) else 'сохранён'
-            analysis['structure_5m'] = 'bearish against LONG' if (two_red or lower_highs or (ema20 is not None and last_close < float(ema20))) else 'слабая, без продолжения'
-        else:
-            if vwap is not None:
-                analysis['vwap_after_entry'] = 'потерян' if last_close > float(vwap) else 'сохранён'
-            analysis['structure_5m'] = 'bullish against SHORT' if (two_green or higher_lows or (ema20 is not None and last_close > float(ema20))) else 'слабая, без продолжения'
+        if vwap is not None:
+            if side == 'LONG':
+                analysis['vwap_after_entry'] = 'потерян' if last_close < vwap else 'сохранён'
+            else:
+                analysis['vwap_after_entry'] = 'потерян' if last_close > vwap else 'сохранён'
+
+        analysis['follow_through'] = 'есть' if abs(float(analysis['mfe_pct'])) >= 0.55 else ('слабый' if abs(float(analysis['mfe_pct'])) >= 0.20 else 'нет')
+        analysis['range_trap_behavior'] = bool(bars >= 4 and abs(float(analysis['mfe_pct'])) < 0.30 and abs(float(analysis['mae_pct'])) >= 0.25)
+        analysis['sl_hit_without_meaningful_excursion'] = bool(abs(float(analysis['mfe_pct'])) < 0.12)
+        analysis['zone_reaction_too_weak'] = bool(first_push_pct < 0.12)
+        analysis['confirm_too_weak'] = bool(first_push_pct < 0.15 and bars <= 4)
+        analysis['retest_too_deep'] = bool(against_move_pct > max(abs(first_push_pct) * 1.1, 0.12))
+        analysis['late_entry_inside_expansion'] = bool(bars <= 3 and abs(float(analysis['mae_pct'])) > abs(float(analysis['mfe_pct'])) and abs(float(analysis['mfe_pct'])) < 0.18)
+        analysis['origin_not_held'] = bool(route_key == 'smc_displacement_origin' and structure_against)
+        analysis['displacement_too_weak'] = bool(route_key == 'smc_displacement_origin' and first_push_pct < 0.18)
+        analysis['stacked_fvg_not_held'] = bool(route_key == 'smc_dual_fvg_origin' and structure_against)
+        analysis['confluence_failed'] = bool(route_key == 'smc_dual_fvg_origin' and (analysis['zone_reaction_too_weak'] or analysis['retest_too_deep']))
+        analysis['reclaim_not_confirmed'] = bool(route_key == 'smc_liquidity_reclaim' and not analysis.get('tp1_threatened') and analysis.get('reclaim_lost_back'))
+        analysis['htf_zone_not_held'] = bool(route_key == 'smc_htf_ob_ltf_fvg' and analysis.get('retest_too_deep'))
+
+        try:
+            bos_level = _loss_diag_parse_float(snapshot.get('bos_level')) if snapshot else None
+            reclaim_level = _loss_diag_parse_float(snapshot.get('reclaim_level')) if snapshot else None
+            origin_level = _loss_diag_parse_float(snapshot.get('origin_level')) if snapshot else None
+            ob_top = _loss_diag_parse_float(snapshot.get('ob_top')) if snapshot else None
+            ob_bottom = _loss_diag_parse_float(snapshot.get('ob_bottom')) if snapshot else None
+            fvg_top = _loss_diag_parse_float(snapshot.get('fvg_top')) if snapshot else None
+            fvg_bottom = _loss_diag_parse_float(snapshot.get('fvg_bottom')) if snapshot else None
+            if bos_level:
+                if side == 'LONG':
+                    analysis['level_reclaimed_back'] = bool(analysis.get('level_reclaimed_back') or float(closes.iloc[-1]) < bos_level)
+                else:
+                    analysis['level_reclaimed_back'] = bool(analysis.get('level_reclaimed_back') or float(closes.iloc[-1]) > bos_level)
+            if reclaim_level:
+                if side == 'LONG':
+                    analysis['reclaim_lost_back'] = bool(analysis.get('reclaim_lost_back') or float(closes.iloc[-1]) < reclaim_level)
+                else:
+                    analysis['reclaim_lost_back'] = bool(analysis.get('reclaim_lost_back') or float(closes.iloc[-1]) > reclaim_level)
+            if origin_level and route_key == 'smc_displacement_origin':
+                if side == 'LONG':
+                    analysis['origin_not_held'] = bool(analysis.get('origin_not_held') or float(closes.iloc[-1]) < origin_level)
+                else:
+                    analysis['origin_not_held'] = bool(analysis.get('origin_not_held') or float(closes.iloc[-1]) > origin_level)
+            zone_top = max([x for x in (ob_top, ob_bottom, fvg_top, fvg_bottom) if x is not None], default=None)
+            zone_bottom = min([x for x in (ob_top, ob_bottom, fvg_top, fvg_bottom) if x is not None], default=None)
+            if zone_top is not None and zone_bottom is not None and zone_top > zone_bottom:
+                zone_width = zone_top - zone_bottom
+                zone_mid = zone_bottom + zone_width * 0.5
+                if side == 'LONG':
+                    deepest = float(lows.min())
+                    analysis['entry_too_deep_into_zone'] = bool(analysis.get('entry_too_deep_into_zone') or deepest < (zone_bottom + zone_width * 0.25))
+                    analysis['zone_midpoint_lost'] = bool(float(closes.iloc[-1]) < zone_mid)
+                else:
+                    highest = float(highs.max())
+                    analysis['entry_too_deep_into_zone'] = bool(analysis.get('entry_too_deep_into_zone') or highest > (zone_top - zone_width * 0.25))
+                    analysis['zone_midpoint_lost'] = bool(float(closes.iloc[-1]) > zone_mid)
+        except Exception:
+            pass
+
         tp1_hit_at = _parse_iso_dt(src.get('tp1_hit_at'))
-        tp1 = _loss_diag_parse_float(src.get('tp1')) or 0.0
         if tp1_hit_at is not None and tp1 > 0:
             analysis['bars_to_tp1'] = max(1, int(math.ceil((tp1_hit_at - opened).total_seconds() / 300.0))) if tp1_hit_at > opened else 1
             analysis['bars_tp1_to_close'] = max(1, int(math.ceil((closed - tp1_hit_at).total_seconds() / 300.0))) if closed > tp1_hit_at else 1
-            after = d[d['_ts'] >= tp1_hit_at]
-            if not after.empty:
-                ah = after['high'].astype(float)
-                al = after['low'].astype(float)
-                analysis['new_high_after_tp1'] = bool(float(ah.max()) > tp1) if side == 'LONG' else bool(float(al.min()) < tp1)
-            analysis['follow_through_tp1'] = 'нет' if not analysis.get('new_high_after_tp1') else 'слабый'
+            after_tp = post[post['_ts'] >= tp1_hit_at].copy()
+            if not after_tp.empty:
+                ah = after_tp['high'].astype(float)
+                al = after_tp['low'].astype(float)
+                if side == 'LONG':
+                    analysis['new_high_after_tp1'] = bool(float(ah.max()) > tp1)
+                else:
+                    analysis['new_high_after_tp1'] = bool(float(al.min()) < tp1)
+            analysis['follow_through_tp1'] = 'есть' if analysis.get('new_high_after_tp1') else 'нет'
             analysis['vwap_after_tp1'] = analysis.get('vwap_after_entry') or 'ослаб'
     except Exception:
         return analysis
@@ -3899,129 +4535,69 @@ def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str, clo
     fallback_reason = _report_close_reason(st, after_tp1=after_tp1, has_tp2=bool(float(src.get('tp2') or 0.0) > 0 if src.get('tp2') is not None else False))
     metrics = _loss_diag_parse_metrics(src)
     analysis = dict(close_analysis or {}) or _loss_diag_load_close_analysis(src)
-
-    reason_code = str(src.get('close_reason_code') or '').strip()
-    reason_text = str(src.get('close_reason_text') or '').strip()
-    weak_filters_raw = str(src.get('weak_filters') or '').strip()
-    improve_note_raw = str(src.get('improve_note') or '').strip()
-
-    if reason_code or reason_text or weak_filters_raw or improve_note_raw:
-        weak_keys = [x.strip() for x in re.split(r'[,;|]+', weak_filters_raw) if x.strip()]
-        improve_keys = [x.strip() for x in re.split(r'[,;|]+', improve_note_raw) if x.strip()]
-        return {
-            'reason_code': reason_code or ('tp1_no_followthrough,tp1_protection_failed' if after_tp1 and st == 'LOSS' else 'fast_invalidation_after_entry' if st == 'LOSS' else ''),
-            'reason_text': reason_text or _loss_diag_reason_text(reason_code, fallback_reason),
-            'weak_filter_keys': weak_keys,
-            'weak_filter_labels': [_loss_diag_weak_filter_label(x) for x in weak_keys],
-            'improve_keys': improve_keys,
-            'improve_labels': [_loss_diag_improve_label(x) for x in improve_keys],
-            'improve_note': improve_note_raw,
-            'analysis_lines': _loss_diag_build_analysis_lines(src, metrics, analysis, after_tp1=after_tp1),
-            'metric_lines': _loss_diag_metric_lines(src, metrics, weak_keys),
-            'metrics_weak_counts': dict(metrics.get('metrics_weak_counts') or {}),
-            'close_analysis_json': analysis,
-        }
+    forensic = _loss_diag_build_forensic_from_analysis(src, analysis, after_tp1=after_tp1, st=st)
 
     if st not in ('LOSS', 'CLOSED'):
         return {
-            'reason_code': '', 'reason_text': fallback_reason, 'weak_filter_keys': [], 'weak_filter_labels': [],
+            'reason_code': '', 'reason_text': fallback_reason,
+            'primary_reason_code': '', 'primary_reason_text': fallback_reason,
+            'scenario_code': '', 'scenario_text': '',
+            'secondary_reason_codes': [], 'secondary_reason_labels': [],
+            'missed_codes': [], 'missed_labels': [],
+            'what_happened_lines': [],
+            'weak_filter_keys': [], 'weak_filter_labels': [],
             'improve_keys': [], 'improve_labels': [], 'improve_note': '',
             'analysis_lines': _loss_diag_build_analysis_lines(src, metrics, analysis, after_tp1=after_tp1),
-            'metric_lines': _loss_diag_metric_lines(src, metrics, []),
-            'metrics_weak_counts': dict(metrics.get('metrics_weak_counts') or {}),
+            'metric_lines': [], 'metrics_weak_counts': dict(metrics.get('metrics_weak_counts') or {}),
             'close_analysis_json': analysis,
         }
 
-    conf = 0
-    try:
-        conf = int(src.get('confidence') or 0)
-    except Exception:
-        conf = 0
-    rr_val = float(metrics.get('rr') or 0.0)
-    conf_cnt = _loss_diag_count_confirmations(src.get('confirmations') or src.get('source_exchange'))
-    ta_score = _loss_diag_parse_ta_score(src.get('risk_note'), src.get('orig_text'))
-    strength = _loss_diag_parse_strength(src.get('risk_note'), src.get('orig_text'))
-    setup_key = _loss_diag_setup_key_from_row(src)
+    metric_lines = _loss_diag_metric_lines(src, metrics, [])
+    exact_route = _loss_diag_is_exact_smc_route(src)
+    improve_keys = []
+    for item in metric_lines:
+        if 'RR TP2' in item:
+            improve_keys.append('raise_min_rr')
+        elif 'Signal strength' in item or 'TA score' in item:
+            improve_keys.append('raise_min_ta_score')
+        elif 'MACD hist' in item or 'ADX' in item or 'VWAP' in item:
+            improve_keys.append('tighten_trend_alignment')
+        elif 'Vol xAvg' in item:
+            improve_keys.append('tighten_volume_support')
+    if analysis.get('late_entry_inside_expansion') or 'late_entry_inside_expansion' in list(forensic.get('missed_codes') or []):
+        improve_keys.append('avoid_late_entry')
+    if analysis.get('retest_too_deep'):
+        improve_keys.append('tighten_retest_depth')
+    if analysis.get('confirm_too_weak'):
+        improve_keys.append('raise_min_confirm_strength')
+    improve_keys = list(dict.fromkeys(improve_keys))
 
-    weak_keys: list[str] = []
-    improve_keys: list[str] = []
-    min_conf = _loss_diag_env_int('LOSS_DIAG_WEAK_CONFIDENCE_MAX', 80)
-    min_rr = _loss_diag_env_float('LOSS_DIAG_WEAK_RR_MAX', 1.8)
-    min_confirms = _loss_diag_env_int('LOSS_DIAG_MIN_CONFIRMATIONS', 1)
-    min_ta_score = _loss_diag_env_float('LOSS_DIAG_WEAK_TA_SCORE_MAX', 70.0)
-
-    if conf > 0 and conf <= min_conf:
-        weak_keys.append('low_confidence'); improve_keys.append('raise_min_confidence')
-    if rr_val > 0 and rr_val <= min_rr:
-        weak_keys.append('low_rr'); improve_keys.append('raise_min_rr')
-    if conf_cnt and conf_cnt <= min_confirms:
-        weak_keys.append('few_confirmations'); improve_keys.append('require_more_confirmations')
-    if ta_score is not None and ta_score <= min_ta_score:
-        weak_keys.append('low_ta_score'); improve_keys.append('raise_min_ta_score')
-    if strength == 'weak':
-        weak_keys.append('weak_signal_strength'); improve_keys.append('raise_min_ta_score')
-    for item in _loss_diag_ta_filter_keys(src.get('risk_note'), src.get('orig_text'), direction=str(src.get('side') or ''), setup_key=setup_key):
-        weak_keys.append(item)
-
-    if st == 'LOSS' and after_tp1:
-        weak_keys.append('tp1_protection'); improve_keys.append('tighten_tp1_protection')
-    elif st == 'LOSS':
-        if setup_key == 'breakout':
-            weak_keys.append('breakout_retest_weak'); improve_keys.append('tighten_breakout_retest')
-        elif setup_key == 'zone_retest':
-            weak_keys.append('zone_hold_weak'); improve_keys.append('tighten_zone_retest_long' if str(src.get('side') or '').upper().strip() == 'LONG' else 'tighten_zone_retest')
-        elif setup_key == 'origin':
-            weak_keys.append('origin_entry_early'); improve_keys.append('tighten_origin_entry')
-        elif setup_key == 'normal_pending_trigger':
-            weak_keys.append('trigger_reconfirm_weak'); improve_keys.append('tighten_trigger_reconfirm')
-        elif setup_key == 'liquidity_reclaim':
-            weak_keys.append('reclaim_confirmation_weak'); improve_keys.append('tighten_liquidity_reclaim')
-
-    market_u = str(src.get('market') or '').upper().strip()
-    side_u = str(src.get('side') or '').upper().strip()
-    for item in list(weak_keys):
-        improve = _loss_diag_improve_from_weak_filter(item, market=market_u, side=side_u, setup_key=setup_key)
-        if improve:
-            improve_keys.append(improve)
-
-    tags: list[str] = []
-    if st == 'LOSS':
-        if after_tp1:
-            tags.extend(['tp1_no_followthrough', 'tp1_protection_failed'])
-            reason_text = 'После TP1 остаток позиции не получил продолжения. Цена потеряла импульс, не обновила локальный high и вернулась в защитную зону.'
-        else:
-            if setup_key == 'zone_retest':
-                tags.append('zone_retest_failed')
-                reason_text = 'После входа цена не удержала retest-зону. Движение вверх не получило продолжения, 5m-структура быстро ослабла, и сделка была быстро инвалидирована до TP1.'
-            elif setup_key == 'breakout':
-                tags.append('false_breakout_after_entry')
-                reason_text = 'После входа цена быстро вернула пробой и сломала структуру движения. Продолжение по направлению сделки не подтвердилось.'
-            else:
-                reason_text = 'После входа не было нормального продолжения по направлению сделки. Импульс быстро ослаб, и цена ушла против позиции до TP1.'
-            if bool(analysis.get('fast_invalidation')):
-                tags.append('fast_invalidation_after_entry')
-            if str(analysis.get('structure_5m') or '').strip():
-                tags.append('structure_break_against_entry')
-            if str(analysis.get('follow_through') or '') in ('нет', 'слабый'):
-                tags.append('no_followthrough_after_entry')
-    if not tags:
-        tags = ['loss_after_tp1_sl' if after_tp1 and st == 'LOSS' else 'loss_before_tp1_sl' if st == 'LOSS' else 'timeout_closed']
-        reason_text = reason_text or _loss_diag_reason_text(tags[0], fallback_reason)
-
-    weak_keys = list(dict.fromkeys([x for x in weak_keys if x]))
-    improve_keys = list(dict.fromkeys([x for x in improve_keys if x]))
-    improve_note = '; '.join([_loss_diag_improve_label(x) for x in improve_keys])
+    reason_code = str(forensic.get('primary_reason_code') or '').strip()
+    reason_text = str(forensic.get('primary_reason_text') or '').strip() or fallback_reason
+    if st == 'CLOSED' and not reason_code:
+        reason_code = 'timeout_closed'
+        reason_text = fallback_reason
 
     return {
-        'reason_code': ','.join(tags),
-        'reason_text': reason_text or _loss_diag_reason_text(tags[0], fallback_reason),
-        'weak_filter_keys': weak_keys,
-        'weak_filter_labels': [_loss_diag_weak_filter_label(x) for x in weak_keys],
+        'reason_code': reason_code,
+        'reason_text': reason_text,
+        'primary_reason_code': reason_code,
+        'primary_reason_text': reason_text,
+        'scenario_code': str(forensic.get('scenario_code') or '').strip(),
+        'scenario_text': str(forensic.get('scenario_text') or '').strip(),
+        'secondary_reason_codes': list(forensic.get('secondary_reason_codes') or []),
+        'secondary_reason_labels': list(forensic.get('secondary_reason_texts') or []),
+        'missed_codes': list(forensic.get('missed_codes') or []),
+        'missed_labels': list(forensic.get('missed_texts') or []),
+        'what_happened_lines': list(forensic.get('what_happened_lines') or []),
+        'entry_snapshot_present': bool(analysis.get('entry_snapshot_present')),
+        'weak_filter_keys': [],
+        'weak_filter_labels': [],
         'improve_keys': improve_keys,
         'improve_labels': [_loss_diag_improve_label(x) for x in improve_keys],
-        'improve_note': improve_note,
+        'improve_note': '; '.join([_loss_diag_improve_label(x) for x in improve_keys]),
         'analysis_lines': _loss_diag_build_analysis_lines(src, metrics, analysis, after_tp1=after_tp1),
-        'metric_lines': _loss_diag_metric_lines(src, metrics, weak_keys),
+        'metric_lines': metric_lines,
         'metrics_weak_counts': dict(metrics.get('metrics_weak_counts') or {}),
         'close_analysis_json': analysis,
     }
@@ -4248,19 +4824,35 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
     price_block = "\n".join(price_lines).strip() or "—"
 
     setup_block = f"🧭 Smart-setup: {setup_label}\n" if setup_label else ""
-    weak_block = ""
-    improve_block = ""
+    primary_block = ""
+    scenario_block = ""
     analysis_block = ""
+    happened_block = ""
+    secondary_block = ""
+    missed_block = ""
+    improve_block = ""
     if st == 'LOSS':
-        metric_lines = list(loss_diag.get('metric_lines') or [])
         analysis_lines = list(loss_diag.get('analysis_lines') or [])
+        happened_lines = list(loss_diag.get('what_happened_lines') or [])
+        secondary_labels = list(loss_diag.get('secondary_reason_labels') or [])
+        missed_labels = list(loss_diag.get('missed_labels') or [])
         improve_labels = list(loss_diag.get('improve_labels') or [])
+        primary_text = str(loss_diag.get('primary_reason_text') or loss_diag.get('reason_text') or reason).strip()
+        scenario_text = str(loss_diag.get('scenario_text') or '').strip()
+        if primary_text:
+            primary_block = "🧠 Главная причина:\n" + primary_text + "\n\n"
+        if scenario_text:
+            scenario_block = "🎭 Сценарий потери:\n" + scenario_text + "\n\n"
         if analysis_lines:
-            analysis_block = "📉 Candle-анализ:\n" + "\n".join([f"• {x}" for x in analysis_lines if x]) + "\n"
-        if metric_lines:
-            weak_block = "⚠️ Слабые фильтры:\n" + "\n".join([f"• {x}" for x in metric_lines if x]) + "\n"
+            analysis_block = "📉 Candle-анализ:\n" + "\n".join([f"• {x}" for x in analysis_lines if x]) + "\n\n"
+        if happened_lines:
+            happened_block = "📉 Что произошло после входа:\n" + "\n".join([f"• {x}" for x in happened_lines if x]) + "\n\n"
+        if secondary_labels:
+            secondary_block = "🧩 Доп. причины:\n" + "\n".join([f"• {x}" for x in secondary_labels if x]) + "\n\n"
+        if missed_labels:
+            missed_block = "⚠️ Что бот пропустил:\n" + "\n".join([f"• {x}" for x in missed_labels if x]) + "\n\n"
         if improve_labels:
-            improve_block = "🛠 Что улучшить:\n" + "\n".join([f"• {x}" for x in improve_labels if x]) + "\n"
+            improve_block = "🛠 Что улучшить:\n" + "\n".join([f"• {x}" for x in improve_labels if x]) + "\n\n"
 
     return (
         f"{_report_close_emoji(st)} {symbol} | {market} | {side}\n\n"
@@ -4268,9 +4860,12 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
         f"📊 Итог PnL: {_report_pnl_pct(pnl_total_pct)}\n"
         f"📊 Risk/Reward: 1 : {rr}\n"
         f"{setup_block}"
-        f"🧠 Причина:\n{loss_diag.get('reason_text') or reason}\n\n"
+        f"{primary_block if primary_block else '🧠 Причина:\n' + (loss_diag.get('reason_text') or reason) + '\n\n'}"
+        f"{scenario_block}"
         f"{analysis_block}"
-        f"{weak_block}"
+        f"{happened_block}"
+        f"{secondary_block}"
+        f"{missed_block}"
         f"{improve_block}"
         f"──────────────\n\n"
         f"{price_block}\n\n"
@@ -4549,13 +5144,35 @@ def _daily_report_reason_label(code: str, text_value: str = '') -> str:
             'loss_after_tp1_sl': 'stop_after_tp1',
             'loss_sl': 'stop_loss',
             'timeout_closed': 'timeout_closed',
-            'zone_retest_failed': 'zone_retest_failed',
-            'fast_invalidation_after_entry': 'fast_invalidation_after_entry',
-            'tp1_no_followthrough': 'tp1_no_followthrough',
-            'tp1_protection_failed': 'tp1_protection_failed',
-            'structure_break_against_entry': 'structure_break_against_entry',
-            'no_followthrough_after_entry': 'no_followthrough_after_entry',
-            'false_breakout_after_entry': 'false_breakout_after_entry',
+            'zone_retest_failed': 'retest-зона не удержалась',
+            'fast_invalidation_after_entry': 'быстрая инвалидация после входа',
+            'tp1_no_followthrough': 'после TP1 не было продолжения',
+            'tp1_protection_failed': 'после TP1 защита не удержала остаток',
+            'structure_break_against_entry': 'структура сломалась против входа',
+            'no_followthrough_after_entry': 'после входа не было continuation',
+            'false_breakout_after_entry': 'ложный breakout после входа',
+            'vwap_lost_after_entry': 'после входа потерян VWAP',
+            'ob_fvg_zone_lost': 'OB+FVG зона не удержалась',
+            'ob_fvg_structure_failed': 'OB+FVG сломался по структуре',
+            'ob_fvg_no_followthrough': 'OB+FVG не дал continuation',
+            'htf_ob_ltf_retest_failed': 'HTF OB + LTF FVG retest не удержался',
+            'htf_ob_ltf_fast_invalidation': 'HTF OB + LTF FVG быстро инвалидирован',
+            'htf_ob_ltf_no_followthrough': 'HTF OB + LTF FVG не дал continuation',
+            'bos_retest_failed': 'BOS retest confirm сломался',
+            'bos_retest_no_followthrough': 'BOS retest confirm не дал continuation',
+            'displacement_origin_fast_fail': 'displacement origin быстро сломался',
+            'displacement_origin_no_followthrough': 'displacement origin не дал continuation',
+            'dual_fvg_origin_fast_fail': 'dual/stacked FVG origin быстро сломался',
+            'dual_fvg_origin_no_followthrough': 'dual/stacked FVG origin не дал continuation',
+            'liquidity_reclaim_not_held': 'liquidity reclaim не удержался',
+            'liquidity_reclaim_fast_fail': 'liquidity reclaim быстро сломался',
+            'liquidity_reclaim_no_followthrough': 'liquidity reclaim не дал continuation',
+            'tp1_ob_fvg_no_followthrough': 'после TP1 OB+FVG не дал продолжения',
+            'tp1_htf_ob_ltf_no_followthrough': 'после TP1 HTF OB + LTF FVG не дал продолжения',
+            'tp1_bos_retest_no_followthrough': 'после TP1 BOS retest не дал продолжения',
+            'tp1_displacement_origin_no_followthrough': 'после TP1 displacement origin не дал продолжения',
+            'tp1_dual_fvg_origin_no_followthrough': 'после TP1 dual/stacked FVG origin не дал продолжения',
+            'tp1_liquidity_reclaim_no_followthrough': 'после TP1 liquidity reclaim не дал продолжения',
         }
         return mapping.get(raw, raw)
     txt = str(text_value or '').strip()
@@ -4566,7 +5183,7 @@ def _daily_report_reason_codes(row: dict) -> list[str]:
     raw = str((row or {}).get('close_reason_code') or '').strip()
     out = [x.strip() for x in re.split(r'[,;|]+', raw) if x.strip()]
     if out:
-        return [_daily_report_reason_label(x) for x in out]
+        return [_daily_report_reason_label(out[0])]
     txt = str((row or {}).get('close_reason_text') or '').strip()
     return [txt] if txt else []
 
@@ -5791,6 +6408,10 @@ async def broadcast_signal(sig: Signal) -> None:
         except Exception:
             pass
         try:
+            _track_kwargs['entry_snapshot_json'] = _signal_forensics_entry_snapshot(sig)
+        except Exception:
+            pass
+        try:
             await db_store.upsert_signal_track(**_track_kwargs)
         except TypeError:
             _track_kwargs.pop('orig_text', None)
@@ -5804,6 +6425,7 @@ async def broadcast_signal(sig: Signal) -> None:
             _track_kwargs.pop('confirmations', None)
             _track_kwargs.pop('source_exchange', None)
             _track_kwargs.pop('risk_note', None)
+            _track_kwargs.pop('entry_snapshot_json', None)
             await db_store.upsert_signal_track(**_track_kwargs)
     except Exception:
         pass
