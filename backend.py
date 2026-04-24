@@ -327,8 +327,8 @@ if _TEST_MODE and _TEST_MODE_SCOPE in ("MID","ALL"):
         "MID_MIN_CONFIDENCE": "90",
         "MID_MIN_VOL_X": "0",
         # --- MID regime / filters ---
-        "MID_NEWS_FILTER": "1",
-        "MID_MACRO_FILTER": "1",
+        "MID_NEWS_FILTER": "0",
+        "MID_MACRO_FILTER": "0",
         "MID_RANGE_POS_FILTER": "0",
         "MID_TOP_FILTERS": "0",
         "MID_TRAP_FILTERS": "1",
@@ -4160,10 +4160,14 @@ async def _okx_public_price(symbol: str, *, market_type: str = "spot") -> float:
     return 0.0
 
 async def _mexc_public_price(symbol: str) -> float:
+    if not EXCHANGE_MEXC_ENABLED:
+        return 0.0
     data = await _http_json("GET", "https://api.mexc.com/api/v3/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
     return float(data.get("price") or 0.0)
 
 async def _gateio_public_price(symbol: str) -> float:
+    if not EXCHANGE_GATEIO_ENABLED:
+        return 0.0
     pair = _gate_pair(symbol)
     data = await _http_json("GET", "https://api.gateio.ws/api/v4/spot/tickers", params={"currency_pair": pair}, timeout_s=8)
     if isinstance(data, list) and data and isinstance(data[0], dict):
@@ -4253,6 +4257,8 @@ def _mexc_contract_symbol(symbol: str) -> str:
     return s.replace("-", "_")
 
 async def _mexc_futures_price(symbol: str) -> float:
+    if not EXCHANGE_MEXC_ENABLED:
+        return 0.0
     # MEXC Contract (Perpetual) public ticker
     # Endpoint is best-effort and parsed defensively.
     sym = _mexc_contract_symbol(symbol)
@@ -4284,6 +4290,8 @@ def _gateio_futures_contract(symbol: str) -> str:
     return s.replace("-", "_")
 
 async def _gateio_futures_price(symbol: str) -> float:
+    if not EXCHANGE_GATEIO_ENABLED:
+        return 0.0
     contract = _gateio_futures_contract(symbol)
     data = await _http_json("GET", "https://api.gateio.ws/api/v4/futures/usdt/tickers", params={"contract": contract}, timeout_s=8)
     # Response is list[dict] usually
@@ -4316,6 +4324,10 @@ async def validate_autotrade_keys(
     mt = (market_type or "spot").lower().strip()
     if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
         return {"ok": False, "read_ok": False, "trade_ok": False, "error": "unsupported_exchange"}
+    if ex == "mexc" and not EXCHANGE_MEXC_ENABLED:
+        return {"ok": False, "read_ok": False, "trade_ok": False, "error": "mexc_disabled"}
+    if ex == "gateio" and not EXCHANGE_GATEIO_ENABLED:
+        return {"ok": False, "read_ok": False, "trade_ok": False, "error": "gateio_disabled"}
     if mt not in ("spot", "futures"):
         mt = "spot"
 
@@ -4627,6 +4639,8 @@ async def _okx_instrument_filters(*, inst_type: str, symbol: str) -> tuple[float
 
 _MEXC_FILTER_CACHE: dict[str, dict] = {}
 async def _mexc_symbol_filters(symbol: str) -> tuple[float, float, float, float]:
+    if not EXCHANGE_MEXC_ENABLED:
+        return 0.0, 0.0, 0.0, 0.0
     """Return (qty_step, min_qty, tick_size, min_notional) for MEXC spot symbol (best-effort)."""
     sym = symbol.upper()
     cached = _MEXC_FILTER_CACHE.get(sym)
@@ -4674,6 +4688,8 @@ async def _mexc_symbol_filters(symbol: str) -> tuple[float, float, float, float]
 
 _GATE_FILTER_CACHE: dict[str, dict] = {}
 async def _gate_symbol_filters(symbol: str) -> tuple[float, float, float, float]:
+    if not EXCHANGE_GATEIO_ENABLED:
+        return 0.0, 0.0, 0.0, 0.0
     """Return (qty_step, min_qty, tick, min_notional) for Gate.io spot symbol (best-effort)."""
     pair = _gate_pair(symbol)
     cached = _GATE_FILTER_CACHE.get(pair)
@@ -12264,6 +12280,20 @@ NEWS_ACTION = os.getenv("NEWS_ACTION", "FUTURES_OFF").strip().upper()  # FUTURES
 
 # Macro filter
 MACRO_FILTER = _env_bool("MACRO_FILTER", False)
+
+# Railway cost control: disable expensive secondary public sources by default.
+EXCHANGE_MEXC_ENABLED = _env_bool("EXCHANGE_MEXC_ENABLED", False)
+EXCHANGE_GATEIO_ENABLED = _env_bool("EXCHANGE_GATEIO_ENABLED", False)
+DISABLED_SECONDARY_EXCHANGES = {ex for ex, enabled in (("MEXC", EXCHANGE_MEXC_ENABLED), ("GATEIO", EXCHANGE_GATEIO_ENABLED)) if not enabled}
+
+def _filter_disabled_exchanges(exchanges):
+    out = []
+    for x in exchanges or []:
+        ux = str(x).strip().upper()
+        if not ux or ux in DISABLED_SECONDARY_EXCHANGES:
+            continue
+        out.append(ux)
+    return out
 
 # Orderbook filter (optional)
 ORDERBOOK_FILTER = _env_bool("ORDERBOOK_FILTER", False)
@@ -22834,10 +22864,10 @@ class Backend:
                                 return name, None
 
                         # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
-                        _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
-                        scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
+                        _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX') or '').strip()
+                        scan_exchanges = _filter_disabled_exchanges([x.strip().upper() for x in _scan_ex.split(',') if x.strip()])
                         if not scan_exchanges:
-                            scan_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
+                            scan_exchanges = ['BINANCE','BYBIT','OKX']
 
                         # --- Choose best exchange candidate (MAIN scanner) ---
                         results = await asyncio.gather(*[fetch_exchange(x) for x in scan_exchanges])
@@ -28862,10 +28892,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
 
             # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
             # NOTE: MID candles routing can restrict this universe further via MID_CANDLES_SOURCES / MID_ENABLE_SECONDARY_EXCHANGES
-            _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
-            scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
+            _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX') or '').strip()
+            scan_exchanges = _filter_disabled_exchanges([x.strip().upper() for x in _scan_ex.split(',') if x.strip()])
             if not scan_exchanges:
-                scan_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
+                scan_exchanges = ['BINANCE','BYBIT','OKX']
 
             # MID candle sources preference.
             # If MID_CANDLES_SOURCES is not provided, we default to the same universe as SCANNER_EXCHANGES
@@ -28873,17 +28903,17 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
             # Secondary exchanges (GATEIO/MEXC) are still gated by MID_ENABLE_SECONDARY_EXCHANGES.
             _mid_sources_env = (os.getenv('MID_CANDLES_SOURCES', '') or '').strip()
             _mid_sources = _mid_sources_env if _mid_sources_env else ','.join(scan_exchanges)
-            mid_candles_sources = [x.strip().upper() for x in _mid_sources.split(',') if x.strip()]
+            mid_candles_sources = _filter_disabled_exchanges([x.strip().upper() for x in _mid_sources.split(',') if x.strip()])
             if not mid_candles_sources:
                 mid_candles_sources = list(scan_exchanges)
 
             # --- MID candles sources (Variant A: multi-exchange) ---
             # We allow pulling candles from all supported adapters, and decide per-symbol dynamically.
             # This is required for tokens that exist on GateIO/MEXC but not on Binance.
-            allowed_candle_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
+            allowed_candle_exchanges = _filter_disabled_exchanges(['BINANCE','BYBIT','OKX','MEXC','GATEIO']) or ['BINANCE','BYBIT','OKX']
 
             mid_force_all = (os.getenv('MID_CANDLES_ALL_EXCHANGES', '1') or '1').strip().lower() in ('1','true','yes','on')
-            enable_secondary = (os.getenv('MID_ENABLE_SECONDARY_EXCHANGES','1') or '1').strip().lower() in ('1','true','yes','on')
+            enable_secondary = (os.getenv('MID_ENABLE_SECONDARY_EXCHANGES','0') or '0').strip().lower() in ('1','true','yes','on')
 
             if mid_force_all:
                 # Don't require candles sources to be present in SCANNER_EXCHANGES:
