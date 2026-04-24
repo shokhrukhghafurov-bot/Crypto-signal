@@ -2477,7 +2477,8 @@ async def _refresh_autotrade_bot_global_once() -> None:
 async def _autotrade_bot_global_loop() -> None:
     """Background loop that refreshes global auto-trade pause/maintenance flags."""
     tick = 0
-    logger.info("[autotrade-global] loop started interval=5s"); _health_mark_ok("autotrade-global")
+    interval_sec = max(10.0, float(os.getenv("AUTOTRADE_GLOBAL_REFRESH_SEC", "60") or 60))
+    logger.info("[autotrade-global] loop started interval=%ss", interval_sec); _health_mark_ok("autotrade-global")
     while True:
         tick += 1
         try:
@@ -2485,7 +2486,7 @@ async def _autotrade_bot_global_loop() -> None:
         except Exception:
             # keep loop alive
             logger.exception("[autotrade-global] refresh failed tick=%s", tick); _health_mark_err("autotrade-global", "refresh_failed")
-        await asyncio.sleep(5)
+        await asyncio.sleep(interval_sec)
 
 
 def _autotrade_gate_text(uid: int) -> Optional[str]:
@@ -9050,19 +9051,7 @@ async def _fetch_gateio_price(symbol: str) -> float:
 def _parse_price_order(env_name: str, default: str) -> list[str]:
     raw = (os.getenv(env_name, default) or default).strip()
     parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
-    parts = parts or [p.strip().lower() for p in default.split(",") if p.strip()]
-
-    # Railway cost control: do not call MEXC/Gate.io unless explicitly enabled.
-    mexc_on = (os.getenv("EXCHANGE_MEXC_ENABLED", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
-    gate_on = (os.getenv("EXCHANGE_GATEIO_ENABLED", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
-    filtered = []
-    for src in parts:
-        if src == "mexc" and not mexc_on:
-            continue
-        if src in ("gate", "gateio") and not gate_on:
-            continue
-        filtered.append(src)
-    return filtered or ["binance", "bybit", "okx"]
+    return parts or [p.strip().lower() for p in default.split(",") if p.strip()]
 
 
 async def _fetch_signal_price(symbol: str, *, market: str) -> tuple[float, str]:
@@ -9143,7 +9132,7 @@ async def _fetch_signal_price(symbol: str, *, market: str) -> tuple[float, str]:
         return 0.0, ""
 
     # SPOT
-    order = _parse_price_order("SIG_PRICE_ORDER_SPOT", "binance,bybit,okx")
+    order = _parse_price_order("SIG_PRICE_ORDER_SPOT", "binance,bybit,okx,mexc,gateio")
     for src in order:
         if src == "binance":
             px = await _safe(_fetch_binance_price(sym, futures=False))
@@ -10032,6 +10021,18 @@ async def main() -> None:
             if not _check_basic(request):
                 return _unauthorized()
 
+            cache_ttl = float(os.getenv("ADMIN_STATS_CACHE_TTL_SEC", "30") or 30)
+            cache_key = "signal_stats"
+            try:
+                now_cache = time.time()
+                cache = getattr(signal_stats, "_cache", {})
+                if cache_ttl > 0 and cache_key in cache:
+                    ts_cached, data_cached = cache[cache_key]
+                    if (now_cache - float(ts_cached)) < cache_ttl:
+                        return web.json_response(data_cached)
+            except Exception:
+                cache = {}
+
             # IMPORTANT:
             # Dashboard numbers must match Moscow time (TZ_NAME/TZ).
             # Use *calendar* ranges in TZ (Europe/Moscow by default):
@@ -10131,12 +10132,19 @@ async def main() -> None:
                 pass
 
 
-            return web.json_response({
+            data = {
                 "ok": True,
                 "signals": signals,
                 "closed": closed,
                 "perf": perf,
-            })
+            }
+            try:
+                cache = getattr(signal_stats, "_cache", {})
+                cache[cache_key] = (time.time(), data)
+                setattr(signal_stats, "_cache", cache)
+            except Exception:
+                pass
+            return web.json_response(data)
 
         async def _apply_signal_user_update(tid: int, data: dict) -> None:
             data = data or {}
@@ -11059,15 +11067,18 @@ async def main() -> None:
             TASKS["db-retention"] = asyncio.create_task(_db_retention_cleanup_loop(), name="db-retention")
             _attach_task_monitor("db-retention", TASKS["db-retention"])
 
+            main_scanner_enabled = os.getenv("MAIN_SCANNER_ENABLED", os.getenv("SCANNER_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
+            main_top_n = os.getenv("MAIN_TOP_N", os.getenv("TOP_N", ""))
             logger.info(
-                "Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s",
+                "Starting scanner_loop check enabled=%s interval=%ss top_n=%s",
+                main_scanner_enabled,
                 os.getenv("SCAN_INTERVAL_SECONDS", ""),
-                os.getenv("TOP_N", ""),
+                main_top_n,
             )
 
             # Some deployments (MID-only builds) intentionally don't ship the legacy scanner_loop.
             # Guard this call to avoid crashing the whole process.
-            if hasattr(backend, "scanner_loop"):
+            if main_scanner_enabled and hasattr(backend, "scanner_loop"):
                 try:
                     TASKS["scanner"] = asyncio.create_task(
                         backend.scanner_loop(broadcast_signal, broadcast_macro_alert),
@@ -11077,6 +11088,8 @@ async def main() -> None:
                     _attach_task_monitor("scanner", TASKS["scanner"])
                 except Exception:
                     logger.exception("Failed to start scanner_loop")
+            elif not main_scanner_enabled:
+                logger.info("MAIN_SCANNER_ENABLED=0 -> legacy main scanner disabled")
             else:
                 logger.warning(
                     "Backend has no scanner_loop; skipping (MID scanner runs via scanner_loop_mid)"
@@ -11091,24 +11104,29 @@ async def main() -> None:
             TASKS["daily-signal-report"] = asyncio.create_task(daily_signal_report_loop(), name="daily-signal-report")
             _attach_task_monitor("daily-signal-report", TASKS["daily-signal-report"])
 
-        # Auto-trade manager can run on all replicas (cluster-safe via DB lease/locks)
-        TASKS["autotrade-manager"] = asyncio.create_task(
-            autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend),
-            name="autotrade-manager",
-        )
-        _health_mark_ok("autotrade-manager")
-        _attach_task_monitor("autotrade-manager", TASKS["autotrade-manager"])
-        TASKS["autotrade-manager-heartbeat"] = asyncio.create_task(
-            _task_heartbeat_loop("autotrade-manager", interval_sec=5.0),
-            name="autotrade-manager-heartbeat",
-        )
+        # Auto-trade manager: available, but low-load. It sleeps long when there are no open positions.
+        autotrade_mgr_enabled = os.getenv("AUTOTRADE_MANAGER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+        if autotrade_mgr_enabled:
+            TASKS["autotrade-manager"] = asyncio.create_task(
+                autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend),
+                name="autotrade-manager",
+            )
+            _health_mark_ok("autotrade-manager")
+            _attach_task_monitor("autotrade-manager", TASKS["autotrade-manager"])
+            TASKS["autotrade-manager-heartbeat"] = asyncio.create_task(
+                _task_heartbeat_loop("autotrade-manager", interval_sec=float(os.getenv("AUTOTRADE_MANAGER_HEARTBEAT_SEC", "60") or 60)),
+                name="autotrade-manager-heartbeat",
+            )
+        else:
+            logger.info("AUTOTRADE_MANAGER_ENABLED=0 -> autotrade manager disabled")
 
-        TASKS["autotrade-anomaly-watchdog"] = asyncio.create_task(
-            autotrade_anomaly_watchdog_loop(notify_api_error=_notify_autotrade_api_error),
-            name="autotrade-anomaly-watchdog",
-        )
-        _health_mark_ok("autotrade-anomaly-watchdog")
-        _attach_task_monitor("autotrade-anomaly-watchdog", TASKS["autotrade-anomaly-watchdog"])
+        if os.getenv("AUTOTRADE_DIAG_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on"):
+            TASKS["autotrade-anomaly-watchdog"] = asyncio.create_task(
+                autotrade_anomaly_watchdog_loop(notify_api_error=_notify_autotrade_api_error),
+                name="autotrade-anomaly-watchdog",
+            )
+            _health_mark_ok("autotrade-anomaly-watchdog")
+            _attach_task_monitor("autotrade-anomaly-watchdog", TASKS["autotrade-anomaly-watchdog"])
 
         TASKS["health-status"] = asyncio.create_task(_health_status_loop(), name="health-status")
         _attach_task_monitor("health-status", TASKS["health-status"])
@@ -11124,10 +11142,12 @@ async def main() -> None:
             "Another instance holds the Telegram polling lock; this replica will run ONLY autotrade manager + HTTP (no polling/scanner)."
         )
         try:
-            TASKS["autotrade-manager"] = asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend), name="autotrade-manager")
-            _health_mark_ok("autotrade-manager")
-            TASKS["autotrade-anomaly-watchdog"] = asyncio.create_task(autotrade_anomaly_watchdog_loop(notify_api_error=_notify_autotrade_api_error), name="autotrade-anomaly-watchdog")
-            _health_mark_ok("autotrade-anomaly-watchdog")
+            if os.getenv("AUTOTRADE_MANAGER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off"):
+                TASKS["autotrade-manager"] = asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend), name="autotrade-manager")
+                _health_mark_ok("autotrade-manager")
+            if os.getenv("AUTOTRADE_DIAG_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on"):
+                TASKS["autotrade-anomaly-watchdog"] = asyncio.create_task(autotrade_anomaly_watchdog_loop(notify_api_error=_notify_autotrade_api_error), name="autotrade-anomaly-watchdog")
+                _health_mark_ok("autotrade-anomaly-watchdog")
         except Exception:
             pass
         await asyncio.Event().wait()
@@ -11137,8 +11157,13 @@ async def main() -> None:
         logger.warning("Backend has no track_loop; skipping")
     TASKS["db-retention"] = asyncio.create_task(_db_retention_cleanup_loop(), name="db-retention")
     _attach_task_monitor("db-retention", TASKS["db-retention"])
-    logger.info("Starting scanner_loop (15m/1h/4h) interval=%ss top_n=%s", os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('TOP_N',''))
-    asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert))
+    main_scanner_enabled = os.getenv("MAIN_SCANNER_ENABLED", os.getenv("SCANNER_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
+    logger.info("Starting scanner_loop check enabled=%s interval=%ss top_n=%s", main_scanner_enabled, os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('MAIN_TOP_N', os.getenv('TOP_N','')))
+    if main_scanner_enabled and hasattr(backend, "scanner_loop"):
+        TASKS["scanner"] = asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert), name="scanner")
+        _attach_task_monitor("scanner", TASKS["scanner"])
+    else:
+        logger.info("MAIN_SCANNER_ENABLED=0 or scanner_loop missing -> legacy main scanner disabled")
 
     # ⚡ MID TREND scanner + MID trap digest
     _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
@@ -11150,8 +11175,11 @@ async def main() -> None:
     _attach_task_monitor("daily-signal-report", TASKS["daily-signal-report"])
 
     # Auto-trade manager (SL/TP/BE) - runs in background.
-    asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend))
-    asyncio.create_task(autotrade_anomaly_watchdog_loop(notify_api_error=_notify_autotrade_api_error))
+    if os.getenv("AUTOTRADE_MANAGER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off"):
+        TASKS["autotrade-manager"] = asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend), name="autotrade-manager")
+        _attach_task_monitor("autotrade-manager", TASKS["autotrade-manager"])
+    if os.getenv("AUTOTRADE_DIAG_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on"):
+        TASKS["autotrade-anomaly-watchdog"] = asyncio.create_task(autotrade_anomaly_watchdog_loop(notify_api_error=_notify_autotrade_api_error), name="autotrade-anomaly-watchdog")
     await dp.start_polling(bot)
 
 
