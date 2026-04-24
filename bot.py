@@ -3776,7 +3776,7 @@ def _loss_diag_improve_label(key: str) -> str:
         'tighten_retest_depth': 'жёстче фильтровать слишком глубокий retest',
         'raise_min_confirm_strength': 'поднять минимум силы confirm-candle перед входом',
         'avoid_overhead_supply': 'не брать LONG прямо под supply / Strong High',
-        'avoid_support_short': 'не брать SHORT прямо над support / Weak Low',
+        'avoid_support_short': 'не шортить прямо в strong low / demand',
         'require_clean_space_to_tp': 'требовать чистое пространство до TP1/TP2',
     }
     return mapping.get(str(key or '').strip(), str(key or '').strip())
@@ -3842,8 +3842,10 @@ def _loss_diag_reason_human_label(code: str) -> str:
         'reclaim_without_acceptance': 'Reclaim had no acceptance',
         'origin_impulse_not_clean': 'Origin impulse was not clean',
         'entry_into_overhead_supply': 'Entry into overhead supply',
-        'long_below_strong_high': 'Long directly below Strong High / liquidity',
-        'short_above_weak_low': 'Short directly above Weak Low / liquidity',
+        'long_below_strong_high': 'Long entered directly into supply / Strong High',
+        'short_above_weak_low': 'Short entered directly into demand / Strong Low',
+        'short_into_demand_scenario': 'Late SHORT into buyer zone',
+        'long_into_supply_scenario': 'Late LONG into seller zone',
         'entry_in_range_premium': 'Entry in bad range location',
         'late_entry_after_exhausted_move': 'Late entry after exhausted move',
         'no_clean_retest_acceptance': 'No clean retest acceptance',
@@ -3883,13 +3885,64 @@ def _loss_diag_format_reason_text(code: str, fallback: str = '') -> str:
         'failed_reclaim_hold': 'Failed reclaim hold: reclaim был показан, но рынок не смог закрепиться по правильную сторону уровня.',
         'breakout_trap': 'Breakout trap: пробой быстро вернулся обратно за уровень, поэтому continuation оказался ложным.',
         'entry_into_overhead_supply': 'Entry into overhead supply: LONG был открыт прямо под зоной продавца / red FVG / supply. Сверху не было чистого пространства до TP, поэтому цена быстро получила sell pressure и ушла к SL.',
-        'long_below_strong_high': 'Long directly below Strong High / liquidity: вход LONG был сделан под сильным high/ликвидностью. Покупка пришлась в место, где продавец чаще защищает уровень, поэтому continuation был маловероятен.',
-        'short_above_weak_low': 'Short directly above Weak Low / liquidity: вход SHORT был сделан прямо над слабым low/ликвидностью. Продавать в такую поддержку опасно — снизу не было чистого пространства для continuation.',
+        'long_below_strong_high': 'Long entered directly into supply: LONG был открыт слишком высоко, прямо под seller zone / Strong High. Цена уже находилась в зоне реакции продавцов, поэтому upside был ограничен, а вероятность rejection вниз была высокой.',
+        'short_above_weak_low': 'Short entered directly into demand: SHORT был открыт слишком низко, прямо над buyer zone / Strong Low. Цена уже находилась в зоне реакции покупателей, поэтому downside был ограничен, а вероятность bounce вверх была высокой.',
+        'short_into_demand_scenario': 'SHORT был открыт слишком низко, прямо над buyer zone и Strong/Weak Low. Цена уже находилась в зоне реакции покупателей, поэтому downside был ограничен, а вероятность bounce вверх была высокой.',
+        'long_into_supply_scenario': 'LONG был открыт слишком высоко, прямо под seller zone и Strong High. Цена уже находилась в зоне реакции продавцов, поэтому upside был ограничен, а вероятность rejection вниз была высокой.',
         'entry_in_range_premium': 'Entry in bad range location: вход был в плохой части range — слишком близко к противоположной ликвидности/стене, а не от дисконта/премиума с запасом хода.',
         'late_entry_after_exhausted_move': 'Late entry after exhausted move: вход был поздний — основное движение уже прошло, retest был несвежий, нового displacement перед входом не было.',
         'no_clean_retest_acceptance': 'No clean retest acceptance: формальный retest был, но цена не закрепилась по правильную сторону зоны/уровня и не показала acceptance перед continuation.',
     }
     return mapping.get(str(code or '').strip(), fallback or _loss_diag_reason_human_label(code))
+
+
+def _loss_diag_chart_visible_lines(analysis: dict, side: str) -> list[str]:
+    """Human chart facts for LOSS report. These lines explain what was visible on the chart at entry."""
+    side_u = str(side or '').upper().strip()
+    lines: list[str] = []
+    if side_u == 'SHORT' and bool(analysis.get('short_above_weak_low')):
+        lines.extend([
+            'SHORT открыт почти прямо над buyer zone / green FVG / Strong Low',
+            'снизу уже была зона реакции покупателей',
+            'downside для SHORT был маленький',
+            'цена уже пришла в discount area',
+            'sell continuation был поздний',
+            'вход сделан слишком низко в range',
+        ])
+        try:
+            cs = float(analysis.get('clean_space_to_tp1_pct') or 0.0)
+            if cs > 0 and cs <= 0.45:
+                lines.append('чистого пространства до TP1 почти не было')
+        except Exception:
+            pass
+    elif side_u == 'LONG' and bool(analysis.get('long_below_strong_high')):
+        lines.extend([
+            'LONG открыт почти прямо под seller zone / red FVG / Strong High',
+            'сверху уже была зона реакции продавцов',
+            'upside для LONG был маленький',
+            'цена уже пришла в premium area',
+            'buy continuation был поздний',
+            'вход сделан слишком высоко в range',
+        ])
+        try:
+            cs = float(analysis.get('clean_space_to_tp1_pct') or 0.0)
+            if cs > 0 and cs <= 0.45:
+                lines.append('чистого пространства до TP1 почти не было')
+        except Exception:
+            pass
+    elif bool(analysis.get('late_entry_after_exhausted_move')):
+        lines.extend([
+            'вход произошёл после уже отработанного импульса',
+            'нового fresh displacement перед входом не было',
+            'сделка была открыта поздно внутри уже идущего движения',
+        ])
+    elif bool(analysis.get('entry_in_range_premium')):
+        lines.extend([
+            'вход был в плохой части range',
+            'до противоположной liquidity/зоны оставалось мало места',
+            'RR location был слабый',
+        ])
+    return list(dict.fromkeys([x for x in lines if x]))
 
 
 def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_tp1: bool, st: str) -> dict:
@@ -3927,6 +3980,7 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
     secondary = []
     missed = []
     happened = []
+    chart_visible = _loss_diag_chart_visible_lines(analysis, side)
 
     if immediate:
         secondary.append('immediate_invalidation')
@@ -4063,13 +4117,30 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
         scenario = 'weak_reaction_then_fade' if weak_follow else ''
 
     # Highest priority: explain WHY the entry itself was bad on the chart, not only what happened after entry.
-    if entry_overhead:
-        if side == 'LONG' and long_below_high:
-            primary = 'long_below_strong_high'
-        elif side == 'SHORT' and short_above_low:
-            primary = 'short_above_weak_low'
-        else:
-            primary = 'entry_into_overhead_supply'
+    if side == 'SHORT' and (short_above_low or (entry_overhead and bad_range_location)):
+        primary = 'short_above_weak_low'
+        scenario = 'short_into_demand_scenario'
+        missed.append('require_clean_space_to_tp')
+        happened = [
+            'цена не смогла продолжить sell-side движение',
+            'buyer zone сразу начала удерживать цену',
+            'продавец не получил displacement вниз',
+            'произошёл bounce против позиции',
+        ] + happened
+        secondary.extend(['late_entry_after_exhausted_move', 'weak_followthrough', 'no_post_entry_expansion', 'tp1_never_threatened'])
+    elif side == 'LONG' and (long_below_high or entry_overhead):
+        primary = 'long_below_strong_high'
+        scenario = 'long_into_supply_scenario'
+        missed.append('require_clean_space_to_tp')
+        happened = [
+            'цена не смогла продолжить buy-side движение',
+            'seller zone сразу начала удерживать цену',
+            'покупатель не получил displacement вверх',
+            'произошёл rejection против позиции',
+        ] + happened
+        secondary.extend(['late_entry_after_exhausted_move', 'weak_followthrough', 'no_post_entry_expansion', 'tp1_never_threatened'])
+    elif entry_overhead:
+        primary = 'entry_into_overhead_supply'
         scenario = 'entry_into_overhead_supply'
         missed.append('require_clean_space_to_tp')
     elif late_exhausted:
@@ -4103,6 +4174,7 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
         'missed_codes': missed,
         'missed_texts': [_loss_diag_reason_human_label(x) for x in missed],
         'what_happened_lines': happened,
+        'chart_visible_lines': chart_visible,
     }
 
 
@@ -4634,7 +4706,7 @@ def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str, clo
             'scenario_code': '', 'scenario_text': '',
             'secondary_reason_codes': [], 'secondary_reason_labels': [],
             'missed_codes': [], 'missed_labels': [],
-            'what_happened_lines': [],
+            'what_happened_lines': [], 'chart_visible_lines': [],
             'weak_filter_keys': [], 'weak_filter_labels': [],
             'improve_keys': [], 'improve_labels': [], 'improve_note': '',
             'analysis_lines': _loss_diag_build_analysis_lines(src, metrics, analysis, after_tp1=after_tp1),
@@ -4661,6 +4733,7 @@ def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str, clo
         improve_keys.append('require_clean_space_to_tp')
     if analysis.get('short_above_weak_low'):
         improve_keys.append('avoid_support_short')
+        improve_keys.append('avoid_late_entry')
         improve_keys.append('require_clean_space_to_tp')
     if analysis.get('retest_too_deep'):
         improve_keys.append('tighten_retest_depth')
@@ -4686,6 +4759,7 @@ def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str, clo
         'missed_codes': list(forensic.get('missed_codes') or []),
         'missed_labels': list(forensic.get('missed_texts') or []),
         'what_happened_lines': list(forensic.get('what_happened_lines') or []),
+        'chart_visible_lines': list(forensic.get('chart_visible_lines') or []),
         'entry_snapshot_present': bool(analysis.get('entry_snapshot_present')),
         'weak_filter_keys': [],
         'weak_filter_labels': [],
@@ -4924,12 +4998,14 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
     scenario_block = ""
     analysis_block = ""
     happened_block = ""
+    visible_block = ""
     secondary_block = ""
     missed_block = ""
     improve_block = ""
     if st == 'LOSS':
         analysis_lines = list(loss_diag.get('analysis_lines') or [])
         happened_lines = list(loss_diag.get('what_happened_lines') or [])
+        visible_lines = list(loss_diag.get('chart_visible_lines') or [])
         secondary_labels = list(loss_diag.get('secondary_reason_labels') or [])
         missed_labels = list(loss_diag.get('missed_labels') or [])
         improve_labels = list(loss_diag.get('improve_labels') or [])
@@ -4943,6 +5019,8 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
             analysis_block = "📉 Candle-анализ:\n" + "\n".join([f"• {x}" for x in analysis_lines if x]) + "\n\n"
         if happened_lines:
             happened_block = "📉 Что произошло после входа:\n" + "\n".join([f"• {x}" for x in happened_lines if x]) + "\n\n"
+        if visible_lines:
+            visible_block = "👁 Что видно на графике:\n" + "\n".join([f"• {x}" for x in visible_lines if x]) + "\n\n"
         if secondary_labels:
             secondary_block = "🧩 Доп. причины:\n" + "\n".join([f"• {x}" for x in secondary_labels if x]) + "\n\n"
         if missed_labels:
@@ -4964,6 +5042,7 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
         f"{scenario_block}"
         f"{analysis_block}"
         f"{happened_block}"
+        f"{visible_block}"
         f"{secondary_block}"
         f"{missed_block}"
         f"{improve_block}"
