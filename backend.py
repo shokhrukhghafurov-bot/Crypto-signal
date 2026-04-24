@@ -49,6 +49,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     v = str(v).strip().lower()
     return v not in ("0", "false", "no", "off", "")
 
+
+def _exchange_enabled(ex: str) -> bool:
+    """Runtime kill-switch for exchange calls. Default: enabled."""
+    exn = (ex or "").strip().lower().replace(".", "")
+    aliases = {"gate": "gateio", "gateio": "gateio", "gateiows": "gateio", "mexc": "mexc", "binance": "binance", "bybit": "bybit", "okx": "okx"}
+    key = aliases.get(exn, exn).upper()
+    return True if not key else _env_bool(f"EXCHANGE_{key}_ENABLED", True)
+
 def _trap_log_enabled() -> bool:
     """Allow disabling noisy [mid][trap] logs without changing trap logic.
 
@@ -327,8 +335,8 @@ if _TEST_MODE and _TEST_MODE_SCOPE in ("MID","ALL"):
         "MID_MIN_CONFIDENCE": "90",
         "MID_MIN_VOL_X": "0",
         # --- MID regime / filters ---
-        "MID_NEWS_FILTER": "0",
-        "MID_MACRO_FILTER": "0",
+        "MID_NEWS_FILTER": "1",
+        "MID_MACRO_FILTER": "1",
         "MID_RANGE_POS_FILTER": "0",
         "MID_TOP_FILTERS": "0",
         "MID_TRAP_FILTERS": "1",
@@ -3997,6 +4005,8 @@ async def _mexc_signed_request(
     use form-encoded bodies for POST order placement, and MEXC validates the
     request content type for these methods.
     """
+    if not _exchange_enabled("mexc"):
+        raise ExchangeAPIError("MEXC disabled by EXCHANGE_MEXC_ENABLED=0")
     params = dict(params or {})
     params.setdefault("timestamp", str(int(dt.datetime.now(dt.timezone.utc).timestamp() * 1000)))
     params.setdefault("recvWindow", "5000")
@@ -4036,6 +4046,8 @@ async def _gateio_signed_request(
     params: dict | None = None,
     json_body: dict | None = None,
 ) -> dict:
+    if not _exchange_enabled("gateio"):
+        raise ExchangeAPIError("Gate.io disabled by EXCHANGE_GATEIO_ENABLED=0")
     # Gate.io v4 signing: https://www.gate.io/docs/developers/apiv4/en/#authentication
     method_u = method.upper()
     query = urllib.parse.urlencode(params or {}, doseq=True)
@@ -4160,14 +4172,14 @@ async def _okx_public_price(symbol: str, *, market_type: str = "spot") -> float:
     return 0.0
 
 async def _mexc_public_price(symbol: str) -> float:
-    if not EXCHANGE_MEXC_ENABLED:
-        return 0.0
+    if not _exchange_enabled("mexc"):
+        raise ExchangeAPIError("MEXC disabled by EXCHANGE_MEXC_ENABLED=0")
     data = await _http_json("GET", "https://api.mexc.com/api/v3/ticker/price", params={"symbol": symbol.upper()}, timeout_s=8)
     return float(data.get("price") or 0.0)
 
 async def _gateio_public_price(symbol: str) -> float:
-    if not EXCHANGE_GATEIO_ENABLED:
-        return 0.0
+    if not _exchange_enabled("gateio"):
+        raise ExchangeAPIError("Gate.io disabled by EXCHANGE_GATEIO_ENABLED=0")
     pair = _gate_pair(symbol)
     data = await _http_json("GET", "https://api.gateio.ws/api/v4/spot/tickers", params={"currency_pair": pair}, timeout_s=8)
     if isinstance(data, list) and data and isinstance(data[0], dict):
@@ -4257,8 +4269,6 @@ def _mexc_contract_symbol(symbol: str) -> str:
     return s.replace("-", "_")
 
 async def _mexc_futures_price(symbol: str) -> float:
-    if not EXCHANGE_MEXC_ENABLED:
-        return 0.0
     # MEXC Contract (Perpetual) public ticker
     # Endpoint is best-effort and parsed defensively.
     sym = _mexc_contract_symbol(symbol)
@@ -4290,8 +4300,6 @@ def _gateio_futures_contract(symbol: str) -> str:
     return s.replace("-", "_")
 
 async def _gateio_futures_price(symbol: str) -> float:
-    if not EXCHANGE_GATEIO_ENABLED:
-        return 0.0
     contract = _gateio_futures_contract(symbol)
     data = await _http_json("GET", "https://api.gateio.ws/api/v4/futures/usdt/tickers", params={"contract": contract}, timeout_s=8)
     # Response is list[dict] usually
@@ -4324,10 +4332,6 @@ async def validate_autotrade_keys(
     mt = (market_type or "spot").lower().strip()
     if ex not in ("binance", "bybit", "okx", "mexc", "gateio"):
         return {"ok": False, "read_ok": False, "trade_ok": False, "error": "unsupported_exchange"}
-    if ex == "mexc" and not EXCHANGE_MEXC_ENABLED:
-        return {"ok": False, "read_ok": False, "trade_ok": False, "error": "mexc_disabled"}
-    if ex == "gateio" and not EXCHANGE_GATEIO_ENABLED:
-        return {"ok": False, "read_ok": False, "trade_ok": False, "error": "gateio_disabled"}
     if mt not in ("spot", "futures"):
         mt = "spot"
 
@@ -4639,9 +4643,9 @@ async def _okx_instrument_filters(*, inst_type: str, symbol: str) -> tuple[float
 
 _MEXC_FILTER_CACHE: dict[str, dict] = {}
 async def _mexc_symbol_filters(symbol: str) -> tuple[float, float, float, float]:
-    if not EXCHANGE_MEXC_ENABLED:
-        return 0.0, 0.0, 0.0, 0.0
     """Return (qty_step, min_qty, tick_size, min_notional) for MEXC spot symbol (best-effort)."""
+    if not _exchange_enabled("mexc"):
+        raise ExchangeAPIError("MEXC disabled by EXCHANGE_MEXC_ENABLED=0")
     sym = symbol.upper()
     cached = _MEXC_FILTER_CACHE.get(sym)
     if cached and cached.get("_ts", 0) > time.time() - 3600:
@@ -4688,9 +4692,9 @@ async def _mexc_symbol_filters(symbol: str) -> tuple[float, float, float, float]
 
 _GATE_FILTER_CACHE: dict[str, dict] = {}
 async def _gate_symbol_filters(symbol: str) -> tuple[float, float, float, float]:
-    if not EXCHANGE_GATEIO_ENABLED:
-        return 0.0, 0.0, 0.0, 0.0
     """Return (qty_step, min_qty, tick, min_notional) for Gate.io spot symbol (best-effort)."""
+    if not _exchange_enabled("gateio"):
+        raise ExchangeAPIError("Gate.io disabled by EXCHANGE_GATEIO_ENABLED=0")
     pair = _gate_pair(symbol)
     cached = _GATE_FILTER_CACHE.get(pair)
     if cached and cached.get("_ts", 0) > time.time() - 3600:
@@ -5672,7 +5676,7 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
     # on Bybit/OKX/MEXC/Gate and the user expects the first eligible exchange from
     # their priority list to be used.
     if mt == "spot":
-        allowed = ["binance", "bybit", "okx", "mexc", "gateio"]
+        allowed = [x for x in ["binance", "bybit", "okx", "mexc", "gateio"] if _exchange_enabled(x)]
 
         def _norm_spot_venues(raw: str) -> set[str]:
             out: set[str] = set()
@@ -5757,6 +5761,8 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                         except Exception:
                             return False
                 if ex == "mexc":
+                    if not _exchange_enabled("mexc"):
+                        return False
                     data = await _http_json("GET", "https://api.mexc.com/api/v3/exchangeInfo", params={"symbol": sym}, timeout_s=10)
                     lst = (data.get("symbols") or [])
                     if any(str(x.get("symbol") or "").upper() == sym for x in lst):
@@ -5766,6 +5772,8 @@ async def autotrade_execute(user_id: int, sig: "Signal") -> dict:
                     except Exception:
                         return False
                 if ex == "gateio":
+                    if not _exchange_enabled("gateio"):
+                        return False
                     pair = _gate_pair(sym)
                     data = await _http_json("GET", "https://api.gateio.ws/api/v4/spot/currency_pairs", params={"id": pair}, timeout_s=10)
                     if isinstance(data, list) and any(str(x.get("id") or "").upper() == pair.upper() for x in data):
@@ -7325,7 +7333,10 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
     manager_worker_id = f"{_wid_base}:{os.getpid()}"
     manager_batch = int(os.getenv("AUTOTRADE_MANAGER_BATCH", "300") or 300)
     manager_lease_sec = int(os.getenv("AUTOTRADE_MANAGER_LEASE_SEC", "120") or 120)
-    manager_sleep_sec = max(0.5, _parse_seconds_env("AUTOTRADE_MANAGER_SLEEP_SEC", 2.0))
+    manager_sleep_sec = max(1.0, _parse_seconds_env("AUTOTRADE_MANAGER_SLEEP_SEC", 10.0))
+    manager_idle_sleep_sec = max(manager_sleep_sec, _parse_seconds_env("AUTOTRADE_MANAGER_IDLE_SLEEP_SEC", 90.0))
+    manager_empty_log_sec = max(60.0, _parse_seconds_env("AUTOTRADE_MANAGER_EMPTY_LOG_SEC", 1800.0))
+    _manager_last_empty_log = 0.0
 
     # autotrade_manager_loop is a module-level coroutine, not a Backend method.
     # Use an explicit Backend instance for shared price/diagnostic helpers so SMART_TICK
@@ -7530,15 +7541,23 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
             except Exception:
                 pass
 
-    try:
-        await _meta_selfheal_once()
-    except Exception:
-        pass
+    if os.getenv("AUTOTRADE_META_SELFHEAL_ON_START", "0").strip().lower() in ("1", "true", "yes", "on"):
+        try:
+            await _meta_selfheal_once()
+        except Exception:
+            pass
 
     # Best-effort; never crash.
     while True:
         try:
             rows = await db_store.claim_open_autotrade_positions(owner=manager_worker_id, limit=manager_batch, lease_sec=manager_lease_sec)
+            if not rows:
+                now_empty = time.time()
+                if (now_empty - _manager_last_empty_log) >= manager_empty_log_sec:
+                    logger.info("[autotrade-manager] idle: no open positions; sleep=%ss", manager_idle_sleep_sec)
+                    _manager_last_empty_log = now_empty
+                await asyncio.sleep(manager_idle_sleep_sec)
+                continue
             for r in rows:
                 rid = int((r or {}).get('id') or 0)
                 # Refresh lease so other replicas won't steal it mid-processing.
@@ -12281,20 +12300,6 @@ NEWS_ACTION = os.getenv("NEWS_ACTION", "FUTURES_OFF").strip().upper()  # FUTURES
 # Macro filter
 MACRO_FILTER = _env_bool("MACRO_FILTER", False)
 
-# Railway cost control: disable expensive secondary public sources by default.
-EXCHANGE_MEXC_ENABLED = _env_bool("EXCHANGE_MEXC_ENABLED", False)
-EXCHANGE_GATEIO_ENABLED = _env_bool("EXCHANGE_GATEIO_ENABLED", False)
-DISABLED_SECONDARY_EXCHANGES = {ex for ex, enabled in (("MEXC", EXCHANGE_MEXC_ENABLED), ("GATEIO", EXCHANGE_GATEIO_ENABLED)) if not enabled}
-
-def _filter_disabled_exchanges(exchanges):
-    out = []
-    for x in exchanges or []:
-        ux = str(x).strip().upper()
-        if not ux or ux in DISABLED_SECONDARY_EXCHANGES:
-            continue
-        out.append(ux)
-    return out
-
 # Orderbook filter (optional)
 ORDERBOOK_FILTER = _env_bool("ORDERBOOK_FILTER", False)
 # ------------------ Orderbook filter (FUTURES only recommended) ------------------
@@ -14109,6 +14114,8 @@ class PriceFeed:
                                     self._set_latest(m, sym_u, float(p), source="WS", ex="okx")
 
                 elif ex0 == "gateio":
+                    if not _exchange_enabled("gateio"):
+                        raise Exception("gateio disabled by EXCHANGE_GATEIO_ENABLED=0")
                     # Gate.io WS v4. Spot-only used in this project.
                     if m != "SPOT":
                         raise Exception("gateio ws only spot")
@@ -14131,6 +14138,8 @@ class PriceFeed:
                                     self._set_latest(m, sym_u, float(p), source="WS", ex="gateio")
 
                 elif ex0 == "mexc":
+                    if not _exchange_enabled("mexc"):
+                        raise Exception("mexc disabled by EXCHANGE_MEXC_ENABLED=0")
                     # MEXC public WS (spot). Futures not used here.
                     if m != "SPOT":
                         raise Exception("mexc ws only spot")
@@ -14390,6 +14399,8 @@ class MultiExchangeData:
         return out
 
     async def _top_from_mexc(self) -> list[tuple[float, str]]:
+        if not _exchange_enabled("mexc"):
+            return []
         assert self.session is not None
         url = f"{self.MEXC}/api/v3/ticker/24hr"
         data = await self._get_json(url)
@@ -14450,6 +14461,8 @@ class MultiExchangeData:
         return out
 
     async def _top_from_gateio(self) -> list[tuple[float, str]]:
+        if not _exchange_enabled("gateio"):
+            return []
         url = f"{self.GATEIO}/spot/tickers"
         data = await self._get_json(url)
         out: list[tuple[float, str]] = []
@@ -14493,6 +14506,7 @@ class MultiExchangeData:
             ("MEXC", self._top_from_mexc),
             ("GATEIO", self._top_from_gateio),
         ]
+        providers = [(name, fn) for name, fn in providers if _exchange_enabled(name)]
     
         last_err: Exception | None = None
         items: list[tuple[float, str]] = []
@@ -14610,6 +14624,8 @@ class MultiExchangeData:
         self._unsupported_until[key] = time.monotonic() + float(self._unsupported_ttl)
 
     async def _get_gateio_markets(self) -> set[str]:
+        if not _exchange_enabled("gateio"):
+            return set()
         now = time.monotonic()
         cached = self._markets_cache.get("GATEIO")
         if cached and now < cached[0]:
@@ -14632,6 +14648,8 @@ class MultiExchangeData:
             return set()
 
     async def _get_mexc_markets(self) -> set[str]:
+        if not _exchange_enabled("mexc"):
+            return set()
         now = time.monotonic()
         cached = self._markets_cache.get("MEXC")
         if cached and now < cached[0]:
@@ -15085,6 +15103,8 @@ class MultiExchangeData:
 
 
     async def klines_mexc(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+        if not _exchange_enabled("mexc"):
+            return pd.DataFrame()
         """Fetch klines from MEXC Spot (Binance-compatible /api/v3/klines)."""
         sym = (symbol or "").upper().strip()
         iv = (interval or "").strip().lower()
@@ -15139,6 +15159,8 @@ class MultiExchangeData:
 
 
     async def klines_gateio(self, symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+        if not _exchange_enabled("gateio"):
+            return pd.DataFrame()
         """Fetch klines from Gate.io Spot API v4 /spot/candlesticks."""
         sym = (symbol or "").upper().strip()
         iv = (interval or "").strip().lower()
@@ -20640,18 +20662,20 @@ class Backend:
                 return True, "OKX_SWAP", sym
         except Exception:
             pass
-        try:
-            p = await self._rest_limiter.run("mexc", lambda: _mexc_price(sym))
-            if p is not None and p > 0:
-                return True, "MEXC_SPOT", sym
-        except Exception:
-            pass
-        try:
-            p = await self._rest_limiter.run("gateio", lambda: _gateio_price(sym))
-            if p is not None and p > 0:
-                return True, "GATEIO_SPOT", sym
-        except Exception:
-            pass
+        if _exchange_enabled("mexc"):
+            try:
+                p = await self._rest_limiter.run("mexc", lambda: _mexc_price(sym))
+                if p is not None and p > 0:
+                    return True, "MEXC_SPOT", sym
+            except Exception:
+                pass
+        if _exchange_enabled("gateio"):
+            try:
+                p = await self._rest_limiter.run("gateio", lambda: _gateio_price(sym))
+                if p is not None and p > 0:
+                    return True, "GATEIO_SPOT", sym
+            except Exception:
+                pass
 
         return False, None, sym
 
@@ -21218,6 +21242,8 @@ class Backend:
 
 
     async def _fetch_mexc_price(self, market: str, symbol: str) -> float | None:
+        if not _exchange_enabled("mexc"):
+            return None
         """MEXC public REST price (spot/futures best-effort).
 
         Spot: https://api.mexc.com/api/v3/ticker/price?symbol=BTCUSDT
@@ -21277,6 +21303,8 @@ class Backend:
 
 
     async def _fetch_gateio_price(self, market: str, symbol: str) -> float | None:
+        if not _exchange_enabled("gateio"):
+            return None
         """Gate.io public REST price (spot/futures best-effort).
 
         Spot: https://api.gateio.ws/api/v4/spot/tickers?currency_pair=BTC_USDT
@@ -22751,18 +22779,24 @@ class Backend:
                 _mid_hardblock_reset_tick()
             except Exception:
                 pass
-            logger.info("SCAN tick start top_n=%s interval=%ss news_filter=%s macro_filter=%s", TOP_N, SCAN_INTERVAL_SECONDS, bool(NEWS_FILTER and CRYPTOPANIC_TOKEN), bool(MACRO_FILTER))
-            logger.info("[scanner] tick start TOP_N=%s interval=%ss", TOP_N, SCAN_INTERVAL_SECONDS)
+            main_enabled = os.getenv("MAIN_SCANNER_ENABLED", os.getenv("SCANNER_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
+            main_top_n = _env_int("MAIN_TOP_N", _env_int("TOP_N", TOP_N))
+            if (not main_enabled) or main_top_n <= 0:
+                logger.debug("[scanner] disabled main_enabled=%s TOP_N=%s", main_enabled, main_top_n)
+                await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+                continue
+            main_top_n = max(1, min(300, int(main_top_n)))
+            logger.info("[scanner] tick start TOP_N=%s interval=%ss", main_top_n, SCAN_INTERVAL_SECONDS)
             self.last_scan_ts = start
             try:
                 async with MultiExchangeData() as api:
-                    await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
+                    if os.getenv("MACRO_FILTER", "0").strip().lower() not in ("0", "false", "no", "off"):
+                        await self.macro.ensure_loaded(api.session)  # type: ignore[arg-type]
 
                     try:
-                        symbols = await api.get_top_usdt_symbols(TOP_N * 3)  # FIX: fetch extra for pre-filter
-                        # FIX: remove blocked/stable symbols BEFORE TOP_N slicing
+                        symbols = await api.get_top_usdt_symbols(main_top_n * 3)
                         symbols = [s for s in symbols if not is_blocked_symbol(s)]
-                        symbols = symbols[:TOP_N]
+                        symbols = symbols[:main_top_n]
                         if symbols:
                             self._symbols_cache = list(symbols)
                             self._symbols_cache_ts = time.time()
@@ -22774,7 +22808,7 @@ class Backend:
                         else:
                             raise
                     self.scanned_symbols_last = len(symbols)
-                    logger.info("[main][scanner] symbols loaded: %s (TOP_N=%s)", self.scanned_symbols_last, TOP_N)
+                    logger.debug("[main][scanner] symbols loaded: %s (TOP_N=%s)", self.scanned_symbols_last, main_top_n)
 
                     # reject stats (per tick) — used only for logging/debug; never crash if missing
                     _rej_counts = defaultdict(int)
@@ -22864,10 +22898,10 @@ class Backend:
                                 return name, None
 
                         # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
-                        _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX') or '').strip()
-                        scan_exchanges = _filter_disabled_exchanges([x.strip().upper() for x in _scan_ex.split(',') if x.strip()])
+                        _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
+                        scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
                         if not scan_exchanges:
-                            scan_exchanges = ['BINANCE','BYBIT','OKX']
+                            scan_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
 
                         # --- Choose best exchange candidate (MAIN scanner) ---
                         results = await asyncio.gather(*[fetch_exchange(x) for x in scan_exchanges])
@@ -28892,10 +28926,10 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
 
             # Exchanges to scan (independent from ORDERBOOK_EXCHANGES)
             # NOTE: MID candles routing can restrict this universe further via MID_CANDLES_SOURCES / MID_ENABLE_SECONDARY_EXCHANGES
-            _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX') or '').strip()
-            scan_exchanges = _filter_disabled_exchanges([x.strip().upper() for x in _scan_ex.split(',') if x.strip()])
+            _scan_ex = (os.getenv('SCANNER_EXCHANGES','BINANCE,BYBIT,OKX,GATEIO,MEXC') or '').strip()
+            scan_exchanges = [x.strip().upper() for x in _scan_ex.split(',') if x.strip()]
             if not scan_exchanges:
-                scan_exchanges = ['BINANCE','BYBIT','OKX']
+                scan_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
 
             # MID candle sources preference.
             # If MID_CANDLES_SOURCES is not provided, we default to the same universe as SCANNER_EXCHANGES
@@ -28903,17 +28937,17 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
             # Secondary exchanges (GATEIO/MEXC) are still gated by MID_ENABLE_SECONDARY_EXCHANGES.
             _mid_sources_env = (os.getenv('MID_CANDLES_SOURCES', '') or '').strip()
             _mid_sources = _mid_sources_env if _mid_sources_env else ','.join(scan_exchanges)
-            mid_candles_sources = _filter_disabled_exchanges([x.strip().upper() for x in _mid_sources.split(',') if x.strip()])
+            mid_candles_sources = [x.strip().upper() for x in _mid_sources.split(',') if x.strip()]
             if not mid_candles_sources:
                 mid_candles_sources = list(scan_exchanges)
 
             # --- MID candles sources (Variant A: multi-exchange) ---
             # We allow pulling candles from all supported adapters, and decide per-symbol dynamically.
             # This is required for tokens that exist on GateIO/MEXC but not on Binance.
-            allowed_candle_exchanges = _filter_disabled_exchanges(['BINANCE','BYBIT','OKX','MEXC','GATEIO']) or ['BINANCE','BYBIT','OKX']
+            allowed_candle_exchanges = ['BINANCE','BYBIT','OKX','MEXC','GATEIO']
 
             mid_force_all = (os.getenv('MID_CANDLES_ALL_EXCHANGES', '1') or '1').strip().lower() in ('1','true','yes','on')
-            enable_secondary = (os.getenv('MID_ENABLE_SECONDARY_EXCHANGES','0') or '0').strip().lower() in ('1','true','yes','on')
+            enable_secondary = (os.getenv('MID_ENABLE_SECONDARY_EXCHANGES','1') or '1').strip().lower() in ('1','true','yes','on')
 
             if mid_force_all:
                 # Don't require candles sources to be present in SCANNER_EXCHANGES:
@@ -38189,7 +38223,7 @@ async def _autotrade_diag_emit(kind: str, *, cooldown_sec: float = 600.0, **data
 
 async def autotrade_anomaly_watchdog_loop(*, notify_api_error=None) -> None:
     """Detect hidden autotrade failures and forward them to log + error bot."""
-    poll_sec = float(os.getenv("AUTOTRADE_DIAG_POLL_SEC", "60") or 60)
+    poll_sec = float(os.getenv("AUTOTRADE_DIAG_POLL_SEC", "300") or 300)
     grace_no_order = float(os.getenv("AUTOTRADE_DIAG_NO_ORDER_GRACE_SEC", "45") or 45)
     grace_no_position = float(os.getenv("AUTOTRADE_DIAG_NO_POSITION_GRACE_SEC", "75") or 75)
     grace_manager_blind = float(os.getenv("AUTOTRADE_DIAG_MANAGER_BLIND_SEC", "180") or 180)
@@ -38198,6 +38232,9 @@ async def autotrade_anomaly_watchdog_loop(*, notify_api_error=None) -> None:
     while True:
         try:
             rows = await db_store.list_open_autotrade_positions(limit=500)
+            if not rows:
+                await asyncio.sleep(poll_sec)
+                continue
             for r in rows or []:
                 try:
                     uid = int(r.get("user_id") or 0)
