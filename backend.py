@@ -7328,13 +7328,18 @@ async def autotrade_manager_loop(*, notify_api_error, notify_smart_event=None, b
     notify_smart_event(user_id:int, text:str) may be called for SL/TP decisions.
     """
 
+    if str(os.getenv("AUTOTRADE_ENABLED", "0") or "0").strip().lower() in ("0", "false", "no", "off") and str(os.getenv("AUTOTRADE_MANAGER_ENABLED", "0") or "0").strip().lower() in ("0", "false", "no", "off"):
+        logger.info("[autotrade-manager] disabled by AUTOTRADE_ENABLED=0/AUTOTRADE_MANAGER_ENABLED=0")
+        while True:
+            await asyncio.sleep(max(300.0, float(os.getenv("AUTOTRADE_MANAGER_DISABLED_SLEEP_SEC", "900") or 900)))
+
     import socket as _socket
     _wid_base = os.getenv("AUTOTRADE_MANAGER_ID") or os.getenv("RAILWAY_REPLICA_ID") or os.getenv("HOSTNAME") or _socket.gethostname()
     manager_worker_id = f"{_wid_base}:{os.getpid()}"
     manager_batch = int(os.getenv("AUTOTRADE_MANAGER_BATCH", "300") or 300)
     manager_lease_sec = int(os.getenv("AUTOTRADE_MANAGER_LEASE_SEC", "120") or 120)
     manager_sleep_sec = max(1.0, _parse_seconds_env("AUTOTRADE_MANAGER_SLEEP_SEC", 10.0))
-    manager_idle_sleep_sec = max(manager_sleep_sec, _parse_seconds_env("AUTOTRADE_MANAGER_IDLE_SLEEP_SEC", 90.0))
+    manager_idle_sleep_sec = max(manager_sleep_sec, _parse_seconds_env("AUTOTRADE_MANAGER_IDLE_SLEEP_SEC", 300.0))
     manager_empty_log_sec = max(60.0, _parse_seconds_env("AUTOTRADE_MANAGER_EMPTY_LOG_SEC", 1800.0))
     _manager_last_empty_log = 0.0
 
