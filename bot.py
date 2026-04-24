@@ -3774,6 +3774,9 @@ def _loss_diag_improve_label(key: str) -> str:
         'avoid_late_entry': 'жёстче отсекать поздний вход внутри уже идущего движения',
         'tighten_retest_depth': 'жёстче фильтровать слишком глубокий retest',
         'raise_min_confirm_strength': 'поднять минимум силы confirm-candle перед входом',
+        'avoid_overhead_supply': 'не брать LONG прямо под supply / Strong High',
+        'avoid_support_short': 'не брать SHORT прямо над support / Weak Low',
+        'require_clean_space_to_tp': 'требовать чистое пространство до TP1/TP2',
     }
     return mapping.get(str(key or '').strip(), str(key or '').strip())
 
@@ -3837,6 +3840,12 @@ def _loss_diag_reason_human_label(code: str) -> str:
         'retest_too_deep': 'Retest was too deep',
         'reclaim_without_acceptance': 'Reclaim had no acceptance',
         'origin_impulse_not_clean': 'Origin impulse was not clean',
+        'entry_into_overhead_supply': 'Entry into overhead supply',
+        'long_below_strong_high': 'Long directly below Strong High / liquidity',
+        'short_above_weak_low': 'Short directly above Weak Low / liquidity',
+        'entry_in_range_premium': 'Entry in bad range location',
+        'late_entry_after_exhausted_move': 'Late entry after exhausted move',
+        'no_clean_retest_acceptance': 'No clean retest acceptance',
     }
     return mapping.get(str(code or '').strip(), str(code or '').strip().replace('_', ' '))
 
@@ -3872,6 +3881,12 @@ def _loss_diag_format_reason_text(code: str, fallback: str = '') -> str:
         'fake_confirm': 'Fake confirm: подтверждение выглядело валидным, но за ним не последовало реального расширения движения.',
         'failed_reclaim_hold': 'Failed reclaim hold: reclaim был показан, но рынок не смог закрепиться по правильную сторону уровня.',
         'breakout_trap': 'Breakout trap: пробой быстро вернулся обратно за уровень, поэтому continuation оказался ложным.',
+        'entry_into_overhead_supply': 'Entry into overhead supply: LONG был открыт прямо под зоной продавца / red FVG / supply. Сверху не было чистого пространства до TP, поэтому цена быстро получила sell pressure и ушла к SL.',
+        'long_below_strong_high': 'Long directly below Strong High / liquidity: вход LONG был сделан под сильным high/ликвидностью. Покупка пришлась в место, где продавец чаще защищает уровень, поэтому continuation был маловероятен.',
+        'short_above_weak_low': 'Short directly above Weak Low / liquidity: вход SHORT был сделан прямо над слабым low/ликвидностью. Продавать в такую поддержку опасно — снизу не было чистого пространства для continuation.',
+        'entry_in_range_premium': 'Entry in bad range location: вход был в плохой части range — слишком близко к противоположной ликвидности/стене, а не от дисконта/премиума с запасом хода.',
+        'late_entry_after_exhausted_move': 'Late entry after exhausted move: вход был поздний — основное движение уже прошло, retest был несвежий, нового displacement перед входом не было.',
+        'no_clean_retest_acceptance': 'No clean retest acceptance: формальный retest был, но цена не закрепилась по правильную сторону зоны/уровня и не показала acceptance перед continuation.',
     }
     return mapping.get(str(code or '').strip(), fallback or _loss_diag_reason_human_label(code))
 
@@ -3901,6 +3916,12 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
     retest_deep = bool(analysis.get('retest_too_deep'))
     volume_faded = bool(analysis.get('post_entry_volume_faded'))
     multiple_failed_pushes = bool(analysis.get('multiple_failed_pushes'))
+    side = str(src.get('side') or analysis.get('side') or 'LONG').upper().strip() or 'LONG'
+    entry_overhead = bool(analysis.get('entry_into_overhead_supply'))
+    long_below_high = bool(analysis.get('long_below_strong_high'))
+    short_above_low = bool(analysis.get('short_above_weak_low'))
+    bad_range_location = bool(analysis.get('entry_in_range_premium'))
+    late_exhausted = bool(analysis.get('late_entry_after_exhausted_move') or analysis.get('late_entry_inside_expansion'))
 
     secondary = []
     missed = []
@@ -3936,6 +3957,20 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
         secondary.append('continuation_missing')
     if bool(analysis.get('range_trap_behavior')):
         secondary.append('range_trap_behavior')
+    if entry_overhead:
+        secondary.append('entry_into_overhead_supply')
+        happened.append('вход был слишком близко к зоне продавца / противоположной ликвидности')
+    if long_below_high:
+        secondary.append('long_below_strong_high')
+        happened.append('LONG был открыт прямо под strong high / liquidity pool')
+    if short_above_low:
+        secondary.append('short_above_weak_low')
+        happened.append('SHORT был открыт прямо над weak low / support liquidity')
+    if bad_range_location:
+        secondary.append('entry_in_range_premium')
+    if late_exhausted:
+        secondary.append('late_entry_after_exhausted_move')
+        happened.append('вход был поздний: основной импульс уже отработал до сигнала')
 
     if exact_route:
         if route_key == 'smc_ob_fvg_overlap':
@@ -4025,6 +4060,25 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
     else:
         primary = 'immediate_invalidation' if immediate else 'continuation_missing'
         scenario = 'weak_reaction_then_fade' if weak_follow else ''
+
+    # Highest priority: explain WHY the entry itself was bad on the chart, not only what happened after entry.
+    if entry_overhead:
+        if side == 'LONG' and long_below_high:
+            primary = 'long_below_strong_high'
+        elif side == 'SHORT' and short_above_low:
+            primary = 'short_above_weak_low'
+        else:
+            primary = 'entry_into_overhead_supply'
+        scenario = 'entry_into_overhead_supply'
+        missed.append('require_clean_space_to_tp')
+    elif late_exhausted:
+        primary = 'late_entry_after_exhausted_move'
+        scenario = 'late_entry_after_exhausted_move'
+        missed.append('late_entry_after_exhausted_move')
+    elif bad_range_location and (not tp1_threatened or weak_follow):
+        primary = 'entry_in_range_premium'
+        scenario = 'entry_in_range_premium'
+        missed.append('require_clean_space_to_tp')
 
     if late := bool(analysis.get('late_entry_inside_expansion')):
         secondary.append('late_entry_inside_expansion'); missed.append('late_entry_inside_expansion')
@@ -4352,7 +4406,7 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
         else:
             ts = pd.Series([pd.NaT] * len(d))
         d['_ts'] = ts
-        d = d[(d['_ts'].notna()) & (d['_ts'] >= (opened - dt.timedelta(minutes=15))) & (d['_ts'] <= (closed + dt.timedelta(minutes=10)))].copy()
+        d = d[(d['_ts'].notna()) & (d['_ts'] >= (opened - dt.timedelta(hours=8))) & (d['_ts'] <= (closed + dt.timedelta(minutes=10)))].copy()
         if d.empty:
             analysis['fast_invalidation'] = bool(int(analysis['duration_min']) <= 15)
             return analysis
@@ -4365,6 +4419,41 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
         d = d.dropna(subset=['open', 'high', 'low', 'close']).sort_values('_ts')
         if d.empty:
             return analysis
+
+        pre = d[d['_ts'] < opened].tail(72).copy()
+        if not pre.empty and entry > 0:
+            ph = pre['high'].astype(float)
+            pl = pre['low'].astype(float)
+            pc = pre['close'].astype(float)
+            prior_high = float(ph.max())
+            prior_low = float(pl.min())
+            prior_range = max(prior_high - prior_low, 1e-9)
+            entry_pos = (entry - prior_low) / prior_range
+            dist_high_pct = ((prior_high - entry) / entry) * 100.0
+            dist_low_pct = ((entry - prior_low) / entry) * 100.0
+            analysis['prior_range_high'] = round(prior_high, 8)
+            analysis['prior_range_low'] = round(prior_low, 8)
+            analysis['entry_position_in_prior_range'] = round(entry_pos, 3)
+            analysis['distance_to_prior_high_pct'] = round(dist_high_pct, 2)
+            analysis['distance_to_prior_low_pct'] = round(dist_low_pct, 2)
+            pre_first = float(pc.iloc[0]) if len(pc) else entry
+            pre_last = float(pc.iloc[-1]) if len(pc) else entry
+            pre_move_pct = ((pre_last - pre_first) / max(pre_first, 1e-9)) * 100.0
+            analysis['pre_entry_move_pct'] = round(pre_move_pct, 2)
+            if side == 'LONG':
+                clean_space_tp1_pct = ((tp1 - entry) / entry) * 100.0 if tp1 > entry else 0.0
+                analysis['clean_space_to_tp1_pct'] = round(clean_space_tp1_pct, 2)
+                analysis['entry_in_range_premium'] = bool(entry_pos >= 0.68)
+                analysis['long_below_strong_high'] = bool(dist_high_pct >= 0 and (dist_high_pct <= max(clean_space_tp1_pct * 1.15, 0.35) or entry_pos >= 0.82))
+                analysis['entry_into_overhead_supply'] = bool(analysis.get('long_below_strong_high') or (entry_pos >= 0.72 and clean_space_tp1_pct <= 0.45))
+                analysis['late_entry_after_exhausted_move'] = bool(pre_move_pct > 0.65 and entry_pos >= 0.60)
+            else:
+                clean_space_tp1_pct = ((entry - tp1) / entry) * 100.0 if 0 < tp1 < entry else 0.0
+                analysis['clean_space_to_tp1_pct'] = round(clean_space_tp1_pct, 2)
+                analysis['entry_in_range_premium'] = bool(entry_pos <= 0.32)
+                analysis['short_above_weak_low'] = bool(dist_low_pct >= 0 and (dist_low_pct <= max(clean_space_tp1_pct * 1.15, 0.35) or entry_pos <= 0.18))
+                analysis['entry_into_overhead_supply'] = bool(analysis.get('short_above_weak_low') or (entry_pos <= 0.28 and clean_space_tp1_pct <= 0.45))
+                analysis['late_entry_after_exhausted_move'] = bool(pre_move_pct < -0.65 and entry_pos <= 0.40)
 
         post = d[d['_ts'] >= opened].copy()
         if post.empty:
@@ -4564,8 +4653,14 @@ def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str, clo
             improve_keys.append('tighten_trend_alignment')
         elif 'Vol xAvg' in item:
             improve_keys.append('tighten_volume_support')
-    if analysis.get('late_entry_inside_expansion') or 'late_entry_inside_expansion' in list(forensic.get('missed_codes') or []):
+    if analysis.get('late_entry_inside_expansion') or analysis.get('late_entry_after_exhausted_move') or 'late_entry_inside_expansion' in list(forensic.get('missed_codes') or []):
         improve_keys.append('avoid_late_entry')
+    if analysis.get('entry_into_overhead_supply') or analysis.get('long_below_strong_high'):
+        improve_keys.append('avoid_overhead_supply')
+        improve_keys.append('require_clean_space_to_tp')
+    if analysis.get('short_above_weak_low'):
+        improve_keys.append('avoid_support_short')
+        improve_keys.append('require_clean_space_to_tp')
     if analysis.get('retest_too_deep'):
         improve_keys.append('tighten_retest_depth')
     if analysis.get('confirm_too_weak'):
