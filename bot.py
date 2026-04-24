@@ -9050,7 +9050,19 @@ async def _fetch_gateio_price(symbol: str) -> float:
 def _parse_price_order(env_name: str, default: str) -> list[str]:
     raw = (os.getenv(env_name, default) or default).strip()
     parts = [p.strip().lower() for p in raw.split(",") if p.strip()]
-    return parts or [p.strip().lower() for p in default.split(",") if p.strip()]
+    parts = parts or [p.strip().lower() for p in default.split(",") if p.strip()]
+
+    # Railway cost control: do not call MEXC/Gate.io unless explicitly enabled.
+    mexc_on = (os.getenv("EXCHANGE_MEXC_ENABLED", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+    gate_on = (os.getenv("EXCHANGE_GATEIO_ENABLED", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+    filtered = []
+    for src in parts:
+        if src == "mexc" and not mexc_on:
+            continue
+        if src in ("gate", "gateio") and not gate_on:
+            continue
+        filtered.append(src)
+    return filtered or ["binance", "bybit", "okx"]
 
 
 async def _fetch_signal_price(symbol: str, *, market: str) -> tuple[float, str]:
@@ -9131,7 +9143,7 @@ async def _fetch_signal_price(symbol: str, *, market: str) -> tuple[float, str]:
         return 0.0, ""
 
     # SPOT
-    order = _parse_price_order("SIG_PRICE_ORDER_SPOT", "binance,bybit,okx,mexc,gateio")
+    order = _parse_price_order("SIG_PRICE_ORDER_SPOT", "binance,bybit,okx")
     for src in order:
         if src == "binance":
             px = await _safe(_fetch_binance_price(sym, futures=False))
