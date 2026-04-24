@@ -143,6 +143,11 @@ async def _ensure_webhook(bot: Bot, target_url: str, *, secret_token: str | None
 
 # --- runtime health/status (autotrade & smart-manager) ---
 TASKS: dict[str, asyncio.Task] = {}
+
+
+def _env_on(name: str, default: str = "1") -> bool:
+    return str(os.getenv(name, default) or default).strip().lower() not in ("0", "false", "no", "off")
+
 HEALTH: dict[str, float] = {"bot_start": time.time()}
 HEALTH_LAST_ERR: dict[str, str] = {}
 
@@ -182,7 +187,10 @@ def _spawn_smart_manager_task() -> asyncio.Task | None:
     return task
 
 
-def _start_signal_outcome_task() -> asyncio.Task:
+def _start_signal_outcome_task() -> asyncio.Task | None:
+    if not _env_on("SIGNAL_OUTCOME_LOOP_ENABLED", "1"):
+        logger.info("SIGNAL_OUTCOME_LOOP_ENABLED=0 -> signal_outcome_loop disabled")
+        return None
     existing = TASKS.get("signal-outcome")
     if existing and not existing.done():
         logger.warning("signal_outcome_loop already running; skip duplicate start")
@@ -6704,7 +6712,11 @@ async def broadcast_signal(sig: Signal) -> None:
                     )
                     await _notify_autotrade_api_error(_uid, ex, mt, f"{getattr(_sig,'symbol','')} {getattr(_sig,'market','')}: {type(e).__name__}: {e}"[:500])
 
-            asyncio.create_task(_run_autotrade(uid, sig))
+            if _env_on("AUTOTRADE_SIGNAL_EXEC_ENABLED", os.getenv("AUTOTRADE_ENABLED", "0")):
+                asyncio.create_task(_run_autotrade(uid, sig))
+            else:
+                # AUTO-TRADE is disabled: do not spawn per-user executor tasks and do not spam skipped logs.
+                pass
         except (TelegramForbiddenError, TelegramBadRequest) as e:
             # Do not spam stack traces for common delivery issues
             msg = str(e).lower()
@@ -9721,10 +9733,16 @@ async def main() -> None:
     except Exception:
         pass
 
-    # Refresh global Auto-trade pause/maintenance flags in background
-    TASKS["autotrade-global"] = asyncio.create_task(_autotrade_bot_global_loop(), name="autotrade-global")
-    _attach_task_monitor("autotrade-global", TASKS["autotrade-global"])
-    await _refresh_autotrade_bot_global_once(); _health_mark_ok("autotrade-global")
+    # Refresh global Auto-trade pause/maintenance flags in background.
+    # Low-load mode: when AUTO-TRADE is disabled, do not keep a DB polling loop alive.
+    if _env_on("AUTOTRADE_GLOBAL_LOOP_ENABLED", os.getenv("AUTOTRADE_ENABLED", "0")):
+        TASKS["autotrade-global"] = asyncio.create_task(_autotrade_bot_global_loop(), name="autotrade-global")
+        _attach_task_monitor("autotrade-global", TASKS["autotrade-global"])
+        await _refresh_autotrade_bot_global_once(); _health_mark_ok("autotrade-global")
+    else:
+        AUTOTRADE_BOT_GLOBAL["pause_autotrade"] = True
+        AUTOTRADE_BOT_GLOBAL["maintenance_mode"] = True
+        logger.info("AUTOTRADE_GLOBAL_LOOP_ENABLED=0/AUTOTRADE_ENABLED=0 -> autotrade global loop disabled")
 
     # --- Admin HTTP API for Status panel (Signal bot access) ---
     # NOTE: Railway public domain requires an HTTP server listening on $PORT.
@@ -11184,7 +11202,7 @@ async def main() -> None:
             _attach_task_monitor("daily-signal-report", TASKS["daily-signal-report"])
 
         # Auto-trade manager: available, but low-load. It sleeps long when there are no open positions.
-        autotrade_mgr_enabled = os.getenv("AUTOTRADE_MANAGER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+        autotrade_mgr_enabled = os.getenv("AUTOTRADE_MANAGER_ENABLED", os.getenv("AUTOTRADE_ENABLED", "0")).strip().lower() not in ("0", "false", "no", "off")
         if autotrade_mgr_enabled:
             TASKS["autotrade-manager"] = asyncio.create_task(
                 autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend),
@@ -11221,7 +11239,7 @@ async def main() -> None:
             "Another instance holds the Telegram polling lock; this replica will run ONLY autotrade manager + HTTP (no polling/scanner)."
         )
         try:
-            if os.getenv("AUTOTRADE_MANAGER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off"):
+            if os.getenv("AUTOTRADE_MANAGER_ENABLED", os.getenv("AUTOTRADE_ENABLED", "0")).strip().lower() not in ("0", "false", "no", "off"):
                 TASKS["autotrade-manager"] = asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend), name="autotrade-manager")
                 _health_mark_ok("autotrade-manager")
             if os.getenv("AUTOTRADE_DIAG_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on"):
@@ -11254,7 +11272,7 @@ async def main() -> None:
     _attach_task_monitor("daily-signal-report", TASKS["daily-signal-report"])
 
     # Auto-trade manager (SL/TP/BE) - runs in background.
-    if os.getenv("AUTOTRADE_MANAGER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off"):
+    if os.getenv("AUTOTRADE_MANAGER_ENABLED", os.getenv("AUTOTRADE_ENABLED", "0")).strip().lower() not in ("0", "false", "no", "off"):
         TASKS["autotrade-manager"] = asyncio.create_task(autotrade_manager_loop(notify_api_error=_notify_autotrade_api_error, notify_smart_event=_notify_smart_manager_event, backend_instance=backend), name="autotrade-manager")
         _attach_task_monitor("autotrade-manager", TASKS["autotrade-manager"])
     if os.getenv("AUTOTRADE_DIAG_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on"):
