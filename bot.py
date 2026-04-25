@@ -3804,6 +3804,9 @@ def _loss_diag_improve_label(key: str) -> str:
         'avoid_overhead_supply': 'не брать LONG прямо под supply / Strong High',
         'avoid_support_short': 'не шортить прямо в strong low / demand',
         'require_clean_space_to_tp': 'требовать чистое пространство до TP1/TP2',
+        'require_bullish_reclaim': 'для LONG требовать bullish reclaim перед входом',
+        'avoid_failed_demand_long': 'не покупать demand после bearish BOS без reclaim',
+        'avoid_overhead_bearish_fvg': 'не брать LONG, если сверху stacked bearish FVG',
     }
     return mapping.get(str(key or '').strip(), str(key or '').strip())
 
@@ -3831,6 +3834,11 @@ def _loss_diag_reason_human_label(code: str) -> str:
         'bos_confirm_weak': 'BOS confirm was weak',
         'bos_level_reclaimed_back': 'BOS level was reclaimed back',
         'fake_breakout_no_continuation': 'Breakout trap / no continuation',
+        'long_failed_demand_bearish_structure': 'Long into bearish BOS / failed demand',
+        'failed_demand_scenario': 'Failed demand under bearish structure',
+        'failed_demand_reaction': 'Failed demand reaction',
+        'long_against_bearish_structure': 'Long against bearish structure',
+        'overhead_bearish_fvg': 'Overhead bearish FVG / supply',
         'displacement_failed': 'Displacement failed',
         'origin_not_held': 'Origin did not hold',
         'impulse_died_fast': 'Impulse died fast',
@@ -3896,6 +3904,11 @@ def _loss_diag_format_reason_text(code: str, fallback: str = '') -> str:
         'bos_confirm_weak': 'BOS confirm was weak: после пробоя confirm-candle оказалась слабой, и breakout не получил нормального continuation.',
         'bos_level_reclaimed_back': 'BOS level was reclaimed back: после входа цена быстро вернулась за BOS-уровень и сломала breakout-сценарий.',
         'fake_breakout_no_continuation': 'Breakout trap / no continuation: пробой выглядел рабочим, но не дал реального продолжения и превратился в trap-сценарий.',
+        'long_failed_demand_bearish_structure': 'Long into bearish BOS / failed demand: LONG был открыт после bearish BOS/CHoCH, рядом с уже ослабленным demand. Покупатель не сделал reclaim/continuation, поэтому зона быстро сломалась.',
+        'failed_demand_scenario': 'LONG был открыт после того, как рынок уже перешёл в bearish-структуру. Цена находилась рядом с buyer zone, но сверху уже давили bearish FVG / supply зоны. Покупатель не смог сделать reclaim и continuation, поэтому demand быстро сломался.',
+        'failed_demand_reaction': 'Failed demand reaction: buyer zone не дала нормальной реакции после входа и быстро была продавлена.',
+        'long_against_bearish_structure': 'Long against bearish structure: LONG был открыт против активной bearish-структуры без подтверждённого bullish reclaim.',
+        'overhead_bearish_fvg': 'Overhead bearish FVG / supply: над входом оставались seller imbalance / FVG зоны, которые давили на LONG.',
         'displacement_failed': 'Displacement failed: displacement оказался слабым, origin не дал продолжения, импульс быстро умер после входа.',
         'origin_not_held': 'Origin did not hold: ключевая origin-зона не удержала цену после входа и сценарий развалился.',
         'impulse_died_fast': 'Impulse died fast: после входа стартовый импульс быстро затух и цена не смогла продолжить движение по сделке.',
@@ -3932,6 +3945,27 @@ def _loss_diag_chart_visible_lines(analysis: dict, side: str) -> list[str]:
     """Human chart facts for LOSS report. These lines explain what was visible on the chart at entry."""
     side_u = str(side or '').upper().strip()
     lines: list[str] = []
+    if side_u == 'LONG' and bool(analysis.get('long_failed_demand_bearish_structure')):
+        lines.extend([
+            'LONG открыт после bearish BOS / CHoCH вниз',
+            'сверху несколько bearish FVG и supply зон',
+            'структура уже делала lower high / lower low',
+            'вход был слишком низко, но без подтверждения reclaim',
+            'цена стояла под sell pressure',
+            'demand/FVG снизу был уже слабый',
+            'RR выглядел формально нормальный, но location был плохой',
+            'это не чистый breakout, а попытка купить слабый demand против структуры',
+        ])
+        if analysis.get('demand_near_tfs'):
+            try:
+                lines.append('buyer zone / demand был рядом на TF: ' + '/'.join([str(x) for x in list(analysis.get('demand_near_tfs') or [])]))
+            except Exception:
+                pass
+        if analysis.get('supply_near_tfs'):
+            try:
+                lines.append('overhead bearish FVG / supply виден на TF: ' + '/'.join([str(x) for x in list(analysis.get('supply_near_tfs') or [])]))
+            except Exception:
+                pass
     if side_u == 'SHORT' and bool(analysis.get('short_above_weak_low')):
         lines.extend([
             'SHORT открыт почти прямо над buyer zone / green FVG / Strong Low',
@@ -4055,6 +4089,19 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
         analysis['short_above_weak_low'] = True
         analysis['entry_into_demand'] = True
         analysis['entry_near_opposite_zone'] = True
+
+    failed_demand_long = bool(analysis.get('long_failed_demand_bearish_structure'))
+    if side == 'LONG' and not failed_demand_long:
+        failed_demand_long = bool(
+            (analysis.get('long_demand_near_entry') or analysis.get('demand_near_tfs'))
+            and (structure_against or analysis.get('level_reclaimed_back') or analysis.get('reclaim_lost_back'))
+            and (weak_follow or no_expansion or analysis.get('zone_reaction_too_weak'))
+            and (not tp1_threatened)
+        )
+    if failed_demand_long:
+        analysis['long_failed_demand_bearish_structure'] = True
+        analysis['failed_demand_reaction'] = True
+        analysis['long_against_bearish_structure'] = True
 
     secondary = []
     missed = []
@@ -4199,7 +4246,30 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
         scenario = 'weak_reaction_then_fade' if weak_follow else ''
 
     # Highest priority: explain WHY the entry itself was bad on the chart, not only what happened after entry.
-    if side == 'SHORT' and (short_above_low or (entry_overhead and bad_range_location)):
+    if side == 'LONG' and failed_demand_long:
+        primary = 'long_failed_demand_bearish_structure'
+        scenario = 'failed_demand_scenario'
+        missed.extend(['require_bullish_reclaim', 'avoid_failed_demand_long'])
+        if bool(analysis.get('overhead_bearish_fvg') or analysis.get('supply_near_tfs')):
+            missed.append('avoid_overhead_bearish_fvg')
+        happened = [
+            'цена не смогла закрепиться выше зоны входа',
+            'buyer zone не удержала',
+            'после входа не было displacement вверх',
+            'продавец продолжил sell-side движение',
+            'SL был выбит почти сразу',
+        ] + happened
+        secondary.extend([
+            'long_against_bearish_structure',
+            'failed_demand_reaction',
+            'no_post_entry_expansion',
+            'weak_followthrough',
+            'tp1_never_threatened',
+            'continuation_missing',
+        ])
+        if bool(analysis.get('overhead_bearish_fvg') or analysis.get('supply_near_tfs')):
+            secondary.append('overhead_bearish_fvg')
+    elif side == 'SHORT' and (short_above_low or (entry_overhead and bad_range_location)):
         primary = 'short_above_weak_low'
         scenario = 'short_into_demand_scenario'
         missed.append('require_clean_space_to_tp')
@@ -4719,12 +4789,16 @@ def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: s
         if pre_moves and min(pre_moves) < -0.45:
             analysis['late_entry_after_exhausted_move'] = True
     elif side_u == 'LONG':
+        if demand_hits:
+            analysis['long_demand_near_entry'] = True
+            analysis['demand_near_tfs'] = list(dict.fromkeys(demand_hits))
         if supply_hits:
+            analysis['supply_near_tfs'] = list(dict.fromkeys(supply_hits))
+            analysis['overhead_bearish_fvg'] = True
             analysis['long_below_strong_high'] = True
             analysis['entry_into_supply'] = True
             analysis['entry_into_overhead_supply'] = True
             analysis['entry_near_opposite_zone'] = True
-            analysis['supply_near_tfs'] = list(dict.fromkeys(supply_hits))
             analysis['entry_in_range_premium'] = True
         elif entry_positions:
             highish = any(ep >= 0.65 for _, ep in entry_positions)
@@ -4736,6 +4810,24 @@ def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: s
                 analysis['entry_in_range_premium'] = True
         if pre_moves and max(pre_moves) > 0.45:
             analysis['late_entry_after_exhausted_move'] = True
+
+        # Failed-demand LONG pattern (ANIMEUSDT-type): buy from demand after market
+        # already shifted bearish. This is different from a simple breakout trap.
+        # It needs a dedicated card reason: bearish BOS/CHoCH + weak/failed demand + no reclaim.
+        bearish_after_entry = bool(analysis.get('structure_against_trade') or analysis.get('level_reclaimed_back') or analysis.get('reclaim_lost_back'))
+        weak_after_entry = bool(analysis.get('weak_followthrough') or analysis.get('no_post_entry_expansion') or analysis.get('zone_reaction_too_weak') or (analysis.get('tp1_threatened') is False))
+        lowish_entry = False
+        try:
+            lowish_entry = any(float(ep) <= 0.45 for _, ep in entry_positions)
+        except Exception:
+            lowish_entry = False
+        if bearish_after_entry and weak_after_entry and (demand_hits or lowish_entry):
+            analysis['long_failed_demand_bearish_structure'] = True
+            analysis['failed_demand_reaction'] = True
+            analysis['long_against_bearish_structure'] = True
+            analysis['long_demand_near_entry'] = bool(analysis.get('long_demand_near_entry') or demand_hits or lowish_entry)
+            if supply_hits:
+                analysis['overhead_bearish_fvg'] = True
 
 
 async def _signal_forensics_entry_snapshot_async(sig) -> dict:
@@ -5259,6 +5351,12 @@ def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str, clo
         improve_keys.append('tighten_retest_depth')
     if analysis.get('confirm_too_weak'):
         improve_keys.append('raise_min_confirm_strength')
+    if analysis.get('long_failed_demand_bearish_structure') or analysis.get('failed_demand_reaction'):
+        improve_keys.append('avoid_failed_demand_long')
+        improve_keys.append('require_bullish_reclaim')
+        improve_keys.append('tighten_trend_alignment')
+        if analysis.get('overhead_bearish_fvg') or analysis.get('supply_near_tfs'):
+            improve_keys.append('avoid_overhead_bearish_fvg')
     improve_keys = list(dict.fromkeys(improve_keys))
 
     reason_code = str(forensic.get('primary_reason_code') or '').strip()
@@ -5487,6 +5585,8 @@ def _loss_card_short_reason_title(code: str, text: str = '') -> str:
         'entry_in_range_premium': 'Poor RR location inside range',
         'continuation_missing': 'Weak continuation after entry',
         'immediate_invalidation': 'Immediate invalidation after entry',
+        'long_failed_demand_bearish_structure': 'Long into bearish BOS / failed demand',
+        'failed_demand_reaction': 'Long into bearish BOS / failed demand',
     }
     if code in mapping:
         return mapping[code]
@@ -5506,6 +5606,7 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
     primary_text = _loss_card_short_reason_title(code, str(loss_diag.get('primary_reason_text') or loss_diag.get('reason_text') or ''))
 
     short_demand = side == 'SHORT' and (code in {'short_above_weak_low', 'entry_into_demand'} or bool(analysis.get('short_above_weak_low') or analysis.get('entry_into_demand')))
+    long_failed_demand = side == 'LONG' and (code in {'long_failed_demand_bearish_structure', 'failed_demand_reaction'} or bool(analysis.get('long_failed_demand_bearish_structure') or analysis.get('failed_demand_reaction')))
     long_supply = side == 'LONG' and (code in {'long_below_strong_high', 'entry_into_supply', 'entry_into_overhead_supply'} or bool(analysis.get('long_below_strong_high') or analysis.get('entry_into_supply') or analysis.get('entry_into_overhead_supply')))
 
     duration_min = None
@@ -5552,6 +5653,54 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         secondary_labels = ['Late entry', 'Short into demand', 'Weak downside continuation', 'Poor RR location', 'Sell-side exhaustion']
         improve_labels = ['не шортить прямо в strong low', 'избегать входа в discount area', 'ждать premium re-entry выше']
         primary_text = 'Short entered directly into demand'
+    elif long_failed_demand:
+        scenario_text = (
+            'LONG был открыт после того, как рынок уже перешёл в bearish-структуру. '
+            'Цена находилась рядом с buyer zone, но сверху уже давили bearish FVG / supply зоны. '
+            'Покупатель не смог сделать reclaim и continuation, поэтому demand быстро сломался.'
+        )
+        analysis_lines.extend([
+            'bullish follow-through отсутствовал',
+            'demand reaction не появилась',
+            'цена сразу ушла против позиции',
+            'TP1 не был нормально поставлен под угрозу',
+        ])
+        happened_lines = [
+            'цена не смогла закрепиться выше зоны входа',
+            'buyer zone не удержала',
+            'после входа не было displacement вверх',
+            'продавец продолжил sell-side движение',
+            'SL был выбит почти сразу',
+        ]
+        visible_lines = [
+            'LONG открыт после bearish BOS / CHoCH вниз',
+            'сверху несколько bearish FVG и supply зон',
+            'структура уже делала lower high / lower low',
+            'вход был слишком низко, но без подтверждения reclaim',
+            'цена стояла под sell pressure',
+            'demand/FVG снизу был уже слабый',
+            'RR выглядел формально нормальный, но location был плохой',
+            'это не чистый breakout, а попытка купить слабый demand против структуры',
+        ]
+        secondary_labels = [
+            'Long against bearish structure',
+            'Failed demand reaction',
+            'No bullish displacement',
+            'Overhead bearish FVG',
+            'Weak follow-through',
+            'TP1 was never threatened',
+            'Invalidation happened too fast',
+            'Continuation missing',
+        ]
+        improve_labels = [
+            'не брать LONG после bearish BOS без reclaim',
+            'требовать закрытие выше локального FVG/supply',
+            'ждать bullish displacement после demand',
+            'не покупать demand, если сверху stacked bearish FVG',
+            'для LONG требовать structure_15m/30m bullish',
+            'если SL выбивается за 1–3 минуты — считать setup trap/catching falling knife',
+        ]
+        primary_text = 'Long into bearish BOS / failed demand'
     elif long_supply:
         scenario_text = (
             'LONG был открыт слишком высоко, прямо под seller zone и strong high. '
