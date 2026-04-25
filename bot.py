@@ -3994,6 +3994,20 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
     short_above_low = bool(analysis.get('short_above_weak_low'))
     bad_range_location = bool(analysis.get('entry_in_range_premium'))
     late_exhausted = bool(analysis.get('late_entry_after_exhausted_move') or analysis.get('late_entry_inside_expansion'))
+    try:
+        clean_space_to_tp = float(analysis.get('clean_space_to_tp1_pct') or 0.0)
+    except Exception:
+        clean_space_to_tp = 0.0
+
+    # Fallback forensic inference:
+    # even if explicit flags were missed, if TP1 space is tiny + no continuation,
+    # treat it as bad entry location near opposite liquidity (real chart reason).
+    if side == 'LONG' and (not long_below_high) and clean_space_to_tp > 0 and clean_space_to_tp <= 0.45 and weak_follow and (not tp1_threatened):
+        long_below_high = True
+        entry_overhead = True
+    if side == 'SHORT' and (not short_above_low) and clean_space_to_tp > 0 and clean_space_to_tp <= 0.45 and weak_follow and (not tp1_threatened):
+        short_above_low = True
+        entry_overhead = True
 
     secondary = []
     missed = []
