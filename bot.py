@@ -3969,6 +3969,9 @@ def _loss_diag_chart_visible_lines(analysis: dict, side: str) -> list[str]:
             'RR выглядел формально нормальный, но location был плохой',
             'это не чистый breakout, а попытка купить слабый demand против структуры',
         ])
+        if analysis.get('bearish_context_before_entry'):
+            lines.append('перед входом уже был bearish displacement / BOS вниз')
+            lines.append('bullish reclaim перед LONG не появился')
         if analysis.get('demand_near_tfs'):
             try:
                 lines.append('buyer zone / demand был рядом на TF: ' + '/'.join([str(x) for x in list(analysis.get('demand_near_tfs') or [])]))
@@ -3990,6 +3993,9 @@ def _loss_diag_chart_visible_lines(analysis: dict, side: str) -> list[str]:
             'RR выглядел формально нормальный, но location был плохой',
             'это не чистый SHORT, а попытка шортить слабую supply против bullish-структуры',
         ])
+        if analysis.get('bullish_context_before_entry'):
+            lines.append('перед входом уже был bullish reclaim / impulse вверх')
+            lines.append('bearish reclaim перед SHORT не появился')
         if analysis.get('supply_near_tfs'):
             try:
                 lines.append('seller zone / supply был рядом на TF: ' + '/'.join([str(x) for x in list(analysis.get('supply_near_tfs') or [])]))
@@ -4316,7 +4322,7 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
         ])
         if bool(analysis.get('overhead_bearish_fvg') or analysis.get('supply_near_tfs')):
             secondary.append('overhead_bearish_fvg')
-    elif side == 'SHORT' and failed_supply_short and not short_above_low:
+    elif side == 'SHORT' and failed_supply_short:
         primary = 'short_failed_supply_bullish_structure'
         scenario = 'failed_supply_scenario'
         missed.extend(['require_bearish_reclaim', 'avoid_failed_supply_short'])
@@ -4921,6 +4927,115 @@ def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: s
                 analysis['overhead_bearish_fvg'] = True
 
 
+def _loss_diag_apply_fast_context_flags(analysis: dict, *, side: str) -> None:
+    """Directional fallback for very fast SL losses.
+
+    If a trade closes by SL before TP1 and candle/snapshot context is thin,
+    use the last pre-entry candles + post-entry failure metrics to avoid a
+    generic "Breakout trap" card. This does not read screenshots; it derives
+    the scenario from OHLCV context saved in close_analysis_json.
+    """
+    if not isinstance(analysis, dict):
+        return
+    side_u = str(side or analysis.get('side') or '').upper().strip()
+    if side_u not in ('LONG', 'SHORT'):
+        return
+
+    def _f(key: str, default: float = 0.0) -> float:
+        try:
+            val = analysis.get(key)
+            if val is None or val == '':
+                return default
+            return float(val)
+        except Exception:
+            return default
+
+    def _i(key: str, default: int = 0) -> int:
+        try:
+            val = analysis.get(key)
+            if val is None or val == '':
+                return default
+            return int(float(val))
+        except Exception:
+            return default
+
+    duration_min = _i('duration_min')
+    bars_to_failure = _i('bars_to_failure') or _i('bars_to_sl')
+    fast_loss = bool(
+        analysis.get('fast_invalidation')
+        or analysis.get('immediate_invalidation')
+        or (duration_min > 0 and duration_min <= 12)
+        or (bars_to_failure > 0 and bars_to_failure <= 3)
+    )
+    tp1_threatened = bool(analysis.get('tp1_threatened'))
+    weak_after_entry = bool(
+        analysis.get('weak_followthrough')
+        or analysis.get('no_post_entry_expansion')
+        or analysis.get('zone_reaction_too_weak')
+        or not analysis.get('continuation_seen')
+        or not tp1_threatened
+    )
+    if not (fast_loss and weak_after_entry and not tp1_threatened):
+        return
+
+    local6 = _f('local_pre_move_6_pct')
+    local12 = _f('local_pre_move_12_pct')
+    local24 = _f('local_pre_move_24_pct')
+    pre_move = _f('pre_entry_move_pct')
+    bullish12 = _i('pre_bullish_candles_12')
+    bearish12 = _i('pre_bearish_candles_12')
+    close_vs_ema = str(analysis.get('pre_close_vs_ema20') or '').lower().strip()
+    entry_pos = _f('entry_position_in_prior_range', _f('entry_position_in_range', 0.5))
+
+    # LONG mirror: quick SL after bearish context means failed demand / no reclaim.
+    bearish_context = bool(
+        local6 <= -0.18
+        or local12 <= -0.30
+        or local24 <= -0.45
+        or pre_move <= -0.65
+        or bearish12 >= bullish12 + 2
+        or close_vs_ema == 'below'
+        or str(analysis.get('structure_5m') or '').lower().startswith('bearish')
+        or analysis.get('structure_against_trade')
+    )
+    if side_u == 'LONG' and bearish_context:
+        analysis['long_failed_demand_bearish_structure'] = True
+        analysis['failed_demand_reaction'] = True
+        analysis['long_against_bearish_structure'] = True
+        analysis['bearish_context_before_entry'] = True
+        analysis['reclaim_missing'] = True
+        analysis['entry_snapshot_inferred_from_fast_loss'] = True
+        if entry_pos <= 0.55 or analysis.get('demand_near_tfs') or analysis.get('long_demand_near_entry'):
+            analysis['long_demand_near_entry'] = True
+        if analysis.get('supply_near_tfs') or local6 < 0 or local12 < 0:
+            analysis['overhead_bearish_fvg'] = bool(analysis.get('overhead_bearish_fvg') or analysis.get('supply_near_tfs'))
+        return
+
+    # SHORT mirror: quick SL after bullish reclaim/impulse means failed supply / short into buyer pressure.
+    bullish_context = bool(
+        local6 >= 0.18
+        or local12 >= 0.30
+        or local24 >= 0.45
+        or pre_move >= 0.65
+        or bullish12 >= bearish12 + 2
+        or close_vs_ema == 'above'
+        or str(analysis.get('structure_5m') or '').lower().startswith('bullish')
+        or analysis.get('structure_against_trade')
+    )
+    if side_u == 'SHORT' and bullish_context:
+        analysis['short_failed_supply_bullish_structure'] = True
+        analysis['failed_supply_reaction'] = True
+        analysis['short_against_bullish_structure'] = True
+        analysis['bullish_context_before_entry'] = True
+        analysis['bearish_reclaim_missing'] = True
+        analysis['entry_snapshot_inferred_from_fast_loss'] = True
+        if entry_pos >= 0.35 or analysis.get('supply_near_tfs') or analysis.get('short_supply_near_entry'):
+            analysis['short_supply_near_entry'] = True
+        if analysis.get('demand_near_tfs') or local6 > 0 or local12 > 0:
+            analysis['underlying_bullish_fvg'] = bool(analysis.get('underlying_bullish_fvg') or analysis.get('demand_near_tfs'))
+        return
+
+
 async def _signal_forensics_entry_snapshot_async(sig) -> dict:
     """Build entry_snapshot_json using candles from 5m/15m/30m/1h at signal emit time."""
     snap = _signal_forensics_entry_snapshot(sig)
@@ -5174,7 +5289,11 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
         else:
             ts = pd.Series([pd.NaT] * len(d))
         d['_ts'] = ts
-        d = d[(d['_ts'].notna()) & (d['_ts'] >= (opened - dt.timedelta(hours=8))) & (d['_ts'] <= (closed + dt.timedelta(minutes=10)))].copy()
+        # Keep a buffer before opened_at because fast SL losses can open and close inside
+        # the same 5m candle. Without this, post-entry analysis may be empty and the
+        # LOSS card falls back to a generic reason.
+        _post_tf_minutes = 5
+        d = d[(d['_ts'].notna()) & (d['_ts'] >= (opened - dt.timedelta(hours=8))) & (d['_ts'] <= (closed + dt.timedelta(minutes=10 + _post_tf_minutes)))].copy()
         if d.empty:
             analysis['fast_invalidation'] = bool(int(analysis['duration_min']) <= 15)
             return analysis
@@ -5208,6 +5327,24 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
             pre_last = float(pc.iloc[-1]) if len(pc) else entry
             pre_move_pct = ((pre_last - pre_first) / max(pre_first, 1e-9)) * 100.0
             analysis['pre_entry_move_pct'] = round(pre_move_pct, 2)
+            # Local pre-entry direction is more important than the whole 6h window
+            # for very fast SL losses (2-7 minutes). It detects bullish reclaim
+            # before SHORT and bearish breakdown before LONG.
+            for _bars in (6, 12, 24):
+                if len(pc) >= _bars:
+                    _first = float(pc.tail(_bars).iloc[0])
+                    _last = float(pc.tail(_bars).iloc[-1])
+                    analysis[f'local_pre_move_{_bars}_pct'] = round(((_last - _first) / max(_first, 1e-9)) * 100.0, 2)
+            try:
+                _last12 = pre.tail(min(12, len(pre))).copy()
+                if not _last12.empty:
+                    analysis['pre_bullish_candles_12'] = int((_last12['close'].astype(float) > _last12['open'].astype(float)).sum())
+                    analysis['pre_bearish_candles_12'] = int((_last12['close'].astype(float) < _last12['open'].astype(float)).sum())
+                _ema20_pre = pc.ewm(span=20, adjust=False).mean()
+                if len(_ema20_pre):
+                    analysis['pre_close_vs_ema20'] = 'above' if float(pc.iloc[-1]) >= float(_ema20_pre.iloc[-1]) else 'below'
+            except Exception:
+                pass
             if side == 'LONG':
                 clean_space_tp1_pct = ((tp1 - entry) / entry) * 100.0 if tp1 > entry else 0.0
                 analysis['clean_space_to_tp1_pct'] = round(clean_space_tp1_pct, 2)
@@ -5226,7 +5363,12 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
                 analysis['entry_near_opposite_zone'] = bool(analysis.get('entry_near_opposite_zone') or analysis.get('entry_into_demand'))
                 analysis['late_entry_after_exhausted_move'] = bool(analysis.get('late_entry_after_exhausted_move') or (pre_move_pct < -0.65 and entry_pos <= 0.40))
 
-        post = d[d['_ts'] >= opened].copy()
+        # Include the candle that contains opened_at. For a 2-7 minute SL, the
+        # whole trade often happens inside one 5m candle; using only candles with
+        # open_time >= opened_at drops the important failure candle.
+        post = d[d['_ts'] >= (opened - dt.timedelta(minutes=_post_tf_minutes))].copy()
+        if post.empty:
+            post = d[d['_ts'] >= opened].copy()
         if post.empty:
             post = d.copy()
         highs = post['high'].astype(float)
@@ -5323,6 +5465,10 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
         analysis['confirm_too_weak'] = bool(first_push_pct < 0.15 and bars <= 4)
         analysis['retest_too_deep'] = bool(against_move_pct > max(abs(first_push_pct) * 1.1, 0.12))
         analysis['late_entry_inside_expansion'] = bool(bars <= 3 and abs(float(analysis['mae_pct'])) > abs(float(analysis['mfe_pct'])) and abs(float(analysis['mfe_pct'])) < 0.18)
+        try:
+            _loss_diag_apply_fast_context_flags(analysis, side=side)
+        except Exception:
+            pass
         analysis['origin_not_held'] = bool(route_key == 'smc_displacement_origin' and structure_against)
         analysis['displacement_too_weak'] = bool(route_key == 'smc_displacement_origin' and first_push_pct < 0.18)
         analysis['stacked_fvg_not_held'] = bool(route_key == 'smc_dual_fvg_origin' and structure_against)
@@ -5371,6 +5517,7 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
 
         try:
             _loss_diag_apply_snapshot_context(analysis, snapshot, side=side, entry=entry, tp1=tp1, sl=sl)
+            _loss_diag_apply_fast_context_flags(analysis, side=side)
         except Exception:
             pass
 
@@ -5782,6 +5929,9 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
             'RR выглядел формально нормальный, но location был плохой',
             'это не чистый SHORT, а попытка шортить слабую supply против bullish-структуры',
         ]
+        if analysis.get('bullish_context_before_entry'):
+            visible_lines.insert(0, 'перед входом уже был bullish reclaim / impulse вверх')
+            visible_lines.insert(1, 'bearish reclaim перед SHORT не появился')
         secondary_labels = [
             'Short against bullish structure',
             'Failed supply reaction',
@@ -5830,6 +5980,9 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
             'RR выглядел формально нормальный, но location был плохой',
             'это не чистый breakout, а попытка купить слабый demand против структуры',
         ]
+        if analysis.get('bearish_context_before_entry'):
+            visible_lines.insert(0, 'перед входом уже был bearish displacement / BOS вниз')
+            visible_lines.insert(1, 'bullish reclaim перед LONG не появился')
         secondary_labels = [
             'Long against bearish structure',
             'Failed demand reaction',
@@ -6030,7 +6183,16 @@ async def _send_closed_signal_report_card(t: dict, *, final_status: str, pnl_tot
     if not chat_ids:
         return
     try:
-        text = _build_closed_signal_report_card(t, final_status=str(final_status or "CLOSED"), pnl_total_pct=float(pnl_total_pct or 0.0), closed_at=closed_at)
+        _row_for_report = dict(t or {})
+        # Safety net: every LOSS card must have candle-based close_analysis_json.
+        # Some manual/legacy close paths can call this sender without precomputed
+        # analysis, which previously produced the same generic Breakout trap text.
+        if str(final_status or '').upper().strip() == 'LOSS' and not _row_for_report.get('close_analysis_json'):
+            try:
+                _row_for_report['close_analysis_json'] = await _loss_diag_build_close_analysis(_row_for_report, closed_at=closed_at)
+            except Exception:
+                logger.exception('[report-bot] close analysis backfill failed')
+        text = _build_closed_signal_report_card(_row_for_report, final_status=str(final_status or "CLOSED"), pnl_total_pct=float(pnl_total_pct or 0.0), closed_at=closed_at)
     except Exception:
         logger.exception("[report-bot] failed to build closed signal card")
         return
