@@ -3807,6 +3807,9 @@ def _loss_diag_improve_label(key: str) -> str:
         'require_bullish_reclaim': 'для LONG требовать bullish reclaim перед входом',
         'avoid_failed_demand_long': 'не покупать demand после bearish BOS без reclaim',
         'avoid_overhead_bearish_fvg': 'не брать LONG, если сверху stacked bearish FVG',
+        'avoid_failed_supply_short': 'не шортить supply после bullish BOS без bearish reclaim',
+        'require_bearish_reclaim': 'для SHORT требовать bearish reclaim перед входом',
+        'avoid_underlying_bullish_fvg': 'не брать SHORT, если снизу stacked bullish FVG / demand',
     }
     return mapping.get(str(key or '').strip(), str(key or '').strip())
 
@@ -3839,6 +3842,11 @@ def _loss_diag_reason_human_label(code: str) -> str:
         'failed_demand_reaction': 'Failed demand reaction',
         'long_against_bearish_structure': 'Long against bearish structure',
         'overhead_bearish_fvg': 'Overhead bearish FVG / supply',
+        'short_failed_supply_bullish_structure': 'Short into bullish BOS / failed supply',
+        'failed_supply_scenario': 'Failed supply under bullish structure',
+        'failed_supply_reaction': 'Failed supply reaction',
+        'short_against_bullish_structure': 'Short against bullish structure',
+        'underlying_bullish_fvg': 'Underlying bullish FVG / demand',
         'displacement_failed': 'Displacement failed',
         'origin_not_held': 'Origin did not hold',
         'impulse_died_fast': 'Impulse died fast',
@@ -3909,6 +3917,11 @@ def _loss_diag_format_reason_text(code: str, fallback: str = '') -> str:
         'failed_demand_reaction': 'Failed demand reaction: buyer zone не дала нормальной реакции после входа и быстро была продавлена.',
         'long_against_bearish_structure': 'Long against bearish structure: LONG был открыт против активной bearish-структуры без подтверждённого bullish reclaim.',
         'overhead_bearish_fvg': 'Overhead bearish FVG / supply: над входом оставались seller imbalance / FVG зоны, которые давили на LONG.',
+        'short_failed_supply_bullish_structure': 'Short into bullish BOS / failed supply: SHORT был открыт после bullish BOS/CHoCH рядом с уже ослабленной supply. Продавец не сделал bearish reclaim/continuation, поэтому seller zone быстро сломалась.',
+        'failed_supply_scenario': 'SHORT был открыт после того, как рынок уже перешёл в bullish-структуру. Цена находилась рядом с seller zone, но снизу уже давили bullish FVG / demand зоны. Продавец не смог сделать bearish reclaim и continuation, поэтому supply быстро сломался.',
+        'failed_supply_reaction': 'Failed supply reaction: seller zone не дала нормальной реакции после входа и быстро была выкуплена.',
+        'short_against_bullish_structure': 'Short against bullish structure: SHORT был открыт против активной bullish-структуры без подтверждённого bearish reclaim.',
+        'underlying_bullish_fvg': 'Underlying bullish FVG / demand: под входом оставались buyer imbalance / FVG зоны, которые поддерживали цену против SHORT.',
         'displacement_failed': 'Displacement failed: displacement оказался слабым, origin не дал продолжения, импульс быстро умер после входа.',
         'origin_not_held': 'Origin did not hold: ключевая origin-зона не удержала цену после входа и сценарий развалился.',
         'impulse_died_fast': 'Impulse died fast: после входа стартовый импульс быстро затух и цена не смогла продолжить движение по сделке.',
@@ -3964,6 +3977,27 @@ def _loss_diag_chart_visible_lines(analysis: dict, side: str) -> list[str]:
         if analysis.get('supply_near_tfs'):
             try:
                 lines.append('overhead bearish FVG / supply виден на TF: ' + '/'.join([str(x) for x in list(analysis.get('supply_near_tfs') or [])]))
+            except Exception:
+                pass
+    if side_u == 'SHORT' and bool(analysis.get('short_failed_supply_bullish_structure')):
+        lines.extend([
+            'SHORT открыт после bullish BOS / CHoCH вверх',
+            'снизу несколько bullish FVG и demand зон',
+            'структура уже делала higher low / higher high',
+            'вход был рядом с supply, но без подтверждения bearish reclaim',
+            'цена стояла под buyer pressure',
+            'supply/FVG сверху был уже слабый',
+            'RR выглядел формально нормальный, но location был плохой',
+            'это не чистый SHORT, а попытка шортить слабую supply против bullish-структуры',
+        ])
+        if analysis.get('supply_near_tfs'):
+            try:
+                lines.append('seller zone / supply был рядом на TF: ' + '/'.join([str(x) for x in list(analysis.get('supply_near_tfs') or [])]))
+            except Exception:
+                pass
+        if analysis.get('demand_near_tfs'):
+            try:
+                lines.append('underlying bullish FVG / demand виден на TF: ' + '/'.join([str(x) for x in list(analysis.get('demand_near_tfs') or [])]))
             except Exception:
                 pass
     if side_u == 'SHORT' and bool(analysis.get('short_above_weak_low')):
@@ -4102,6 +4136,19 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
         analysis['long_failed_demand_bearish_structure'] = True
         analysis['failed_demand_reaction'] = True
         analysis['long_against_bearish_structure'] = True
+
+    failed_supply_short = bool(analysis.get('short_failed_supply_bullish_structure'))
+    if side == 'SHORT' and not failed_supply_short:
+        failed_supply_short = bool(
+            (analysis.get('short_supply_near_entry') or analysis.get('supply_near_tfs'))
+            and (structure_against or analysis.get('level_reclaimed_back') or analysis.get('reclaim_lost_back'))
+            and (weak_follow or no_expansion or analysis.get('zone_reaction_too_weak'))
+            and (not tp1_threatened)
+        )
+    if failed_supply_short:
+        analysis['short_failed_supply_bullish_structure'] = True
+        analysis['failed_supply_reaction'] = True
+        analysis['short_against_bullish_structure'] = True
 
     secondary = []
     missed = []
@@ -4269,6 +4316,29 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
         ])
         if bool(analysis.get('overhead_bearish_fvg') or analysis.get('supply_near_tfs')):
             secondary.append('overhead_bearish_fvg')
+    elif side == 'SHORT' and failed_supply_short and not short_above_low:
+        primary = 'short_failed_supply_bullish_structure'
+        scenario = 'failed_supply_scenario'
+        missed.extend(['require_bearish_reclaim', 'avoid_failed_supply_short'])
+        if bool(analysis.get('underlying_bullish_fvg') or analysis.get('demand_near_tfs')):
+            missed.append('avoid_underlying_bullish_fvg')
+        happened = [
+            'цена не смогла продолжить sell-side движение',
+            'seller zone не удержала',
+            'после входа не было displacement вниз',
+            'покупатель продолжил buy-side движение',
+            'SL был выбит почти сразу',
+        ] + happened
+        secondary.extend([
+            'short_against_bullish_structure',
+            'failed_supply_reaction',
+            'no_post_entry_expansion',
+            'weak_followthrough',
+            'tp1_never_threatened',
+            'continuation_missing',
+        ])
+        if bool(analysis.get('underlying_bullish_fvg') or analysis.get('demand_near_tfs')):
+            secondary.append('underlying_bullish_fvg')
     elif side == 'SHORT' and (short_above_low or (entry_overhead and bad_range_location)):
         primary = 'short_above_weak_low'
         scenario = 'short_into_demand_scenario'
@@ -4773,11 +4843,15 @@ def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: s
         cs = 0.0
 
     if side_u == 'SHORT':
+        if supply_hits:
+            analysis['short_supply_near_entry'] = True
+            analysis['supply_near_tfs'] = list(dict.fromkeys(supply_hits))
         if demand_hits:
+            analysis['demand_near_tfs'] = list(dict.fromkeys(demand_hits))
+            analysis['underlying_bullish_fvg'] = True
             analysis['short_above_weak_low'] = True
             analysis['entry_into_demand'] = True
             analysis['entry_near_opposite_zone'] = True
-            analysis['demand_near_tfs'] = list(dict.fromkeys(demand_hits))
             analysis['entry_in_range_premium'] = True
         elif entry_positions:
             lowish = any(ep <= 0.35 for _, ep in entry_positions)
@@ -4788,6 +4862,23 @@ def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: s
                 analysis['entry_in_range_premium'] = True
         if pre_moves and min(pre_moves) < -0.45:
             analysis['late_entry_after_exhausted_move'] = True
+
+        # Failed-supply SHORT pattern: sell from supply after market already shifted bullish.
+        # This is the SHORT mirror of ANIMEUSDT-type failed-demand LONG.
+        bullish_after_entry = bool(analysis.get('structure_against_trade') or analysis.get('level_reclaimed_back') or analysis.get('reclaim_lost_back'))
+        weak_after_entry = bool(analysis.get('weak_followthrough') or analysis.get('no_post_entry_expansion') or analysis.get('zone_reaction_too_weak') or (analysis.get('tp1_threatened') is False))
+        highish_entry = False
+        try:
+            highish_entry = any(float(ep) >= 0.55 for _, ep in entry_positions)
+        except Exception:
+            highish_entry = False
+        if bullish_after_entry and weak_after_entry and (supply_hits or highish_entry):
+            analysis['short_failed_supply_bullish_structure'] = True
+            analysis['failed_supply_reaction'] = True
+            analysis['short_against_bullish_structure'] = True
+            analysis['short_supply_near_entry'] = bool(analysis.get('short_supply_near_entry') or supply_hits or highish_entry)
+            if demand_hits:
+                analysis['underlying_bullish_fvg'] = True
     elif side_u == 'LONG':
         if demand_hits:
             analysis['long_demand_near_entry'] = True
@@ -5357,6 +5448,12 @@ def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str, clo
         improve_keys.append('tighten_trend_alignment')
         if analysis.get('overhead_bearish_fvg') or analysis.get('supply_near_tfs'):
             improve_keys.append('avoid_overhead_bearish_fvg')
+    if analysis.get('short_failed_supply_bullish_structure') or analysis.get('failed_supply_reaction'):
+        improve_keys.append('avoid_failed_supply_short')
+        improve_keys.append('require_bearish_reclaim')
+        improve_keys.append('tighten_trend_alignment')
+        if analysis.get('underlying_bullish_fvg') or analysis.get('demand_near_tfs'):
+            improve_keys.append('avoid_underlying_bullish_fvg')
     improve_keys = list(dict.fromkeys(improve_keys))
 
     reason_code = str(forensic.get('primary_reason_code') or '').strip()
@@ -5587,6 +5684,8 @@ def _loss_card_short_reason_title(code: str, text: str = '') -> str:
         'immediate_invalidation': 'Immediate invalidation after entry',
         'long_failed_demand_bearish_structure': 'Long into bearish BOS / failed demand',
         'failed_demand_reaction': 'Long into bearish BOS / failed demand',
+        'short_failed_supply_bullish_structure': 'Short into bullish BOS / failed supply',
+        'failed_supply_reaction': 'Short into bullish BOS / failed supply',
     }
     if code in mapping:
         return mapping[code]
@@ -5605,7 +5704,8 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
     code = str(loss_diag.get('primary_reason_code') or loss_diag.get('reason_code') or '').strip()
     primary_text = _loss_card_short_reason_title(code, str(loss_diag.get('primary_reason_text') or loss_diag.get('reason_text') or ''))
 
-    short_demand = side == 'SHORT' and (code in {'short_above_weak_low', 'entry_into_demand'} or bool(analysis.get('short_above_weak_low') or analysis.get('entry_into_demand')))
+    short_failed_supply = side == 'SHORT' and (code in {'short_failed_supply_bullish_structure', 'failed_supply_reaction'} or bool(analysis.get('short_failed_supply_bullish_structure') or analysis.get('failed_supply_reaction')))
+    short_demand = side == 'SHORT' and (not short_failed_supply) and (code in {'short_above_weak_low', 'entry_into_demand'} or bool(analysis.get('short_above_weak_low') or analysis.get('entry_into_demand')))
     long_failed_demand = side == 'LONG' and (code in {'long_failed_demand_bearish_structure', 'failed_demand_reaction'} or bool(analysis.get('long_failed_demand_bearish_structure') or analysis.get('failed_demand_reaction')))
     long_supply = side == 'LONG' and (code in {'long_below_strong_high', 'entry_into_supply', 'entry_into_overhead_supply'} or bool(analysis.get('long_below_strong_high') or analysis.get('entry_into_supply') or analysis.get('entry_into_overhead_supply')))
 
@@ -5653,6 +5753,54 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         secondary_labels = ['Late entry', 'Short into demand', 'Weak downside continuation', 'Poor RR location', 'Sell-side exhaustion']
         improve_labels = ['не шортить прямо в strong low', 'избегать входа в discount area', 'ждать premium re-entry выше']
         primary_text = 'Short entered directly into demand'
+    elif short_failed_supply:
+        scenario_text = (
+            'SHORT был открыт после того, как рынок уже перешёл в bullish-структуру. '
+            'Цена находилась рядом с seller zone, но снизу уже давили bullish FVG / demand зоны. '
+            'Продавец не смог сделать bearish reclaim и continuation, поэтому supply быстро сломался.'
+        )
+        analysis_lines.extend([
+            'bearish follow-through отсутствовал',
+            'supply reaction не появилась',
+            'цена сразу ушла против позиции',
+            'TP1 не был нормально поставлен под угрозу',
+        ])
+        happened_lines = [
+            'цена не смогла закрепиться ниже зоны входа',
+            'seller zone не удержала',
+            'после входа не было displacement вниз',
+            'покупатель продолжил buy-side движение',
+            'SL был выбит почти сразу',
+        ]
+        visible_lines = [
+            'SHORT открыт после bullish BOS / CHoCH вверх',
+            'снизу несколько bullish FVG и demand зон',
+            'структура уже делала higher low / higher high',
+            'вход был рядом с supply, но без подтверждения bearish reclaim',
+            'цена стояла под buyer pressure',
+            'supply/FVG сверху был уже слабый',
+            'RR выглядел формально нормальный, но location был плохой',
+            'это не чистый SHORT, а попытка шортить слабую supply против bullish-структуры',
+        ]
+        secondary_labels = [
+            'Short against bullish structure',
+            'Failed supply reaction',
+            'No bearish displacement',
+            'Underlying bullish FVG',
+            'Weak follow-through',
+            'TP1 was never threatened',
+            'Invalidation happened too fast',
+            'Continuation missing',
+        ]
+        improve_labels = [
+            'не брать SHORT после bullish BOS без bearish reclaim',
+            'требовать закрытие ниже локального FVG/demand',
+            'ждать bearish displacement после supply',
+            'не шортить supply, если снизу stacked bullish FVG',
+            'для SHORT требовать structure_15m/30m bearish',
+            'если SL выбивается за 1–3 минуты — считать setup trap/catching falling knife',
+        ]
+        primary_text = 'Short into bullish BOS / failed supply'
     elif long_failed_demand:
         scenario_text = (
             'LONG был открыт после того, как рынок уже перешёл в bearish-структуру. '
@@ -5742,6 +5890,21 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         analysis_lines = [str(x) for x in list(loss_diag.get('analysis_lines') or []) if str(x).strip()]
     if not visible_lines:
         visible_lines = [str(x) for x in list(loss_diag.get('chart_visible_lines') or []) if str(x).strip()]
+    if not visible_lines:
+        if side == 'SHORT':
+            visible_lines = [
+                'SHORT не получил clean sell-side continuation после входа',
+                'цена быстро вернулась против направления сделки',
+                'bearish displacement после входа не появился',
+                'TP1 не был нормально поставлен под угрозу',
+            ]
+        else:
+            visible_lines = [
+                'LONG не получил clean buy-side continuation после входа',
+                'цена быстро вернулась против направления сделки',
+                'bullish displacement после входа не появился',
+                'TP1 не был нормально поставлен под угрозу',
+            ]
     if not secondary_labels:
         secondary_labels = [str(x) for x in list(loss_diag.get('secondary_reason_labels') or []) if str(x).strip()]
     if not improve_labels:
