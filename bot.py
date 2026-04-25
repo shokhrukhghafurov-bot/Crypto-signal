@@ -3533,11 +3533,19 @@ def _loss_diag_route_title(route_key: str) -> str:
 
 
 def _loss_diag_route_key_from_row(row: dict) -> str:
+    snap = {}
+    try:
+        snap = _loss_diag_load_entry_snapshot(row)
+    except Exception:
+        snap = {}
     for candidate in (
         row.get('emit_route'),
         row.get('smc_setup_route'),
         row.get('setup_route'),
         row.get('route_key'),
+        (snap.get('route_key') if isinstance(snap, dict) else None),
+        (snap.get('smc_setup_route') if isinstance(snap, dict) else None),
+        (snap.get('emit_route') if isinstance(snap, dict) else None),
     ):
         raw = str(candidate or '').strip()
         if raw.startswith('smc_'):
@@ -3860,6 +3868,9 @@ def _loss_diag_reason_human_label(code: str) -> str:
         'reclaim_without_acceptance': 'Reclaim had no acceptance',
         'origin_impulse_not_clean': 'Origin impulse was not clean',
         'entry_into_overhead_supply': 'Entry into overhead supply',
+        'entry_into_supply': 'Entry into supply / seller zone',
+        'entry_into_demand': 'Entry into demand / buyer zone',
+        'entry_near_opposite_zone': 'Entry too close to opposite reaction zone',
         'long_below_strong_high': 'Long entered directly into supply / Strong High',
         'short_above_weak_low': 'Short entered directly into demand / Strong Low',
         'short_into_demand_scenario': 'Late SHORT into buyer zone',
@@ -3903,6 +3914,9 @@ def _loss_diag_format_reason_text(code: str, fallback: str = '') -> str:
         'failed_reclaim_hold': 'Failed reclaim hold: reclaim был показан, но рынок не смог закрепиться по правильную сторону уровня.',
         'breakout_trap': 'Breakout trap: пробой быстро вернулся обратно за уровень, поэтому continuation оказался ложным.',
         'entry_into_overhead_supply': 'Entry into overhead supply: LONG был открыт прямо под зоной продавца / red FVG / supply. Сверху не было чистого пространства до TP, поэтому цена быстро получила sell pressure и ушла к SL.',
+        'entry_into_supply': 'Entry into supply: LONG был открыт прямо под seller zone / Strong High. Сверху не было чистого пространства до TP, поэтому вероятность rejection вниз была высокой.',
+        'entry_into_demand': 'Entry into demand: SHORT был открыт прямо над buyer zone / Strong Low. Снизу не было чистого пространства до TP, поэтому вероятность bounce вверх была высокой.',
+        'entry_near_opposite_zone': 'Entry too close to opposite reaction zone: вход был рядом с зоной, откуда цена могла сразу отреагировать против сделки.',
         'long_below_strong_high': 'Long entered directly into supply: LONG был открыт слишком высоко, прямо под seller zone / Strong High. Цена уже находилась в зоне реакции продавцов, поэтому upside был ограничен, а вероятность rejection вниз была высокой.',
         'short_above_weak_low': 'Short entered directly into demand: SHORT был открыт слишком низко, прямо над buyer zone / Strong Low. Цена уже находилась в зоне реакции покупателей, поэтому downside был ограничен, а вероятность bounce вверх была высокой.',
         'short_into_demand_scenario': 'SHORT был открыт слишком низко, прямо над buyer zone и Strong/Weak Low. Цена уже находилась в зоне реакции покупателей, поэтому downside был ограничен, а вероятность bounce вверх была высокой.',
@@ -4013,9 +4027,10 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
     volume_faded = bool(analysis.get('post_entry_volume_faded'))
     multiple_failed_pushes = bool(analysis.get('multiple_failed_pushes'))
     side = str(src.get('side') or analysis.get('side') or 'LONG').upper().strip() or 'LONG'
-    entry_overhead = bool(analysis.get('entry_into_overhead_supply'))
-    long_below_high = bool(analysis.get('long_below_strong_high'))
-    short_above_low = bool(analysis.get('short_above_weak_low'))
+    long_below_high = bool(analysis.get('long_below_strong_high') or analysis.get('entry_into_supply'))
+    short_above_low = bool(analysis.get('short_above_weak_low') or analysis.get('entry_into_demand'))
+    entry_overhead = bool((side == 'LONG') and (analysis.get('entry_into_overhead_supply') or analysis.get('entry_into_supply') or long_below_high))
+    entry_opposite_zone = bool(analysis.get('entry_near_opposite_zone') or long_below_high or short_above_low)
     bad_range_location = bool(analysis.get('entry_in_range_premium'))
     late_exhausted = bool(analysis.get('late_entry_after_exhausted_move') or analysis.get('late_entry_inside_expansion'))
     try:
@@ -4029,13 +4044,17 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
     if side == 'LONG' and (not long_below_high) and clean_space_to_tp > 0 and clean_space_to_tp <= 0.45 and weak_follow and (not tp1_threatened):
         long_below_high = True
         entry_overhead = True
+        entry_opposite_zone = True
         analysis['long_below_strong_high'] = True
+        analysis['entry_into_supply'] = True
         analysis['entry_into_overhead_supply'] = True
+        analysis['entry_near_opposite_zone'] = True
     if side == 'SHORT' and (not short_above_low) and clean_space_to_tp > 0 and clean_space_to_tp <= 0.45 and weak_follow and (not tp1_threatened):
         short_above_low = True
-        entry_overhead = True
+        entry_opposite_zone = True
         analysis['short_above_weak_low'] = True
-        analysis['entry_into_overhead_supply'] = True
+        analysis['entry_into_demand'] = True
+        analysis['entry_near_opposite_zone'] = True
 
     secondary = []
     missed = []
@@ -4080,7 +4099,10 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
         happened.append('LONG был открыт прямо под strong high / liquidity pool')
     if short_above_low:
         secondary.append('short_above_weak_low')
-        happened.append('SHORT был открыт прямо над weak low / support liquidity')
+        happened.append('SHORT был открыт прямо над weak low / demand liquidity')
+    if entry_opposite_zone and not (entry_overhead or long_below_high or short_above_low):
+        secondary.append('entry_near_opposite_zone')
+        happened.append('вход был слишком близко к противоположной зоне реакции')
     if bad_range_location:
         secondary.append('entry_in_range_premium')
     if late_exhausted:
@@ -4524,6 +4546,102 @@ def _loss_diag_build_tf_snapshot_from_df(df, *, entry: float, side: str, tf: str
         return {}
 
 
+def _loss_diag_enrich_entry_snapshot_from_tfs(snapshot: dict, *, side: str = '') -> dict:
+    """Add a stable root summary to entry_snapshot_json from all configured TF snapshots.
+
+    Detailed candle facts stay under tf_snapshots[5m/15m/30m/1h].
+    Root fields make DB inspection and close-analysis deterministic for every
+    base setup and every SMC route.
+    """
+    if not isinstance(snapshot, dict):
+        return {}
+    tfs = snapshot.get('tf_snapshots')
+    if not isinstance(tfs, dict) or not tfs:
+        return snapshot
+    side_u = str(side or snapshot.get('direction') or '').upper().strip()
+    ordered = [tf for tf in ('5m', '15m', '30m', '1h') if isinstance(tfs.get(tf), dict) and tfs.get(tf)]
+    if ordered:
+        snapshot['loss_diag_timeframes'] = ordered
+    preferred_tf = None
+    for name in ('15m', '30m', '1h', '5m'):
+        if name in ordered:
+            preferred_tf = name
+            break
+    base = tfs.get(preferred_tf or (ordered[0] if ordered else ''), {}) if ordered else {}
+    if isinstance(base, dict) and base:
+        for dst, src_key in {
+            'range_high': 'range_high',
+            'range_low': 'range_low',
+            'entry_position_in_range': 'entry_position_in_range',
+            'distance_to_range_high_pct': 'distance_to_range_high_pct',
+            'distance_to_range_low_pct': 'distance_to_range_low_pct',
+            'pre_entry_move_pct': 'pre_entry_move_pct',
+        }.items():
+            if snapshot.get(dst) in (None, '', [], {}):
+                val = base.get(src_key)
+                if val not in (None, '', [], {}):
+                    snapshot[dst] = val
+        snapshot.setdefault('preferred_snapshot_tf', preferred_tf or '')
+
+    all_fvgs = []
+    demand_hits = []
+    supply_hits = []
+    for tf in ordered:
+        one = tfs.get(tf)
+        if not isinstance(one, dict):
+            continue
+        dz = one.get('demand_zone') if isinstance(one.get('demand_zone'), dict) else {}
+        sz = one.get('supply_zone') if isinstance(one.get('supply_zone'), dict) else {}
+        if dz:
+            demand_hits.append(tf)
+            all_fvgs.append(dict(dz, tf=tf))
+        elif one.get('entry_near_demand'):
+            demand_hits.append(tf)
+        if sz:
+            supply_hits.append(tf)
+            all_fvgs.append(dict(sz, tf=tf))
+        elif one.get('entry_near_supply'):
+            supply_hits.append(tf)
+    if demand_hits:
+        snapshot['demand_near_entry_tfs'] = list(dict.fromkeys(demand_hits))
+        if snapshot.get('nearest_demand_zone') in (None, '', [], {}):
+            for z in all_fvgs:
+                if str(z.get('side') or '').lower() == 'demand':
+                    snapshot['nearest_demand_zone'] = z
+                    break
+    if supply_hits:
+        snapshot['supply_near_entry_tfs'] = list(dict.fromkeys(supply_hits))
+        if snapshot.get('nearest_supply_zone') in (None, '', [], {}):
+            for z in all_fvgs:
+                if str(z.get('side') or '').lower() == 'supply':
+                    snapshot['nearest_supply_zone'] = z
+                    break
+    if all_fvgs:
+        snapshot['fvg_zones_near_entry'] = all_fvgs[:12]
+
+    # Conservative candidates for DB/debug. Explicit SMC levels from Signal/meta are not overwritten.
+    try:
+        rh = _loss_diag_parse_float(snapshot.get('range_high'))
+        rl = _loss_diag_parse_float(snapshot.get('range_low'))
+        if rh is not None and rl is not None and rh > rl:
+            if side_u == 'LONG':
+                snapshot.setdefault('bos_level_candidate', rh)
+                snapshot.setdefault('reclaim_level_candidate', rh)
+                snapshot.setdefault('sweep_level_candidate', rl)
+                snapshot.setdefault('origin_level_candidate', rl)
+            elif side_u == 'SHORT':
+                snapshot.setdefault('bos_level_candidate', rl)
+                snapshot.setdefault('reclaim_level_candidate', rl)
+                snapshot.setdefault('sweep_level_candidate', rh)
+                snapshot.setdefault('origin_level_candidate', rh)
+            else:
+                snapshot.setdefault('bos_level_candidate', rh)
+                snapshot.setdefault('sweep_level_candidate', rl)
+    except Exception:
+        pass
+    return snapshot
+
+
 def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: str, entry: float, tp1: float, sl: float) -> None:
     """Merge entry_snapshot_json into close analysis and set chart-location flags.
 
@@ -4587,29 +4705,35 @@ def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: s
     if side_u == 'SHORT':
         if demand_hits:
             analysis['short_above_weak_low'] = True
-            analysis['entry_into_overhead_supply'] = True
+            analysis['entry_into_demand'] = True
+            analysis['entry_near_opposite_zone'] = True
             analysis['demand_near_tfs'] = list(dict.fromkeys(demand_hits))
             analysis['entry_in_range_premium'] = True
         elif entry_positions:
             lowish = any(ep <= 0.35 for _, ep in entry_positions)
             if lowish and (cs <= 0.55 or bool(analysis.get('weak_followthrough'))):
                 analysis['short_above_weak_low'] = True
+                analysis['entry_into_demand'] = True
+                analysis['entry_near_opposite_zone'] = True
                 analysis['entry_in_range_premium'] = True
-                analysis['entry_into_overhead_supply'] = True
         if pre_moves and min(pre_moves) < -0.45:
             analysis['late_entry_after_exhausted_move'] = True
     elif side_u == 'LONG':
         if supply_hits:
             analysis['long_below_strong_high'] = True
+            analysis['entry_into_supply'] = True
             analysis['entry_into_overhead_supply'] = True
+            analysis['entry_near_opposite_zone'] = True
             analysis['supply_near_tfs'] = list(dict.fromkeys(supply_hits))
             analysis['entry_in_range_premium'] = True
         elif entry_positions:
             highish = any(ep >= 0.65 for _, ep in entry_positions)
             if highish and (cs <= 0.55 or bool(analysis.get('weak_followthrough'))):
                 analysis['long_below_strong_high'] = True
-                analysis['entry_in_range_premium'] = True
+                analysis['entry_into_supply'] = True
                 analysis['entry_into_overhead_supply'] = True
+                analysis['entry_near_opposite_zone'] = True
+                analysis['entry_in_range_premium'] = True
         if pre_moves and max(pre_moves) > 0.45:
             analysis['late_entry_after_exhausted_move'] = True
 
@@ -4637,6 +4761,7 @@ async def _signal_forensics_entry_snapshot_async(sig) -> dict:
         if tf_snaps:
             snap['tf_snapshots'] = tf_snaps
             snap['loss_diag_timeframes'] = list(tf_snaps.keys())
+            snap = _loss_diag_enrich_entry_snapshot_from_tfs(snap, side=side)
     except Exception:
         pass
     return snap
@@ -4840,7 +4965,10 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
             if tf_snaps:
                 snapshot['tf_snapshots'] = tf_snaps
                 snapshot['loss_diag_timeframes'] = list(tf_snaps.keys())
+                snapshot = _loss_diag_enrich_entry_snapshot_from_tfs(snapshot, side=side)
                 analysis['entry_snapshot_present'] = True
+        else:
+            snapshot = _loss_diag_enrich_entry_snapshot_from_tfs(snapshot, side=side)
         _loss_diag_apply_snapshot_context(analysis, snapshot, side=side, entry=entry, tp1=tp1, sl=sl)
     except Exception:
         pass
@@ -4902,14 +5030,17 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
                 analysis['clean_space_to_tp1_pct'] = round(clean_space_tp1_pct, 2)
                 analysis['entry_in_range_premium'] = bool(analysis.get('entry_in_range_premium') or entry_pos >= 0.68)
                 analysis['long_below_strong_high'] = bool(analysis.get('long_below_strong_high') or (dist_high_pct >= 0 and (dist_high_pct <= max(clean_space_tp1_pct * 1.15, 0.35) or entry_pos >= 0.82)))
-                analysis['entry_into_overhead_supply'] = bool(analysis.get('entry_into_overhead_supply') or analysis.get('long_below_strong_high') or (entry_pos >= 0.72 and clean_space_tp1_pct <= 0.45))
+                analysis['entry_into_supply'] = bool(analysis.get('entry_into_supply') or analysis.get('long_below_strong_high') or (entry_pos >= 0.72 and clean_space_tp1_pct <= 0.45))
+                analysis['entry_into_overhead_supply'] = bool(analysis.get('entry_into_overhead_supply') or analysis.get('entry_into_supply'))
+                analysis['entry_near_opposite_zone'] = bool(analysis.get('entry_near_opposite_zone') or analysis.get('entry_into_supply'))
                 analysis['late_entry_after_exhausted_move'] = bool(analysis.get('late_entry_after_exhausted_move') or (pre_move_pct > 0.65 and entry_pos >= 0.60))
             else:
                 clean_space_tp1_pct = ((entry - tp1) / entry) * 100.0 if 0 < tp1 < entry else 0.0
                 analysis['clean_space_to_tp1_pct'] = round(clean_space_tp1_pct, 2)
                 analysis['entry_in_range_premium'] = bool(analysis.get('entry_in_range_premium') or entry_pos <= 0.32)
                 analysis['short_above_weak_low'] = bool(analysis.get('short_above_weak_low') or (dist_low_pct >= 0 and (dist_low_pct <= max(clean_space_tp1_pct * 1.15, 0.35) or entry_pos <= 0.18)))
-                analysis['entry_into_overhead_supply'] = bool(analysis.get('entry_into_overhead_supply') or analysis.get('short_above_weak_low') or (entry_pos <= 0.28 and clean_space_tp1_pct <= 0.45))
+                analysis['entry_into_demand'] = bool(analysis.get('entry_into_demand') or analysis.get('short_above_weak_low') or (entry_pos <= 0.28 and clean_space_tp1_pct <= 0.45))
+                analysis['entry_near_opposite_zone'] = bool(analysis.get('entry_near_opposite_zone') or analysis.get('entry_into_demand'))
                 analysis['late_entry_after_exhausted_move'] = bool(analysis.get('late_entry_after_exhausted_move') or (pre_move_pct < -0.65 and entry_pos <= 0.40))
 
         post = d[d['_ts'] >= opened].copy()
@@ -5117,10 +5248,10 @@ def _build_loss_diagnostics_from_row(row: dict | None, *, final_status: str, clo
             improve_keys.append('tighten_volume_support')
     if analysis.get('late_entry_inside_expansion') or analysis.get('late_entry_after_exhausted_move') or 'late_entry_inside_expansion' in list(forensic.get('missed_codes') or []):
         improve_keys.append('avoid_late_entry')
-    if analysis.get('entry_into_overhead_supply') or analysis.get('long_below_strong_high'):
+    if analysis.get('entry_into_overhead_supply') or analysis.get('entry_into_supply') or analysis.get('long_below_strong_high'):
         improve_keys.append('avoid_overhead_supply')
         improve_keys.append('require_clean_space_to_tp')
-    if analysis.get('short_above_weak_low'):
+    if analysis.get('short_above_weak_low') or analysis.get('entry_into_demand'):
         improve_keys.append('avoid_support_short')
         improve_keys.append('avoid_late_entry')
         improve_keys.append('require_clean_space_to_tp')
@@ -5343,6 +5474,140 @@ def _report_setup_label_from_row(row: dict) -> str:
     return ""
 
 
+def _loss_card_short_reason_title(code: str, text: str = '') -> str:
+    """Short one-line title for LOSS card main reason."""
+    code = str(code or '').strip()
+    mapping = {
+        'short_above_weak_low': 'Short entered directly into demand',
+        'entry_into_demand': 'Short entered directly into demand',
+        'long_below_strong_high': 'Long entered directly into supply',
+        'entry_into_supply': 'Long entered directly into supply',
+        'entry_into_overhead_supply': 'Long entered directly into overhead supply',
+        'late_entry_after_exhausted_move': 'Late entry after exhausted move',
+        'entry_in_range_premium': 'Poor RR location inside range',
+        'continuation_missing': 'Weak continuation after entry',
+        'immediate_invalidation': 'Immediate invalidation after entry',
+    }
+    if code in mapping:
+        return mapping[code]
+    raw = str(text or '').strip()
+    if ':' in raw:
+        raw = raw.split(':', 1)[0].strip()
+    return raw or _loss_diag_reason_human_label(code)
+
+
+def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool = False) -> dict:
+    """Build human forensic sections exactly for Telegram LOSS report card."""
+    src = dict(src or {})
+    loss_diag = dict(loss_diag or {})
+    analysis = dict(loss_diag.get('close_analysis_json') or {})
+    side = str(src.get('side') or analysis.get('side') or '').upper().strip() or 'LONG'
+    code = str(loss_diag.get('primary_reason_code') or loss_diag.get('reason_code') or '').strip()
+    primary_text = _loss_card_short_reason_title(code, str(loss_diag.get('primary_reason_text') or loss_diag.get('reason_text') or ''))
+
+    short_demand = side == 'SHORT' and (code in {'short_above_weak_low', 'entry_into_demand'} or bool(analysis.get('short_above_weak_low') or analysis.get('entry_into_demand')))
+    long_supply = side == 'LONG' and (code in {'long_below_strong_high', 'entry_into_supply', 'entry_into_overhead_supply'} or bool(analysis.get('long_below_strong_high') or analysis.get('entry_into_supply') or analysis.get('entry_into_overhead_supply')))
+
+    duration_min = None
+    try:
+        opened = _parse_iso_dt(src.get('opened_at'))
+        closed = _parse_iso_dt(src.get('closed_at'))
+        if opened and closed and closed > opened:
+            duration_min = int(round((closed - opened).total_seconds() / 60.0))
+    except Exception:
+        duration_min = None
+    if duration_min is None:
+        try:
+            if analysis.get('duration_min') is not None:
+                duration_min = int(float(analysis.get('duration_min') or 0))
+        except Exception:
+            duration_min = None
+
+    analysis_lines = []
+    if duration_min is not None and duration_min > 0:
+        analysis_lines.append(f"вход → SL: {duration_min} мин")
+
+    if short_demand:
+        scenario_text = (
+            'SHORT был открыт слишком низко, прямо над buyer zone и weak low. '
+            'Цена уже находилась в зоне реакции покупателей, поэтому downside был ограничен, '
+            'а вероятность bounce вверх была высокой.'
+        )
+        analysis_lines.extend(['immediate rejection from demand', 'downside expansion отсутствовал'])
+        happened_lines = [
+            'цена не смогла продолжить sell-side движение',
+            'buyer zone сразу начала удерживать цену',
+            'продавец не получил displacement вниз',
+            'произошёл bounce против позиции',
+        ]
+        visible_lines = [
+            'SHORT открыт почти прямо над green FVG + weak low',
+            'снизу уже buyer reaction zone',
+            'upside для SHORT маленький',
+            'RR плохой',
+            'цена уже пришла в discount area',
+            'sell continuation уже поздний',
+            'вход сделан слишком низко в range',
+        ]
+        secondary_labels = ['Late entry', 'Short into demand', 'Weak downside continuation', 'Poor RR location', 'Sell-side exhaustion']
+        improve_labels = ['не шортить прямо в strong low', 'избегать входа в discount area', 'ждать premium re-entry выше']
+        primary_text = 'Short entered directly into demand'
+    elif long_supply:
+        scenario_text = (
+            'LONG был открыт слишком высоко, прямо под seller zone и strong high. '
+            'Цена уже находилась в зоне реакции продавцов, поэтому upside был ограничен, '
+            'а вероятность rejection вниз была высокой.'
+        )
+        analysis_lines.extend(['immediate rejection from supply', 'upside expansion отсутствовал'])
+        happened_lines = [
+            'цена не смогла продолжить buy-side движение',
+            'seller zone сразу начала удерживать цену',
+            'покупатель не получил displacement вверх',
+            'произошёл rejection против позиции',
+        ]
+        visible_lines = [
+            'LONG открыт почти прямо под red FVG + strong high',
+            'сверху уже seller reaction zone',
+            'downside для LONG маленький',
+            'RR плохой',
+            'цена уже пришла в premium area',
+            'buy continuation уже поздний',
+            'вход сделан слишком высоко в range',
+        ]
+        secondary_labels = ['Late entry', 'Long into supply', 'Weak upside continuation', 'Poor RR location', 'Buy-side exhaustion']
+        improve_labels = ['не лонговать прямо под strong high', 'избегать входа в premium area', 'ждать discount re-entry ниже']
+        primary_text = 'Long entered directly into supply'
+    else:
+        scenario_text = str(loss_diag.get('scenario_text') or '').strip()
+        analysis_lines.extend([str(x) for x in list(loss_diag.get('analysis_lines') or []) if str(x).strip()])
+        happened_lines = [str(x) for x in list(loss_diag.get('what_happened_lines') or []) if str(x).strip()]
+        visible_lines = [str(x) for x in list(loss_diag.get('chart_visible_lines') or []) if str(x).strip()]
+        secondary_labels = [str(x) for x in list(loss_diag.get('secondary_reason_labels') or []) if str(x).strip()]
+        improve_labels = [str(x) for x in list(loss_diag.get('improve_labels') or []) if str(x).strip()]
+
+    if not scenario_text:
+        scenario_text = str(loss_diag.get('primary_reason_text') or loss_diag.get('reason_text') or '').strip()
+    if not happened_lines:
+        happened_lines = ['после входа не появилось нормальное continuation-движение', 'цена ушла против позиции до SL']
+    if not analysis_lines:
+        analysis_lines = [str(x) for x in list(loss_diag.get('analysis_lines') or []) if str(x).strip()]
+    if not visible_lines:
+        visible_lines = [str(x) for x in list(loss_diag.get('chart_visible_lines') or []) if str(x).strip()]
+    if not secondary_labels:
+        secondary_labels = [str(x) for x in list(loss_diag.get('secondary_reason_labels') or []) if str(x).strip()]
+    if not improve_labels:
+        improve_labels = [str(x) for x in list(loss_diag.get('improve_labels') or []) if str(x).strip()]
+
+    return {
+        'primary_text': primary_text,
+        'scenario_text': scenario_text,
+        'analysis_lines': list(dict.fromkeys([x for x in analysis_lines if str(x).strip()])),
+        'what_happened_lines': list(dict.fromkeys([x for x in happened_lines if str(x).strip()])),
+        'chart_visible_lines': list(dict.fromkeys([x for x in visible_lines if str(x).strip()])),
+        'secondary_reason_labels': list(dict.fromkeys([x for x in secondary_labels if str(x).strip()])),
+        'improve_labels': list(dict.fromkeys([x for x in improve_labels if str(x).strip()])),
+    }
+
 def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pct: float, closed_at: dt.datetime | None = None) -> str:
     row = dict(t or {})
     st = str(final_status or "CLOSED").upper().strip() or "CLOSED"
@@ -5376,13 +5641,13 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
         price_lines.append(f"🛑 SL: {sl:.6f}")
     if tp1 > 0:
         price_lines.append(f"🎯 TP1: {tp1:.6f}")
-    if has_tp2:
+    if has_tp2 and st != 'LOSS':
         price_lines.append(f"🚀 TP2: {tp2:.6f}")
     if after_tp1 and be_price > 0:
         price_lines.append(f"🛡 BE: {be_price:.6f}")
     price_block = "\n".join(price_lines).strip() or "—"
 
-    setup_block = f"🧭 Smart-setup: {setup_label}\n" if setup_label else ""
+    setup_block = f"🧭 Smart-setup: {setup_label}\n" if (setup_label and (st != 'LOSS' or str(os.getenv('LOSS_CARD_SHOW_SETUP', '0')).lower() in ('1','true','yes','on'))) else ""
     primary_block = ""
     scenario_block = ""
     analysis_block = ""
@@ -5392,14 +5657,14 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
     missed_block = ""
     improve_block = ""
     if st == 'LOSS':
-        analysis_lines = list(loss_diag.get('analysis_lines') or [])
-        happened_lines = list(loss_diag.get('what_happened_lines') or [])
-        visible_lines = list(loss_diag.get('chart_visible_lines') or [])
-        secondary_labels = list(loss_diag.get('secondary_reason_labels') or [])
-        missed_labels = list(loss_diag.get('missed_labels') or [])
-        improve_labels = list(loss_diag.get('improve_labels') or [])
-        primary_text = str(loss_diag.get('primary_reason_text') or loss_diag.get('reason_text') or reason).strip()
-        scenario_text = str(loss_diag.get('scenario_text') or '').strip()
+        card_payload = _loss_card_forensic_payload(row, loss_diag, after_tp1=after_tp1)
+        analysis_lines = list(card_payload.get('analysis_lines') or [])
+        happened_lines = list(card_payload.get('what_happened_lines') or [])
+        visible_lines = list(card_payload.get('chart_visible_lines') or [])
+        secondary_labels = list(card_payload.get('secondary_reason_labels') or [])
+        improve_labels = list(card_payload.get('improve_labels') or [])
+        primary_text = str(card_payload.get('primary_text') or reason).strip()
+        scenario_text = str(card_payload.get('scenario_text') or '').strip()
         if primary_text:
             primary_block = "🧠 Главная причина:\n" + primary_text + "\n\n"
         if scenario_text:
@@ -5412,8 +5677,10 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
             visible_block = "👁 Что видно на графике:\n" + "\n".join([f"• {x}" for x in visible_lines if x]) + "\n\n"
         if secondary_labels:
             secondary_block = "🧩 Доп. причины:\n" + "\n".join([f"• {x}" for x in secondary_labels if x]) + "\n\n"
-        if missed_labels:
-            missed_block = "⚠️ Что бот пропустил:\n" + "\n".join([f"• {x}" for x in missed_labels if x]) + "\n\n"
+        if str(os.getenv('LOSS_CARD_SHOW_MISSED', '0')).lower() in ('1','true','yes','on'):
+            missed_labels = list(loss_diag.get('missed_labels') or [])
+            if missed_labels:
+                missed_block = "⚠️ Что бот пропустил:\n" + "\n".join([f"• {x}" for x in missed_labels if x]) + "\n\n"
         if improve_labels:
             improve_block = "🛠 Что улучшить:\n" + "\n".join([f"• {x}" for x in improve_labels if x]) + "\n\n"
 
@@ -5435,7 +5702,7 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
         f"{secondary_block}"
         f"{missed_block}"
         f"{improve_block}"
-        f"──────────────\n\n"
+        f"──────────────────\n\n"
         f"{price_block}\n\n"
         f"🕒 Открыта: {opened_time} ({tz_label})\n"
         f"🕒 Закрыта: {closed_time} ({tz_label})\n\n"
