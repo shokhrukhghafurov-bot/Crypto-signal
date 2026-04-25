@@ -682,7 +682,8 @@ ON CONFLICT (id) DO NOTHING;
           close_reason_text TEXT,
           weak_filters TEXT,
           improve_note TEXT,
-          close_analysis_json JSONB
+          close_analysis_json JSONB,
+          entry_snapshot_json JSONB DEFAULT '{}'::jsonb
         );
         """)
 
@@ -710,7 +711,7 @@ ON CONFLICT (id) DO NOTHING;
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS weak_filters TEXT;")
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS improve_note TEXT;")
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS close_analysis_json JSONB;")
-            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS entry_snapshot_json JSONB;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS entry_snapshot_json JSONB DEFAULT '{}'::jsonb;")
         except Exception:
             pass
 
@@ -1820,10 +1821,15 @@ async def upsert_signal_track(
     confirmations: str | None = None,
     source_exchange: str | None = None,
     risk_note: str | None = None,
+    entry_snapshot_json: dict | str | None = None,
 ) -> None:
     """Create/update a bot-level signal tracking row.
 
     This is independent from user trades. Used for signal performance stats.
+
+    entry_snapshot_json stores the market structure at the moment of signal emit
+    (range, OB/FVG, BOS/reclaim/sweep levels). LOSS diagnostics use it later so
+    closed-card reasons are based on the actual chart context, not one template.
     """
     if not signal_id:
         return
