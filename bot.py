@@ -3927,6 +3927,18 @@ def _loss_diag_chart_visible_lines(analysis: dict, side: str) -> list[str]:
             'sell continuation был поздний',
             'вход сделан слишком низко в range',
         ])
+        if analysis.get('demand_near_tfs'):
+            try:
+                lines.append('buyer zone / demand подтверждена на TF: ' + '/'.join([str(x) for x in list(analysis.get('demand_near_tfs') or [])]))
+            except Exception:
+                pass
+        if analysis.get('entry_position_in_prior_range') is not None:
+            try:
+                tf = str(analysis.get('entry_position_tf') or 'range')
+                pos = float(analysis.get('entry_position_in_prior_range'))
+                lines.append(f'позиция SHORT в {tf} range: {pos:.2f} — низкая часть range')
+            except Exception:
+                pass
         try:
             cs = float(analysis.get('clean_space_to_tp1_pct') or 0.0)
             if cs > 0 and cs <= 0.45:
@@ -3942,6 +3954,18 @@ def _loss_diag_chart_visible_lines(analysis: dict, side: str) -> list[str]:
             'buy continuation был поздний',
             'вход сделан слишком высоко в range',
         ])
+        if analysis.get('supply_near_tfs'):
+            try:
+                lines.append('seller zone / supply подтверждена на TF: ' + '/'.join([str(x) for x in list(analysis.get('supply_near_tfs') or [])]))
+            except Exception:
+                pass
+        if analysis.get('entry_position_in_prior_range') is not None:
+            try:
+                tf = str(analysis.get('entry_position_tf') or 'range')
+                pos = float(analysis.get('entry_position_in_prior_range'))
+                lines.append(f'позиция LONG в {tf} range: {pos:.2f} — верхняя часть range')
+            except Exception:
+                pass
         try:
             cs = float(analysis.get('clean_space_to_tp1_pct') or 0.0)
             if cs > 0 and cs <= 0.45:
@@ -4005,9 +4029,13 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
     if side == 'LONG' and (not long_below_high) and clean_space_to_tp > 0 and clean_space_to_tp <= 0.45 and weak_follow and (not tp1_threatened):
         long_below_high = True
         entry_overhead = True
+        analysis['long_below_strong_high'] = True
+        analysis['entry_into_overhead_supply'] = True
     if side == 'SHORT' and (not short_above_low) and clean_space_to_tp > 0 and clean_space_to_tp <= 0.45 and weak_follow and (not tp1_threatened):
         short_above_low = True
         entry_overhead = True
+        analysis['short_above_weak_low'] = True
+        analysis['entry_into_overhead_supply'] = True
 
     secondary = []
     missed = []
@@ -4316,6 +4344,302 @@ def _loss_diag_pick_nested_value(obj, *paths):
         if ok and cur is not None and str(cur).strip() != '':
             return cur
     return None
+def _loss_diag_tf_minutes(tf: str) -> int:
+    s = str(tf or '').strip().lower()
+    if s.endswith('m'):
+        try:
+            return max(1, int(float(s[:-1] or 0)))
+        except Exception:
+            return 5
+    if s.endswith('h'):
+        try:
+            return max(1, int(float(s[:-1] or 0) * 60))
+        except Exception:
+            return 60
+    return 5
+
+
+def _loss_diag_snapshot_tfs() -> list[str]:
+    raw = str(os.getenv('LOSS_DIAG_TIMEFRAMES', '5m,15m,30m,1h') or '5m,15m,30m,1h')
+    out: list[str] = []
+    for part in re.split(r"[,;\s]+", raw):
+        tf = str(part or '').strip().lower()
+        if tf in {'5m', '15m', '30m', '1h'} and tf not in out:
+            out.append(tf)
+    return out or ['5m', '15m', '30m', '1h']
+
+
+def _loss_diag_norm_ohlcv_df(df) -> pd.DataFrame:
+    """Return normalized OHLCV dataframe with _ts/open/high/low/close/volume.
+
+    The bot uses this for forensic LOSS analysis. It reads candles, not PNG screenshots.
+    """
+    if df is None or getattr(df, 'empty', True):
+        return pd.DataFrame()
+    try:
+        d = df.copy()
+    except Exception:
+        return pd.DataFrame()
+    try:
+        if 'open_time_ms' in d.columns:
+            ts = pd.to_datetime(d['open_time_ms'], unit='ms', utc=True, errors='coerce')
+        elif 'timestamp' in d.columns:
+            ts = pd.to_datetime(d['timestamp'], unit='ms', utc=True, errors='coerce')
+        elif 'time' in d.columns:
+            ts = pd.to_datetime(d['time'], utc=True, errors='coerce')
+        elif isinstance(d.index, pd.DatetimeIndex):
+            ts = pd.to_datetime(d.index, utc=True, errors='coerce')
+        else:
+            ts = pd.Series([pd.NaT] * len(d))
+        d['_ts'] = ts
+        for col in ('open', 'high', 'low', 'close'):
+            if col not in d.columns:
+                return pd.DataFrame()
+            d[col] = pd.to_numeric(d[col], errors='coerce')
+        if 'volume' in d.columns:
+            d['volume'] = pd.to_numeric(d['volume'], errors='coerce').fillna(0.0)
+        else:
+            d['volume'] = 0.0
+        d = d[d['_ts'].notna()].dropna(subset=['open', 'high', 'low', 'close']).sort_values('_ts').reset_index(drop=True)
+        return d
+    except Exception:
+        return pd.DataFrame()
+
+
+def _loss_diag_find_fvg_zones(d: pd.DataFrame, *, tf: str = '', max_scan: int = 90) -> list[dict]:
+    zones: list[dict] = []
+    if d is None or getattr(d, 'empty', True) or len(d) < 3:
+        return zones
+    try:
+        x = d.tail(max(3, int(max_scan))).reset_index(drop=True)
+        for i in range(2, len(x)):
+            h2 = float(x.loc[i - 2, 'high'])
+            l2 = float(x.loc[i - 2, 'low'])
+            hi = float(x.loc[i, 'high'])
+            lo = float(x.loc[i, 'low'])
+            ts = x.loc[i, '_ts'] if '_ts' in x.columns else None
+            # Bullish FVG: demand / buyer imbalance below current price.
+            if lo > h2:
+                zones.append({
+                    'kind': 'bullish_fvg', 'side': 'demand', 'tf': str(tf or ''),
+                    'bottom': round(h2, 8), 'top': round(lo, 8),
+                    'age_bars': int(len(x) - 1 - i), 'time': str(ts) if ts is not None else '',
+                })
+            # Bearish FVG: supply / seller imbalance above current price.
+            if hi < l2:
+                zones.append({
+                    'kind': 'bearish_fvg', 'side': 'supply', 'tf': str(tf or ''),
+                    'bottom': round(hi, 8), 'top': round(l2, 8),
+                    'age_bars': int(len(x) - 1 - i), 'time': str(ts) if ts is not None else '',
+                })
+    except Exception:
+        return zones
+    return zones
+
+
+def _loss_diag_pick_near_zone(zones: list[dict], *, entry: float, zone_side: str, max_dist_pct: float) -> dict:
+    if not zones or entry <= 0:
+        return {}
+    want = str(zone_side or '').strip().lower()
+    best = None
+    best_dist = 10**9
+    for z in zones:
+        try:
+            if str(z.get('side') or '').lower() != want:
+                continue
+            bottom = float(z.get('bottom'))
+            top = float(z.get('top'))
+            if top < bottom:
+                bottom, top = top, bottom
+            if bottom <= entry <= top:
+                dist_pct = 0.0
+                relation = 'inside'
+            elif want == 'demand' and entry > top:
+                dist_pct = ((entry - top) / entry) * 100.0
+                relation = 'above'
+            elif want == 'supply' and entry < bottom:
+                dist_pct = ((bottom - entry) / entry) * 100.0
+                relation = 'below'
+            else:
+                continue
+            if dist_pct <= float(max_dist_pct) and dist_pct < best_dist:
+                best_dist = dist_pct
+                best = dict(z)
+                best['distance_pct'] = round(dist_pct, 3)
+                best['relation'] = relation
+        except Exception:
+            continue
+    return best or {}
+
+
+def _loss_diag_build_tf_snapshot_from_df(df, *, entry: float, side: str, tf: str, opened_at: dt.datetime | None = None) -> dict:
+    d = _loss_diag_norm_ohlcv_df(df)
+    if d.empty or entry <= 0:
+        return {}
+    try:
+        if opened_at is not None:
+            # Use only candles known before / at entry so the snapshot does not learn from the future.
+            d = d[d['_ts'] <= (opened_at + dt.timedelta(seconds=30))].copy()
+            if d.empty:
+                return {}
+        lookback = 96 if str(tf).lower() == '5m' else 72
+        pre = d.tail(lookback).copy()
+        highs = pre['high'].astype(float)
+        lows = pre['low'].astype(float)
+        closes = pre['close'].astype(float)
+        range_high = float(highs.max())
+        range_low = float(lows.min())
+        rng = max(range_high - range_low, 1e-12)
+        entry_pos = (float(entry) - range_low) / rng
+        dist_high_pct = ((range_high - float(entry)) / float(entry)) * 100.0
+        dist_low_pct = ((float(entry) - range_low) / float(entry)) * 100.0
+        tfm = _loss_diag_tf_minutes(tf)
+        max_dist_pct = 0.32 if tfm <= 5 else (0.42 if tfm <= 15 else 0.55)
+        zones = _loss_diag_find_fvg_zones(pre, tf=tf, max_scan=min(len(pre), 90))
+        demand = _loss_diag_pick_near_zone(zones, entry=float(entry), zone_side='demand', max_dist_pct=max_dist_pct)
+        supply = _loss_diag_pick_near_zone(zones, entry=float(entry), zone_side='supply', max_dist_pct=max_dist_pct)
+        strong_low_near = bool(0 <= dist_low_pct <= max(max_dist_pct, 0.38) or entry_pos <= 0.20)
+        strong_high_near = bool(0 <= dist_high_pct <= max(max_dist_pct, 0.38) or entry_pos >= 0.80)
+        pre_move_pct = 0.0
+        if len(closes) >= 2:
+            pre_move_pct = ((float(closes.iloc[-1]) - float(closes.iloc[0])) / max(float(closes.iloc[0]), 1e-12)) * 100.0
+        return {
+            'tf': str(tf),
+            'bars': int(len(pre)),
+            'range_high': round(range_high, 8),
+            'range_low': round(range_low, 8),
+            'entry_position_in_range': round(entry_pos, 3),
+            'distance_to_range_high_pct': round(dist_high_pct, 3),
+            'distance_to_range_low_pct': round(dist_low_pct, 3),
+            'pre_entry_move_pct': round(pre_move_pct, 3),
+            'demand_zone': demand,
+            'supply_zone': supply,
+            'entry_near_demand': bool(demand or strong_low_near),
+            'entry_near_supply': bool(supply or strong_high_near),
+            'entry_near_strong_low': strong_low_near,
+            'entry_near_strong_high': strong_high_near,
+            'fvg_zones_count': int(len(zones)),
+        }
+    except Exception:
+        return {}
+
+
+def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: str, entry: float, tp1: float, sl: float) -> None:
+    """Merge entry_snapshot_json into close analysis and set chart-location flags.
+
+    Priority is location first: if SHORT is opened into demand / near Strong Low, the card must
+    explain that, not only generic breakout trap. Same mirror logic for LONG under supply.
+    """
+    if not isinstance(analysis, dict) or entry <= 0:
+        return
+    side_u = str(side or '').upper().strip()
+    tfs = snapshot.get('tf_snapshots') if isinstance(snapshot, dict) else None
+    if not isinstance(tfs, dict):
+        tfs = {}
+    checked = [tf for tf in ('5m', '15m', '30m', '1h') if isinstance(tfs.get(tf), dict) and tfs.get(tf)]
+    if checked:
+        analysis['tf_checked'] = checked
+    try:
+        if tp1 > 0:
+            if side_u == 'SHORT' and tp1 < entry:
+                analysis['clean_space_to_tp1_pct'] = round(((entry - tp1) / entry) * 100.0, 3)
+            elif side_u == 'LONG' and tp1 > entry:
+                analysis['clean_space_to_tp1_pct'] = round(((tp1 - entry) / entry) * 100.0, 3)
+    except Exception:
+        pass
+
+    demand_hits = []
+    supply_hits = []
+    entry_positions = []
+    pre_moves = []
+    for tf, one in (tfs or {}).items():
+        if not isinstance(one, dict):
+            continue
+        try:
+            ep = one.get('entry_position_in_range')
+            if ep is not None:
+                entry_positions.append((str(tf), float(ep)))
+            pm = one.get('pre_entry_move_pct')
+            if pm is not None:
+                pre_moves.append(float(pm))
+            if one.get('entry_near_demand') or one.get('demand_zone'):
+                demand_hits.append(str(tf))
+            if one.get('entry_near_supply') or one.get('supply_zone'):
+                supply_hits.append(str(tf))
+        except Exception:
+            continue
+
+    if entry_positions and analysis.get('entry_position_in_prior_range') is None:
+        preferred = None
+        for name in ('15m', '30m', '1h', '5m'):
+            preferred = next((x for x in entry_positions if x[0] == name), None)
+            if preferred:
+                break
+        if preferred:
+            analysis['entry_position_in_prior_range'] = round(float(preferred[1]), 3)
+            analysis['entry_position_tf'] = preferred[0]
+
+    try:
+        cs = float(analysis.get('clean_space_to_tp1_pct') or 0.0)
+    except Exception:
+        cs = 0.0
+
+    if side_u == 'SHORT':
+        if demand_hits:
+            analysis['short_above_weak_low'] = True
+            analysis['entry_into_overhead_supply'] = True
+            analysis['demand_near_tfs'] = list(dict.fromkeys(demand_hits))
+            analysis['entry_in_range_premium'] = True
+        elif entry_positions:
+            lowish = any(ep <= 0.35 for _, ep in entry_positions)
+            if lowish and (cs <= 0.55 or bool(analysis.get('weak_followthrough'))):
+                analysis['short_above_weak_low'] = True
+                analysis['entry_in_range_premium'] = True
+                analysis['entry_into_overhead_supply'] = True
+        if pre_moves and min(pre_moves) < -0.45:
+            analysis['late_entry_after_exhausted_move'] = True
+    elif side_u == 'LONG':
+        if supply_hits:
+            analysis['long_below_strong_high'] = True
+            analysis['entry_into_overhead_supply'] = True
+            analysis['supply_near_tfs'] = list(dict.fromkeys(supply_hits))
+            analysis['entry_in_range_premium'] = True
+        elif entry_positions:
+            highish = any(ep >= 0.65 for _, ep in entry_positions)
+            if highish and (cs <= 0.55 or bool(analysis.get('weak_followthrough'))):
+                analysis['long_below_strong_high'] = True
+                analysis['entry_in_range_premium'] = True
+                analysis['entry_into_overhead_supply'] = True
+        if pre_moves and max(pre_moves) > 0.45:
+            analysis['late_entry_after_exhausted_move'] = True
+
+
+async def _signal_forensics_entry_snapshot_async(sig) -> dict:
+    """Build entry_snapshot_json using candles from 5m/15m/30m/1h at signal emit time."""
+    snap = _signal_forensics_entry_snapshot(sig)
+    try:
+        symbol = str(getattr(sig, 'symbol', '') or '').upper().strip()
+        market = str(getattr(sig, 'market', 'FUTURES') or 'FUTURES').upper().strip()
+        side = str(getattr(sig, 'direction', '') or '').upper().strip()
+        entry = _loss_diag_parse_float(getattr(sig, 'entry', None)) or 0.0
+        if not symbol or entry <= 0:
+            return snap
+        tf_snaps: dict = {}
+        for tf in _loss_diag_snapshot_tfs():
+            try:
+                limit = 220 if tf == '5m' else 180
+                df = await backend.load_candles(symbol, tf, market=market, limit=limit)
+                one = _loss_diag_build_tf_snapshot_from_df(df, entry=entry, side=side, tf=tf, opened_at=None)
+                if one:
+                    tf_snaps[tf] = one
+            except Exception:
+                continue
+        if tf_snaps:
+            snap['tf_snapshots'] = tf_snaps
+            snap['loss_diag_timeframes'] = list(tf_snaps.keys())
+    except Exception:
+        pass
+    return snap
 
 
 def _signal_forensics_entry_snapshot(sig) -> dict:
@@ -4420,6 +4744,11 @@ def _loss_diag_build_analysis_lines(src: dict, metrics: dict, analysis: dict, *,
         lines.append(f"вход → SL: {int(analysis.get('duration_min') or 0)} мин")
     if analysis.get('bars_to_failure') is not None:
         lines.append(f"баров до слома: {int(analysis.get('bars_to_failure') or 0)}")
+    if analysis.get('tf_checked'):
+        try:
+            lines.append("проверены TF: " + "/".join([str(x) for x in list(analysis.get('tf_checked') or [])]))
+        except Exception:
+            pass
     if analysis.get('mfe_pct') is not None:
         lines.append(f"макс. ход в сторону сделки: {float(analysis.get('mfe_pct')):+.2f}%")
     if analysis.get('mae_pct') is not None:
@@ -4493,6 +4822,29 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
             if key in snapshot and key not in analysis:
                 analysis[key] = snapshot.get(key)
     try:
+        # Backfill/refresh multi-timeframe entry context for older rows that were
+        # created before entry_snapshot_json had 5m/15m/30m/1h candle snapshots.
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        if not isinstance(snapshot.get('tf_snapshots'), dict) or not snapshot.get('tf_snapshots'):
+            tf_snaps = {}
+            for _tf in _loss_diag_snapshot_tfs():
+                try:
+                    _limit = 220 if _tf == '5m' else 180
+                    _df = await backend.load_candles(symbol, _tf, market=market, limit=_limit)
+                    _one = _loss_diag_build_tf_snapshot_from_df(_df, entry=entry, side=side, tf=_tf, opened_at=opened)
+                    if _one:
+                        tf_snaps[_tf] = _one
+                except Exception:
+                    continue
+            if tf_snaps:
+                snapshot['tf_snapshots'] = tf_snaps
+                snapshot['loss_diag_timeframes'] = list(tf_snaps.keys())
+                analysis['entry_snapshot_present'] = True
+        _loss_diag_apply_snapshot_context(analysis, snapshot, side=side, entry=entry, tp1=tp1, sl=sl)
+    except Exception:
+        pass
+    try:
         df5 = await backend.load_candles(symbol, '5m', market=market, limit=160)
     except Exception:
         df5 = None
@@ -4548,17 +4900,17 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
             if side == 'LONG':
                 clean_space_tp1_pct = ((tp1 - entry) / entry) * 100.0 if tp1 > entry else 0.0
                 analysis['clean_space_to_tp1_pct'] = round(clean_space_tp1_pct, 2)
-                analysis['entry_in_range_premium'] = bool(entry_pos >= 0.68)
-                analysis['long_below_strong_high'] = bool(dist_high_pct >= 0 and (dist_high_pct <= max(clean_space_tp1_pct * 1.15, 0.35) or entry_pos >= 0.82))
-                analysis['entry_into_overhead_supply'] = bool(analysis.get('long_below_strong_high') or (entry_pos >= 0.72 and clean_space_tp1_pct <= 0.45))
-                analysis['late_entry_after_exhausted_move'] = bool(pre_move_pct > 0.65 and entry_pos >= 0.60)
+                analysis['entry_in_range_premium'] = bool(analysis.get('entry_in_range_premium') or entry_pos >= 0.68)
+                analysis['long_below_strong_high'] = bool(analysis.get('long_below_strong_high') or (dist_high_pct >= 0 and (dist_high_pct <= max(clean_space_tp1_pct * 1.15, 0.35) or entry_pos >= 0.82)))
+                analysis['entry_into_overhead_supply'] = bool(analysis.get('entry_into_overhead_supply') or analysis.get('long_below_strong_high') or (entry_pos >= 0.72 and clean_space_tp1_pct <= 0.45))
+                analysis['late_entry_after_exhausted_move'] = bool(analysis.get('late_entry_after_exhausted_move') or (pre_move_pct > 0.65 and entry_pos >= 0.60))
             else:
                 clean_space_tp1_pct = ((entry - tp1) / entry) * 100.0 if 0 < tp1 < entry else 0.0
                 analysis['clean_space_to_tp1_pct'] = round(clean_space_tp1_pct, 2)
-                analysis['entry_in_range_premium'] = bool(entry_pos <= 0.32)
-                analysis['short_above_weak_low'] = bool(dist_low_pct >= 0 and (dist_low_pct <= max(clean_space_tp1_pct * 1.15, 0.35) or entry_pos <= 0.18))
-                analysis['entry_into_overhead_supply'] = bool(analysis.get('short_above_weak_low') or (entry_pos <= 0.28 and clean_space_tp1_pct <= 0.45))
-                analysis['late_entry_after_exhausted_move'] = bool(pre_move_pct < -0.65 and entry_pos <= 0.40)
+                analysis['entry_in_range_premium'] = bool(analysis.get('entry_in_range_premium') or entry_pos <= 0.32)
+                analysis['short_above_weak_low'] = bool(analysis.get('short_above_weak_low') or (dist_low_pct >= 0 and (dist_low_pct <= max(clean_space_tp1_pct * 1.15, 0.35) or entry_pos <= 0.18)))
+                analysis['entry_into_overhead_supply'] = bool(analysis.get('entry_into_overhead_supply') or analysis.get('short_above_weak_low') or (entry_pos <= 0.28 and clean_space_tp1_pct <= 0.45))
+                analysis['late_entry_after_exhausted_move'] = bool(analysis.get('late_entry_after_exhausted_move') or (pre_move_pct < -0.65 and entry_pos <= 0.40))
 
         post = d[d['_ts'] >= opened].copy()
         if post.empty:
@@ -4700,6 +5052,11 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
                     highest = float(highs.max())
                     analysis['entry_too_deep_into_zone'] = bool(analysis.get('entry_too_deep_into_zone') or highest > (zone_top - zone_width * 0.25))
                     analysis['zone_midpoint_lost'] = bool(float(closes.iloc[-1]) > zone_mid)
+        except Exception:
+            pass
+
+        try:
+            _loss_diag_apply_snapshot_context(analysis, snapshot, side=side, entry=entry, tp1=tp1, sl=sl)
         except Exception:
             pass
 
@@ -6619,7 +6976,7 @@ async def broadcast_signal(sig: Signal) -> None:
         except Exception:
             pass
         try:
-            _track_kwargs['entry_snapshot_json'] = _signal_forensics_entry_snapshot(sig)
+            _track_kwargs['entry_snapshot_json'] = await _signal_forensics_entry_snapshot_async(sig)
         except Exception:
             pass
         try:
