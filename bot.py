@@ -5744,7 +5744,7 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         visible_lines = [
             'SHORT открыт почти прямо над green FVG + weak low',
             'снизу уже buyer reaction zone',
-            'upside для SHORT маленький',
+            'downside для SHORT маленький',
             'RR плохой',
             'цена уже пришла в discount area',
             'sell continuation уже поздний',
@@ -5865,7 +5865,7 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         visible_lines = [
             'LONG открыт почти прямо под red FVG + strong high',
             'сверху уже seller reaction zone',
-            'downside для LONG маленький',
+            'upside для LONG маленький',
             'RR плохой',
             'цена уже пришла в premium area',
             'buy continuation уже поздний',
