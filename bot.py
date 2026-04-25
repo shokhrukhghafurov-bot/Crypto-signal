@@ -158,6 +158,12 @@ def _health_mark_err(name: str, err: str) -> None:
     HEALTH_LAST_ERR[name] = (err or "").strip()[:500]
     HEALTH[f"{name}_last_err"] = time.time()
 
+def _cost_saver_mode() -> bool:
+    return str(os.getenv("COST_SAVER_MODE", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+
+def _cost_default(on_value: str = "1", off_value: str = "0") -> str:
+    return off_value if _cost_saver_mode() else on_value
+
 def _task_state(t: asyncio.Task | None) -> str:
     if not t:
         return "missing"
@@ -173,6 +179,10 @@ _TASK_RESTART_INFLIGHT: set[str] = set()
 
 
 def _spawn_smart_manager_task() -> asyncio.Task | None:
+    smart_default = _cost_default("1", "0")
+    if not _env_on("SMART_MANAGER_ENABLED", smart_default):
+        logger.info("SMART_MANAGER_ENABLED=0 -> smart-manager/track_loop disabled")
+        return None
     if not hasattr(backend, "track_loop"):
         logger.warning("Backend has no track_loop; skipping smart-manager spawn")
         return None
@@ -188,7 +198,7 @@ def _spawn_smart_manager_task() -> asyncio.Task | None:
 
 
 def _start_signal_outcome_task() -> asyncio.Task | None:
-    if not _env_on("SIGNAL_OUTCOME_LOOP_ENABLED", "1"):
+    if not _env_on("SIGNAL_OUTCOME_LOOP_ENABLED", _cost_default("1", "0")):
         logger.info("SIGNAL_OUTCOME_LOOP_ENABLED=0 -> signal_outcome_loop disabled")
         return None
     existing = TASKS.get("signal-outcome")
@@ -967,7 +977,7 @@ def _start_mid_components(backend: object, broadcast_signal, broadcast_macro_ale
     Fixes a production issue where MID_SCANNER_ENABLED=1 but MID loop is skipped,
     and ensures trap digest is also enabled in webhook mode.
     """
-    mid_enabled = os.getenv('MID_SCANNER_ENABLED', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+    mid_enabled = os.getenv('MID_SCANNER_ENABLED', _cost_default('1', '0')).strip().lower() not in ('0', 'false', 'no', 'off')
     if not mid_enabled:
         return
 
@@ -11164,7 +11174,7 @@ async def main() -> None:
             TASKS["db-retention"] = asyncio.create_task(_db_retention_cleanup_loop(), name="db-retention")
             _attach_task_monitor("db-retention", TASKS["db-retention"])
 
-            main_scanner_enabled = os.getenv("MAIN_SCANNER_ENABLED", os.getenv("SCANNER_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
+            main_scanner_enabled = os.getenv("MAIN_SCANNER_ENABLED", os.getenv("SCANNER_ENABLED", _cost_default("1", "0"))).strip().lower() not in ("0", "false", "no", "off")
             main_top_n = os.getenv("MAIN_TOP_N", os.getenv("TOP_N", ""))
             logger.info(
                 "Starting scanner_loop check enabled=%s interval=%ss top_n=%s",
@@ -11254,7 +11264,7 @@ async def main() -> None:
         logger.warning("Backend has no track_loop; skipping")
     TASKS["db-retention"] = asyncio.create_task(_db_retention_cleanup_loop(), name="db-retention")
     _attach_task_monitor("db-retention", TASKS["db-retention"])
-    main_scanner_enabled = os.getenv("MAIN_SCANNER_ENABLED", os.getenv("SCANNER_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
+    main_scanner_enabled = os.getenv("MAIN_SCANNER_ENABLED", os.getenv("SCANNER_ENABLED", _cost_default("1", "0"))).strip().lower() not in ("0", "false", "no", "off")
     logger.info("Starting scanner_loop check enabled=%s interval=%ss top_n=%s", main_scanner_enabled, os.getenv('SCAN_INTERVAL_SECONDS',''), os.getenv('MAIN_TOP_N', os.getenv('TOP_N','')))
     if main_scanner_enabled and hasattr(backend, "scanner_loop"):
         TASKS["scanner"] = asyncio.create_task(backend.scanner_loop(broadcast_signal, broadcast_macro_alert), name="scanner")
