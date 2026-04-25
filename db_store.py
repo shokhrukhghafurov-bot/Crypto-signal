@@ -1755,6 +1755,7 @@ async def reserve_signal_track_with_symbol_cooldown(
                         "reserve_signal_track_with_symbol_cooldown dedup by sig_key: market=%s symbol=%s signal_id=%s",
                         market, symbol, int(signal_id),
                     )
+                    return False, None
                 return True, None
         except Exception:
             logger.exception('reserve_signal_track_with_symbol_cooldown failed')
@@ -1903,8 +1904,14 @@ async def _upsert_signal_track_conn(
     Returns False when an existing UNIQUE(sig_key) row was reused as dedup.
     """
     try:
-        await conn.execute(
-            """
+        # If INSERT hits UNIQUE(sig_key), PostgreSQL marks the current transaction
+        # as aborted. This function is sometimes called inside a wider transaction,
+        # so we isolate the INSERT inside a nested asyncpg transaction/SAVEPOINT.
+        # After a duplicate-key error, only this savepoint is rolled back and the
+        # fallback UPDATE below can still run safely.
+        async with conn.transaction():
+            await conn.execute(
+                """
             INSERT INTO signal_tracks (
               signal_id, sig_key, market, symbol, side, entry, tp1, tp2, sl,
               status, opened_at, updated_at, orig_text, setup_source, setup_source_label, ui_setup_label, emit_route,
@@ -1956,7 +1963,7 @@ async def _upsert_signal_track_conn(
             (str(source_exchange) if source_exchange is not None else None),
             (str(risk_note) if risk_note is not None else None),
             (json.dumps(entry_snapshot_json, ensure_ascii=False) if isinstance(entry_snapshot_json, dict) else (str(entry_snapshot_json or "") or None)),
-        )
+            )
         return True
     except asyncpg.UniqueViolationError:
         # Existing row with the same sig_key: treat it as dedup instead of crashing.
