@@ -4085,6 +4085,11 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
             'what_happened_lines': [],
         }
 
+    try:
+        _loss_diag_apply_directional_location_flags(analysis, side=str(src.get('side') or analysis.get('side') or ''))
+    except Exception:
+        pass
+
     mfe_pct = abs(float(analysis.get('mfe_pct') or 0.0))
     mae_pct = abs(float(analysis.get('mae_pct') or 0.0))
     bars_to_failure = int(analysis.get('bars_to_failure') or analysis.get('bars_to_sl') or 0)
@@ -4788,6 +4793,128 @@ def _loss_diag_enrich_entry_snapshot_from_tfs(snapshot: dict, *, side: str = '')
     return snapshot
 
 
+
+
+def _loss_diag_apply_directional_location_flags(analysis: dict, *, side: str) -> None:
+    """Infer the real chart location for LOSS cards from candle context.
+
+    This is a safety net for trades where the close reason is a generic SL/no-follow-through,
+    but the chart clearly shows the entry was against a nearby demand/supply zone or after
+    an opposite reclaim. It is intentionally conservative and only runs when TP1 was not
+    properly threatened and follow-through was weak.
+    """
+    if not isinstance(analysis, dict):
+        return
+    side_u = str(side or analysis.get('side') or '').upper().strip()
+    if side_u not in ('LONG', 'SHORT'):
+        return
+
+    def _f(key: str, default: float = 0.0) -> float:
+        try:
+            val = analysis.get(key)
+            if val is None or val == '':
+                return default
+            return float(val)
+        except Exception:
+            return default
+
+    def _b(key: str) -> bool:
+        val = analysis.get(key)
+        if isinstance(val, str):
+            return val.strip().lower() in ('1', 'true', 'yes', 'on', 'да', 'есть')
+        return bool(val)
+
+    tp1_known = 'tp1_threatened' in analysis
+    tp1_threatened = bool(analysis.get('tp1_threatened'))
+    weak_after_entry = bool(
+        _b('weak_followthrough')
+        or _b('no_post_entry_expansion')
+        or _b('zone_reaction_too_weak')
+        or analysis.get('continuation_seen') is False
+        or (tp1_known and not tp1_threatened)
+    )
+    if not weak_after_entry:
+        return
+
+    clean_space = _f('clean_space_to_tp1_pct')
+    entry_pos = _f('entry_position_in_prior_range', _f('entry_position_in_range', 0.5))
+    local6 = _f('local_pre_move_6_pct')
+    local12 = _f('local_pre_move_12_pct')
+    local24 = _f('local_pre_move_24_pct')
+    pre_move = _f('pre_entry_move_pct')
+    close_vs_ema = str(analysis.get('pre_close_vs_ema20') or '').lower().strip()
+
+    bullish_context = bool(
+        local6 >= 0.12
+        or local12 >= 0.22
+        or local24 >= 0.35
+        or pre_move >= 0.45
+        or close_vs_ema == 'above'
+        or str(analysis.get('structure_5m') or '').lower().startswith('bullish')
+        or _b('structure_against_trade')
+        or _b('level_reclaimed_back')
+        or _b('reclaim_lost_back')
+    )
+    bearish_context = bool(
+        local6 <= -0.12
+        or local12 <= -0.22
+        or local24 <= -0.35
+        or pre_move <= -0.45
+        or close_vs_ema == 'below'
+        or str(analysis.get('structure_5m') or '').lower().startswith('bearish')
+        or _b('structure_against_trade')
+        or _b('level_reclaimed_back')
+        or _b('reclaim_lost_back')
+    )
+
+    if side_u == 'SHORT':
+        demand_near = bool(
+            analysis.get('demand_near_tfs')
+            or _b('underlying_bullish_fvg')
+            or _b('entry_into_demand')
+            or _b('short_above_weak_low')
+        )
+        supply_near = bool(analysis.get('supply_near_tfs') or _b('short_supply_near_entry'))
+        lowish_or_no_space = bool((0 < clean_space <= 0.65) or entry_pos <= 0.45)
+        if (not tp1_threatened) and (demand_near or lowish_or_no_space or bullish_context):
+            analysis['short_above_weak_low'] = True
+            analysis['entry_into_demand'] = True
+            analysis['entry_near_opposite_zone'] = True
+            analysis['entry_in_range_premium'] = True
+            analysis['underlying_bullish_fvg'] = bool(analysis.get('underlying_bullish_fvg') or demand_near or bullish_context)
+            if bullish_context:
+                analysis['bullish_context_before_entry'] = True
+                analysis['bearish_reclaim_missing'] = True
+        if (not tp1_threatened) and bullish_context and supply_near and not demand_near and entry_pos >= 0.45:
+            analysis['short_failed_supply_bullish_structure'] = True
+            analysis['failed_supply_reaction'] = True
+            analysis['short_against_bullish_structure'] = True
+        return
+
+    supply_near = bool(
+        analysis.get('supply_near_tfs')
+        or _b('overhead_bearish_fvg')
+        or _b('entry_into_supply')
+        or _b('entry_into_overhead_supply')
+        or _b('long_below_strong_high')
+    )
+    demand_near = bool(analysis.get('demand_near_tfs') or _b('long_demand_near_entry'))
+    highish_or_no_space = bool((0 < clean_space <= 0.65) or entry_pos >= 0.55)
+    if (not tp1_threatened) and (supply_near or highish_or_no_space or bearish_context):
+        analysis['long_below_strong_high'] = True
+        analysis['entry_into_supply'] = True
+        analysis['entry_into_overhead_supply'] = True
+        analysis['entry_near_opposite_zone'] = True
+        analysis['entry_in_range_premium'] = True
+        analysis['overhead_bearish_fvg'] = bool(analysis.get('overhead_bearish_fvg') or supply_near or bearish_context)
+        if bearish_context:
+            analysis['bearish_context_before_entry'] = True
+            analysis['reclaim_missing'] = True
+    if (not tp1_threatened) and bearish_context and demand_near and not supply_near and entry_pos <= 0.55:
+        analysis['long_failed_demand_bearish_structure'] = True
+        analysis['failed_demand_reaction'] = True
+        analysis['long_against_bearish_structure'] = True
+
 def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: str, entry: float, tp1: float, sl: float) -> None:
     """Merge entry_snapshot_json into close analysis and set chart-location flags.
 
@@ -5268,6 +5395,7 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
         else:
             snapshot = _loss_diag_enrich_entry_snapshot_from_tfs(snapshot, side=side)
         _loss_diag_apply_snapshot_context(analysis, snapshot, side=side, entry=entry, tp1=tp1, sl=sl)
+        _loss_diag_apply_directional_location_flags(analysis, side=side)
     except Exception:
         pass
     try:
@@ -5517,7 +5645,9 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
 
         try:
             _loss_diag_apply_snapshot_context(analysis, snapshot, side=side, entry=entry, tp1=tp1, sl=sl)
+            _loss_diag_apply_directional_location_flags(analysis, side=side)
             _loss_diag_apply_fast_context_flags(analysis, side=side)
+            _loss_diag_apply_directional_location_flags(analysis, side=side)
         except Exception:
             pass
 
@@ -5851,8 +5981,11 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
     code = str(loss_diag.get('primary_reason_code') or loss_diag.get('reason_code') or '').strip()
     primary_text = _loss_card_short_reason_title(code, str(loss_diag.get('primary_reason_text') or loss_diag.get('reason_text') or ''))
 
-    short_failed_supply = side == 'SHORT' and (code in {'short_failed_supply_bullish_structure', 'failed_supply_reaction'} or bool(analysis.get('short_failed_supply_bullish_structure') or analysis.get('failed_supply_reaction')))
-    short_demand = side == 'SHORT' and (not short_failed_supply) and (code in {'short_above_weak_low', 'entry_into_demand'} or bool(analysis.get('short_above_weak_low') or analysis.get('entry_into_demand')))
+    short_demand_raw = side == 'SHORT' and (code in {'short_above_weak_low', 'entry_into_demand'} or bool(analysis.get('short_above_weak_low') or analysis.get('entry_into_demand') or analysis.get('demand_near_tfs')))
+    short_failed_supply_raw = side == 'SHORT' and (code in {'short_failed_supply_bullish_structure', 'failed_supply_reaction'} or bool(analysis.get('short_failed_supply_bullish_structure') or analysis.get('failed_supply_reaction')))
+    demand_dominates = bool(short_demand_raw and not analysis.get('supply_near_tfs'))
+    short_demand = bool(short_demand_raw and (demand_dominates or not short_failed_supply_raw))
+    short_failed_supply = bool(short_failed_supply_raw and not short_demand)
     long_failed_demand = side == 'LONG' and (code in {'long_failed_demand_bearish_structure', 'failed_demand_reaction'} or bool(analysis.get('long_failed_demand_bearish_structure') or analysis.get('failed_demand_reaction')))
     long_supply = side == 'LONG' and (code in {'long_below_strong_high', 'entry_into_supply', 'entry_into_overhead_supply'} or bool(analysis.get('long_below_strong_high') or analysis.get('entry_into_supply') or analysis.get('entry_into_overhead_supply')))
 
@@ -5876,12 +6009,21 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         analysis_lines.append(f"вход → SL: {duration_min} мин")
 
     if short_demand:
-        scenario_text = (
-            'SHORT был открыт слишком низко, прямо над buyer zone и weak low. '
-            'Цена уже находилась в зоне реакции покупателей, поэтому downside был ограничен, '
-            'а вероятность bounce вверх была высокой.'
-        )
+        if analysis.get('bullish_context_before_entry') or analysis.get('bearish_reclaim_missing') or analysis.get('underlying_bullish_fvg'):
+            scenario_text = (
+                'SHORT был открыт после bullish reclaim / CHoCH, прямо над buyer zone / green FVG. '
+                'Снизу уже была поддержка покупателей, bearish reclaim перед входом не появился, '
+                'поэтому downside был ограничен, а цена быстро вернулась к SL.'
+            )
+        else:
+            scenario_text = (
+                'SHORT был открыт слишком низко, прямо над buyer zone и weak low. '
+                'Цена уже находилась в зоне реакции покупателей, поэтому downside был ограничен, '
+                'а вероятность bounce вверх была высокой.'
+            )
         analysis_lines.extend(['immediate rejection from demand', 'downside expansion отсутствовал'])
+        if analysis.get('bearish_reclaim_missing'):
+            analysis_lines.append('bearish reclaim перед SHORT не подтвердился')
         happened_lines = [
             'цена не смогла продолжить sell-side движение',
             'buyer zone сразу начала удерживать цену',
@@ -5897,7 +6039,15 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
             'sell continuation уже поздний',
             'вход сделан слишком низко в range',
         ]
-        secondary_labels = ['Late entry', 'Short into demand', 'Weak downside continuation', 'Poor RR location', 'Sell-side exhaustion']
+        if analysis.get('bullish_context_before_entry') or analysis.get('bearish_reclaim_missing'):
+            visible_lines.insert(0, 'перед входом уже был bullish reclaim / CHoCH вверх')
+            visible_lines.insert(1, 'bearish reclaim перед SHORT не появился')
+        if analysis.get('demand_near_tfs'):
+            try:
+                visible_lines.append('buyer zone / demand виден на TF: ' + '/'.join([str(x) for x in list(analysis.get('demand_near_tfs') or [])]))
+            except Exception:
+                pass
+        secondary_labels = ['Late entry', 'Short into demand', 'Underlying bullish FVG', 'Weak downside continuation', 'Poor RR location', 'Sell-side exhaustion']
         improve_labels = ['не шортить прямо в strong low', 'избегать входа в discount area', 'ждать premium re-entry выше']
         primary_text = 'Short entered directly into demand'
     elif short_failed_supply:
