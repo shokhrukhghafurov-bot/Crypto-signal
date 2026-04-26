@@ -4111,6 +4111,13 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
     entry_overhead = bool((side == 'LONG') and (analysis.get('entry_into_overhead_supply') or analysis.get('entry_into_supply') or long_below_high))
     entry_opposite_zone = bool(analysis.get('entry_near_opposite_zone') or long_below_high or short_above_low)
     bad_range_location = bool(analysis.get('entry_in_range_premium'))
+    try:
+        entry_pos_for_priority = float(analysis.get('entry_position_in_prior_range') or analysis.get('entry_position_in_range') or 0.5)
+    except Exception:
+        entry_pos_for_priority = 0.5
+    # If LONG had a red FVG/supply directly above and entry was not in the low/demand
+    # part of the range, the visible chart reason is LONG into supply, not failed demand.
+    supply_dominates_long = bool(side == 'LONG' and entry_overhead and entry_pos_for_priority >= 0.48)
     late_exhausted = bool(analysis.get('late_entry_after_exhausted_move') or analysis.get('late_entry_inside_expansion'))
     try:
         clean_space_to_tp = float(analysis.get('clean_space_to_tp1_pct') or 0.0)
@@ -4304,7 +4311,7 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
         scenario = 'weak_reaction_then_fade' if weak_follow else ''
 
     # Highest priority: explain WHY the entry itself was bad on the chart, not only what happened after entry.
-    if side == 'LONG' and failed_demand_long:
+    if side == 'LONG' and failed_demand_long and not supply_dominates_long:
         primary = 'long_failed_demand_bearish_structure'
         scenario = 'failed_demand_scenario'
         missed.extend(['require_bullish_reclaim', 'avoid_failed_demand_long'])
@@ -4610,12 +4617,17 @@ def _loss_diag_find_fvg_zones(d: pd.DataFrame, *, tf: str = '', max_scan: int = 
     return zones
 
 
-def _loss_diag_pick_near_zone(zones: list[dict], *, entry: float, zone_side: str, max_dist_pct: float) -> dict:
+def _loss_diag_pick_near_zone(zones: list[dict], *, entry: float, zone_side: str, max_dist_pct: float, target: float = 0.0) -> dict:
     if not zones or entry <= 0:
         return {}
     want = str(zone_side or '').strip().lower()
     best = None
     best_dist = 10**9
+    target_f = 0.0
+    try:
+        target_f = float(target or 0.0)
+    except Exception:
+        target_f = 0.0
     for z in zones:
         try:
             if str(z.get('side') or '').lower() != want:
@@ -4624,6 +4636,17 @@ def _loss_diag_pick_near_zone(zones: list[dict], *, entry: float, zone_side: str
             top = float(z.get('top'))
             if top < bottom:
                 bottom, top = top, bottom
+
+            relation = ''
+            blocks_target = False
+            # Important for LOSS cards: a zone can be correct reason even when
+            # entry is not inside it. If it sits between entry and TP1, it blocks
+            # the path (LONG into overhead red FVG / SHORT into underlying green FVG).
+            if target_f > 0 and abs(target_f - entry) > 1e-12:
+                lo_path, hi_path = (entry, target_f) if entry <= target_f else (target_f, entry)
+                if max(lo_path, bottom) <= min(hi_path, top):
+                    blocks_target = True
+
             if bottom <= entry <= top:
                 dist_pct = 0.0
                 relation = 'inside'
@@ -4633,19 +4656,29 @@ def _loss_diag_pick_near_zone(zones: list[dict], *, entry: float, zone_side: str
             elif want == 'supply' and entry < bottom:
                 dist_pct = ((bottom - entry) / entry) * 100.0
                 relation = 'below'
+            elif blocks_target:
+                dist_pct = 0.0
+                relation = 'blocks_target'
             else:
                 continue
-            if dist_pct <= float(max_dist_pct) and dist_pct < best_dist:
+
+            limit = float(max_dist_pct)
+            if blocks_target:
+                limit = max(limit, 0.85)
+                relation = 'blocks_target' if relation not in ('inside',) else 'inside_blocks_target'
+            if dist_pct <= limit and dist_pct < best_dist:
                 best_dist = dist_pct
                 best = dict(z)
                 best['distance_pct'] = round(dist_pct, 3)
                 best['relation'] = relation
+                if blocks_target:
+                    best['blocks_target'] = True
         except Exception:
             continue
     return best or {}
 
 
-def _loss_diag_build_tf_snapshot_from_df(df, *, entry: float, side: str, tf: str, opened_at: dt.datetime | None = None) -> dict:
+def _loss_diag_build_tf_snapshot_from_df(df, *, entry: float, side: str, tf: str, opened_at: dt.datetime | None = None, tp1: float = 0.0) -> dict:
     d = _loss_diag_norm_ohlcv_df(df)
     if d.empty or entry <= 0:
         return {}
@@ -4669,8 +4702,8 @@ def _loss_diag_build_tf_snapshot_from_df(df, *, entry: float, side: str, tf: str
         tfm = _loss_diag_tf_minutes(tf)
         max_dist_pct = 0.32 if tfm <= 5 else (0.42 if tfm <= 15 else 0.55)
         zones = _loss_diag_find_fvg_zones(pre, tf=tf, max_scan=min(len(pre), 90))
-        demand = _loss_diag_pick_near_zone(zones, entry=float(entry), zone_side='demand', max_dist_pct=max_dist_pct)
-        supply = _loss_diag_pick_near_zone(zones, entry=float(entry), zone_side='supply', max_dist_pct=max_dist_pct)
+        demand = _loss_diag_pick_near_zone(zones, entry=float(entry), zone_side='demand', max_dist_pct=max_dist_pct, target=float(tp1 or 0.0))
+        supply = _loss_diag_pick_near_zone(zones, entry=float(entry), zone_side='supply', max_dist_pct=max_dist_pct, target=float(tp1 or 0.0))
         strong_low_near = bool(0 <= dist_low_pct <= max(max_dist_pct, 0.38) or entry_pos <= 0.20)
         strong_high_near = bool(0 <= dist_high_pct <= max(max_dist_pct, 0.38) or entry_pos >= 0.80)
         pre_move_pct = 0.0
@@ -5045,7 +5078,8 @@ def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: s
             lowish_entry = any(float(ep) <= 0.45 for _, ep in entry_positions)
         except Exception:
             lowish_entry = False
-        if bearish_after_entry and weak_after_entry and (demand_hits or lowish_entry):
+        supply_blocks_long = bool(supply_hits and not lowish_entry)
+        if bearish_after_entry and weak_after_entry and (demand_hits or lowish_entry) and not supply_blocks_long:
             analysis['long_failed_demand_bearish_structure'] = True
             analysis['failed_demand_reaction'] = True
             analysis['long_against_bearish_structure'] = True
@@ -5178,7 +5212,7 @@ async def _signal_forensics_entry_snapshot_async(sig) -> dict:
             try:
                 limit = 220 if tf == '5m' else 180
                 df = await backend.load_candles(symbol, tf, market=market, limit=limit)
-                one = _loss_diag_build_tf_snapshot_from_df(df, entry=entry, side=side, tf=tf, opened_at=None)
+                one = _loss_diag_build_tf_snapshot_from_df(df, entry=entry, side=side, tf=tf, opened_at=None, tp1=(_loss_diag_parse_float(getattr(sig, 'tp1', None)) or 0.0))
                 if one:
                     tf_snaps[tf] = one
             except Exception:
@@ -5382,7 +5416,7 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
                 try:
                     _limit = 220 if _tf == '5m' else 180
                     _df = await backend.load_candles(symbol, _tf, market=market, limit=_limit)
-                    _one = _loss_diag_build_tf_snapshot_from_df(_df, entry=entry, side=side, tf=_tf, opened_at=opened)
+                    _one = _loss_diag_build_tf_snapshot_from_df(_df, entry=entry, side=side, tf=_tf, opened_at=opened, tp1=tp1)
                     if _one:
                         tf_snaps[_tf] = _one
                 except Exception:
@@ -5992,8 +6026,13 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
     demand_dominates = bool(short_demand_raw and not analysis.get('supply_near_tfs'))
     short_demand = bool(short_demand_raw and (demand_dominates or not short_failed_supply_raw))
     short_failed_supply = bool(short_failed_supply_raw and not short_demand)
-    long_failed_demand = side == 'LONG' and (code in {'long_failed_demand_bearish_structure', 'failed_demand_reaction'} or bool(analysis.get('long_failed_demand_bearish_structure') or analysis.get('failed_demand_reaction')))
-    long_supply = side == 'LONG' and (code in {'long_below_strong_high', 'entry_into_supply', 'entry_into_overhead_supply'} or bool(analysis.get('long_below_strong_high') or analysis.get('entry_into_supply') or analysis.get('entry_into_overhead_supply')))
+    long_supply = side == 'LONG' and (code in {'long_below_strong_high', 'entry_into_supply', 'entry_into_overhead_supply'} or bool(analysis.get('long_below_strong_high') or analysis.get('entry_into_supply') or analysis.get('entry_into_overhead_supply') or analysis.get('supply_near_tfs') or analysis.get('overhead_bearish_fvg')))
+    try:
+        _entry_pos_payload = float(analysis.get('entry_position_in_prior_range') or analysis.get('entry_position_in_range') or 0.5)
+    except Exception:
+        _entry_pos_payload = 0.5
+    _supply_dominates_payload = bool(long_supply and _entry_pos_payload >= 0.48)
+    long_failed_demand = side == 'LONG' and not _supply_dominates_payload and (code in {'long_failed_demand_bearish_structure', 'failed_demand_reaction'} or bool(analysis.get('long_failed_demand_bearish_structure') or analysis.get('failed_demand_reaction')))
 
     duration_min = None
     try:
@@ -6172,16 +6211,26 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
             'произошёл rejection против позиции',
         ]
         visible_lines = [
-            'LONG открыт почти прямо под red FVG + strong high',
-            'сверху уже seller reaction zone',
-            'upside для LONG маленький',
-            'RR плохой',
-            'цена уже пришла в premium area',
-            'buy continuation уже поздний',
-            'вход сделан слишком высоко в range',
+            'LONG открыт почти прямо под red FVG / seller zone',
+            'сверху уже seller reaction zone, которая блокировала путь к TP1',
+            'upside для LONG был ограничен',
+            'цена уже пришла в premium/верхнюю часть локального range',
+            'buy continuation был поздний',
+            'после входа не было clean bullish displacement',
         ]
-        secondary_labels = ['Late entry', 'Long into supply', 'Weak upside continuation', 'Poor RR location', 'Buy-side exhaustion']
-        improve_labels = ['не лонговать прямо под strong high', 'избегать входа в premium area', 'ждать discount re-entry ниже']
+        if analysis.get('supply_near_tfs'):
+            try:
+                visible_lines.append('overhead supply / red FVG виден на TF: ' + '/'.join([str(x) for x in list(analysis.get('supply_near_tfs') or [])]))
+            except Exception:
+                pass
+        try:
+            cs = float(analysis.get('clean_space_to_tp1_pct') or 0.0)
+            if cs > 0:
+                visible_lines.append(f'расстояние до TP1 было около {cs:.2f}% и упиралось в supply')
+        except Exception:
+            pass
+        secondary_labels = ['Late entry', 'Long into supply', 'Overhead bearish FVG', 'Weak upside continuation', 'Poor RR location', 'Buy-side exhaustion']
+        improve_labels = ['не лонговать прямо под red FVG / supply', 'требовать чистое пространство до TP1', 'ждать discount re-entry ниже']
         primary_text = 'Long entered directly into supply'
     else:
         scenario_text = str(loss_diag.get('scenario_text') or '').strip()
@@ -6334,6 +6383,29 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
     ).strip()
 
 
+def _loss_diag_close_analysis_is_thin(value) -> bool:
+    """True when close_analysis_json exists but lacks chart-location context.
+
+    Thin analysis can still build a card, but it often falls back to generic
+    "Breakout trap / no continuation". Rebuilding it before sending the report
+    adds 5m/15m/30m/1h entry snapshots and lets the bot detect supply/demand zones.
+    """
+    try:
+        a = dict(value or {})
+    except Exception:
+        return True
+    if not a:
+        return True
+    rich_keys = (
+        'tf_checked',
+        'supply_near_tfs', 'demand_near_tfs',
+        'entry_into_supply', 'entry_into_overhead_supply', 'entry_into_demand',
+        'long_below_strong_high', 'short_above_weak_low',
+        'long_failed_demand_bearish_structure', 'short_failed_supply_bullish_structure',
+        'entry_position_in_prior_range', 'entry_position_in_range',
+    )
+    return not any(a.get(k) not in (None, '', [], {}, False) for k in rich_keys)
+
 
 async def _send_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pct: float, closed_at: dt.datetime | None = None) -> None:
     if _report_bot is None:
@@ -6346,7 +6418,7 @@ async def _send_closed_signal_report_card(t: dict, *, final_status: str, pnl_tot
         # Safety net: every LOSS card must have candle-based close_analysis_json.
         # Some manual/legacy close paths can call this sender without precomputed
         # analysis, which previously produced the same generic Breakout trap text.
-        if str(final_status or '').upper().strip() == 'LOSS' and not _row_for_report.get('close_analysis_json'):
+        if str(final_status or '').upper().strip() == 'LOSS' and _loss_diag_close_analysis_is_thin(_row_for_report.get('close_analysis_json')):
             try:
                 _row_for_report['close_analysis_json'] = await _loss_diag_build_close_analysis(_row_for_report, closed_at=closed_at)
             except Exception:
