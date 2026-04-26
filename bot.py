@@ -5084,6 +5084,8 @@ def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: s
         if demand_hits:
             analysis['long_demand_near_entry'] = True
             analysis['demand_near_tfs'] = list(dict.fromkeys(demand_hits))
+        pre_bearish = bool(pre_moves and min(pre_moves) < -0.45)
+        pre_bullish = bool(pre_moves and max(pre_moves) > 0.45)
         if supply_hits:
             analysis['supply_near_tfs'] = list(dict.fromkeys(supply_hits))
             analysis['overhead_bearish_fvg'] = True
@@ -5091,7 +5093,13 @@ def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: s
             analysis['entry_into_supply'] = True
             analysis['entry_into_overhead_supply'] = True
             analysis['entry_near_opposite_zone'] = True
-            analysis['entry_in_range_premium'] = True
+            if pre_bearish and not pre_bullish:
+                analysis['bearish_context_before_entry'] = True
+                analysis['long_against_bearish_structure'] = True
+                analysis['long_bearish_continuation_under_supply'] = True
+                analysis['reclaim_missing'] = True
+            else:
+                analysis['entry_in_range_premium'] = True
         elif entry_positions:
             highish = any(ep >= 0.65 for _, ep in entry_positions)
             if highish and (cs <= 0.55 or bool(analysis.get('weak_followthrough'))):
@@ -5102,6 +5110,12 @@ def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: s
                 analysis['entry_in_range_premium'] = True
         if pre_moves and max(pre_moves) > 0.45:
             analysis['late_entry_after_exhausted_move'] = True
+        if pre_moves and min(pre_moves) < -0.45:
+            analysis['bearish_context_before_entry'] = True
+            if analysis.get('overhead_bearish_fvg') or analysis.get('supply_near_tfs'):
+                analysis['long_against_bearish_structure'] = True
+                analysis['long_bearish_continuation_under_supply'] = True
+                analysis['reclaim_missing'] = True
 
         # Failed-demand LONG pattern (ANIMEUSDT-type): buy from demand after market
         # already shifted bearish. This is different from a simple breakout trap.
@@ -6124,21 +6138,33 @@ def _loss_card_apply_price_location_override(src: dict, analysis: dict, *, side:
             or analysis.get('long_below_strong_high')
         )
         bullish_pre = False
+        bearish_pre = False
         for key in ('local_pre_move_6_pct', 'local_pre_move_12_pct', 'local_pre_move_24_pct', 'pre_entry_move_pct'):
             try:
-                if float(analysis.get(key) or 0.0) >= (0.12 if key.startswith('local') else 0.45):
+                v = float(analysis.get(key) or 0.0)
+                if v >= (0.12 if key.startswith('local') else 0.45):
                     bullish_pre = True
-                    break
+                if v <= (-0.12 if key.startswith('local') else -0.45):
+                    bearish_pre = True
             except Exception:
                 pass
-        if supply_near or (no_clean_space and (entry_pos >= 0.50 or bullish_pre or analysis.get('late_entry_after_exhausted_move'))):
+        if supply_near or (no_clean_space and (entry_pos >= 0.50 or bullish_pre or bearish_pre or analysis.get('late_entry_after_exhausted_move'))):
             analysis['long_below_strong_high'] = True
             analysis['entry_into_supply'] = True
             analysis['entry_into_overhead_supply'] = True
             analysis['entry_near_opposite_zone'] = True
-            analysis['entry_in_range_premium'] = True
             analysis['overhead_bearish_fvg'] = True
-            analysis['location_override_reason'] = 'long_into_supply_from_tiny_tp1_space'
+            if bearish_pre and not bullish_pre:
+                # Exact HOLO-type case: LONG is not only “into supply”; it is a buy
+                # against bearish structure while red FVG/supply is still overhead.
+                analysis['bearish_context_before_entry'] = True
+                analysis['long_against_bearish_structure'] = True
+                analysis['long_bearish_continuation_under_supply'] = True
+                analysis['reclaim_missing'] = True
+                analysis['location_override_reason'] = 'long_against_bearish_structure_under_supply'
+            else:
+                analysis['entry_in_range_premium'] = True
+                analysis['location_override_reason'] = 'long_into_supply_from_tiny_tp1_space'
         return
 
     demand_near = bool(
@@ -6279,8 +6305,35 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
         zone = analysis.get('nearest_supply_zone') if isinstance(analysis.get('nearest_supply_zone'), dict) else {}
         blocks_tp1 = bool(_loss_card_bool(analysis, 'supply_zone_blocks_tp1') or str(analysis.get('supply_zone_relation') or '') in ('blocks_target', 'inside_blocks_target'))
         late_pump = bool(_loss_card_bool(analysis, 'late_entry_after_exhausted_move') or local6 >= 0.12 or local12 >= 0.22 or pre_move >= 0.45)
+        bearish_context = bool(
+            _loss_card_bool(analysis, 'bearish_context_before_entry')
+            or _loss_card_bool(analysis, 'long_against_bearish_structure')
+            or _loss_card_bool(analysis, 'long_bearish_continuation_under_supply')
+            or _loss_card_bool(analysis, 'reclaim_missing')
+            or local6 <= -0.12
+            or local12 <= -0.22
+            or pre_move <= -0.45
+            or str(analysis.get('structure_5m') or '').lower().startswith('bearish')
+            or str(analysis.get('trend_context') or '').lower().startswith('bearish')
+        )
         strong_high = bool(_loss_card_bool(analysis, 'long_below_strong_high') or entry_pos >= 0.72)
         zone_desc = _loss_card_zone_desc(zone, 'red FVG / seller zone')
+        if bearish_context and not late_pump:
+            return {
+                'pattern': 'long_against_bearish_structure_under_supply',
+                'primary_text': 'Long against bearish structure under supply',
+                'scenario_text': 'LONG был открыт не из чистого bullish continuation, а под red FVG / supply внутри bearish-структуры. Цена не сделала reclaim выше зоны продавца, поэтому покупатель не получил продолжение и sell-side движение продолжилось к SL.',
+                'analysis_add': ['bearish structure перед входом', 'bullish reclaim выше supply отсутствовал', 'upside expansion отсутствовал'],
+                'visible': [
+                    'перед входом структура уже была bearish / делала lower high → lower low',
+                    f'LONG открыт под {zone_desc}',
+                    'red FVG / seller zone оставалась активной над входом',
+                    'после входа не было clean bullish reclaim выше supply',
+                    'это был не clean breakout continuation, а попытка купить против seller pressure',
+                ],
+                'secondary': ['Long against bearish structure', 'Overhead bearish FVG', 'Failed reclaim', 'Weak upside continuation', 'Bearish continuation resumed', 'Poor RR location'],
+                'improve': ['не брать LONG под red FVG, если 5m/15m структура bearish', 'ждать reclaim и закрепление выше supply', 'требовать clean space до TP1 без seller zone'],
+            }
         if blocks_tp1 or (no_tp_space and bool(analysis.get('supply_near_tfs'))):
             return {
                 'pattern': 'tp1_blocked_by_overhead_fvg',
@@ -6346,8 +6399,35 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
         zone = analysis.get('nearest_demand_zone') if isinstance(analysis.get('nearest_demand_zone'), dict) else {}
         blocks_tp1 = bool(_loss_card_bool(analysis, 'demand_zone_blocks_tp1') or str(analysis.get('demand_zone_relation') or '') in ('blocks_target', 'inside_blocks_target'))
         late_dump = bool(_loss_card_bool(analysis, 'late_entry_after_exhausted_move') or local6 <= -0.12 or local12 <= -0.22 or pre_move <= -0.45)
+        bullish_context = bool(
+            _loss_card_bool(analysis, 'bullish_context_before_entry')
+            or _loss_card_bool(analysis, 'short_against_bullish_structure')
+            or _loss_card_bool(analysis, 'short_bullish_continuation_over_demand')
+            or _loss_card_bool(analysis, 'bearish_reclaim_missing')
+            or local6 >= 0.12
+            or local12 >= 0.22
+            or pre_move >= 0.45
+            or str(analysis.get('structure_5m') or '').lower().startswith('bullish')
+            or str(analysis.get('trend_context') or '').lower().startswith('bullish')
+        )
         strong_low = bool(_loss_card_bool(analysis, 'short_above_weak_low') or entry_pos <= 0.28)
         zone_desc = _loss_card_zone_desc(zone, 'green FVG / buyer zone')
+        if bullish_context and not late_dump:
+            return {
+                'pattern': 'short_against_bullish_structure_over_demand',
+                'primary_text': 'Short against bullish structure over demand',
+                'scenario_text': 'SHORT был открыт не из чистого bearish continuation, а над green FVG / demand внутри bullish-структуры. Цена не сделала bearish reclaim ниже зоны покупателя, поэтому продавец не получил продолжение и buy-side движение продолжилось к SL.',
+                'analysis_add': ['bullish structure перед входом', 'bearish reclaim ниже demand отсутствовал', 'downside expansion отсутствовал'],
+                'visible': [
+                    'перед входом структура уже была bullish / делала higher low → higher high',
+                    f'SHORT открыт над {zone_desc}',
+                    'green FVG / buyer zone оставалась активной под входом',
+                    'после входа не было clean bearish reclaim ниже demand',
+                    'это был не clean breakdown continuation, а попытка шортить против buyer pressure',
+                ],
+                'secondary': ['Short against bullish structure', 'Underlying bullish FVG', 'Failed bearish reclaim', 'Weak downside continuation', 'Bullish continuation resumed', 'Poor RR location'],
+                'improve': ['не брать SHORT над green FVG, если 5m/15m структура bullish', 'ждать reclaim и закрепление ниже demand', 'требовать clean space до TP1 без buyer zone'],
+            }
         if blocks_tp1 or (no_tp_space and bool(analysis.get('demand_near_tfs'))):
             return {
                 'pattern': 'tp1_blocked_by_underlying_fvg',
