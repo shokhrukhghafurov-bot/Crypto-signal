@@ -4127,7 +4127,7 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
     # Fallback forensic inference:
     # even if explicit flags were missed, if TP1 space is tiny + no continuation,
     # treat it as bad entry location near opposite liquidity (real chart reason).
-    if side == 'LONG' and (not long_below_high) and clean_space_to_tp > 0 and clean_space_to_tp <= 0.45 and weak_follow and (not tp1_threatened):
+    if side == 'LONG' and (not long_below_high) and clean_space_to_tp > 0 and clean_space_to_tp <= _loss_card_location_tp_space_pct() and weak_follow and (not tp1_threatened):
         long_below_high = True
         entry_overhead = True
         entry_opposite_zone = True
@@ -4135,7 +4135,7 @@ def _loss_diag_build_forensic_from_analysis(src: dict, analysis: dict, *, after_
         analysis['entry_into_supply'] = True
         analysis['entry_into_overhead_supply'] = True
         analysis['entry_near_opposite_zone'] = True
-    if side == 'SHORT' and (not short_above_low) and clean_space_to_tp > 0 and clean_space_to_tp <= 0.45 and weak_follow and (not tp1_threatened):
+    if side == 'SHORT' and (not short_above_low) and clean_space_to_tp > 0 and clean_space_to_tp <= _loss_card_location_tp_space_pct() and weak_follow and (not tp1_threatened):
         short_above_low = True
         entry_opposite_zone = True
         analysis['short_above_weak_low'] = True
@@ -6012,13 +6012,199 @@ def _loss_card_short_reason_title(code: str, text: str = '') -> str:
     return raw or _loss_diag_reason_human_label(code)
 
 
+def _loss_card_location_tp_space_pct() -> float:
+    """Max TP1 clean-space (%) that still counts as blocked by nearby opposite zone."""
+    try:
+        raw = os.getenv('LOSS_CARD_LOCATION_TP_SPACE_PCT', '0.65')
+        val = float(str(raw or '0.65').replace(',', '.'))
+        return max(0.15, min(2.0, val))
+    except Exception:
+        return 0.65
+
+
+def _loss_card_apply_price_location_override(src: dict, analysis: dict, *, side: str) -> None:
+    """Prefer the visible chart-location reason over a generic breakout trap."""
+    if not isinstance(analysis, dict):
+        return
+    side_u = str(side or src.get('side') or analysis.get('side') or '').upper().strip()
+    if side_u not in ('LONG', 'SHORT'):
+        return
+
+    def _f(obj, key: str, default: float = 0.0) -> float:
+        try:
+            val = obj.get(key) if isinstance(obj, dict) else None
+            if val is None or val == '':
+                return default
+            return float(str(val).replace(',', '.'))
+        except Exception:
+            return default
+
+    entry = _f(src, 'entry') or _f(analysis, 'entry')
+    tp1 = _f(src, 'tp1') or _f(analysis, 'tp1')
+    if entry <= 0 or tp1 <= 0:
+        return
+
+    clean_space = _f(analysis, 'clean_space_to_tp1_pct')
+    if clean_space <= 0:
+        if side_u == 'LONG' and tp1 > entry:
+            clean_space = ((tp1 - entry) / entry) * 100.0
+        elif side_u == 'SHORT' and 0 < tp1 < entry:
+            clean_space = ((entry - tp1) / entry) * 100.0
+        if clean_space > 0:
+            analysis['clean_space_to_tp1_pct'] = round(clean_space, 3)
+
+    try:
+        duration_min = int(float(analysis.get('duration_min') or 0))
+    except Exception:
+        duration_min = 0
+    tp1_known = 'tp1_threatened' in analysis
+    tp1_threatened = bool(analysis.get('tp1_threatened'))
+    weak_or_fast = bool(
+        analysis.get('weak_followthrough')
+        or analysis.get('no_post_entry_expansion')
+        or analysis.get('zone_reaction_too_weak')
+        or analysis.get('fast_invalidation')
+        or analysis.get('immediate_invalidation')
+        or analysis.get('continuation_seen') is False
+        or (tp1_known and not tp1_threatened)
+        or (duration_min and duration_min <= 20)
+    )
+    if not weak_or_fast:
+        return
+
+    max_space = _loss_card_location_tp_space_pct()
+    no_clean_space = bool(0 < clean_space <= max_space and (not tp1_threatened))
+
+    try:
+        entry_pos = float(analysis.get('entry_position_in_prior_range') or analysis.get('entry_position_in_range') or 0.5)
+    except Exception:
+        entry_pos = 0.5
+
+    if side_u == 'LONG':
+        supply_near = bool(
+            analysis.get('supply_near_tfs')
+            or analysis.get('overhead_bearish_fvg')
+            or analysis.get('entry_into_supply')
+            or analysis.get('entry_into_overhead_supply')
+            or analysis.get('long_below_strong_high')
+        )
+        bullish_pre = False
+        for key in ('local_pre_move_6_pct', 'local_pre_move_12_pct', 'local_pre_move_24_pct', 'pre_entry_move_pct'):
+            try:
+                if float(analysis.get(key) or 0.0) >= (0.12 if key.startswith('local') else 0.45):
+                    bullish_pre = True
+                    break
+            except Exception:
+                pass
+        if supply_near or (no_clean_space and (entry_pos >= 0.50 or bullish_pre or analysis.get('late_entry_after_exhausted_move'))):
+            analysis['long_below_strong_high'] = True
+            analysis['entry_into_supply'] = True
+            analysis['entry_into_overhead_supply'] = True
+            analysis['entry_near_opposite_zone'] = True
+            analysis['entry_in_range_premium'] = True
+            analysis['overhead_bearish_fvg'] = True
+            analysis['location_override_reason'] = 'long_into_supply_from_tiny_tp1_space'
+        return
+
+    demand_near = bool(
+        analysis.get('demand_near_tfs')
+        or analysis.get('underlying_bullish_fvg')
+        or analysis.get('entry_into_demand')
+        or analysis.get('short_above_weak_low')
+    )
+    bearish_pre = False
+    for key in ('local_pre_move_6_pct', 'local_pre_move_12_pct', 'local_pre_move_24_pct', 'pre_entry_move_pct'):
+        try:
+            if float(analysis.get(key) or 0.0) <= (-0.12 if key.startswith('local') else -0.45):
+                bearish_pre = True
+                break
+        except Exception:
+            pass
+    if demand_near or (no_clean_space and (entry_pos <= 0.50 or bearish_pre or analysis.get('late_entry_after_exhausted_move'))):
+        analysis['short_above_weak_low'] = True
+        analysis['entry_into_demand'] = True
+        analysis['entry_near_opposite_zone'] = True
+        analysis['entry_in_range_premium'] = True
+        analysis['underlying_bullish_fvg'] = True
+        analysis['location_override_reason'] = 'short_into_demand_from_tiny_tp1_space'
+
+
+def _report_price_precision(values) -> int:
+    """Choose enough decimals so small-cap coin levels are not rounded equal."""
+    nums = []
+    for v in values or []:
+        try:
+            fv = float(v)
+            if math.isfinite(fv) and fv > 0:
+                nums.append(fv)
+        except Exception:
+            continue
+    if not nums:
+        return 6
+    mn = min(abs(x) for x in nums if x > 0)
+    if mn >= 1000:
+        prec = 2
+    elif mn >= 100:
+        prec = 3
+    elif mn >= 10:
+        prec = 4
+    elif mn >= 1:
+        prec = 5
+    elif mn >= 0.1:
+        prec = 6
+    elif mn >= 0.01:
+        prec = 7
+    elif mn >= 0.001:
+        prec = 8
+    elif mn >= 0.0001:
+        prec = 9
+    else:
+        prec = 10
+
+    diffs = []
+    for i, a in enumerate(nums):
+        for b in nums[i + 1:]:
+            d = abs(a - b)
+            if d > 0:
+                diffs.append(d)
+    if diffs:
+        try:
+            prec = max(prec, int(math.ceil(-math.log10(min(diffs)))) + 2)
+        except Exception:
+            pass
+    try:
+        cap = int(float(os.getenv('LOSS_CARD_PRICE_MAX_DECIMALS', '12') or 12))
+    except Exception:
+        cap = 12
+    return max(2, min(max(6, cap), prec))
+
+
+def _fmt_report_price(value, precision: int) -> str:
+    try:
+        fv = float(value)
+        if not math.isfinite(fv) or fv <= 0:
+            return '—'
+        precision = int(max(2, min(14, precision)))
+        return f"{fv:.{precision}f}"
+    except Exception:
+        return str(value) if value is not None else '—'
+
+
 def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool = False) -> dict:
     """Build human forensic sections exactly for Telegram LOSS report card."""
     src = dict(src or {})
     loss_diag = dict(loss_diag or {})
     analysis = dict(loss_diag.get('close_analysis_json') or {})
     side = str(src.get('side') or analysis.get('side') or '').upper().strip() or 'LONG'
+    try:
+        _loss_card_apply_price_location_override(src, analysis, side=side)
+    except Exception:
+        pass
     code = str(loss_diag.get('primary_reason_code') or loss_diag.get('reason_code') or '').strip()
+    if side == 'LONG' and bool(analysis.get('entry_into_supply') or analysis.get('entry_into_overhead_supply') or analysis.get('long_below_strong_high')):
+        code = 'long_below_strong_high'
+    elif side == 'SHORT' and bool(analysis.get('entry_into_demand') or analysis.get('short_above_weak_low')):
+        code = 'short_above_weak_low'
     primary_text = _loss_card_short_reason_title(code, str(loss_diag.get('primary_reason_text') or loss_diag.get('reason_text') or ''))
 
     short_demand_raw = side == 'SHORT' and (code in {'short_above_weak_low', 'entry_into_demand'} or bool(analysis.get('short_above_weak_low') or analysis.get('entry_into_demand') or analysis.get('demand_near_tfs')))
@@ -6304,17 +6490,23 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
     setup_label = _report_setup_label_from_row(row)
     loss_diag = _build_loss_diagnostics_from_row(row, final_status=st, closed_at=closed_at)
 
+    price_values_for_precision = [entry, sl, tp1]
+    if has_tp2 and st != 'LOSS':
+        price_values_for_precision.append(tp2)
+    if after_tp1 and be_price > 0:
+        price_values_for_precision.append(be_price)
+    price_precision = _report_price_precision(price_values_for_precision)
     price_lines = []
     if entry > 0:
-        price_lines.append(f"💰 Вход: {entry:.6f}")
+        price_lines.append(f"💰 Вход: {_fmt_report_price(entry, price_precision)}")
     if sl > 0:
-        price_lines.append(f"🛑 SL: {sl:.6f}")
+        price_lines.append(f"🛑 SL: {_fmt_report_price(sl, price_precision)}")
     if tp1 > 0:
-        price_lines.append(f"🎯 TP1: {tp1:.6f}")
+        price_lines.append(f"🎯 TP1: {_fmt_report_price(tp1, price_precision)}")
     if has_tp2 and st != 'LOSS':
-        price_lines.append(f"🚀 TP2: {tp2:.6f}")
+        price_lines.append(f"🚀 TP2: {_fmt_report_price(tp2, price_precision)}")
     if after_tp1 and be_price > 0:
-        price_lines.append(f"🛡 BE: {be_price:.6f}")
+        price_lines.append(f"🛡 BE: {_fmt_report_price(be_price, price_precision)}")
     price_block = "\n".join(price_lines).strip() or "—"
 
     # Show the setup on LOSS cards by default too.
@@ -6396,13 +6588,15 @@ def _loss_diag_close_analysis_is_thin(value) -> bool:
         return True
     if not a:
         return True
+    # `tf_checked` alone is not rich enough: old rows can have checked TFs but
+    # still miss the actual location flags, causing generic Breakout-trap cards.
     rich_keys = (
-        'tf_checked',
         'supply_near_tfs', 'demand_near_tfs',
         'entry_into_supply', 'entry_into_overhead_supply', 'entry_into_demand',
         'long_below_strong_high', 'short_above_weak_low',
         'long_failed_demand_bearish_structure', 'short_failed_supply_bullish_structure',
         'entry_position_in_prior_range', 'entry_position_in_range',
+        'clean_space_to_tp1_pct', 'local_pre_move_6_pct', 'local_pre_move_12_pct',
     )
     return not any(a.get(k) not in (None, '', [], {}, False) for k in rich_keys)
 
@@ -7550,7 +7744,11 @@ def _fmt_price(v) -> str:
     try:
         if v is None:
             return "—"
-        return f"{float(v):.6f}".rstrip("0").rstrip(".")
+        fv = float(v)
+        if not math.isfinite(fv):
+            return "—"
+        precision = _report_price_precision([fv])
+        return f"{fv:.{precision}f}".rstrip("0").rstrip(".")
     except Exception:
         return str(v) if v is not None else "—"
 
