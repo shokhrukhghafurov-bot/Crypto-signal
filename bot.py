@@ -4974,6 +4974,8 @@ def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: s
 
     demand_hits = []
     supply_hits = []
+    demand_zone_candidates = []
+    supply_zone_candidates = []
     entry_positions = []
     pre_moves = []
     for tf, one in (tfs or {}).items():
@@ -4986,10 +4988,16 @@ def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: s
             pm = one.get('pre_entry_move_pct')
             if pm is not None:
                 pre_moves.append(float(pm))
-            if one.get('entry_near_demand') or one.get('demand_zone'):
+            dz = one.get('demand_zone') if isinstance(one.get('demand_zone'), dict) else {}
+            sz = one.get('supply_zone') if isinstance(one.get('supply_zone'), dict) else {}
+            if one.get('entry_near_demand') or dz:
                 demand_hits.append(str(tf))
-            if one.get('entry_near_supply') or one.get('supply_zone'):
+                if dz:
+                    demand_zone_candidates.append(dict(dz, tf=str(tf)))
+            if one.get('entry_near_supply') or sz:
                 supply_hits.append(str(tf))
+                if sz:
+                    supply_zone_candidates.append(dict(sz, tf=str(tf)))
         except Exception:
             continue
 
@@ -5007,6 +5015,33 @@ def _loss_diag_apply_snapshot_context(analysis: dict, snapshot: dict, *, side: s
         cs = float(analysis.get('clean_space_to_tp1_pct') or 0.0)
     except Exception:
         cs = 0.0
+
+    def _zone_distance_key(z):
+        try:
+            return (0 if bool(z.get('blocks_target')) else 1, float(z.get('distance_pct') or 999.0), int(z.get('age_bars') or 9999))
+        except Exception:
+            return (9, 999.0, 9999)
+
+    if supply_zone_candidates:
+        try:
+            supply_zone_candidates = sorted(supply_zone_candidates, key=_zone_distance_key)
+            nearest_supply = dict(supply_zone_candidates[0])
+            analysis['nearest_supply_zone'] = nearest_supply
+            analysis['supply_zone_relation'] = str(nearest_supply.get('relation') or '')
+            analysis['supply_zone_blocks_tp1'] = bool(nearest_supply.get('blocks_target'))
+            analysis['supply_zone_distance_pct'] = nearest_supply.get('distance_pct')
+        except Exception:
+            pass
+    if demand_zone_candidates:
+        try:
+            demand_zone_candidates = sorted(demand_zone_candidates, key=_zone_distance_key)
+            nearest_demand = dict(demand_zone_candidates[0])
+            analysis['nearest_demand_zone'] = nearest_demand
+            analysis['demand_zone_relation'] = str(nearest_demand.get('relation') or '')
+            analysis['demand_zone_blocks_tp1'] = bool(nearest_demand.get('blocks_target'))
+            analysis['demand_zone_distance_pct'] = nearest_demand.get('distance_pct')
+        except Exception:
+            pass
 
     if side_u == 'SHORT':
         if supply_hits:
@@ -6190,6 +6225,192 @@ def _fmt_report_price(value, precision: int) -> str:
         return str(value) if value is not None else '—'
 
 
+def _loss_card_float(analysis: dict, key: str, default: float = 0.0) -> float:
+    try:
+        val = analysis.get(key) if isinstance(analysis, dict) else None
+        if val is None or val == '':
+            return default
+        return float(str(val).replace(',', '.'))
+    except Exception:
+        return default
+
+
+def _loss_card_bool(analysis: dict, key: str) -> bool:
+    val = analysis.get(key) if isinstance(analysis, dict) else None
+    if isinstance(val, str):
+        return val.strip().lower() in ('1', 'true', 'yes', 'on', 'да', 'есть')
+    return bool(val)
+
+
+def _loss_card_zone_desc(zone: dict, fallback: str) -> str:
+    if not isinstance(zone, dict) or not zone:
+        return fallback
+    tf = str(zone.get('tf') or '').strip()
+    rel = str(zone.get('relation') or '').strip()
+    dist = zone.get('distance_pct')
+    parts = [fallback]
+    if tf:
+        parts.append(f'TF {tf}')
+    if rel in ('blocks_target', 'inside_blocks_target'):
+        parts.append('между входом и TP1')
+    elif rel == 'inside':
+        parts.append('вход внутри зоны')
+    elif dist not in (None, ''):
+        try:
+            parts.append(f'дистанция {float(dist):.2f}%')
+        except Exception:
+            pass
+    return ' / '.join(parts)
+
+
+def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: int | None = None) -> dict:
+    """Pick the exact chart-visible LOSS reason instead of one generic label."""
+    side_u = str(side or '').upper().strip()
+    analysis = dict(analysis or {})
+    cs = _loss_card_float(analysis, 'clean_space_to_tp1_pct')
+    entry_pos = _loss_card_float(analysis, 'entry_position_in_prior_range', _loss_card_float(analysis, 'entry_position_in_range', 0.5))
+    local6 = _loss_card_float(analysis, 'local_pre_move_6_pct')
+    local12 = _loss_card_float(analysis, 'local_pre_move_12_pct')
+    pre_move = _loss_card_float(analysis, 'pre_entry_move_pct')
+    immediate = bool(_loss_card_bool(analysis, 'immediate_invalidation') or _loss_card_bool(analysis, 'fast_invalidation') or (duration_min is not None and duration_min <= 8))
+    no_tp_space = bool(0 < cs <= _loss_card_location_tp_space_pct())
+
+    if side_u == 'LONG':
+        zone = analysis.get('nearest_supply_zone') if isinstance(analysis.get('nearest_supply_zone'), dict) else {}
+        blocks_tp1 = bool(_loss_card_bool(analysis, 'supply_zone_blocks_tp1') or str(analysis.get('supply_zone_relation') or '') in ('blocks_target', 'inside_blocks_target'))
+        late_pump = bool(_loss_card_bool(analysis, 'late_entry_after_exhausted_move') or local6 >= 0.12 or local12 >= 0.22 or pre_move >= 0.45)
+        strong_high = bool(_loss_card_bool(analysis, 'long_below_strong_high') or entry_pos >= 0.72)
+        zone_desc = _loss_card_zone_desc(zone, 'red FVG / seller zone')
+        if blocks_tp1 or (no_tp_space and bool(analysis.get('supply_near_tfs'))):
+            return {
+                'pattern': 'tp1_blocked_by_overhead_fvg',
+                'primary_text': 'TP1 blocked by overhead bearish FVG',
+                'scenario_text': 'LONG был открыт под red FVG / supply, а TP1 находился прямо в зоне продавца. Формальный RR был, но чистого пространства до TP1 не было, поэтому price получил rejection раньше цели.',
+                'analysis_add': ['TP1 был заблокирован overhead FVG', 'upside expansion отсутствовал'],
+                'visible': [
+                    f'TP1 упирался в {zone_desc}',
+                    'между входом и TP1 не было clean space',
+                    'seller imbalance стоял прямо на пути LONG',
+                    'после входа не появился clean bullish displacement',
+                ],
+                'secondary': ['TP1 blocked by supply', 'Overhead bearish FVG', 'No clean space to TP1', 'Weak upside continuation', 'Poor RR location'],
+                'improve': ['не брать LONG, если TP1 внутри red FVG / supply', 'требовать чистое пространство до TP1', 'ждать вход ниже от discount / demand'],
+            }
+        if late_pump and strong_high:
+            return {
+                'pattern': 'late_long_after_exhausted_pump',
+                'primary_text': 'Late LONG after exhausted pump into supply',
+                'scenario_text': 'LONG был открыт после уже отработанного buy-side impulse. Цена пришла в premium/верх range прямо под seller zone, поэтому продолжение вверх было слабым и быстро начался rejection.',
+                'analysis_add': ['вход после уже отработанного pump', 'immediate rejection from supply'],
+                'visible': [
+                    'перед входом уже был сильный buy-side impulse',
+                    'LONG открыт в premium/верхней части range, а не из discount',
+                    f'сверху находился {zone_desc}',
+                    'покупатель не получил нового displacement после входа',
+                ],
+                'secondary': ['Late entry', 'Buy-side exhaustion', 'Long into supply', 'Weak upside continuation', 'No post-entry expansion'],
+                'improve': ['не покупать после вертикального pump прямо под supply', 'ждать pullback ниже', 'требовать новый bullish displacement после retest'],
+            }
+        if immediate:
+            return {
+                'pattern': 'immediate_rejection_from_supply',
+                'primary_text': 'Immediate rejection from overhead supply',
+                'scenario_text': 'LONG вошёл прямо перед зоной продавца. Реакция продавца появилась почти сразу, поэтому покупатель не успел построить continuation и цена ушла к SL.',
+                'analysis_add': ['immediate rejection from supply', 'bullish follow-through отсутствовал'],
+                'visible': [
+                    f'над входом стоял {zone_desc}',
+                    'первая реакция после входа была вниз',
+                    'bullish continuation не закрепился',
+                    'SL был выбит без нормального движения к TP1',
+                ],
+                'secondary': ['Immediate rejection', 'Long into supply', 'Weak follow-through', 'SL hit without meaningful excursion'],
+                'improve': ['не входить прямо перед seller reaction zone', 'ждать пробой и закрепление выше supply', 'после быстрого rejection считать setup invalid'],
+            }
+        return {
+            'pattern': 'long_directly_into_supply',
+            'primary_text': 'Long entered directly into supply',
+            'scenario_text': 'LONG был открыт слишком высоко, прямо под seller zone и strong high. Цена уже находилась в зоне реакции продавцов, поэтому upside был ограничен, а вероятность rejection вниз была высокой.',
+            'analysis_add': ['immediate rejection from supply', 'upside expansion отсутствовал'],
+            'visible': [
+                'LONG открыт почти прямо под red FVG / seller zone',
+                'сверху уже seller reaction zone, которая блокировала путь к TP1',
+                'upside для LONG был ограничен',
+                'цена уже пришла в premium/верхнюю часть локального range',
+                'после входа не было clean bullish displacement',
+            ],
+            'secondary': ['Late entry', 'Long into supply', 'Overhead bearish FVG', 'Weak upside continuation', 'Poor RR location', 'Buy-side exhaustion'],
+            'improve': ['не лонговать прямо под red FVG / supply', 'требовать чистое пространство до TP1', 'ждать discount re-entry ниже'],
+        }
+
+    if side_u == 'SHORT':
+        zone = analysis.get('nearest_demand_zone') if isinstance(analysis.get('nearest_demand_zone'), dict) else {}
+        blocks_tp1 = bool(_loss_card_bool(analysis, 'demand_zone_blocks_tp1') or str(analysis.get('demand_zone_relation') or '') in ('blocks_target', 'inside_blocks_target'))
+        late_dump = bool(_loss_card_bool(analysis, 'late_entry_after_exhausted_move') or local6 <= -0.12 or local12 <= -0.22 or pre_move <= -0.45)
+        strong_low = bool(_loss_card_bool(analysis, 'short_above_weak_low') or entry_pos <= 0.28)
+        zone_desc = _loss_card_zone_desc(zone, 'green FVG / buyer zone')
+        if blocks_tp1 or (no_tp_space and bool(analysis.get('demand_near_tfs'))):
+            return {
+                'pattern': 'tp1_blocked_by_underlying_fvg',
+                'primary_text': 'TP1 blocked by underlying bullish FVG',
+                'scenario_text': 'SHORT был открыт над green FVG / demand, а TP1 находился прямо в зоне покупателя. Формальный RR был, но sell-side путь был заблокирован buyer imbalance.',
+                'analysis_add': ['TP1 был заблокирован underlying FVG', 'downside expansion отсутствовал'],
+                'visible': [
+                    f'TP1 упирался в {zone_desc}',
+                    'между входом и TP1 не было clean downside space',
+                    'buyer imbalance стоял прямо на пути SHORT',
+                    'после входа не появился clean bearish displacement',
+                ],
+                'secondary': ['TP1 blocked by demand', 'Underlying bullish FVG', 'No clean space to TP1', 'Weak downside continuation', 'Poor RR location'],
+                'improve': ['не брать SHORT, если TP1 внутри green FVG / demand', 'требовать чистое пространство до TP1', 'ждать вход выше от premium / supply'],
+            }
+        if late_dump and strong_low:
+            return {
+                'pattern': 'late_short_after_exhausted_dump',
+                'primary_text': 'Late SHORT after exhausted dump into demand',
+                'scenario_text': 'SHORT был открыт после уже отработанного sell-side impulse. Цена пришла в discount/низ range прямо над buyer zone, поэтому продолжение вниз было слабым и быстро начался bounce.',
+                'analysis_add': ['вход после уже отработанного dump', 'immediate bounce from demand'],
+                'visible': [
+                    'перед входом уже был сильный sell-side impulse',
+                    'SHORT открыт в discount/нижней части range, а не из premium',
+                    f'снизу находился {zone_desc}',
+                    'продавец не получил нового displacement после входа',
+                ],
+                'secondary': ['Late entry', 'Sell-side exhaustion', 'Short into demand', 'Weak downside continuation', 'No post-entry expansion'],
+                'improve': ['не шортить после вертикального dump прямо в demand', 'ждать pullback выше', 'требовать новый bearish displacement после retest'],
+            }
+        if immediate:
+            return {
+                'pattern': 'immediate_bounce_from_demand',
+                'primary_text': 'Immediate bounce from underlying demand',
+                'scenario_text': 'SHORT вошёл прямо перед зоной покупателя. Реакция покупателя появилась почти сразу, поэтому продавец не успел построить continuation и цена ушла к SL.',
+                'analysis_add': ['immediate bounce from demand', 'bearish follow-through отсутствовал'],
+                'visible': [
+                    f'под входом стоял {zone_desc}',
+                    'первая реакция после входа была вверх',
+                    'bearish continuation не закрепился',
+                    'SL был выбит без нормального движения к TP1',
+                ],
+                'secondary': ['Immediate bounce', 'Short into demand', 'Weak follow-through', 'SL hit without meaningful excursion'],
+                'improve': ['не входить прямо перед buyer reaction zone', 'ждать пробой и закрепление ниже demand', 'после быстрого bounce считать setup invalid'],
+            }
+        return {
+            'pattern': 'short_directly_into_demand',
+            'primary_text': 'Short entered directly into demand',
+            'scenario_text': 'SHORT был открыт слишком низко, прямо над buyer zone и weak low. Цена уже находилась в зоне реакции покупателей, поэтому downside был ограничен, а вероятность bounce вверх была высокой.',
+            'analysis_add': ['immediate bounce from demand', 'downside expansion отсутствовал'],
+            'visible': [
+                'SHORT открыт почти прямо над green FVG / buyer zone',
+                'снизу уже buyer reaction zone, которая блокировала путь к TP1',
+                'downside для SHORT был ограничен',
+                'цена уже пришла в discount/нижнюю часть локального range',
+                'после входа не было clean bearish displacement',
+            ],
+            'secondary': ['Late entry', 'Short into demand', 'Underlying bullish FVG', 'Weak downside continuation', 'Poor RR location', 'Sell-side exhaustion'],
+            'improve': ['не шортить прямо в green FVG / demand', 'требовать чистое пространство до TP1', 'ждать premium re-entry выше'],
+        }
+    return {}
+
+
 def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool = False) -> dict:
     """Build human forensic sections exactly for Telegram LOSS report card."""
     src = dict(src or {})
@@ -6240,47 +6461,30 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         analysis_lines.append(f"вход → SL: {duration_min} мин")
 
     if short_demand:
-        if analysis.get('bullish_context_before_entry') or analysis.get('bearish_reclaim_missing') or analysis.get('underlying_bullish_fvg'):
-            scenario_text = (
-                'SHORT был открыт после bullish reclaim / CHoCH, прямо над buyer zone / green FVG. '
-                'Снизу уже была поддержка покупателей, bearish reclaim перед входом не появился, '
-                'поэтому downside был ограничен, а цена быстро вернулась к SL.'
-            )
-        else:
-            scenario_text = (
-                'SHORT был открыт слишком низко, прямо над buyer zone и weak low. '
-                'Цена уже находилась в зоне реакции покупателей, поэтому downside был ограничен, '
-                'а вероятность bounce вверх была высокой.'
-            )
-        analysis_lines.extend(['immediate rejection from demand', 'downside expansion отсутствовал'])
-        if analysis.get('bearish_reclaim_missing'):
-            analysis_lines.append('bearish reclaim перед SHORT не подтвердился')
+        variant = _loss_card_exact_location_variant(side, analysis, duration_min)
+        scenario_text = str(variant.get('scenario_text') or '').strip()
+        analysis_lines.extend([str(x) for x in list(variant.get('analysis_add') or []) if str(x).strip()])
         happened_lines = [
             'цена не смогла продолжить sell-side движение',
             'buyer zone сразу начала удерживать цену',
             'продавец не получил displacement вниз',
             'произошёл bounce против позиции',
         ]
-        visible_lines = [
-            'SHORT открыт почти прямо над green FVG + weak low',
-            'снизу уже buyer reaction zone',
-            'downside для SHORT маленький',
-            'RR плохой',
-            'цена уже пришла в discount area',
-            'sell continuation уже поздний',
-            'вход сделан слишком низко в range',
-        ]
-        if analysis.get('bullish_context_before_entry') or analysis.get('bearish_reclaim_missing'):
-            visible_lines.insert(0, 'перед входом уже был bullish reclaim / CHoCH вверх')
-            visible_lines.insert(1, 'bearish reclaim перед SHORT не появился')
+        visible_lines = [str(x) for x in list(variant.get('visible') or []) if str(x).strip()]
         if analysis.get('demand_near_tfs'):
             try:
-                visible_lines.append('buyer zone / demand виден на TF: ' + '/'.join([str(x) for x in list(analysis.get('demand_near_tfs') or [])]))
+                visible_lines.append('underlying demand / green FVG виден на TF: ' + '/'.join([str(x) for x in list(analysis.get('demand_near_tfs') or [])]))
             except Exception:
                 pass
-        secondary_labels = ['Late entry', 'Short into demand', 'Underlying bullish FVG', 'Weak downside continuation', 'Poor RR location', 'Sell-side exhaustion']
-        improve_labels = ['не шортить прямо в strong low', 'избегать входа в discount area', 'ждать premium re-entry выше']
-        primary_text = 'Short entered directly into demand'
+        try:
+            cs = float(analysis.get('clean_space_to_tp1_pct') or 0.0)
+            if cs > 0:
+                visible_lines.append(f'расстояние до TP1 было около {cs:.2f}% и упиралось в demand')
+        except Exception:
+            pass
+        secondary_labels = [str(x) for x in list(variant.get('secondary') or []) if str(x).strip()]
+        improve_labels = [str(x) for x in list(variant.get('improve') or []) if str(x).strip()]
+        primary_text = str(variant.get('primary_text') or 'Short entered directly into demand')
     elif short_failed_supply:
         scenario_text = (
             'SHORT был открыт после того, как рынок уже перешёл в bullish-структуру. '
@@ -6384,26 +6588,16 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         ]
         primary_text = 'Long into bearish BOS / failed demand'
     elif long_supply:
-        scenario_text = (
-            'LONG был открыт слишком высоко, прямо под seller zone и strong high. '
-            'Цена уже находилась в зоне реакции продавцов, поэтому upside был ограничен, '
-            'а вероятность rejection вниз была высокой.'
-        )
-        analysis_lines.extend(['immediate rejection from supply', 'upside expansion отсутствовал'])
+        variant = _loss_card_exact_location_variant(side, analysis, duration_min)
+        scenario_text = str(variant.get('scenario_text') or '').strip()
+        analysis_lines.extend([str(x) for x in list(variant.get('analysis_add') or []) if str(x).strip()])
         happened_lines = [
             'цена не смогла продолжить buy-side движение',
             'seller zone сразу начала удерживать цену',
             'покупатель не получил displacement вверх',
             'произошёл rejection против позиции',
         ]
-        visible_lines = [
-            'LONG открыт почти прямо под red FVG / seller zone',
-            'сверху уже seller reaction zone, которая блокировала путь к TP1',
-            'upside для LONG был ограничен',
-            'цена уже пришла в premium/верхнюю часть локального range',
-            'buy continuation был поздний',
-            'после входа не было clean bullish displacement',
-        ]
+        visible_lines = [str(x) for x in list(variant.get('visible') or []) if str(x).strip()]
         if analysis.get('supply_near_tfs'):
             try:
                 visible_lines.append('overhead supply / red FVG виден на TF: ' + '/'.join([str(x) for x in list(analysis.get('supply_near_tfs') or [])]))
@@ -6415,9 +6609,9 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
                 visible_lines.append(f'расстояние до TP1 было около {cs:.2f}% и упиралось в supply')
         except Exception:
             pass
-        secondary_labels = ['Late entry', 'Long into supply', 'Overhead bearish FVG', 'Weak upside continuation', 'Poor RR location', 'Buy-side exhaustion']
-        improve_labels = ['не лонговать прямо под red FVG / supply', 'требовать чистое пространство до TP1', 'ждать discount re-entry ниже']
-        primary_text = 'Long entered directly into supply'
+        secondary_labels = [str(x) for x in list(variant.get('secondary') or []) if str(x).strip()]
+        improve_labels = [str(x) for x in list(variant.get('improve') or []) if str(x).strip()]
+        primary_text = str(variant.get('primary_text') or 'Long entered directly into supply')
     else:
         scenario_text = str(loss_diag.get('scenario_text') or '').strip()
         analysis_lines.extend([str(x) for x in list(loss_diag.get('analysis_lines') or []) if str(x).strip()])
