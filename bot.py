@@ -4705,15 +4705,88 @@ def _loss_diag_build_tf_snapshot_from_df(df, *, entry: float, side: str, tf: str
         range_high = float(highs.max())
         range_low = float(lows.min())
         rng = max(range_high - range_low, 1e-12)
-        entry_pos = (float(entry) - range_low) / rng
-        dist_high_pct = ((range_high - float(entry)) / float(entry)) * 100.0
-        dist_low_pct = ((float(entry) - range_low) / float(entry)) * 100.0
+        entry_f = float(entry)
+        target_f = float(tp1 or 0.0)
+        side_u = str(side or '').upper().strip()
+        entry_pos = (entry_f - range_low) / rng
+        dist_high_pct = ((range_high - entry_f) / entry_f) * 100.0
+        dist_low_pct = ((entry_f - range_low) / entry_f) * 100.0
         max_dist_pct = 0.32 if tfm <= 5 else (0.42 if tfm <= 15 else 0.55)
         zones = _loss_diag_find_fvg_zones(pre, tf=tf, max_scan=min(len(pre), 90))
-        demand = _loss_diag_pick_near_zone(zones, entry=float(entry), zone_side='demand', max_dist_pct=max_dist_pct, target=float(tp1 or 0.0))
-        supply = _loss_diag_pick_near_zone(zones, entry=float(entry), zone_side='supply', max_dist_pct=max_dist_pct, target=float(tp1 or 0.0))
-        strong_low_near = bool(0 <= dist_low_pct <= max(max_dist_pct, 0.38) or entry_pos <= 0.20)
-        strong_high_near = bool(0 <= dist_high_pct <= max(max_dist_pct, 0.38) or entry_pos >= 0.80)
+        demand = _loss_diag_pick_near_zone(zones, entry=entry_f, zone_side='demand', max_dist_pct=max_dist_pct, target=target_f)
+        supply = _loss_diag_pick_near_zone(zones, entry=entry_f, zone_side='supply', max_dist_pct=max_dist_pct, target=target_f)
+
+        # FVG is the best signal, but it is not the only visible blocker.
+        # Many LOSS cards were falling back to “Breakout trap / no continuation”
+        # because the pre-entry candle snapshot had a recent swing high/low between
+        # entry and TP1, but no strict 3-candle FVG. For the report card this is
+        # still a chart-location problem: LONG has overhead supply/resistance before
+        # TP1; SHORT has underlying demand/support before TP1.
+        path_block_zone: dict = {}
+        path_block_enabled = str(os.getenv('LOSS_DIAG_PATH_BLOCK_ENABLED', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
+        try:
+            path_max_tp_space_pct = float(str(os.getenv('LOSS_DIAG_PATH_BLOCK_MAX_TP_SPACE_PCT', '1.35') or '1.35').replace(',', '.'))
+        except Exception:
+            path_max_tp_space_pct = 1.35
+        try:
+            path_buffer_pct = float(str(os.getenv('LOSS_DIAG_PATH_BLOCK_BUFFER_PCT', '0.08') or '0.08').replace(',', '.'))
+        except Exception:
+            path_buffer_pct = 0.08
+        try:
+            zone_band_pct = float(str(os.getenv('LOSS_DIAG_PATH_BLOCK_ZONE_BAND_PCT', '0.06') or '0.06').replace(',', '.'))
+        except Exception:
+            zone_band_pct = 0.06
+        clean_space_pct = 0.0
+        if path_block_enabled and target_f > 0 and abs(target_f - entry_f) > 1e-12:
+            if side_u == 'LONG' and target_f > entry_f:
+                clean_space_pct = ((target_f - entry_f) / entry_f) * 100.0
+                if clean_space_pct <= max(0.20, path_max_tp_space_pct):
+                    upper_limit = target_f + entry_f * (path_buffer_pct / 100.0)
+                    path_highs = pre[(pre['high'].astype(float) >= entry_f) & (pre['high'].astype(float) <= upper_limit)].copy()
+                    if not path_highs.empty:
+                        # First obstacle on the path to TP1, not necessarily the absolute high.
+                        obstacle = float(path_highs['high'].astype(float).min())
+                        rows = path_highs[path_highs['high'].astype(float) == obstacle]
+                        idx = int(rows.index[-1]) if not rows.empty else int(path_highs.index[-1])
+                        age = int(max(0, len(pre) - 1 - list(pre.index).index(idx))) if idx in list(pre.index) else 0
+                        band = max(entry_f * (zone_band_pct / 100.0), (target_f - entry_f) * 0.10)
+                        bottom = max(entry_f, obstacle - band)
+                        top = max(bottom, obstacle)
+                        path_block_zone = {
+                            'kind': 'recent_swing_high_supply', 'side': 'supply', 'tf': str(tf or ''),
+                            'bottom': round(bottom, 8), 'top': round(top, 8),
+                            'age_bars': age, 'distance_pct': round(max(0.0, ((bottom - entry_f) / entry_f) * 100.0), 3),
+                            'relation': 'blocks_target', 'blocks_target': True,
+                            'source': 'range_high_between_entry_and_tp1',
+                        }
+                        if not supply:
+                            supply = dict(path_block_zone)
+            elif side_u == 'SHORT' and target_f < entry_f:
+                clean_space_pct = ((entry_f - target_f) / entry_f) * 100.0
+                if clean_space_pct <= max(0.20, path_max_tp_space_pct):
+                    lower_limit = target_f - entry_f * (path_buffer_pct / 100.0)
+                    path_lows = pre[(pre['low'].astype(float) <= entry_f) & (pre['low'].astype(float) >= lower_limit)].copy()
+                    if not path_lows.empty:
+                        # First obstacle on the path to TP1 for SHORT.
+                        obstacle = float(path_lows['low'].astype(float).max())
+                        rows = path_lows[path_lows['low'].astype(float) == obstacle]
+                        idx = int(rows.index[-1]) if not rows.empty else int(path_lows.index[-1])
+                        age = int(max(0, len(pre) - 1 - list(pre.index).index(idx))) if idx in list(pre.index) else 0
+                        band = max(entry_f * (zone_band_pct / 100.0), (entry_f - target_f) * 0.10)
+                        top = min(entry_f, obstacle + band)
+                        bottom = min(top, obstacle)
+                        path_block_zone = {
+                            'kind': 'recent_swing_low_demand', 'side': 'demand', 'tf': str(tf or ''),
+                            'bottom': round(bottom, 8), 'top': round(top, 8),
+                            'age_bars': age, 'distance_pct': round(max(0.0, ((entry_f - top) / entry_f) * 100.0), 3),
+                            'relation': 'blocks_target', 'blocks_target': True,
+                            'source': 'range_low_between_entry_and_tp1',
+                        }
+                        if not demand:
+                            demand = dict(path_block_zone)
+
+        strong_low_near = bool(0 <= dist_low_pct <= max(max_dist_pct, 0.38) or entry_pos <= 0.20 or (side_u == 'SHORT' and bool(path_block_zone) and path_block_zone.get('side') == 'demand'))
+        strong_high_near = bool(0 <= dist_high_pct <= max(max_dist_pct, 0.38) or entry_pos >= 0.80 or (side_u == 'LONG' and bool(path_block_zone) and path_block_zone.get('side') == 'supply'))
         pre_move_pct = 0.0
         if len(closes) >= 2:
             pre_move_pct = ((float(closes.iloc[-1]) - float(closes.iloc[0])) / max(float(closes.iloc[0]), 1e-12)) * 100.0
@@ -4725,9 +4798,13 @@ def _loss_diag_build_tf_snapshot_from_df(df, *, entry: float, side: str, tf: str
             'entry_position_in_range': round(entry_pos, 3),
             'distance_to_range_high_pct': round(dist_high_pct, 3),
             'distance_to_range_low_pct': round(dist_low_pct, 3),
+            'clean_space_to_tp1_pct': round(clean_space_pct, 3) if clean_space_pct > 0 else 0.0,
             'pre_entry_move_pct': round(pre_move_pct, 3),
             'demand_zone': demand,
             'supply_zone': supply,
+            'path_block_zone': path_block_zone,
+            'range_high_blocks_tp1': bool(side_u == 'LONG' and path_block_zone and path_block_zone.get('side') == 'supply'),
+            'range_low_blocks_tp1': bool(side_u == 'SHORT' and path_block_zone and path_block_zone.get('side') == 'demand'),
             'entry_near_demand': bool(demand or strong_low_near),
             'entry_near_supply': bool(supply or strong_high_near),
             'entry_near_strong_low': strong_low_near,
@@ -5465,9 +5542,31 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
     try:
         # Backfill/refresh multi-timeframe entry context for older rows that were
         # created before entry_snapshot_json had 5m/15m/30m/1h candle snapshots.
+        # Old snapshots can exist but still be "thin": they may contain only range
+        # numbers and no supply/demand/path-block location. Refresh those too, so
+        # the report does not fall back to a generic Breakout-trap reason.
         if not isinstance(snapshot, dict):
             snapshot = {}
-        if not isinstance(snapshot.get('tf_snapshots'), dict) or not snapshot.get('tf_snapshots'):
+        existing_tf_snaps = snapshot.get('tf_snapshots') if isinstance(snapshot.get('tf_snapshots'), dict) else {}
+
+        def _tf_snaps_have_location(snaps) -> bool:
+            if not isinstance(snaps, dict) or not snaps:
+                return False
+            side_u = str(side or '').upper().strip()
+            for _one in snaps.values():
+                if not isinstance(_one, dict):
+                    continue
+                if _one.get('demand_zone') or _one.get('supply_zone') or _one.get('path_block_zone'):
+                    return True
+                if _one.get('range_high_blocks_tp1') or _one.get('range_low_blocks_tp1'):
+                    return True
+                if side_u == 'LONG' and _one.get('entry_near_supply'):
+                    return True
+                if side_u == 'SHORT' and _one.get('entry_near_demand'):
+                    return True
+            return False
+
+        if not _tf_snaps_have_location(existing_tf_snaps):
             tf_snaps = {}
             for _tf in _loss_diag_snapshot_tfs():
                 try:
@@ -6910,11 +7009,13 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
 
 
 def _loss_diag_close_analysis_is_thin(value) -> bool:
-    """True when close_analysis_json exists but lacks chart-location context.
+    """True when close_analysis_json lacks real chart-location context.
 
-    Thin analysis can still build a card, but it often falls back to generic
-    "Breakout trap / no continuation". Rebuilding it before sending the report
-    adds 5m/15m/30m/1h entry snapshots and lets the bot detect supply/demand zones.
+    Generic post-entry metrics such as mfe_pct / mae_pct / tp1_threatened are not
+    enough. Those metrics tell that the trade failed, but not *where* it failed on
+    the chart. Older rows with only those fields produced repeated generic cards:
+    "Breakout trap / no continuation". Treat them as thin so the sender rebuilds
+    close_analysis_json from candle snapshots and can detect supply/demand blockers.
     """
     try:
         a = dict(value or {})
@@ -6922,21 +7023,22 @@ def _loss_diag_close_analysis_is_thin(value) -> bool:
         return True
     if not a:
         return True
-    # `tf_checked` or `clean_space_to_tp1_pct` alone is not rich enough: old rows
-    # can have those fields but still miss the actual candle/snapshot location
-    # flags, which caused generic Breakout-trap cards or wrong supply/demand labels.
-    rich_keys = (
+
+    location_keys = (
         'supply_near_tfs', 'demand_near_tfs',
         'nearest_supply_zone', 'nearest_demand_zone',
         'supply_zone_relation', 'demand_zone_relation',
+        'supply_zone_blocks_tp1', 'demand_zone_blocks_tp1',
         'entry_into_supply', 'entry_into_overhead_supply', 'entry_into_demand',
         'long_below_strong_high', 'short_above_weak_low',
-        'long_failed_demand_bearish_structure', 'short_failed_supply_bullish_structure',
-        'entry_position_in_prior_range', 'entry_position_in_range',
-        'local_pre_move_6_pct', 'local_pre_move_12_pct', 'pre_entry_move_pct',
-        'mfe_pct', 'mae_pct', 'tp1_threatened',
+        'entry_near_opposite_zone', 'overhead_bearish_fvg', 'underlying_bullish_fvg',
+        'long_failed_demand_bearish_structure', 'failed_demand_reaction',
+        'short_failed_supply_bullish_structure', 'failed_supply_reaction',
+        'long_bearish_continuation_under_supply', 'short_against_bullish_structure',
+        'range_high_blocks_tp1', 'range_low_blocks_tp1',
+        'location_override_reason',
     )
-    return not any(a.get(k) not in (None, '', [], {}, False) for k in rich_keys)
+    return not any(a.get(k) not in (None, '', [], {}, False) for k in location_keys)
 
 
 async def _send_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pct: float, closed_at: dt.datetime | None = None) -> None:
