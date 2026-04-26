@@ -4683,9 +4683,18 @@ def _loss_diag_build_tf_snapshot_from_df(df, *, entry: float, side: str, tf: str
     if d.empty or entry <= 0:
         return {}
     try:
+        tfm = _loss_diag_tf_minutes(tf)
         if opened_at is not None:
-            # Use only candles known before / at entry so the snapshot does not learn from the future.
-            d = d[d['_ts'] <= (opened_at + dt.timedelta(seconds=30))].copy()
+            # Backfill must be an entry snapshot, not a close-time snapshot.
+            # For 5m/15m/30m/1h candles fetched after the trade closed, the candle
+            # that contains opened_at already has future high/low/close values.
+            # Use only candles that were fully closed before the entry time. If an
+            # exchange response is too sparse, fall back to candle-open <= entry.
+            cutoff = opened_at + dt.timedelta(seconds=5)
+            closed_before_entry = d[(d['_ts'] + dt.timedelta(minutes=tfm)) <= cutoff].copy()
+            if closed_before_entry.empty:
+                closed_before_entry = d[d['_ts'] <= cutoff].copy()
+            d = closed_before_entry
             if d.empty:
                 return {}
         lookback = 96 if str(tf).lower() == '5m' else 72
@@ -4699,7 +4708,6 @@ def _loss_diag_build_tf_snapshot_from_df(df, *, entry: float, side: str, tf: str
         entry_pos = (float(entry) - range_low) / rng
         dist_high_pct = ((range_high - float(entry)) / float(entry)) * 100.0
         dist_low_pct = ((float(entry) - range_low) / float(entry)) * 100.0
-        tfm = _loss_diag_tf_minutes(tf)
         max_dist_pct = 0.32 if tfm <= 5 else (0.42 if tfm <= 15 else 0.55)
         zones = _loss_diag_find_fvg_zones(pre, tf=tf, max_scan=min(len(pre), 90))
         demand = _loss_diag_pick_near_zone(zones, entry=float(entry), zone_side='demand', max_dist_pct=max_dist_pct, target=float(tp1 or 0.0))
@@ -6318,6 +6326,25 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
         )
         strong_high = bool(_loss_card_bool(analysis, 'long_below_strong_high') or entry_pos >= 0.72)
         zone_desc = _loss_card_zone_desc(zone, 'red FVG / seller zone')
+        has_supply_context = bool(zone or analysis.get('supply_near_tfs') or _loss_card_bool(analysis, 'overhead_bearish_fvg') or strong_high or blocks_tp1)
+        # Very fast SL under/into supply should be labelled as immediate rejection.
+        # This keeps ILV/YGG-type cards from falling back to generic breakout trap
+        # or a slow "directly into supply" variant.
+        if immediate and has_supply_context:
+            return {
+                'pattern': 'immediate_rejection_from_supply',
+                'primary_text': 'Immediate rejection from overhead supply',
+                'scenario_text': 'LONG вошёл прямо перед зоной продавца. Реакция продавца появилась почти сразу, поэтому покупатель не успел построить continuation и цена ушла к SL.',
+                'analysis_add': ['immediate rejection from supply', 'bullish follow-through отсутствовал'],
+                'visible': [
+                    f'над входом стоял {zone_desc}',
+                    'первая реакция после входа была вниз',
+                    'bullish continuation не закрепился',
+                    'SL был выбит без нормального движения к TP1',
+                ],
+                'secondary': ['Immediate rejection', 'Long into supply', 'Weak follow-through', 'SL hit without meaningful excursion'],
+                'improve': ['не входить прямо перед seller reaction zone', 'ждать пробой и закрепление выше supply', 'после быстрого rejection считать setup invalid'],
+            }
         if bearish_context and not late_pump:
             return {
                 'pattern': 'long_against_bearish_structure_under_supply',
@@ -6354,7 +6381,7 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
                 'pattern': 'late_long_after_exhausted_pump',
                 'primary_text': 'Late LONG after exhausted pump into supply',
                 'scenario_text': 'LONG был открыт после уже отработанного buy-side impulse. Цена пришла в premium/верх range прямо под seller zone, поэтому продолжение вверх было слабым и быстро начался rejection.',
-                'analysis_add': ['вход после уже отработанного pump', 'immediate rejection from supply'],
+                'analysis_add': ['вход после уже отработанного pump', 'failed continuation under supply'],
                 'visible': [
                     'перед входом уже был сильный buy-side impulse',
                     'LONG открыт в premium/верхней части range, а не из discount',
@@ -6383,7 +6410,7 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
             'pattern': 'long_directly_into_supply',
             'primary_text': 'Long entered directly into supply',
             'scenario_text': 'LONG был открыт слишком высоко, прямо под seller zone и strong high. Цена уже находилась в зоне реакции продавцов, поэтому upside был ограничен, а вероятность rejection вниз была высокой.',
-            'analysis_add': ['immediate rejection from supply', 'upside expansion отсутствовал'],
+            'analysis_add': ['failed continuation under supply', 'upside expansion отсутствовал'],
             'visible': [
                 'LONG открыт почти прямо под red FVG / seller zone',
                 'сверху уже seller reaction zone, которая блокировала путь к TP1',
@@ -6412,6 +6439,23 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
         )
         strong_low = bool(_loss_card_bool(analysis, 'short_above_weak_low') or entry_pos <= 0.28)
         zone_desc = _loss_card_zone_desc(zone, 'green FVG / buyer zone')
+        has_demand_context = bool(zone or analysis.get('demand_near_tfs') or _loss_card_bool(analysis, 'underlying_bullish_fvg') or strong_low or blocks_tp1)
+        # Very fast SL above/into demand should be labelled as immediate bounce.
+        if immediate and has_demand_context:
+            return {
+                'pattern': 'immediate_bounce_from_demand',
+                'primary_text': 'Immediate bounce from underlying demand',
+                'scenario_text': 'SHORT вошёл прямо перед зоной покупателя. Реакция покупателя появилась почти сразу, поэтому продавец не успел построить continuation и цена ушла к SL.',
+                'analysis_add': ['immediate bounce from demand', 'bearish follow-through отсутствовал'],
+                'visible': [
+                    f'под входом стоял {zone_desc}',
+                    'первая реакция после входа была вверх',
+                    'bearish continuation не закрепился',
+                    'SL был выбит без нормального движения к TP1',
+                ],
+                'secondary': ['Immediate bounce', 'Short into demand', 'Weak follow-through', 'SL hit without meaningful excursion'],
+                'improve': ['не входить прямо перед buyer reaction zone', 'ждать пробой и закрепление ниже demand', 'после быстрого bounce считать setup invalid'],
+            }
         if bullish_context and not late_dump:
             return {
                 'pattern': 'short_against_bullish_structure_over_demand',
@@ -6448,7 +6492,7 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
                 'pattern': 'late_short_after_exhausted_dump',
                 'primary_text': 'Late SHORT after exhausted dump into demand',
                 'scenario_text': 'SHORT был открыт после уже отработанного sell-side impulse. Цена пришла в discount/низ range прямо над buyer zone, поэтому продолжение вниз было слабым и быстро начался bounce.',
-                'analysis_add': ['вход после уже отработанного dump', 'immediate bounce from demand'],
+                'analysis_add': ['вход после уже отработанного dump', 'failed continuation over demand'],
                 'visible': [
                     'перед входом уже был сильный sell-side impulse',
                     'SHORT открыт в discount/нижней части range, а не из premium',
@@ -6477,7 +6521,7 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
             'pattern': 'short_directly_into_demand',
             'primary_text': 'Short entered directly into demand',
             'scenario_text': 'SHORT был открыт слишком низко, прямо над buyer zone и weak low. Цена уже находилась в зоне реакции покупателей, поэтому downside был ограничен, а вероятность bounce вверх была высокой.',
-            'analysis_add': ['immediate bounce from demand', 'downside expansion отсутствовал'],
+            'analysis_add': ['failed continuation over demand', 'downside expansion отсутствовал'],
             'visible': [
                 'SHORT открыт почти прямо над green FVG / buyer zone',
                 'снизу уже buyer reaction zone, которая блокировала путь к TP1',
@@ -6544,12 +6588,20 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         variant = _loss_card_exact_location_variant(side, analysis, duration_min)
         scenario_text = str(variant.get('scenario_text') or '').strip()
         analysis_lines.extend([str(x) for x in list(variant.get('analysis_add') or []) if str(x).strip()])
-        happened_lines = [
-            'цена не смогла продолжить sell-side движение',
-            'buyer zone сразу начала удерживать цену',
-            'продавец не получил displacement вниз',
-            'произошёл bounce против позиции',
-        ]
+        if duration_min is not None and duration_min > 12:
+            happened_lines = [
+                'цена не смогла продолжить sell-side движение',
+                'buyer zone удержала движение снизу',
+                'продавец не получил displacement вниз',
+                'произошёл bounce против позиции',
+            ]
+        else:
+            happened_lines = [
+                'цена не смогла продолжить sell-side движение',
+                'buyer zone сразу начала удерживать цену',
+                'продавец не получил displacement вниз',
+                'произошёл bounce против позиции',
+            ]
         visible_lines = [str(x) for x in list(variant.get('visible') or []) if str(x).strip()]
         if analysis.get('demand_near_tfs'):
             try:
@@ -6671,12 +6723,20 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         variant = _loss_card_exact_location_variant(side, analysis, duration_min)
         scenario_text = str(variant.get('scenario_text') or '').strip()
         analysis_lines.extend([str(x) for x in list(variant.get('analysis_add') or []) if str(x).strip()])
-        happened_lines = [
-            'цена не смогла продолжить buy-side движение',
-            'seller zone сразу начала удерживать цену',
-            'покупатель не получил displacement вверх',
-            'произошёл rejection против позиции',
-        ]
+        if duration_min is not None and duration_min > 12:
+            happened_lines = [
+                'цена не смогла продолжить buy-side движение',
+                'seller zone удержала движение сверху',
+                'покупатель не получил displacement вверх',
+                'произошёл rejection против позиции',
+            ]
+        else:
+            happened_lines = [
+                'цена не смогла продолжить buy-side движение',
+                'seller zone сразу начала удерживать цену',
+                'покупатель не получил displacement вверх',
+                'произошёл rejection против позиции',
+            ]
         visible_lines = [str(x) for x in list(variant.get('visible') or []) if str(x).strip()]
         if analysis.get('supply_near_tfs'):
             try:
@@ -6862,15 +6922,19 @@ def _loss_diag_close_analysis_is_thin(value) -> bool:
         return True
     if not a:
         return True
-    # `tf_checked` alone is not rich enough: old rows can have checked TFs but
-    # still miss the actual location flags, causing generic Breakout-trap cards.
+    # `tf_checked` or `clean_space_to_tp1_pct` alone is not rich enough: old rows
+    # can have those fields but still miss the actual candle/snapshot location
+    # flags, which caused generic Breakout-trap cards or wrong supply/demand labels.
     rich_keys = (
         'supply_near_tfs', 'demand_near_tfs',
+        'nearest_supply_zone', 'nearest_demand_zone',
+        'supply_zone_relation', 'demand_zone_relation',
         'entry_into_supply', 'entry_into_overhead_supply', 'entry_into_demand',
         'long_below_strong_high', 'short_above_weak_low',
         'long_failed_demand_bearish_structure', 'short_failed_supply_bullish_structure',
         'entry_position_in_prior_range', 'entry_position_in_range',
-        'clean_space_to_tp1_pct', 'local_pre_move_6_pct', 'local_pre_move_12_pct',
+        'local_pre_move_6_pct', 'local_pre_move_12_pct', 'pre_entry_move_pct',
+        'mfe_pct', 'mae_pct', 'tp1_threatened',
     )
     return not any(a.get(k) not in (None, '', [], {}, False) for k in rich_keys)
 
