@@ -5900,13 +5900,19 @@ def _report_extract_setup_label_from_text(text: str) -> str:
         src = str(text or "")
         if not src:
             return ""
-        m = re.search(r"(?:^|\n)\s*(?:🧭\s*)?Smart-setup:\s*([^\n\r]+)", src, flags=re.IGNORECASE)
+        # Accept both the old signal text label and the new Russian report-card label.
+        # This is used for legacy rows where setup_source/ui_setup_label columns are empty,
+        # but the original signal text still contains the setup line.
+        m = re.search(
+            r"(?:^|\n)\s*(?:🧭\s*)?(?:Smart[-\s]?setup|Setup|Сетап(?:\s+сигнала)?):\s*([^\n\r]+)",
+            src,
+            flags=re.IGNORECASE,
+        )
         if not m:
             return ""
         return _report_setup_label_human(str(m.group(1) or "").strip())
     except Exception:
         return ""
-
 
 def _report_setup_label_from_row(row: dict) -> str:
     try:
@@ -6262,7 +6268,10 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
         price_lines.append(f"🛡 BE: {be_price:.6f}")
     price_block = "\n".join(price_lines).strip() or "—"
 
-    setup_block = f"🧭 Smart-setup: {setup_label}\n" if (setup_label and (st != 'LOSS' or str(os.getenv('LOSS_CARD_SHOW_SETUP', '0')).lower() in ('1','true','yes','on'))) else ""
+    # Show the setup on LOSS cards by default too.
+    # Set LOSS_CARD_SHOW_SETUP=0 only if you intentionally want to hide it.
+    _show_loss_setup = str(os.getenv('LOSS_CARD_SHOW_SETUP', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
+    setup_block = f"🧭 Smart-setup: {setup_label}\n" if (setup_label and (st != 'LOSS' or _show_loss_setup)) else ""
     primary_block = ""
     scenario_block = ""
     analysis_block = ""
