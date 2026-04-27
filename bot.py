@@ -4955,6 +4955,10 @@ def _loss_diag_apply_directional_location_flags(analysis: dict, *, side: str) ->
         return
 
     clean_space = _f('clean_space_to_tp1_pct')
+    entry_pos_known = bool(
+        (analysis.get('entry_position_in_prior_range') not in (None, ''))
+        or (analysis.get('entry_position_in_range') not in (None, ''))
+    )
     entry_pos = _f('entry_position_in_prior_range', _f('entry_position_in_range', 0.5))
     local6 = _f('local_pre_move_6_pct')
     local12 = _f('local_pre_move_12_pct')
@@ -4993,8 +4997,9 @@ def _loss_diag_apply_directional_location_flags(analysis: dict, *, side: str) ->
             or _b('short_above_weak_low')
         )
         supply_near = bool(analysis.get('supply_near_tfs') or _b('short_supply_near_entry'))
-        lowish_or_no_space = bool((0 < clean_space <= 0.65) or entry_pos <= 0.45)
-        if (not tp1_threatened) and (demand_near or lowish_or_no_space or bullish_context):
+        lowish = bool(entry_pos_known and entry_pos <= 0.45)
+        tight_space_with_context = bool(0 < clean_space <= 0.65 and (demand_near or bullish_context or lowish))
+        if (not tp1_threatened) and (demand_near or lowish or tight_space_with_context or bullish_context):
             analysis['short_above_weak_low'] = True
             analysis['entry_into_demand'] = True
             analysis['entry_near_opposite_zone'] = True
@@ -5017,8 +5022,9 @@ def _loss_diag_apply_directional_location_flags(analysis: dict, *, side: str) ->
         or _b('long_below_strong_high')
     )
     demand_near = bool(analysis.get('demand_near_tfs') or _b('long_demand_near_entry'))
-    highish_or_no_space = bool((0 < clean_space <= 0.65) or entry_pos >= 0.55)
-    if (not tp1_threatened) and (supply_near or highish_or_no_space or bearish_context):
+    highish = bool(entry_pos_known and entry_pos >= 0.55)
+    tight_space_with_context = bool(0 < clean_space <= 0.65 and (supply_near or bearish_context or highish))
+    if (not tp1_threatened) and (supply_near or highish or tight_space_with_context or bearish_context):
         analysis['long_below_strong_high'] = True
         analysis['entry_into_supply'] = True
         analysis['entry_into_overhead_supply'] = True
@@ -6231,10 +6237,7 @@ def _loss_card_apply_price_location_override(src: dict, analysis: dict, *, side:
     max_space = _loss_card_location_tp_space_pct()
     no_clean_space = bool(0 < clean_space <= max_space and (not tp1_threatened))
 
-    try:
-        entry_pos = float(analysis.get('entry_position_in_prior_range') or analysis.get('entry_position_in_range') or 0.5)
-    except Exception:
-        entry_pos = 0.5
+    entry_pos, entry_pos_known = _loss_card_entry_position(analysis)
 
     if side_u == 'LONG':
         supply_near = bool(
@@ -6255,7 +6258,8 @@ def _loss_card_apply_price_location_override(src: dict, analysis: dict, *, side:
                     bearish_pre = True
             except Exception:
                 pass
-        if supply_near or (no_clean_space and (entry_pos >= 0.50 or bullish_pre or bearish_pre or analysis.get('late_entry_after_exhausted_move'))):
+        highish = bool(entry_pos_known and entry_pos >= 0.58)
+        if supply_near or (no_clean_space and entry_pos_known and (highish or bullish_pre or bearish_pre or analysis.get('late_entry_after_exhausted_move'))):
             analysis['long_below_strong_high'] = True
             analysis['entry_into_supply'] = True
             analysis['entry_into_overhead_supply'] = True
@@ -6288,7 +6292,8 @@ def _loss_card_apply_price_location_override(src: dict, analysis: dict, *, side:
                 break
         except Exception:
             pass
-    if demand_near or (no_clean_space and (entry_pos <= 0.50 or bearish_pre or analysis.get('late_entry_after_exhausted_move'))):
+    lowish = bool(entry_pos_known and entry_pos <= 0.42)
+    if demand_near or (no_clean_space and entry_pos_known and (lowish or bearish_pre or analysis.get('late_entry_after_exhausted_move'))):
         analysis['short_above_weak_low'] = True
         analysis['entry_into_demand'] = True
         analysis['entry_near_opposite_zone'] = True
@@ -6374,6 +6379,116 @@ def _loss_card_bool(analysis: dict, key: str) -> bool:
         return val.strip().lower() in ('1', 'true', 'yes', 'on', 'да', 'есть')
     return bool(val)
 
+
+def _loss_card_has_real_value(analysis: dict, key: str) -> bool:
+    if not isinstance(analysis, dict) or key not in analysis:
+        return False
+    val = analysis.get(key)
+    if val in (None, '', [], {}, False):
+        return False
+    try:
+        fv = float(str(val).replace(',', '.'))
+        return math.isfinite(fv)
+    except Exception:
+        return True
+
+
+def _loss_card_entry_position(analysis: dict, default: float = 0.5) -> tuple[float, bool]:
+    """Return entry position and whether it was measured, not just defaulted to 0.50."""
+    for key in ('entry_position_in_prior_range', 'entry_position_in_range'):
+        if _loss_card_has_real_value(analysis, key):
+            try:
+                return float(str(analysis.get(key)).replace(',', '.')), True
+            except Exception:
+                pass
+    return float(default), False
+
+
+def _loss_card_after_tp1_context_payload(src: dict, analysis: dict, *, side: str, duration_min: int | None = None) -> dict:
+    """Build correct wording for LOSS after TP1/BE.
+
+    TP1 was already reached, so the card must not say that TP1 was never threatened.
+    """
+    src = dict(src or {})
+    analysis = dict(analysis or {})
+    side_u = str(side or src.get('side') or analysis.get('side') or '').upper().strip()
+    if side_u not in ('LONG', 'SHORT'):
+        return {}
+
+    def _safe_int(key: str) -> int | None:
+        try:
+            val = analysis.get(key)
+            if val in (None, ''):
+                return None
+            iv = int(float(val))
+            return iv if iv > 0 else None
+        except Exception:
+            return None
+
+    bars_to_tp1 = _safe_int('bars_to_tp1')
+    bars_after = _safe_int('bars_tp1_to_close')
+    follow_tp1 = str(analysis.get('follow_through_tp1') or '').strip().lower()
+
+    analysis_lines: list[str] = []
+    if duration_min is not None and duration_min > 0:
+        analysis_lines.append(f"вход → закрытие остатка: {duration_min} мин")
+    if bars_to_tp1 is not None:
+        analysis_lines.append(f"TP1 был достигнут примерно за {bars_to_tp1 * 5} мин")
+    else:
+        analysis_lines.append('TP1 был достигнут до закрытия остатка')
+    if bars_after is not None:
+        analysis_lines.append(f"после TP1 до возврата в BE/SL: около {bars_after * 5} мин")
+    if follow_tp1:
+        analysis_lines.append('follow-through после TP1: ' + ('слабый/нет' if follow_tp1 in ('нет', 'no', 'false') else follow_tp1))
+
+    if side_u == 'SHORT':
+        return {
+            'primary_text': 'TP1 hit, then bounce back to BE/SL',
+            'scenario_text': (
+                'SHORT сначала дошёл до TP1, поэтому это не обычный LOSS до цели. '
+                'После фиксации TP1 остаток позиции был защищён BE/SL, но sell-side continuation не продолжился: '
+                'цена дала bounce из discount/нижней зоны и закрыла остаток.'
+            ),
+            'analysis_lines': analysis_lines,
+            'what_happened_lines': [
+                'TP1 был достигнут и первая часть движения отработала',
+                'после TP1 продавец не смог дать новую волну вниз',
+                'цена развернулась вверх/bounce против остатка SHORT',
+                'остаток позиции закрылся по BE/SL, поэтому итог около нуля',
+            ],
+            'chart_visible_lines': [
+                'первый sell-side impulse дошёл до TP1',
+                'после TP1 цена оказалась в discount/возле local low',
+                'снизу появился bounce/reversal, который вернул цену к входу',
+                'карточка не должна писать “TP1 не был поставлен под угрозу” — TP1 уже был взят',
+            ],
+            'secondary_reason_labels': ['TP1 secured', 'Post-TP1 bounce', 'Sell-side exhaustion after TP1', 'BE/SL on remainder'],
+            'improve_labels': ['после TP1 не считать сделку обычным LOSS', 'для остатка ждать новый bearish displacement', 'после резкого bounce закрывать остаток вручную или держать BE'],
+        }
+
+    return {
+        'primary_text': 'TP1 hit, then rejection back to BE/SL',
+        'scenario_text': (
+            'LONG сначала дошёл до TP1, поэтому это не обычный LOSS до цели. '
+            'После фиксации TP1 остаток позиции был защищён BE/SL, но buy-side continuation не продолжился: '
+            'цена дала rejection из premium/верхней зоны и закрыла остаток.'
+        ),
+        'analysis_lines': analysis_lines,
+        'what_happened_lines': [
+            'TP1 был достигнут и первая часть движения отработала',
+            'после TP1 покупатель не смог дать новую волну вверх',
+            'цена развернулась вниз/rejection против остатка LONG',
+            'остаток позиции закрылся по BE/SL, поэтому итог около нуля',
+        ],
+        'chart_visible_lines': [
+            'первый buy-side impulse дошёл до TP1',
+            'после TP1 цена оказалась в premium/возле local high',
+            'сверху появился rejection/reversal, который вернул цену к входу',
+            'карточка не должна писать “TP1 не был поставлен под угрозу” — TP1 уже был взят',
+        ],
+        'secondary_reason_labels': ['TP1 secured', 'Post-TP1 rejection', 'Buy-side exhaustion after TP1', 'BE/SL on remainder'],
+        'improve_labels': ['после TP1 не считать сделку обычным LOSS', 'для остатка ждать новый bullish displacement', 'после резкого rejection закрывать остаток вручную или держать BE'],
+    }
 
 
 def _loss_card_zone_is_fvg(zone: dict, side: str = '') -> bool:
@@ -6511,7 +6626,7 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
     side_u = str(side or '').upper().strip()
     analysis = dict(analysis or {})
     cs = _loss_card_float(analysis, 'clean_space_to_tp1_pct')
-    entry_pos = _loss_card_float(analysis, 'entry_position_in_prior_range', _loss_card_float(analysis, 'entry_position_in_range', 0.5))
+    entry_pos, entry_pos_known = _loss_card_entry_position(analysis)
     local6 = _loss_card_float(analysis, 'local_pre_move_6_pct')
     local12 = _loss_card_float(analysis, 'local_pre_move_12_pct')
     pre_move = _loss_card_float(analysis, 'pre_entry_move_pct')
@@ -6535,7 +6650,7 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
             or str(analysis.get('structure_5m') or '').lower().startswith('bearish')
             or str(analysis.get('trend_context') or '').lower().startswith('bearish')
         )
-        strong_high = bool(_loss_card_bool(analysis, 'long_below_strong_high') or entry_pos >= 0.72)
+        strong_high = bool(_loss_card_bool(analysis, 'long_below_strong_high') or (entry_pos_known and entry_pos >= 0.72))
         has_supply_context = bool(ctx.get('has_zone') or _loss_card_bool(analysis, 'overhead_bearish_fvg') or strong_high or blocks_tp1)
         has_real_zone = bool(ctx.get('has_zone'))
 
@@ -6600,7 +6715,7 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
                 'improve': ['не брать LONG, если TP1 внутри/сразу за resistance/supply', 'требовать чистое пространство до TP1', 'ждать вход ниже от discount / demand'],
             }
 
-        if late_pump and (strong_high or no_tp_space):
+        if late_pump and (strong_high or (entry_pos_known and entry_pos >= 0.58) or (no_tp_space and (ctx.get('has_zone') or entry_pos_known))):
             visible_zone = f'сверху находился {zone_desc}' if has_real_zone else 'сверху был локальный high / resistance'
             return {
                 'pattern': 'late_long_after_exhausted_pump',
@@ -6649,7 +6764,7 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
             or str(analysis.get('structure_5m') or '').lower().startswith('bullish')
             or str(analysis.get('trend_context') or '').lower().startswith('bullish')
         )
-        strong_low = bool(_loss_card_bool(analysis, 'short_above_weak_low') or entry_pos <= 0.28)
+        strong_low = bool(_loss_card_bool(analysis, 'short_above_weak_low') or (entry_pos_known and entry_pos <= 0.28))
         has_demand_context = bool(ctx.get('has_zone') or _loss_card_bool(analysis, 'underlying_bullish_fvg') or strong_low or blocks_tp1)
         has_real_zone = bool(ctx.get('has_zone'))
 
@@ -6714,7 +6829,7 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
                 'improve': ['не брать SHORT, если TP1 внутри/сразу за demand/support', 'требовать чистое пространство до TP1', 'ждать вход выше от premium / supply'],
             }
 
-        if late_dump and (strong_low or no_tp_space):
+        if late_dump and (strong_low or (entry_pos_known and entry_pos <= 0.42) or (no_tp_space and (ctx.get('has_zone') or entry_pos_known))):
             visible_zone = f'снизу находился {zone_desc}' if has_real_zone else 'снизу был локальный low / support'
             return {
                 'pattern': 'late_short_after_exhausted_dump',
@@ -6821,9 +6936,10 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
         except Exception:
             pass
 
-    pos = f('entry_position_in_prior_range', f('entry_position_in_range', 0.5))
+    pos, pos_known = _loss_card_entry_position(analysis)
     l6, l12, l24, premove = f('local_pre_move_6_pct'), f('local_pre_move_12_pct'), f('local_pre_move_24_pct'), f('pre_entry_move_pct')
-    no_tp = not bool(analysis.get('tp1_threatened'))
+    after_tp1 = bool(b('after_tp1') or b('tp1_hit') or b('loss_after_tp1'))
+    no_tp = (not after_tp1) and (not bool(analysis.get('tp1_threatened')))
     no_space = bool(0 < cs <= max(_loss_card_location_tp_space_pct(), 0.70) and no_tp)
     level_back = bool(b('level_reclaimed_back') or b('reclaim_lost_back'))
     weak = bool(b('weak_followthrough') or b('no_post_entry_expansion') or b('zone_reaction_too_weak') or no_tp or abs(f('mfe_pct')) < 0.35)
@@ -6869,8 +6985,10 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
                 ['ждать закрытие выше resistance/supply перед LONG', 'не брать LONG под sell pressure при bearish 5m/15m', 'требовать bullish displacement после retest'],
             )
 
-        if late_pump and (supply or pos >= 0.58 or no_space):
-            vis = ['перед входом уже прошёл buy-side impulse', 'LONG открыт поздно в верхней части локального range', 'после входа не было нового fresh bullish displacement', f'позиция входа в range: {pos:.2f}']
+        if late_pump and (supply or (pos_known and pos >= 0.58) or (no_space and (supply or pos_known))):
+            vis = ['перед входом уже прошёл buy-side impulse', 'LONG открыт поздно в верхней части локального range', 'после входа не было нового fresh bullish displacement']
+            if pos_known:
+                vis.append(f'позиция входа в range: {pos:.2f}')
             if supply:
                 vis.insert(2, f'сверху находился {zd}')
             return out(
@@ -6911,13 +7029,13 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
                 ['ждать 1–2 закрытия выше BOS-level', 'требовать retest acceptance', 'не входить на первом слабом confirm'],
             )
 
-        if pos >= 0.58 or no_space:
+        if (pos_known and pos >= 0.58) or (no_space and (supply or late_pump or bearish)):
             return out(
                 'Poor LONG location near range high',
                 'LONG был открыт в верхней части локального range, где upside был ограничен. Вход находился слишком близко к local high / resistance, поэтому RR location был слабый.',
                 ['вход в верхней части range', 'чистого пространства до TP1 было мало'],
                 ['покупатель не смог расширить движение вверх', 'цена быстро потеряла momentum', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после отката'],
-                [f'позиция входа в range: {pos:.2f}', 'вход был ближе к range high, чем к discount', 'upside до TP1 был ограничен', 'после входа не было clean bullish displacement'],
+                ([f'позиция входа в range: {pos:.2f}'] if pos_known else []) + ['вход был ближе к range high, чем к discount', 'upside до TP1 был ограничен', 'после входа не было clean bullish displacement'],
                 ['Poor RR location', 'Weak upside continuation', 'No clean space to TP1', 'Buy-side exhaustion'],
                 ['не брать LONG в premium без сильного reclaim', 'ждать discount re-entry', 'поднимать фильтр clean space до TP1'],
             )
@@ -6963,8 +7081,10 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
                 ['ждать закрытие ниже demand/support перед SHORT', 'не брать SHORT над demand при bullish 5m/15m', 'требовать bearish displacement после retest'],
             )
 
-        if late_dump and (demand or pos <= 0.55 or no_space):
-            vis = ['перед входом уже прошёл sell-side impulse', 'SHORT открыт поздно в нижней части локального range', 'после входа не было нового fresh bearish displacement', f'позиция входа в range: {pos:.2f}']
+        if late_dump and (demand or (pos_known and pos <= 0.55) or (no_space and (demand or pos_known))):
+            vis = ['перед входом уже прошёл sell-side impulse', 'SHORT открыт поздно в нижней части локального range', 'после входа не было нового fresh bearish displacement']
+            if pos_known:
+                vis.append(f'позиция входа в range: {pos:.2f}')
             if demand:
                 vis.insert(2, f'снизу находился {zd}')
             return out(
@@ -6977,7 +7097,7 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
                 ['не шортить после вертикального dump', 'ждать pullback выше', 'входить только после нового bearish displacement'],
             )
 
-        if bullish and supply and pos >= 0.55:
+        if bullish and supply and (not pos_known or pos >= 0.55):
             sd = str(supply_ctx.get('desc') or 'supply/resistance')
             vis = ['SHORT открыт возле supply/resistance, но структура уже была bullish', 'seller zone не дала сильной реакции', 'bearish reclaim перед входом не подтвердился']
             if stf:
@@ -7005,13 +7125,13 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
                 ['ждать 1–2 закрытия ниже BOS-level', 'требовать retest acceptance', 'не входить на первом слабом confirm'],
             )
 
-        if pos <= 0.45 or no_space:
+        if (pos_known and pos <= 0.45) or (no_space and (demand or late_dump or bullish)):
             return out(
                 'Poor SHORT location near range low',
                 'SHORT был открыт в нижней части локального range, где downside был ограничен. Вход находился слишком близко к local low / support, поэтому RR location был слабый.',
                 ['вход в нижней части range', 'чистого пространства до TP1 было мало'],
                 ['продавец не смог расширить движение вниз', 'цена быстро потеряла sell-side momentum', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после bounce'],
-                [f'позиция входа в range: {pos:.2f}', 'вход был ближе к range low, чем к premium', 'downside до TP1 был ограничен', 'после входа не было clean bearish displacement'],
+                ([f'позиция входа в range: {pos:.2f}'] if pos_known else []) + ['вход был ближе к range low, чем к premium', 'downside до TP1 был ограничен', 'после входа не было clean bearish displacement'],
                 ['Poor RR location', 'Weak downside continuation', 'No clean space to TP1', 'Sell-side exhaustion'],
                 ['не брать SHORT в discount без сильного reclaim', 'ждать premium re-entry', 'поднимать фильтр clean space до TP1'],
             )
@@ -7036,6 +7156,10 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
     loss_diag = dict(loss_diag or {})
     analysis = dict(loss_diag.get('close_analysis_json') or {})
     side = str(src.get('side') or analysis.get('side') or '').upper().strip() or 'LONG'
+    if after_tp1:
+        analysis['after_tp1'] = True
+        analysis['tp1_hit'] = True
+        analysis['tp1_threatened'] = True
     try:
         _loss_card_apply_price_location_override(src, analysis, side=side)
     except Exception:
@@ -7074,6 +7198,11 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
                 duration_min = int(float(analysis.get('duration_min') or 0))
         except Exception:
             duration_min = None
+
+    if after_tp1:
+        after_payload = _loss_card_after_tp1_context_payload(src, analysis, side=side, duration_min=duration_min)
+        if after_payload:
+            return after_payload
 
     analysis_lines = []
     if duration_min is not None and duration_min > 0:
