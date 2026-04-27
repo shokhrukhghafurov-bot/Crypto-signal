@@ -3961,11 +3961,11 @@ def _loss_diag_chart_visible_lines(analysis: dict, side: str) -> list[str]:
     if side_u == 'LONG' and bool(analysis.get('long_failed_demand_bearish_structure')):
         lines.extend([
             'LONG открыт после bearish BOS / CHoCH вниз',
-            'сверху несколько bearish FVG и supply зон',
+            'сверху seller pressure / resistance zones',
             'структура уже делала lower high / lower low',
             'вход был слишком низко, но без подтверждения reclaim',
             'цена стояла под sell pressure',
-            'demand/FVG снизу был уже слабый',
+            'demand/support снизу был уже слабый',
             'RR выглядел формально нормальный, но location был плохой',
             'это не чистый breakout, а попытка купить слабый demand против структуры',
         ])
@@ -3985,11 +3985,11 @@ def _loss_diag_chart_visible_lines(analysis: dict, side: str) -> list[str]:
     if side_u == 'SHORT' and bool(analysis.get('short_failed_supply_bullish_structure')):
         lines.extend([
             'SHORT открыт после bullish BOS / CHoCH вверх',
-            'снизу несколько bullish FVG и demand зон',
+            'снизу buyer pressure / demand/support zones',
             'структура уже делала higher low / higher high',
             'вход был рядом с supply, но без подтверждения bearish reclaim',
             'цена стояла под buyer pressure',
-            'supply/FVG сверху был уже слабый',
+            'supply/resistance сверху был уже слабый',
             'RR выглядел формально нормальный, но location был плохой',
             'это не чистый SHORT, а попытка шортить слабую supply против bullish-структуры',
         ])
@@ -4008,7 +4008,7 @@ def _loss_diag_chart_visible_lines(analysis: dict, side: str) -> list[str]:
                 pass
     if side_u == 'SHORT' and bool(analysis.get('short_above_weak_low')):
         lines.extend([
-            'SHORT открыт почти прямо над buyer zone / green FVG / Strong Low',
+            'SHORT открыт низко — рядом с buyer zone/support/Strong Low',
             'снизу уже была зона реакции покупателей',
             'downside для SHORT был маленький',
             'цена уже пришла в discount area',
@@ -4035,7 +4035,7 @@ def _loss_diag_chart_visible_lines(analysis: dict, side: str) -> list[str]:
             pass
     elif side_u == 'LONG' and bool(analysis.get('long_below_strong_high')):
         lines.extend([
-            'LONG открыт почти прямо под seller zone / red FVG / Strong High',
+            'LONG открыт высоко — рядом с seller zone/resistance/Strong High',
             'сверху уже была зона реакции продавцов',
             'upside для LONG был маленький',
             'цена уже пришла в premium area',
@@ -6375,13 +6375,49 @@ def _loss_card_bool(analysis: dict, key: str) -> bool:
     return bool(val)
 
 
+
+def _loss_card_zone_is_fvg(zone: dict, side: str = '') -> bool:
+    """True only when the saved pre-entry snapshot contains a real FVG zone."""
+    if not isinstance(zone, dict) or not zone:
+        return False
+    kind = str(zone.get('kind') or '').lower()
+    zside = str(zone.get('side') or side or '').lower()
+    if zside == 'supply':
+        return 'bearish_fvg' in kind or ('fvg' in kind and 'supply' in zside)
+    if zside == 'demand':
+        return 'bullish_fvg' in kind or ('fvg' in kind and 'demand' in zside)
+    return 'fvg' in kind
+
+
 def _loss_card_zone_desc(zone: dict, fallback: str) -> str:
     if not isinstance(zone, dict) or not zone:
         return fallback
+
+    kind = str(zone.get('kind') or '').lower()
+    side = str(zone.get('side') or '').lower()
+    source = str(zone.get('source') or '').lower()
+
+    # Do not call a simple range high/low blocker "FVG".
+    # It is a real chart blocker, but the card must say resistance/support, not red/green FVG.
+    if 'recent_swing_high' in kind or 'range_high' in source:
+        base = 'recent swing high / resistance'
+    elif 'recent_swing_low' in kind or 'range_low' in source:
+        base = 'recent swing low / support'
+    elif 'bearish_fvg' in kind or (side == 'supply' and 'fvg' in kind):
+        base = 'red FVG / seller zone'
+    elif 'bullish_fvg' in kind or (side == 'demand' and 'fvg' in kind):
+        base = 'green FVG / buyer zone'
+    elif side == 'supply':
+        base = 'seller reaction / resistance zone'
+    elif side == 'demand':
+        base = 'buyer reaction / demand zone'
+    else:
+        base = fallback
+
     tf = str(zone.get('tf') or '').strip()
     rel = str(zone.get('relation') or '').strip()
     dist = zone.get('distance_pct')
-    parts = [fallback]
+    parts = [base]
     if tf:
         parts.append(f'TF {tf}')
     if rel in ('blocks_target', 'inside_blocks_target'):
@@ -6396,8 +6432,82 @@ def _loss_card_zone_desc(zone: dict, fallback: str) -> str:
     return ' / '.join(parts)
 
 
+def _loss_card_real_zone_context(analysis: dict, side: str) -> dict:
+    """Return pre-entry zone/resistance/support context without inventing FVGs.
+
+    Boolean flags like entry_into_supply/entry_into_demand may be inferred from price
+    location. They are useful, but they are NOT proof that a red/green FVG existed
+    before entry. This helper separates actual saved zone/path blocker from inferred
+    price-location flags so LOSS cards do not lie about what is visible.
+    """
+    analysis = analysis if isinstance(analysis, dict) else {}
+    side_l = str(side or '').lower().strip()
+    if side_l not in ('supply', 'demand'):
+        return {'zone': {}, 'tfs': [], 'has_zone': False, 'is_fvg': False, 'is_path_block': False, 'blocks_tp1': False, 'desc': 'reaction zone', 'fvg_word': 'FVG'}
+
+    zone_key = 'nearest_supply_zone' if side_l == 'supply' else 'nearest_demand_zone'
+    tfs_key = 'supply_near_tfs' if side_l == 'supply' else 'demand_near_tfs'
+    blocks_key = 'supply_zone_blocks_tp1' if side_l == 'supply' else 'demand_zone_blocks_tp1'
+    relation_key = 'supply_zone_relation' if side_l == 'supply' else 'demand_zone_relation'
+
+    zone = analysis.get(zone_key) if isinstance(analysis.get(zone_key), dict) else {}
+    tfs = [str(x) for x in list(analysis.get(tfs_key) or []) if str(x).strip()]
+    relation = str(analysis.get(relation_key) or '').strip()
+    blocks = bool(analysis.get(blocks_key) or relation in ('blocks_target', 'inside_blocks_target'))
+
+    kind = str(zone.get('kind') or '').lower() if zone else ''
+    source = str(zone.get('source') or '').lower() if zone else ''
+    is_fvg = _loss_card_zone_is_fvg(zone, side_l)
+    is_path = bool('recent_swing' in kind or 'range_' in source or 'path' in source)
+    has_zone = bool(zone or tfs or blocks)
+
+    if side_l == 'supply':
+        if is_fvg:
+            base = 'red FVG / seller zone'
+            fvg_word = 'red FVG / supply'
+        elif is_path:
+            base = 'recent swing high / resistance'
+            fvg_word = 'resistance / supply'
+        elif has_zone:
+            base = 'seller reaction / resistance zone'
+            fvg_word = 'supply / resistance'
+        else:
+            base = 'local high / resistance'
+            fvg_word = 'local high / resistance'
+    else:
+        if is_fvg:
+            base = 'green FVG / buyer zone'
+            fvg_word = 'green FVG / demand'
+        elif is_path:
+            base = 'recent swing low / support'
+            fvg_word = 'support / demand'
+        elif has_zone:
+            base = 'buyer reaction / demand zone'
+            fvg_word = 'demand / support'
+        else:
+            base = 'local low / support'
+            fvg_word = 'local low / support'
+
+    return {
+        'zone': zone,
+        'tfs': tfs,
+        'has_zone': has_zone,
+        'is_fvg': is_fvg,
+        'is_path_block': is_path,
+        'blocks_tp1': blocks,
+        'desc': _loss_card_zone_desc(zone, base) if zone else base,
+        'fvg_word': fvg_word,
+    }
+
+
+
 def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: int | None = None) -> dict:
-    """Pick the exact chart-visible LOSS reason instead of one generic label."""
+    """Pick the exact chart-visible LOSS reason instead of one generic label.
+
+    The wording is conservative: it says "red/green FVG" only when a real FVG was
+    present in the saved pre-entry snapshot. If the blocker was a swing high/low or
+    just bad range location, the card says resistance/support/local high/low instead.
+    """
     side_u = str(side or '').upper().strip()
     analysis = dict(analysis or {})
     cs = _loss_card_float(analysis, 'clean_space_to_tp1_pct')
@@ -6409,8 +6519,10 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
     no_tp_space = bool(0 < cs <= _loss_card_location_tp_space_pct())
 
     if side_u == 'LONG':
-        zone = analysis.get('nearest_supply_zone') if isinstance(analysis.get('nearest_supply_zone'), dict) else {}
-        blocks_tp1 = bool(_loss_card_bool(analysis, 'supply_zone_blocks_tp1') or str(analysis.get('supply_zone_relation') or '') in ('blocks_target', 'inside_blocks_target'))
+        ctx = _loss_card_real_zone_context(analysis, 'supply')
+        zone_desc = str(ctx.get('desc') or 'local high / resistance')
+        fvg_word = str(ctx.get('fvg_word') or 'local high / resistance')
+        blocks_tp1 = bool(ctx.get('blocks_tp1'))
         late_pump = bool(_loss_card_bool(analysis, 'late_entry_after_exhausted_move') or local6 >= 0.12 or local12 >= 0.22 or pre_move >= 0.45)
         bearish_context = bool(
             _loss_card_bool(analysis, 'bearish_context_before_entry')
@@ -6424,106 +6536,107 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
             or str(analysis.get('trend_context') or '').lower().startswith('bearish')
         )
         strong_high = bool(_loss_card_bool(analysis, 'long_below_strong_high') or entry_pos >= 0.72)
-        zone_desc = _loss_card_zone_desc(zone, 'red FVG / seller zone')
-        has_supply_context = bool(zone or analysis.get('supply_near_tfs') or _loss_card_bool(analysis, 'overhead_bearish_fvg') or strong_high or blocks_tp1)
-        # Very fast SL under/into supply should be labelled as immediate rejection.
-        # This keeps ILV/YGG-type cards from falling back to generic breakout trap
-        # or a slow "directly into supply" variant.
+        has_supply_context = bool(ctx.get('has_zone') or _loss_card_bool(analysis, 'overhead_bearish_fvg') or strong_high or blocks_tp1)
+        has_real_zone = bool(ctx.get('has_zone'))
+
         if immediate and has_supply_context:
+            if has_real_zone:
+                primary = 'Immediate rejection from overhead supply'
+                scenario = f'LONG вошёл прямо перед {fvg_word}. Реакция продавца появилась почти сразу, поэтому покупатель не успел построить continuation и цена ушла к SL.'
+                visible0 = f'над входом была {zone_desc}'
+                secondary_zone = 'Long into supply'
+                improve0 = 'не входить прямо перед seller reaction zone'
+            else:
+                primary = 'Immediate rejection near local high'
+                scenario = 'LONG был открыт рядом с локальным high / resistance после уже сделанного движения вверх. Покупатель не получил clean continuation, цена сразу дала rejection и ушла к SL.'
+                visible0 = 'вход был рядом с локальным high / resistance, а не из discount'
+                secondary_zone = 'Long near local high'
+                improve0 = 'не входить в LONG прямо возле локального high без clean breakout'
             return {
-                'pattern': 'immediate_rejection_from_supply',
-                'primary_text': 'Immediate rejection from overhead supply',
-                'scenario_text': 'LONG вошёл прямо перед зоной продавца. Реакция продавца появилась почти сразу, поэтому покупатель не успел построить continuation и цена ушла к SL.',
-                'analysis_add': ['immediate rejection from supply', 'bullish follow-through отсутствовал'],
+                'pattern': 'immediate_long_rejection',
+                'primary_text': primary,
+                'scenario_text': scenario,
+                'analysis_add': ['immediate rejection after entry', 'bullish follow-through отсутствовал'],
                 'visible': [
-                    f'над входом стоял {zone_desc}',
+                    visible0,
                     'первая реакция после входа была вниз',
                     'bullish continuation не закрепился',
                     'SL был выбит без нормального движения к TP1',
                 ],
-                'secondary': ['Immediate rejection', 'Long into supply', 'Weak follow-through', 'SL hit without meaningful excursion'],
-                'improve': ['не входить прямо перед seller reaction zone', 'ждать пробой и закрепление выше supply', 'после быстрого rejection считать setup invalid'],
+                'secondary': ['Immediate rejection', secondary_zone, 'Weak follow-through', 'SL hit without meaningful excursion'],
+                'improve': [improve0, 'ждать закрепление выше уровня/зоны', 'после быстрого rejection считать setup invalid'],
             }
+
         if bearish_context and not late_pump:
+            zone_line = f'LONG открыт под {zone_desc}' if has_real_zone else 'LONG открыт против bearish context рядом с resistance/high'
             return {
-                'pattern': 'long_against_bearish_structure_under_supply',
-                'primary_text': 'Long against bearish structure under supply',
-                'scenario_text': 'LONG был открыт не из чистого bullish continuation, а под red FVG / supply внутри bearish-структуры. Цена не сделала reclaim выше зоны продавца, поэтому покупатель не получил продолжение и sell-side движение продолжилось к SL.',
-                'analysis_add': ['bearish structure перед входом', 'bullish reclaim выше supply отсутствовал', 'upside expansion отсутствовал'],
+                'pattern': 'long_against_bearish_structure_under_resistance',
+                'primary_text': 'Long against bearish structure / failed reclaim',
+                'scenario_text': f'LONG был открыт не из чистого bullish continuation: структура была bearish или reclaim не закрепился. Цена не смогла закрепиться выше {fvg_word}, поэтому покупатель не получил продолжение и движение ушло к SL.',
+                'analysis_add': ['bearish structure перед входом', 'bullish reclaim отсутствовал', 'upside expansion отсутствовал'],
                 'visible': [
-                    'перед входом структура уже была bearish / делала lower high → lower low',
-                    f'LONG открыт под {zone_desc}',
-                    'red FVG / seller zone оставалась активной над входом',
-                    'после входа не было clean bullish reclaim выше supply',
-                    'это был не clean breakout continuation, а попытка купить против seller pressure',
+                    'перед входом структура уже была bearish / продавец контролировал движение',
+                    zone_line,
+                    'после входа не было clean bullish reclaim',
+                    'это был не clean breakout continuation, а покупка против seller pressure',
                 ],
-                'secondary': ['Long against bearish structure', 'Overhead bearish FVG', 'Failed reclaim', 'Weak upside continuation', 'Bearish continuation resumed', 'Poor RR location'],
-                'improve': ['не брать LONG под red FVG, если 5m/15m структура bearish', 'ждать reclaim и закрепление выше supply', 'требовать clean space до TP1 без seller zone'],
+                'secondary': ['Long against bearish structure', 'Failed reclaim', 'Weak upside continuation', 'Bearish continuation resumed', 'Poor RR location'],
+                'improve': ['не брать LONG против bearish 5m/15m без reclaim', 'ждать закрепление выше resistance/supply', 'требовать clean space до TP1'],
             }
-        if blocks_tp1 or (no_tp_space and bool(analysis.get('supply_near_tfs'))):
+
+        if blocks_tp1 or (no_tp_space and bool(ctx.get('has_zone'))):
             return {
-                'pattern': 'tp1_blocked_by_overhead_fvg',
-                'primary_text': 'TP1 blocked by overhead bearish FVG',
-                'scenario_text': 'LONG был открыт под red FVG / supply, а TP1 находился прямо в зоне продавца. Формальный RR был, но чистого пространства до TP1 не было, поэтому price получил rejection раньше цели.',
-                'analysis_add': ['TP1 был заблокирован overhead FVG', 'upside expansion отсутствовал'],
+                'pattern': 'tp1_blocked_by_overhead_zone',
+                'primary_text': 'TP1 blocked by overhead supply/resistance',
+                'scenario_text': f'LONG был открыт под {fvg_word}, а TP1 находился прямо в зоне продавца/сопротивления или сразу за ней. Формальный RR был, но чистого пространства до TP1 не было.',
+                'analysis_add': ['TP1 был заблокирован overhead zone', 'upside expansion отсутствовал'],
                 'visible': [
                     f'TP1 упирался в {zone_desc}',
                     'между входом и TP1 не было clean space',
-                    'seller imbalance стоял прямо на пути LONG',
+                    'seller reaction zone стояла на пути LONG',
                     'после входа не появился clean bullish displacement',
                 ],
-                'secondary': ['TP1 blocked by supply', 'Overhead bearish FVG', 'No clean space to TP1', 'Weak upside continuation', 'Poor RR location'],
-                'improve': ['не брать LONG, если TP1 внутри red FVG / supply', 'требовать чистое пространство до TP1', 'ждать вход ниже от discount / demand'],
+                'secondary': ['TP1 blocked by supply/resistance', 'No clean space to TP1', 'Weak upside continuation', 'Poor RR location'],
+                'improve': ['не брать LONG, если TP1 внутри/сразу за resistance/supply', 'требовать чистое пространство до TP1', 'ждать вход ниже от discount / demand'],
             }
-        if late_pump and strong_high:
+
+        if late_pump and (strong_high or no_tp_space):
+            visible_zone = f'сверху находился {zone_desc}' if has_real_zone else 'сверху был локальный high / resistance'
             return {
                 'pattern': 'late_long_after_exhausted_pump',
-                'primary_text': 'Late LONG after exhausted pump into supply',
-                'scenario_text': 'LONG был открыт после уже отработанного buy-side impulse. Цена пришла в premium/верх range прямо под seller zone, поэтому продолжение вверх было слабым и быстро начался rejection.',
-                'analysis_add': ['вход после уже отработанного pump', 'failed continuation under supply'],
+                'primary_text': 'Late LONG after exhausted pump near high',
+                'scenario_text': 'LONG был открыт после уже отработанного buy-side impulse. Цена пришла в premium/верх range, поэтому продолжение вверх было слабым и быстро начался откат/rejection.',
+                'analysis_add': ['вход после уже отработанного pump', 'fresh bullish displacement после входа отсутствовал'],
                 'visible': [
-                    'перед входом уже был сильный buy-side impulse',
+                    'перед входом уже был buy-side impulse',
                     'LONG открыт в premium/верхней части range, а не из discount',
-                    f'сверху находился {zone_desc}',
+                    visible_zone,
                     'покупатель не получил нового displacement после входа',
                 ],
-                'secondary': ['Late entry', 'Buy-side exhaustion', 'Long into supply', 'Weak upside continuation', 'No post-entry expansion'],
-                'improve': ['не покупать после вертикального pump прямо под supply', 'ждать pullback ниже', 'требовать новый bullish displacement после retest'],
+                'secondary': ['Late entry', 'Buy-side exhaustion', 'Weak upside continuation', 'No post-entry expansion'],
+                'improve': ['не покупать после вертикального pump возле high/resistance', 'ждать pullback ниже', 'требовать новый bullish displacement после retest'],
             }
-        if immediate:
-            return {
-                'pattern': 'immediate_rejection_from_supply',
-                'primary_text': 'Immediate rejection from overhead supply',
-                'scenario_text': 'LONG вошёл прямо перед зоной продавца. Реакция продавца появилась почти сразу, поэтому покупатель не успел построить continuation и цена ушла к SL.',
-                'analysis_add': ['immediate rejection from supply', 'bullish follow-through отсутствовал'],
-                'visible': [
-                    f'над входом стоял {zone_desc}',
-                    'первая реакция после входа была вниз',
-                    'bullish continuation не закрепился',
-                    'SL был выбит без нормального движения к TP1',
-                ],
-                'secondary': ['Immediate rejection', 'Long into supply', 'Weak follow-through', 'SL hit without meaningful excursion'],
-                'improve': ['не входить прямо перед seller reaction zone', 'ждать пробой и закрепление выше supply', 'после быстрого rejection считать setup invalid'],
-            }
+
         return {
-            'pattern': 'long_directly_into_supply',
-            'primary_text': 'Long entered directly into supply',
-            'scenario_text': 'LONG был открыт слишком высоко, прямо под seller zone и strong high. Цена уже находилась в зоне реакции продавцов, поэтому upside был ограничен, а вероятность rejection вниз была высокой.',
-            'analysis_add': ['failed continuation under supply', 'upside expansion отсутствовал'],
+            'pattern': 'long_poor_location_near_high',
+            'primary_text': 'Long near local high / poor RR location',
+            'scenario_text': 'LONG был открыт высоко в локальном range. До TP1 оставалось мало чистого пространства, а покупатель не показал нового displacement после входа, поэтому цена быстро вернулась против позиции.',
+            'analysis_add': ['вход высоко в range', 'upside expansion отсутствовал'],
             'visible': [
-                'LONG открыт почти прямо под red FVG / seller zone',
-                'сверху уже seller reaction zone, которая блокировала путь к TP1',
+                'LONG открыт в верхней части локального range',
+                'сверху был local high / resistance, а не обязательно red FVG',
                 'upside для LONG был ограничен',
-                'цена уже пришла в premium/верхнюю часть локального range',
                 'после входа не было clean bullish displacement',
             ],
-            'secondary': ['Late entry', 'Long into supply', 'Overhead bearish FVG', 'Weak upside continuation', 'Poor RR location', 'Buy-side exhaustion'],
-            'improve': ['не лонговать прямо под red FVG / supply', 'требовать чистое пространство до TP1', 'ждать discount re-entry ниже'],
+            'secondary': ['Poor RR location', 'Weak upside continuation', 'No clean space to TP1', 'Buy-side exhaustion'],
+            'improve': ['не лонговать высоко в range без clean breakout', 'требовать чистое пространство до TP1', 'ждать discount re-entry ниже'],
         }
 
     if side_u == 'SHORT':
-        zone = analysis.get('nearest_demand_zone') if isinstance(analysis.get('nearest_demand_zone'), dict) else {}
-        blocks_tp1 = bool(_loss_card_bool(analysis, 'demand_zone_blocks_tp1') or str(analysis.get('demand_zone_relation') or '') in ('blocks_target', 'inside_blocks_target'))
+        ctx = _loss_card_real_zone_context(analysis, 'demand')
+        zone_desc = str(ctx.get('desc') or 'local low / support')
+        fvg_word = str(ctx.get('fvg_word') or 'local low / support')
+        blocks_tp1 = bool(ctx.get('blocks_tp1'))
         late_dump = bool(_loss_card_bool(analysis, 'late_entry_after_exhausted_move') or local6 <= -0.12 or local12 <= -0.22 or pre_move <= -0.45)
         bullish_context = bool(
             _loss_card_bool(analysis, 'bullish_context_before_entry')
@@ -6537,202 +6650,385 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
             or str(analysis.get('trend_context') or '').lower().startswith('bullish')
         )
         strong_low = bool(_loss_card_bool(analysis, 'short_above_weak_low') or entry_pos <= 0.28)
-        zone_desc = _loss_card_zone_desc(zone, 'green FVG / buyer zone')
-        has_demand_context = bool(zone or analysis.get('demand_near_tfs') or _loss_card_bool(analysis, 'underlying_bullish_fvg') or strong_low or blocks_tp1)
-        # Very fast SL above/into demand should be labelled as immediate bounce.
+        has_demand_context = bool(ctx.get('has_zone') or _loss_card_bool(analysis, 'underlying_bullish_fvg') or strong_low or blocks_tp1)
+        has_real_zone = bool(ctx.get('has_zone'))
+
         if immediate and has_demand_context:
+            if has_real_zone:
+                primary = 'Immediate bounce from underlying demand'
+                scenario = f'SHORT вошёл прямо перед {fvg_word}. Реакция покупателя появилась почти сразу, поэтому продавец не успел построить continuation и цена ушла к SL.'
+                visible0 = f'под входом была {zone_desc}'
+                secondary_zone = 'Short into demand'
+                improve0 = 'не входить прямо перед buyer reaction zone'
+            else:
+                primary = 'Immediate bounce near local low'
+                scenario = 'SHORT был открыт рядом с локальным low / support после уже сделанного движения вниз. Продавец не получил clean continuation, цена сразу дала bounce и ушла к SL.'
+                visible0 = 'вход был рядом с локальным low / support, а не из premium'
+                secondary_zone = 'Short near local low'
+                improve0 = 'не входить в SHORT прямо возле локального low без clean breakdown'
             return {
-                'pattern': 'immediate_bounce_from_demand',
-                'primary_text': 'Immediate bounce from underlying demand',
-                'scenario_text': 'SHORT вошёл прямо перед зоной покупателя. Реакция покупателя появилась почти сразу, поэтому продавец не успел построить continuation и цена ушла к SL.',
-                'analysis_add': ['immediate bounce from demand', 'bearish follow-through отсутствовал'],
+                'pattern': 'immediate_short_bounce',
+                'primary_text': primary,
+                'scenario_text': scenario,
+                'analysis_add': ['immediate bounce after entry', 'bearish follow-through отсутствовал'],
                 'visible': [
-                    f'под входом стоял {zone_desc}',
+                    visible0,
                     'первая реакция после входа была вверх',
                     'bearish continuation не закрепился',
                     'SL был выбит без нормального движения к TP1',
                 ],
-                'secondary': ['Immediate bounce', 'Short into demand', 'Weak follow-through', 'SL hit without meaningful excursion'],
-                'improve': ['не входить прямо перед buyer reaction zone', 'ждать пробой и закрепление ниже demand', 'после быстрого bounce считать setup invalid'],
+                'secondary': ['Immediate bounce', secondary_zone, 'Weak follow-through', 'SL hit without meaningful excursion'],
+                'improve': [improve0, 'ждать закрепление ниже уровня/зоны', 'после быстрого bounce считать setup invalid'],
             }
+
         if bullish_context and not late_dump:
+            zone_line = f'SHORT открыт над {zone_desc}' if has_real_zone else 'SHORT открыт против bullish context рядом с support/low'
             return {
-                'pattern': 'short_against_bullish_structure_over_demand',
-                'primary_text': 'Short against bullish structure over demand',
-                'scenario_text': 'SHORT был открыт не из чистого bearish continuation, а над green FVG / demand внутри bullish-структуры. Цена не сделала bearish reclaim ниже зоны покупателя, поэтому продавец не получил продолжение и buy-side движение продолжилось к SL.',
-                'analysis_add': ['bullish structure перед входом', 'bearish reclaim ниже demand отсутствовал', 'downside expansion отсутствовал'],
+                'pattern': 'short_against_bullish_structure_over_support',
+                'primary_text': 'Short against bullish structure / failed bearish reclaim',
+                'scenario_text': f'SHORT был открыт не из чистого bearish continuation: структура была bullish или bearish reclaim не закрепился. Цена не смогла закрепиться ниже {fvg_word}, поэтому продавец не получил продолжение и движение ушло к SL.',
+                'analysis_add': ['bullish structure перед входом', 'bearish reclaim отсутствовал', 'downside expansion отсутствовал'],
                 'visible': [
-                    'перед входом структура уже была bullish / делала higher low → higher high',
-                    f'SHORT открыт над {zone_desc}',
-                    'green FVG / buyer zone оставалась активной под входом',
-                    'после входа не было clean bearish reclaim ниже demand',
-                    'это был не clean breakdown continuation, а попытка шортить против buyer pressure',
+                    'перед входом структура уже была bullish / покупатель контролировал движение',
+                    zone_line,
+                    'после входа не было clean bearish reclaim',
+                    'это был не clean breakdown continuation, а SHORT против buyer pressure',
                 ],
-                'secondary': ['Short against bullish structure', 'Underlying bullish FVG', 'Failed bearish reclaim', 'Weak downside continuation', 'Bullish continuation resumed', 'Poor RR location'],
-                'improve': ['не брать SHORT над green FVG, если 5m/15m структура bullish', 'ждать reclaim и закрепление ниже demand', 'требовать clean space до TP1 без buyer zone'],
+                'secondary': ['Short against bullish structure', 'Failed bearish reclaim', 'Weak downside continuation', 'Bullish continuation resumed', 'Poor RR location'],
+                'improve': ['не брать SHORT против bullish 5m/15m без bearish reclaim', 'ждать закрепление ниже demand/support', 'требовать clean space до TP1'],
             }
-        if blocks_tp1 or (no_tp_space and bool(analysis.get('demand_near_tfs'))):
+
+        if blocks_tp1 or (no_tp_space and bool(ctx.get('has_zone'))):
             return {
-                'pattern': 'tp1_blocked_by_underlying_fvg',
-                'primary_text': 'TP1 blocked by underlying bullish FVG',
-                'scenario_text': 'SHORT был открыт над green FVG / demand, а TP1 находился прямо в зоне покупателя. Формальный RR был, но sell-side путь был заблокирован buyer imbalance.',
-                'analysis_add': ['TP1 был заблокирован underlying FVG', 'downside expansion отсутствовал'],
+                'pattern': 'tp1_blocked_by_underlying_zone',
+                'primary_text': 'TP1 blocked by underlying demand/support',
+                'scenario_text': f'SHORT был открыт над {fvg_word}, а TP1 находился прямо в зоне покупателя/поддержки или сразу за ней. Формальный RR был, но sell-side путь был заблокирован.',
+                'analysis_add': ['TP1 был заблокирован underlying zone', 'downside expansion отсутствовал'],
                 'visible': [
                     f'TP1 упирался в {zone_desc}',
                     'между входом и TP1 не было clean downside space',
-                    'buyer imbalance стоял прямо на пути SHORT',
+                    'buyer reaction zone стояла на пути SHORT',
                     'после входа не появился clean bearish displacement',
                 ],
-                'secondary': ['TP1 blocked by demand', 'Underlying bullish FVG', 'No clean space to TP1', 'Weak downside continuation', 'Poor RR location'],
-                'improve': ['не брать SHORT, если TP1 внутри green FVG / demand', 'требовать чистое пространство до TP1', 'ждать вход выше от premium / supply'],
+                'secondary': ['TP1 blocked by demand/support', 'No clean space to TP1', 'Weak downside continuation', 'Poor RR location'],
+                'improve': ['не брать SHORT, если TP1 внутри/сразу за demand/support', 'требовать чистое пространство до TP1', 'ждать вход выше от premium / supply'],
             }
-        if late_dump and strong_low:
+
+        if late_dump and (strong_low or no_tp_space):
+            visible_zone = f'снизу находился {zone_desc}' if has_real_zone else 'снизу был локальный low / support'
             return {
                 'pattern': 'late_short_after_exhausted_dump',
-                'primary_text': 'Late SHORT after exhausted dump into demand',
-                'scenario_text': 'SHORT был открыт после уже отработанного sell-side impulse. Цена пришла в discount/низ range прямо над buyer zone, поэтому продолжение вниз было слабым и быстро начался bounce.',
-                'analysis_add': ['вход после уже отработанного dump', 'failed continuation over demand'],
+                'primary_text': 'Late SHORT after exhausted dump near low',
+                'scenario_text': 'SHORT был открыт после уже отработанного sell-side impulse. Цена пришла в discount/низ range, поэтому продолжение вниз было слабым и быстро начался bounce.',
+                'analysis_add': ['вход после уже отработанного dump', 'fresh bearish displacement после входа отсутствовал'],
                 'visible': [
-                    'перед входом уже был сильный sell-side impulse',
+                    'перед входом уже был sell-side impulse',
                     'SHORT открыт в discount/нижней части range, а не из premium',
-                    f'снизу находился {zone_desc}',
+                    visible_zone,
                     'продавец не получил нового displacement после входа',
                 ],
-                'secondary': ['Late entry', 'Sell-side exhaustion', 'Short into demand', 'Weak downside continuation', 'No post-entry expansion'],
-                'improve': ['не шортить после вертикального dump прямо в demand', 'ждать pullback выше', 'требовать новый bearish displacement после retest'],
+                'secondary': ['Late entry', 'Sell-side exhaustion', 'Weak downside continuation', 'No post-entry expansion'],
+                'improve': ['не шортить после вертикального dump возле low/support', 'ждать pullback выше', 'требовать новый bearish displacement после retest'],
             }
-        if immediate:
-            return {
-                'pattern': 'immediate_bounce_from_demand',
-                'primary_text': 'Immediate bounce from underlying demand',
-                'scenario_text': 'SHORT вошёл прямо перед зоной покупателя. Реакция покупателя появилась почти сразу, поэтому продавец не успел построить continuation и цена ушла к SL.',
-                'analysis_add': ['immediate bounce from demand', 'bearish follow-through отсутствовал'],
-                'visible': [
-                    f'под входом стоял {zone_desc}',
-                    'первая реакция после входа была вверх',
-                    'bearish continuation не закрепился',
-                    'SL был выбит без нормального движения к TP1',
-                ],
-                'secondary': ['Immediate bounce', 'Short into demand', 'Weak follow-through', 'SL hit without meaningful excursion'],
-                'improve': ['не входить прямо перед buyer reaction zone', 'ждать пробой и закрепление ниже demand', 'после быстрого bounce считать setup invalid'],
-            }
+
         return {
-            'pattern': 'short_directly_into_demand',
-            'primary_text': 'Short entered directly into demand',
-            'scenario_text': 'SHORT был открыт слишком низко, прямо над buyer zone и weak low. Цена уже находилась в зоне реакции покупателей, поэтому downside был ограничен, а вероятность bounce вверх была высокой.',
-            'analysis_add': ['failed continuation over demand', 'downside expansion отсутствовал'],
+            'pattern': 'short_poor_location_near_low',
+            'primary_text': 'Short near local low / poor RR location',
+            'scenario_text': 'SHORT был открыт низко в локальном range. До TP1 оставалось мало чистого пространства, а продавец не показал нового displacement после входа, поэтому цена быстро дала bounce против позиции.',
+            'analysis_add': ['вход низко в range', 'downside expansion отсутствовал'],
             'visible': [
-                'SHORT открыт почти прямо над green FVG / buyer zone',
-                'снизу уже buyer reaction zone, которая блокировала путь к TP1',
+                'SHORT открыт в нижней части локального range',
+                'снизу был local low / support, а не обязательно green FVG',
                 'downside для SHORT был ограничен',
-                'цена уже пришла в discount/нижнюю часть локального range',
                 'после входа не было clean bearish displacement',
             ],
-            'secondary': ['Late entry', 'Short into demand', 'Underlying bullish FVG', 'Weak downside continuation', 'Poor RR location', 'Sell-side exhaustion'],
-            'improve': ['не шортить прямо в green FVG / demand', 'требовать чистое пространство до TP1', 'ждать premium re-entry выше'],
+            'secondary': ['Poor RR location', 'Weak downside continuation', 'No clean space to TP1', 'Sell-side exhaustion'],
+            'improve': ['не шортить низко в range без clean breakdown', 'требовать чистое пространство до TP1', 'ждать premium re-entry выше'],
         }
     return {}
 
 
 
 def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: str, code: str = '', duration_min: int | None = None) -> dict:
-    """Replace generic LOSS reason with a candle/snapshot-based chart reason."""
-    src = dict(src or {}); analysis = dict(analysis or {})
+    """Replace generic/template LOSS reason with candle/snapshot based chart facts.
+
+    This function is deliberately allowed to override many exact-route failure labels
+    (for example OB+FVG fast invalidation) when the stored candles show a clearer
+    location reason such as late SHORT after dump, TP1 blocked by demand, or LONG
+    near range high. That keeps LOSS cards from showing one repeated template.
+    """
+    src = dict(src or {})
+    analysis = dict(analysis or {})
     side_u = str(side or src.get('side') or analysis.get('side') or '').upper().strip() or 'LONG'
     code = str(code or '').strip()
-    generic = {'', 'fake_breakout_no_continuation', 'breakout_trap', 'bos_retest_no_followthrough', 'bos_retest_failed', 'no_continuation_after_retest', 'continuation_missing', 'no_followthrough_after_entry', 'loss_before_tp1_sl', 'ob_fvg_no_continuation', 'ob_fvg_no_followthrough', 'htf_ob_ltf_no_followthrough', 'weak_reaction_then_fade', 'fake_confirm'}
+
+    override_codes = {
+        '', 'fake_breakout_no_continuation', 'breakout_trap', 'bos_retest_no_followthrough',
+        'bos_retest_failed', 'bos_confirm_weak', 'bos_level_reclaimed_back',
+        'no_continuation_after_retest', 'continuation_missing', 'no_followthrough_after_entry',
+        'loss_before_tp1_sl', 'weak_reaction_then_fade', 'fake_confirm',
+        'ob_fvg_zone_failed', 'ob_fvg_reaction_weak', 'ob_fvg_invalidation_fast',
+        'ob_fvg_no_continuation', 'ob_fvg_no_followthrough',
+        'htf_ob_ltf_retest_failed', 'htf_zone_not_held', 'ltf_confirm_weak',
+        'htf_ob_ltf_no_followthrough',
+        'displacement_failed', 'origin_not_held', 'impulse_died_fast',
+        'dual_fvg_failed', 'stacked_fvg_not_held', 'reaction_from_dual_fvg_weak',
+        'liquidity_reclaim_failed', 'reclaim_not_confirmed', 'sweep_without_continuation',
+        'short_above_weak_low', 'entry_into_demand', 'long_below_strong_high',
+        'entry_into_supply', 'entry_into_overhead_supply', 'entry_near_opposite_zone',
+        'late_entry_after_exhausted_move', 'entry_in_range_premium',
+    }
     raw = str(analysis.get('primary_reason_text') or analysis.get('reason_text') or '').lower()
-    if code not in generic and 'breakout trap' not in raw and 'no continuation' not in raw:
+    if code not in override_codes and 'breakout trap' not in raw and 'no continuation' not in raw and 'invalidation' not in raw:
         return {}
+
     def f(k, d=0.0):
         try:
             v = analysis.get(k)
             return d if v in (None, '') else float(str(v).replace(',', '.'))
         except Exception:
             return d
+
     def b(k):
         v = analysis.get(k)
-        return v.strip().lower() in ('1','true','yes','on','да','есть') if isinstance(v, str) else bool(v)
+        return v.strip().lower() in ('1', 'true', 'yes', 'on', 'да', 'есть') if isinstance(v, str) else bool(v)
+
+    def tfs(name):
+        return [str(x) for x in list(analysis.get(name) or []) if str(x).strip()]
+
+    def out(primary, scenario, analysis_lines, happened, visible, secondary, improve):
+        return {
+            'primary_text': primary,
+            'scenario_text': scenario,
+            'analysis_lines': [x for x in analysis_lines if str(x).strip()],
+            'happened_lines': [x for x in happened if str(x).strip()],
+            'visible_lines': [x for x in visible if str(x).strip()],
+            'secondary_labels': [x for x in secondary if str(x).strip()],
+            'improve_labels': [x for x in improve if str(x).strip()],
+        }
+
     cs = f('clean_space_to_tp1_pct')
     if cs <= 0:
         try:
-            e = float(src.get('entry') or 0); t = float(src.get('tp1') or 0)
-            cs = ((t-e)/e*100.0) if side_u == 'LONG' and e > 0 and t > e else (((e-t)/e*100.0) if side_u == 'SHORT' and e > 0 and 0 < t < e else 0.0)
-            if cs > 0: analysis['clean_space_to_tp1_pct'] = round(cs, 3)
+            e = float(src.get('entry') or 0)
+            t = float(src.get('tp1') or 0)
+            if side_u == 'LONG' and e > 0 and t > e:
+                cs = ((t - e) / e) * 100.0
+            elif side_u == 'SHORT' and e > 0 and 0 < t < e:
+                cs = ((e - t) / e) * 100.0
+            if cs > 0:
+                analysis['clean_space_to_tp1_pct'] = round(cs, 3)
         except Exception:
             pass
+
     pos = f('entry_position_in_prior_range', f('entry_position_in_range', 0.5))
     l6, l12, l24, premove = f('local_pre_move_6_pct'), f('local_pre_move_12_pct'), f('local_pre_move_24_pct'), f('pre_entry_move_pct')
     no_tp = not bool(analysis.get('tp1_threatened'))
     no_space = bool(0 < cs <= max(_loss_card_location_tp_space_pct(), 0.70) and no_tp)
     level_back = bool(b('level_reclaimed_back') or b('reclaim_lost_back'))
     weak = bool(b('weak_followthrough') or b('no_post_entry_expansion') or b('zone_reaction_too_weak') or no_tp or abs(f('mfe_pct')) < 0.35)
-    def tfs(name): return [str(x) for x in list(analysis.get(name) or []) if str(x).strip()]
-    def zdesc(z, fb): return _loss_card_zone_desc(z if isinstance(z, dict) else {}, fb)
-    def out(primary, scenario, analysis_lines, happened, visible, secondary, improve):
-        return {'primary_text': primary, 'scenario_text': scenario, 'analysis_lines': analysis_lines, 'happened_lines': happened, 'visible_lines': visible, 'secondary_labels': secondary, 'improve_labels': improve}
+
     if side_u == 'LONG':
-        sz = analysis.get('nearest_supply_zone') if isinstance(analysis.get('nearest_supply_zone'), dict) else {}
-        dz = analysis.get('nearest_demand_zone') if isinstance(analysis.get('nearest_demand_zone'), dict) else {}
+        supply_ctx = _loss_card_real_zone_context(analysis, 'supply')
+        demand_ctx = _loss_card_real_zone_context(analysis, 'demand')
         stf, dtf = tfs('supply_near_tfs'), tfs('demand_near_tfs')
-        supply = bool(sz or stf or b('overhead_bearish_fvg') or b('entry_into_supply') or b('entry_into_overhead_supply') or b('supply_zone_blocks_tp1'))
-        demand = bool(dz or dtf or b('long_demand_near_entry'))
+        supply = bool(supply_ctx.get('has_zone') or b('overhead_bearish_fvg') or b('entry_into_supply') or b('entry_into_overhead_supply') or b('long_below_strong_high') or b('supply_zone_blocks_tp1'))
+        demand = bool(demand_ctx.get('has_zone') or b('long_demand_near_entry'))
         bearish = bool(b('bearish_context_before_entry') or b('long_against_bearish_structure') or level_back or l6 <= -0.12 or l12 <= -0.22 or l24 <= -0.35 or premove <= -0.45 or str(analysis.get('structure_5m') or '').lower().startswith('bearish'))
         late_pump = bool(l6 >= 0.12 or l12 >= 0.22 or l24 >= 0.35 or premove >= 0.45 or b('late_entry_after_exhausted_move'))
-        zd = zdesc(sz, 'red FVG / seller zone')
-        if supply and no_space:
-            vis = [f'TP1/путь к TP1 упирался в {zd}', 'между входом и целью не было чистого пространства', 'red FVG / seller imbalance стоял над входом', 'после входа не появился clean bullish displacement']
-            if stf: vis.append('supply подтверждена на TF: ' + '/'.join(stf))
-            if cs > 0: vis.append(f'чистое пространство до TP1: около {cs:.2f}%')
-            return out('TP1 blocked by overhead supply', 'LONG был открыт под red FVG / supply. TP1 находился прямо в зоне продавца или сразу за ней, поэтому формально RR был, но реального clean space вверх не было.', ['TP1 был заблокирован overhead supply','bullish expansion после входа отсутствовал'], ['цена не смогла пройти seller imbalance','покупатель не получил continuation до TP1','продавец удержал верхнюю зону','SL был достигнут после rejection/затухания'], vis, ['TP1 blocked by supply','No clean space to TP1','Overhead bearish FVG','Weak upside continuation'], ['не брать LONG, если TP1 внутри/сразу за red FVG','требовать clean space до TP1','ждать вход ниже от discount / demand'])
+        zd = str(supply_ctx.get('desc') or 'local high / resistance')
+        zw = str(supply_ctx.get('fvg_word') or 'local high / resistance')
+
+        if supply and no_space and bool(supply_ctx.get('has_zone')):
+            vis = [f'TP1/путь к TP1 упирался в {zd}', 'между входом и целью не было чистого пространства', f'{zw} был на пути LONG', 'после входа не появился clean bullish displacement']
+            if stf:
+                vis.append('overhead zone подтверждена на TF: ' + '/'.join(stf))
+            if cs > 0:
+                vis.append(f'чистое пространство до TP1: около {cs:.2f}%')
+            return out(
+                'TP1 blocked by overhead supply/resistance',
+                f'LONG был открыт под {zw}. TP1 находился прямо в зоне продавца/сопротивления или сразу за ней, поэтому формально RR был, но реального clean space вверх не было.',
+                ['TP1 был заблокирован overhead zone', 'bullish expansion после входа отсутствовал'],
+                ['цена не смогла пройти seller reaction zone', 'покупатель не получил continuation до TP1', 'верхняя зона удержала движение', 'SL был достигнут после rejection/затухания'],
+                vis,
+                ['TP1 blocked by supply/resistance', 'No clean space to TP1', 'Weak upside continuation'],
+                ['не брать LONG, если TP1 внутри/сразу за resistance/supply', 'требовать clean space до TP1', 'ждать вход ниже от discount / demand'],
+            )
+
         if supply and (bearish or level_back):
-            vis = ['перед входом структура была bearish или reclaim не закрепился', f'LONG открыт под {zd}', 'red FVG / seller zone оставалась активной над входом', 'после входа не было закрепления выше supply', 'это не clean breakout continuation, а покупка под sell pressure']
-            if stf: vis.append('overhead supply виден на TF: ' + '/'.join(stf))
-            return out('Long under supply after failed reclaim', 'LONG был открыт под активной зоной продавца после слабого/неподтверждённого reclaim. Цена не смогла закрепиться выше supply, поэтому buy-side continuation не появился и движение развернулось к SL.', ['bullish reclaim выше supply отсутствовал','upside expansion отсутствовал'], ['цена не смогла закрепиться выше зоны входа','seller zone удержала движение сверху','покупатель не получил displacement вверх','sell-side движение продолжилось к SL'], vis, ['Failed reclaim','Overhead bearish FVG','Long under supply','Weak upside continuation'], ['ждать закрытие выше supply перед LONG','не брать LONG под red FVG при bearish 5m/15m','требовать bullish displacement после retest'])
-        if late_pump and (supply or pos >= 0.58):
-            return out('Late LONG after exhausted pump', 'LONG был открыт после уже отработанного импульса. Цена пришла в premium/верх range, поэтому покупатель уже был уставший, а продолжение до TP1 быстро затухло.', ['вход после уже отработанного pump','fresh bullish displacement после входа отсутствовал'], ['первичный импульс уже был израсходован до входа','после входа покупатель не смог дать новую волну','цена перешла в откат против позиции','SL был достигнут без нормального движения к TP1'], ['перед входом уже прошёл buy-side impulse','LONG открыт поздно в верхней части локального range',f'сверху находился {zd}','после входа не было нового fresh displacement',f'позиция входа в range: {pos:.2f}'], ['Late entry','Buy-side exhaustion','Weak follow-through','No post-entry expansion'], ['не покупать после вертикального pump','ждать pullback ниже','входить только после нового bullish displacement'])
-        if bearish and demand and pos <= 0.48:
-            vis = ['LONG открыт возле demand, но структура уже была bearish','buyer zone не дала сильной реакции','сверху оставался seller pressure / bearish FVG','bullish reclaim перед входом не подтвердился']
-            if dtf: vis.append('demand/FVG рядом на TF: ' + '/'.join(dtf))
-            if stf: vis.append('overhead supply также виден на TF: ' + '/'.join(stf))
-            return out('Long into bearish structure / failed demand', 'LONG был открыт от demand, но рынок уже показывал bearish structure. Demand не дал reclaim и сильной реакции, поэтому покупатель не удержал зону и цена ушла к SL.', ['demand reaction была слабой','bullish reclaim не появился'], ['buyer zone не удержала цену','после входа не было displacement вверх','продавец продолжил sell-side движение','TP1 не был поставлен под угрозу'], vis, ['Failed demand reaction','Long against bearish structure','No bullish displacement','Weak follow-through'], ['не брать LONG от demand без bullish reclaim','ждать закрытие выше локальной supply/FVG','фильтровать LONG против bearish 5m/15m структуры'])
+            vis = ['перед входом структура была bearish или reclaim не закрепился', f'LONG открыт под {zd}', 'после входа не было закрепления выше resistance/supply', 'это не clean breakout continuation, а покупка под sell pressure']
+            if stf:
+                vis.append('overhead zone видна на TF: ' + '/'.join(stf))
+            return out(
+                'Long under supply/resistance after failed reclaim',
+                f'LONG был открыт под активной зоной продавца/сопротивления после слабого или неподтверждённого reclaim. Цена не смогла закрепиться выше {zw}, поэтому buy-side continuation не появился и движение развернулось к SL.',
+                ['bullish reclaim выше resistance/supply отсутствовал', 'upside expansion отсутствовал'],
+                ['цена не смогла закрепиться выше зоны входа', 'seller pressure удержал движение сверху', 'покупатель не получил displacement вверх', 'sell-side движение продолжилось к SL'],
+                vis,
+                ['Failed reclaim', 'Overhead supply/resistance', 'Weak upside continuation'],
+                ['ждать закрытие выше resistance/supply перед LONG', 'не брать LONG под sell pressure при bearish 5m/15m', 'требовать bullish displacement после retest'],
+            )
+
+        if late_pump and (supply or pos >= 0.58 or no_space):
+            vis = ['перед входом уже прошёл buy-side impulse', 'LONG открыт поздно в верхней части локального range', 'после входа не было нового fresh bullish displacement', f'позиция входа в range: {pos:.2f}']
+            if supply:
+                vis.insert(2, f'сверху находился {zd}')
+            return out(
+                'Late LONG after exhausted pump near high',
+                'LONG был открыт после уже отработанного импульса вверх. Цена пришла в premium/верх range, поэтому покупатель уже был уставший, а продолжение до TP1 быстро затухло.',
+                ['вход после уже отработанного pump', 'fresh bullish displacement после входа отсутствовал'],
+                ['первичный импульс вверх уже был израсходован до входа', 'после входа покупатель не смог дать новую волну', 'цена перешла в откат против позиции', 'SL был достигнут без нормального движения к TP1'],
+                vis,
+                ['Late entry', 'Buy-side exhaustion', 'Weak follow-through', 'No post-entry expansion'],
+                ['не покупать после вертикального pump', 'ждать pullback ниже', 'входить только после нового bullish displacement'],
+            )
+
+        if bearish and demand and pos <= 0.50:
+            dd = str(demand_ctx.get('desc') or 'demand/support')
+            vis = ['LONG открыт возле demand/support, но структура уже была bearish', 'buyer zone не дала сильной реакции', 'bullish reclaim перед входом не подтвердился']
+            if dtf:
+                vis.append('demand/support рядом на TF: ' + '/'.join(dtf))
+            if stf:
+                vis.append('overhead resistance/supply также видна на TF: ' + '/'.join(stf))
+            return out(
+                'Long into bearish structure / failed demand',
+                f'LONG был открыт от {dd}, но рынок уже показывал bearish structure. Demand не дал reclaim и сильной реакции, поэтому покупатель не удержал зону и цена ушла к SL.',
+                ['demand reaction была слабой', 'bullish reclaim не появился'],
+                ['buyer zone не удержала цену', 'после входа не было displacement вверх', 'продавец продолжил sell-side движение', 'TP1 не был поставлен под угрозу'],
+                vis,
+                ['Failed demand reaction', 'Long against bearish structure', 'No bullish displacement', 'Weak follow-through'],
+                ['не брать LONG от demand без bullish reclaim', 'ждать закрытие выше локальной resistance/supply', 'фильтровать LONG против bearish 5m/15m структуры'],
+            )
+
         if level_back:
-            return out('BOS/retest level was reclaimed back', 'Пробой/ретест выглядел валидно, но после входа цена быстро вернулась обратно под уровень. Acceptance выше уровня не было, поэтому continuation не подтвердился.', ['BOS/retest level был потерян после входа','acceptance выше уровня не было'], ['цена вернулась обратно за уровень входа','покупатель не смог удержать retest','после входа не было clean bullish displacement','SL был достигнут до TP1'], ['retest не закрепился по правильную сторону уровня','после входа цена быстро вернулась в старый range','breakout не получил follow-through','TP1 не был нормально поставлен под угрозу'], ['Level reclaimed back','No retest acceptance','Weak confirmation','Continuation missing'], ['ждать 1–2 закрытия выше BOS-level','требовать retest acceptance','не входить на первом слабом confirm'])
+            return out(
+                'BOS/retest level was reclaimed back',
+                'Пробой/ретест выглядел валидно, но после входа цена быстро вернулась обратно под уровень. Acceptance выше уровня не было, поэтому continuation не подтвердился.',
+                ['BOS/retest level был потерян после входа', 'acceptance выше уровня не было'],
+                ['цена вернулась обратно за уровень входа', 'покупатель не смог удержать retest', 'после входа не было clean bullish displacement', 'SL был достигнут до TP1'],
+                ['retest не закрепился по правильную сторону уровня', 'после входа цена быстро вернулась в старый range', 'breakout не получил follow-through', 'TP1 не был нормально поставлен под угрозу'],
+                ['Level reclaimed back', 'No retest acceptance', 'Weak confirmation', 'Continuation missing'],
+                ['ждать 1–2 закрытия выше BOS-level', 'требовать retest acceptance', 'не входить на первом слабом confirm'],
+            )
+
         if pos >= 0.58 or no_space:
-            return out('Poor LONG location near range high', 'LONG был открыт в верхней части локального range, где upside был ограничен. Вход находился слишком близко к противоположной ликвидности, поэтому RR location был слабый.', ['вход в верхней части range','чистого пространства до TP1 было мало'], ['покупатель не смог расширить движение вверх','цена быстро потеряла momentum','TP1 не был нормально поставлен под угрозу','SL был достигнут после отката'], [f'позиция входа в range: {pos:.2f}','вход был ближе к range high, чем к discount','upside до TP1 был ограничен','после входа не было clean bullish displacement'], ['Poor RR location','Weak upside continuation','No clean space to TP1','Buy-side exhaustion'], ['не брать LONG в premium без сильного reclaim','ждать discount re-entry','поднимать фильтр clean space до TP1'])
+            return out(
+                'Poor LONG location near range high',
+                'LONG был открыт в верхней части локального range, где upside был ограничен. Вход находился слишком близко к local high / resistance, поэтому RR location был слабый.',
+                ['вход в верхней части range', 'чистого пространства до TP1 было мало'],
+                ['покупатель не смог расширить движение вверх', 'цена быстро потеряла momentum', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после отката'],
+                [f'позиция входа в range: {pos:.2f}', 'вход был ближе к range high, чем к discount', 'upside до TP1 был ограничен', 'после входа не было clean bullish displacement'],
+                ['Poor RR location', 'Weak upside continuation', 'No clean space to TP1', 'Buy-side exhaustion'],
+                ['не брать LONG в premium без сильного reclaim', 'ждать discount re-entry', 'поднимать фильтр clean space до TP1'],
+            )
+
     else:
-        dz = analysis.get('nearest_demand_zone') if isinstance(analysis.get('nearest_demand_zone'), dict) else {}
-        sz = analysis.get('nearest_supply_zone') if isinstance(analysis.get('nearest_supply_zone'), dict) else {}
+        demand_ctx = _loss_card_real_zone_context(analysis, 'demand')
+        supply_ctx = _loss_card_real_zone_context(analysis, 'supply')
         dtf, stf = tfs('demand_near_tfs'), tfs('supply_near_tfs')
-        demand = bool(dz or dtf or b('underlying_bullish_fvg') or b('entry_into_demand') or b('demand_zone_blocks_tp1'))
-        supply = bool(sz or stf or b('short_supply_near_entry'))
+        demand = bool(demand_ctx.get('has_zone') or b('underlying_bullish_fvg') or b('entry_into_demand') or b('short_above_weak_low') or b('demand_zone_blocks_tp1'))
+        supply = bool(supply_ctx.get('has_zone') or b('short_supply_near_entry'))
         bullish = bool(b('bullish_context_before_entry') or b('short_against_bullish_structure') or level_back or l6 >= 0.12 or l12 >= 0.22 or l24 >= 0.35 or premove >= 0.45 or str(analysis.get('structure_5m') or '').lower().startswith('bullish'))
         late_dump = bool(l6 <= -0.12 or l12 <= -0.22 or l24 <= -0.35 or premove <= -0.45 or b('late_entry_after_exhausted_move'))
-        zd = zdesc(dz, 'green FVG / buyer zone')
-        if demand and no_space:
-            vis = [f'TP1/путь к TP1 упирался в {zd}','между входом и целью не было чистого downside-space','green FVG / buyer imbalance стоял под входом','после входа не появился clean bearish displacement']
-            if dtf: vis.append('demand подтверждён на TF: ' + '/'.join(dtf))
-            if cs > 0: vis.append(f'чистое пространство до TP1: около {cs:.2f}%')
-            return out('TP1 blocked by underlying demand', 'SHORT был открыт над green FVG / demand. TP1 находился прямо в зоне покупателя или сразу за ней, поэтому sell-side путь был заблокирован buyer imbalance.', ['TP1 был заблокирован underlying demand','downside expansion отсутствовал'], ['цена не смогла продавить buyer imbalance','продавец не получил continuation до TP1','buyer zone удержала движение снизу','SL был достигнут после bounce/затухания'], vis, ['TP1 blocked by demand','No clean space to TP1','Underlying bullish FVG','Weak downside continuation'], ['не брать SHORT, если TP1 внутри/сразу за green FVG','требовать clean space до TP1','ждать вход выше от premium / supply'])
+        zd = str(demand_ctx.get('desc') or 'local low / support')
+        zw = str(demand_ctx.get('fvg_word') or 'local low / support')
+
+        if demand and no_space and bool(demand_ctx.get('has_zone')):
+            vis = [f'TP1/путь к TP1 упирался в {zd}', 'между входом и целью не было чистого downside-space', f'{zw} был на пути SHORT', 'после входа не появился clean bearish displacement']
+            if dtf:
+                vis.append('underlying zone подтверждена на TF: ' + '/'.join(dtf))
+            if cs > 0:
+                vis.append(f'чистое пространство до TP1: около {cs:.2f}%')
+            return out(
+                'TP1 blocked by underlying demand/support',
+                f'SHORT был открыт над {zw}. TP1 находился прямо в зоне покупателя/поддержки или сразу за ней, поэтому sell-side путь был заблокирован.',
+                ['TP1 был заблокирован underlying zone', 'downside expansion отсутствовал'],
+                ['цена не смогла продавить buyer reaction zone', 'продавец не получил continuation до TP1', 'нижняя зона удержала движение', 'SL был достигнут после bounce/затухания'],
+                vis,
+                ['TP1 blocked by demand/support', 'No clean space to TP1', 'Weak downside continuation'],
+                ['не брать SHORT, если TP1 внутри/сразу за demand/support', 'требовать clean space до TP1', 'ждать вход выше от premium / supply'],
+            )
+
         if demand and (bullish or level_back):
-            vis = ['перед входом структура была bullish или bearish reclaim не закрепился',f'SHORT открыт над {zd}','green FVG / buyer zone оставалась активной под входом','после входа не было закрепления ниже demand','это не clean breakdown continuation, а SHORT против buyer pressure']
-            if dtf: vis.append('underlying demand виден на TF: ' + '/'.join(dtf))
-            return out('Short over demand after failed bearish reclaim', 'SHORT был открыт над активной зоной покупателя после слабого/неподтверждённого bearish reclaim. Цена не смогла закрепиться ниже demand, поэтому sell-side continuation не появился и движение развернулось к SL.', ['bearish reclaim ниже demand отсутствовал','downside expansion отсутствовал'], ['цена не смогла закрепиться ниже зоны входа','buyer zone удержала движение снизу','продавец не получил displacement вниз','buy-side движение продолжилось к SL'], vis, ['Failed bearish reclaim','Underlying bullish FVG','Short over demand','Weak downside continuation'], ['ждать закрытие ниже demand перед SHORT','не брать SHORT над green FVG при bullish 5m/15m','требовать bearish displacement после retest'])
-        if late_dump and (demand or pos <= 0.42):
-            return out('Late SHORT after exhausted dump', 'SHORT был открыт после уже отработанного импульса вниз. Цена пришла в discount/низ range, поэтому продавец уже был уставший, а продолжение до TP1 быстро затухло.', ['вход после уже отработанного dump','fresh bearish displacement после входа отсутствовал'], ['первичный импульс вниз уже был израсходован до входа','после входа продавец не смог дать новую волну','цена перешла в bounce против позиции','SL был достигнут без нормального движения к TP1'], ['перед входом уже прошёл sell-side impulse','SHORT открыт поздно в нижней части локального range',f'снизу находился {zd}','после входа не было нового fresh bearish displacement',f'позиция входа в range: {pos:.2f}'], ['Late entry','Sell-side exhaustion','Weak follow-through','No post-entry expansion'], ['не шортить после вертикального dump','ждать pullback выше','входить только после нового bearish displacement'])
+            vis = ['перед входом структура была bullish или bearish reclaim не закрепился', f'SHORT открыт над {zd}', 'после входа не было закрепления ниже demand/support', 'это не clean breakdown continuation, а SHORT против buyer pressure']
+            if dtf:
+                vis.append('underlying zone видна на TF: ' + '/'.join(dtf))
+            return out(
+                'Short over demand/support after failed bearish reclaim',
+                f'SHORT был открыт над активной зоной покупателя/поддержки после слабого или неподтверждённого bearish reclaim. Цена не смогла закрепиться ниже {zw}, поэтому sell-side continuation не появился и движение развернулось к SL.',
+                ['bearish reclaim ниже demand/support отсутствовал', 'downside expansion отсутствовал'],
+                ['цена не смогла закрепиться ниже зоны входа', 'buyer reaction zone удержала движение снизу', 'продавец не получил displacement вниз', 'buy-side движение продолжилось к SL'],
+                vis,
+                ['Failed bearish reclaim', 'Underlying demand/support', 'Short over demand', 'Weak downside continuation'],
+                ['ждать закрытие ниже demand/support перед SHORT', 'не брать SHORT над demand при bullish 5m/15m', 'требовать bearish displacement после retest'],
+            )
+
+        if late_dump and (demand or pos <= 0.55 or no_space):
+            vis = ['перед входом уже прошёл sell-side impulse', 'SHORT открыт поздно в нижней части локального range', 'после входа не было нового fresh bearish displacement', f'позиция входа в range: {pos:.2f}']
+            if demand:
+                vis.insert(2, f'снизу находился {zd}')
+            return out(
+                'Late SHORT after exhausted dump near low',
+                'SHORT был открыт после уже отработанного импульса вниз. Цена пришла в discount/низ range, поэтому продавец уже был уставший, а продолжение до TP1 быстро затухло.',
+                ['вход после уже отработанного dump', 'fresh bearish displacement после входа отсутствовал'],
+                ['первичный импульс вниз уже был израсходован до входа', 'после входа продавец не смог дать новую волну', 'цена перешла в bounce против позиции', 'SL был достигнут без нормального движения к TP1'],
+                vis,
+                ['Late entry', 'Sell-side exhaustion', 'Weak follow-through', 'No post-entry expansion'],
+                ['не шортить после вертикального dump', 'ждать pullback выше', 'входить только после нового bearish displacement'],
+            )
+
         if bullish and supply and pos >= 0.55:
-            vis = ['SHORT открыт возле supply, но структура уже была bullish','seller zone не дала сильной реакции','снизу оставался buyer pressure / bullish FVG','bearish reclaim перед входом не подтвердился']
-            if stf: vis.append('supply/FVG рядом на TF: ' + '/'.join(stf))
-            if dtf: vis.append('underlying demand также виден на TF: ' + '/'.join(dtf))
-            return out('Short into bullish structure / failed supply', 'SHORT был открыт от supply, но рынок уже показывал bullish structure. Supply не дала bearish reclaim и сильной реакции, поэтому продавец не удержал зону и цена ушла к SL.', ['supply reaction была слабой','bearish reclaim не появился'], ['seller zone не удержала цену','после входа не было displacement вниз','покупатель продолжил buy-side движение','TP1 не был поставлен под угрозу'], vis, ['Failed supply reaction','Short against bullish structure','No bearish displacement','Weak follow-through'], ['не брать SHORT от supply без bearish reclaim','ждать закрытие ниже локальной demand/FVG','фильтровать SHORT против bullish 5m/15m структуры'])
+            sd = str(supply_ctx.get('desc') or 'supply/resistance')
+            vis = ['SHORT открыт возле supply/resistance, но структура уже была bullish', 'seller zone не дала сильной реакции', 'bearish reclaim перед входом не подтвердился']
+            if stf:
+                vis.append('supply/resistance рядом на TF: ' + '/'.join(stf))
+            if dtf:
+                vis.append('underlying demand/support также видна на TF: ' + '/'.join(dtf))
+            return out(
+                'Short into bullish structure / failed supply',
+                f'SHORT был открыт от {sd}, но рынок уже показывал bullish structure. Supply не дала bearish reclaim и сильной реакции, поэтому продавец не удержал зону и цена ушла к SL.',
+                ['supply reaction была слабой', 'bearish reclaim не появился'],
+                ['seller zone не удержала цену', 'после входа не было displacement вниз', 'покупатель продолжил buy-side движение', 'TP1 не был поставлен под угрозу'],
+                vis,
+                ['Failed supply reaction', 'Short against bullish structure', 'No bearish displacement', 'Weak follow-through'],
+                ['не брать SHORT от supply без bearish reclaim', 'ждать закрытие ниже локальной demand/support', 'фильтровать SHORT против bullish 5m/15m структуры'],
+            )
+
         if level_back:
-            return out('BOS/retest level was reclaimed back', 'Пробой/ретест выглядел валидно, но после входа цена быстро вернулась обратно выше уровня. Acceptance ниже уровня не было, поэтому bearish continuation не подтвердился.', ['BOS/retest level был потерян после входа','acceptance ниже уровня не было'], ['цена вернулась обратно за уровень входа','продавец не смог удержать retest','после входа не было clean bearish displacement','SL был достигнут до TP1'], ['retest не закрепился по правильную сторону уровня','после входа цена быстро вернулась в старый range','breakdown не получил follow-through','TP1 не был нормально поставлен под угрозу'], ['Level reclaimed back','No retest acceptance','Weak confirmation','Continuation missing'], ['ждать 1–2 закрытия ниже BOS-level','требовать retest acceptance','не входить на первом слабом confirm'])
-        if pos <= 0.42 or no_space:
-            return out('Poor SHORT location near range low', 'SHORT был открыт в нижней части локального range, где downside был ограничен. Вход находился слишком близко к противоположной ликвидности, поэтому RR location был слабый.', ['вход в нижней части range','чистого пространства до TP1 было мало'], ['продавец не смог расширить движение вниз','цена быстро потеряла sell-side momentum','TP1 не был нормально поставлен под угрозу','SL был достигнут после bounce'], [f'позиция входа в range: {pos:.2f}','вход был ближе к range low, чем к premium','downside до TP1 был ограничен','после входа не было clean bearish displacement'], ['Poor RR location','Weak downside continuation','No clean space to TP1','Sell-side exhaustion'], ['не брать SHORT в discount без сильного reclaim','ждать premium re-entry','поднимать фильтр clean space до TP1'])
+            return out(
+                'BOS/retest level was reclaimed back',
+                'Пробой/ретест выглядел валидно, но после входа цена быстро вернулась обратно выше уровня. Acceptance ниже уровня не было, поэтому bearish continuation не подтвердился.',
+                ['BOS/retest level был потерян после входа', 'acceptance ниже уровня не было'],
+                ['цена вернулась обратно за уровень входа', 'продавец не смог удержать retest', 'после входа не было clean bearish displacement', 'SL был достигнут до TP1'],
+                ['retest не закрепился по правильную сторону уровня', 'после входа цена быстро вернулась в старый range', 'breakdown не получил follow-through', 'TP1 не был нормально поставлен под угрозу'],
+                ['Level reclaimed back', 'No retest acceptance', 'Weak confirmation', 'Continuation missing'],
+                ['ждать 1–2 закрытия ниже BOS-level', 'требовать retest acceptance', 'не входить на первом слабом confirm'],
+            )
+
+        if pos <= 0.45 or no_space:
+            return out(
+                'Poor SHORT location near range low',
+                'SHORT был открыт в нижней части локального range, где downside был ограничен. Вход находился слишком близко к local low / support, поэтому RR location был слабый.',
+                ['вход в нижней части range', 'чистого пространства до TP1 было мало'],
+                ['продавец не смог расширить движение вниз', 'цена быстро потеряла sell-side momentum', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после bounce'],
+                [f'позиция входа в range: {pos:.2f}', 'вход был ближе к range low, чем к premium', 'downside до TP1 был ограничен', 'после входа не было clean bearish displacement'],
+                ['Poor RR location', 'Weak downside continuation', 'No clean space to TP1', 'Sell-side exhaustion'],
+                ['не брать SHORT в discount без сильного reclaim', 'ждать premium re-entry', 'поднимать фильтр clean space до TP1'],
+            )
+
     if weak:
         direction = 'bullish' if side_u == 'LONG' else 'bearish'
-        return out(f'Weak {direction} confirm / no retest acceptance', 'Сигнал имел формальное подтверждение, но по свечам после входа не было acceptance и displacement. Цена не показала продолжение в сторону сделки и быстро ушла к SL.', [f'первый ход в сторону сделки: около {f("first_push_pct"):.2f}%' if f('first_push_pct') else 'первый ход в сторону сделки был слабый', f'движение против входа в первых свечах: около {f("against_move_first3_pct"):.2f}%' if f('against_move_first3_pct') else 'движение против входа появилось быстро'], ['после входа не появилось сильное continuation-движение','confirm-candle не получила follow-through','TP1 не был поставлен под угрозу','SL был достигнут без нормального excursion'], ['нет clean displacement после входа','нет acceptance по правильную сторону retest/уровня','свечи после входа показывают слабое продолжение','цена быстро перешла против направления сделки'], ['Weak confirm','No retest acceptance','No post-entry expansion','TP1 was never threatened'], ['требовать сильнее confirm-candle','ждать follow-through после retest','не входить без acceptance по уровню'])
+        return out(
+            f'Weak {direction} confirm / no retest acceptance',
+            'Сигнал имел формальное подтверждение, но по свечам после входа не было acceptance и displacement. Цена не показала продолжение в сторону сделки и быстро ушла к SL.',
+            [f'первый ход в сторону сделки: около {f("first_push_pct"):.2f}%' if f('first_push_pct') else 'первый ход в сторону сделки был слабый', f'движение против входа в первых свечах: около {f("against_move_first3_pct"):.2f}%' if f('against_move_first3_pct') else 'движение против входа появилось быстро'],
+            ['после входа не появилось сильное continuation-движение', 'confirm-candle не получила follow-through', 'TP1 не был поставлен под угрозу', 'SL был достигнут без нормального excursion'],
+            ['нет clean displacement после входа', 'нет acceptance по правильную сторону retest/уровня', 'свечи после входа показывают слабое продолжение', 'цена быстро перешла против направления сделки'],
+            ['Weak confirm', 'No retest acceptance', 'No post-entry expansion', 'TP1 was never threatened'],
+            ['требовать сильнее confirm-candle', 'ждать follow-through после retest', 'не входить без acceptance по уровню'],
+        )
     return {}
+
 
 def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool = False) -> dict:
     """Build human forensic sections exactly for Telegram LOSS report card."""
@@ -6837,11 +7133,11 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         ]
         visible_lines = [
             'SHORT открыт после bullish BOS / CHoCH вверх',
-            'снизу несколько bullish FVG и demand зон',
+            'снизу buyer pressure / demand/support zones',
             'структура уже делала higher low / higher high',
             'вход был рядом с supply, но без подтверждения bearish reclaim',
             'цена стояла под buyer pressure',
-            'supply/FVG сверху был уже слабый',
+            'supply/resistance сверху был уже слабый',
             'RR выглядел формально нормальный, но location был плохой',
             'это не чистый SHORT, а попытка шортить слабую supply против bullish-структуры',
         ]
@@ -6888,11 +7184,11 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         ]
         visible_lines = [
             'LONG открыт после bearish BOS / CHoCH вниз',
-            'сверху несколько bearish FVG и supply зон',
+            'сверху seller pressure / resistance zones',
             'структура уже делала lower high / lower low',
             'вход был слишком низко, но без подтверждения reclaim',
             'цена стояла под sell pressure',
-            'demand/FVG снизу был уже слабый',
+            'demand/support снизу был уже слабый',
             'RR выглядел формально нормальный, но location был плохой',
             'это не чистый breakout, а попытка купить слабый demand против структуры',
         ]
