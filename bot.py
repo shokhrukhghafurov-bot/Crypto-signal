@@ -6864,6 +6864,69 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
 
 
 
+def _loss_card_measured_candle_lines(analysis: dict, *, side: str = '') -> list[str]:
+    """Only factual, measured lines from close_analysis_json; no invented template text."""
+    if not isinstance(analysis, dict):
+        return []
+    out: list[str] = []
+    def _f(key: str):
+        try:
+            val = analysis.get(key)
+            if val in (None, ''):
+                return None
+            fv = float(str(val).replace(',', '.'))
+            return fv if math.isfinite(fv) else None
+        except Exception:
+            return None
+    def _i(key: str):
+        try:
+            val = analysis.get(key)
+            if val in (None, ''):
+                return None
+            iv = int(float(str(val).replace(',', '.')))
+            return iv if iv >= 0 else None
+        except Exception:
+            return None
+    for key, label in (
+        ('first_push_pct', 'первый ход в сторону сделки'),
+        ('against_move_first3_pct', 'движение против входа в первых свечах'),
+        ('mfe_pct', 'MFE до закрытия'),
+        ('mae_pct', 'MAE против сделки'),
+        ('clean_space_to_tp1_pct', 'чистое расстояние до TP1'),
+    ):
+        v = _f(key)
+        if v is not None and (key != 'clean_space_to_tp1_pct' or v > 0):
+            out.append(f'{label}: {v:.2f}%')
+    ep, ep_known = _loss_card_entry_position(analysis)
+    if ep_known:
+        tf = str(analysis.get('entry_position_tf') or '').strip()
+        out.append(f'позиция входа в локальном range: {ep:.2f}' + (f' ({tf})' if tf else ''))
+    bars_sl = _i('bars_to_sl') or _i('bars_to_failure')
+    if bars_sl is not None and bars_sl > 0:
+        out.append(f'до SL/закрытия против сделки: {bars_sl} свеч.')
+    checked = analysis.get('tf_checked') or analysis.get('loss_diag_timeframes') or []
+    if isinstance(checked, (list, tuple)) and checked:
+        out.append('проверены TF: ' + '/'.join([str(x) for x in checked if str(x).strip()]))
+    return list(dict.fromkeys([x for x in out if str(x).strip()]))
+
+
+def _loss_card_has_specific_chart_evidence(analysis: dict) -> bool:
+    """True only when analysis contains actual candle/snapshot evidence, not default 0.50/template."""
+    if not isinstance(analysis, dict):
+        return False
+    for k in (
+        'nearest_supply_zone', 'nearest_demand_zone', 'supply_near_tfs', 'demand_near_tfs',
+        'entry_snapshot_present', 'tf_checked', 'loss_diag_timeframes',
+        'first_push_pct', 'against_move_first3_pct', 'mfe_pct', 'mae_pct',
+        'bars_to_sl', 'bars_to_failure', 'clean_space_to_tp1_pct',
+        'local_pre_move_6_pct', 'local_pre_move_12_pct', 'local_pre_move_24_pct', 'pre_entry_move_pct',
+    ):
+        if _loss_card_has_real_value(analysis, k):
+            return True
+    _, pos_known = _loss_card_entry_position(analysis)
+    return bool(pos_known)
+
+
 def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: str, code: str = '', duration_min: int | None = None) -> dict:
     """Replace generic/template LOSS reason with candle/snapshot based chart facts.
 
@@ -6938,6 +7001,35 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
 
     pos, pos_known = _loss_card_entry_position(analysis)
     l6, l12, l24, premove = f('local_pre_move_6_pct'), f('local_pre_move_12_pct'), f('local_pre_move_24_pct'), f('pre_entry_move_pct')
+
+    entry_f = 0.0
+    sl_f = 0.0
+    tp1_f = 0.0
+    try:
+        entry_f = float(str(src.get('entry') or analysis.get('entry') or 0).replace(',', '.'))
+        sl_f = float(str(src.get('sl') or analysis.get('sl') or 0).replace(',', '.'))
+        tp1_f = float(str(src.get('tp1') or analysis.get('tp1') or 0).replace(',', '.'))
+    except Exception:
+        entry_f = sl_f = tp1_f = 0.0
+    risk_pct = 0.0
+    target_pct = 0.0
+    rr_to_tp1 = 0.0
+    try:
+        if entry_f > 0 and sl_f > 0:
+            risk_pct = abs(entry_f - sl_f) / entry_f * 100.0
+        if entry_f > 0 and tp1_f > 0:
+            if side_u == 'LONG' and tp1_f > entry_f:
+                target_pct = (tp1_f - entry_f) / entry_f * 100.0
+            elif side_u == 'SHORT' and tp1_f < entry_f:
+                target_pct = (entry_f - tp1_f) / entry_f * 100.0
+        if risk_pct > 0 and target_pct > 0:
+            rr_to_tp1 = target_pct / risk_pct
+            analysis['rr_to_tp1_measured'] = round(rr_to_tp1, 3)
+            analysis['risk_to_sl_pct'] = round(risk_pct, 3)
+            analysis['tp1_distance_pct'] = round(target_pct, 3)
+    except Exception:
+        pass
+
     after_tp1 = bool(b('after_tp1') or b('tp1_hit') or b('loss_after_tp1'))
     no_tp = (not after_tp1) and (not bool(analysis.get('tp1_threatened')))
     no_space = bool(0 < cs <= max(_loss_card_location_tp_space_pct(), 0.70) and no_tp)
@@ -6954,6 +7046,62 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
         late_pump = bool(l6 >= 0.12 or l12 >= 0.22 or l24 >= 0.35 or premove >= 0.45 or b('late_entry_after_exhausted_move'))
         zd = str(supply_ctx.get('desc') or 'local high / resistance')
         zw = str(supply_ctx.get('fvg_word') or 'local high / resistance')
+
+        if no_tp and rr_to_tp1 >= 3.5 and side_u == 'LONG':
+            measured = _loss_card_measured_candle_lines(analysis, side=side_u)
+            analysis_bits = []
+            if duration_min is not None and duration_min > 0:
+                analysis_bits.append(f'вход → SL: {duration_min} мин')
+            if target_pct > 0:
+                analysis_bits.append(f'TP1 был далеко от входа: около {target_pct:.2f}%')
+            if risk_pct > 0:
+                analysis_bits.append(f'риск до SL: около {risk_pct:.2f}%')
+            analysis_bits.append(f'RR до TP1: около 1:{rr_to_tp1:.2f}')
+            analysis_bits.extend(measured[:3])
+            vis = [
+                'TP1 был поставлен слишком далеко для текущего локального движения',
+                'до TP1 нужно было пройти несколько зон/предыдущих highs, а не один чистый impulse',
+                'после входа не появился fresh bullish displacement',
+            ]
+            if supply:
+                vis.insert(1, f'над входом была {zd}')
+                if stf:
+                    vis.append('overhead zone видна на TF: ' + '/'.join(stf))
+            return out(
+                'TP1 too far / no realistic clean path',
+                'LONG имел формальный RR, но цель TP1 была слишком далеко от входа относительно SL и текущей структуры. Покупателю нужно было пробить overhead resistance/supply и дать сильный fresh impulse, но после входа такого движения не появилось.',
+                analysis_bits,
+                ['покупатель не смог развить движение к дальней цели', 'цена остановилась под верхней зоной/предыдущим high', 'после входа momentum быстро ослаб', 'SL был достигнут без реального давления на TP1'],
+                vis,
+                ['Unrealistic TP1 distance', 'Overhead supply/resistance', 'No fresh displacement', 'Weak follow-through'],
+                ['не ставить TP1 далеко за несколько зон без сильного HTF impulse', 'для RR выше 1:3 требовать clean path на 15m/30m', 'не брать LONG под overhead supply без закрепления выше неё'],
+            )
+
+        if supply and no_tp and not no_space:
+            measured = _loss_card_measured_candle_lines(analysis, side=side_u)
+            analysis_bits = []
+            if duration_min is not None and duration_min > 0:
+                analysis_bits.append(f'вход → SL: {duration_min} мин')
+            analysis_bits.extend(measured[:4])
+            if cs > 0:
+                analysis_bits.append(f'расстояние до TP1: около {cs:.2f}%')
+            vis = [
+                f'LONG был открыт под {zd}',
+                'цена не закрепилась выше этой зоны/сопротивления',
+                'после входа не было clean bullish displacement',
+                'движение превратилось в rejection/откат против LONG',
+            ]
+            if stf:
+                vis.append('overhead zone видна на TF: ' + '/'.join(stf))
+            return out(
+                'Long under overhead supply/resistance',
+                f'LONG был открыт под активной зоной продавца/сопротивления. Цена не смогла принять/закрепиться выше {zw}, поэтому buy-side continuation не появился и сделка закрылась по SL.',
+                analysis_bits or ['покупатель не дал continuation после входа'],
+                ['покупатель не смог пройти верхнюю зону', 'reclaim выше resistance/supply не закрепился', 'продавец вернул цену обратно под вход', 'SL был достигнут после rejection'],
+                vis,
+                ['Overhead supply/resistance', 'No acceptance above level', 'Weak upside continuation', 'No post-entry displacement'],
+                ['не брать LONG прямо под overhead supply', 'ждать закрытие выше зоны и retest сверху', 'требовать clean space до TP1'],
+            )
 
         if supply and no_space and bool(supply_ctx.get('has_zone')):
             vis = [f'TP1/путь к TP1 упирался в {zd}', 'между входом и целью не было чистого пространства', f'{zw} был на пути LONG', 'после входа не появился clean bullish displacement']
@@ -7029,11 +7177,12 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
                 ['ждать 1–2 закрытия выше BOS-level', 'требовать retest acceptance', 'не входить на первом слабом confirm'],
             )
 
-        if (pos_known and pos >= 0.58) or (no_space and (supply or late_pump or bearish)):
+        if pos_known and pos >= 0.58:
+            measured = _loss_card_measured_candle_lines(analysis, side=side_u)
             return out(
                 'Poor LONG location near range high',
                 'LONG был открыт в верхней части локального range, где upside был ограничен. Вход находился слишком близко к local high / resistance, поэтому RR location был слабый.',
-                ['вход в верхней части range', 'чистого пространства до TP1 было мало'],
+                (measured or ['вход в верхней части range', 'чистого пространства до TP1 было мало']),
                 ['покупатель не смог расширить движение вверх', 'цена быстро потеряла momentum', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после отката'],
                 ([f'позиция входа в range: {pos:.2f}'] if pos_known else []) + ['вход был ближе к range high, чем к discount', 'upside до TP1 был ограничен', 'после входа не было clean bullish displacement'],
                 ['Poor RR location', 'Weak upside continuation', 'No clean space to TP1', 'Buy-side exhaustion'],
@@ -7125,11 +7274,12 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
                 ['ждать 1–2 закрытия ниже BOS-level', 'требовать retest acceptance', 'не входить на первом слабом confirm'],
             )
 
-        if (pos_known and pos <= 0.45) or (no_space and (demand or late_dump or bullish)):
+        if pos_known and pos <= 0.45:
+            measured = _loss_card_measured_candle_lines(analysis, side=side_u)
             return out(
                 'Poor SHORT location near range low',
                 'SHORT был открыт в нижней части локального range, где downside был ограничен. Вход находился слишком близко к local low / support, поэтому RR location был слабый.',
-                ['вход в нижней части range', 'чистого пространства до TP1 было мало'],
+                (measured or ['вход в нижней части range', 'чистого пространства до TP1 было мало']),
                 ['продавец не смог расширить движение вниз', 'цена быстро потеряла sell-side momentum', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после bounce'],
                 ([f'позиция входа в range: {pos:.2f}'] if pos_known else []) + ['вход был ближе к range low, чем к premium', 'downside до TP1 был ограничен', 'после входа не было clean bearish displacement'],
                 ['Poor RR location', 'Weak downside continuation', 'No clean space to TP1', 'Sell-side exhaustion'],
@@ -7137,15 +7287,34 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
             )
 
     if weak:
-        direction = 'bullish' if side_u == 'LONG' else 'bearish'
+        direction = 'buy-side' if side_u == 'LONG' else 'sell-side'
+        measured = _loss_card_measured_candle_lines(analysis, side=side_u)
+        analysis_bits = []
+        if duration_min is not None and duration_min > 0:
+            analysis_bits.append(f'вход → SL: {duration_min} мин')
+        analysis_bits.extend(measured[:5])
+        if target_pct > 0 and risk_pct > 0:
+            analysis_bits.append(f'TP1 distance: около {target_pct:.2f}% при риске {risk_pct:.2f}%')
+        if not analysis_bits:
+            analysis_bits = ['snapshot/close_analysis не содержит подтверждённой зоны, поэтому FVG/support/resistance не придумываются']
+        visible = []
+        if pos_known:
+            visible.append(f'позиция входа в локальном range: {pos:.2f}')
+        if target_pct > 0 and risk_pct > 0 and rr_to_tp1 > 0:
+            visible.append(f'формальный RR до TP1: около 1:{rr_to_tp1:.2f}')
+        visible.extend([
+            f'после входа не появился fresh {direction} displacement',
+            'цена не дала continuation в сторону сделки',
+            'TP1 не был реально атакован до SL',
+        ])
         return out(
-            f'Weak {direction} confirm / no retest acceptance',
-            'Сигнал имел формальное подтверждение, но по свечам после входа не было acceptance и displacement. Цена не показала продолжение в сторону сделки и быстро ушла к SL.',
-            [f'первый ход в сторону сделки: около {f("first_push_pct"):.2f}%' if f('first_push_pct') else 'первый ход в сторону сделки был слабый', f'движение против входа в первых свечах: около {f("against_move_first3_pct"):.2f}%' if f('against_move_first3_pct') else 'движение против входа появилось быстро'],
-            ['после входа не появилось сильное continuation-движение', 'confirm-candle не получила follow-through', 'TP1 не был поставлен под угрозу', 'SL был достигнут без нормального excursion'],
-            ['нет clean displacement после входа', 'нет acceptance по правильную сторону retest/уровня', 'свечи после входа показывают слабое продолжение', 'цена быстро перешла против направления сделки'],
-            ['Weak confirm', 'No retest acceptance', 'No post-entry expansion', 'TP1 was never threatened'],
-            ['требовать сильнее confirm-candle', 'ждать follow-through после retest', 'не входить без acceptance по уровню'],
+            f'No measured {direction} continuation after entry',
+            'Карточка не ставит готовый шаблон причины. По сохранённым свечам видно только фактический провал продолжения: после входа движение в сторону сделки было слабым, обратное движение оказалось сильнее, и TP1 не был реально атакован до SL.',
+            analysis_bits,
+            ['continuation после входа не появился', 'движение против позиции стало сильнее движения к TP1', 'SL был достигнут до нормального excursion', 'подтверждённой зоны/FVG для отдельной причины в snapshot нет'],
+            visible,
+            ['No measured continuation', 'Weak post-entry flow', 'TP1 was not attacked', 'No confirmed zone context'],
+            ['не использовать эту сделку как “реальную зону” без snapshot-доказательства', 'сохранять entry_snapshot_json по 5m/15m/30m/1h', 'для входа требовать fresh displacement после retest'],
         )
     return {}
 
@@ -7202,6 +7371,9 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
     if after_tp1:
         after_payload = _loss_card_after_tp1_context_payload(src, analysis, side=side, duration_min=duration_min)
         if after_payload:
+            extra_measured = _loss_card_measured_candle_lines(analysis, side=side)
+            if extra_measured:
+                after_payload['analysis_lines'] = list(dict.fromkeys(list(after_payload.get('analysis_lines') or []) + extra_measured))
             return after_payload
 
     analysis_lines = []
@@ -7385,7 +7557,7 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         improve_labels = [str(x) for x in list(loss_diag.get('improve_labels') or []) if str(x).strip()]
 
     contextual_payload = _loss_card_non_template_context_payload(src, analysis, side=side, code=code, duration_min=duration_min)
-    if contextual_payload:
+    if contextual_payload and _loss_card_has_specific_chart_evidence(analysis):
         primary_text = str(contextual_payload.get('primary_text') or primary_text).strip()
         scenario_text = str(contextual_payload.get('scenario_text') or scenario_text).strip()
         analysis_lines = [str(x) for x in list(contextual_payload.get('analysis_lines') or []) if str(x).strip()]
@@ -7403,19 +7575,18 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
     if not visible_lines:
         visible_lines = [str(x) for x in list(loss_diag.get('chart_visible_lines') or []) if str(x).strip()]
     if not visible_lines:
-        if side == 'SHORT':
+        measured_visible = _loss_card_measured_candle_lines(analysis, side=side)
+        if measured_visible:
+            visible_lines = measured_visible
+        elif side == 'SHORT':
             visible_lines = [
                 'SHORT не получил clean sell-side continuation после входа',
-                'цена быстро вернулась против направления сделки',
-                'bearish displacement после входа не появился',
-                'TP1 не был нормально поставлен под угрозу',
+                'snapshot-контекста зон нет, поэтому карточка не придумывает FVG/support',
             ]
         else:
             visible_lines = [
                 'LONG не получил clean buy-side continuation после входа',
-                'цена быстро вернулась против направления сделки',
-                'bullish displacement после входа не появился',
-                'TP1 не был нормально поставлен под угрозу',
+                'snapshot-контекста зон нет, поэтому карточка не придумывает FVG/resistance',
             ]
     if not secondary_labels:
         secondary_labels = [str(x) for x in list(loss_diag.get('secondary_reason_labels') or []) if str(x).strip()]
