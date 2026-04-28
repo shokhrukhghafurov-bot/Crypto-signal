@@ -52,6 +52,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import datetime as dt
 
 import asyncpg
+import aiohttp
 from aiohttp import web, ClientSession
 
 import db_store
@@ -198,7 +199,9 @@ def _spawn_smart_manager_task() -> asyncio.Task | None:
 
 
 def _start_signal_outcome_task() -> asyncio.Task | None:
-    if not _env_on("SIGNAL_OUTCOME_LOOP_ENABLED", _cost_default("1", "0")):
+    # The outcome loop is the source of closed-signal report cards. Keep it ON
+    # by default even in COST_SAVER_MODE; disable only with SIGNAL_OUTCOME_LOOP_ENABLED=0.
+    if not _env_on("SIGNAL_OUTCOME_LOOP_ENABLED", "1"):
         logger.info("SIGNAL_OUTCOME_LOOP_ENABLED=0 -> signal_outcome_loop disabled")
         return None
     existing = TASKS.get("signal-outcome")
@@ -212,19 +215,41 @@ def _start_signal_outcome_task() -> asyncio.Task | None:
 
 
 async def _restart_task_later(name: str, reason: str = "") -> None:
-    if name != "smart-manager":
+    """Restart critical background tasks after an unexpected stop.
+
+    Railway redeploys / transient exceptions can kill a background task while the
+    bot process keeps serving HTTP. The closed-position report depends on
+    signal-outcome + report-retry, so both are restarted automatically.
+    """
+    restartable = {"smart-manager", "signal-outcome", "closed-signal-report-retry", "daily-signal-report"}
+    if name not in restartable:
         return
     if name in _TASK_RESTART_INFLIGHT:
         return
     _TASK_RESTART_INFLIGHT.add(name)
     try:
-        delay = max(1.0, float(os.getenv("SMART_MANAGER_RESTART_DELAY_SEC", "5") or 5))
+        delay_default = "5"
+        delay = max(1.0, float(os.getenv(f"{name.upper().replace('-', '_')}_RESTART_DELAY_SEC", delay_default) or delay_default))
         await asyncio.sleep(delay)
         cur = TASKS.get(name)
         if cur and not cur.done():
             return
-        logger.warning("[smart-manager] restarting task after %s", reason or "unexpected stop")
-        _spawn_smart_manager_task()
+
+        logger.warning("[task] restarting name=%s after %s", name, reason or "unexpected stop")
+        if name == "smart-manager":
+            _spawn_smart_manager_task()
+        elif name == "signal-outcome":
+            _start_signal_outcome_task()
+        elif name == "closed-signal-report-retry":
+            if _env_on("CLOSED_SIGNAL_REPORT_RETRY_ENABLED", "1"):
+                task = asyncio.create_task(closed_signal_report_retry_loop(), name="closed-signal-report-retry")
+                TASKS["closed-signal-report-retry"] = task
+                _attach_task_monitor("closed-signal-report-retry", task)
+        elif name == "daily-signal-report":
+            if _env_on("DAILY_SIGNAL_REPORT_ENABLED", "1"):
+                task = asyncio.create_task(daily_signal_report_loop(), name="daily-signal-report")
+                TASKS["daily-signal-report"] = task
+                _attach_task_monitor("daily-signal-report", task)
     finally:
         _TASK_RESTART_INFLIGHT.discard(name)
 
@@ -239,6 +264,8 @@ async def _health_status_loop() -> None:
             at_global = TASKS.get("autotrade-global")
             smart = TASKS.get("smart-manager")
             at_mgr = TASKS.get("autotrade-manager")
+            sig_outcome = TASKS.get("signal-outcome")
+            report_retry = TASKS.get("closed-signal-report-retry")
             def age(key: str) -> float | None:
                 t = float(HEALTH.get(key, 0.0) or 0.0)
                 return None if t <= 0 else max(0.0, now - t)
@@ -260,12 +287,16 @@ async def _health_status_loop() -> None:
             at_ok = age("autotrade-global_last_ok")
             at_mgr_ok = age("autotrade-manager_last_ok")
             sm_ok = age("smart-manager_last_ok")
+            sig_ok = age("signal-outcome_last_ok")
+            rep_ok = age("closed-signal-report-retry_last_ok")
 
             msg = (
                 "[health] "
                 f"{'✅' if status(at_global, at_ok)=='RUNNING' else '❌'} autotrade=\"{status(at_global, at_ok)}\" last_ok={fmt_age(at_ok)} "
                 f"| {'✅' if status(at_mgr, at_mgr_ok)=='RUNNING' else '❌'} autotrade_mgr=\"{status(at_mgr, at_mgr_ok)}\" last_ok={fmt_age(at_mgr_ok)} "
-                f"| {'✅' if status(smart, sm_ok)=='RUNNING' else '❌'} smart_manager=\"{status(smart, sm_ok)}\" last_ok={fmt_age(sm_ok)}"
+                f"| {'✅' if status(smart, sm_ok)=='RUNNING' else '❌'} smart_manager=\"{status(smart, sm_ok)}\" last_ok={fmt_age(sm_ok)} "
+                f"| {'✅' if status(sig_outcome, sig_ok)=='RUNNING' else '❌'} signal_outcome=\"{status(sig_outcome, sig_ok)}\" last_ok={fmt_age(sig_ok)} "
+                f"| {'✅' if status(report_retry, rep_ok)=='RUNNING' else '❌'} report_retry=\"{status(report_retry, rep_ok)}\" last_ok={fmt_age(rep_ok)}"
             )
             logger.info(msg)
         except Exception:
@@ -280,10 +311,10 @@ def _attach_task_monitor(name: str, task: asyncio.Task) -> None:
             try:
                 if t.cancelled():
                     logger.warning("[task] cancelled name=%s", name)
-                    if name == "smart-manager":
-                        _health_mark_err("smart-manager", "task_cancelled")
+                    if name in ("smart-manager", "signal-outcome", "closed-signal-report-retry", "daily-signal-report"):
+                        _health_mark_err(name, "task_cancelled")
                         try:
-                            asyncio.create_task(_restart_task_later("smart-manager", reason="cancelled"))
+                            asyncio.create_task(_restart_task_later(name, reason="cancelled"))
                         except Exception:
                             pass
                     return
@@ -305,6 +336,12 @@ def _attach_task_monitor(name: str, task: asyncio.Task) -> None:
                         pass
                 else:
                     logger.error("[task] crashed name=%s exc=%s", name, repr(exc), exc_info=exc)
+                    if name in ("signal-outcome", "closed-signal-report-retry", "daily-signal-report"):
+                        _health_mark_err(name, f"task_crash:{type(exc).__name__}")
+                        try:
+                            asyncio.create_task(_restart_task_later(name, reason=f"exception:{type(exc).__name__}"))
+                        except Exception:
+                            pass
             except Exception:
                 return
 
@@ -584,33 +621,109 @@ if PAYMENT_BOT_TOKEN:
 else:
     logger.warning("[payment-alert] PAYMENT_BOT_TOKEN is not set; payment alerts will NOT be sent")
 
-# Dedicated report bot for closed signal cards.
-# It sends formatted outcome cards (WIN / LOSS / BE / CLOSED) to configured chats.
+# Dedicated report sender for closed signal cards.
+# It sends formatted outcome cards (WIN / LOSS / BE / CLOSED) only after a
+# signal track reaches a final state.
 REPORT_BOT_TOKEN = (os.getenv("REPORT_BOT_TOKEN") or "").strip()
-_REPORT_BOT_CHAT_IDS_RAW = (os.getenv("REPORT_BOT_CHAT_IDS") or "").strip()
-REPORT_BOT_CHAT_IDS: list[int] = []
-if _REPORT_BOT_CHAT_IDS_RAW:
-    for _part in _REPORT_BOT_CHAT_IDS_RAW.split(","):
-        _part = _part.strip()
-        if not _part:
+
+
+def _parse_report_chat_ids() -> list[int]:
+    """Read report chat ids from all supported env aliases.
+
+    Old deployments used different variable names. Supporting aliases prevents
+    the report card from silently disappearing when only REPORT_CHAT_ID or
+    SIGNAL_REPORT_CHAT_ID is set in Railway.
+    """
+    names = (
+        "REPORT_BOT_CHAT_IDS",
+        "REPORT_BOT_CHAT_ID",
+        "REPORT_CHAT_IDS",
+        "REPORT_CHAT_ID",
+        "SIGNAL_REPORT_CHAT_IDS",
+        "SIGNAL_REPORT_CHAT_ID",
+        "CLOSED_SIGNAL_REPORT_CHAT_IDS",
+        "CLOSED_SIGNAL_REPORT_CHAT_ID",
+    )
+    out: list[int] = []
+    seen: set[int] = set()
+    for name in names:
+        raw = (os.getenv(name) or "").strip()
+        if not raw:
             continue
-        try:
-            REPORT_BOT_CHAT_IDS.append(int(_part))
-        except Exception:
-            logger.warning("[report-bot] invalid chat id in REPORT_BOT_CHAT_IDS: %r", _part)
-if not REPORT_BOT_CHAT_IDS and ADMIN_IDS:
-    REPORT_BOT_CHAT_IDS = list(ADMIN_IDS)
+        for part in raw.replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                cid = int(part)
+            except Exception:
+                logger.warning("[report-bot] invalid chat id in %s: %r", name, part)
+                continue
+            if cid not in seen:
+                out.append(cid)
+                seen.add(cid)
+    if not out and ADMIN_IDS:
+        # Safe default: send reports to admins when a separate report chat is not configured.
+        for cid in ADMIN_IDS:
+            try:
+                cid_i = int(cid)
+            except Exception:
+                continue
+            if cid_i not in seen:
+                out.append(cid_i)
+                seen.add(cid_i)
+    return out
+
+
+REPORT_BOT_CHAT_IDS: list[int] = _parse_report_chat_ids()
+REPORT_BOT_USE_MAIN_FALLBACK = _env_on("REPORT_BOT_USE_MAIN_FALLBACK", "1")
 
 _report_bot: Bot | None = None
+_report_bot_is_main = False
 if REPORT_BOT_TOKEN:
     try:
         _report_bot = Bot(REPORT_BOT_TOKEN)
-        logger.info("[report-bot] enabled chats=%s", REPORT_BOT_CHAT_IDS)
+        logger.info("[report-bot] dedicated bot enabled chats=%s", REPORT_BOT_CHAT_IDS)
     except Exception:
         _report_bot = None
-        logger.exception("[report-bot] failed to initialize")
+        logger.exception("[report-bot] failed to initialize dedicated report bot")
+        if REPORT_BOT_USE_MAIN_FALLBACK:
+            _report_bot = bot
+            _report_bot_is_main = True
+            logger.warning("[report-bot] fallback to main BOT_TOKEN after dedicated report bot init failed chats=%s", REPORT_BOT_CHAT_IDS)
+elif REPORT_BOT_USE_MAIN_FALLBACK:
+    # Do not drop cards just because a separate REPORT_BOT_TOKEN was not set.
+    # The main bot can send the same closed-position report to REPORT_* chats/admins.
+    _report_bot = bot
+    _report_bot_is_main = True
+    logger.warning("[report-bot] REPORT_BOT_TOKEN is not set; using main BOT_TOKEN for closed signal report cards chats=%s", REPORT_BOT_CHAT_IDS)
 else:
-    logger.info("[report-bot] REPORT_BOT_TOKEN is not set; closed signal report cards are disabled")
+    logger.info("[report-bot] REPORT_BOT_TOKEN is not set and fallback disabled; closed signal report cards are disabled")
+
+
+async def _report_send_message(chat_id: int, text: str) -> None:
+    """Send a report message with main-bot fallback.
+
+    Some deployments set REPORT_BOT_TOKEN to a wrong bot or forget to add that
+    bot to the report chat. In that case, do not lose the final card if the main
+    bot can send it.
+    """
+    if _report_bot is None:
+        raise RuntimeError("report bot is not configured")
+    try:
+        await _report_bot.send_message(int(chat_id), text)
+        return
+    except TelegramRetryAfter:
+        raise
+    except Exception as primary_err:
+        if REPORT_BOT_USE_MAIN_FALLBACK and not _report_bot_is_main:
+            try:
+                await bot.send_message(int(chat_id), text)
+                logger.warning("[report-bot] sent via main BOT_TOKEN fallback chat_id=%s after primary error=%s", chat_id, type(primary_err).__name__)
+                return
+            except Exception as fallback_err:
+                raise fallback_err from primary_err
+        raise
 
 
 logger.info("[mid][dbg] methods can_add_mid_pending=%s add_mid_pending=%s mid_pending_trigger_loop=%s scanner_loop_mid=%s",
@@ -7591,36 +7704,129 @@ def _loss_diag_close_analysis_is_thin(value) -> bool:
     return not any(a.get(k) not in (None, '', [], {}, False) for k in location_keys)
 
 
-async def _send_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pct: float, closed_at: dt.datetime | None = None) -> None:
-    if _report_bot is None:
-        return
-    chat_ids = [int(x) for x in (REPORT_BOT_CHAT_IDS or []) if int(x)]
-    if not chat_ids:
-        return
+async def _send_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pct: float, closed_at: dt.datetime | None = None) -> bool:
+    """Send one final outcome card and persist the send status.
+
+    Returns True when at least one configured report chat received the card.
+    The function is intentionally called only from final close paths and from
+    the retry loop for final rows, so TP1/intermediate updates are not sent here.
+    """
+    row_for_report = dict(t or {})
     try:
-        _row_for_report = dict(t or {})
+        signal_id = int(row_for_report.get('signal_id') or 0)
+    except Exception:
+        signal_id = 0
+
+    if _report_bot is None:
+        logger.warning("[report-bot] not configured; final report skipped signal_id=%s status=%s", signal_id, final_status)
+        return False
+    try:
+        chat_ids = [int(x) for x in (REPORT_BOT_CHAT_IDS or []) if int(x)]
+    except Exception:
+        chat_ids = []
+    if not chat_ids:
+        logger.warning("[report-bot] no REPORT_* chat ids/admin ids configured; final report skipped signal_id=%s status=%s", signal_id, final_status)
+        return False
+
+    try:
         # Safety net: every LOSS card must have candle-based close_analysis_json.
         # Some manual/legacy close paths can call this sender without precomputed
         # analysis, which previously produced the same generic Breakout trap text.
-        if str(final_status or '').upper().strip() == 'LOSS' and _loss_diag_close_analysis_is_thin(_row_for_report.get('close_analysis_json')):
+        if str(final_status or '').upper().strip() == 'LOSS' and _loss_diag_close_analysis_is_thin(row_for_report.get('close_analysis_json')):
             try:
-                _row_for_report['close_analysis_json'] = await _loss_diag_build_close_analysis(_row_for_report, closed_at=closed_at)
+                row_for_report['close_analysis_json'] = await _loss_diag_build_close_analysis(row_for_report, closed_at=closed_at)
             except Exception:
                 logger.exception('[report-bot] close analysis backfill failed')
-        text = _build_closed_signal_report_card(_row_for_report, final_status=str(final_status or "CLOSED"), pnl_total_pct=float(pnl_total_pct or 0.0), closed_at=closed_at)
-    except Exception:
+        text = _build_closed_signal_report_card(row_for_report, final_status=str(final_status or "CLOSED"), pnl_total_pct=float(pnl_total_pct or 0.0), closed_at=closed_at)
+    except Exception as e:
         logger.exception("[report-bot] failed to build closed signal card")
-        return
+        if signal_id > 0:
+            try:
+                await db_store.mark_signal_report_failed(signal_id=signal_id, error=f"build_failed: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+        return False
+
+    sent_any = False
+    errors: list[str] = []
     for chat_id in chat_ids:
         try:
-            await _report_bot.send_message(int(chat_id), text)
-        except TelegramForbiddenError:
-            logger.warning("[report-bot] bot is blocked by chat_id=%s", chat_id)
+            await _report_send_message(int(chat_id), text)
+            sent_any = True
+        except TelegramRetryAfter as e:
+            try:
+                wait_s = float(getattr(e, 'retry_after', 1) or 1) + 0.5
+                await asyncio.sleep(min(wait_s, 10.0))
+                await _report_send_message(int(chat_id), text)
+                sent_any = True
+            except Exception as e2:
+                msg = f"retry_after_failed chat_id={chat_id}: {type(e2).__name__}: {e2}"
+                errors.append(msg)
+                logger.warning("[report-bot] %s", msg)
+        except TelegramForbiddenError as e:
+            msg = f"bot blocked/no access chat_id={chat_id}: {e}"
+            errors.append(msg)
+            logger.warning("[report-bot] %s", msg)
         except TelegramBadRequest as e:
-            logger.warning("[report-bot] send failed chat_id=%s err=%s", chat_id, e)
-        except Exception:
+            msg = f"bad request chat_id={chat_id}: {e}"
+            errors.append(msg)
+            logger.warning("[report-bot] %s", msg)
+        except Exception as e:
+            msg = f"send failed chat_id={chat_id}: {type(e).__name__}: {e}"
+            errors.append(msg)
             logger.exception("[report-bot] send failed chat_id=%s", chat_id)
 
+    if signal_id > 0:
+        try:
+            if sent_any:
+                await db_store.mark_signal_report_sent(signal_id=signal_id)
+            else:
+                await db_store.mark_signal_report_failed(signal_id=signal_id, error="; ".join(errors) or "send_failed")
+        except Exception:
+            logger.exception("[report-bot] failed to persist report send state signal_id=%s", signal_id)
+
+    if sent_any:
+        logger.info("[report-bot] final card sent signal_id=%s status=%s chats=%s", signal_id, final_status, chat_ids)
+    return bool(sent_any)
+
+
+_CLOSED_SIGNAL_REPORT_RETRY_ENABLED = _env_on("CLOSED_SIGNAL_REPORT_RETRY_ENABLED", "1")
+_CLOSED_SIGNAL_REPORT_RETRY_SEC = max(15, int(float(os.getenv("CLOSED_SIGNAL_REPORT_RETRY_SEC", "60") or 60)))
+_CLOSED_SIGNAL_REPORT_RETRY_LIMIT = max(1, int(float(os.getenv("CLOSED_SIGNAL_REPORT_RETRY_LIMIT", "10") or 10)))
+# Retry a full week by default. If Railway slept or REPORT_* env was fixed later,
+# rows from the same day must still be delivered, not silently ignored after 6h.
+_CLOSED_SIGNAL_REPORT_RECENT_MIN = max(0, int(float(os.getenv("CLOSED_SIGNAL_REPORT_RECENT_MIN", "10080") or 10080)))
+
+
+async def closed_signal_report_retry_loop() -> None:
+    """Retry final report cards that closed but were not delivered.
+
+    This fixes missed cards after Railway restart, temporary Telegram errors, or
+    a late REPORT_BOT_TOKEN / REPORT_CHAT_ID configuration. It only reads rows
+    already in final states, so it never sends reports for open positions.
+    """
+    if not _CLOSED_SIGNAL_REPORT_RETRY_ENABLED:
+        logger.info("[report-bot] retry loop disabled")
+        return
+    logger.info("[report-bot] retry loop started interval=%ss limit=%s recent_min=%s", _CLOSED_SIGNAL_REPORT_RETRY_SEC, _CLOSED_SIGNAL_REPORT_RETRY_LIMIT, _CLOSED_SIGNAL_REPORT_RECENT_MIN)
+    while True:
+        try:
+            _health_mark_ok("closed-signal-report-retry")
+            if _report_bot is None or not REPORT_BOT_CHAT_IDS:
+                await asyncio.sleep(_CLOSED_SIGNAL_REPORT_RETRY_SEC)
+                continue
+            rows = await db_store.list_unsent_signal_reports(limit=_CLOSED_SIGNAL_REPORT_RETRY_LIMIT, recent_minutes=_CLOSED_SIGNAL_REPORT_RECENT_MIN)
+            for row in rows or []:
+                st = str(row.get('status') or 'CLOSED').upper().strip() or 'CLOSED'
+                pnl = float(row.get('pnl_total_pct') or 0.0)
+                closed_dt = row.get('closed_at')
+                if isinstance(closed_dt, str):
+                    closed_dt = _parse_iso_dt(closed_dt)
+                await _send_closed_signal_report_card(dict(row), final_status=st, pnl_total_pct=pnl, closed_at=closed_dt)
+                await asyncio.sleep(0.25)
+        except Exception:
+            logger.exception("[report-bot] retry loop error")
+        await asyncio.sleep(_CLOSED_SIGNAL_REPORT_RETRY_SEC)
 
 
 # ---------------- Daily report bot summary ----------------
@@ -8639,7 +8845,7 @@ async def _report_bot_send_long(chat_id: int, text: str) -> None:
     if not (payload or '').strip():
         return
     try:
-        await _report_bot.send_message(int(chat_id), payload)
+        await _report_send_message(int(chat_id), payload)
         return
     except TelegramBadRequest as e:
         msg = str(e).lower()
@@ -8658,7 +8864,7 @@ async def _report_bot_send_long(chat_id: int, text: str) -> None:
         parts.append(cur)
 
     for part in parts or [payload[:max_len]]:
-        await _report_bot.send_message(int(chat_id), part)
+        await _report_send_message(int(chat_id), part)
 
 
 async def _send_daily_signal_report(*, since: dt.datetime, until: dt.datetime) -> None:
@@ -11498,6 +11704,13 @@ _SIG_SL_BREACH_SINCE: dict[int, float] = {}  # signal_id -> unix ts when SL was 
 
 _SIG_MAX_TRACK_AGE_HOURS = float(os.getenv("SIG_MAX_TRACK_AGE_HOURS", "72") or 72)  # auto-close stale signals
 
+# Candle catch-up closes signals that hit TP/SL while Railway/app was sleeping or
+# while REST price polling temporarily missed the exact touch.
+_SIG_CANDLE_CATCHUP_ENABLED = _env_on("SIGNAL_CANDLE_CATCHUP_ENABLED", "1")
+_SIG_CANDLE_CATCHUP_INTERVAL_SEC = max(60, int(float(os.getenv("SIGNAL_CANDLE_CATCHUP_INTERVAL_SEC", "300") or 300)))
+_SIG_CANDLE_CATCHUP_MAX_CANDLES = max(50, min(1500, int(float(os.getenv("SIGNAL_CANDLE_CATCHUP_MAX_CANDLES", "1000") or 1000))))
+_SIG_CANDLE_CATCHUP_LAST: dict[int, float] = {}
+
 _SIG_TP1_PARTIAL_PCT = float(os.getenv("SIG_TP1_PARTIAL_CLOSE_PCT", "50") or 50)  # model partial close at TP1
 _SIG_BE_ARM_PCT_TO_TP2 = max(0.0, min(1.0, float(os.getenv('BE_ARM_PCT_TO_TP2', '0') or 0.0)))
 
@@ -11662,6 +11875,36 @@ async def _fetch_mexc_price(symbol: str) -> float:
         return 0.0
 
 
+async def _fetch_mexc_futures_price(symbol: str) -> float:
+    """Public last price from MEXC USDT-M futures/contract."""
+    raw = str(symbol or "").upper().replace("/", "").replace("-", "").replace(":", "").strip()
+    if not raw:
+        return 0.0
+    contract = raw
+    if raw.endswith("USDT") and len(raw) > 4:
+        contract = f"{raw[:-4]}_USDT"
+    url = "https://contract.mexc.com/api/v1/contract/ticker"
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url, params={"symbol": contract}) as r:
+                data = await r.json(content_type=None)
+        payload = (data or {}).get("data") if isinstance(data, dict) else None
+        if isinstance(payload, list) and payload:
+            payload = payload[0]
+        if isinstance(payload, dict):
+            for key in ("lastPrice", "last_price", "fairPrice", "indexPrice"):
+                try:
+                    px = float(payload.get(key) or 0.0)
+                    if px > 0:
+                        return px
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return 0.0
+
+
 async def _fetch_gateio_price(symbol: str) -> float:
     """Public last price from Gate.io spot."""
     pair = _gate_pair(symbol)
@@ -11675,6 +11918,31 @@ async def _fetch_gateio_price(symbol: str) -> float:
                 data = await r.json(content_type=None)
                 if isinstance(data, list) and data:
                     return float((data[0] or {}).get("last") or 0.0)
+    except Exception:
+        pass
+    return 0.0
+
+
+async def _fetch_gateio_futures_price(symbol: str) -> float:
+    """Public last price from Gate.io USDT futures."""
+    contract = _gate_pair(symbol)
+    if not contract:
+        return 0.0
+    url = "https://api.gateio.ws/api/v4/futures/usdt/tickers"
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url, params={"contract": contract}) as r:
+                data = await r.json(content_type=None)
+        if isinstance(data, list) and data:
+            item = data[0] or {}
+            for key in ("last", "mark_price", "index_price"):
+                try:
+                    px = float(item.get(key) or 0.0)
+                    if px > 0:
+                        return px
+                except Exception:
+                    continue
     except Exception:
         pass
     return 0.0
@@ -11748,8 +12016,9 @@ async def _fetch_signal_price(symbol: str, *, market: str) -> tuple[float, str]:
                 only = [s for v,s in srcs if v > 0][0]
                 return float(vals[0]), only
 
-        # Fallback order-based
-        order = _parse_price_order("SIG_PRICE_ORDER_FUTURES", "binance,bybit,okx")
+        # Fallback order-based. Include MEXC/Gate futures so newer alts still close
+        # and report even when Binance/Bybit/OKX do not list the contract.
+        order = _parse_price_order("SIG_PRICE_ORDER_FUTURES", "binance,bybit,okx,mexc,gateio")
         for src in order:
             if src == "binance":
                 px = await _safe(_fetch_binance_price(sym, futures=True))
@@ -11757,6 +12026,10 @@ async def _fetch_signal_price(symbol: str, *, market: str) -> tuple[float, str]:
                 px = await _safe(_fetch_bybit_price(sym, futures=True))
             elif src == "okx":
                 px = await _safe(_fetch_okx_price(sym, futures=True))
+            elif src == "mexc":
+                px = await _safe(_fetch_mexc_futures_price(sym))
+            elif src in ("gate", "gateio"):
+                px = await _safe(_fetch_gateio_futures_price(sym))
             else:
                 px = 0.0
             if px > 0:
@@ -11781,6 +12054,423 @@ async def _fetch_signal_price(symbol: str, *, market: str) -> tuple[float, str]:
         if px > 0:
             return px, src
     return 0.0, ""
+
+
+def _sig_tf_minutes(tf: str) -> int:
+    s = str(tf or "1m").strip().lower()
+    m = re.match(r"^(\d+)\s*m$", s)
+    if m:
+        return max(1, int(m.group(1)))
+    m = re.match(r"^(\d+)\s*h$", s)
+    if m:
+        return max(1, int(m.group(1)) * 60)
+    return 1
+
+
+def _sig_candle_dt(value) -> dt.datetime | None:
+    try:
+        if value is None:
+            return None
+        if isinstance(value, dt.datetime):
+            return value if value.tzinfo else value.replace(tzinfo=dt.timezone.utc)
+        if isinstance(value, (int, float)):
+            x = float(value)
+            if x > 10_000_000_000:  # ms
+                x = x / 1000.0
+            return dt.datetime.fromtimestamp(x, tz=dt.timezone.utc)
+        s = str(value).strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        # numeric string timestamp
+        if re.fullmatch(r"\d+(?:\.\d+)?", s):
+            return _sig_candle_dt(float(s))
+        d = dt.datetime.fromisoformat(s)
+        return d if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def _sig_candle_contract(symbol: str, sep: str = "_") -> str:
+    raw = str(symbol or "").upper().replace("/", "").replace("-", "").replace("_", "").replace(":", "").strip()
+    if raw.endswith("USDT") and len(raw) > 4:
+        return f"{raw[:-4]}{sep}USDT"
+    return raw
+
+
+def _sig_norm_candle_rows(rows: list[dict] | None) -> list[dict]:
+    out: list[dict] = []
+    for r in rows or []:
+        try:
+            o = float(r.get("open"))
+            h = float(r.get("high"))
+            l = float(r.get("low"))
+            c = float(r.get("close"))
+            if not (h > 0 and l > 0 and o > 0 and c > 0):
+                continue
+            ts = _sig_candle_dt(r.get("ts") or r.get("time") or r.get("timestamp"))
+            out.append({"ts": ts, "open": o, "high": h, "low": l, "close": c})
+        except Exception:
+            continue
+    out.sort(key=lambda x: x.get("ts") or dt.datetime.min.replace(tzinfo=dt.timezone.utc))
+    return out
+
+
+async def _fetch_binance_candles_simple(symbol: str, *, futures: bool, interval: str, limit: int) -> list[dict]:
+    sym = re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())
+    if not sym:
+        return []
+    url = "https://fapi.binance.com/fapi/v1/klines" if futures else "https://api.binance.com/api/v3/klines"
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(url, params={"symbol": sym, "interval": interval, "limit": int(limit)}) as r:
+                data = await r.json(content_type=None)
+        rows = []
+        for it in data or []:
+            rows.append({"ts": it[0], "open": it[1], "high": it[2], "low": it[3], "close": it[4]})
+        return _sig_norm_candle_rows(rows)
+    except Exception:
+        return []
+
+
+async def _fetch_bybit_candles_simple(symbol: str, *, futures: bool, interval: str, limit: int) -> list[dict]:
+    sym = re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())
+    if not sym:
+        return []
+    iv = str(_sig_tf_minutes(interval))
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get(
+                "https://api.bybit.com/v5/market/kline",
+                params={"category": ("linear" if futures else "spot"), "symbol": sym, "interval": iv, "limit": int(limit)},
+            ) as r:
+                data = await r.json(content_type=None)
+        arr = (((data or {}).get("result") or {}).get("list") or [])
+        rows = []
+        for it in arr or []:
+            # [start, open, high, low, close, volume, turnover]
+            if not isinstance(it, (list, tuple)) or len(it) < 5:
+                continue
+            rows.append({"ts": it[0], "open": it[1], "high": it[2], "low": it[3], "close": it[4]})
+        return _sig_norm_candle_rows(rows)
+    except Exception:
+        return []
+
+
+async def _fetch_okx_candles_simple(symbol: str, *, futures: bool, interval: str, limit: int) -> list[dict]:
+    inst = _okx_inst(symbol, futures=futures)
+    if not inst:
+        return []
+    bar = f"{_sig_tf_minutes(interval)}m"
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            async with s.get("https://www.okx.com/api/v5/market/candles", params={"instId": inst, "bar": bar, "limit": int(limit)}) as r:
+                data = await r.json(content_type=None)
+        arr = (data or {}).get("data") or []
+        rows = []
+        for it in arr or []:
+            # [ts, o, h, l, c, ...]
+            if not isinstance(it, (list, tuple)) or len(it) < 5:
+                continue
+            rows.append({"ts": it[0], "open": it[1], "high": it[2], "low": it[3], "close": it[4]})
+        return _sig_norm_candle_rows(rows)
+    except Exception:
+        return []
+
+
+async def _fetch_mexc_candles_simple(symbol: str, *, futures: bool, interval: str, limit: int) -> list[dict]:
+    raw = re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())
+    if not raw:
+        return []
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            if futures:
+                contract = _sig_candle_contract(raw, "_")
+                iv_map = {1: "Min1", 3: "Min3", 5: "Min5", 15: "Min15", 30: "Min30", 60: "Min60"}
+                iv = iv_map.get(_sig_tf_minutes(interval), "Min1")
+                async with s.get(f"https://contract.mexc.com/api/v1/contract/kline/{contract}", params={"interval": iv, "limit": int(limit)}) as r:
+                    data = await r.json(content_type=None)
+                payload = (data or {}).get("data") if isinstance(data, dict) else None
+                rows = []
+                if isinstance(payload, dict):
+                    times = payload.get("time") or []
+                    opens = payload.get("open") or []
+                    highs = payload.get("high") or []
+                    lows = payload.get("low") or []
+                    closes = payload.get("close") or []
+                    for i in range(min(len(times), len(opens), len(highs), len(lows), len(closes))):
+                        rows.append({"ts": times[i], "open": opens[i], "high": highs[i], "low": lows[i], "close": closes[i]})
+                return _sig_norm_candle_rows(rows)
+            else:
+                async with s.get("https://api.mexc.com/api/v3/klines", params={"symbol": raw, "interval": interval, "limit": int(limit)}) as r:
+                    data = await r.json(content_type=None)
+                rows = []
+                for it in data or []:
+                    if not isinstance(it, (list, tuple)) or len(it) < 5:
+                        continue
+                    rows.append({"ts": it[0], "open": it[1], "high": it[2], "low": it[3], "close": it[4]})
+                return _sig_norm_candle_rows(rows)
+    except Exception:
+        return []
+
+
+async def _fetch_gateio_candles_simple(symbol: str, *, futures: bool, interval: str, limit: int) -> list[dict]:
+    contract = _sig_candle_contract(symbol, "_")
+    if not contract:
+        return []
+    iv = f"{_sig_tf_minutes(interval)}m"
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as s:
+            if futures:
+                url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks"
+                params = {"contract": contract, "interval": iv, "limit": int(limit)}
+            else:
+                url = "https://api.gateio.ws/api/v4/spot/candlesticks"
+                params = {"currency_pair": contract, "interval": iv, "limit": int(limit)}
+            async with s.get(url, params=params) as r:
+                data = await r.json(content_type=None)
+        rows = []
+        for it in data or []:
+            if isinstance(it, dict):
+                rows.append({
+                    "ts": it.get("t") or it.get("time"),
+                    "open": it.get("o") or it.get("open"),
+                    "high": it.get("h") or it.get("high"),
+                    "low": it.get("l") or it.get("low"),
+                    "close": it.get("c") or it.get("close"),
+                })
+            elif isinstance(it, (list, tuple)) and len(it) >= 6:
+                # Gate spot: [time, volume, close, high, low, open]
+                rows.append({"ts": it[0], "open": it[5], "high": it[3], "low": it[4], "close": it[2]})
+        return _sig_norm_candle_rows(rows)
+    except Exception:
+        return []
+
+
+async def _fetch_signal_candles(symbol: str, *, market: str, interval: str, limit: int) -> tuple[list[dict], str]:
+    """Best-effort OHLC candles for outcome catch-up."""
+    sym = str(symbol or "").upper().strip()
+    m = (market or "SPOT").upper().strip()
+    futures = m == "FUTURES"
+    limit = max(10, min(int(limit or 200), _SIG_CANDLE_CATCHUP_MAX_CANDLES))
+
+    # Try the backend candle router first because it already has caching/health.
+    try:
+        if hasattr(backend, "load_candles"):
+            df = await backend.load_candles(sym, interval, m, limit=limit)  # type: ignore[attr-defined]
+            if df is not None and not getattr(df, "empty", True):
+                rows = []
+                for idx, r in df.tail(limit).iterrows():
+                    ts_val = None
+                    try:
+                        ts_val = r.get("time") or r.get("timestamp") or r.get("ts") or r.get("open_time")
+                    except Exception:
+                        ts_val = None
+                    if ts_val is None:
+                        try:
+                            if isinstance(idx, (dt.datetime, pd.Timestamp)):
+                                ts_val = idx
+                        except Exception:
+                            ts_val = None
+                    rows.append({
+                        "ts": ts_val,
+                        "open": r.get("open"),
+                        "high": r.get("high"),
+                        "low": r.get("low"),
+                        "close": r.get("close"),
+                    })
+                out = _sig_norm_candle_rows(rows)
+                # For catch-up we need timestamps; otherwise candles from before
+                # the signal could falsely close a new signal.
+                if out and any(c.get("ts") for c in out):
+                    return out, "backend.load_candles"
+    except Exception:
+        pass
+
+    default_order = "binance,bybit,okx,mexc,gateio" if futures else "binance,bybit,okx,mexc,gateio"
+    order = _parse_price_order("SIG_CANDLE_ORDER_FUTURES" if futures else "SIG_CANDLE_ORDER_SPOT", default_order)
+    for src in order:
+        if src == "binance":
+            rows = await _fetch_binance_candles_simple(sym, futures=futures, interval=interval, limit=limit)
+        elif src == "bybit":
+            rows = await _fetch_bybit_candles_simple(sym, futures=futures, interval=interval, limit=limit)
+        elif src == "okx":
+            rows = await _fetch_okx_candles_simple(sym, futures=futures, interval=interval, limit=limit)
+        elif src == "mexc":
+            rows = await _fetch_mexc_candles_simple(sym, futures=futures, interval=interval, limit=limit)
+        elif src in ("gate", "gateio"):
+            rows = await _fetch_gateio_candles_simple(sym, futures=futures, interval=interval, limit=limit)
+        else:
+            rows = []
+        if rows:
+            return rows, src
+    return [], ""
+
+
+def _sig_catchup_params(opened_at_dt: dt.datetime | None, now: dt.datetime) -> tuple[str, int]:
+    try:
+        age_min = int(max(1, (now - opened_at_dt).total_seconds() / 60.0)) if opened_at_dt else 240
+    except Exception:
+        age_min = 240
+    if age_min <= (_SIG_CANDLE_CATCHUP_MAX_CANDLES - 10):
+        return "1m", min(_SIG_CANDLE_CATCHUP_MAX_CANDLES, max(50, age_min + 10))
+    return "5m", min(_SIG_CANDLE_CATCHUP_MAX_CANDLES, max(50, int(age_min / 5) + 10))
+
+
+def _sig_candle_touched(side: str, candle: dict, level: float, *, kind: str) -> bool:
+    if level <= 0:
+        return False
+    high = float(candle.get("high") or 0.0)
+    low = float(candle.get("low") or 0.0)
+    side_u = str(side or "LONG").upper()
+    if kind == "tp":
+        return high >= level if side_u == "LONG" else low <= level
+    # sl/be are adverse direction
+    return low <= level if side_u == "LONG" else high >= level
+
+
+def _sig_choose_same_candle(side: str, candle: dict, favorable_level: float, adverse_level: float) -> str:
+    """Return 'fav' or 'adv' for a candle that touched both.
+
+    Exact intrabar order is unknown from OHLC. Use close direction; if unclear,
+    use the level closer to open. This only affects catch-up after missed polling.
+    """
+    try:
+        o = float(candle.get("open") or 0.0)
+        c = float(candle.get("close") or 0.0)
+        side_u = str(side or "LONG").upper()
+        if side_u == "LONG":
+            if c >= o:
+                return "fav"
+            if c < o:
+                return "adv"
+            return "fav" if abs(favorable_level - o) <= abs(o - adverse_level) else "adv"
+        else:
+            if c <= o:
+                return "fav"
+            if c > o:
+                return "adv"
+            return "fav" if abs(o - favorable_level) <= abs(adverse_level - o) else "adv"
+    except Exception:
+        return "adv"
+
+
+async def _detect_signal_candle_catchup(t: dict, *, now: dt.datetime) -> dict | None:
+    """Detect a missed final outcome using OHLC since the signal opened.
+
+    This is a fallback for sleeps/restarts/API misses. It only returns final
+    statuses or TP1 arming; reports still go out only after final close.
+    """
+    if not _SIG_CANDLE_CATCHUP_ENABLED:
+        return None
+    try:
+        sid = int(t.get("signal_id") or 0)
+    except Exception:
+        sid = 0
+    if sid <= 0:
+        return None
+
+    now_mono = time.monotonic()
+    last = float(_SIG_CANDLE_CATCHUP_LAST.get(sid, 0.0) or 0.0)
+    if last and (now_mono - last) < _SIG_CANDLE_CATCHUP_INTERVAL_SEC:
+        return None
+    _SIG_CANDLE_CATCHUP_LAST[sid] = now_mono
+
+    market = str(t.get("market") or "SPOT").upper()
+    symbol = str(t.get("symbol") or "").upper()
+    side = str(t.get("side") or "LONG").upper()
+    status = str(t.get("status") or "ACTIVE").upper()
+    opened_at_dt = _parse_iso_dt(t.get("opened_at"))
+    tf, limit = _sig_catchup_params(opened_at_dt, now)
+    candles, src = await _fetch_signal_candles(symbol, market=market, interval=tf, limit=limit)
+    if not candles:
+        return None
+
+    tf_minutes = _sig_tf_minutes(tf)
+    start_dt = opened_at_dt
+    if status == "TP1":
+        start_dt = _parse_iso_dt(t.get("tp1_hit_at")) or _parse_iso_dt(t.get("be_armed_at")) or opened_at_dt
+    if start_dt:
+        # Use only candles that opened after the signal/TP1 moment. Including the
+        # previous candle can create false closes from a wick that happened before
+        # the signal existed.
+        start_floor = start_dt - dt.timedelta(seconds=5)
+        candles = [c for c in candles if not c.get("ts") or c["ts"] >= start_floor]
+    if not candles:
+        return None
+
+    entry = float(t.get("entry") or 0.0)
+    tp1 = float(t.get("tp1") or 0.0) if t.get("tp1") is not None else 0.0
+    tp2 = float(t.get("tp2") or 0.0) if t.get("tp2") is not None else 0.0
+    sl = float(t.get("sl") or 0.0) if t.get("sl") is not None else 0.0
+    eff_tp2 = tp2 if (tp2 > 0 and (tp1 <= 0 or abs(tp2 - tp1) > 1e-12)) else 0.0
+    eff_tp1 = tp1 if tp1 > 0 else 0.0
+
+    # Use the same anti-wick buffer for SL catch-up as live polling.
+    sl_trigger = 0.0
+    if sl > 0:
+        sl_trigger = sl * (1.0 - _SIG_SL_BUFFER_PCT) if side == "LONG" else sl * (1.0 + _SIG_SL_BUFFER_PCT)
+    be_trigger = entry * (1.0 - _BE_BUFFER_PCT) if side == "LONG" else entry * (1.0 + _BE_BUFFER_PCT)
+
+    virtual_tp1 = bool(t.get("tp1_hit")) or status == "TP1"
+    tp1_seen_at = _parse_iso_dt(t.get("tp1_hit_at")) or _parse_iso_dt(t.get("be_armed_at"))
+    for candle in candles:
+        cts = candle.get("ts")
+        event_time = (cts + dt.timedelta(minutes=tf_minutes)) if isinstance(cts, dt.datetime) else now
+
+        if not virtual_tp1:
+            tp2_hit = bool(eff_tp2 > 0 and _sig_candle_touched(side, candle, eff_tp2, kind="tp"))
+            tp1_hit = bool(eff_tp1 > 0 and _sig_candle_touched(side, candle, eff_tp1, kind="tp"))
+            sl_hit = bool(sl_trigger > 0 and _sig_candle_touched(side, candle, sl_trigger, kind="sl"))
+
+            # Single target: TP1 is final if there is no TP2.
+            if eff_tp2 <= 0 and tp1_hit:
+                if sl_hit:
+                    choose = _sig_choose_same_candle(side, candle, eff_tp1, sl_trigger)
+                    if choose == "adv":
+                        return {"status": "LOSS", "closed_at": event_time, "source": src, "tp1_before": False}
+                return {"status": "WIN", "closed_at": event_time, "source": src, "target": "tp1", "tp1_before": False}
+
+            if tp2_hit or sl_hit:
+                if tp2_hit and sl_hit:
+                    choose = _sig_choose_same_candle(side, candle, eff_tp2, sl_trigger)
+                    return {"status": ("WIN" if choose == "fav" else "LOSS"), "closed_at": event_time, "source": src, "target": "tp2", "tp1_before": bool(choose == "fav" and eff_tp1 > 0)}
+                if tp2_hit:
+                    return {"status": "WIN", "closed_at": event_time, "source": src, "target": "tp2", "tp1_before": bool(eff_tp1 > 0)}
+                return {"status": "LOSS", "closed_at": event_time, "source": src, "tp1_before": False}
+
+            if tp1_hit:
+                virtual_tp1 = True
+                tp1_seen_at = event_time
+                continue
+
+        # TP1 armed stage
+        tp2_hit = bool(eff_tp2 > 0 and _sig_candle_touched(side, candle, eff_tp2, kind="tp"))
+        sl_hit = bool(sl_trigger > 0 and _sig_candle_touched(side, candle, sl_trigger, kind="sl"))
+        be_hit = bool(entry > 0 and _sig_candle_touched(side, candle, be_trigger, kind="sl"))
+
+        if tp2_hit or sl_hit:
+            if tp2_hit and sl_hit:
+                choose = _sig_choose_same_candle(side, candle, eff_tp2, sl_trigger)
+                return {"status": ("WIN" if choose == "fav" else "LOSS"), "closed_at": event_time, "source": src, "target": "tp2", "tp1_before": True}
+            if tp2_hit:
+                return {"status": "WIN", "closed_at": event_time, "source": src, "target": "tp2", "tp1_before": True}
+            return {"status": "LOSS", "closed_at": event_time, "source": src, "tp1_before": True}
+
+        if be_hit:
+            return {"status": "BE", "closed_at": event_time, "source": src, "tp1_before": True}
+
+    if status == "ACTIVE" and virtual_tp1:
+        return {"status": "TP1", "closed_at": tp1_seen_at or now, "source": src, "tp1_before": True}
+    return None
+
+
 
 def _hit_tp(side: str, price: float, lvl: float) -> bool:
     return price >= lvl if side == "LONG" else price <= lvl
@@ -11902,6 +12592,7 @@ async def signal_outcome_loop() -> None:
     while True:
         try:
             tick += 1
+            _health_mark_ok("signal-outcome")
             rows = await db_store.list_open_signal_tracks(limit=1000)
             open_tracks = len(rows)
             # heartbeat: show loop is alive even when open_tracks=0
@@ -11941,8 +12632,116 @@ async def signal_outcome_loop() -> None:
                     tp2 = float(t.get("tp2") or 0.0) if t.get("tp2") is not None else 0.0
                     sl  = float(t.get("sl") or 0.0)  if t.get("sl")  is not None else 0.0
 
+                    # Effective targets are needed by both candle catch-up and live price polling.
+                    eff_tp2 = tp2 if (tp2 > 0 and (tp1 <= 0 or abs(tp2 - tp1) > 1e-12)) else 0.0
+                    eff_tp1 = tp1 if tp1 > 0 else 0.0
+
                     if sid <= 0 or entry <= 0 or not symbol:
                         continue
+
+                    # Catch-up by OHLC candles. This is the safety net for Railway/app sleep:
+                    # if TP/SL happened while the loop was not polling current price, close
+                    # the signal and send the final report card after wake/redeploy.
+                    try:
+                        _catch = await _detect_signal_candle_catchup(t, now=now)
+                    except Exception:
+                        logger.exception("[sig-outcome] candle catch-up failed sid=%s %s %s", sid, market, symbol)
+                        _catch = None
+                    if _catch:
+                        cst = str(_catch.get("status") or "").upper().strip()
+                        catch_closed_at = _catch.get("closed_at") if isinstance(_catch.get("closed_at"), dt.datetime) else now
+                        catch_src = str(_catch.get("source") or "candles")
+                        catch_tp1_before = bool(_catch.get("tp1_before")) or status == "TP1" or bool(t.get("tp1_hit"))
+
+                        if cst == "TP1" and status == "ACTIVE":
+                            try:
+                                tp1_part = _model_partial_pct()
+                                tp1_exec = float(eff_tp1 if 'eff_tp1' in locals() else (tp1 or 0.0))
+                                ent = float(entry)
+                                if side.upper() == "LONG":
+                                    tp1_pnl = ((tp1_exec - ent) / ent) * 100.0
+                                else:
+                                    tp1_pnl = ((ent - tp1_exec) / ent) * 100.0
+                                tp1_realized = tp1_pnl * tp1_part
+                            except Exception:
+                                tp1_realized = None
+                            await db_store.mark_signal_tp1(signal_id=sid, be_price=float(entry), tp1_pnl_pct=tp1_realized)
+                            _SIG_SL_BREACH_SINCE.pop(sid, None)
+                            logger.info("[sig-outcome][catchup] TP1 sid=%s %s %s src=%s", sid, market, symbol, catch_src)
+                            tp1_marked += 1
+                            continue
+
+                        if cst in ("WIN", "LOSS", "BE"):
+                            # Compute the same model PnL used by the live polling path.
+                            target = str(_catch.get("target") or "").lower()
+                            if cst == "WIN":
+                                if target == "tp2" and eff_tp2 > 0:
+                                    pnl = _sig_net_pnl_two_targets(market=market, side=side, entry=entry, tp1=eff_tp1, tp2=eff_tp2, part=part) if (eff_tp1 > 0 and eff_tp2 > 0) else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp2, part_entry_to_close=1.0)
+                                else:
+                                    close_px = eff_tp1 if eff_tp1 > 0 else (eff_tp2 if eff_tp2 > 0 else entry)
+                                    pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=close_px, part_entry_to_close=1.0)
+                                closed_now = await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl), closed_at=catch_closed_at)
+                                _SIG_SL_BREACH_SINCE.pop(sid, None)
+                                if not closed_now:
+                                    continue
+                                _report_row = dict(t)
+                                if catch_tp1_before:
+                                    _report_row["tp1_hit"] = True
+                                    _report_row["status"] = "TP1"
+                                await _send_closed_signal_report_card(_report_row, final_status="WIN", pnl_total_pct=float(pnl), closed_at=catch_closed_at)
+                                await _adaptive_v3_update_from_outcome(dict(_report_row), final_status="WIN", pnl_total_pct=float(pnl), closed_at=catch_closed_at)
+                                logger.info("[sig-outcome][catchup] WIN sid=%s %s %s src=%s", sid, market, symbol, catch_src)
+                                closed_win += 1
+                                continue
+
+                            if cst == "LOSS":
+                                pnl = _sig_net_pnl_tp1_then_sl(market=market, side=side, entry=entry, tp1=eff_tp1, sl=sl, part=part) if (catch_tp1_before and eff_tp1 > 0) else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=sl, part_entry_to_close=1.0)
+                                _base_row = dict(t)
+                                if catch_tp1_before:
+                                    _base_row["tp1_hit"] = True
+                                    _base_row["status"] = "TP1"
+                                _close_analysis = await _loss_diag_build_close_analysis(_base_row, closed_at=catch_closed_at)
+                                _loss_diag = _build_loss_diagnostics_from_row(_base_row, final_status="LOSS", closed_at=catch_closed_at, close_analysis=_close_analysis)
+                                closed_now = await db_store.close_signal_track(
+                                    signal_id=sid,
+                                    status="LOSS",
+                                    pnl_total_pct=float(pnl),
+                                    close_reason_code=str(_loss_diag.get("reason_code") or ""),
+                                    close_reason_text=str(_loss_diag.get("reason_text") or ""),
+                                    weak_filters=",".join(list(_loss_diag.get("weak_filter_keys") or [])),
+                                    improve_note="; ".join(list(_loss_diag.get("improve_keys") or [])),
+                                    close_analysis_json=_loss_diag.get("close_analysis_json") or _close_analysis,
+                                    closed_at=catch_closed_at,
+                                )
+                                _SIG_SL_BREACH_SINCE.pop(sid, None)
+                                if not closed_now:
+                                    continue
+                                _report_row = dict(_base_row)
+                                _report_row["close_analysis_json"] = _loss_diag.get("close_analysis_json") or _close_analysis
+                                _report_row["close_reason_code"] = str(_loss_diag.get("reason_code") or "")
+                                _report_row["close_reason_text"] = str(_loss_diag.get("reason_text") or "")
+                                _report_row["weak_filters"] = ",".join(list(_loss_diag.get("weak_filter_keys") or []))
+                                _report_row["improve_note"] = "; ".join(list(_loss_diag.get("improve_keys") or []))
+                                await _send_closed_signal_report_card(_report_row, final_status="LOSS", pnl_total_pct=float(pnl), closed_at=catch_closed_at)
+                                await _adaptive_v3_update_from_outcome(dict(_report_row), final_status="LOSS", pnl_total_pct=float(pnl), closed_at=catch_closed_at)
+                                logger.info("[sig-outcome][catchup] LOSS sid=%s %s %s src=%s", sid, market, symbol, catch_src)
+                                closed_loss += 1
+                                continue
+
+                            if cst == "BE":
+                                pnl = _sig_net_pnl_tp1_then_be(market=market, side=side, entry=entry, tp1=eff_tp1, part=part) if eff_tp1 > 0 else _sig_net_pnl_pct(market=market, side=side, entry=entry, close=entry, part_entry_to_close=1.0)
+                                closed_now = await db_store.close_signal_track(signal_id=sid, status="BE", pnl_total_pct=float(pnl), closed_at=catch_closed_at)
+                                _SIG_SL_BREACH_SINCE.pop(sid, None)
+                                if not closed_now:
+                                    continue
+                                _report_row = dict(t)
+                                _report_row["tp1_hit"] = True
+                                _report_row["status"] = "TP1"
+                                await _send_closed_signal_report_card(_report_row, final_status="BE", pnl_total_pct=float(pnl), closed_at=catch_closed_at)
+                                await _adaptive_v3_update_from_outcome(dict(_report_row), final_status="BE", pnl_total_pct=float(pnl), closed_at=catch_closed_at)
+                                logger.info("[sig-outcome][catchup] BE sid=%s %s %s src=%s", sid, market, symbol, catch_src)
+                                closed_be += 1
+                                continue
 
                     # Auto-close stale signals so outcomes stats do not stay at zero forever
                     # (e.g., if a signal never reaches TP/SL or the market becomes illiquid).
@@ -12083,7 +12882,9 @@ async def signal_outcome_loop() -> None:
                         # Legacy migration: single-target signals should not stay in TP1.
                         if eff_tp2 <= 0 and eff_tp1 > 0:
                             pnl = _sig_net_pnl_pct(market=market, side=side, entry=entry, close=eff_tp1, part_entry_to_close=1.0)
-                            await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            closed_now = await db_store.close_signal_track(signal_id=sid, status="WIN", pnl_total_pct=float(pnl))
+                            if not closed_now:
+                                continue
                             await _send_closed_signal_report_card(t, final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
                             await _adaptive_v3_update_from_outcome(dict(t), final_status="WIN", pnl_total_pct=float(pnl), closed_at=now)
                             logger.info("[sig-outcome] WIN sid=%s %s %s legacy_tp1_finalize tp1=%s src=%s", sid, market, symbol, _fmt_price(eff_tp1 if eff_tp1>0 else None), _src)
@@ -13738,6 +14539,9 @@ async def main() -> None:
 
             logger.info("Starting signal_outcome_loop")
             _start_signal_outcome_task()
+            if _CLOSED_SIGNAL_REPORT_RETRY_ENABLED:
+                TASKS["closed-signal-report-retry"] = asyncio.create_task(closed_signal_report_retry_loop(), name="closed-signal-report-retry")
+                _attach_task_monitor("closed-signal-report-retry", TASKS["closed-signal-report-retry"])
 
             TASKS["daily-signal-report"] = asyncio.create_task(daily_signal_report_loop(), name="daily-signal-report")
             _attach_task_monitor("daily-signal-report", TASKS["daily-signal-report"])
@@ -13808,6 +14612,9 @@ async def main() -> None:
 
     logger.info("Starting signal_outcome_loop")
     _start_signal_outcome_task()
+    if _CLOSED_SIGNAL_REPORT_RETRY_ENABLED:
+        TASKS["closed-signal-report-retry"] = asyncio.create_task(closed_signal_report_retry_loop(), name="closed-signal-report-retry")
+        _attach_task_monitor("closed-signal-report-retry", TASKS["closed-signal-report-retry"])
 
     TASKS["daily-signal-report"] = asyncio.create_task(daily_signal_report_loop(), name="daily-signal-report")
     _attach_task_monitor("daily-signal-report", TASKS["daily-signal-report"])
