@@ -7042,14 +7042,19 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
             )
 
         if no_space and not supply and not bearish and pos < 0.72:
+            # Do not label this as a generic template/premature entry only.
+            # On real charts (GALA/BTC-style losses) the important fact is
+            # usually that TP1 was too close and the path to TP1 was blocked by
+            # local resistance even when no strict pre-entry FVG object was saved.
+            cs_line = f'чистое пространство до TP1 было около {cs:.2f}%' if cs > 0 else 'чистого пространства до TP1 было мало'
             return out(
-                'Premature LONG / tight TP1 space',
-                'LONG был открыт до нормального закрепления после retest. Пространство до TP1 было маленькое, а SL стоял внутри обычного pullback/retest-движения, поэтому цена сначала выбила SL и только потом могла продолжить движение.',
-                ['чистого пространства до TP1 было мало', 'bullish acceptance после входа не подтвердился'],
-                ['первый откат после входа оказался сильнее допустимого SL', 'покупатель не дал сразу нового displacement вверх', 'сделка закрылась по SL до нормального continuation'],
-                [f'позиция входа в range: {pos:.2f}', 'нет признака, что вход был прямо возле range high', 'проблема больше в раннем входе/маленьком SL, чем в premium-location', 'после входа не было clean bullish displacement'],
-                ['Premature entry', 'Tight TP1/SL space', 'No retest acceptance', 'Weak initial follow-through'],
-                ['ждать закрытие/acceptance выше retest-зоны', 'не ставить SL внутри активного pullback', 'брать LONG только после fresh bullish displacement'],
+                'TP1 blocked by local resistance / tight upside space',
+                'LONG был открыт с маленьким расстоянием до TP1. Между входом и целью не было clean upside-space: ближайший local high / resistance мог остановить движение, а обычный pullback/retest выбил SL до нормального continuation.',
+                [cs_line, 'bullish acceptance после входа не подтвердился'],
+                ['первый откат после входа оказался сильнее допустимого SL', 'покупатель не дал сразу нового displacement вверх', 'TP1 не был нормально поставлен под угрозу', 'сделка закрылась по SL до нормального continuation'],
+                [f'позиция входа в range: {pos:.2f}', 'путь к TP1 был слишком короткий и упирался в local high / resistance', 'SL находился внутри обычного pullback/retest-движения', 'после входа не было clean bullish displacement'],
+                ['TP1 blocked by local resistance', 'No clean space to TP1', 'Tight TP1/SL space', 'No retest acceptance'],
+                ['не брать LONG, если TP1 слишком близко к local high/resistance', 'требовать clean space до TP1', 'ждать закрытие/acceptance выше retest-зоны', 'не ставить SL внутри активного pullback'],
             )
 
         if bearish and demand and pos <= 0.50:
@@ -7192,14 +7197,20 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
             )
 
         if no_space and not demand and not bullish and pos > 0.28:
+            # Mirror rule for SHORT: when TP1 is very close and SL is hit after
+            # a bounce, the real chart reason is tight downside space / local
+            # support blocking TP1. Do not print the misleading line
+            # "нет признака возле range low" because the support/demand reaction
+            # is often visible even if no strict FVG zone was serialized.
+            cs_line = f'чистое пространство до TP1 было около {cs:.2f}%' if cs > 0 else 'чистого пространства до TP1 было мало'
             return out(
-                'Premature SHORT / tight TP1 space',
-                'SHORT был открыт до нормального закрепления после retest. Пространство до TP1 было маленькое, а SL стоял внутри обычного bounce/retest-движения, поэтому цена сначала выбила SL и только потом могла продолжить движение.',
-                ['чистого пространства до TP1 было мало', 'bearish acceptance после входа не подтвердился'],
-                ['первый bounce после входа оказался сильнее допустимого SL', 'продавец не дал сразу нового displacement вниз', 'сделка закрылась по SL до нормального continuation'],
-                [f'позиция входа в range: {pos:.2f}', 'нет признака, что вход был прямо возле range low', 'проблема больше в раннем входе/маленьком SL, чем в discount-location', 'после входа не было clean bearish displacement'],
-                ['Premature entry', 'Tight TP1/SL space', 'No retest acceptance', 'Weak initial follow-through'],
-                ['ждать закрытие/acceptance ниже retest-зоны', 'не ставить SL внутри активного bounce', 'брать SHORT только после fresh bearish displacement'],
+                'TP1 blocked by local support / tight downside space',
+                'SHORT был открыт с маленьким расстоянием до TP1. Путь к TP1 упирался в local low / support / demand, поэтому продавец не получил clean downside-space: цена дала bounce и выбила SL до нормального continuation.',
+                [cs_line, 'bearish acceptance после входа не подтвердился'],
+                ['первый bounce после входа оказался сильнее допустимого SL', 'продавец не дал сразу нового displacement вниз', 'TP1 не был нормально поставлен под угрозу', 'сделка закрылась по SL до нормального continuation'],
+                [f'позиция входа в range: {pos:.2f}', 'путь к TP1 был слишком короткий и упирался в local low / support', 'SL находился внутри обычного bounce/retest-движения', 'после входа не было clean bearish displacement'],
+                ['TP1 blocked by local support', 'No clean space to TP1', 'Tight TP1/SL space', 'No retest acceptance'],
+                ['не брать SHORT, если TP1 слишком близко к local low/support', 'требовать clean space до TP1', 'ждать закрытие/acceptance ниже retest-зоны', 'не ставить SL внутри активного bounce'],
             )
 
         if pos <= 0.28:
