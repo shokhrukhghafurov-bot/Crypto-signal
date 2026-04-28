@@ -683,7 +683,10 @@ ON CONFLICT (id) DO NOTHING;
           weak_filters TEXT,
           improve_note TEXT,
           close_analysis_json JSONB,
-          entry_snapshot_json JSONB DEFAULT '{}'::jsonb
+          entry_snapshot_json JSONB DEFAULT '{}'::jsonb,
+          report_sent_at TIMESTAMPTZ,
+          report_attempts INT NOT NULL DEFAULT 0,
+          report_send_error TEXT
         );
         """)
 
@@ -712,6 +715,9 @@ ON CONFLICT (id) DO NOTHING;
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS improve_note TEXT;")
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS close_analysis_json JSONB;")
             await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS entry_snapshot_json JSONB DEFAULT '{}'::jsonb;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS report_sent_at TIMESTAMPTZ;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS report_attempts INT NOT NULL DEFAULT 0;")
+            await conn.execute("ALTER TABLE signal_tracks ADD COLUMN IF NOT EXISTS report_send_error TEXT;")
         except Exception:
             pass
 
@@ -720,6 +726,7 @@ ON CONFLICT (id) DO NOTHING;
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_tracks_closed_at ON signal_tracks(closed_at);")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_tracks_tp1_hit_at ON signal_tracks(tp1_hit_at);")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_tracks_market_symbol_opened_at ON signal_tracks(market, symbol, opened_at DESC);")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_tracks_report_unsent ON signal_tracks(closed_at ASC) WHERE status IN ('WIN','LOSS','BE','CLOSED') AND report_sent_at IS NULL;")
         except Exception:
             pass
 
@@ -2102,6 +2109,7 @@ async def close_signal_track(
     weak_filters: str | None = None,
     improve_note: str | None = None,
     close_analysis_json: dict | str | None = None,
+    closed_at: dt.datetime | None = None,
 ) -> bool:
     """Close an ACTIVE/TP1 signal track exactly once and store pnl.
 
@@ -2140,7 +2148,7 @@ async def close_signal_track(
             """
             UPDATE signal_tracks
             SET status=$2,
-                closed_at=NOW(),
+                closed_at=COALESCE($9, NOW()),
                 updated_at=NOW(),
                 pnl_total_pct=$3,
                 close_reason_code=COALESCE($4, close_reason_code),
@@ -2160,8 +2168,68 @@ async def close_signal_track(
             (str(weak_filters or "") or None),
             (str(improve_note or "") or None),
             (json.dumps(close_analysis_json, ensure_ascii=False) if isinstance(close_analysis_json, dict) else (str(close_analysis_json or "") or None)),
+            closed_at,
         )
     return bool(row)
+
+
+async def list_unsent_signal_reports(*, limit: int = 50, recent_minutes: int = 10080) -> List[dict]:
+    """Return final signal tracks whose Telegram report card was not sent yet.
+
+    recent_minutes=0 means retry all unsent final rows. Otherwise, rows are
+    retried when they already have a failed send attempt or closed recently.
+    """
+    pool = get_pool()
+    recent_minutes = max(0, int(recent_minutes or 0))
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT *
+            FROM signal_tracks
+            WHERE status IN ('WIN','LOSS','BE','CLOSED')
+              AND closed_at IS NOT NULL
+              AND report_sent_at IS NULL
+              AND ($2::int = 0 OR COALESCE(report_attempts, 0) > 0 OR closed_at >= NOW() - ($2::int * INTERVAL '1 minute'))
+            ORDER BY closed_at ASC
+            LIMIT $1;
+            """,
+            int(limit),
+            recent_minutes,
+        )
+    return [dict(r) for r in rows]
+
+
+async def mark_signal_report_sent(*, signal_id: int) -> None:
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        await conn.execute(
+            """
+            UPDATE signal_tracks
+            SET report_sent_at=NOW(),
+                report_attempts=COALESCE(report_attempts, 0) + 1,
+                report_send_error=NULL,
+                updated_at=NOW()
+            WHERE signal_id=$1;
+            """,
+            int(signal_id),
+        )
+
+
+async def mark_signal_report_failed(*, signal_id: int, error: str | None = None) -> None:
+    pool = get_pool()
+    async with pool.acquire(timeout=_db_acquire_timeout()) as conn:
+        await conn.execute(
+            """
+            UPDATE signal_tracks
+            SET report_attempts=COALESCE(report_attempts, 0) + 1,
+                report_send_error=$2,
+                updated_at=NOW()
+            WHERE signal_id=$1
+              AND report_sent_at IS NULL;
+            """,
+            int(signal_id),
+            str(error or '')[:500],
+        )
 
 
 async def signal_perf_bucket_global(market: str, *, since: dt.datetime, until: dt.datetime) -> Dict[str, Any]:
