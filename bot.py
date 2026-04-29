@@ -7892,7 +7892,435 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         visible=['после входа нет расширения тела свечей в сторону сделки', 'импульс затухает вместо continuation', pos_line],
         secondary=['Momentum faded', 'Weak follow-through', 'Volume faded'],
         improve=['не держать setup, если первые свечи после входа теряют momentum', 'требовать импульс/объём после confirm'],
+
         evidence=bool(volume_faded and weak_follow and no_tp))
+
+    # v9 full reason catalog detectors.  These keep every common LOSS reason
+    # available as an explicit candidate, but still require a matching flag,
+    # metric, setup text, structure text, or zone context before printing it.
+    # Rule: no evidence -> no text in Telegram card.
+    is_short = side_u == 'SHORT'
+    side_word = 'SHORT' if is_short else 'LONG'
+    opp_zone_word = 'demand/support' if is_short else 'supply/resistance'
+    opp_reaction_word = 'buyer reaction / bounce' if is_short else 'seller reaction / rejection'
+    direction_loss_word = 'downside' if is_short else 'upside'
+    confirm_word = 'bearish' if is_short else 'bullish'
+    strong_bad_context = bullish_ctx if is_short else bearish_ctx
+    near_bad_zone = demand_seen if is_short else supply_seen
+    bad_zone_blocks = demand_blocks if is_short else supply_blocks
+    bad_zone_desc = str((demand_ctx if is_short else supply_ctx).get('desc') or opp_zone_word)
+    too_bad_location = lowish if is_short else highish
+    late_after_extended = late_short if is_short else late_long
+    move_name = 'dump' if is_short else 'pump'
+    premium_discount_bad = (lowish if is_short else highish)
+
+    def any_flag(*keys: str) -> bool:
+        return any(b(k) for k in keys)
+
+    def any_text(*words: str) -> bool:
+        joined = ' '.join([
+            sget('loss_reason'), sget('close_reason'), sget('reason'), sget('debug_reason'),
+            sget('ta_summary'), sget('snapshot_reason'), structure_text, route_text,
+        ]).lower()
+        return any(str(w).lower() in joined for w in words if str(w).strip())
+
+    # 1) LOCATION / место входа
+    add(5.2, 'entry_inside_range_middle',
+        primary=f'{side_word} opened inside range middle / chop zone',
+        scenario='Вход был не из сильной premium/discount зоны, а ближе к середине локального диапазона. В середине range цена часто пилит обе стороны, поэтому setup не получил directional expansion и ушёл к SL.',
+        analysis_add=['entry находился внутри середины локального range'],
+        happened=['после входа не появилось уверенное continuation-движение', 'рынок остался в chop/range', 'SL был достигнут после возврата против позиции'],
+        visible=['вход не был от края диапазона', 'цена торговалась внутри локального range', pos_line],
+        secondary=['Entry inside range middle', 'Chop/range location', 'No directional edge'],
+        improve=['не входить в середине range', 'ждать вход от premium/discount края или подтверждённый breakout + retest'],
+        evidence=bool(midrange and weak_follow and no_tp))
+    add(5.3, 'entry_near_local_extreme',
+        primary=f'{side_word} opened near local extreme',
+        scenario=f'Вход был слишком близко к локальному extreme. Для {side_word} путь до продолжения был ограничен, а вероятность обратной реакции стала высокой.',
+        analysis_add=['entry был рядом с local high/low'],
+        happened=['цена быстро дала реакцию против позиции', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после обратного движения'],
+        visible=['entry расположен рядом с локальным high/low', f'рядом была зона {opp_reaction_word}', pos_line],
+        secondary=['Entry near local high/low', 'Poor entry location', 'Reaction zone nearby'],
+        improve=['не входить прямо возле local high/low после уже прошедшего импульса', 'ждать ретест глубже в сторону лучшей цены'],
+        evidence=bool(any_flag('entry_near_local_extreme','entry_near_local_high_low','entry_near_local_low','entry_near_local_high') or (too_bad_location and no_tp)))
+    add(5.5, 'entry_after_extended_move',
+        primary=f'Late entry after extended {move_name}',
+        scenario=f'{side_word} был открыт после уже выполненного сильного движения. Momentum к моменту входа был частично потрачен, поэтому вместо continuation появилась обратная реакция и SL.',
+        analysis_add=['entry был после extended move'],
+        happened=['после входа не появился новый fresh expansion', 'движение против позиции появилось быстрее continuation', 'SL был достигнут после exhaustion/reaction'],
+        visible=[f'перед входом уже был extended {move_name}', 'вход был поздним относительно импульса', pos_line],
+        secondary=['Entry after extended move', 'Momentum already spent', 'Late entry'],
+        improve=['после сильного импульса ждать pullback/retest с лучшей ценой', 'не входить в конце расширения'],
+        evidence=bool(late_after_extended and no_tp))
+    add(5.0, 'entry_too_far_from_fvg_ob',
+        primary='Entry too far from FVG/OB origin zone',
+        scenario='Вход был слишком далеко от реальной FVG/OB зоны. Цена уже ушла от зоны, поэтому risk был хуже, SL оказался ближе к шуму, а continuation не подтвердился.',
+        analysis_add=['entry был далеко от FVG/OB зоны'],
+        happened=['цена не получила сильную реакцию прямо от зоны', 'после входа не появился clean displacement', 'SL был достигнут после отката к зоне/против входа'],
+        visible=['entry не был рядом с origin/FVG/OB', 'между зоной и entry уже был пройденный импульс', pos_line],
+        secondary=['Entry too far from FVG/OB', 'Bad zone distance', 'Late zone entry'],
+        improve=['входить ближе к FVG/OB origin', 'не брать сигнал, если цена уже далеко ушла от зоны'],
+        evidence=bool(any_flag('entry_too_far_from_fvg_ob','entry_far_from_zone','late_zone_entry') or (ob_fvg_route and late_after_extended and weak_follow)))
+    add(5.3, 'bad_premium_discount_location',
+        primary='Bad premium/discount location',
+        scenario=f'Location был плохой для {side_word}: сделка открыта в зоне, где ожидание continuation слабее, а обратная реакция сильнее. Из-за этого цена быстро пошла к SL.',
+        analysis_add=['premium/discount location был слабый'],
+        happened=['рынок не дал продолжение из этой зоны', 'появилась реакция против позиции', 'SL был достигнут до нормального TP1 threat'],
+        visible=[f'{side_word} открыт в плохой premium/discount зоне', pos_line],
+        secondary=['Bad premium/discount location', 'Poor location', 'Opposite reaction risk'],
+        improve=['SHORT искать выше в premium, LONG искать ниже в discount', 'не входить, если location уже даёт плохую цену'],
+        evidence=bool(premium_discount_bad and no_tp))
+
+    # 2) SL / проблема стопа
+    add(5.4, 'sl_inside_wick_zone',
+        primary='SL inside wick rejection zone',
+        scenario='SL стоял внутри зоны фитилей/снятия ликвидности. Обычный wick sweep против entry был достаточен, чтобы выбить стоп, хотя структурная invalidation была дальше.',
+        analysis_add=['SL попал внутрь wick zone'],
+        happened=['цена сделала wick/sweep против входа', 'стоп был выбит фитилём/шумом', 'после этого setup мог ещё не быть структурно сломан'],
+        visible=['SL расположен внутри зоны предыдущих фитилей', 'рядом была wick/liquidity область', pos_line],
+        secondary=['SL inside wick zone', 'Wick noise hit SL', 'Stop placed in liquidity'],
+        improve=['ставить SL за wick cluster / liquidity sweep зоной', 'не ставить SL внутри области частых фитилей'],
+        evidence=bool(any_flag('sl_inside_wick_zone','sl_in_wick_zone','wick_zone_hit_sl','sl_inside_wicks')))
+    add(5.6, 'sl_before_structural_invalidation',
+        primary='SL before real structural invalidation',
+        scenario='SL был поставлен до реальной structural invalidation. Цена выбила короткий стоп обычным откатом, но структура сделки формально ломалась дальше.',
+        analysis_add=['SL был до structural invalidation'],
+        happened=['обычный откат дошёл до SL', 'уровень реальной invalidation был дальше', 'сделка закрылась раньше структурного слома'],
+        visible=['SL не стоял за structural high/low', 'между SL и настоящей invalidation-зоной оставался запас', pos_line],
+        secondary=['SL before structural invalidation', 'Invalidation level farther', 'Premature SL'],
+        improve=['SL ставить за реальной structural invalidation', 'если RR ломается после структурного SL — пропускать сделку'],
+        evidence=bool(any_flag('sl_before_structural_invalidation','sl_not_behind_structure','structural_sl_farther') or (normal_pullback and any_text('structural invalidation'))))
+    add(5.1, 'sl_too_close_to_fvg_ob_edge',
+        primary='SL too close to FVG/OB edge',
+        scenario='SL стоял слишком близко к краю FVG/OB зоны. Обычный retest/mitigation зашёл чуть глубже зоны и выбил стоп до подтверждения continuation.',
+        analysis_add=['SL был слишком близко к FVG/OB edge'],
+        happened=['цена сделала глубокий retest зоны', 'стоп был выбит внутри нормальной mitigation области', 'continuation не успел подтвердиться'],
+        visible=['SL почти на границе FVG/OB', 'зона могла дать более глубокий retest', pos_line],
+        secondary=['SL too close to FVG/OB edge', 'Deep mitigation hit SL', 'Zone edge SL'],
+        improve=['для OB/FVG ставить SL за полной зоной/структурой', 'не ставить SL прямо на edge зоны'],
+        evidence=bool(any_flag('sl_too_close_to_fvg_ob_edge','sl_close_to_zone_edge','sl_inside_zone_edge') or (ob_fvg_route and normal_pullback)))
+    add(4.9, 'sl_weak_micro_level_only',
+        primary='SL protected only by weak micro level',
+        scenario='SL был спрятан только за слабым micro-level, а не за сильной структурой. Такой уровень легко снимается обычным retest/sweep, поэтому цена дошла до SL.',
+        analysis_add=['SL защищал только weak micro level'],
+        happened=['micro-level не удержал цену', 'рынок снял локальный уровень', 'SL был достигнут без сильного structural break'],
+        visible=['SL был за маленьким локальным уровнем', 'сильной HTF/LTF invalidation за SL не было', pos_line],
+        secondary=['SL above/below weak micro level only', 'Weak SL protection', 'Micro level sweep'],
+        improve=['не ставить SL только за микрофитилем', 'использовать structural SL или пропускать плохой RR'],
+        evidence=bool(any_flag('sl_weak_micro_level_only','weak_micro_level_sl','sl_above_weak_micro_level','sl_below_weak_micro_level')))
+    add(5.2, 'sl_inside_liquidity_sweep_zone',
+        primary='SL placed inside liquidity sweep zone',
+        scenario='SL оказался в зоне, где рынок часто снимает ликвидность. Цена сделала sweep против позиции, забрала стоп и не дала нормального TP1 threat.',
+        analysis_add=['SL был внутри liquidity sweep зоны'],
+        happened=['цена сняла ликвидность возле SL', 'после sweep стоп был выбит', 'до TP1 движение не дошло'],
+        visible=['SL стоял в очевидной liquidity area', 'рядом были equal highs/lows или wick cluster', pos_line],
+        secondary=['SL inside liquidity sweep zone', 'Stop hunt area', 'Liquidity near SL'],
+        improve=['выносить SL за liquidity pool', 'не ставить SL там, где очевидно лежат стопы'],
+        evidence=bool(any_flag('sl_inside_liquidity_sweep_zone','sl_in_liquidity_pool','liquidity_near_sl','stop_hunt_zone_sl')))
+
+    # 3) TP / проблема цели
+    add(5.6, 'tp1_behind_local_sr',
+        primary=f'TP1 behind local {opp_zone_word}',
+        scenario=f'Путь к TP1 проходил через локальную {opp_zone_word} зону. Цена не смогла пройти эту реакционную область сразу, поэтому TP1 не был поставлен под угрозу и сделка ушла в SL.',
+        analysis_add=[f'TP1 был за local {opp_zone_word}'],
+        happened=['ближний уровень остановил continuation', 'TP1 не был нормально поставлен под угрозу', 'цена развернулась к SL'],
+        visible=[f'между entry и TP1 была {bad_zone_desc}', 'TP1 стоял за реакционной зоной', pos_line],
+        secondary=['TP1 behind local support/resistance', 'Blocked TP path', 'Reaction zone before TP1'],
+        improve=['TP1 ставить перед сильной встречной зоной', 'пропускать вход, если до TP1 нет свободного пути'],
+        evidence=bool(bad_zone_blocks or any_flag('tp1_behind_local_sr','tp1_behind_support_resistance','tp1_blocked_by_local_level')))
+    add(5.4, 'tp1_inside_demand_supply_reaction',
+        primary='TP1 inside demand/supply reaction area',
+        scenario='TP1 оказался внутри зоны, где рынок уже давал реакцию. Вместо чистого достижения цели цена получила встречный ответ и пошла к SL.',
+        analysis_add=['TP1 находился внутри reaction zone'],
+        happened=['цена не прошла реакционную область до TP1', 'встречная сторона быстро появилась', 'SL был достигнут после rejection/bounce'],
+        visible=['TP1 расположен внутри demand/supply реакции', 'цель не была в чистом пространстве', pos_line],
+        secondary=['TP1 inside demand/supply reaction', 'Bad TP placement', 'Target inside reaction zone'],
+        improve=['ставить TP1 до reaction zone', 'не считать RR хорошим, если TP внутри зоны реакции'],
+        evidence=bool(any_flag('tp1_inside_reaction_zone','tp1_inside_demand_supply','tp1_in_demand','tp1_in_supply') or (tight_space and bad_zone_blocks)))
+    add(5.0, 'tp1_requires_breaking_fresh_structure',
+        primary='TP1 required breaking fresh structure',
+        scenario='Чтобы дойти до TP1, цена должна была сразу сломать свежую встречную структуру. Без сильного displacement это маловероятно, поэтому движение остановилось раньше и SL был выбит.',
+        analysis_add=['TP1 требовал пробоя свежей структуры'],
+        happened=['fresh structure не была пробита', 'continuation не получил силы', 'цена вернулась к SL'],
+        visible=['на пути к TP1 стояла свежая структура', 'для TP1 нужен был дополнительный BOS/impulse', pos_line],
+        secondary=['TP1 requires breaking fresh structure', 'Fresh structure blocked target', 'Weak target path'],
+        improve=['не ставить TP1 за свежей структурой без clear displacement', 'ждать пробоя структуры до входа или брать цель раньше'],
+        evidence=bool(any_flag('tp1_requires_breaking_fresh_structure','tp1_requires_new_bos','fresh_structure_blocks_tp1')))
+    add(4.8, 'tp1_after_liquidity_pocket_filled',
+        primary='TP1 after liquidity pocket already filled',
+        scenario='Ликвидность по направлению сделки уже была частично забрана до входа. TP1 стоял после уже заполненного liquidity pocket, поэтому цене не хватило магнита для continuation.',
+        analysis_add=['liquidity pocket перед TP1 уже был заполнен'],
+        happened=['после входа не осталось сильного liquidity magnet до TP1', 'движение быстро затухло', 'цена ушла к SL'],
+        visible=['ликвидность по направлению уже была снята до entry', 'TP1 стоял после заполненной liquidity pocket', pos_line],
+        secondary=['TP1 after liquidity pocket filled', 'No liquidity magnet to TP1', 'Target after filled pocket'],
+        improve=['проверять, осталась ли ликвидность до TP1', 'не брать target, если liquidity pocket уже заполнен'],
+        evidence=bool(any_flag('tp1_after_liquidity_pocket_filled','liquidity_pocket_filled_before_tp1','tp1_after_filled_liquidity')))
+
+    # 4) CONFIRM / подтверждение
+    add(4.9, 'confirm_long_opposite_wick',
+        primary='Confirm candle had long opposite wick',
+        scenario='Confirm candle выглядел формально валидно, но имел длинный фитиль против направления сделки. Это показывало встречную реакцию ещё до входа, поэтому continuation быстро провалился.',
+        analysis_add=['confirm candle имел длинный opposite wick'],
+        happened=['после входа wick-pressure продолжился', 'acceptance не подтвердился', 'SL был достигнут после реакции против позиции'],
+        visible=['confirm candle закрылась неуверенно', 'длинный фитиль показал rejection/absorption', pos_line],
+        secondary=['Confirm candle has long opposite wick', 'Weak close quality', 'Rejection on confirm'],
+        improve=['не принимать confirm candle с большим opposite wick', 'требовать clean body close в сторону сделки'],
+        evidence=bool(any_flag('confirm_opposite_wick','confirm_long_opposite_wick','confirm_wick_against_trade')))
+    add(5.0, 'confirm_closed_back_inside_zone',
+        primary='Confirm candle closed back inside zone',
+        scenario='Confirm candle закрылась обратно внутри retest/FVG/OB зоны. Это не acceptance, а слабое подтверждение; после входа цена не продолжила движение и ушла к SL.',
+        analysis_add=['confirm закрылась обратно внутри зоны'],
+        happened=['acceptance за зоной не было', 'цена осталась внутри retest area', 'SL был достигнут после провала follow-through'],
+        visible=['закрытие confirm candle не вышло чисто за зону', 'entry был без уверенного acceptance', pos_line],
+        secondary=['Confirm closed back inside zone', 'No acceptance after retest', 'Weak confirm close'],
+        improve=['требовать close за зоной/уровнем', 'не входить, если confirm candle закрывается обратно внутри зоны'],
+        evidence=bool(any_flag('confirm_closed_back_inside_zone','confirm_close_inside_zone','confirm_back_inside_retest_zone')))
+    add(5.1, 'entry_triggered_without_continuation',
+        primary='Entry triggered without continuation',
+        scenario='Trigger сработал, но сразу после него не появилось продолжение по направлению сделки. Без post-trigger displacement цена вернулась против entry и дошла до SL.',
+        analysis_add=['entry trigger был без continuation'],
+        happened=['trigger сработал формально', 'следующие свечи не подтвердили направление', 'цена вернулась к SL'],
+        visible=['после trigger нет clean continuation candle', 'TP1 не был нормально поставлен под угрозу', pos_line],
+        secondary=['Entry triggered without continuation', 'No post-trigger expansion', 'Follow-through failed'],
+        improve=['после trigger требовать immediate continuation', 'отменять/не брать сигнал при слабой post-trigger реакции'],
+        evidence=bool(any_flag('entry_triggered_without_continuation','trigger_without_continuation') or (weak_follow and no_tp and not fast)))
+
+    # 5) STRUCTURE / структура
+    add(5.3, 'no_real_bos',
+        primary='No real BOS before entry',
+        scenario='Вход был построен как continuation, но реального BOS/структурного слома до входа не было. Без подтверждённой структуры рынок быстро вернулся против позиции.',
+        analysis_add=['реальный BOS перед входом не подтверждён'],
+        happened=['структура не дала подтверждение направления', 'retest оказался слабым', 'SL был достигнут после возврата в range'],
+        visible=['нет чистого BOS перед входом', 'уровень не был уверенно сломан и принят рынком', pos_line],
+        secondary=['No real BOS', 'Structure not confirmed', 'Weak continuation base'],
+        improve=['требовать реальный BOS с close и retest', 'не входить по формальному пробою без структуры'],
+        evidence=bool(any_flag('no_real_bos','bos_missing','fake_bos') or any_text('no real bos')))
+    add(5.1, 'bos_was_weak',
+        primary='BOS was weak / low-quality break',
+        scenario='BOS был слабым: пробой не дал сильного close/displacement и не закрепился. Поэтому retest не получил continuation и цена ушла к SL.',
+        analysis_add=['BOS был слабый'],
+        happened=['пробой не дал follow-through', 'retest не подтвердился', 'SL был достигнут после возврата обратно'],
+        visible=['BOS без сильного тела свечи', 'после BOS нет clean expansion', pos_line],
+        secondary=['BOS was weak', 'Weak break quality', 'No displacement after BOS'],
+        improve=['фильтровать weak BOS', 'требовать displacement и acceptance после BOS'],
+        evidence=bool(any_flag('weak_bos','bos_was_weak','low_quality_bos')))
+    add(5.2, 'choch_failed',
+        primary='CHoCH failed / structure shift was not accepted',
+        scenario='CHoCH был формальным, но рынок не принял смену структуры. Цена вернулась обратно в старую структуру и выбила SL.',
+        analysis_add=['CHoCH не подтвердился acceptance'],
+        happened=['после CHoCH не было continuation', 'цена вернулась против нового направления', 'SL был достигнут после failed shift'],
+        visible=['CHoCH не получил закрепления', 'structure shift был быстро отменён', pos_line],
+        secondary=['CHoCH failed', 'Failed structure shift', 'No acceptance after CHoCH'],
+        improve=['после CHoCH ждать retest + continuation', 'не входить только на первом shift без acceptance'],
+        evidence=bool(any_flag('choch_failed','failed_choch','choch_not_accepted')))
+    add(5.0, 'lower_high_higher_low_not_confirmed',
+        primary='Lower high / higher low not confirmed',
+        scenario='Ожидаемая continuation-структура не подтвердила новый LH/HL. Без подтверждённого swing рынок потерял направление и пошёл к SL.',
+        analysis_add=['LH/HL confirmation отсутствовал'],
+        happened=['структурный swing не подтвердился', 'цена не продолжила направление сделки', 'SL был достигнут после возврата'],
+        visible=['нет подтверждённого lower high / higher low', 'структура осталась неопределённой', pos_line],
+        secondary=['Lower high / higher low not confirmed', 'Swing not confirmed', 'Structure uncertain'],
+        improve=['ждать подтверждение LH для SHORT или HL для LONG', 'не входить до подтверждённого swing'],
+        evidence=bool(any_flag('lh_hl_not_confirmed','lower_high_not_confirmed','higher_low_not_confirmed')))
+    add(5.4, 'htf_structure_against_trade',
+        primary=f'{side_word} against HTF structure',
+        scenario='Младший сигнал был против 15m/30m/HTF структуры. Без поддержки старшего таймфрейма движение не получило continuation, и цена вернулась к SL.',
+        analysis_add=['HTF structure была против сделки'],
+        happened=['LTF setup не получил поддержку HTF', 'старшая структура потянула цену против входа', 'SL был достигнут после HTF pressure'],
+        visible=['15m/30m context не подтверждал сделку', 'сделка была против старшей структуры', pos_line],
+        secondary=['HTF structure against trade', 'LTF signal against HTF', 'No HTF confirmation'],
+        improve=['фильтровать сделки против явной HTF структуры', 'требовать neutral/aligned HTF context'],
+        evidence=bool(any_flag('htf_structure_against_trade','ltf_against_htf','against_htf_structure') or (strong_bad_context and contains_any(structure_text, ('15m', '30m', 'htf')) and no_tp)))
+
+    # 6) MOMENTUM / импульс
+    add(5.2, 'counter_impulse_fast',
+        primary='Counter impulse appeared fast after entry',
+        scenario='После входа быстро появился импульс против позиции. Это отменило идею continuation и показало, что встречная сторона сильнее в моменте.',
+        analysis_add=['counter impulse появился быстро после entry'],
+        happened=['первая сильная свеча пошла против входа', 'continuation не подтвердился', 'SL был достигнут на counter impulse'],
+        visible=['быстрое движение против entry', 'свеча против позиции сильнее first push в сторону сделки', pos_line],
+        secondary=['Counter impulse appeared fast', 'Immediate opposite pressure', 'Momentum against trade'],
+        improve=['не держать setup, если первая сильная свеча после входа против позиции', 'требовать first impulse в сторону сделки'],
+        evidence=bool(any_flag('counter_impulse_fast','fast_counter_impulse') or immediate_counter))
+    add(5.0, 'volume_spike_exhaustion',
+        primary='Volume spike exhaustion before entry',
+        scenario='Перед входом был volume/momentum spike, который больше похож на exhaustion, чем на начало continuation. После spike движение затухло и цена пошла к SL.',
+        analysis_add=['перед входом был volume spike exhaustion'],
+        happened=['после spike не было нового expansion', 'momentum затух', 'SL был достигнут после обратной реакции'],
+        visible=['большая импульсная свеча/volume spike перед входом', 'после неё нет продолжения', pos_line],
+        secondary=['Volume spike exhaustion', 'Momentum spent', 'No follow-through after spike'],
+        improve=['не входить сразу после exhaustion spike', 'ждать нормальный pullback и новый impulse'],
+        evidence=bool(any_flag('volume_spike_exhaustion','exhaustion_volume_spike','climax_volume')))
+    add(4.9, 'no_fresh_expansion_candle',
+        primary='No fresh expansion candle after entry',
+        scenario='После входа не появилась новая expansion-свеча в сторону сделки. Без fresh expansion setup остался слабым и цена дошла до SL.',
+        analysis_add=['fresh expansion candle после entry отсутствовала'],
+        happened=['свечи после входа были слабыми', 'directional momentum не появился', 'SL был достигнут после слабого follow-through'],
+        visible=['нет новой большой свечи в сторону сделки после entry', 'тела свечей не расширяются по направлению', pos_line],
+        secondary=['No fresh expansion candle', 'No post-entry expansion', 'Weak momentum'],
+        improve=['требовать fresh expansion после confirm', 'не брать сделки без новой impulse candle'],
+        evidence=bool(any_flag('no_fresh_expansion_candle','no_post_entry_expansion') or (weak_follow and no_tp)))
+
+    # 7) FVG / OB качество зоны
+    add(4.8, 'fvg_too_small',
+        primary='FVG too small / weak imbalance',
+        scenario='FVG была слишком маленькой или слабой, поэтому зона не дала качественную реакцию. Entry получил слабый continuation и ушёл к SL.',
+        analysis_add=['FVG была маленькая/слабая'],
+        happened=['FVG не дала сильный retest response', 'цена не продолжила направление', 'SL был достигнут после слабой реакции зоны'],
+        visible=['FVG выглядит маленькой относительно шума свечей', 'imbalance недостаточно сильный', pos_line],
+        secondary=['FVG too small', 'Weak imbalance', 'Low-quality FVG'],
+        improve=['фильтровать слишком маленькие FVG', 'брать только FVG с нормальным displacement'],
+        evidence=bool(any_flag('fvg_too_small','small_fvg','weak_fvg') or (ob_fvg_route and any_text('fvg too small'))))
+    add(5.0, 'fvg_already_mitigated',
+        primary='FVG already mitigated before entry',
+        scenario='FVG уже была mitigated до входа. Повторный вход от такой зоны слабее, поэтому реакция не удержала цену и SL был достигнут.',
+        analysis_add=['FVG уже была mitigated до entry'],
+        happened=['зона уже отработала раньше', 'повторная реакция была слабой', 'цена ушла против сделки'],
+        visible=['FVG была протестирована/закрыта до входа', 'entry был по уже использованной зоне', pos_line],
+        secondary=['FVG already mitigated', 'Used imbalance', 'Weak repeat reaction'],
+        improve=['не использовать уже mitigated FVG как свежую', 'снижать score повторно протестированных зон'],
+        evidence=bool(any_flag('fvg_already_mitigated','fvg_mitigated_before_entry','used_fvg')))
+    add(5.0, 'fvg_filled_before_entry',
+        primary='FVG filled before entry',
+        scenario='FVG была заполнена до входа, поэтому imbalance уже не давал сильного преимущества. После entry цена не получила continuation и дошла до SL.',
+        analysis_add=['FVG была заполнена до entry'],
+        happened=['imbalance уже был закрыт', 'зона не дала свежей реакции', 'SL был достигнут после слабого continuation'],
+        visible=['FVG уже filled перед входом', 'нет свежего imbalance на момент entry', pos_line],
+        secondary=['FVG filled before entry', 'No fresh imbalance', 'Filled FVG'],
+        improve=['не входить по заполненной FVG', 'требовать fresh imbalance на момент entry'],
+        evidence=bool(any_flag('fvg_filled_before_entry','fvg_filled','imbalance_filled_before_entry')))
+    add(4.9, 'ob_already_tested',
+        primary='OB already tested / not fresh',
+        scenario='OB уже был протестирован до входа. Свежесть зоны потеряна, поэтому реакция оказалась слабой и цена дошла до SL.',
+        analysis_add=['OB уже был tested до entry'],
+        happened=['повторный retest OB не дал сильной реакции', 'цена не удержала зону', 'SL был достигнут'],
+        visible=['OB уже имел предыдущий тест', 'entry был не от свежей зоны', pos_line],
+        secondary=['OB already tested', 'Not fresh OB', 'Weak repeat OB reaction'],
+        improve=['снижать score уже протестированных OB', 'предпочитать fresh/origin OB'],
+        evidence=bool(any_flag('ob_already_tested','ob_tested_before_entry','used_ob')))
+    add(4.9, 'ob_weak_not_origin',
+        primary='OB weak / not true origin',
+        scenario='OB не был настоящей origin-зоной displacement. Такая зона слабее удерживает цену, поэтому entry не получил continuation и SL сработал.',
+        analysis_add=['OB был weak / not origin'],
+        happened=['OB не дал сильной реакции', 'цена не продолжила направление', 'SL был достигнут после слабого zone hold'],
+        visible=['OB не является origin сильного displacement', 'реакция от OB слабая', pos_line],
+        secondary=['OB weak / not origin', 'Weak OB quality', 'No origin displacement'],
+        improve=['использовать только OB у origin displacement', 'фильтровать слабые OB без импульса'],
+        evidence=bool(any_flag('ob_weak_not_origin','weak_ob','ob_not_origin')))
+    add(5.1, 'zone_too_close_to_opposing_zone',
+        primary='Zone too close to opposing zone',
+        scenario='Входная зона находилась слишком близко к встречной demand/supply зоне. Пространства для continuation было мало, поэтому цена быстро получила обратную реакцию и ушла к SL.',
+        analysis_add=['entry zone была слишком близко к opposing zone'],
+        happened=['встречная зона быстро остановила движение', 'TP1 не был нормально поставлен под угрозу', 'цена вернулась к SL'],
+        visible=['между entry zone и opposing zone мало расстояния', 'clean space отсутствовал', pos_line],
+        secondary=['Zone too close to opposing zone', 'No clean zone-to-zone space', 'Opposing zone nearby'],
+        improve=['требовать расстояние между зоной входа и встречной зоной', 'не брать OB/FVG прямо перед opposing zone'],
+        evidence=bool(any_flag('zone_too_close_to_opposing_zone','opposing_zone_too_close') or (ob_fvg_route and bad_zone_blocks and tight_space)))
+    add(4.8, 'zone_inside_chop_range',
+        primary='FVG/OB zone inside chop/range',
+        scenario='Зона входа находилась внутри chop/range, а не в чистой импульсной структуре. Поэтому реакция была слабой, и цена пошла к SL.',
+        analysis_add=['FVG/OB зона была внутри chop/range'],
+        happened=['range не дал directional expansion', 'зона не удержала price action', 'SL был достигнут после возврата в range'],
+        visible=['OB/FVG расположена внутри локального range', 'свечи вокруг зоны выглядят choppy', pos_line],
+        secondary=['Zone inside chop/range', 'Low-quality zone context', 'Range zone failed'],
+        improve=['не брать зоны внутри chop', 'ждать выход из range или зону у края структуры'],
+        evidence=bool(any_flag('zone_inside_chop_range','zone_inside_range','fvg_ob_inside_chop') or (ob_fvg_route and range_trap)))
+
+    # 8) LIQUIDITY
+    add(5.0, 'entry_after_liquidity_already_taken',
+        primary='Entry after liquidity already taken',
+        scenario='Ликвидность по направлению сделки уже была снята до входа. После этого у цены стало меньше причины продолжать движение, поэтому momentum затух и SL был достигнут.',
+        analysis_add=['entry был после уже снятой ликвидности'],
+        happened=['после снятия ликвидности continuation не появился', 'цена дала обратную реакцию', 'SL был достигнут'],
+        visible=['liquidity target уже был взят перед entry', 'после entry нет нового liquidity magnet', pos_line],
+        secondary=['Entry after liquidity already taken', 'Liquidity already swept', 'No fresh liquidity magnet'],
+        improve=['не входить после уже снятого liquidity target без нового setup', 'искать следующий liquidity target до TP1'],
+        evidence=bool(any_flag('entry_after_liquidity_taken','liquidity_already_taken_before_entry','liquidity_already_swept')))
+    add(5.1, 'equal_highs_lows_magnet_against_trade',
+        primary='Equal highs/lows magnet was against trade',
+        scenario='Рядом была ликвидность equal highs/lows против направления сделки. Рынок потянулся к этому магниту, поэтому позиция быстро ушла к SL.',
+        analysis_add=['equal highs/lows liquidity magnet был против сделки'],
+        happened=['цена потянулась к встречной ликвидности', 'continuation по сделке не подтвердился', 'SL был достигнут после liquidity draw'],
+        visible=['рядом видны equal highs/lows против позиции', 'они стали более близким магнитом, чем TP1', pos_line],
+        secondary=['Equal highs/lows magnet against trade', 'Opposite liquidity draw', 'Liquidity magnet to SL'],
+        improve=['проверять equal highs/lows против позиции перед входом', 'не входить, если ближайший liquidity magnet находится за SL'],
+        evidence=bool(any_flag('equal_highs_lows_magnet_against_trade','equal_highs_against_trade','equal_lows_against_trade')))
+    add(5.3, 'stop_hunt_sweep_then_reclaim',
+        primary='Stop hunt / sweep then reclaim against entry',
+        scenario='Рынок сделал sweep/stop-hunt и затем reclaim против позиции. Это отменило continuation-сценарий и привело к SL.',
+        analysis_add=['sweep then reclaim появился против entry'],
+        happened=['снятие ликвидности не дало продолжения по сделке', 'после sweep цена вернулась против входа', 'SL был достигнут после reclaim'],
+        visible=['виден sweep уровня и быстрый reclaim', 'reclaim был против направления сделки', pos_line],
+        secondary=['Stop hunt / sweep then reclaim', 'Reclaim against entry', 'Liquidity trap'],
+        improve=['после sweep ждать подтверждение направления', 'не входить, если reclaim быстро идёт против setup'],
+        evidence=bool(any_flag('stop_hunt_sweep_then_reclaim','sweep_then_reclaim_against_entry','liquidity_trap') or (reclaim_route and any_flag('reclaim_lost_back','reclaim_not_confirmed'))))
+    add(5.0, 'untaken_liquidity_opposite_side',
+        primary='Untaken liquidity on opposite side pulled price to SL',
+        scenario='С противоположной стороны оставалась не снятая ликвидность. Она стала сильнее как магнит, чем TP1, и цена пошла за ней против позиции.',
+        analysis_add=['untaken opposite liquidity была рядом'],
+        happened=['рынок потянулся к не снятой ликвидности против entry', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после liquidity draw'],
+        visible=['за SL/против позиции была видимая ликвидность', 'по направлению TP1 магнит был слабее', pos_line],
+        secondary=['Untaken liquidity on opposite side', 'Liquidity draw against entry', 'Opposite liquidity magnet'],
+        improve=['не входить, если ближайшая не снятая ликвидность находится против сделки', 'сначала ждать sweep этой ликвидности или новый reclaim'],
+        evidence=bool(any_flag('untaken_liquidity_opposite_side','opposite_liquidity_untaken','liquidity_draw_against_trade')))
+    add(5.0, 'internal_liquidity_pulled_against_entry',
+        primary='Internal liquidity pulled price against entry',
+        scenario='Внутри локального range оставалась внутренняя ликвидность против entry. Цена сначала пошла за этой ликвидностью и выбила SL.',
+        analysis_add=['internal liquidity тянула цену против entry'],
+        happened=['цена пошла за внутренней ликвидностью', 'continuation по сделке не подтвердился', 'SL был достигнут до TP1'],
+        visible=['внутри range была ближняя liquidity pocket против позиции', 'entry был до её снятия', pos_line],
+        secondary=['Internal liquidity pulled price against entry', 'Internal liquidity draw', 'Range liquidity against trade'],
+        improve=['перед входом проверять internal liquidity внутри range', 'не входить, пока ближняя liquidity против позиции не снята'],
+        evidence=bool(any_flag('internal_liquidity_pulled_against_entry','internal_liquidity_against_trade','range_liquidity_against_entry')))
+
+    # 9) TIME / скорость сделки
+    add(4.9, 'trade_stayed_too_long_without_progress',
+        primary='Trade stayed too long without progress',
+        scenario='После входа сделка долго не показывала прогресс в сторону TP1. Чем дольше нет continuation, тем выше риск возврата к SL — именно это и произошло.',
+        analysis_add=['сделка долго стояла без прогресса'],
+        happened=['TP1 не был поставлен под угрозу в нормальное время', 'momentum постепенно затух', 'цена вернулась к SL'],
+        visible=['несколько свечей после entry не дали продвижения к TP1', 'рынок начал сжиматься/возвращаться против позиции', pos_line],
+        secondary=['Trade stayed too long without progress', 'No time-based follow-through', 'Stalled trade'],
+        improve=['добавить time-stop/soft exit, если нет прогресса', 'не держать setup после нескольких слабых свечей'],
+        evidence=bool(any_flag('trade_stayed_too_long_without_progress','time_stop_needed','no_progress_too_long') or ((duration_min or 0) >= 45 and no_tp and weak_follow)))
+    add(5.2, 'immediate_rejection_after_entry',
+        primary='Immediate rejection after entry',
+        scenario='Сразу после входа появилась реакция против позиции. Это показало, что entry попал в зону встречной силы, и цена быстро дошла до SL.',
+        analysis_add=['immediate rejection появился после entry'],
+        happened=['первая реакция после входа была против сделки', 'continuation не подтвердился', 'SL был достигнут после rejection/bounce'],
+        visible=['свечи сразу после entry показывают rejection', 'первое сильное движение было против позиции', pos_line],
+        secondary=['Immediate rejection after entry', 'Fast opposite reaction', 'Entry into reaction zone'],
+        improve=['не входить, если первая свеча после trigger сразу rejected', 'ждать нового подтверждения после rejection'],
+        evidence=bool(any_flag('immediate_rejection_after_entry','immediate_rejection') or (fast and immediate_counter)))
+
+    # 10) MULTI-TF
+    add(5.4, 'htf_demand_supply_blocked_trade',
+        primary=f'HTF {opp_zone_word} blocked the trade',
+        scenario=f'На старшем таймфрейме рядом была встречная зона {opp_zone_word}. LTF вход упёрся в HTF блок, поэтому continuation не прошёл и SL был достигнут.',
+        analysis_add=[f'HTF {opp_zone_word} блокировал путь сделки'],
+        happened=['LTF setup упёрся в HTF зону', 'цена дала реакцию от старшего уровня', 'TP1 не был нормально поставлен под угрозу'],
+        visible=[f'рядом была HTF {bad_zone_desc}', 'LTF entry был слишком близко к старшей встречной зоне', pos_line],
+        secondary=['HTF demand/supply blocked trade', 'HTF opposing zone nearby', 'LTF into HTF block'],
+        improve=['проверять HTF demand/supply перед входом', 'не входить LTF setup прямо в HTF встречную зону'],
+        evidence=bool(any_flag('htf_demand_supply_blocked_trade','htf_opposing_zone_blocked','htf_zone_blocks_tp1') or (contains_any(structure_text, ('htf', '15m', '30m')) and bad_zone_blocks)))
+    add(5.0, 'ltf_signal_inside_htf_range',
+        primary='LTF signal inside HTF range',
+        scenario='Сигнал на младшем таймфрейме появился внутри старшего range. Внутри HTF range часто нет чистого continuation, поэтому цена вернулась к SL.',
+        analysis_add=['LTF signal был внутри HTF range'],
+        happened=['HTF range не дал clean expansion', 'младший trigger не получил продолжение', 'SL был достигнут после range reaction'],
+        visible=['на HTF цена была внутри диапазона', 'LTF setup не был у сильного HTF края', pos_line],
+        secondary=['LTF signal inside HTF range', 'HTF range chop', 'No HTF expansion'],
+        improve=['внутри HTF range брать только края диапазона', 'ждать breakout/retest HTF range'],
+        evidence=bool(any_flag('ltf_signal_inside_htf_range','inside_htf_range','htf_range_chop') or (midrange and contains_any(structure_text, ('htf range', '15m range', '30m range')))))
+    add(5.1, 'htf_opposite_fvg_ob_nearby',
+        primary='HTF FVG/OB opposite direction nearby',
+        scenario='Рядом находилась HTF FVG/OB зона против направления сделки. Эта старшая зона дала встречную реакцию и заблокировала путь к TP1.',
+        analysis_add=['HTF opposite FVG/OB была рядом'],
+        happened=['цена отреагировала на HTF opposing zone', 'LTF continuation не прошёл', 'SL был достигнут после реакции старшей зоны'],
+        visible=['рядом есть HTF FVG/OB против позиции', 'entry был слишком близко к старшей opposing zone', pos_line],
+        secondary=['HTF FVG/OB opposite direction nearby', 'Opposing HTF imbalance', 'HTF OB/FVG reaction'],
+        improve=['не входить LTF setup прямо перед HTF opposite FVG/OB', 'цель TP1 ставить до HTF opposing zone'],
+        evidence=bool(any_flag('htf_opposite_fvg_ob_nearby','htf_opposing_fvg_ob','opposite_htf_ob_fvg_nearby')))
 
     if side_u == 'SHORT':
         demand_desc = str(demand_ctx.get('desc') or 'local low / support')
