@@ -2634,6 +2634,14 @@ def _mid_level_quality_veto_reason(sig=None, ta: dict | None = None, it: dict | 
             min_rr_hard = float(os.getenv("MID_FINAL_HARD_MIN_RR", "1.20" if str(market).upper() == "FUTURES" else "1.00") or 1.20)
         except Exception:
             min_rr_hard = 1.20 if str(market).upper() == "FUTURES" else 1.00
+        # User-facing structural-RR guard: after SL is moved behind real invalidation,
+        # do not send the signal if the final geometry is no longer worth the risk.
+        try:
+            trade_min_rr = _trade_env_float("TRADE_REJECT_IF_RR_AFTER_STRUCT_SL_BELOW", 1.30)
+            if trade_min_rr > 0:
+                min_rr_hard = max(float(min_rr_hard), float(trade_min_rr))
+        except Exception:
+            min_rr_hard = max(float(min_rr_hard), 1.30)
         target = tp2 if tp2 > 0 else tp1
         rr = (abs(target - entry) / risk) if (entry > 0 and target > 0 and risk > 1e-12) else 0.0
         if target > 0 and risk > 1e-12 and rr + 1e-12 < min_rr_hard:
@@ -17744,6 +17752,31 @@ def _be_is_armed(*, side: str, price: float, tp1: float | None, tp2: float | Non
         return (px >= arm_lvl) if s == "LONG" else (px <= arm_lvl)
     except Exception:
         return True
+def _trade_env_float(names, default: float) -> float:
+    """Read the first valid float from a list of ENV names.
+
+    TRADE_* names are the user-facing knobs for signal geometry.  MID_* aliases
+    are kept for backward compatibility with old Railway variables.
+    """
+    try:
+        if isinstance(names, str):
+            names = [names]
+        for name in names:
+            try:
+                raw = os.getenv(str(name), "")
+            except Exception:
+                raw = ""
+            if raw is None or str(raw).strip() == "":
+                continue
+            try:
+                return float(str(raw).replace(",", "."))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return float(default)
+
+
 def _mid_max_sl_pct() -> float:
     try:
         v = float(os.getenv("MID_MAX_SL_PCT", "10") or 10.0)
@@ -17822,31 +17855,60 @@ def _build_levels(direction: str, entry: float, atr: float, *, tp2_r: float | No
 
 
 def _mid_struct_zone_bounds(ta: dict | None = None, it: dict | None = None) -> tuple[float | None, float | None]:
+    """Return the broadest known structural zone around the entry idea.
+
+    Sources can come from pending records (entry_low/entry_high), TA snapshots
+    (OB/FVG zones), or older key names.  This is the zone whose far edge becomes
+    real invalidation for SL placement: SHORT -> above high, LONG -> below low.
+    """
     ta = ta or {}
     it = it or {}
-    vals_lo = []
-    vals_hi = []
-    for src in (ta, it):
+    vals_lo: list[float] = []
+    vals_hi: list[float] = []
+
+    def _push_pair(lo, hi) -> None:
         try:
-            lo = src.get("entry_low")
-            hi = src.get("entry_high")
+            lo_f = float(lo)
+            hi_f = float(hi)
         except Exception:
-            lo = hi = None
-        try:
-            lo_f = float(lo) if lo is not None else None
-        except Exception:
-            lo_f = None
-        try:
-            hi_f = float(hi) if hi is not None else None
-        except Exception:
-            hi_f = None
-        if lo_f is not None and hi_f is not None and math.isfinite(lo_f) and math.isfinite(hi_f) and hi_f > lo_f > 0:
+            return
+        if not (math.isfinite(lo_f) and math.isfinite(hi_f)):
+            return
+        lo_f, hi_f = float(min(lo_f, hi_f)), float(max(lo_f, hi_f))
+        if hi_f > lo_f > 0:
             vals_lo.append(lo_f)
             vals_hi.append(hi_f)
+
+    pair_keys = (
+        ("entry_low", "entry_high"),
+        ("zone_low", "zone_high"),
+        ("entry_zone_low", "entry_zone_high"),
+        ("retest_low", "retest_high"),
+        ("ob_low", "ob_high"),
+        ("fvg_low", "fvg_high"),
+        ("order_block_low", "order_block_high"),
+        ("fair_value_gap_low", "fair_value_gap_high"),
+    )
+    tuple_keys = ("ob_zone", "fvg_zone", "entry_zone", "zone", "retest_zone")
+
+    for src in (ta, it):
+        if not isinstance(src, dict):
+            continue
+        for lo_key, hi_key in pair_keys:
+            _push_pair(src.get(lo_key), src.get(hi_key))
+        for key in tuple_keys:
+            z = src.get(key)
+            try:
+                if isinstance(z, dict):
+                    _push_pair(z.get("low") or z.get("lo") or z.get("min"), z.get("high") or z.get("hi") or z.get("max"))
+                elif isinstance(z, (list, tuple)) and len(z) >= 2:
+                    _push_pair(z[0], z[1])
+            except Exception:
+                pass
+
     if vals_lo and vals_hi:
         return (float(min(vals_lo)), float(max(vals_hi)))
     return (None, None)
-
 
 def _mid_pick_entry_anchor(direction: str,
                            trigger_price: float,
@@ -17911,9 +17973,9 @@ def _mid_min_stop_distance(entry: float,
         zone_w = 0.0
         if zlo is not None and zhi is not None and zhi > zlo:
             zone_w = float(zhi - zlo)
-        min_atr = float(os.getenv("MID_MIN_SL_ATR", "0.55") or 0.55)
-        min_pct = float(os.getenv("MID_MIN_SL_PCT", "0.0018") or 0.0018)
-        zone_mult = float(os.getenv("MID_MIN_SL_ZONE_MULT", "1.10") or 1.10)
+        min_atr = _trade_env_float(("TRADE_MIN_SL_ATR_MULT", "MID_MIN_SL_ATR"), 0.45)
+        min_pct = _trade_env_float(("TRADE_MIN_SL_PCT", "MID_MIN_SL_PCT"), 0.0018)
+        zone_mult = _trade_env_float(("TRADE_MIN_SL_ZONE_MULT", "MID_MIN_SL_ZONE_MULT"), 1.10)
         return max(
             atr_f * max(0.0, min_atr),
             abs(entry_f) * max(0.0, min_pct),
@@ -17947,8 +18009,8 @@ def _mid_anchor_sl_to_structure(direction: str,
     if entry_f <= 0 or sl_f <= 0:
         return sl_f
 
-    buf_atr = float(os.getenv("MID_STRUCT_SL_BUFFER_ATR", "0.25") or 0.25)
-    buf_pct = float(os.getenv("MID_STRUCT_SL_BUFFER_PCT", "0.0010") or 0.0010)
+    buf_atr = _trade_env_float(("TRADE_SL_BUFFER_ATR_MULT", "MID_STRUCT_SL_BUFFER_ATR"), 0.20)
+    buf_pct = _trade_env_float(("TRADE_SL_BUFFER_PCT", "MID_STRUCT_SL_BUFFER_PCT"), 0.0010)
     buf = max(atr_f * max(0.0, buf_atr), abs(entry_f) * max(0.0, buf_pct), 1e-12)
     min_risk = _mid_min_stop_distance(entry_f, atr_f, ta, it)
 
@@ -18147,9 +18209,9 @@ def _mid_build_structure_first_levels(direction: str,
 
     - Entry stays as provided by the caller.
     - raw ATR SL is built first as fallback/raw-risk geometry.
-    - SL is then anchored to nearest structure and only after that clamped by the 10% cap.
-    - TP1/TP2 prefer structure; missing targets are completed from risk geometry.
-    - RR is displayed from the pre-clamp idea (raw/structural reference), not from an artificially tightened capped SL.
+    - SL is then anchored behind real structure and only after that clamped by the 10% cap.
+    - TP1/TP2 prefer structure; missing targets are completed from final structural risk geometry.
+    - RR is recalculated from the final structural SL; low-RR layouts are rejected later.
     """
     entry_f = float(entry or 0.0)
     atr_f = abs(float(atr or 0.0))
@@ -18181,8 +18243,8 @@ def _mid_build_structure_first_levels(direction: str,
 
     tp1_emit, tp2_emit, _ = _mid_finalize_targets(direction, entry_f, sl_emit, tp1_emit, tp2_emit, atr_f, market=market)
 
-    # RR reference: use the pre-clamp structural idea when available, otherwise raw ATR stop.
-    sl_rr_ref = float(sl_struct) if float(sl_struct) > 0 else float(sl_raw)
+    # RR reference: use the final structural SL that will actually be sent.
+    sl_rr_ref = float(sl_emit) if float(sl_emit) > 0 else (float(sl_struct) if float(sl_struct) > 0 else float(sl_raw))
     rr_emit = _rr_from_levels(entry_f, sl_rr_ref, tp1_emit, tp2_emit)
     return float(sl_emit), float(tp1_emit), float(tp2_emit), float(rr_emit), float(sl_rr_ref)
 
