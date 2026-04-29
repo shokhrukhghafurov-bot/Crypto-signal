@@ -13125,7 +13125,7 @@ def _mid_setup_source_label(source: str | None) -> str:
         "origin": "Origin",
         "breakout": "Breakout",
         "zone_retest": "Zone retest",
-        "normal_pending_trigger": "Normal pending trigger",
+        "normal_pending_trigger": "Structure pending trigger",
         "liquidity_reclaim": "Liquidity reclaim",
     }
     return labels.get(src, "")
