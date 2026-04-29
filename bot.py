@@ -3495,6 +3495,13 @@ def _report_pnl_pct(pnl_total_pct: float | int | None) -> str:
 
 
 def _report_rr_str(entry: float, sl: float, tp1: float, tp2: float) -> str:
+    """Closed-card RR.
+
+    The report card prints TP1 on every LOSS card, so RR must be calculated to TP1
+    by default. Otherwise the card can show 1:2.40 while the printed TP1 is only
+    around 1:1.40. Set LOSS_CARD_RR_TARGET=TP2 only if you intentionally want
+    final-target RR in closed reports.
+    """
     try:
         entry = float(entry or 0.0)
         sl = float(sl or 0.0)
@@ -3505,7 +3512,8 @@ def _report_rr_str(entry: float, sl: float, tp1: float, tp2: float) -> str:
         risk = abs(entry - sl)
         if risk <= 0:
             return "-"
-        target = tp2 if tp2 > 0 and abs(tp2 - tp1) > 1e-12 else tp1
+        rr_target = str(os.getenv('LOSS_CARD_RR_TARGET', 'TP1') or 'TP1').strip().upper()
+        target = tp2 if rr_target == 'TP2' and tp2 > 0 and abs(tp2 - tp1) > 1e-12 else tp1
         if target <= 0:
             return "-"
         reward = abs(target - entry)
@@ -6094,13 +6102,13 @@ def _report_setup_label_human(source: str | None) -> str:
         "zone touch": "zone retest",
         "zone touch retest": "zone retest",
         "возврат в зону": "zone retest",
-        "normal pending": "normal pending trigger",
-        "normal pending trigger": "normal pending trigger",
-        "pending": "normal pending trigger",
-        "pending trigger": "normal pending trigger",
-        "обычный trigger": "normal pending trigger",
-        "обычный триггер": "normal pending trigger",
-        "обычный pending trigger": "normal pending trigger",
+        "normal pending": "Structure pending trigger",
+        "normal pending trigger": "Structure pending trigger",
+        "pending": "Structure pending trigger",
+        "pending trigger": "Structure pending trigger",
+        "обычный trigger": "Structure pending trigger",
+        "обычный триггер": "Structure pending trigger",
+        "обычный pending trigger": "Structure pending trigger",
         "liquidity reclaim": "liquidity_reclaim",
         "liquidity reclaim emit": "liquidity_reclaim",
         "liquidity reclaim entry": "liquidity_reclaim",
@@ -6231,7 +6239,7 @@ def _report_setup_label_from_row(row: dict) -> str:
     try:
         label = _row_ui_setup_label(row)
         if label:
-            return label
+            return _report_setup_label_sanitize(row, label)
 
         sid = 0
         try:
@@ -6246,7 +6254,7 @@ def _report_setup_label_from_row(row: dict) -> str:
                 sig = None
             label = _report_setup_label_from_signal(sig)
             if label:
-                return label
+                return _report_setup_label_sanitize(row, label)
 
             try:
                 cached_text = str(ORIGINAL_SIGNAL_TEXT.get((0, sid)) or "")
@@ -6254,12 +6262,12 @@ def _report_setup_label_from_row(row: dict) -> str:
                 cached_text = ""
             label = _report_extract_setup_label_from_text(cached_text)
             if label:
-                return label
+                return _report_setup_label_sanitize(row, label)
 
         for candidate in (row.get("risk_note"), row.get("orig_text")):
             label = _report_extract_setup_label_from_text(str(candidate or ""))
             if label:
-                return label
+                return _report_setup_label_sanitize(row, label)
     except Exception:
         pass
     return ""
@@ -6324,6 +6332,114 @@ def _loss_card_tiny_space_only(analysis: dict) -> bool:
     if analysis.get('tp1_too_close_no_clean_space'):
         return True
     return False
+
+
+
+def _loss_card_has_real_entry_position(analysis: dict) -> bool:
+    """Return True only when entry-position was actually measured, not the 0.50 default."""
+    if not isinstance(analysis, dict):
+        return False
+    if analysis.get('entry_position_in_prior_range') not in (None, ''):
+        return True
+    if analysis.get('entry_position_in_range') not in (None, ''):
+        return True
+    return False
+
+
+def _loss_card_entry_position_line(analysis: dict, *, prefix: str = 'позиция входа в range') -> str:
+    """Safe range-position line for cards.
+
+    Old cards printed `0.50` even when no real snapshot existed. That made the card
+    look exact while it was only the default. Now we print the range position only
+    when the value exists in analysis and the TF is known/derived.
+    """
+    if not _loss_card_has_real_entry_position(analysis):
+        return ''
+    try:
+        pos = float(analysis.get('entry_position_in_prior_range') if analysis.get('entry_position_in_prior_range') not in (None, '') else analysis.get('entry_position_in_range'))
+        if not math.isfinite(pos):
+            return ''
+        tf = str(analysis.get('entry_position_tf') or analysis.get('preferred_snapshot_tf') or '').strip()
+        suffix = f' ({tf})' if tf else ''
+        return f'{prefix}: {pos:.2f}{suffix}'
+    except Exception:
+        return ''
+
+
+
+
+def _loss_card_normalize_visible_position_lines(lines: list[str], analysis: dict) -> list[str]:
+    """Remove fake/default range-position lines and replace them with a measured one."""
+    out = []
+    for x in list(lines or []):
+        sx = str(x or '').strip()
+        if not sx:
+            continue
+        if sx.lower().startswith('позиция входа'):
+            continue
+        out.append(sx)
+    pos_line = _loss_card_entry_position_line(analysis)
+    if pos_line:
+        out.append(pos_line)
+    return list(dict.fromkeys(out))
+
+
+def _loss_card_real_rr_to_tp1(entry: float, sl: float, tp1: float) -> str:
+    """RR used in closed reports must match the printed TP1 line."""
+    try:
+        entry = float(entry or 0.0)
+        sl = float(sl or 0.0)
+        tp1 = float(tp1 or 0.0)
+        risk = abs(entry - sl)
+        reward = abs(tp1 - entry)
+        if entry <= 0 or sl <= 0 or tp1 <= 0 or risk <= 0 or reward <= 0:
+            return '-'
+        return f'{(reward / risk):.2f}'
+    except Exception:
+        return '-'
+
+
+def _loss_card_route_label(route: str | None) -> str:
+    route = str(route or '').strip()
+    labels = {
+        'smc_ob_fvg_overlap': 'OB+FVG priority emit',
+        'smc_htf_ob_ltf_fvg': 'HTF OB + LTF FVG retest emit',
+        'smc_bos_retest_confirm': 'BOS → FVG/OB retest → confirm',
+        'smc_displacement_origin': 'Displacement origin fast-path',
+        'smc_dual_fvg_origin': 'Dual/stacked FVG origin',
+        'smc_liquidity_reclaim': 'Liquidity sweep → reclaim → BOS continuation',
+    }
+    return labels.get(route, '')
+
+
+def _report_setup_label_is_generic(label: str | None) -> bool:
+    raw = str(label or '').strip().lower().replace('_', ' ')
+    raw = re.sub(r'\s+', ' ', raw)
+    return raw in {'normal pending trigger', 'normal pending', 'pending trigger', 'pending', 'обычный trigger', 'обычный триггер'}
+
+
+def _report_setup_label_sanitize(row: dict, label: str) -> str:
+    """Avoid showing the useless `normal pending trigger` label when a route is known."""
+    try:
+        src = row if isinstance(row, dict) else {}
+        if not _report_setup_label_is_generic(label):
+            return str(label or '').strip()
+        route = str(src.get('smc_setup_route') or src.get('emit_route') or '').strip()
+        if not route:
+            ca = src.get('close_analysis_json')
+            if isinstance(ca, str):
+                try:
+                    ca = json.loads(ca)
+                except Exception:
+                    ca = {}
+            if isinstance(ca, dict):
+                route = str(ca.get('route_key') or ca.get('smc_setup_route') or ca.get('emit_route') or '').strip()
+        route_label = _loss_card_route_label(route)
+        if route_label:
+            return route_label
+        return 'Structure pending trigger'
+    except Exception:
+        return str(label or '').strip()
 
 
 def _loss_card_apply_price_location_override(src: dict, analysis: dict, *, side: str) -> None:
@@ -7559,6 +7675,192 @@ def _loss_card_after_tp1_payload(src: dict, analysis: dict, *, side: str, durati
     }
 
 
+
+def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, duration_min: int | None = None) -> dict:
+    """Score visible chart reasons and choose the strongest one.
+
+    LOSS cards can have many simultaneous facts: tight SL, late entry after dump,
+    demand/supply on the path to TP1, failed reclaim, bullish/bearish context, etc.
+    The old branch order could pick one generic reason too early. This function
+    ranks the evidence so the card prints the dominant visible reason and includes
+    the other factors as secondary labels.
+    """
+    if str(os.getenv('LOSS_CARD_RANKED_REASON_ENABLED', '1')).strip().lower() in ('0', 'false', 'no', 'off'):
+        return {}
+    src = dict(src or {})
+    analysis = dict(analysis or {})
+    side_u = str(side or src.get('side') or analysis.get('side') or '').upper().strip()
+    if side_u not in ('LONG', 'SHORT'):
+        return {}
+
+    def f(k: str, default: float = 0.0) -> float:
+        try:
+            v = analysis.get(k)
+            return default if v in (None, '') else float(str(v).replace(',', '.'))
+        except Exception:
+            return default
+
+    def fs(obj: dict, k: str, default: float = 0.0) -> float:
+        try:
+            v = obj.get(k) if isinstance(obj, dict) else None
+            return default if v in (None, '') else float(str(v).replace(',', '.'))
+        except Exception:
+            return default
+
+    def b(k: str) -> bool:
+        v = analysis.get(k)
+        if isinstance(v, str):
+            return v.strip().lower() in ('1', 'true', 'yes', 'on', 'да', 'есть')
+        return bool(v)
+
+    entry = fs(src, 'entry') or f('entry')
+    sl = fs(src, 'sl') or f('sl')
+    tp1 = fs(src, 'tp1') or f('tp1')
+    if entry <= 0 or sl <= 0:
+        return {}
+
+    cs = f('clean_space_to_tp1_pct')
+    if cs <= 0 and tp1 > 0:
+        if side_u == 'LONG' and tp1 > entry:
+            cs = ((tp1 - entry) / entry) * 100.0
+        elif side_u == 'SHORT' and tp1 < entry:
+            cs = ((entry - tp1) / entry) * 100.0
+    risk_pct = f('risk_pct_to_sl')
+    if risk_pct <= 0:
+        risk_pct = abs((sl - entry) / entry) * 100.0
+    try:
+        tight_sl_pct = float(str(os.getenv('LOSS_CARD_TIGHT_SL_PCT', '0.38') or '0.38').replace(',', '.'))
+    except Exception:
+        tight_sl_pct = 0.38
+    try:
+        tight_space_pct = float(str(os.getenv('LOSS_CARD_TIGHT_TP1_SPACE_PCT', '0.75') or '0.75').replace(',', '.'))
+    except Exception:
+        tight_space_pct = 0.75
+
+    pos = f('entry_position_in_prior_range', f('entry_position_in_range', 0.5))
+    pos_known = _loss_card_has_real_entry_position(analysis)
+    l6, l12, l24, premove = f('local_pre_move_6_pct'), f('local_pre_move_12_pct'), f('local_pre_move_24_pct'), f('pre_entry_move_pct')
+    first_push = abs(f('first_push_pct'))
+    against = abs(f('against_move_first3_pct'))
+    no_tp = (analysis.get('tp1_threatened') is False) or b('tp1_too_close_no_clean_space') or b('weak_followthrough') or b('no_post_entry_expansion')
+    fast = bool(b('fast_invalidation') or b('immediate_invalidation') or (duration_min is not None and duration_min <= 15))
+    tight_space = bool(0 < cs <= tight_space_pct)
+    sl_tight = bool(risk_pct > 0 and (risk_pct <= tight_sl_pct or (cs > 0 and risk_pct <= cs * 0.88)))
+    normal_pullback = bool(sl_tight and no_tp and (against >= max(first_push * 1.05, risk_pct * 0.55, 0.08) or fast))
+
+    demand_ctx = _loss_card_real_zone_context(analysis, 'demand')
+    supply_ctx = _loss_card_real_zone_context(analysis, 'supply')
+    demand_seen = bool(demand_ctx.get('has_zone') or b('entry_into_demand') or b('short_above_weak_low') or analysis.get('demand_near_tfs'))
+    supply_seen = bool(supply_ctx.get('has_zone') or b('entry_into_supply') or b('entry_into_overhead_supply') or b('long_below_strong_high') or analysis.get('supply_near_tfs'))
+    demand_blocks = bool(demand_ctx.get('blocks_tp1') or b('demand_zone_blocks_tp1'))
+    supply_blocks = bool(supply_ctx.get('blocks_tp1') or b('supply_zone_blocks_tp1'))
+    bearish_ctx = bool(b('bearish_context_before_entry') or b('long_against_bearish_structure') or b('reclaim_missing') or str(analysis.get('structure_5m') or '').lower().startswith('bearish') or l6 <= -0.12 or l12 <= -0.22 or premove <= -0.45)
+    bullish_ctx = bool(b('bullish_context_before_entry') or b('short_against_bullish_structure') or b('bearish_reclaim_missing') or str(analysis.get('structure_5m') or '').lower().startswith('bullish') or l6 >= 0.12 or l12 >= 0.22 or premove >= 0.45)
+    late_long = bool(b('late_entry_after_exhausted_move') or l6 >= 0.12 or l12 >= 0.22 or l24 >= 0.35 or premove >= 0.45)
+    late_short = bool(b('late_entry_after_exhausted_move') or l6 <= -0.12 or l12 <= -0.22 or l24 <= -0.35 or premove <= -0.45)
+
+    cs_line = f'clean space до TP1: около {cs:.2f}%' if cs > 0 else 'clean space до TP1 не подтверждён свечами'
+    risk_line = f'расстояние entry → SL: около {risk_pct:.2f}%' if risk_pct > 0 else ''
+    pos_line = _loss_card_entry_position_line(analysis)
+    dline = f'вход → SL: {duration_min} мин' if duration_min is not None and duration_min > 0 else ''
+    base_analysis = [x for x in [dline, cs_line, risk_line] if x]
+
+    candidates: list[tuple[float, str, dict]] = []
+
+    def add(score: float, key: str, payload: dict):
+        if score > 0:
+            payload.setdefault('analysis_lines', base_analysis)
+            candidates.append((float(score), key, payload))
+
+    if side_u == 'SHORT':
+        failed_supply_score = (4 if bullish_ctx else 0) + (2 if supply_seen else 0) + (1 if no_tp else 0) + (1 if fast else 0)
+        late_dump_score = (3 if late_short else 0) + (2 if normal_pullback else 0) + (1 if tight_space else 0) + (1 if (pos_known and pos <= 0.55) else 0) + (1 if no_tp else 0)
+        blocked_score = (3 if demand_seen else 0) + (3 if demand_blocks else 0) + (2 if tight_space else 0) + (1 if (pos_known and pos <= 0.35) else 0) + (1 if no_tp else 0)
+        if failed_supply_score >= 5 and not demand_blocks:
+            add(failed_supply_score, 'failed_supply_bullish_context', {
+                'primary_text': 'SHORT against bullish structure / failed supply reaction',
+                'scenario_text': 'SHORT был открыт от seller/supply идеи, но рынок уже показывал bullish reclaim или buy-side pressure. Bearish reclaim не закрепился, поэтому продавец не получил continuation и покупатель выбил SL.',
+                'analysis_lines': base_analysis + ['bullish context / reclaim перед SHORT', 'bearish displacement после входа отсутствовал'],
+                'happened_lines': ['seller zone не дала сильной реакции', 'цена не закрепилась ниже entry/retest зоны', 'после входа не было clean bearish displacement', 'SL был достигнут после buy-side reclaim'],
+                'visible_lines': ['перед входом был buy-side impulse / bullish context', 'SHORT был взят без подтверждённого bearish reclaim', 'снизу сохранялся buyer pressure / demand', 'TP1 не был нормально поставлен под угрозу', pos_line],
+                'secondary_labels': ['Short against bullish structure', 'Failed supply reaction', 'No bearish reclaim', 'Weak downside follow-through'],
+                'improve_labels': ['не брать SHORT против bullish 5m/15m без bearish reclaim', 'ждать закрытие ниже demand/support', 'требовать новый bearish displacement после retest'],
+            })
+        if late_dump_score >= 5:
+            add(late_dump_score, 'late_short_sl_inside_pullback', {
+                'primary_text': 'Late SHORT after dump / SL inside normal pullback',
+                'scenario_text': 'SHORT был открыт после уже отработанного sell-side impulse, не из хорошего premium re-entry. SL стоял внутри обычного bounce/retest после dump: цена сначала дала pullback/reclaim к SL, а fresh bearish displacement после входа не появился.',
+                'analysis_lines': base_analysis + ['перед входом уже был sell-side impulse', 'SL попал в обычный bounce/retest после dump'],
+                'happened_lines': ['продавец не дал нового continuation сразу после входа', 'цена не закрепилась ниже entry/retest зоны', 'первый bounce оказался сильнее SL', 'TP1 не был нормально поставлен под угрозу'],
+                'visible_lines': ['перед входом уже прошёл sell-side impulse / dump', 'SHORT открыт поздно после движения вниз', 'SL находился внутри нормального pullback/retest-шума', 'сначала появился bounce/reclaim против SHORT', 'после входа не было clean bearish displacement', pos_line],
+                'secondary_labels': ['Late entry after dump', 'SL too tight for pullback', 'No fresh bearish displacement', 'Buyer bounce against entry'],
+                'improve_labels': ['после сильного dump ждать pullback выше / premium re-entry', 'ставить SL за реальной invalidation-зоной, не внутри bounce', 'входить только после нового bearish displacement'],
+            })
+        if blocked_score >= 5:
+            desc = str(demand_ctx.get('desc') or 'local low / support')
+            add(blocked_score, 'tp1_blocked_by_demand', {
+                'primary_text': 'TP1 blocked by local support / downside space was limited',
+                'scenario_text': f'SHORT был открыт рядом с зоной покупателя: {desc}. Путь к TP1 был короткий/заблокированный, поэтому продавец не получил clean downside-space и цена дала bounce к SL.',
+                'analysis_lines': base_analysis + ['downside до TP1 был ограничен'],
+                'happened_lines': ['продавец не смог расширить движение вниз', 'цена дала реакцию от support/demand', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после bounce/reclaim вверх'],
+                'visible_lines': [f'снизу была {desc}', 'SHORT открыт рядом с local low / support', 'между entry и TP1 не было нормального clean space', 'после входа не появился clean bearish displacement', pos_line],
+                'secondary_labels': ['TP1 blocked by demand/support', 'No clean space to TP1', 'Poor SHORT location', 'Weak downside follow-through'],
+                'improve_labels': ['не шортить прямо над local low/support', 'ждать premium re-entry выше', 'требовать clean space до TP1'],
+            })
+    else:
+        failed_demand_score = (4 if bearish_ctx else 0) + (2 if demand_seen else 0) + (1 if no_tp else 0) + (1 if fast else 0)
+        late_pump_score = (3 if late_long else 0) + (2 if normal_pullback else 0) + (1 if tight_space else 0) + (1 if (pos_known and pos >= 0.45) else 0) + (1 if no_tp else 0)
+        blocked_score = (3 if supply_seen else 0) + (3 if supply_blocks else 0) + (2 if tight_space else 0) + (1 if (pos_known and pos >= 0.65) else 0) + (1 if no_tp else 0)
+        if failed_demand_score >= 5 and not supply_blocks:
+            add(failed_demand_score, 'failed_demand_bearish_context', {
+                'primary_text': 'LONG against bearish structure / failed demand reaction',
+                'scenario_text': 'LONG был открыт от buyer/demand идеи, но рынок уже показывал bearish breakdown или seller pressure. Bullish reclaim не закрепился, поэтому покупатель не получил continuation и цена ушла к SL.',
+                'analysis_lines': base_analysis + ['bearish context / breakdown перед LONG', 'bullish displacement после входа отсутствовал'],
+                'happened_lines': ['buyer zone не дала сильной реакции', 'цена не закрепилась выше entry/retest зоны', 'после входа не было clean bullish displacement', 'SL был достигнут после sell-side pressure'],
+                'visible_lines': ['перед входом был sell-side impulse / bearish context', 'LONG был взят без подтверждённого bullish reclaim', 'сверху сохранялся seller pressure / supply', 'TP1 не был нормально поставлен под угрозу', pos_line],
+                'secondary_labels': ['Long against bearish structure', 'Failed demand reaction', 'No bullish reclaim', 'Weak upside follow-through'],
+                'improve_labels': ['не брать LONG против bearish 5m/15m без bullish reclaim', 'ждать закрытие выше supply/resistance', 'требовать новый bullish displacement после retest'],
+            })
+        if late_pump_score >= 5:
+            add(late_pump_score, 'late_long_sl_inside_pullback', {
+                'primary_text': 'Late LONG after pump / SL inside normal pullback',
+                'scenario_text': 'LONG был открыт после уже отработанного buy-side impulse, не из хорошего discount re-entry. SL стоял внутри обычного pullback/retest после pump: цена сначала дала откат к SL, а fresh bullish displacement после входа не появился.',
+                'analysis_lines': base_analysis + ['перед входом уже был buy-side impulse', 'SL попал в обычный pullback/retest после pump'],
+                'happened_lines': ['покупатель не дал нового continuation сразу после входа', 'цена не закрепилась выше entry/retest зоны', 'первый pullback оказался сильнее SL', 'TP1 не был нормально поставлен под угрозу'],
+                'visible_lines': ['перед входом уже прошёл buy-side impulse / pump', 'LONG открыт поздно после движения вверх', 'SL находился внутри нормального pullback/retest-шума', 'сначала появился откат/rejection против LONG', 'после входа не было clean bullish displacement', pos_line],
+                'secondary_labels': ['Late entry after pump', 'SL too tight for pullback', 'No fresh bullish displacement', 'Seller rejection against entry'],
+                'improve_labels': ['после сильного pump ждать pullback ниже / discount re-entry', 'ставить SL за реальной invalidation-зоной, не внутри pullback', 'входить только после нового bullish displacement'],
+            })
+        if blocked_score >= 5:
+            desc = str(supply_ctx.get('desc') or 'local high / resistance')
+            add(blocked_score, 'tp1_blocked_by_supply', {
+                'primary_text': 'TP1 blocked by local resistance / upside space was limited',
+                'scenario_text': f'LONG был открыт рядом с зоной продавца: {desc}. Путь к TP1 был короткий/заблокированный, поэтому покупатель не получил clean upside-space и цена дала rejection к SL.',
+                'analysis_lines': base_analysis + ['upside до TP1 был ограничен'],
+                'happened_lines': ['покупатель не смог расширить движение вверх', 'цена дала реакцию от resistance/supply', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после rejection/отката'],
+                'visible_lines': [f'сверху была {desc}', 'LONG открыт рядом с local high / resistance', 'между entry и TP1 не было нормального clean space', 'после входа не появился clean bullish displacement', pos_line],
+                'secondary_labels': ['TP1 blocked by supply/resistance', 'No clean space to TP1', 'Poor LONG location', 'Weak upside follow-through'],
+                'improve_labels': ['не лонговать прямо под local high/resistance', 'ждать discount re-entry ниже', 'требовать clean space до TP1'],
+            })
+
+    if not candidates:
+        return {}
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best = dict(candidates[0][2])
+    # Merge lower-ranked evidence into secondary reasons, but keep the main reason clean.
+    extra_secondary = []
+    for _, key, payload in candidates[1:3]:
+        for item in list(payload.get('secondary_labels') or [])[:2]:
+            if item not in extra_secondary:
+                extra_secondary.append(item)
+    if extra_secondary:
+        best['secondary_labels'] = list(dict.fromkeys(list(best.get('secondary_labels') or []) + extra_secondary))
+    for fld in ('analysis_lines', 'happened_lines', 'visible_lines', 'secondary_labels', 'improve_labels'):
+        best[fld] = [x for x in list(dict.fromkeys([str(v).strip() for v in list(best.get(fld) or []) if str(v).strip()]))]
+    best['visible_lines'] = _loss_card_normalize_visible_position_lines(best.get('visible_lines') or [], analysis)
+    return best
+
+
 def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool = False) -> dict:
     """Build human forensic sections exactly for Telegram LOSS report card."""
     src = dict(src or {})
@@ -7798,6 +8100,16 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         secondary_labels = [str(x) for x in list(contextual_payload.get('secondary_labels') or []) if str(x).strip()]
         improve_labels = [str(x) for x in list(contextual_payload.get('improve_labels') or []) if str(x).strip()]
 
+    ranked_payload = _loss_card_ranked_reason_payload(src, analysis, side=side, duration_min=duration_min)
+    if ranked_payload:
+        primary_text = str(ranked_payload.get('primary_text') or primary_text).strip()
+        scenario_text = str(ranked_payload.get('scenario_text') or scenario_text).strip()
+        analysis_lines = [str(x) for x in list(ranked_payload.get('analysis_lines') or []) if str(x).strip()]
+        happened_lines = [str(x) for x in list(ranked_payload.get('happened_lines') or []) if str(x).strip()]
+        visible_lines = [str(x) for x in list(ranked_payload.get('visible_lines') or []) if str(x).strip()]
+        secondary_labels = [str(x) for x in list(ranked_payload.get('secondary_labels') or []) if str(x).strip()]
+        improve_labels = [str(x) for x in list(ranked_payload.get('improve_labels') or []) if str(x).strip()]
+
     if not scenario_text:
         scenario_text = str(loss_diag.get('primary_reason_text') or loss_diag.get('reason_text') or '').strip()
     if not happened_lines:
@@ -7825,6 +8137,8 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         secondary_labels = [str(x) for x in list(loss_diag.get('secondary_reason_labels') or []) if str(x).strip()]
     if not improve_labels:
         improve_labels = [str(x) for x in list(loss_diag.get('improve_labels') or []) if str(x).strip()]
+
+    visible_lines = _loss_card_normalize_visible_position_lines(visible_lines, analysis)
 
     return {
         'primary_text': primary_text,
@@ -7872,13 +8186,16 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
     if entry > 0:
         price_lines.append(f"💰 Вход: {_fmt_report_price(entry, price_precision)}")
     if sl > 0:
-        price_lines.append(f"🛑 SL: {_fmt_report_price(sl, price_precision)}")
+        if after_tp1 and be_price > 0:
+            price_lines.append(f"🛑 SL исходный: {_fmt_report_price(sl, price_precision)}")
+        else:
+            price_lines.append(f"🛑 SL: {_fmt_report_price(sl, price_precision)}")
     if tp1 > 0:
         price_lines.append(f"🎯 TP1: {_fmt_report_price(tp1, price_precision)}")
     if has_tp2 and st != 'LOSS':
         price_lines.append(f"🚀 TP2: {_fmt_report_price(tp2, price_precision)}")
     if after_tp1 and be_price > 0:
-        price_lines.append(f"🛡 BE: {_fmt_report_price(be_price, price_precision)}")
+        price_lines.append(f"🛡 Активный SL/BE: {_fmt_report_price(be_price, price_precision)}")
     price_block = "\n".join(price_lines).strip() or "—"
 
     # Show the setup on LOSS cards by default too.
@@ -7929,7 +8246,7 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
         f"{_report_close_emoji(st)} {symbol} | {market} | {side}\n\n"
         f"📌 Статус: {_report_close_status(st, after_tp1=after_tp1)}\n"
         f"📊 Итог PnL: {_report_pnl_pct(pnl_total_pct)}\n"
-        f"📊 Risk/Reward: 1 : {rr}\n"
+        f"📊 Risk/Reward до TP1: 1 : {rr}\n"
         f"{setup_block}"
         f"{fallback_primary_block}"
         f"{scenario_block}"
