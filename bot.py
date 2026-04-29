@@ -6294,11 +6294,11 @@ def _loss_card_short_reason_title(code: str, text: str = '') -> str:
 def _loss_card_location_tp_space_pct() -> float:
     """Max TP1 clean-space (%) that still counts as blocked by nearby opposite zone."""
     try:
-        raw = os.getenv('LOSS_CARD_LOCATION_TP_SPACE_PCT', '0.95')
-        val = float(str(raw or '0.95').replace(',', '.'))
+        raw = os.getenv('LOSS_CARD_LOCATION_TP_SPACE_PCT', '1.20')
+        val = float(str(raw or '1.20').replace(',', '.'))
         return max(0.15, min(2.0, val))
     except Exception:
-        return 0.95
+        return 1.20
 
 
 
@@ -6961,12 +6961,35 @@ def _loss_card_graph_visible_override_payload(src: dict, analysis: dict, *, side
     first_push = abs(f('first_push_pct'))
     against_first = abs(f('against_move_first3_pct'))
     no_tp = ('tp1_threatened' in analysis and not b('tp1_threatened')) or b('weak_followthrough') or b('no_post_entry_expansion') or mfe < 0.35
-    tight_space_pct = _loss_diag_env_float('LOSS_CARD_GRAPH_CONTEXT_TP_SPACE_PCT', 1.05)
+    tight_space_pct = _loss_diag_env_float('LOSS_CARD_GRAPH_CONTEXT_TP_SPACE_PCT', 1.20)
     tight_space = bool(0 < cs <= max(tight_space_pct, _loss_card_location_tp_space_pct()))
     bullish_pre = bool(l6 >= 0.12 or l12 >= 0.22 or l24 >= 0.35 or premove >= 0.45 or b('bullish_context_before_entry') or str(analysis.get('structure_5m') or '').lower().startswith('bullish'))
     bearish_pre = bool(l6 <= -0.12 or l12 <= -0.22 or l24 <= -0.35 or premove <= -0.45 or b('bearish_context_before_entry') or str(analysis.get('structure_5m') or '').lower().startswith('bearish'))
     supply_seen = bool(analysis.get('supply_near_tfs') or b('overhead_bearish_fvg') or b('entry_into_supply') or b('entry_into_overhead_supply') or b('long_below_strong_high'))
     demand_seen = bool(analysis.get('demand_near_tfs') or b('underlying_bullish_fvg') or b('entry_into_demand') or b('short_above_weak_low'))
+
+    # V5: separate a real saved FVG/demand/supply zone from synthetic
+    # price-location flags. Flags like entry_into_demand can be created only
+    # because the entry was low/tight; they must not make the card say
+    # "green FVG" when the snapshot did not save an actual green FVG.
+    try:
+        _real_demand_ctx = _loss_card_real_zone_context(analysis, 'demand')
+        _real_supply_ctx = _loss_card_real_zone_context(analysis, 'supply')
+        real_demand_seen = bool(_real_demand_ctx.get('has_zone'))
+        real_supply_seen = bool(_real_supply_ctx.get('has_zone'))
+        real_demand_is_fvg = bool(_real_demand_ctx.get('is_fvg'))
+        real_supply_is_fvg = bool(_real_supply_ctx.get('is_fvg'))
+    except Exception:
+        real_demand_seen = bool(analysis.get('demand_near_tfs'))
+        real_supply_seen = bool(analysis.get('supply_near_tfs'))
+        real_demand_is_fvg = False
+        real_supply_is_fvg = False
+
+    try:
+        fast_pullback_min = int(float(os.getenv('LOSS_CARD_SHORT_AFTER_DUMP_PULLBACK_MIN', '12') or 12))
+    except Exception:
+        fast_pullback_min = 12
+    fast_sl_pullback = bool(duration_min is not None and 0 < int(duration_min) <= max(3, min(30, fast_pullback_min)))
 
     common_analysis = []
     if duration_min is not None and duration_min > 0:
@@ -7019,8 +7042,11 @@ def _loss_card_graph_visible_override_payload(src: dict, analysis: dict, *, side
                 ]
                 secondary = ['TP1 blocked by local resistance', 'No clean space to TP1', 'Weak upside follow-through', 'No retest acceptance']
                 improve = ['не брать LONG, если TP1 слишком близко к local high/resistance', 'требовать clean space до TP1', 'ждать acceptance выше уровня']
-            if supply_seen:
-                visible.insert(1, 'сверху была seller zone / red FVG / resistance')
+            if real_supply_seen:
+                if real_supply_is_fvg:
+                    visible.insert(1, 'сверху была реальная seller zone / red FVG / resistance')
+                else:
+                    visible.insert(1, 'сверху была реальная supply/resistance zone')
             if pos > 0:
                 visible.append(f'позиция входа в prior range: {pos:.2f}')
             return {
@@ -7040,7 +7066,26 @@ def _loss_card_graph_visible_override_payload(src: dict, analysis: dict, *, side
 
     else:
         if (bullish_pre or bearish_pre or demand_seen or pos <= 0.42 or tight_space) and no_tp:
-            if bullish_pre and (demand_seen or pos <= 0.55 or tight_space):
+            # V5: WLD/FLOW-type losses. The old branch called every tight
+            # SHORT "opened into demand". On the chart these are often better
+            # described as premature SHORT after an already completed dump:
+            # the direction can be right later, but the first normal pullback
+            # hits a tight SL before fresh bearish continuation appears.
+            if bearish_pre and (fast_sl_pullback or tight_space or pos <= 0.55 or demand_seen):
+                primary = 'Premature SHORT after dump / SL inside pullback'
+                scenario = ('SHORT был открыт после уже прошедшего sell-side импульса, но не из premium re-entry. '
+                            'SL оказался внутри обычного pullback/retest-движения: цена сначала дала bounce/reclaim к SL, '
+                            'а нового clean bearish displacement сразу после входа не было.')
+                visible = [
+                    'перед входом уже был sell-side impulse / движение вниз',
+                    'SHORT открыт после отработанного dump, не после нового bearish displacement',
+                    'SL стоял слишком близко и попал в обычный pullback/retest',
+                    'TP1 был рядом с local low/support, поэтому первое движение вниз не имело большого clean space',
+                    'сначала появился bounce/reclaim против SHORT',
+                ]
+                secondary = ['Premature short after dump', 'SL inside pullback', 'No fresh bearish displacement', 'Tight TP1/SL space']
+                improve = ['после сильного dump ждать pullback выше / premium re-entry', 'ставить SHORT только после нового bearish displacement', 'не ставить SL внутри обычного retest/bounce']
+            elif bullish_pre and (demand_seen or pos <= 0.55 or tight_space):
                 primary = 'SHORT against fresh bullish impulse / no bearish reclaim'
                 scenario = ('SHORT был открыт во время активного восстановления вверх, до подтверждённой реакции продавца. '
                             'Цена уже сделала buy-side reclaim/impulse, bearish reclaim не закрепился, поэтому покупатель выбил SL.')
@@ -7053,16 +7098,16 @@ def _loss_card_graph_visible_override_payload(src: dict, analysis: dict, *, side
                 secondary = ['Short against bullish impulse', 'No bearish reclaim', 'Failed supply confirmation', 'Weak downside follow-through']
                 improve = ['ждать свечной rejection от supply перед SHORT', 'требовать закрытие ниже локальной demand/support', 'не шортить fresh bullish impulse без подтверждения разворота']
             elif demand_seen or pos <= 0.42 or tight_space:
-                primary = 'SHORT opened into demand / downside was blocked'
-                scenario = ('SHORT был открыт слишком низко: путь к TP1 был рядом с local low / demand / buyer reaction zone. '
+                primary = 'SHORT opened too low / downside space was blocked'
+                scenario = ('SHORT был открыт слишком низко: путь к TP1 был рядом с local low / support / buyer reaction area. '
                             'Downside был ограничен, поэтому цена дала bounce и дошла до SL раньше, чем появилась нормальная sell-side continuation.')
                 visible = [
-                    'SHORT открыт рядом с local low / demand/support',
-                    'снизу уже была зона реакции покупателей',
+                    'SHORT открыт рядом с local low / support',
+                    'снизу уже была область реакции покупателей / local support',
                     'downside до TP1 был ограничен',
                     'после входа не появился clean bearish displacement',
                 ]
-                secondary = ['Short into demand/support', 'No clean space to TP1', 'Buyer bounce against entry', 'Weak downside follow-through']
+                secondary = ['Short too low', 'No clean space to TP1', 'Buyer bounce against entry', 'Weak downside follow-through']
                 improve = ['не шортить в discount / возле local low', 'ждать premium re-entry выше', 'требовать clean space до TP1']
             else:
                 primary = 'Late SHORT after exhausted dump near low'
@@ -7076,8 +7121,11 @@ def _loss_card_graph_visible_override_payload(src: dict, analysis: dict, *, side
                 ]
                 secondary = ['Late entry', 'Sell-side exhaustion', 'Weak follow-through', 'No post-entry expansion']
                 improve = ['не шортить после уже отработанного dump', 'ждать pullback выше', 'входить только после нового bearish displacement']
-            if demand_seen:
-                visible.insert(1, 'снизу была buyer zone / green FVG / demand')
+            if real_demand_seen:
+                if real_demand_is_fvg:
+                    visible.insert(1, 'снизу была реальная buyer zone / green FVG / demand')
+                else:
+                    visible.insert(1, 'снизу была реальная demand/support zone')
             if pos > 0:
                 visible.append(f'позиция входа в prior range: {pos:.2f}')
             return {
@@ -7171,7 +7219,16 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
     pos = f('entry_position_in_prior_range', f('entry_position_in_range', 0.5))
     l6, l12, l24, premove = f('local_pre_move_6_pct'), f('local_pre_move_12_pct'), f('local_pre_move_24_pct'), f('pre_entry_move_pct')
     no_tp = not bool(analysis.get('tp1_threatened'))
-    no_space = bool(0 < cs <= max(_loss_card_location_tp_space_pct(), 0.70) and no_tp)
+    # V3: stop FET/COMP/SPELL-type losses from falling into the repeated
+    # "Weak confirm / no retest acceptance" template. For crypto 1:1.7 setups,
+    # clean-space to TP1 around 0.6-0.9% is already tight and should be treated
+    # as a chart-location problem.
+    graph_tp_space_limit = max(
+        _loss_card_location_tp_space_pct(),
+        _loss_diag_env_float('LOSS_CARD_GRAPH_CONTEXT_TP_SPACE_PCT', 1.20),
+        1.20,
+    )
+    no_space = bool(0 < cs <= graph_tp_space_limit and no_tp)
     level_back = bool(b('level_reclaimed_back') or b('reclaim_lost_back'))
     weak = bool(b('weak_followthrough') or b('no_post_entry_expansion') or b('zone_reaction_too_weak') or no_tp or abs(f('mfe_pct')) < 0.35)
     tiny_space_only = _loss_card_tiny_space_only(analysis)
@@ -7419,15 +7476,29 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
         return graph_override
 
     if weak:
-        direction = 'bullish' if side_u == 'LONG' else 'bearish'
+        # V3: last-resort fallback must still describe chart/location. The old
+        # `Weak bullish/bearish confirm / no retest acceptance` was true but too
+        # generic and made different losses look identical.
+        cs_line = f'clean space до TP1: около {cs:.2f}%' if cs > 0 else 'clean space до TP1 не подтверждён свечами'
+        pos_line = f'позиция входа в range: {pos:.2f}' if pos > 0 else ''
+        if side_u == 'LONG':
+            return out(
+                'LONG had no clean upside space / weak location',
+                'LONG был открыт без нормального clean upside-space. Даже если confirm формально был, путь к TP1 упирался в local high / resistance или вход был после уже отработанного импульса. Поэтому покупатель не смог дать continuation и цена ушла к SL.',
+                [cs_line, pos_line, 'fresh bullish displacement после входа отсутствовал'],
+                ['покупатель не смог расширить движение вверх', 'цена не закрепилась выше entry/retest зоны', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после отката/rejection'],
+                ['вход был не из сильного discount, а ближе к зоне сопротивления или после уже отработанного движения', 'сверху было мало свободного пространства до TP1', 'после входа не появился clean bullish displacement', 'движение быстро перешло против LONG'],
+                ['No clean upside space', 'Late/weak LONG location', 'No post-entry expansion', 'TP1 was never threatened'],
+                ['не брать LONG без clean space до TP1', 'ждать pullback ниже / discount entry', 'требовать fresh bullish displacement после retest'],
+            )
         return out(
-            f'Weak {direction} confirm / no retest acceptance',
-            'Сигнал имел формальное подтверждение, но по свечам после входа не было acceptance и displacement. Цена не показала продолжение в сторону сделки и быстро ушла к SL.',
-            [f'первый ход в сторону сделки: около {f("first_push_pct"):.2f}%' if f('first_push_pct') else 'первый ход в сторону сделки был слабый', f'движение против входа в первых свечах: около {f("against_move_first3_pct"):.2f}%' if f('against_move_first3_pct') else 'движение против входа появилось быстро'],
-            ['после входа не появилось сильное continuation-движение', 'confirm-candle не получила follow-through', 'TP1 не был поставлен под угрозу', 'SL был достигнут без нормального excursion'],
-            ['нет clean displacement после входа', 'нет acceptance по правильную сторону retest/уровня', 'свечи после входа показывают слабое продолжение', 'цена быстро перешла против направления сделки'],
-            ['Weak confirm', 'No retest acceptance', 'No post-entry expansion', 'TP1 was never threatened'],
-            ['требовать сильнее confirm-candle', 'ждать follow-through после retest', 'не входить без acceptance по уровню'],
+            'SHORT had no clean downside space / bearish reclaim missing',
+            'SHORT был открыт без нормального clean downside-space или без подтверждённого bearish reclaim. Даже если confirm формально был, снизу находился local low / demand либо рынок шёл fresh bullish impulse. Поэтому продавец не смог дать continuation и цена ушла к SL.',
+            [cs_line, pos_line, 'fresh bearish displacement после входа отсутствовал'],
+            ['продавец не смог расширить движение вниз', 'цена не закрепилась ниже entry/retest зоны', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после bounce/reclaim вверх'],
+            ['вход был не из сильного premium или был против buy-side momentum', 'снизу было мало свободного пространства до TP1 / buyer zone могла держать цену', 'после входа не появился clean bearish displacement', 'движение быстро перешло против SHORT'],
+            ['No clean downside space', 'Bearish reclaim missing', 'No post-entry expansion', 'TP1 was never threatened'],
+            ['не брать SHORT без clean space до TP1', 'ждать premium re-entry выше', 'требовать fresh bearish displacement/reclaim после retest'],
         )
     return {}
 
