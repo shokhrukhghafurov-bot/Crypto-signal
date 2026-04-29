@@ -6294,11 +6294,11 @@ def _loss_card_short_reason_title(code: str, text: str = '') -> str:
 def _loss_card_location_tp_space_pct() -> float:
     """Max TP1 clean-space (%) that still counts as blocked by nearby opposite zone."""
     try:
-        raw = os.getenv('LOSS_CARD_LOCATION_TP_SPACE_PCT', '0.65')
-        val = float(str(raw or '0.65').replace(',', '.'))
+        raw = os.getenv('LOSS_CARD_LOCATION_TP_SPACE_PCT', '0.95')
+        val = float(str(raw or '0.95').replace(',', '.'))
         return max(0.15, min(2.0, val))
     except Exception:
-        return 0.65
+        return 0.95
 
 
 
@@ -6906,6 +6906,196 @@ def _loss_card_exact_location_variant(side: str, analysis: dict, duration_min: i
 
 
 
+
+def _loss_card_graph_visible_override_payload(src: dict, analysis: dict, *, side: str, duration_min: int | None = None) -> dict:
+    """Final anti-template guard for LOSS cards.
+
+    If diagnostics still lead to a generic "Weak confirm" card, use the actual
+    candle context around entry: pre-entry impulse, entry position in range,
+    clean space to TP1, and TP1 threat. The card should describe the visible
+    chart reason, not only the fact that continuation was weak.
+    """
+    src = dict(src or {})
+    analysis = dict(analysis or {})
+    side_u = str(side or src.get('side') or analysis.get('side') or '').upper().strip()
+    if side_u not in ('LONG', 'SHORT'):
+        return {}
+
+    def f(k: str, default: float = 0.0) -> float:
+        try:
+            v = analysis.get(k)
+            return default if v in (None, '') else float(str(v).replace(',', '.'))
+        except Exception:
+            return default
+
+    def b(k: str) -> bool:
+        v = analysis.get(k)
+        if isinstance(v, str):
+            return v.strip().lower() in ('1', 'true', 'yes', 'on', 'да', 'есть')
+        return bool(v)
+
+    def pct_line(label: str, value: float, threshold: float = 0.01) -> str:
+        return f'{label}: {value:+.2f}%' if abs(value) >= threshold else ''
+
+    try:
+        entry = float(str(src.get('entry') or analysis.get('entry') or 0).replace(',', '.'))
+        tp1 = float(str(src.get('tp1') or analysis.get('tp1') or 0).replace(',', '.'))
+    except Exception:
+        entry = 0.0
+        tp1 = 0.0
+
+    cs = f('clean_space_to_tp1_pct')
+    if cs <= 0 and entry > 0 and tp1 > 0:
+        if side_u == 'LONG' and tp1 > entry:
+            cs = ((tp1 - entry) / entry) * 100.0
+        elif side_u == 'SHORT' and 0 < tp1 < entry:
+            cs = ((entry - tp1) / entry) * 100.0
+
+    pos = f('entry_position_in_prior_range', f('entry_position_in_range', 0.5))
+    l6 = f('local_pre_move_6_pct')
+    l12 = f('local_pre_move_12_pct')
+    l24 = f('local_pre_move_24_pct')
+    premove = f('pre_entry_move_pct')
+    mfe = abs(f('mfe_pct'))
+    mae = abs(f('mae_pct'))
+    first_push = abs(f('first_push_pct'))
+    against_first = abs(f('against_move_first3_pct'))
+    no_tp = ('tp1_threatened' in analysis and not b('tp1_threatened')) or b('weak_followthrough') or b('no_post_entry_expansion') or mfe < 0.35
+    tight_space_pct = _loss_diag_env_float('LOSS_CARD_GRAPH_CONTEXT_TP_SPACE_PCT', 1.05)
+    tight_space = bool(0 < cs <= max(tight_space_pct, _loss_card_location_tp_space_pct()))
+    bullish_pre = bool(l6 >= 0.12 or l12 >= 0.22 or l24 >= 0.35 or premove >= 0.45 or b('bullish_context_before_entry') or str(analysis.get('structure_5m') or '').lower().startswith('bullish'))
+    bearish_pre = bool(l6 <= -0.12 or l12 <= -0.22 or l24 <= -0.35 or premove <= -0.45 or b('bearish_context_before_entry') or str(analysis.get('structure_5m') or '').lower().startswith('bearish'))
+    supply_seen = bool(analysis.get('supply_near_tfs') or b('overhead_bearish_fvg') or b('entry_into_supply') or b('entry_into_overhead_supply') or b('long_below_strong_high'))
+    demand_seen = bool(analysis.get('demand_near_tfs') or b('underlying_bullish_fvg') or b('entry_into_demand') or b('short_above_weak_low'))
+
+    common_analysis = []
+    if duration_min is not None and duration_min > 0:
+        common_analysis.append(f'вход → SL: {int(duration_min)} мин')
+    for item in (
+        pct_line('локальный ход перед входом 30м', l6),
+        pct_line('локальный ход перед входом 60м', l12),
+        (f'clean space до TP1: около {cs:.2f}%' if cs > 0 else ''),
+        (f'макс. ход в сторону сделки: около {mfe:.2f}%' if mfe > 0 else ''),
+        (f'макс. ход против сделки: около {mae:.2f}%' if mae > 0 else ''),
+    ):
+        if item:
+            common_analysis.append(item)
+
+    if side_u == 'LONG':
+        if (bullish_pre or bearish_pre or supply_seen or pos >= 0.62 or tight_space) and no_tp:
+            if bullish_pre and (supply_seen or pos >= 0.62 or tight_space):
+                primary = 'Late LONG after exhausted pump / upside blocked'
+                scenario = ('LONG был открыт после уже прошедшего buy-side импульса. Цена пришла в верхнюю часть локального range / под resistance-supply, '
+                            'а до TP1 не было чистого пространства. После входа покупатель не дал новую волну, поэтому цена ушла в откат к SL.')
+                visible = [
+                    'перед входом уже был импульс вверх, fresh displacement после входа не появился',
+                    'LONG открыт поздно, ближе к local high / resistance, чем к discount',
+                    'TP1 стоял над зоной, куда цена уже пришла уставшей',
+                    'после входа свечи не закрепились выше entry/retest уровня',
+                ]
+                secondary = ['Late entry', 'Buy-side exhaustion', 'Upside blocked by resistance/supply', 'No post-entry expansion']
+                improve = ['не покупать после уже отработанного pump', 'ждать pullback ниже / discount entry', 'требовать новый bullish displacement после retest']
+            elif bearish_pre:
+                primary = 'LONG against bearish pressure / failed reclaim'
+                scenario = ('LONG был открыт против свежего sell-side давления. Перед входом рынок не показал устойчивый bullish reclaim, '
+                            'поэтому покупка была слабой и цена быстро вернулась к SL.')
+                visible = [
+                    'перед входом уже было bearish давление / возврат под уровень',
+                    'bullish reclaim перед LONG не закрепился',
+                    'покупатель не смог удержать entry/retest уровень',
+                    'TP1 не был нормально поставлен под угрозу',
+                ]
+                secondary = ['Long against bearish pressure', 'Failed bullish reclaim', 'No bullish displacement', 'Weak follow-through']
+                improve = ['не брать LONG без закрепления выше уровня', 'ждать bullish reclaim и follow-through', 'фильтровать LONG против bearish 5m/15m контекста']
+            else:
+                primary = 'TP1 blocked by local resistance / tight upside space'
+                scenario = ('LONG был открыт с ограниченным пространством до TP1. Путь вверх упирался в local high / resistance, '
+                            'поэтому даже формальный confirm не имел нормального места для continuation.')
+                visible = [
+                    'между входом и TP1 было мало чистого пространства',
+                    'ближайший local high / resistance блокировал движение вверх',
+                    'после входа не появился clean bullish displacement',
+                    'SL стоял внутри обычного pullback/retest-движения',
+                ]
+                secondary = ['TP1 blocked by local resistance', 'No clean space to TP1', 'Weak upside follow-through', 'No retest acceptance']
+                improve = ['не брать LONG, если TP1 слишком близко к local high/resistance', 'требовать clean space до TP1', 'ждать acceptance выше уровня']
+            if supply_seen:
+                visible.insert(1, 'сверху была seller zone / red FVG / resistance')
+            if pos > 0:
+                visible.append(f'позиция входа в prior range: {pos:.2f}')
+            return {
+                'primary_text': primary,
+                'scenario_text': scenario,
+                'analysis_lines': list(dict.fromkeys(common_analysis or ['bullish continuation после входа отсутствовал'])),
+                'happened_lines': list(dict.fromkeys([
+                    'покупатель не смог дать continuation после входа',
+                    'цена не закрепилась выше entry/retest зоны',
+                    'TP1 не был нормально поставлен под угрозу',
+                    'SL был достигнут после rejection/отката',
+                ])),
+                'visible_lines': list(dict.fromkeys(visible)),
+                'secondary_labels': secondary,
+                'improve_labels': improve,
+            }
+
+    else:
+        if (bullish_pre or bearish_pre or demand_seen or pos <= 0.42 or tight_space) and no_tp:
+            if bullish_pre and (demand_seen or pos <= 0.55 or tight_space):
+                primary = 'SHORT against fresh bullish impulse / no bearish reclaim'
+                scenario = ('SHORT был открыт во время активного восстановления вверх, до подтверждённой реакции продавца. '
+                            'Цена уже сделала buy-side reclaim/impulse, bearish reclaim не закрепился, поэтому покупатель выбил SL.')
+                visible = [
+                    'перед входом уже был fresh bullish impulse / reclaim вверх',
+                    'bearish reclaim перед SHORT не подтвердился',
+                    'SHORT открыт против активного buy-side momentum',
+                    'после входа не было clean bearish displacement',
+                ]
+                secondary = ['Short against bullish impulse', 'No bearish reclaim', 'Failed supply confirmation', 'Weak downside follow-through']
+                improve = ['ждать свечной rejection от supply перед SHORT', 'требовать закрытие ниже локальной demand/support', 'не шортить fresh bullish impulse без подтверждения разворота']
+            elif demand_seen or pos <= 0.42 or tight_space:
+                primary = 'SHORT opened into demand / downside was blocked'
+                scenario = ('SHORT был открыт слишком низко: путь к TP1 был рядом с local low / demand / buyer reaction zone. '
+                            'Downside был ограничен, поэтому цена дала bounce и дошла до SL раньше, чем появилась нормальная sell-side continuation.')
+                visible = [
+                    'SHORT открыт рядом с local low / demand/support',
+                    'снизу уже была зона реакции покупателей',
+                    'downside до TP1 был ограничен',
+                    'после входа не появился clean bearish displacement',
+                ]
+                secondary = ['Short into demand/support', 'No clean space to TP1', 'Buyer bounce against entry', 'Weak downside follow-through']
+                improve = ['не шортить в discount / возле local low', 'ждать premium re-entry выше', 'требовать clean space до TP1']
+            else:
+                primary = 'Late SHORT after exhausted dump near low'
+                scenario = ('SHORT был открыт после уже отработанного sell-side импульса. Цена пришла в нижнюю часть range, '
+                            'продавец был уставший, поэтому продолжение до TP1 затухло и появился bounce к SL.')
+                visible = [
+                    'перед входом уже прошёл sell-side impulse',
+                    'SHORT открыт поздно в нижней части локального range',
+                    'после входа не было нового fresh bearish displacement',
+                    'TP1 не был нормально поставлен под угрозу',
+                ]
+                secondary = ['Late entry', 'Sell-side exhaustion', 'Weak follow-through', 'No post-entry expansion']
+                improve = ['не шортить после уже отработанного dump', 'ждать pullback выше', 'входить только после нового bearish displacement']
+            if demand_seen:
+                visible.insert(1, 'снизу была buyer zone / green FVG / demand')
+            if pos > 0:
+                visible.append(f'позиция входа в prior range: {pos:.2f}')
+            return {
+                'primary_text': primary,
+                'scenario_text': scenario,
+                'analysis_lines': list(dict.fromkeys(common_analysis or ['bearish continuation после входа отсутствовал'])),
+                'happened_lines': list(dict.fromkeys([
+                    'продавец не смог дать continuation после входа',
+                    'цена не закрепилась ниже entry/retest зоны',
+                    'TP1 не был нормально поставлен под угрозу',
+                    'SL был достигнут после bounce/reclaim вверх',
+                ])),
+                'visible_lines': list(dict.fromkeys(visible)),
+                'secondary_labels': secondary,
+                'improve_labels': improve,
+            }
+    return {}
+
 def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: str, code: str = '', duration_min: int | None = None) -> dict:
     """Replace generic/template LOSS reason with candle/snapshot based chart facts.
 
@@ -7223,6 +7413,10 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
                 ['Poor RR location', 'Weak downside continuation', 'No clean space to TP1', 'Sell-side exhaustion'],
                 ['не брать SHORT в discount без сильного reclaim', 'ждать premium re-entry', 'поднимать фильтр clean space до TP1'],
             )
+
+    graph_override = _loss_card_graph_visible_override_payload(src, analysis, side=side_u, duration_min=duration_min)
+    if graph_override:
+        return graph_override
 
     if weak:
         direction = 'bullish' if side_u == 'LONG' else 'bearish'
@@ -7711,6 +7905,9 @@ def _loss_diag_close_analysis_is_thin(value) -> bool:
         'long_bearish_continuation_under_supply', 'short_against_bullish_structure',
         'range_high_blocks_tp1', 'range_low_blocks_tp1',
         'location_override_reason',
+        'entry_position_in_prior_range', 'entry_position_in_range',
+        'local_pre_move_6_pct', 'local_pre_move_12_pct', 'local_pre_move_24_pct',
+        'pre_entry_move_pct', 'mfe_pct', 'mae_pct', 'first_push_pct', 'against_move_first3_pct',
     )
     return not any(a.get(k) not in (None, '', [], {}, False) for k in location_keys)
 
@@ -7743,9 +7940,13 @@ async def _send_closed_signal_report_card(t: dict, *, final_status: str, pnl_tot
         # Safety net: every LOSS card must have candle-based close_analysis_json.
         # Some manual/legacy close paths can call this sender without precomputed
         # analysis, which previously produced the same generic Breakout trap text.
-        if str(final_status or '').upper().strip() == 'LOSS' and _loss_diag_close_analysis_is_thin(row_for_report.get('close_analysis_json')):
+        if str(final_status or '').upper().strip() == 'LOSS':
             try:
-                row_for_report['close_analysis_json'] = await _loss_diag_build_close_analysis(row_for_report, closed_at=closed_at)
+                _always_rebuild = str(os.getenv('LOSS_CARD_ALWAYS_REBUILD_ANALYSIS', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
+                if _always_rebuild or _loss_diag_close_analysis_is_thin(row_for_report.get('close_analysis_json')):
+                    _rebuilt_analysis = await _loss_diag_build_close_analysis(row_for_report, closed_at=closed_at)
+                    if _rebuilt_analysis:
+                        row_for_report['close_analysis_json'] = _rebuilt_analysis
             except Exception:
                 logger.exception('[report-bot] close analysis backfill failed')
         text = _build_closed_signal_report_card(row_for_report, final_status=str(final_status or "CLOSED"), pnl_total_pct=float(pnl_total_pct or 0.0), closed_at=closed_at)
