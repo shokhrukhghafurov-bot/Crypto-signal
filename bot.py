@@ -7072,7 +7072,7 @@ def _loss_card_graph_visible_override_payload(src: dict, analysis: dict, *, side
             # the direction can be right later, but the first normal pullback
             # hits a tight SL before fresh bearish continuation appears.
             if bearish_pre and (fast_sl_pullback or tight_space or pos <= 0.55 or demand_seen):
-                primary = 'Premature SHORT after dump / SL inside pullback'
+                primary = 'SL too tight / stopped by normal pullback before continuation'
                 scenario = ('SHORT был открыт после уже прошедшего sell-side импульса, но не из premium re-entry. '
                             'SL оказался внутри обычного pullback/retest-движения: цена сначала дала bounce/reclaim к SL, '
                             'а нового clean bearish displacement сразу после входа не было.')
@@ -7083,7 +7083,7 @@ def _loss_card_graph_visible_override_payload(src: dict, analysis: dict, *, side
                     'TP1 был рядом с local low/support, поэтому первое движение вниз не имело большого clean space',
                     'сначала появился bounce/reclaim против SHORT',
                 ]
-                secondary = ['Premature short after dump', 'SL inside pullback', 'No fresh bearish displacement', 'Tight TP1/SL space']
+                secondary = ['SL too tight', 'Stopped by normal pullback', 'No fresh bearish displacement', 'Tight TP1/SL space']
                 improve = ['после сильного dump ждать pullback выше / premium re-entry', 'ставить SHORT только после нового bearish displacement', 'не ставить SL внутри обычного retest/bounce']
             elif bullish_pre and (demand_seen or pos <= 0.55 or tight_space):
                 primary = 'SHORT against fresh bullish impulse / no bearish reclaim'
