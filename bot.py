@@ -7861,11 +7861,15 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         }
         candidates.append((float(score), key, payload))
 
-    # Shared timing/SL/confirmation detectors. They can become main only when very strong;
-    # otherwise they are merged into secondary reasons.
+    # Shared timing/SL/confirmation detectors.
+    # IMPORTANT: FAST_SL is only a context flag. It must not become the main
+    # Telegram reason when the chart gives a real cause (location, structure,
+    # market reversal, weak confirm, TP path, OB/FVG failure, etc.). The final
+    # selector below will prefer the best real chart reason over generic
+    # fast/tight-SL labels and merge FAST_SL only as an additional fact.
     direction_word = 'bearish' if side_u == 'SHORT' else 'bullish'
     opp_pullback_word = 'bounce/reclaim' if side_u == 'SHORT' else 'pullback/rejection'
-    add(4.4 + (2 if fast else 0) + (1 if meaningful_excursion_missing else 0), 'fast_sl_no_excursion',
+    add(2.4 + (0.6 if fast else 0) + (0.4 if meaningful_excursion_missing else 0), 'fast_sl_no_excursion',
         primary='SL hit fast before any meaningful excursion',
         scenario='Цена почти сразу пошла против входа: нормального хода в сторону сделки не было, TP1 не был поставлен под угрозу, поэтому SL сработал как быстрый invalidation.',
         analysis_add=['SL был достигнут быстро', 'ход в сторону сделки был слишком маленький'],
@@ -7874,7 +7878,7 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         secondary=['Fast invalidation', 'No meaningful excursion', 'TP1 was not threatened'],
         improve=['не открывать сделку, если confirmation не даёт immediate follow-through', 'после быстрого SL считать setup trap и ждать новый retest'],
         evidence=bool(fast and no_tp and meaningful_excursion_missing))
-    add(4.0 + (2 if normal_pullback else 0), 'sl_inside_normal_pullback',
+    add(2.8 + (0.7 if normal_pullback else 0), 'sl_inside_normal_pullback',
         primary='SL was inside normal pullback / retest noise',
         scenario=f'SL стоял не за реальной invalidation-зоной, а внутри обычного {opp_pullback_word} после импульса. Цена сделала нормальный откат/ретест и выбила SL раньше, чем появился continuation.',
         analysis_add=['SL стоял внутри обычного pullback/retest-шума'],
@@ -7882,7 +7886,7 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         visible=['SL находился слишком близко к entry относительно шума свечей', 'после входа цена сделала обычный retest/pullback', 'уровень invalidation был дальше, чем фактический SL', pos_line],
         secondary=['SL too tight', 'SL inside pullback', 'Retest noise hit SL'],
         improve=['ставить SL за структурной invalidation-зоной', 'не ставить SL внутри первой зоны pullback после импульса'],
-        evidence=normal_pullback)
+        evidence=bool(normal_pullback and (risk_pct <= max(tight_sl_pct, 0.45) or any_flag('sl_too_tight','sl_inside_pullback','sl_inside_normal_pullback'))))
     add(3.8 + (2 if weak_confirm else 0), 'weak_confirm_no_displacement',
         primary=f'Weak {direction_word} confirm / no displacement after entry',
         scenario='Сигнал имел формальное подтверждение, но после входа не появилось сильной displacement-свечи и acceptance. Цена не показала продолжение и ушла к SL.',
@@ -7949,6 +7953,51 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             sget('ta_summary'), sget('snapshot_reason'), structure_text, route_text,
         ]).lower()
         return any(str(w).lower() in joined for w in words if str(w).strip())
+
+    # Market / BTC context. These flags are optional; if backend/snapshot provides
+    # them, a fast SL can be explained as a real market reversal instead of a
+    # generic "SL too tight". Numeric keys are tolerated with several names so
+    # older snapshots do not break.
+    btc_move_pct = f('btc_move_after_entry_pct', f('btc_first_move_pct', f('btc_move_first3_pct', 0.0)))
+    market_move_pct = f('market_move_after_entry_pct', f('market_first_move_pct', f('market_move_first3_pct', 0.0)))
+    try:
+        market_reversal_min_pct = float(str(os.getenv('LOSS_CARD_MARKET_REVERSAL_MIN_PCT', '0.18') or '0.18').replace(',', '.'))
+    except Exception:
+        market_reversal_min_pct = 0.18
+    if side_u == 'SHORT':
+        market_against = bool(
+            any_flag('market_reversal_against_position','btc_reversal_against_position','btc_bounce_against_short','broad_market_bounce')
+            or any_text('btc bounce', 'market bounce', 'market reversal', 'btc reversal')
+            or btc_move_pct >= market_reversal_min_pct
+            or market_move_pct >= market_reversal_min_pct
+        )
+        market_primary = 'Market/BTC bounce invalidated SHORT'
+        market_scenario = 'После входа рынок дал быстрый bounce против SHORT. Bearish continuation не появился, общий market/BTC impulse поднял цену обратно к entry/SL, поэтому сделка быстро закрылась по SL.'
+        market_secondary = ['Market reversal', 'BTC/market bounce against SHORT', 'No bearish continuation']
+        market_visible = ['BTC/общий рынок двигался против SHORT после входа', 'после входа не появился clean bearish displacement', pos_line]
+        market_improve = ['не брать SHORT, если BTC/общий рынок уже даёт bounce против сделки', 'добавить фильтр market context перед входом']
+    else:
+        market_against = bool(
+            any_flag('market_reversal_against_position','btc_reversal_against_position','btc_dump_against_long','broad_market_dump')
+            or any_text('btc dump', 'market dump', 'market reversal', 'btc reversal')
+            or btc_move_pct <= -market_reversal_min_pct
+            or market_move_pct <= -market_reversal_min_pct
+        )
+        market_primary = 'Market/BTC dump invalidated LONG'
+        market_scenario = 'После входа рынок дал быстрый dump против LONG. Bullish continuation не появился, общий market/BTC impulse продавил цену обратно к entry/SL, поэтому сделка быстро закрылась по SL.'
+        market_secondary = ['Market reversal', 'BTC/market dump against LONG', 'No bullish continuation']
+        market_visible = ['BTC/общий рынок двигался против LONG после входа', 'после входа не появился clean bullish displacement', pos_line]
+        market_improve = ['не брать LONG, если BTC/общий рынок уже давит вниз против сделки', 'добавить фильтр market context перед входом']
+
+    add(8.0 + (1.2 if fast else 0) + (0.8 if immediate_counter else 0), 'market_reversal_against_position',
+        primary=market_primary,
+        scenario=market_scenario,
+        analysis_add=['market/BTC context был против позиции', 'после входа движение рынка пошло против сделки'],
+        happened=['после входа market/BTC impulse пошёл против позиции', 'сетап не получил continuation', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут из-за рыночного разворота'],
+        visible=market_visible,
+        secondary=market_secondary,
+        improve=market_improve,
+        evidence=bool(market_against and no_tp))
 
     # 1) LOCATION / место входа
     add(5.2, 'entry_inside_range_middle',
@@ -8559,16 +8608,33 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     if not candidates:
         return {}
 
-    # Prefer chart-location reasons over generic timing reasons when scores are close.
-    location_keys = ('late_', 'short_into', 'long_into', 'discount', 'premium', 'against_', 'htf_', 'break', 'liquidity', 'ob_fvg', 'origin', 'stacked')
+    # Prefer the real chart/market cause over generic timing/SL labels.
+    # Fast SL is a symptom. It can explain urgency, but the main card reason
+    # should be location/structure/market/confirmation/TP path whenever such
+    # evidence exists.
+    location_keys = ('late_', 'short_into', 'long_into', 'discount', 'premium', 'against_', 'htf_', 'break', 'liquidity', 'ob_fvg', 'origin', 'stacked', 'entry_', 'bad_', 'tp1_', 'weak_', 'range_', 'volume_', 'counter_', 'market_')
+    generic_timing_keys = {'fast_sl_no_excursion', 'sl_inside_normal_pullback'}
     boosted = []
     for score, key, payload in candidates:
         if key.startswith(location_keys):
-            score += 0.25
+            score += 0.35
+        if key in generic_timing_keys:
+            score -= 1.50
         boosted.append((score, key, payload))
     boosted.sort(key=lambda x: x[0], reverse=True)
-    best_score, best_key, best_payload = boosted[0]
+
+    real_candidates = [(score, key, payload) for score, key, payload in boosted if key not in generic_timing_keys]
+    if real_candidates:
+        best_score, best_key, best_payload = real_candidates[0]
+    else:
+        best_score, best_key, best_payload = boosted[0]
     best = dict(best_payload)
+
+    if fast and best_key not in generic_timing_keys:
+        fast_label = 'Fast SL / quick invalidation'
+        best['secondary_labels'] = list(dict.fromkeys(list(best.get('secondary_labels') or []) + [fast_label]))
+        if dline and dline not in list(best.get('analysis_lines') or []):
+            best['analysis_lines'] = [dline] + list(best.get('analysis_lines') or [])
 
     # Merge evidence from next strongest distinct causes. Keep main reason clean and
     # only show additional labels, not full paragraphs, so the Telegram card stays readable.
