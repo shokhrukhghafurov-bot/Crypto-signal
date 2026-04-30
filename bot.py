@@ -7414,6 +7414,10 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
     level_back = bool(b('level_reclaimed_back') or b('reclaim_lost_back'))
     weak = bool(b('weak_followthrough') or b('no_post_entry_expansion') or b('zone_reaction_too_weak') or no_tp or abs(f('mfe_pct')) < 0.35)
     tiny_space_only = _loss_card_tiny_space_only(analysis)
+    try:
+        fast_graph_loss = bool(duration_min is not None and 0 < int(duration_min) <= int(float(os.getenv('LOSS_CARD_FAST_SL_MIN', '15') or 15)))
+    except Exception:
+        fast_graph_loss = bool(duration_min is not None and 0 < int(duration_min) <= 15)
 
     if side_u == 'LONG':
         supply_ctx = _loss_card_real_zone_context(analysis, 'supply')
@@ -7484,6 +7488,29 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
                 vis,
                 ['Late entry', 'Buy-side exhaustion', 'Weak follow-through', 'No post-entry expansion'],
                 ['не покупать после вертикального pump', 'ждать pullback ниже', 'входить только после нового bullish displacement'],
+            )
+
+        if no_space and not supply and not bearish and pos < 0.72 and (late_pump or fast_graph_loss):
+            # POL/API3-type losses: even when the snapshot did not serialize a
+            # strict red FVG, a quick LOSS after an upward push is not only
+            # "TP1 blocked". The visible cause is failed acceptance under
+            # the nearest local resistance, usually after an already completed
+            # pump/breakout attempt.
+            cs_line = f'чистое пространство до TP1 было около {cs:.2f}%' if cs > 0 else 'чистого пространства до TP1 было мало'
+            primary = 'Late LONG after pump / no acceptance at resistance' if late_pump else 'LONG under local resistance / no acceptance after retest'
+            scenario = (
+                'LONG был открыт после движения вверх под ближайшим local high/resistance. '
+                'Главная проблема не только в расстоянии до TP1: после входа не появилось acceptance выше entry/retest зоны, '
+                'покупатель не дал fresh bullish displacement, и цена быстро ушла в rejection/pullback к SL.'
+            )
+            return out(
+                primary,
+                scenario,
+                [cs_line, 'acceptance выше entry/retest зоны отсутствовал', 'fresh bullish displacement после входа отсутствовал'],
+                ['покупатель не смог дать новую волну после входа', 'цена не закрепилась выше entry/retest зоны', 'local resistance удержал движение сверху', 'SL был достигнут после rejection/pullback'],
+                [f'позиция входа в range: {pos:.2f}', 'LONG был не из discount, а под ближайшим local high/resistance', 'TP1 стоял рядом/за seller reaction area', 'после входа нет clean bullish displacement', 'первая реакция быстро пошла против LONG'],
+                ['No retest acceptance', 'Late/weak LONG location', 'Local resistance rejection', 'No fresh bullish displacement'],
+                ['после pump ждать pullback ниже/discount re-entry', 'не брать LONG без acceptance выше retest/resistance', 'требовать fresh bullish displacement после входа', 'если TP1 упирается в local resistance — брать цель раньше или пропускать'],
             )
 
         if no_space and not supply and not bearish and pos < 0.72:
@@ -7869,9 +7896,20 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     bars = int(f('bars_to_failure') or f('bars_to_sl') or 0)
 
     tp1_known = 'tp1_threatened' in analysis
-    no_tp = bool((tp1_known and not b('tp1_threatened')) or b('tp1_too_close_no_clean_space') or b('weak_followthrough') or b('no_post_entry_expansion') or (mfe > 0 and mfe < 0.35))
-    fast = bool(b('fast_invalidation') or b('immediate_invalidation') or (duration_min is not None and duration_min <= fast_sl_min) or (bars > 0 and bars <= 3))
     tight_space = bool(0 < cs <= tight_space_pct)
+    fast = bool(b('fast_invalidation') or b('immediate_invalidation') or (duration_min is not None and duration_min <= fast_sl_min) or (bars > 0 and bars <= 3))
+    # When old rows do not store tp1_threatened, a LOSS with tight TP1 path
+    # and quick invalidation should still be treated as "TP1 was not properly
+    # threatened". Otherwise the ranked engine returns {} and the card falls
+    # back to the generic "TP1 blocked by local resistance" template.
+    no_tp = bool(
+        (tp1_known and not b('tp1_threatened'))
+        or ((not tp1_known) and (tight_space or fast or b('weak_followthrough') or b('no_post_entry_expansion')))
+        or b('tp1_too_close_no_clean_space')
+        or b('weak_followthrough')
+        or b('no_post_entry_expansion')
+        or (mfe > 0 and mfe < 0.35)
+    )
     sl_tight = bool(risk_pct > 0 and (risk_pct <= tight_sl_pct or (cs > 0 and risk_pct <= cs * 0.88)))
     normal_pullback = bool(sl_tight and no_tp and (against >= max(first_push * 1.05, risk_pct * 0.55, 0.08) or fast or b('retest_too_deep')))
     meaningful_excursion_missing = bool(b('sl_hit_without_meaningful_excursion') or (mfe > 0 and mfe < 0.12) or (mfe_r > 0 and mfe_r < 0.45))
