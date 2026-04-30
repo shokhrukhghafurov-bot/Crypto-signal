@@ -7720,7 +7720,10 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
         # V3: last-resort fallback must still describe chart/location. The old
         # `Weak bullish/bearish confirm / no retest acceptance` was true but too
         # generic and made different losses look identical.
-        cs_line = f'clean space до TP1: около {cs:.2f}%' if cs > 0 else 'clean space до TP1 не подтверждён свечами'
+        # For distant TP1, `cs` is geometric distance, not proof that the
+        # path was clean. Tight targets keep the old clean-space wording.
+        wide_target_hint = bool(cs >= 1.50)
+        cs_line = (f'расстояние entry → TP1: около {cs:.2f}%' if wide_target_hint else f'clean space до TP1: около {cs:.2f}%') if cs > 0 else 'clean space до TP1 не подтверждён свечами'
         pos_line = f'позиция входа в range: {pos:.2f}' if pos > 0 else ''
         if side_u == 'LONG':
             return out(
@@ -7867,6 +7870,23 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     risk_pct = f('risk_pct_to_sl')
     if risk_pct <= 0:
         risk_pct = abs((sl - entry) / entry) * 100.0
+    reward_pct = 0.0
+    rr_to_tp1 = 0.0
+    if tp1 > 0 and entry > 0:
+        reward_pct = abs((tp1 - entry) / entry) * 100.0
+        try:
+            rr_to_tp1 = abs(tp1 - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0.0
+        except Exception:
+            rr_to_tp1 = 0.0
+    try:
+        wide_tp1_pct = float(str(os.getenv('LOSS_CARD_WIDE_TP1_SPACE_PCT', '1.50') or '1.50').replace(',', '.'))
+    except Exception:
+        wide_tp1_pct = 1.50
+    try:
+        wide_tp1_rr = float(str(os.getenv('LOSS_CARD_WIDE_TP1_RR', '2.50') or '2.50').replace(',', '.'))
+    except Exception:
+        wide_tp1_rr = 2.50
+    wide_tp_target = bool((cs > 0 and cs >= wide_tp1_pct) or (rr_to_tp1 > 0 and rr_to_tp1 >= wide_tp1_rr))
     try:
         tight_sl_pct = float(str(os.getenv('LOSS_CARD_TIGHT_SL_PCT', '0.38') or '0.38').replace(',', '.'))
     except Exception:
@@ -7961,7 +7981,7 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     reclaim_route = contains_any(route_text, ('reclaim', 'liquidity'))
     breakout_route = contains_any(route_text, ('bos', 'breakout'))
 
-    cs_line = f'clean space до TP1: около {cs:.2f}%' if cs > 0 else 'clean space до TP1 не подтверждён свечами'
+    cs_line = (f'расстояние entry → TP1: около {cs:.2f}%' if wide_tp_target else f'clean space до TP1: около {cs:.2f}%') if cs > 0 else 'clean space до TP1 не подтверждён свечами'
     risk_line = f'расстояние entry → SL: около {risk_pct:.2f}%' if risk_pct > 0 else ''
     mfe_line = f'макс. ход в сторону сделки: около {mfe:.2f}%' if mfe > 0 else ''
     against_line = f'первое движение против входа: около {against:.2f}%' if against > 0 else ''
@@ -7970,6 +7990,16 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     base_analysis = [x for x in [dline, cs_line, risk_line, mfe_line, against_line] if x]
 
     candidates: list[tuple[float, str, dict]] = []
+
+    def any_flag(*keys: str) -> bool:
+        return any(b(k) for k in keys)
+
+    def any_text(*words: str) -> bool:
+        joined = ' '.join([
+            sget('loss_reason'), sget('close_reason'), sget('reason'), sget('debug_reason'),
+            sget('ta_summary'), sget('snapshot_reason'), structure_text, route_text,
+        ]).lower()
+        return any(str(w).lower() in joined for w in words if str(w).strip())
 
     def add(score: float, key: str, *, primary: str, scenario: str, analysis_add: list[str] | None = None,
             happened: list[str] | None = None, visible: list[str] | None = None,
@@ -8070,16 +8100,6 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     late_after_extended = late_short if is_short else late_long
     move_name = 'dump' if is_short else 'pump'
     premium_discount_bad = (lowish if is_short else highish)
-
-    def any_flag(*keys: str) -> bool:
-        return any(b(k) for k in keys)
-
-    def any_text(*words: str) -> bool:
-        joined = ' '.join([
-            sget('loss_reason'), sget('close_reason'), sget('reason'), sget('debug_reason'),
-            sget('ta_summary'), sget('snapshot_reason'), structure_text, route_text,
-        ]).lower()
-        return any(str(w).lower() in joined for w in words if str(w).strip())
 
     # Market / BTC context. These flags are optional; if backend/snapshot provides
     # them, a fast SL can be explained as a real market reversal instead of a
@@ -8654,6 +8674,29 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         supply_desc = str(supply_ctx.get('desc') or 'local high / resistance')
         demand_desc = str(demand_ctx.get('desc') or 'demand / support')
         tp1_supply_path_line = f'TP1 находился рядом/за supply/resistance reaction area ({supply_desc})'
+        tp1_distance_line = f'расстояние entry → TP1 было около {cs:.2f}% / RR до TP1 около 1:{rr_to_tp1:.2f}' if cs > 0 and rr_to_tp1 > 0 else (f'расстояние entry → TP1 было около {cs:.2f}%' if cs > 0 else 'TP1 был далеко за ближайшими reaction levels')
+
+        add(10.2 + (1.0 if late_long else 0) + (0.8 if (supply_seen or supply_blocks) else 0) + (0.6 if normal_pullback else 0), 'long_tp1_far_behind_resistance_no_acceptance',
+            primary='LONG into local resistance / TP1 too far behind supply',
+            scenario='LONG был открыт после bounce/reclaim, но прямо под ближайшим local high / resistance. TP1 стоял далеко выше и проходил через несколько overhead reaction levels, поэтому большой RR не означал clean path. Цена не закрепилась выше resistance, fresh bullish displacement не появился, и pullback/rejection дошёл до SL.',
+            analysis_add=[tp1_distance_line, 'acceptance выше local resistance отсутствовал', 'fresh bullish displacement после входа отсутствовал'],
+            happened=['покупатель не смог закрепиться выше ближайшего resistance', 'TP1 был слишком далеко за overhead reaction area', 'после входа не появился новый bullish expansion', 'SL был достигнут после pullback/rejection'],
+            visible=['перед входом уже был bounce/reclaim вверх', f'над входом находился {supply_desc}', 'TP1 был далеко выше, за ближайшими resistance/supply реакциями', 'путь к TP1 не был clean, хотя расстояние до цели было большим', 'после входа цена не дала acceptance выше local high/resistance', pos_line],
+            secondary=['TP1 too far behind resistance', 'No acceptance above resistance', 'Late/weak LONG location', 'No fresh bullish displacement', 'Seller reaction from local high'],
+            improve=['не ставить TP1 за несколькими overhead supply/resistance зонами', 'для LONG ждать acceptance выше ближайшего resistance', 'после bounce брать цель до resistance или ждать discount re-entry ниже', 'не считать большой RR чистым путём до TP1'],
+            evidence=bool(wide_tp_target and no_tp and weak_follow and (late_long or supply_seen or supply_blocks or highish or normal_pullback or (duration_min is not None and duration_min >= 20))))
+
+        resistance_acceptance_primary = 'Late LONG after pump / no acceptance at resistance' if late_long else 'LONG under local resistance / no acceptance after retest'
+        add(9.4 + (1.0 if tight_space else 0) + (0.8 if normal_pullback else 0) + (0.6 if supply_seen else 0), 'long_under_resistance_no_acceptance',
+            primary=resistance_acceptance_primary,
+            scenario=f'LONG был открыт под ближайшим resistance/seller reaction area ({supply_desc}). После входа цена не закрепилась выше entry/retest зоны, покупатель не дал fresh bullish displacement, поэтому движение быстро превратилось в rejection/pullback к SL.',
+            analysis_add=['acceptance выше entry/retest зоны отсутствовал', 'fresh bullish displacement после входа отсутствовал'],
+            happened=['покупатель не смог закрепиться выше локального resistance', 'seller reaction появилась раньше continuation', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после rejection/отката'],
+            visible=[f'над входом была {supply_desc}', 'LONG открыт под local high / seller reaction area', 'после входа нет clean bullish displacement', 'цена не удержала reclaim/entry-зону', pos_line],
+            secondary=['No acceptance after retest', 'Local resistance held', 'Weak bullish follow-through', 'Seller rejection'],
+            improve=['не брать LONG под resistance без закрепления выше', 'ждать 1–2 close выше seller reaction area', 'если после retest нет displacement — пропускать вход'],
+            evidence=bool((not wide_tp_target) and no_tp and weak_follow and (tight_space or supply_seen or supply_blocks or highish or normal_pullback or ob_fvg_route) and not bearish_ctx))
+
         add(9.0 + (1.5 if fast else 0) + (1 if normal_pullback else 0) + (0.8 if supply_seen else 0), 'fast_failed_long_after_pump_no_acceptance',
             primary='Late LONG after pump / no acceptance after retest',
             scenario='LONG был открыт после уже выполненного buy-side движения. После входа не появилось acceptance выше entry/retest зоны и fresh bullish displacement. Цена быстро дала rejection/pullback к SL, поэтому проблема была не только в SL, а в позднем входе без подтверждённого continuation.',
