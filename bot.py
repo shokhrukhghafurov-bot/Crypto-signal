@@ -3468,8 +3468,21 @@ def _report_tz_label() -> str:
         return "UTC"
 
 
-def _report_close_emoji(final_status: str) -> str:
+def _report_close_emoji(final_status: str, *, after_tp1: bool = False, pnl_total_pct: float | int | None = None) -> str:
     st = str(final_status or "").upper().strip()
+    if after_tp1:
+        # TP1-hit trades are not ordinary red LOSS cards. The title emoji follows
+        # the total realised result: green for positive partial win, white for flat,
+        # yellow when the remainder after TP1 still made the total negative.
+        try:
+            pnl = float(pnl_total_pct or 0.0)
+        except Exception:
+            pnl = 0.0
+        if pnl > 0.0001:
+            return "🟢"
+        if pnl < -0.0001:
+            return "🟡"
+        return "⚪️"
     return {
         "WIN": "🟢",
         "LOSS": "🔴",
@@ -3478,10 +3491,23 @@ def _report_close_emoji(final_status: str) -> str:
     }.get(st, "⚪️")
 
 
-def _report_close_status(final_status: str, *, after_tp1: bool = False) -> str:
+def _report_close_status(final_status: str, *, after_tp1: bool = False, pnl_total_pct: float | int | None = None) -> str:
     st = str(final_status or "").upper().strip() or "CLOSED"
-    if after_tp1 and st in ("WIN", "LOSS", "BE"):
-        return f"{st} (после TP1)"
+    if after_tp1:
+        try:
+            pnl = float(pnl_total_pct or 0.0)
+        except Exception:
+            pnl = 0.0
+        if st == "WIN":
+            return "TP1 HIT → TP2 WIN"
+        if st == "BE":
+            return "TP1 HIT → BE remainder"
+        if st == "LOSS":
+            if pnl > 0.0001:
+                return "TP1 HIT → BE/SL remainder"
+            if pnl < -0.0001:
+                return "TP1 HIT → SL remainder"
+            return "TP1 HIT → BE remainder"
     if st == "CLOSED":
         return "CLOSED"
     return st
@@ -3532,7 +3558,7 @@ def _report_close_reason(final_status: str, *, after_tp1: bool = False, has_tp2:
         return "Цена дошла до TP1 — фиксируем прибыль."
     if st == "LOSS":
         if after_tp1:
-            return "После TP1 цена вернулась к SL — остаток позиции закрыт по риску."
+            return "TP1 был взят, затем остаток вернулся к BE/SL — это не LOSS до первой цели."
         return "Цена дошла до SL — сработал лимит риска."
     if st == "BE":
         return "После TP1 цена вернулась к BE — закрытие без убытка."
@@ -7660,8 +7686,8 @@ def _loss_card_after_tp1_payload(src: dict, analysis: dict, *, side: str, durati
         ]
     analysis_lines = [x for x in [dline, 'TP1 был достигнут', f'{direction} continuation к TP2 не подтвердился', f'после TP1 появился {reversal}'] if x]
     return {
-        'primary_text': 'TP1 hit, then reversal to BE/SL on remainder',
-        'scenario_text': f'Сделка сначала дошла до TP1, но после первой цели не дала продолжения. {move}, цена развернулась против позиции и закрыла остаток по BE/SL.',
+        'primary_text': 'TP1 hit, then no TP2 continuation / BE-SL remainder',
+        'scenario_text': f'Сделка сначала дошла до TP1 — это не обычный LOSS до первой цели. Но после TP1 продолжения к TP2 не было: {move}, цена развернулась против позиции и закрыла остаток по BE/SL.',
         'analysis_lines': analysis_lines,
         'what_happened_lines': [
             'первая цель была взята',
@@ -8335,6 +8361,15 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             secondary=['Late entry after dump', 'Seller exhaustion', 'Buyer bounce from low', 'No fresh bearish displacement'],
             improve=['после сильного dump ждать premium re-entry выше', 'не шортить прямо возле post-dump low', 'требовать новый bearish displacement после bounce/retest'],
             evidence=bool(late_short and (normal_pullback or no_tp or lowish or tight_space)))
+        add(8.4 + (2 if fast else 0) + (1 if normal_pullback else 0) + (1 if tight_space else 0) + (1 if demand_blocks else 0), 'short_into_demand_tight_sl_fast',
+            primary='SHORT into demand + SL inside normal bounce',
+            scenario=f'SHORT был открыт низко рядом с зоной покупателя: {demand_desc}. Downside до TP1 был заблокирован, а SL стоял слишком близко к entry для обычного bounce/retest. Поэтому цена быстро дала реакцию покупателя и выбила SL до нормального bearish continuation.',
+            analysis_add=['SL был слишком близко для такого bounce/retest', 'downside до TP1 был ограничен demand/support зоной'],
+            happened=['продавец не смог сразу пробить ближний support/demand', 'обычный bounce/retest оказался сильнее SL', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут до fresh bearish continuation'],
+            visible=[f'снизу была {demand_desc}', 'SHORT открыт рядом с local low / support', 'SL находился внутри нормального bounce/retest-движения', 'между entry и TP1 не было чистого пространства', 'после входа не появился clean bearish displacement', pos_line],
+            secondary=['Short into demand', 'SL too tight', 'SL inside normal bounce', 'TP1 blocked by support', 'No clean downside space'],
+            improve=['не шортить прямо над local low/support', 'SL ставить за structural invalidation, а не внутри bounce', 'ждать premium re-entry выше', 'если RR ломается после нормального SL — пропускать сделку'],
+            evidence=bool(fast and no_tp and (demand_seen or demand_blocks or lowish or tight_space) and (risk_pct <= max(tight_sl_pct, 0.45) or normal_pullback or tight_space)))
         add(6.5 + (2 if demand_blocks else 0) + (1 if tight_space else 0) + (1 if lowish else 0), 'short_into_demand_support',
             primary='SHORT opened into demand / local support blocked downside',
             scenario=f'SHORT был открыт рядом с зоной покупателя: {demand_desc}. Downside до TP1 был ограничен, поэтому продавец не смог расширить движение вниз и цена дала bounce к SL.',
@@ -8430,6 +8465,15 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             secondary=['Late entry after pump', 'Buyer exhaustion', 'Seller rejection from high', 'No fresh bullish displacement'],
             improve=['после сильного pump ждать discount re-entry ниже', 'не лонговать прямо возле post-pump high', 'требовать новый bullish displacement после pullback/retest'],
             evidence=bool(late_long and (normal_pullback or no_tp or highish or tight_space)))
+        add(8.4 + (2 if fast else 0) + (1 if normal_pullback else 0) + (1 if tight_space else 0) + (1 if supply_blocks else 0), 'long_into_supply_tight_sl_fast',
+            primary='LONG into supply + SL inside normal pullback',
+            scenario=f'LONG был открыт высоко рядом с зоной продавца: {supply_desc}. Upside до TP1 был заблокирован, а SL стоял слишком близко к entry для обычного pullback/retest. Поэтому цена быстро дала реакцию продавца и выбила SL до нормального bullish continuation.',
+            analysis_add=['SL был слишком близко для такого pullback/retest', 'upside до TP1 был ограничен supply/resistance зоной'],
+            happened=['покупатель не смог сразу пробить ближний resistance/supply', 'обычный pullback/retest оказался сильнее SL', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут до fresh bullish continuation'],
+            visible=[f'сверху была {supply_desc}', 'LONG открыт рядом с local high / resistance', 'SL находился внутри нормального pullback/retest-движения', 'между entry и TP1 не было чистого пространства', 'после входа не появился clean bullish displacement', pos_line],
+            secondary=['Long into supply', 'SL too tight', 'SL inside normal pullback', 'TP1 blocked by resistance', 'No clean upside space'],
+            improve=['не лонговать прямо под local high/resistance', 'SL ставить за structural invalidation, а не внутри pullback', 'ждать discount re-entry ниже', 'если RR ломается после нормального SL — пропускать сделку'],
+            evidence=bool(fast and no_tp and (supply_seen or supply_blocks or highish or tight_space) and (risk_pct <= max(tight_sl_pct, 0.45) or normal_pullback or tight_space)))
         add(6.5 + (2 if supply_blocks else 0) + (1 if tight_space else 0) + (1 if highish else 0), 'long_into_supply_resistance',
             primary='LONG opened into supply / local resistance blocked upside',
             scenario=f'LONG был открыт рядом с зоной продавца: {supply_desc}. Upside до TP1 был ограничен, поэтому покупатель не смог расширить движение вверх и цена дала rejection к SL.',
@@ -8871,7 +8915,7 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
     loss_diag = _build_loss_diagnostics_from_row(row, final_status=st, closed_at=closed_at)
 
     price_values_for_precision = [entry, sl, tp1]
-    if has_tp2 and st != 'LOSS':
+    if has_tp2 and (st != 'LOSS' or after_tp1):
         price_values_for_precision.append(tp2)
     if after_tp1 and be_price > 0:
         price_values_for_precision.append(be_price)
@@ -8886,7 +8930,7 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
             price_lines.append(f"🛑 SL: {_fmt_report_price(sl, price_precision)}")
     if tp1 > 0:
         price_lines.append(f"🎯 TP1: {_fmt_report_price(tp1, price_precision)}")
-    if has_tp2 and st != 'LOSS':
+    if has_tp2 and (st != 'LOSS' or after_tp1):
         price_lines.append(f"🚀 TP2: {_fmt_report_price(tp2, price_precision)}")
     if after_tp1 and be_price > 0:
         price_lines.append(f"🛡 Активный SL/BE: {_fmt_report_price(be_price, price_precision)}")
@@ -8916,11 +8960,13 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
         if primary_text:
             primary_block = "🧠 Главная причина:\n" + primary_text + "\n\n"
         if scenario_text:
-            scenario_block = "🎭 Сценарий потери:\n" + scenario_text + "\n\n"
+            scenario_title = "🎭 Сценарий закрытия остатка:" if after_tp1 else "🎭 Сценарий потери:"
+            scenario_block = scenario_title + "\n" + scenario_text + "\n\n"
         if analysis_lines:
             analysis_block = "📉 Candle-анализ:\n" + "\n".join([f"• {x}" for x in analysis_lines if x]) + "\n\n"
         if happened_lines:
-            happened_block = "📉 Что произошло после входа:\n" + "\n".join([f"• {x}" for x in happened_lines if x]) + "\n\n"
+            happened_title = "📉 Что произошло после TP1:" if after_tp1 else "📉 Что произошло после входа:"
+            happened_block = happened_title + "\n" + "\n".join([f"• {x}" for x in happened_lines if x]) + "\n\n"
         if visible_lines:
             visible_block = "👁 Что видно на графике:\n" + "\n".join([f"• {x}" for x in visible_lines if x]) + "\n\n"
         if secondary_labels:
@@ -8937,8 +8983,8 @@ def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pc
     )
 
     return (
-        f"{_report_close_emoji(st)} {symbol} | {market} | {side}\n\n"
-        f"📌 Статус: {_report_close_status(st, after_tp1=after_tp1)}\n"
+        f"{_report_close_emoji(st, after_tp1=after_tp1, pnl_total_pct=pnl_total_pct)} {symbol} | {market} | {side}\n\n"
+        f"📌 Статус: {_report_close_status(st, after_tp1=after_tp1, pnl_total_pct=pnl_total_pct)}\n"
         f"📊 Итог PnL: {_report_pnl_pct(pnl_total_pct)}\n"
         f"📊 Risk/Reward до TP1: 1 : {rr}\n"
         f"{setup_block}"
