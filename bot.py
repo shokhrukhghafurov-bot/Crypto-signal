@@ -6445,6 +6445,10 @@ def _loss_card_normalize_analysis_lines(lines: list[str]) -> list[str]:
             bucket = 'weak_followthrough'
         elif 'tp1 не был нормально поставлен под угрозу' in low:
             bucket = 'tp1_not_threatened'
+        elif 'entry → tp1' in low or 'entry->tp1' in low or 'entry to tp1' in low:
+            bucket = 'entry_tp1_distance'
+        elif 'rr до tp1' in low or 'risk/reward до tp1' in low:
+            bucket = 'entry_tp1_distance'
 
         if bucket and bucket in buckets:
             continue
@@ -8748,13 +8752,13 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             evidence=bool(wide_tp_target and no_tp and weak_follow and (late_long or supply_seen or supply_blocks or highish or normal_pullback or (duration_min is not None and duration_min >= 20))))
 
         add(10.4 + (1.2 if wide_tp_target else 0) + (1.0 if normal_pullback else 0) + (0.7 if late_long else 0), 'late_long_after_pump_sl_inside_pullback_wide_tp',
-            primary='Late LONG after pump / SL inside normal pullback',
-            scenario='LONG был открыт после сильного роста, когда цена уже находилась высоко относительно последнего impulse. TP1 мог быть далеко по проценту/RR, но вход был не из discount: перед продолжением рынок сделал обычный pullback/retest, а SL стоял внутри этого шума. Поэтому сделку выбило по SL до нормального continuation.',
-            analysis_add=[tp1_distance_line, 'SL стоял внутри normal pullback/retest после pump', 'fresh bullish displacement после входа отсутствовал'],
-            happened=['после входа покупатель не дал сразу новую волну вверх', 'цена сделала normal pullback/retest против LONG', 'SL был достигнут раньше подтверждённого continuation', 'TP1 не был взят, хотя цель могла быть далеко'],
-            visible=['перед входом уже прошёл buy-side impulse / pump', 'LONG был открыт после роста, а не из discount', 'SL находился внутри обычного pullback после импульса', 'большое расстояние до TP1 не означает clean path', pos_line],
-            secondary=['Late long after pump', 'SL inside normal pullback', 'No fresh bullish displacement', 'TP1 not reached'],
-            improve=['после сильного pump ждать pullback ниже / discount re-entry', 'ставить SL за structural invalidation, а не внутри первого pullback', 'не считать большой RR чистым путём до TP1 без acceptance'],
+            primary='Late LONG after pump / no acceptance + SL inside pullback',
+            scenario='LONG был открыт после сильного роста, когда цена уже находилась высоко относительно последнего impulse и под/рядом с seller reaction area. TP1 мог быть далеко по проценту/RR, но вход был не из discount: рынок не дал acceptance выше resistance, затем сделал обычный pullback/retest, а SL стоял внутри этого шума. Поэтому сделку выбило по SL до подтверждённого continuation.',
+            analysis_add=[tp1_distance_line, 'acceptance выше local resistance отсутствовал', 'SL стоял внутри normal pullback/retest после pump', 'fresh bullish displacement после входа отсутствовал'],
+            happened=['после входа покупатель не дал сразу новую волну вверх', 'цена не закрепилась выше local resistance / entry-zone', 'цена сделала normal pullback/retest против LONG', 'SL был достигнут раньше подтверждённого continuation', 'TP1 не был взят, хотя цель могла быть далеко'],
+            visible=['перед входом уже прошёл buy-side impulse / pump', 'LONG был открыт после роста, а не из discount', 'над входом оставалась seller reaction / resistance area', 'SL находился внутри обычного pullback после импульса', 'большое расстояние до TP1 не означает clean path', pos_line],
+            secondary=['Late long after pump', 'No acceptance above resistance', 'SL inside normal pullback', 'No fresh bullish displacement', 'TP1 not reached'],
+            improve=['после сильного pump ждать pullback ниже / discount re-entry', 'лонговать выше resistance только после acceptance/закрепления', 'ставить SL за structural invalidation, а не внутри первого pullback', 'не считать большой RR чистым путём до TP1 без acceptance'],
             evidence=bool(wide_tp_target and no_tp and (late_long or bullish_ctx or normal_pullback or supply_seen or highish or wide_tp_target) and (weak_follow or normal_pullback or duration_min is not None)))
 
         resistance_acceptance_primary = 'Late LONG after pump / no acceptance at resistance' if late_long else 'LONG under local resistance / no acceptance after retest'
