@@ -6410,6 +6410,51 @@ def _loss_card_normalize_visible_position_lines(lines: list[str], analysis: dict
     return list(dict.fromkeys(out))
 
 
+def _loss_card_normalize_analysis_lines(lines: list[str]) -> list[str]:
+    """Compact repeated LOSS-card analysis facts.
+
+    Ranked engine can collect the same fact from several detectors (for example
+    "fresh bullish displacement отсутствовал" and "bullish displacement отсутствовал").
+    Keep the stronger/fresher version once so the Telegram card does not look
+    templated or duplicated.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    buckets: set[str] = set()
+    for item in list(lines or []):
+        text = str(item or '').strip()
+        if not text:
+            continue
+        low = text.lower()
+        key = re.sub(r'\s+', ' ', low)
+        if key in seen:
+            continue
+
+        bucket = ''
+        if 'acceptance' in low and ('отсутств' in low or 'не подтверд' in low):
+            bucket = 'no_acceptance'
+        elif 'fresh bullish displacement' in low and 'отсутств' in low:
+            bucket = 'no_fresh_bullish_displacement'
+        elif 'bullish displacement' in low and 'отсутств' in low:
+            bucket = 'no_fresh_bullish_displacement'
+        elif 'fresh bearish displacement' in low and 'отсутств' in low:
+            bucket = 'no_fresh_bearish_displacement'
+        elif 'bearish displacement' in low and 'отсутств' in low:
+            bucket = 'no_fresh_bearish_displacement'
+        elif 'follow-through' in low and ('слаб' in low or 'отсутств' in low):
+            bucket = 'weak_followthrough'
+        elif 'tp1 не был нормально поставлен под угрозу' in low:
+            bucket = 'tp1_not_threatened'
+
+        if bucket and bucket in buckets:
+            continue
+        seen.add(key)
+        if bucket:
+            buckets.add(bucket)
+        out.append(text)
+    return out
+
+
 def _loss_card_real_rr_to_tp1(entry: float, sl: float, tp1: float) -> str:
     """RR used in closed reports must match the printed TP1 line."""
     try:
@@ -7726,14 +7771,24 @@ def _loss_card_non_template_context_payload(src: dict, analysis: dict, *, side: 
         cs_line = (f'расстояние entry → TP1: около {cs:.2f}%' if wide_target_hint else f'clean space до TP1: около {cs:.2f}%') if cs > 0 else 'clean space до TP1 не подтверждён свечами'
         pos_line = f'позиция входа в range: {pos:.2f}' if pos > 0 else ''
         if side_u == 'LONG':
+            if wide_target_hint:
+                return out(
+                    'Late LONG after pump / TP1 too far behind resistance',
+                    'LONG был открыт после уже выполненного buy-side движения. TP1 был далеко по проценту/RR, но путь к нему проходил через overhead resistance/supply, поэтому большое расстояние до TP1 не означало clean path. После входа не было acceptance и fresh bullish displacement, цена ушла в pullback/rejection к SL.',
+                    [cs_line, pos_line, 'fresh bullish displacement после входа отсутствовал'],
+                    ['покупатель не смог закрепиться выше entry/retest зоны', 'после входа не появился новый bullish expansion', 'TP1 был слишком далеко за reaction area', 'SL был достигнут после pullback/rejection'],
+                    ['перед входом уже был bounce/pump вверх', 'LONG открыт после роста, а не из сильного discount', 'на пути к TP1 были local high / resistance зоны', 'большой RR не равен чистому пути до TP1'],
+                    ['Late long after pump', 'TP1 too far behind resistance', 'No retest acceptance', 'No fresh bullish displacement'],
+                    ['после pump ждать discount re-entry ниже', 'для LONG требовать acceptance выше ближайшего resistance', 'не ставить TP1 далеко за несколькими overhead зонами'],
+                )
             return out(
-                'LONG had no clean upside space / weak location',
-                'LONG был открыт без нормального clean upside-space. Даже если confirm формально был, путь к TP1 упирался в local high / resistance или вход был после уже отработанного импульса. Поэтому покупатель не смог дать continuation и цена ушла к SL.',
+                'LONG under local resistance / no acceptance after retest',
+                'LONG был открыт без нормального acceptance выше entry/retest зоны. Путь вверх упирался в local high / resistance или вход был после уже отработанного импульса, поэтому покупатель не смог дать fresh continuation и цена ушла к SL.',
                 [cs_line, pos_line, 'fresh bullish displacement после входа отсутствовал'],
                 ['покупатель не смог расширить движение вверх', 'цена не закрепилась выше entry/retest зоны', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после отката/rejection'],
-                ['вход был не из сильного discount, а ближе к зоне сопротивления или после уже отработанного движения', 'сверху было мало свободного пространства до TP1', 'после входа не появился clean bullish displacement', 'движение быстро перешло против LONG'],
-                ['TP1 near supply/resistance reaction area', 'Late/weak LONG location', 'No post-entry expansion', 'TP1 was never threatened'],
-                ['не брать LONG без clean space до TP1', 'ждать pullback ниже / discount entry', 'требовать fresh bullish displacement после retest'],
+                ['вход был не из сильного discount, а ближе к resistance или после уже отработанного движения', 'после входа не появился clean bullish displacement', 'движение быстро перешло против LONG'],
+                ['No retest acceptance', 'Late/weak LONG location', 'No post-entry expansion', 'TP1 was never threatened'],
+                ['не брать LONG без acceptance после retest', 'ждать pullback ниже / discount entry', 'требовать fresh bullish displacement после retest'],
             )
         return out(
             'SHORT had no clean downside space / bearish reclaim missing',
@@ -7907,6 +7962,10 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     pos = f('entry_position_in_prior_range', f('entry_position_in_range', 0.5))
     pos_known = _loss_card_has_real_entry_position(analysis)
     l6, l12, l24, premove = f('local_pre_move_6_pct'), f('local_pre_move_12_pct'), f('local_pre_move_24_pct'), f('pre_entry_move_pct')
+    first_push_known = 'first_push_pct' in analysis
+    against_known = 'against_move_first3_pct' in analysis
+    mfe_known = 'mfe_pct' in analysis
+    mae_known = 'mae_pct' in analysis
     first_push = abs(f('first_push_pct'))
     against = abs(f('against_move_first3_pct'))
     mfe = abs(f('mfe_pct'))
@@ -7922,8 +7981,10 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     # and quick invalidation should still be treated as "TP1 was not properly
     # threatened". Otherwise the ranked engine returns {} and the card falls
     # back to the generic "TP1 blocked by local resistance" template.
+    infer_tp1_not_threatened = str(os.getenv('LOSS_CARD_INFER_TP1_NOT_THREATENED', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
     no_tp = bool(
         (tp1_known and not b('tp1_threatened'))
+        or (infer_tp1_not_threatened and (not tp1_known) and (duration_min is not None and duration_min > 0))
         or ((not tp1_known) and (tight_space or fast or b('weak_followthrough') or b('no_post_entry_expansion')))
         or b('tp1_too_close_no_clean_space')
         or b('weak_followthrough')
@@ -7934,8 +7995,8 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     normal_pullback = bool(sl_tight and no_tp and (against >= max(first_push * 1.05, risk_pct * 0.55, 0.08) or fast or b('retest_too_deep')))
     meaningful_excursion_missing = bool(b('sl_hit_without_meaningful_excursion') or (mfe > 0 and mfe < 0.12) or (mfe_r > 0 and mfe_r < 0.45))
     immediate_counter = bool(b('immediate_invalidation') or against >= max(first_push * 1.15, risk_pct * 0.75, 0.12))
-    weak_confirm = bool(b('confirm_too_weak') or b('zone_reaction_too_weak') or first_push < 0.15)
-    weak_follow = bool(b('weak_followthrough') or b('no_post_entry_expansion') or no_tp or mfe < 0.35)
+    weak_confirm = bool(b('confirm_too_weak') or b('zone_reaction_too_weak') or (first_push_known and first_push < 0.15))
+    weak_follow = bool(b('weak_followthrough') or b('no_post_entry_expansion') or no_tp or (mfe_known and mfe < 0.35))
     range_trap = bool(b('range_trap_behavior') or b('multiple_failed_pushes'))
     volume_faded = bool(b('post_entry_volume_faded'))
 
@@ -8577,12 +8638,12 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             improve=['после сильного dump ждать premium re-entry выше', 'не шортить прямо возле post-dump low', 'требовать новый bearish displacement после bounce/retest'],
             evidence=bool(late_or_low_short and (normal_pullback or no_tp or lowish or tight_space)))
         add(8.4 + (2 if fast else 0) + (1 if normal_pullback else 0) + (1 if tight_space else 0) + (1 if demand_blocks else 0), 'short_into_demand_tight_sl_fast',
-            primary='SHORT into demand + SL inside normal bounce',
-            scenario=f'SHORT был открыт низко рядом с зоной покупателя: {demand_desc}. Downside до TP1 был заблокирован, а SL стоял слишком близко к entry для обычного bounce/retest. Поэтому цена быстро дала реакцию покупателя и выбила SL до нормального bearish continuation.',
+            primary='SHORT near support + SL inside normal bounce',
+            scenario=f'SHORT был открыт низко рядом с support/buyer reaction area: {demand_desc}. Downside до TP1 был ограничен, а SL стоял внутри обычного bounce/retest. Поэтому цена дала реакцию покупателя и выбила SL до нормального bearish continuation.',
             analysis_add=['SL был слишком близко для такого bounce/retest', 'downside до TP1 был ограничен demand/support зоной'],
             happened=['продавец не смог сразу пробить ближний support/demand', 'обычный bounce/retest оказался сильнее SL', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут до fresh bearish continuation'],
             visible=[f'снизу была {demand_desc}', 'SHORT открыт рядом с local low / support', 'SL находился внутри нормального bounce/retest-движения', 'TP1 был рядом/за реакционной зоной, поэтому путь не был чистым', 'после входа не появился clean bearish displacement', pos_line],
-            secondary=['Short into demand', 'SL too tight', 'SL inside normal bounce', 'TP1 blocked by support', 'TP1 near demand/support reaction area'],
+            secondary=['Short near support', 'SL too tight', 'SL inside normal bounce', 'TP1 blocked by support', 'Buyer bounce reaction'],
             improve=['не шортить прямо над local low/support', 'SL ставить за structural invalidation, а не внутри bounce', 'ждать premium re-entry выше', 'если RR ломается после нормального SL — пропускать сделку'],
             evidence=bool(fast and no_tp and (demand_seen or demand_blocks or lowish or tight_space) and (risk_pct <= max(tight_sl_pct, 0.45) or normal_pullback or tight_space)))
         short_demand_primary = 'SHORT opened too low near demand/support / downside path blocked' if lowish else 'SHORT opened near demand/support / downside path blocked'
@@ -8686,6 +8747,16 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             improve=['не ставить TP1 за несколькими overhead supply/resistance зонами', 'для LONG ждать acceptance выше ближайшего resistance', 'после bounce брать цель до resistance или ждать discount re-entry ниже', 'не считать большой RR чистым путём до TP1'],
             evidence=bool(wide_tp_target and no_tp and weak_follow and (late_long or supply_seen or supply_blocks or highish or normal_pullback or (duration_min is not None and duration_min >= 20))))
 
+        add(10.4 + (1.2 if wide_tp_target else 0) + (1.0 if normal_pullback else 0) + (0.7 if late_long else 0), 'late_long_after_pump_sl_inside_pullback_wide_tp',
+            primary='Late LONG after pump / SL inside normal pullback',
+            scenario='LONG был открыт после сильного роста, когда цена уже находилась высоко относительно последнего impulse. TP1 мог быть далеко по проценту/RR, но вход был не из discount: перед продолжением рынок сделал обычный pullback/retest, а SL стоял внутри этого шума. Поэтому сделку выбило по SL до нормального continuation.',
+            analysis_add=[tp1_distance_line, 'SL стоял внутри normal pullback/retest после pump', 'fresh bullish displacement после входа отсутствовал'],
+            happened=['после входа покупатель не дал сразу новую волну вверх', 'цена сделала normal pullback/retest против LONG', 'SL был достигнут раньше подтверждённого continuation', 'TP1 не был взят, хотя цель могла быть далеко'],
+            visible=['перед входом уже прошёл buy-side impulse / pump', 'LONG был открыт после роста, а не из discount', 'SL находился внутри обычного pullback после импульса', 'большое расстояние до TP1 не означает clean path', pos_line],
+            secondary=['Late long after pump', 'SL inside normal pullback', 'No fresh bullish displacement', 'TP1 not reached'],
+            improve=['после сильного pump ждать pullback ниже / discount re-entry', 'ставить SL за structural invalidation, а не внутри первого pullback', 'не считать большой RR чистым путём до TP1 без acceptance'],
+            evidence=bool(wide_tp_target and no_tp and (late_long or bullish_ctx or normal_pullback or supply_seen or highish or wide_tp_target) and (weak_follow or normal_pullback or duration_min is not None)))
+
         resistance_acceptance_primary = 'Late LONG after pump / no acceptance at resistance' if late_long else 'LONG under local resistance / no acceptance after retest'
         add(9.4 + (1.0 if tight_space else 0) + (0.8 if normal_pullback else 0) + (0.6 if supply_seen else 0), 'long_under_resistance_no_acceptance',
             primary=resistance_acceptance_primary,
@@ -8725,14 +8796,14 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             improve=['после сильного pump ждать discount re-entry ниже', 'не лонговать прямо возле post-pump high', 'требовать новый bullish displacement после pullback/retest'],
             evidence=bool(late_or_high_long and (normal_pullback or no_tp or highish or tight_space)))
         add(8.4 + (2 if fast else 0) + (1 if normal_pullback else 0) + (1 if tight_space else 0) + (1 if supply_blocks else 0), 'long_into_supply_tight_sl_fast',
-            primary='LONG into supply + SL inside normal pullback',
-            scenario=f'LONG был открыт высоко рядом с зоной продавца: {supply_desc}. Upside до TP1 был заблокирован, а SL стоял слишком близко к entry для обычного pullback/retest. Поэтому цена быстро дала реакцию продавца и выбила SL до нормального bullish continuation.',
+            primary='LONG under resistance + SL inside normal pullback',
+            scenario=f'LONG был открыт под/рядом с resistance/seller reaction area: {supply_desc}. Upside до TP1 был ограничен, а SL стоял внутри обычного pullback/retest. Поэтому цена дала откат/rejection и выбила SL до нормального bullish continuation.',
             analysis_add=['SL был слишком близко для такого pullback/retest', 'upside до TP1 был ограничен supply/resistance зоной'],
             happened=['покупатель не смог сразу пробить ближний resistance/supply', 'обычный pullback/retest оказался сильнее SL', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут до fresh bullish continuation'],
             visible=[f'сверху была {supply_desc}', 'LONG открыт рядом с local high / resistance', 'SL находился внутри нормального pullback/retest-движения', 'TP1 был рядом/за реакционной зоной, поэтому путь не был чистым', 'после входа не появился clean bullish displacement', pos_line],
-            secondary=['Long into supply', 'SL too tight', 'SL inside normal pullback', 'TP1 blocked by resistance', 'TP1 near supply/resistance reaction area'],
+            secondary=['Long under resistance', 'SL too tight', 'SL inside normal pullback', 'TP1 blocked by resistance', 'Seller rejection reaction'],
             improve=['не лонговать прямо под local high/resistance', 'SL ставить за structural invalidation, а не внутри pullback', 'ждать discount re-entry ниже', 'если RR ломается после нормального SL — пропускать сделку'],
-            evidence=bool(fast and no_tp and (supply_seen or supply_blocks or highish or tight_space) and (risk_pct <= max(tight_sl_pct, 0.45) or normal_pullback or tight_space)))
+            evidence=bool(fast and no_tp and (supply_seen or supply_blocks or highish) and (risk_pct <= max(tight_sl_pct, 0.45) or normal_pullback or tight_space)))
         long_supply_primary = 'LONG opened too high near supply/resistance / upside path blocked' if highish else 'LONG opened into nearby supply/resistance / upside path blocked'
         long_supply_scenario_prefix = 'слишком высоко, рядом' if highish else 'рядом'
         add(6.5 + (2 if supply_blocks else 0) + (1 if tight_space else 0) + (1 if highish else 0), 'long_into_supply_resistance',
@@ -8870,7 +8941,11 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
 
     for fld in ('analysis_lines', 'happened_lines', 'visible_lines', 'secondary_labels', 'improve_labels'):
         best[fld] = [x for x in list(dict.fromkeys([str(v).strip() for v in list(best.get(fld) or []) if str(v).strip()]))]
+        if fld == 'analysis_lines':
+            best[fld] = _loss_card_normalize_analysis_lines(best[fld])[:8]
         if fld in ('happened_lines', 'visible_lines'):
+            best[fld] = best[fld][:8]
+        if fld == 'secondary_labels':
             best[fld] = best[fld][:8]
         if fld == 'improve_labels':
             best[fld] = best[fld][:6]
@@ -9159,7 +9234,7 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
     return {
         'primary_text': primary_text,
         'scenario_text': scenario_text,
-        'analysis_lines': list(dict.fromkeys([x for x in analysis_lines if str(x).strip()])),
+        'analysis_lines': _loss_card_normalize_analysis_lines(list(dict.fromkeys([x for x in analysis_lines if str(x).strip()]))),
         'what_happened_lines': list(dict.fromkeys([x for x in happened_lines if str(x).strip()])),
         'chart_visible_lines': list(dict.fromkeys([x for x in visible_lines if str(x).strip()])),
         'secondary_reason_labels': list(dict.fromkeys([x for x in secondary_labels if str(x).strip()])),
