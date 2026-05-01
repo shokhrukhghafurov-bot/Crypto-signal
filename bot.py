@@ -8166,6 +8166,92 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     move_name = 'dump' if is_short else 'pump'
     premium_discount_bad = (lowish if is_short else highish)
 
+    # v9.1 explicit reason keys requested for card precision.
+    # These reasons used to appear only as secondary labels/text.  They are now
+    # first-class candidates, so the card can select them as the main reason when
+    # the snapshot clearly proves that exact failure mode.
+    add(6.4 + (1.0 if weak_confirm else 0) + (0.6 if fast else 0), 'no_acceptance_after_retest',
+        primary=f'{side_word} no acceptance after retest',
+        scenario=f'{side_word} получил формальный trigger/retest, но цена не закрепилась в сторону сделки. После входа не было {confirm_word} acceptance выше/ниже entry-zone, поэтому retest не подтвердился и цена ушла к SL.',
+        analysis_add=['acceptance после retest отсутствовал', f'fresh {confirm_word} displacement после входа отсутствовал'],
+        happened=['цена не закрепилась в сторону сделки после retest', 'confirm не получил follow-through', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после возврата против entry'],
+        visible=['после retest нет 1–2 strong close в сторону сделки', f'нет clean {confirm_word} displacement после входа', 'entry/retest зона не получила acceptance', pos_line],
+        secondary=['No acceptance after retest', 'Retest failed', 'No clean displacement'],
+        improve=['после retest ждать 1–2 close в сторону сделки', 'не входить по одному касанию зоны без acceptance', 'если первая свеча после entry слабая — пропускать setup'],
+        evidence=bool(any_flag('no_acceptance_after_retest','no_retest_acceptance','retest_acceptance_missing','reclaim_without_acceptance','no_clean_retest_acceptance') or (weak_follow and no_tp and (weak_confirm or any_text('no acceptance','acceptance missing','no retest acceptance')))))
+    add(5.9 + (0.8 if fast else 0), 'no_post_entry_expansion',
+        primary=f'{side_word} no post-entry expansion',
+        scenario=f'После входа не появилась fresh {confirm_word} expansion candle. Сделка стояла без прогресса, импульс не расширился в сторону TP1, и цена вернулась к SL.',
+        analysis_add=[f'fresh {confirm_word} expansion candle после entry отсутствовала', 'post-entry expansion отсутствовал'],
+        happened=['после входа не появилось расширения движения', 'первые свечи не подтвердили continuation', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после слабого follow-through'],
+        visible=[f'нет fresh {confirm_word} expansion после entry', 'свечи после входа слабые/смешанные', pos_line],
+        secondary=['No post-entry expansion', 'No fresh expansion candle', 'Weak continuation'],
+        improve=['требовать fresh expansion candle после trigger', 'если entry не получает continuation в первые свечи — не держать идею как сильный setup'],
+        evidence=bool(any_flag('no_post_entry_expansion','no_fresh_expansion_candle','post_entry_expansion_missing') or (weak_follow and no_tp and not normal_pullback)))
+    add(5.6 + (0.6 if meaningful_excursion_missing else 0), 'tp1_was_never_threatened',
+        primary='TP1 was never threatened',
+        scenario='Цена после входа не приблизилась к TP1 достаточно близко и не поставила первую цель под реальную угрозу. Это означает, что setup не получил нужного continuation, а LOSS произошёл до нормального развития идеи.',
+        analysis_add=['TP1 не был нормально поставлен под угрозу', mfe_line],
+        happened=['движение в сторону сделки было слабым', 'рынок не дошёл до зоны TP1', 'после слабого excursion цена развернулась к SL'],
+        visible=['TP1 не был протестирован перед SL', f'{side_u} не получил достаточного хода в сторону сделки', pos_line],
+        secondary=['TP1 was never threatened', 'No meaningful excursion', 'Continuation missing'],
+        improve=['не засчитывать формальный confirm без реального движения к TP1', 'добавить фильтр MFE/R после entry', 'требовать первый push в сторону сделки'],
+        evidence=bool(any_flag('tp1_was_never_threatened','tp1_never_threatened') or (no_tp and (meaningful_excursion_missing or weak_follow))))
+    add(3.6 + (0.8 if sl_tight else 0), 'sl_too_tight',
+        primary='SL too tight for normal market noise',
+        scenario='SL был поставлен слишком близко к entry относительно обычного свечного шума. Даже без полной invalidation рынок мог сделать нормальный pullback/bounce и выбить такой SL.',
+        analysis_add=[risk_line, 'SL был слишком близко к entry для такого шума'],
+        happened=['обычный откат против входа оказался больше SL', 'структурная invalidation была дальше фактического SL', 'SL был достигнут до подтверждённого continuation'],
+        visible=['SL расположен внутри ближнего свечного шума', 'после входа был обычный retest/pullback, а не чистая structural invalidation', pos_line],
+        secondary=['SL too tight', 'SL inside noise', 'Structural invalidation farther away'],
+        improve=['ставить SL за structural invalidation', 'не ставить SL только за слабый micro-level', 'если нормальный SL ломает RR — пропускать сделку'],
+        evidence=bool(any_flag('sl_too_tight','tight_sl') or (sl_tight and no_tp)))
+    add(4.2 + (0.8 if normal_pullback else 0), 'sl_inside_normal_bounce',
+        primary='SL inside normal bounce after SHORT',
+        scenario='SHORT был открыт, но SL стоял внутри обычного bounce/retest после снижения. Цена сделала нормальный откат вверх против SHORT и выбила SL до подтверждённого bearish continuation.',
+        analysis_add=[risk_line, 'SL стоял внутри normal bounce/retest после SHORT'],
+        happened=['после входа появился обычный bounce против SHORT', 'bounce оказался сильнее SL', 'bearish continuation не успел подтвердиться', 'SL был достигнут до нового sell-side impulse'],
+        visible=['SL находился внутри обычного bounce/retest-движения', 'SHORT не получил clean bearish displacement после entry', pos_line],
+        secondary=['SL inside normal bounce', 'SL too tight', 'Bearish continuation missing'],
+        improve=['для SHORT ставить SL за structural invalidation выше bounce-зоны', 'не шортить, если первый bounce легко выбивает SL', 'если нормальный SL ломает RR — пропускать сделку'],
+        evidence=bool(is_short and (any_flag('sl_inside_normal_bounce','sl_inside_bounce') or normal_pullback)))
+    add(6.1 + (1.0 if bad_zone_blocks else 0) + (0.6 if normal_pullback else 0), 'short_above_local_support',
+        primary='SHORT above local support / no acceptance below entry',
+        scenario=f'SHORT был открыт прямо над local support / buyer reaction area ({bad_zone_desc}). Цена не закрепилась ниже entry/retest зоны, продавец не получил fresh bearish displacement, и support дал bounce к SL.',
+        analysis_add=['SHORT был над local support / buyer reaction area', 'acceptance ниже entry/retest зоны отсутствовал'],
+        happened=['продавец не смог продавить local support', 'появился buyer bounce против SHORT', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после reclaim/bounce вверх'],
+        visible=['снизу была local support / buyer reaction area', 'SHORT открыт слишком близко над support', 'после entry нет clean bearish displacement', pos_line],
+        secondary=['SHORT above local support', 'No acceptance below entry', 'Buyer bounce'],
+        improve=['не шортить прямо над local support', 'ждать premium re-entry выше', 'входить только после close ниже support/buyer reaction area'],
+        evidence=bool(is_short and (any_flag('short_above_local_support','short_above_support') or (no_tp and (demand_seen or demand_blocks or lowish)))))
+    add(6.0 + (1.0 if (not is_short and bad_zone_blocks) else 0), 'tp1_blocked_by_resistance',
+        primary='TP1 blocked by local resistance',
+        scenario='LONG имел формальный RR, но путь к TP1 проходил через ближайший local resistance / seller reaction area. Покупатель не закрепился выше этой зоны, поэтому TP1 не был нормально поставлен под угрозу и цена ушла к SL.',
+        analysis_add=[cs_line, 'TP1 был заблокирован local resistance / seller reaction area'],
+        happened=['покупатель не смог пробить ближний resistance', 'seller reaction появилась раньше continuation', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после rejection/отката'],
+        visible=['между entry и TP1 была local resistance / seller reaction area', 'TP1 стоял рядом/за зоной реакции продавца', 'после входа нет clean bullish displacement', pos_line],
+        secondary=['TP1 blocked by resistance', 'No clean upside path', 'Seller reaction before TP1'],
+        improve=['не брать LONG, если TP1 сразу за resistance', 'ждать acceptance выше resistance', 'ставить TP1 до первой сильной seller reaction area или пропускать вход'],
+        evidence=bool((not is_short) and (any_flag('tp1_blocked_by_resistance','tp1_blocked_by_local_resistance','resistance_blocks_tp1','supply_zone_blocks_tp1') or (no_tp and (supply_blocks or (tight_space and supply_seen))))))
+    add(6.0 + (1.0 if (is_short and bad_zone_blocks) else 0), 'tp1_blocked_by_support',
+        primary='TP1 blocked by local support',
+        scenario='SHORT имел формальный RR, но путь к TP1 проходил через ближайший local support / buyer reaction area. Продавец не закрепился ниже этой зоны, поэтому TP1 не был нормально поставлен под угрозу и цена дала bounce к SL.',
+        analysis_add=[cs_line, 'TP1 был заблокирован local support / buyer reaction area'],
+        happened=['продавец не смог пробить ближний support', 'buyer reaction появилась раньше continuation', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после bounce/reclaim вверх'],
+        visible=['между entry и TP1 была local support / buyer reaction area', 'TP1 стоял рядом/за зоной реакции покупателя', 'после входа нет clean bearish displacement', pos_line],
+        secondary=['TP1 blocked by support', 'No clean downside path', 'Buyer reaction before TP1'],
+        improve=['не брать SHORT, если TP1 сразу за support', 'ждать acceptance ниже support', 'ставить TP1 до первой сильной buyer reaction area или пропускать вход'],
+        evidence=bool(is_short and (any_flag('tp1_blocked_by_support','tp1_blocked_by_local_support','support_blocks_tp1','demand_zone_blocks_tp1') or (no_tp and (demand_blocks or (tight_space and demand_seen))))))
+    add(5.7 + (0.8 if weak_confirm else 0), 'follow_through_failed',
+        primary=f'{side_word} follow-through failed after confirm',
+        scenario=f'Confirm был формально принят, но следующего {confirm_word} follow-through не появилось. Первые свечи после entry не продолжили движение, поэтому setup потерял momentum и ушёл к SL.',
+        analysis_add=['follow-through после входа был слабый/отсутствовал', f'{confirm_word} continuation не подтвердился'],
+        happened=['confirm-candle не получила продолжение', 'цена не закрепилась в сторону сделки', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после failure follow-through'],
+        visible=[f'после confirm нет clean {confirm_word} continuation', 'первые свечи после entry не расширили движение', pos_line],
+        secondary=['Follow-through failed', 'Weak confirm continuation', 'No fresh displacement'],
+        improve=['после confirm требовать продолжение следующей свечой', 'не входить, если confirm есть только формально, без follow-through'],
+        evidence=bool(any_flag('follow_through_failed','followthrough_failed','weak_followthrough') or (weak_follow and no_tp)))
+
     # Market / BTC context. These flags are optional; if backend/snapshot provides
     # them, a fast SL can be explained as a real market reversal instead of a
     # generic "SL too tight". Numeric keys are tolerated with several names so
@@ -9202,7 +9288,7 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     # should be location/structure/market/confirmation/TP path whenever such
     # evidence exists.
     location_keys = ('late_', 'short_into', 'long_into', 'discount', 'premium', 'against_', 'htf_', 'break', 'liquidity', 'ob_fvg', 'origin', 'stacked', 'entry_', 'bad_', 'tp1_', 'weak_', 'range_', 'volume_', 'counter_', 'market_')
-    generic_timing_keys = {'fast_sl_no_excursion', 'sl_inside_normal_pullback'}
+    generic_timing_keys = {'fast_sl_no_excursion', 'sl_inside_normal_pullback', 'sl_too_tight', 'sl_inside_normal_bounce'}
     boosted = []
     for score, key, payload in candidates:
         if key.startswith(location_keys):
