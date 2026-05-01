@@ -8761,6 +8761,34 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             improve=['после сильного pump ждать pullback ниже / discount re-entry', 'лонговать выше resistance только после acceptance/закрепления', 'ставить SL за structural invalidation, а не внутри первого pullback', 'не считать большой RR чистым путём до TP1 без acceptance'],
             evidence=bool(wide_tp_target and no_tp and (late_long or bullish_ctx or normal_pullback or supply_seen or highish or wide_tp_target) and (weak_follow or normal_pullback or duration_min is not None)))
 
+        # V7 exact FVG/seller-zone detector. If the pre-entry snapshot shows
+        # a real overhead red FVG / supply zone, make that the main reason instead
+        # of the broader "local resistance" wording. This fixes ASTER-type cards:
+        # LONG was not just under resistance; it was opened into/under a bearish FVG
+        # and price never accepted above entry before SL.
+        real_bearish_fvg_block = bool(side_u == 'LONG' and (real_supply_is_fvg or b('overhead_bearish_fvg')) and no_tp and (weak_follow or tight_space or supply_blocks or normal_pullback))
+        add(12.6 + (1.0 if supply_blocks else 0) + (0.8 if tight_space else 0) + (0.6 if normal_pullback else 0), 'long_into_bearish_fvg_no_acceptance',
+            primary='LONG into bearish FVG / local resistance, no acceptance above entry',
+            scenario=f'LONG был открыт прямо под/в районе bearish FVG / seller reaction area ({supply_desc}). Цена не смогла закрепиться выше entry/retest зоны, fresh bullish displacement не появился, а TP1 находился за ближайшей зоной продавца. Поэтому после слабого стояния под зоной движение ушло к SL.',
+            analysis_add=['bearish FVG / seller reaction area была над entry', 'acceptance выше entry/retest зоны отсутствовал', 'fresh bullish displacement после входа отсутствовал', tp1_supply_path_line],
+            happened=['покупатель не смог принять цену выше bearish FVG / resistance', 'seller reaction удержала движение сверху', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после rejection/pullback'],
+            visible=[f'над входом была {supply_desc}', 'LONG был открыт под/в районе bearish FVG / seller reaction area', 'TP1 стоял за ближайшей зоной продавца, а не перед свободным пространством', 'после входа нет clean bullish displacement', 'цена не удержала reclaim/entry-зону', pos_line],
+            secondary=['Bearish FVG above entry', 'No acceptance above entry', 'Local resistance held', 'Seller rejection', 'No fresh bullish displacement'],
+            improve=['не брать LONG прямо под bearish FVG / seller reaction area', 'ждать 1–2 close выше FVG/resistance', 'если после retest нет fresh bullish displacement — пропускать вход', 'TP1 ставить до ближайшей seller zone или не брать сделку'],
+            evidence=real_bearish_fvg_block)
+
+        # Symmetric exact detector for SHORT near a real green FVG / buyer zone.
+        real_bullish_fvg_block = bool(side_u == 'SHORT' and (real_demand_is_fvg or b('underlying_bullish_fvg')) and no_tp and (weak_follow or tight_space or demand_blocks or normal_pullback))
+        add(12.6 + (1.0 if demand_blocks else 0) + (0.8 if tight_space else 0) + (0.6 if normal_pullback else 0), 'short_into_bullish_fvg_no_acceptance',
+            primary='SHORT into bullish FVG / local support, no acceptance below entry',
+            scenario=f'SHORT был открыт прямо над/в районе bullish FVG / buyer reaction area ({demand_desc}). Цена не смогла закрепиться ниже entry/retest зоны, fresh bearish displacement не появился, а TP1 находился за ближайшей зоной покупателя. Поэтому после слабого стояния над зоной цена дала bounce/reclaim к SL.',
+            analysis_add=['bullish FVG / buyer reaction area была под entry', 'acceptance ниже entry/retest зоны отсутствовал', 'fresh bearish displacement после входа отсутствовал', tp1_demand_path_line],
+            happened=['продавец не смог принять цену ниже bullish FVG / support', 'buyer reaction удержала движение снизу', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после bounce/reclaim'],
+            visible=[f'под входом была {demand_desc}', 'SHORT был открыт над/в районе bullish FVG / buyer reaction area', 'TP1 стоял за ближайшей зоной покупателя, а не перед свободным пространством', 'после входа нет clean bearish displacement', 'цена не удержала breakdown/entry-зону', pos_line],
+            secondary=['Bullish FVG below entry', 'No acceptance below entry', 'Local support held', 'Buyer bounce', 'No fresh bearish displacement'],
+            improve=['не брать SHORT прямо над bullish FVG / buyer reaction area', 'ждать 1–2 close ниже FVG/support', 'если после retest нет fresh bearish displacement — пропускать вход', 'TP1 ставить до ближайшей buyer zone или не брать сделку'],
+            evidence=real_bullish_fvg_block)
+
         resistance_acceptance_primary = 'Late LONG after pump / no acceptance at resistance' if late_long else 'LONG under local resistance / no acceptance after retest'
         add(9.4 + (1.0 if tight_space else 0) + (0.8 if normal_pullback else 0) + (0.6 if supply_seen else 0), 'long_under_resistance_no_acceptance',
             primary=resistance_acceptance_primary,
