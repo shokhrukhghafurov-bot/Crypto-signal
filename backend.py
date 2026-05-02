@@ -17854,19 +17854,19 @@ def _build_levels(direction: str, entry: float, atr: float, *, tp2_r: float | No
 
 
 
-def _mid_struct_zone_bounds(ta: dict | None = None, it: dict | None = None) -> tuple[float | None, float | None]:
-    """Return the broadest known structural zone around the entry idea.
+def _mid_collect_structural_zone_pairs(ta: dict | None = None, it: dict | None = None) -> list[tuple[float, float, str]]:
+    """Collect known OB/FVG/retest/support zones as normalized (low, high, name).
 
-    Sources can come from pending records (entry_low/entry_high), TA snapshots
-    (OB/FVG zones), or older key names.  This is the zone whose far edge becomes
-    real invalidation for SL placement: SHORT -> above high, LONG -> below low.
+    The previous SL logic only used a broad min/max zone. That can still leave a
+    stop inside the *active* retest pullback when the real entry zone is stored
+    under a different key.  This collector keeps all zone pairs so the SL engine
+    can anchor behind the nearest valid invalidation zone, not inside it.
     """
     ta = ta or {}
     it = it or {}
-    vals_lo: list[float] = []
-    vals_hi: list[float] = []
+    out: list[tuple[float, float, str]] = []
 
-    def _push_pair(lo, hi) -> None:
+    def _push_pair(lo, hi, name: str = "zone") -> None:
         try:
             lo_f = float(lo)
             hi_f = float(hi)
@@ -17876,8 +17876,7 @@ def _mid_struct_zone_bounds(ta: dict | None = None, it: dict | None = None) -> t
             return
         lo_f, hi_f = float(min(lo_f, hi_f)), float(max(lo_f, hi_f))
         if hi_f > lo_f > 0:
-            vals_lo.append(lo_f)
-            vals_hi.append(hi_f)
+            out.append((lo_f, hi_f, str(name or "zone")))
 
     pair_keys = (
         ("entry_low", "entry_high"),
@@ -17888,26 +17887,55 @@ def _mid_struct_zone_bounds(ta: dict | None = None, it: dict | None = None) -> t
         ("fvg_low", "fvg_high"),
         ("order_block_low", "order_block_high"),
         ("fair_value_gap_low", "fair_value_gap_high"),
+        # extra aliases seen in snapshots / diagnostics
+        ("bullish_fvg_low", "bullish_fvg_high"),
+        ("bearish_fvg_low", "bearish_fvg_high"),
+        ("demand_low", "demand_high"),
+        ("supply_low", "supply_high"),
+        ("support_low", "support_high"),
+        ("resistance_low", "resistance_high"),
+        ("buyer_zone_low", "buyer_zone_high"),
+        ("seller_zone_low", "seller_zone_high"),
+        ("nearest_demand_low", "nearest_demand_high"),
+        ("nearest_supply_low", "nearest_supply_high"),
+        ("nearest_bullish_fvg_low", "nearest_bullish_fvg_high"),
+        ("nearest_bearish_fvg_low", "nearest_bearish_fvg_high"),
     )
-    tuple_keys = ("ob_zone", "fvg_zone", "entry_zone", "zone", "retest_zone")
+    tuple_keys = (
+        "ob_zone", "fvg_zone", "entry_zone", "zone", "retest_zone",
+        "bullish_fvg_zone", "bearish_fvg_zone", "demand_zone", "supply_zone",
+        "support_zone", "resistance_zone", "buyer_zone", "seller_zone",
+        "nearest_demand_zone", "nearest_supply_zone",
+    )
 
     for src in (ta, it):
         if not isinstance(src, dict):
             continue
         for lo_key, hi_key in pair_keys:
-            _push_pair(src.get(lo_key), src.get(hi_key))
+            _push_pair(src.get(lo_key), src.get(hi_key), lo_key.rsplit("_", 1)[0])
         for key in tuple_keys:
             z = src.get(key)
             try:
                 if isinstance(z, dict):
-                    _push_pair(z.get("low") or z.get("lo") or z.get("min"), z.get("high") or z.get("hi") or z.get("max"))
+                    _push_pair(z.get("low") or z.get("lo") or z.get("min"), z.get("high") or z.get("hi") or z.get("max"), key)
                 elif isinstance(z, (list, tuple)) and len(z) >= 2:
-                    _push_pair(z[0], z[1])
+                    _push_pair(z[0], z[1], key)
             except Exception:
                 pass
 
-    if vals_lo and vals_hi:
-        return (float(min(vals_lo)), float(max(vals_hi)))
+    # de-duplicate very close zones
+    dedup: list[tuple[float, float, str]] = []
+    for lo, hi, name in out:
+        if not any(abs(lo - a) <= max(1e-12, abs(lo) * 1e-6) and abs(hi - b) <= max(1e-12, abs(hi) * 1e-6) for a, b, _ in dedup):
+            dedup.append((lo, hi, name))
+    return dedup
+
+
+def _mid_struct_zone_bounds(ta: dict | None = None, it: dict | None = None) -> tuple[float | None, float | None]:
+    """Return broad known structural zone bounds around the entry idea."""
+    pairs = _mid_collect_structural_zone_pairs(ta, it)
+    if pairs:
+        return (float(min(p[0] for p in pairs)), float(max(p[1] for p in pairs)))
     return (None, None)
 
 def _mid_pick_entry_anchor(direction: str,
@@ -17973,9 +18001,11 @@ def _mid_min_stop_distance(entry: float,
         zone_w = 0.0
         if zlo is not None and zhi is not None and zhi > zlo:
             zone_w = float(zhi - zlo)
-        min_atr = _trade_env_float(("TRADE_MIN_SL_ATR_MULT", "MID_MIN_SL_ATR"), 0.45)
-        min_pct = _trade_env_float(("TRADE_MIN_SL_PCT", "MID_MIN_SL_PCT"), 0.0018)
-        zone_mult = _trade_env_float(("TRADE_MIN_SL_ZONE_MULT", "MID_MIN_SL_ZONE_MULT"), 1.10)
+        # v14: default floor is intentionally wider. 0.45 ATR was still often
+        # inside the first normal pullback/retest after a pump.
+        min_atr = _trade_env_float(("TRADE_MIN_SL_ATR_MULT", "MID_MIN_SL_ATR"), 0.70)
+        min_pct = _trade_env_float(("TRADE_MIN_SL_PCT", "MID_MIN_SL_PCT"), 0.0025)
+        zone_mult = _trade_env_float(("TRADE_MIN_SL_ZONE_MULT", "MID_MIN_SL_ZONE_MULT"), 1.35)
         return max(
             atr_f * max(0.0, min_atr),
             abs(entry_f) * max(0.0, min_pct),
@@ -18009,11 +18039,14 @@ def _mid_anchor_sl_to_structure(direction: str,
     if entry_f <= 0 or sl_f <= 0:
         return sl_f
 
-    buf_atr = _trade_env_float(("TRADE_SL_BUFFER_ATR_MULT", "MID_STRUCT_SL_BUFFER_ATR"), 0.20)
-    buf_pct = _trade_env_float(("TRADE_SL_BUFFER_PCT", "MID_STRUCT_SL_BUFFER_PCT"), 0.0010)
+    # v14: SL must sit *behind invalidation*, not at the near edge of the pullback.
+    # Wider defaults reduce false SL hits like BBUSDT: idea correct, stop too close.
+    buf_atr = _trade_env_float(("TRADE_SL_BUFFER_ATR_MULT", "MID_STRUCT_SL_BUFFER_ATR"), 0.35)
+    buf_pct = _trade_env_float(("TRADE_SL_BUFFER_PCT", "MID_STRUCT_SL_BUFFER_PCT"), 0.0015)
     buf = max(atr_f * max(0.0, buf_atr), abs(entry_f) * max(0.0, buf_pct), 1e-12)
     min_risk = _mid_min_stop_distance(entry_f, atr_f, ta, it)
 
+    zone_pairs = _mid_collect_structural_zone_pairs(ta, it)
     zlo, zhi = _mid_struct_zone_bounds(ta, it)
     anchors: list[float] = []
 
@@ -18026,18 +18059,57 @@ def _mid_anchor_sl_to_structure(direction: str,
             return
         anchors.append(float(fv))
 
+    # Do not treat an already-generated raw SL as structure.  That was the common
+    # source of “SL inside normal pullback”: the raw SL was near entry and could win
+    # over the real FVG/OB far edge.  We only use zone edges, swing points, support /
+    # resistance and equal highs/lows as invalidation anchors.
+    near_zone = max(atr_f * float(os.getenv("TRADE_STRUCT_SL_NEAR_ZONE_ATR", "0.55") or 0.55),
+                    abs(entry_f) * float(os.getenv("TRADE_STRUCT_SL_NEAR_ZONE_PCT", "0.0040") or 0.0040))
+
+    def _best_long_zone_low() -> float | None:
+        candidates: list[tuple[float, float, float, str]] = []
+        for lo, hi, name in zone_pairs:
+            # Entry may be inside the zone, just above it, or just after a reclaim.
+            if lo < entry_f and hi <= entry_f + near_zone:
+                dist = max(0.0, entry_f - hi)
+                if dist <= near_zone:
+                    candidates.append((dist, -(hi - lo), lo, name))
+        if candidates:
+            candidates.sort()
+            return float(candidates[0][2])
+        if zlo is not None and zlo < entry_f:
+            return float(zlo)
+        return None
+
+    def _best_short_zone_high() -> float | None:
+        candidates: list[tuple[float, float, float, str]] = []
+        for lo, hi, name in zone_pairs:
+            # Entry may be inside the zone, just below it, or just after a rejection.
+            if hi > entry_f and lo >= entry_f - near_zone:
+                dist = max(0.0, lo - entry_f)
+                if dist <= near_zone:
+                    candidates.append((dist, -(hi - lo), hi, name))
+        if candidates:
+            candidates.sort()
+            return float(candidates[0][2])
+        if zhi is not None and zhi > entry_f:
+            return float(zhi)
+        return None
+
     if d == "LONG":
-        _push(zlo)
-        _push(ta.get("support"))
-        _push(it.get("support"))
-        _push(ta.get("eq_lo"))
-        _push(it.get("eq_lo"))
-        _push(ta.get("recent_low"))
-        _push(it.get("recent_low"))
-        _push(ta.get("sl"))
-        _push(it.get("sl"))
+        _push(_best_long_zone_low())
+        for src in (ta, it):
+            for key in (
+                "support", "eq_lo", "recent_low", "swing_low", "last_swing_low",
+                "pivot_low", "last_pivot_low", "retest_low", "wick_low",
+                "liquidity_low", "structural_low", "invalidation_low",
+            ):
+                _push(src.get(key))
         below = [x for x in anchors if x < entry_f]
         if below:
+            # Use the nearest valid structural anchor, then force it far enough by
+            # volatility/zone floor.  This makes SL sit under invalidation, not inside
+            # the first retest candle.
             nearest = max(below)
             structural_sl = max(1e-12, float(nearest) - buf)
             max_close_sl = max(1e-12, entry_f - min_risk)
@@ -18045,15 +18117,14 @@ def _mid_anchor_sl_to_structure(direction: str,
         return float(min(sl_f, max(1e-12, entry_f - min_risk)))
 
     if d == "SHORT":
-        _push(zhi)
-        _push(ta.get("resistance"))
-        _push(it.get("resistance"))
-        _push(ta.get("eq_hi"))
-        _push(it.get("eq_hi"))
-        _push(ta.get("recent_high"))
-        _push(it.get("recent_high"))
-        _push(ta.get("sl"))
-        _push(it.get("sl"))
+        _push(_best_short_zone_high())
+        for src in (ta, it):
+            for key in (
+                "resistance", "eq_hi", "recent_high", "swing_high", "last_swing_high",
+                "pivot_high", "last_pivot_high", "retest_high", "wick_high",
+                "liquidity_high", "structural_high", "invalidation_high",
+            ):
+                _push(src.get(key))
         above = [x for x in anchors if x > entry_f]
         if above:
             nearest = min(above)
