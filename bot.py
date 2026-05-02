@@ -8065,6 +8065,38 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     bullish_ctx = bool(b('bullish_context_before_entry') or b('short_against_bullish_structure') or b('bearish_reclaim_missing') or contains_any(structure_text, ('bullish', 'higher high', 'higher low', 'buy')) or l6 >= 0.12 or l12 >= 0.22 or premove >= exhausted_move_pct)
     late_long = bool(b('late_entry_after_exhausted_move') or b('late_entry_inside_expansion') or l6 >= 0.12 or l12 >= 0.22 or l24 >= 0.35 or premove >= exhausted_move_pct)
     late_short = bool(b('late_entry_after_exhausted_move') or b('late_entry_inside_expansion') or l6 <= -0.12 or l12 <= -0.22 or l24 <= -0.35 or premove <= -exhausted_move_pct)
+    try:
+        vertical_pump_6_pct = float(str(os.getenv('LOSS_CARD_VERTICAL_PUMP_6_PCT', '0.55') or '0.55').replace(',', '.'))
+    except Exception:
+        vertical_pump_6_pct = 0.55
+    try:
+        vertical_pump_12_pct = float(str(os.getenv('LOSS_CARD_VERTICAL_PUMP_12_PCT', '0.85') or '0.85').replace(',', '.'))
+    except Exception:
+        vertical_pump_12_pct = 0.85
+    try:
+        vertical_pump_24_pct = float(str(os.getenv('LOSS_CARD_VERTICAL_PUMP_24_PCT', '1.20') or '1.20').replace(',', '.'))
+    except Exception:
+        vertical_pump_24_pct = 1.20
+    try:
+        vertical_pump_min_cs_pct = float(str(os.getenv('LOSS_CARD_VERTICAL_PUMP_MIN_TP_SPACE_PCT', '0.55') or '0.55').replace(',', '.'))
+    except Exception:
+        vertical_pump_min_cs_pct = 0.55
+    try:
+        vertical_pump_min_risk_pct = float(str(os.getenv('LOSS_CARD_VERTICAL_PUMP_MIN_RISK_PCT', '0.40') or '0.40').replace(',', '.'))
+    except Exception:
+        vertical_pump_min_risk_pct = 0.40
+    vertical_long_pump = bool(
+        side_u == 'LONG'
+        and (
+            b('vertical_pump_before_entry')
+            or b('entry_after_vertical_pump')
+            or b('strong_buy_side_impulse_before_entry')
+            or l6 >= vertical_pump_6_pct
+            or l12 >= vertical_pump_12_pct
+            or l24 >= vertical_pump_24_pct
+            or premove >= max(exhausted_move_pct, vertical_pump_12_pct)
+        )
+    )
     highish = bool(pos_known and pos >= 0.68)
     lowish = bool(pos_known and pos <= 0.32)
     midrange = bool(pos_known and 0.42 <= pos <= 0.58)
@@ -9242,6 +9274,54 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             secondary=['SL too tight', 'SL inside normal pullback', 'Bullish idea continued after stop', 'Structural invalidation was lower', 'TP1 was reachable'],
             improve=['ставить SL за structural invalidation ниже buyer-support/FVG зоны', 'не ставить SL внутри первого pullback после impulse', 'если нормальный structural SL ломает RR — пропускать сделку', 'для valid LONG не менять причину на late entry, если после SL идея продолжила работать'],
             evidence=valid_long_but_bad_sl)
+
+        # V15: VIRTUAL-type fix. A LONG after a near-vertical buy-side leg
+        # should not be reduced to the generic "under resistance" label. If the
+        # move into entry was extended and SL sits inside the first pullback, make
+        # the pump + pullback context the main reason.
+        inferred_vertical_long_pump = bool(
+            side_u == 'LONG'
+            and no_tp
+            and not real_supply_is_fvg
+            and (
+                vertical_long_pump
+                or (ob_fvg_route and tight_space and risk_pct >= vertical_pump_min_risk_pct and cs >= vertical_pump_min_cs_pct and duration_min is not None and duration_min >= 18)
+            )
+            and (normal_pullback or sl_tight or weak_follow)
+            and (supply_seen or supply_blocks or ob_fvg_route or highish)
+        )
+        add(13.2 + (0.8 if vertical_long_pump else 0.0) + (0.6 if normal_pullback else 0.0) + (0.4 if supply_seen else 0.0), 'late_long_after_vertical_pump_sl_inside_pullback',
+            primary='Late LONG after vertical pump / SL inside normal pullback',
+            scenario='LONG был открыт после сильного почти вертикального buy-side impulse, уже высоко относительно последнего движения и под/рядом с local high / seller reaction area. После входа не появилось acceptance выше entry и fresh bullish displacement, цена сделала обычный pullback/retest после pump, а SL стоял внутри этого шума. Поэтому стоп выбило до подтверждённого continuation.',
+            analysis_add=['перед входом был extended / vertical buy-side pump', 'acceptance выше entry/local high отсутствовал', 'SL стоял внутри normal pullback/retest после pump', 'fresh bullish displacement после входа отсутствовал'],
+            happened=['после входа покупатель не дал сразу новую волну вверх', 'цена не закрепилась выше entry/local high', 'рынок сделал normal pullback после pump', 'SL был достигнут раньше подтверждённого continuation'],
+            visible=['перед входом был сильный buy-side impulse / pump', 'LONG был открыт после роста, а не из discount', 'над/рядом с entry оставалась local high / seller reaction area', 'SL находился внутри обычного pullback после импульса', 'после входа нет clean bullish displacement', pos_line],
+            secondary=['Late long after vertical pump', 'SL inside normal pullback', 'No acceptance above entry', 'No fresh bullish displacement', 'Entry after extended move'],
+            improve=['после vertical pump ждать pullback ниже / discount re-entry', 'не лонговать сразу под local high без acceptance', 'SL ставить за structural invalidation ниже buyer-support/FVG зоны', 'если после retest нет fresh bullish displacement — пропускать вход'],
+            evidence=inferred_vertical_long_pump)
+
+        # V15: 0G-type fix. When the problem is both overhead local resistance
+        # and a stop inside a normal retest, print the combined cause instead of
+        # only "no acceptance after retest". Real red FVG keeps its own stronger
+        # FVG-specific reason above.
+        inferred_resistance_plus_bad_sl = bool(
+            side_u == 'LONG'
+            and no_tp
+            and not real_supply_is_fvg
+            and not inferred_vertical_long_pump
+            and (tight_space or supply_seen or supply_blocks or highish or ob_fvg_route)
+            and (normal_pullback or sl_tight)
+            and weak_follow
+        )
+        add(11.4 + (0.6 if normal_pullback else 0.0) + (0.4 if supply_seen else 0.0), 'long_under_resistance_sl_inside_pullback',
+            primary='LONG under local resistance + SL inside normal pullback',
+            scenario=f'LONG был открыт под ближайшим local resistance / seller reaction area ({supply_desc}), но SL одновременно стоял слишком близко и попал внутрь обычного pullback/retest. Покупатель не дал acceptance выше entry, цена откатила в нормальную зону ретеста и выбила SL до подтверждённого continuation.',
+            analysis_add=['acceptance выше entry/retest зоны отсутствовал', 'SL стоял внутри normal pullback/retest', 'fresh bullish displacement после входа отсутствовал', tp1_supply_path_line],
+            happened=['покупатель не смог закрепиться выше local resistance', 'рынок сделал обычный pullback/retest против LONG', 'SL был достигнут раньше structural invalidation', 'TP1 не был нормально поставлен под угрозу'],
+            visible=[f'над входом была {supply_desc}', 'LONG открыт под/рядом с local high / seller reaction area', 'SL находился внутри нормального pullback/retest-движения', 'после входа нет clean bullish displacement', 'цена не удержала entry/retest-зону', pos_line],
+            secondary=['Long under local resistance', 'SL inside normal pullback', 'No acceptance above entry', 'Weak bullish follow-through', 'TP1 blocked by resistance'],
+            improve=['не брать LONG под resistance без закрепления выше', 'SL ставить за structural invalidation, а не внутри первого pullback', 'ждать 1–2 close выше seller reaction area', 'если после retest нет displacement — пропускать вход'],
+            evidence=inferred_resistance_plus_bad_sl)
 
         add(10.2 + (1.0 if late_long else 0) + (0.8 if (supply_seen or supply_blocks) else 0) + (0.6 if normal_pullback else 0), 'long_tp1_far_behind_resistance_no_acceptance',
             primary='LONG into local resistance / TP1 too far behind supply',
