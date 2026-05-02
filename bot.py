@@ -6725,25 +6725,37 @@ def _loss_card_bool(analysis: dict, key: str) -> bool:
 
 
 def _loss_card_zone_is_fvg(zone: dict, side: str = '') -> bool:
-    """True only when the saved pre-entry snapshot contains a real FVG zone."""
+    """True only when the saved pre-entry snapshot contains a real FVG zone.
+
+    Some snapshots store the kind as ``bearish_fvg``/``bullish_fvg``, others as
+    ``fvg_bearish``, ``red_fvg``, ``supply_fvg`` or simply ``fvg`` with a
+    separate side/type/source field. Keep the detector conservative, but support
+    all these saved formats so a real FVG does not fall back to generic
+    resistance/support wording.
+    """
     if not isinstance(zone, dict) or not zone:
         return False
-    kind = str(zone.get('kind') or '').lower()
+    kind = str(zone.get('kind') or zone.get('type') or zone.get('zone_type') or '').lower()
     zside = str(zone.get('side') or side or '').lower()
+    source = str(zone.get('source') or zone.get('name') or zone.get('label') or '').lower()
+    text = f"{kind} {zside} {source}"
+    if 'fvg' not in text and 'fair_value_gap' not in text and 'fair value gap' not in text:
+        return False
     if zside == 'supply':
-        return 'bearish_fvg' in kind or ('fvg' in kind and 'supply' in zside)
+        return bool(any(x in text for x in ('bearish', 'red', 'supply', 'seller', 'fvg')))
     if zside == 'demand':
-        return 'bullish_fvg' in kind or ('fvg' in kind and 'demand' in zside)
-    return 'fvg' in kind
+        return bool(any(x in text for x in ('bullish', 'green', 'demand', 'buyer', 'fvg')))
+    return True
 
 
 def _loss_card_zone_desc(zone: dict, fallback: str) -> str:
     if not isinstance(zone, dict) or not zone:
         return fallback
 
-    kind = str(zone.get('kind') or '').lower()
+    kind = str(zone.get('kind') or zone.get('type') or zone.get('zone_type') or '').lower()
     side = str(zone.get('side') or '').lower()
-    source = str(zone.get('source') or '').lower()
+    source = str(zone.get('source') or zone.get('name') or zone.get('label') or '').lower()
+    ztext = f"{kind} {side} {source}"
 
     # Do not call a simple range high/low blocker "FVG".
     # It is a real chart blocker, but the card must say resistance/support, not red/green FVG.
@@ -6751,9 +6763,9 @@ def _loss_card_zone_desc(zone: dict, fallback: str) -> str:
         base = 'recent swing high / resistance'
     elif 'recent_swing_low' in kind or 'range_low' in source:
         base = 'recent swing low / support'
-    elif 'bearish_fvg' in kind or (side == 'supply' and 'fvg' in kind):
+    elif ('fvg' in ztext or 'fair_value_gap' in ztext or 'fair value gap' in ztext) and (side == 'supply' or any(x in ztext for x in ('bearish', 'red', 'seller'))):
         base = 'red FVG / seller zone'
-    elif 'bullish_fvg' in kind or (side == 'demand' and 'fvg' in kind):
+    elif ('fvg' in ztext or 'fair_value_gap' in ztext or 'fair value gap' in ztext) and (side == 'demand' or any(x in ztext for x in ('bullish', 'green', 'buyer'))):
         base = 'green FVG / buyer zone'
     elif side == 'supply':
         base = 'seller reaction / resistance zone'
@@ -6801,13 +6813,45 @@ def _loss_card_real_zone_context(analysis: dict, side: str) -> dict:
     zone = analysis.get(zone_key) if isinstance(analysis.get(zone_key), dict) else {}
     tfs = [str(x) for x in list(analysis.get(tfs_key) or []) if str(x).strip()]
     relation = str(analysis.get(relation_key) or '').strip()
-    blocks = bool(analysis.get(blocks_key) or relation in ('blocks_target', 'inside_blocks_target'))
 
-    kind = str(zone.get('kind') or '').lower() if zone else ''
-    source = str(zone.get('source') or '').lower() if zone else ''
-    is_fvg = _loss_card_zone_is_fvg(zone, side_l)
+    def _truthy(v):
+        if isinstance(v, str):
+            return v.strip().lower() in ('1', 'true', 'yes', 'on', 'да', 'есть')
+        return bool(v)
+
+    if side_l == 'supply':
+        fvg_aliases = (
+            'overhead_bearish_fvg', 'bearish_fvg_above_entry', 'red_fvg_above_entry',
+            'supply_fvg_above_entry', 'nearest_bearish_fvg', 'nearest_supply_fvg',
+            'fvg_above_entry', 'fvg_overhead', 'tp1_behind_bearish_fvg',
+            'supply_fvg_blocks_tp1', 'bearish_fvg_blocks_tp1',
+        )
+        block_aliases = (
+            'supply_zone_blocks_tp1', 'supply_fvg_blocks_tp1', 'bearish_fvg_blocks_tp1',
+            'tp1_behind_bearish_fvg', 'tp1_behind_supply_fvg',
+        )
+    else:
+        fvg_aliases = (
+            'underlying_bullish_fvg', 'bullish_fvg_below_entry', 'green_fvg_below_entry',
+            'demand_fvg_below_entry', 'nearest_bullish_fvg', 'nearest_demand_fvg',
+            'fvg_below_entry', 'fvg_under_entry', 'tp1_behind_bullish_fvg',
+            'demand_fvg_blocks_tp1', 'bullish_fvg_blocks_tp1',
+        )
+        block_aliases = (
+            'demand_zone_blocks_tp1', 'demand_fvg_blocks_tp1', 'bullish_fvg_blocks_tp1',
+            'tp1_behind_bullish_fvg', 'tp1_behind_demand_fvg',
+        )
+
+    alias_fvg = bool(any(_truthy(analysis.get(k)) for k in fvg_aliases))
+    alias_blocks = bool(any(_truthy(analysis.get(k)) for k in block_aliases))
+    tfs_has_fvg = bool(any(('fvg' in x.lower() or 'fair value gap' in x.lower()) for x in tfs))
+    blocks = bool(analysis.get(blocks_key) or alias_blocks or relation in ('blocks_target', 'inside_blocks_target'))
+
+    kind = str(zone.get('kind') or zone.get('type') or zone.get('zone_type') or '').lower() if zone else ''
+    source = str(zone.get('source') or zone.get('name') or zone.get('label') or '').lower() if zone else ''
+    is_fvg = bool(_loss_card_zone_is_fvg(zone, side_l) or alias_fvg or tfs_has_fvg)
     is_path = bool('recent_swing' in kind or 'range_' in source or 'path' in source)
-    has_zone = bool(zone or tfs or blocks)
+    has_zone = bool(zone or tfs or blocks or alias_fvg)
 
     if side_l == 'supply':
         if is_fvg:
