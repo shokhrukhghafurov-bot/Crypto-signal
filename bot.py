@@ -8039,12 +8039,38 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         or b('no_post_entry_expansion')
         or (mfe > 0 and mfe < 0.35)
     )
+    # V19: separate "TP1 not hit" from "TP1 was never threatened".
+    # Some trades move 55-80% of the way to TP1 and then reject back to SL.
+    # Those are near-miss / exhaustion failures, not "no meaningful excursion".
+    try:
+        tp1_near_miss_min = float(str(os.getenv('LOSS_CARD_TP1_NEAR_MISS_PROGRESS', '0.55') or '0.55').replace(',', '.'))
+    except Exception:
+        tp1_near_miss_min = 0.55
+    try:
+        tp1_meaningful_mfe_r_min = float(str(os.getenv('LOSS_CARD_TP1_MEANINGFUL_MFE_R', '0.75') or '0.75').replace(',', '.'))
+    except Exception:
+        tp1_meaningful_mfe_r_min = 0.75
+    tp1_progress_frac = 0.0
+    if cs > 0 and mfe > 0:
+        tp1_progress_frac = max(0.0, min(2.0, mfe / max(cs, 1e-9)))
+    elif cs > 0 and first_push > 0:
+        tp1_progress_frac = max(0.0, min(2.0, first_push / max(cs, 1e-9)))
+    tp1_near_miss = bool(
+        no_tp
+        and (
+            tp1_progress_frac >= tp1_near_miss_min
+            or (mfe_r > 0 and mfe_r >= tp1_meaningful_mfe_r_min)
+            or b('tp1_near_miss')
+            or b('tp1_almost_hit')
+        )
+    )
+
     sl_tight = bool(risk_pct > 0 and (risk_pct <= tight_sl_pct or (cs > 0 and risk_pct <= cs * 0.88)))
     normal_pullback = bool(sl_tight and no_tp and (against >= max(first_push * 1.05, risk_pct * 0.55, 0.08) or fast or b('retest_too_deep')))
-    meaningful_excursion_missing = bool(b('sl_hit_without_meaningful_excursion') or (mfe > 0 and mfe < 0.12) or (mfe_r > 0 and mfe_r < 0.45))
+    meaningful_excursion_missing = bool((b('sl_hit_without_meaningful_excursion') or (mfe > 0 and mfe < 0.12) or (mfe_r > 0 and mfe_r < 0.45)) and not tp1_near_miss)
     immediate_counter = bool(b('immediate_invalidation') or against >= max(first_push * 1.15, risk_pct * 0.75, 0.12))
     weak_confirm = bool(b('confirm_too_weak') or b('zone_reaction_too_weak') or (first_push_known and first_push < 0.15))
-    weak_follow = bool(b('weak_followthrough') or b('no_post_entry_expansion') or no_tp or (mfe_known and mfe < 0.35))
+    weak_follow = bool(b('weak_followthrough') or b('no_post_entry_expansion') or (no_tp and not tp1_near_miss) or (mfe_known and mfe < 0.35))
     range_trap = bool(b('range_trap_behavior') or b('multiple_failed_pushes'))
     volume_faded = bool(b('post_entry_volume_faded'))
 
@@ -8279,6 +8305,27 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         secondary=['No post-entry expansion', 'No fresh expansion candle', 'Weak continuation'],
         improve=['требовать fresh expansion candle после trigger', 'если entry не получает continuation в первые свечи — не держать идею как сильный setup'],
         evidence=bool(any_flag('no_post_entry_expansion','no_fresh_expansion_candle','post_entry_expansion_missing') or (weak_follow and no_tp and not normal_pullback)))
+    if side_u == 'LONG':
+        add(13.0 + (0.9 if late_long else 0.0) + (0.6 if vertical_long_pump else 0.0), 'long_near_tp1_then_rejected_after_pump',
+            primary='LONG pushed near TP1, then rejected / no acceptance above high',
+            scenario='LONG сначала дал движение в сторону TP1 и почти поставил цель под угрозу, но выше локального high/resistance не появилось acceptance. После near-miss покупатель потерял momentum, цена дала rejection/pullback и ушла к SL. Это не "TP1 was never threatened" — TP1 был близко, но continuation выше high не подтвердился.',
+            analysis_add=[cs_line, mfe_line, 'TP1 был близко, но не взят', 'acceptance выше local high/resistance отсутствовал', 'fresh bullish expansion после near-miss отсутствовал'],
+            happened=['первый push пошёл в сторону TP1', 'выше локального high не появилось закрепление', 'после near-miss цена развернулась против LONG', 'SL был достигнут после rejection/pullback'],
+            visible=['после entry был ход вверх в сторону TP1', 'цена не приняла уровень выше локального high/resistance', 'после near-miss появился seller rejection', 'TP1 был близко, но не подтверждён continuation', pos_line],
+            secondary=['TP1 near-miss', 'No acceptance above high', 'Momentum faded after near TP1', 'Seller rejection after push'],
+            improve=['после near-miss к TP1 быстрее защищать позицию/часть выхода', 'для продолжения требовать close выше local high', 'не держать LONG, если после подхода к TP1 появляется rejection'],
+            evidence=bool(tp1_near_miss and (late_long or vertical_long_pump or supply_seen or highish or b('no_acceptance_after_retest') or b('no_post_entry_expansion'))))
+    elif side_u == 'SHORT':
+        add(13.0 + (0.9 if late_short else 0.0), 'short_near_tp1_then_bounced_after_dump',
+            primary='SHORT pushed near TP1, then bounced / no acceptance below low',
+            scenario='SHORT сначала дал движение в сторону TP1 и почти поставил цель под угрозу, но ниже локального low/support не появилось acceptance. После near-miss продавец потерял momentum, цена дала bounce/reclaim и ушла к SL. Это не "TP1 was never threatened" — TP1 был близко, но continuation ниже low не подтвердился.',
+            analysis_add=[cs_line, mfe_line, 'TP1 был близко, но не взят', 'acceptance ниже local low/support отсутствовал', 'fresh bearish expansion после near-miss отсутствовал'],
+            happened=['первый push пошёл в сторону TP1', 'ниже локального low не появилось закрепление', 'после near-miss цена развернулась против SHORT', 'SL был достигнут после bounce/reclaim'],
+            visible=['после entry был ход вниз в сторону TP1', 'цена не приняла уровень ниже local low/support', 'после near-miss появилась buyer reaction', 'TP1 был близко, но не подтверждён continuation', pos_line],
+            secondary=['TP1 near-miss', 'No acceptance below low', 'Momentum faded after near TP1', 'Buyer bounce after push'],
+            improve=['после near-miss к TP1 быстрее защищать позицию/часть выхода', 'для продолжения требовать close ниже local low', 'не держать SHORT, если после подхода к TP1 появляется bounce'],
+            evidence=bool(tp1_near_miss and (late_short or demand_seen or lowish or b('no_acceptance_after_retest') or b('no_post_entry_expansion'))))
+
     add(5.6 + (0.6 if meaningful_excursion_missing else 0), 'tp1_was_never_threatened',
         primary='TP1 was never threatened',
         scenario='Цена после входа не приблизилась к TP1 достаточно близко и не поставила первую цель под реальную угрозу. Это означает, что setup не получил нужного continuation, а LOSS произошёл до нормального развития идеи.',
@@ -8287,7 +8334,7 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         visible=['TP1 не был протестирован перед SL', f'{side_u} не получил достаточного хода в сторону сделки', pos_line],
         secondary=['TP1 was never threatened', 'No meaningful excursion', 'Continuation missing'],
         improve=['не засчитывать формальный confirm без реального движения к TP1', 'добавить фильтр MFE/R после entry', 'требовать первый push в сторону сделки'],
-        evidence=bool(any_flag('tp1_was_never_threatened','tp1_never_threatened') or (no_tp and (meaningful_excursion_missing or weak_follow))))
+        evidence=bool((any_flag('tp1_was_never_threatened','tp1_never_threatened') and not tp1_near_miss) or (no_tp and meaningful_excursion_missing)))
     add(3.6 + (0.8 if sl_tight else 0), 'sl_too_tight',
         primary='SL too tight for normal market noise',
         scenario='SL был поставлен слишком близко к entry относительно обычного свечного шума. Даже без полной invalidation рынок мог сделать нормальный pullback/bounce и выбить такой SL.',
