@@ -8059,6 +8059,7 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     dual_fvg_route = contains_any(route_text, ('dual', 'stacked'))
     reclaim_route = contains_any(route_text, ('reclaim', 'liquidity'))
     breakout_route = contains_any(route_text, ('bos', 'breakout'))
+    structure_pending_route = contains_any(route_text, ('structure pending', 'pending trigger', 'pending'))
 
     cs_line = (f'расстояние entry → TP1: около {cs:.2f}%' if wide_tp_target else f'clean space до TP1: около {cs:.2f}%') if cs > 0 else 'clean space до TP1 не подтверждён свечами'
     risk_line = f'расстояние entry → SL: около {risk_pct:.2f}%' if risk_pct > 0 else ''
@@ -8988,18 +8989,44 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         supply_desc = str(supply_ctx.get('desc') or 'supply / resistance')
         tp1_demand_path_line = f'TP1 находился рядом/за demand/support reaction area ({demand_desc})'
 
-        # v10 precision: do not explain every fast SHORT loss as "near support".
-        # If price was in a fresh buy-side impulse/reclaim and the short did not
-        # get bearish acceptance, the real chart cause is an anti-momentum short.
-        add(13.4 + (1.0 if fast else 0) + (0.6 if normal_pullback else 0), 'short_against_fresh_bullish_impulse_no_acceptance',
-            primary='SHORT against fresh bullish impulse / no bearish acceptance',
-            scenario='SHORT был открыт против активного buy-side impulse/reclaim. Продавец не получил acceptance ниже entry/retest зоны и fresh bearish displacement не появился, поэтому рынок продолжил bounce/reclaim вверх и выбил SL.',
+        # v11 precision: do not explain every fast SHORT loss as only
+        # "near support" or generic "TP1 was never threatened". If price is
+        # reclaiming from bullish FVG/support and the short has no bearish
+        # acceptance, the primary cause is anti-momentum entry into buyer pressure.
+        short_bullish_reclaim_evidence = bool(
+            no_tp and weak_follow
+            and (
+                bullish_ctx
+                or b('underlying_bullish_fvg')
+                or b('fresh_bullish_impulse')
+                or b('bullish_reclaim_before_entry')
+                or (structure_pending_route and (demand_seen or demand_blocks or rr_to_tp1 >= 1.80 or cs >= 0.95))
+            )
+            and (fast or normal_pullback or sl_tight or b('short_against_bullish_structure') or b('underlying_bullish_fvg'))
+        )
+        add(14.4 + (1.0 if fast else 0) + (0.6 if normal_pullback else 0) + (0.4 if structure_pending_route else 0), 'short_against_fresh_bullish_impulse_no_acceptance',
+            primary='SHORT against fresh bullish reclaim / no bearish acceptance',
+            scenario='SHORT был открыт против активного buy-side impulse/reclaim и рядом с buyer-support/FVG pressure. Продавец не получил acceptance ниже entry/retest зоны и fresh bearish displacement не появился, поэтому рынок продолжил bounce/reclaim вверх и выбил SL.',
             analysis_add=['перед входом был buy-side impulse / bullish reclaim', 'acceptance ниже entry/retest зоны отсутствовал', 'fresh bearish displacement после входа отсутствовал'],
             happened=['продавец не смог закрепить цену ниже entry/retest зоны', 'покупатель продолжил buy-side движение против SHORT', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после bounce/reclaim вверх'],
             visible=['перед входом был fresh bullish impulse / reclaim', 'SHORT был взят без подтверждённого bearish acceptance', 'снизу оставалась buyer reaction / bullish FVG pressure', 'после входа нет clean bearish displacement', pos_line],
-            secondary=['Short against bullish impulse', 'No bearish acceptance', 'Buyer pressure continued', 'No fresh bearish displacement'],
-            improve=['не шортить fresh bullish impulse без bearish reclaim', 'ждать 1–2 close ниже entry/support/FVG', 'для SHORT требовать новый bearish displacement после retest'],
-            evidence=bool(no_tp and weak_follow and bullish_ctx and (fast or normal_pullback or b('short_against_bullish_structure') or b('underlying_bullish_fvg')) and not demand_blocks))
+            secondary=['Short against bullish reclaim', 'No bearish acceptance', 'Buyer pressure continued', 'Bullish FVG/support below'],
+            improve=['не шортить fresh bullish reclaim без bearish acceptance', 'ждать 1–2 close ниже entry/support/FVG', 'для SHORT требовать новый bearish displacement после retest'],
+            evidence=short_bullish_reclaim_evidence)
+
+        # v11 precision for Structure pending trigger shorts: a very quick loss
+        # with TP1 far below is not just "TP1 was never threatened". It means
+        # the pending trigger fired against buyer pressure / FVG stack without
+        # bearish acceptance, so TP1 was placed beyond support.
+        add(13.9 + (1.0 if fast else 0) + (0.6 if rr_to_tp1 >= 2.0 else 0), 'structure_short_trigger_failed_below_buyer_support',
+            primary='SHORT trigger failed / TP1 below buyer support',
+            scenario='Structure SHORT trigger сработал, но bearish acceptance не подтвердился. Под входом оставалась buyer reaction / bullish FVG-support зона, а TP1 стоял ниже этой области. Поэтому цена не дала продолжение вниз, быстро сделала bounce/reclaim и дошла до SL.',
+            analysis_add=['structure SHORT trigger был без bearish acceptance', 'TP1 находился ниже buyer-support / bullish FVG reaction area', 'fresh bearish displacement после entry отсутствовал'],
+            happened=['trigger сработал формально, но продавец не получил continuation', 'цена не закрепилась ниже support/FVG pressure', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после bounce/reclaim'],
+            visible=['SHORT был открыт до подтверждённого breakdown ниже buyer-support', 'под entry оставалась bullish FVG/support pressure', 'TP1 был ниже ближайшей зоны покупателей', 'после entry нет clean bearish displacement', pos_line],
+            secondary=['Structure trigger failed', 'No bearish acceptance', 'TP1 below support/FVG', 'Buyer reclaim against short'],
+            improve=['для Structure pending SHORT ждать close ниже support/FVG', 'не ставить TP1 ниже buyer-zone без breakdown', 'если trigger сразу не даёт bearish displacement — пропускать вход'],
+            evidence=bool(structure_pending_route and no_tp and weak_follow and (fast or sl_tight or normal_pullback) and (rr_to_tp1 >= 1.8 or cs >= 0.95) and (demand_seen or demand_blocks or bullish_ctx or b('underlying_bullish_fvg'))))
 
         # v10 precision: for wide-RR SHORT losses, "TP1 was never threatened" is
         # true but too generic.  When TP1 is far below and the entry comes after a
