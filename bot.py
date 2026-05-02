@@ -8987,6 +8987,34 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         demand_desc = str(demand_ctx.get('desc') or 'local low / support')
         supply_desc = str(supply_ctx.get('desc') or 'supply / resistance')
         tp1_demand_path_line = f'TP1 находился рядом/за demand/support reaction area ({demand_desc})'
+
+        # v10 precision: do not explain every fast SHORT loss as "near support".
+        # If price was in a fresh buy-side impulse/reclaim and the short did not
+        # get bearish acceptance, the real chart cause is an anti-momentum short.
+        add(13.4 + (1.0 if fast else 0) + (0.6 if normal_pullback else 0), 'short_against_fresh_bullish_impulse_no_acceptance',
+            primary='SHORT against fresh bullish impulse / no bearish acceptance',
+            scenario='SHORT был открыт против активного buy-side impulse/reclaim. Продавец не получил acceptance ниже entry/retest зоны и fresh bearish displacement не появился, поэтому рынок продолжил bounce/reclaim вверх и выбил SL.',
+            analysis_add=['перед входом был buy-side impulse / bullish reclaim', 'acceptance ниже entry/retest зоны отсутствовал', 'fresh bearish displacement после входа отсутствовал'],
+            happened=['продавец не смог закрепить цену ниже entry/retest зоны', 'покупатель продолжил buy-side движение против SHORT', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут после bounce/reclaim вверх'],
+            visible=['перед входом был fresh bullish impulse / reclaim', 'SHORT был взят без подтверждённого bearish acceptance', 'снизу оставалась buyer reaction / bullish FVG pressure', 'после входа нет clean bearish displacement', pos_line],
+            secondary=['Short against bullish impulse', 'No bearish acceptance', 'Buyer pressure continued', 'No fresh bearish displacement'],
+            improve=['не шортить fresh bullish impulse без bearish reclaim', 'ждать 1–2 close ниже entry/support/FVG', 'для SHORT требовать новый bearish displacement после retest'],
+            evidence=bool(no_tp and weak_follow and bullish_ctx and (fast or normal_pullback or b('short_against_bullish_structure') or b('underlying_bullish_fvg')) and not demand_blocks))
+
+        # v10 precision: for wide-RR SHORT losses, "TP1 was never threatened" is
+        # true but too generic.  When TP1 is far below and the entry comes after a
+        # sell-side extension / weak reclaim, the main cause is a late short with
+        # TP1 placed behind support/demand, not merely missing MFE.
+        add(12.8 + (1.0 if fast else 0) + (0.8 if normal_pullback else 0), 'late_short_wide_tp1_behind_support_no_acceptance',
+            primary='Late SHORT after dump / TP1 too far below support',
+            scenario='SHORT был открыт после sell-side extension или возле нижней части реакции рынка. TP1 стоял далеко ниже и проходил через support/demand reaction area, поэтому большой RR не означал clean downside path. Продавец не дал fresh bearish continuation, цена сделала bounce/reclaim и дошла до SL.',
+            analysis_add=['TP1 был далеко ниже entry / за support reaction area', 'acceptance ниже entry/retest зоны отсутствовал', 'fresh bearish displacement после входа отсутствовал'],
+            happened=['продавец не получил продолжение после входа', 'цена не закрепилась ниже entry/retest зоны', 'TP1 был слишком далеко за buyer reaction/support', 'SL был достигнут после bounce/reclaim вверх'],
+            visible=['перед входом sell-side идея уже была частично отработана', 'ниже entry находилась support/buyer reaction area', 'TP1 был далеко ниже, за ближайшими уровнями реакции покупателей', 'после входа нет clean bearish displacement', pos_line],
+            secondary=['Late short after dump', 'TP1 too far behind support', 'No bearish acceptance', 'Buyer bounce/reclaim'],
+            improve=['после dump ждать premium re-entry выше', 'не ставить TP1 далеко за support без подтверждённого breakdown', 'для SHORT требовать close ниже support и fresh bearish displacement'],
+            evidence=bool(wide_tp_target and no_tp and weak_follow and (late_short or normal_pullback or fast or lowish or demand_seen or bullish_ctx)))
+
         # Location / momentum
         add(9.1 + (1.2 if fast else 0) + (1 if normal_pullback else 0) + (0.8 if tight_space else 0), 'late_short_after_dump_no_premium_reentry',
             primary='Late SHORT after dump / no premium re-entry',
