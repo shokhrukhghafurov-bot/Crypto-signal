@@ -16897,6 +16897,16 @@ async def main() -> None:
     PRIMARY_LEASE_NAME = os.getenv("PRIMARY_LEASE_NAME", "crypto_signal_primary").strip() or "crypto_signal_primary"
     PRIMARY_LEASE_TTL_SEC = int(os.getenv("PRIMARY_LEASE_TTL_SEC", "45"))
     PRIMARY_HEARTBEAT_SEC = int(os.getenv("PRIMARY_HEARTBEAT_SEC", "15"))
+    PRIMARY_ELECTION_RETRY_ENABLED = os.getenv("PRIMARY_ELECTION_RETRY_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+    try:
+        PRIMARY_ELECTION_RETRY_SEC = float(os.getenv("PRIMARY_ELECTION_RETRY_SEC", "10") or 10)
+    except Exception:
+        PRIMARY_ELECTION_RETRY_SEC = 10.0
+    PRIMARY_ELECTION_RETRY_SEC = max(2.0, min(60.0, PRIMARY_ELECTION_RETRY_SEC))
+    # Safe default for Railway rolling deploys: if the advisory lock is busy, do NOT
+    # take a separate lease immediately, because the old container may still be PRIMARY.
+    # Lease fallback remains available only when the advisory-lock query itself fails.
+    PRIMARY_LEASE_FALLBACK_ON_BUSY = os.getenv("PRIMARY_LEASE_FALLBACK_ON_BUSY", "0").strip().lower() in ("1", "true", "yes", "on")
 
     _leader_heartbeat_task: asyncio.Task | None = None
 
@@ -16912,7 +16922,16 @@ async def main() -> None:
                 await pool.release(conn)
             except Exception:
                 pass
-            logger.warning("Primary election: advisory lock key=%s NOT acquired (maybe held elsewhere). Falling back to lease.", PRIMARY_LOCK_KEY)
+            if not PRIMARY_LEASE_FALLBACK_ON_BUSY:
+                logger.warning(
+                    "Primary election: advisory lock key=%s NOT acquired (old deployment/another replica still holds it). Staying WORKER and retrying; lease fallback on busy lock is disabled.",
+                    PRIMARY_LOCK_KEY,
+                )
+                return False, None
+            logger.warning(
+                "Primary election: advisory lock key=%s NOT acquired, but PRIMARY_LEASE_FALLBACK_ON_BUSY=1 -> falling back to lease.",
+                PRIMARY_LOCK_KEY,
+            )
         except Exception as e:
             logger.warning("Primary election: advisory lock failed (%s). Falling back to lease.", e)
 
@@ -17000,6 +17019,22 @@ async def main() -> None:
             # Better to become WORKER and keep webhook alive.
             logger.error("Primary election: lease mechanism failed (%s). Running as WORKER.", e)
             return False, None
+
+    async def _retry_until_primary(current_is_primary: bool, current_lock_conn: object | None) -> tuple[bool, object | None]:
+        if current_is_primary or not PRIMARY_ELECTION_RETRY_ENABLED:
+            return current_is_primary, current_lock_conn
+        logger.warning(
+            "Primary election: this replica is WORKER at boot. Retrying every %.1fs until the old Railway deployment releases the lock.",
+            PRIMARY_ELECTION_RETRY_SEC,
+        )
+        while not current_is_primary:
+            await asyncio.sleep(PRIMARY_ELECTION_RETRY_SEC)
+            current_is_primary, current_lock_conn = await _acquire_primary_lock()
+            if current_is_primary:
+                logger.warning("Primary election: this replica became PRIMARY after retry. Starting polling/scanner now.")
+                return True, current_lock_conn
+            logger.warning("Primary election: still WORKER; next retry in %.1fs.", PRIMARY_ELECTION_RETRY_SEC)
+        return current_is_primary, current_lock_conn
 
     is_primary, _primary_lock_conn = await _acquire_primary_lock()
 
@@ -17124,8 +17159,12 @@ async def main() -> None:
     asyncio.create_task(_start_http_server())
 
     if not is_primary:
+        if PRIMARY_ELECTION_RETRY_ENABLED:
+            is_primary, _primary_lock_conn = await _retry_until_primary(is_primary, _primary_lock_conn)
+
+    if not is_primary:
         logger.warning(
-            "Another instance holds the Telegram polling lock; this replica will run ONLY autotrade manager + HTTP (no polling/scanner)."
+            "Another instance holds the Telegram polling lock; this replica will run ONLY HTTP/worker mode (no Telegram polling/scanner)."
         )
         try:
             if os.getenv("AUTOTRADE_MANAGER_ENABLED", os.getenv("AUTOTRADE_ENABLED", "0")).strip().lower() not in ("0", "false", "no", "off"):
