@@ -9256,6 +9256,24 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             'idea_continued_after_stop', 'setup_worked_after_sl',
             'price_reached_tp1_after_sl', 'tp1_hit_after_sl', 'tp1_reached_after_sl'
         ))
+
+        # V17: do not call every tight LONG stop under resistance an "SL inside
+        # normal pullback". That wording is only exact when the snapshot/outcome
+        # confirms the idea continued after SL, the stop was explicitly diagnosed
+        # inside a retest/pullback, or the stop was very fast. ROSE-type cards
+        # should stay focused on resistance/no acceptance if price continued
+        # lower after SL instead of reclaiming toward TP1.
+        long_sl_pullback_confirmed = bool(
+            bullish_idea_continued_after_stop
+            or any_flag(
+                'sl_inside_normal_pullback', 'sl_inside_pullback',
+                'sl_inside_retest', 'sl_inside_pullback_retest',
+                'stop_inside_normal_pullback', 'normal_pullback_to_sl',
+                'price_reclaimed_after_sl', 'reclaim_after_sl',
+                'bounce_after_sl', 'long_reclaimed_after_sl'
+            )
+            or (fast and normal_pullback)
+        )
         valid_long_but_bad_sl = bool(
             side_u == 'LONG'
             and no_tp
@@ -9340,17 +9358,20 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             improve=['после vertical pump ждать pullback ниже / discount re-entry', 'не лонговать сразу под local high без acceptance', 'SL ставить за structural invalidation ниже buyer-support/FVG зоны', 'если после retest нет fresh bullish displacement — пропускать вход'],
             evidence=inferred_vertical_long_pump)
 
-        # V15: 0G-type fix. When the problem is both overhead local resistance
-        # and a stop inside a normal retest, print the combined cause instead of
-        # only "no acceptance after retest". Real red FVG keeps its own stronger
-        # FVG-specific reason above.
+        # V15/V17: 0G/ROSE-type precision. When the problem is truly both
+        # overhead local resistance and a confirmed stop inside a normal retest,
+        # print the combined cause. If the stop was merely close but price kept
+        # moving against the trade after SL, keep the main reason as resistance /
+        # no acceptance instead of overstating the SL problem. Real red FVG keeps
+        # its own stronger FVG-specific reason above.
         inferred_resistance_plus_bad_sl = bool(
             side_u == 'LONG'
             and no_tp
             and not real_supply_is_fvg
             and not inferred_vertical_long_pump
             and (tight_space or supply_seen or supply_blocks or highish or ob_fvg_route)
-            and (normal_pullback or sl_tight)
+            and long_sl_pullback_confirmed
+            and (normal_pullback or sl_tight or any_flag('sl_inside_normal_pullback', 'sl_inside_pullback', 'sl_inside_retest'))
             and weak_follow
         )
         add(11.4 + (0.6 if normal_pullback else 0.0) + (0.4 if supply_seen else 0.0), 'long_under_resistance_sl_inside_pullback',
