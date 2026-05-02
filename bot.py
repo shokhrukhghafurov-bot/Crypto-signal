@@ -9257,27 +9257,47 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             'price_reached_tp1_after_sl', 'tp1_hit_after_sl', 'tp1_reached_after_sl'
         ))
 
-        # V17: do not call every tight LONG stop under resistance an "SL inside
-        # normal pullback". That wording is only exact when the snapshot/outcome
-        # confirms the idea continued after SL, the stop was explicitly diagnosed
-        # inside a retest/pullback, or the stop was very fast. ROSE-type cards
-        # should stay focused on resistance/no acceptance if price continued
-        # lower after SL instead of reclaiming toward TP1.
-        long_sl_pullback_confirmed = bool(
+        # V18: do not call every tight LONG stop under resistance an "SL inside
+        # normal pullback".  Generic pre-close diagnostics such as
+        # sl_inside_normal_pullback can be true for any close stop, including
+        # cases where price keeps moving against the trade after SL.  We only
+        # allow that wording as a MAIN reason when there is real after-SL proof
+        # (TP1/reclaim/idea continued) or when the stop was very fast and the
+        # pullback/retest is obvious.  Long slow losses like GALA/POL/ROSE stay
+        # focused on resistance/no acceptance, not on an unproven SL diagnosis.
+        try:
+            sl_pullback_confirm_max_min = int(float(str(os.getenv('LOSS_CARD_SL_PULLBACK_CONFIRM_MAX_MIN', '30') or '30').replace(',', '.')))
+        except Exception:
+            sl_pullback_confirm_max_min = 30
+        long_after_sl_reclaim_confirmed = bool(
             bullish_idea_continued_after_stop
             or any_flag(
-                'sl_inside_normal_pullback', 'sl_inside_pullback',
-                'sl_inside_retest', 'sl_inside_pullback_retest',
-                'stop_inside_normal_pullback', 'normal_pullback_to_sl',
-                'price_reclaimed_after_sl', 'reclaim_after_sl',
-                'bounce_after_sl', 'long_reclaimed_after_sl'
+                'price_reclaimed_after_sl', 'reclaim_after_sl', 'bounce_after_sl',
+                'long_reclaimed_after_sl', 'price_reached_tp1_after_sl',
+                'tp1_hit_after_sl', 'tp1_reached_after_sl', 'setup_worked_after_sl',
+                'idea_continued_after_stop', 'long_continued_after_sl',
             )
+        )
+        long_generic_sl_pullback_flag = bool(any_flag(
+            'sl_inside_normal_pullback', 'sl_inside_pullback',
+            'sl_inside_retest', 'sl_inside_pullback_retest',
+            'stop_inside_normal_pullback', 'normal_pullback_to_sl'
+        ))
+        long_sl_pullback_confirmed = bool(
+            long_after_sl_reclaim_confirmed
             or (fast and normal_pullback)
+            or (
+                long_generic_sl_pullback_flag
+                and normal_pullback
+                and duration_min is not None
+                and duration_min <= sl_pullback_confirm_max_min
+            )
         )
         valid_long_but_bad_sl = bool(
             side_u == 'LONG'
             and no_tp
-            and (normal_pullback or sl_tight or any_flag('sl_inside_normal_pullback', 'sl_too_tight'))
+            and long_sl_pullback_confirmed
+            and (normal_pullback or sl_tight or long_generic_sl_pullback_flag or any_flag('sl_too_tight'))
             and (real_demand_seen or demand_seen or bullish_ctx or late_long)
             and not (real_supply_seen or supply_blocks or highish or bearish_ctx)
             and (cs <= 0 or cs <= float(str(os.getenv('LOSS_CARD_VALID_LONG_MAX_TP1_PCT', '2.20') or '2.20').replace(',', '.')))
@@ -9348,14 +9368,36 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             and (normal_pullback or sl_tight or weak_follow)
             and (supply_seen or supply_blocks or ob_fvg_route or highish)
         )
+        vertical_long_sl_confirmed = bool(long_sl_pullback_confirmed and (normal_pullback or sl_tight or long_generic_sl_pullback_flag))
+        vertical_long_primary = (
+            'Late LONG after vertical pump / SL inside normal pullback'
+            if vertical_long_sl_confirmed
+            else 'Late LONG after vertical pump / no acceptance above resistance'
+        )
+        vertical_long_scenario = (
+            'LONG был открыт после сильного почти вертикального buy-side impulse, уже высоко относительно последнего движения и под/рядом с local high / seller reaction area. После входа не появилось acceptance выше entry и fresh bullish displacement, цена сделала обычный pullback/retest после pump, а SL стоял внутри этого шума. Поэтому стоп выбило до подтверждённого continuation.'
+            if vertical_long_sl_confirmed
+            else 'LONG был открыт после сильного почти вертикального buy-side impulse, уже высоко относительно последнего движения и под/рядом с local high / seller reaction area. После входа не появилось acceptance выше entry и fresh bullish displacement, поэтому цена ушла к SL без подтверждённого continuation.'
+        )
+        vertical_long_analysis = ['перед входом был extended / vertical buy-side pump', 'acceptance выше entry/local high отсутствовал', 'fresh bullish displacement после входа отсутствовал']
+        vertical_long_happened = ['после входа покупатель не дал сразу новую волну вверх', 'цена не закрепилась выше entry/local high']
+        vertical_long_visible = ['перед входом был сильный buy-side impulse / pump', 'LONG был открыт после роста, а не из discount', 'над/рядом с entry оставалась local high / seller reaction area', 'после входа нет clean bullish displacement', pos_line]
+        vertical_long_secondary = ['Late long after vertical pump', 'No acceptance above entry', 'No fresh bullish displacement', 'Entry after extended move']
+        vertical_long_improve = ['после vertical pump ждать pullback ниже / discount re-entry', 'не лонговать сразу под local high без acceptance', 'если после retest нет fresh bullish displacement — пропускать вход']
+        if vertical_long_sl_confirmed:
+            vertical_long_analysis.insert(2, 'SL стоял внутри normal pullback/retest после pump')
+            vertical_long_happened.extend(['рынок сделал normal pullback после pump', 'SL был достигнут раньше подтверждённого continuation'])
+            vertical_long_visible.insert(3, 'SL находился внутри обычного pullback после импульса')
+            vertical_long_secondary.insert(1, 'SL inside normal pullback')
+            vertical_long_improve.insert(2, 'SL ставить за structural invalidation ниже buyer-support/FVG зоны')
         add(13.2 + (0.8 if vertical_long_pump else 0.0) + (0.6 if normal_pullback else 0.0) + (0.4 if supply_seen else 0.0), 'late_long_after_vertical_pump_sl_inside_pullback',
-            primary='Late LONG after vertical pump / SL inside normal pullback',
-            scenario='LONG был открыт после сильного почти вертикального buy-side impulse, уже высоко относительно последнего движения и под/рядом с local high / seller reaction area. После входа не появилось acceptance выше entry и fresh bullish displacement, цена сделала обычный pullback/retest после pump, а SL стоял внутри этого шума. Поэтому стоп выбило до подтверждённого continuation.',
-            analysis_add=['перед входом был extended / vertical buy-side pump', 'acceptance выше entry/local high отсутствовал', 'SL стоял внутри normal pullback/retest после pump', 'fresh bullish displacement после входа отсутствовал'],
-            happened=['после входа покупатель не дал сразу новую волну вверх', 'цена не закрепилась выше entry/local high', 'рынок сделал normal pullback после pump', 'SL был достигнут раньше подтверждённого continuation'],
-            visible=['перед входом был сильный buy-side impulse / pump', 'LONG был открыт после роста, а не из discount', 'над/рядом с entry оставалась local high / seller reaction area', 'SL находился внутри обычного pullback после импульса', 'после входа нет clean bullish displacement', pos_line],
-            secondary=['Late long after vertical pump', 'SL inside normal pullback', 'No acceptance above entry', 'No fresh bullish displacement', 'Entry after extended move'],
-            improve=['после vertical pump ждать pullback ниже / discount re-entry', 'не лонговать сразу под local high без acceptance', 'SL ставить за structural invalidation ниже buyer-support/FVG зоны', 'если после retest нет fresh bullish displacement — пропускать вход'],
+            primary=vertical_long_primary,
+            scenario=vertical_long_scenario,
+            analysis_add=vertical_long_analysis,
+            happened=vertical_long_happened,
+            visible=vertical_long_visible,
+            secondary=vertical_long_secondary,
+            improve=vertical_long_improve,
             evidence=inferred_vertical_long_pump)
 
         # V15/V17: 0G/ROSE-type precision. When the problem is truly both
@@ -9394,14 +9436,37 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             improve=['не ставить TP1 за несколькими overhead supply/resistance зонами', 'для LONG ждать acceptance выше ближайшего resistance', 'после bounce брать цель до resistance или ждать discount re-entry ниже', 'не считать большой RR чистым путём до TP1'],
             evidence=bool(wide_tp_target and no_tp and weak_follow and (late_long or supply_seen or supply_blocks or highish or normal_pullback or (duration_min is not None and duration_min >= 20))))
 
+        late_long_wide_sl_confirmed = bool(long_sl_pullback_confirmed and (normal_pullback or sl_tight or long_generic_sl_pullback_flag))
+        late_long_wide_primary = (
+            'Late LONG after pump / no acceptance + SL inside pullback'
+            if late_long_wide_sl_confirmed
+            else 'Late LONG after pump / no acceptance above resistance'
+        )
+        late_long_wide_scenario = (
+            'LONG был открыт после сильного роста, когда цена уже находилась высоко относительно последнего impulse и под/рядом с seller reaction area. TP1 мог быть далеко по проценту/RR, но вход был не из discount: рынок не дал acceptance выше resistance, затем сделал обычный pullback/retest, а SL стоял внутри этого шума. Поэтому сделку выбило по SL до подтверждённого continuation.'
+            if late_long_wide_sl_confirmed
+            else 'LONG был открыт после сильного роста, когда цена уже находилась высоко относительно последнего impulse и под/рядом с seller reaction area. TP1 мог быть далеко по проценту/RR, но путь к цели не был чистым: рынок не дал acceptance выше resistance и fresh bullish displacement после входа не появился. Поэтому цена ушла к SL без подтверждённого continuation.'
+        )
+        late_long_wide_analysis = [tp1_distance_line, 'acceptance выше local resistance отсутствовал', 'fresh bullish displacement после входа отсутствовал']
+        late_long_wide_happened = ['после входа покупатель не дал сразу новую волну вверх', 'цена не закрепилась выше local resistance / entry-zone', 'TP1 не был взят, хотя цель могла быть далеко']
+        late_long_wide_visible = ['перед входом уже прошёл buy-side impulse / pump', 'LONG был открыт после роста, а не из discount', 'над входом оставалась seller reaction / resistance area', 'большое расстояние до TP1 не означает clean path', pos_line]
+        late_long_wide_secondary = ['Late long after pump', 'No acceptance above resistance', 'No fresh bullish displacement', 'TP1 not reached']
+        late_long_wide_improve = ['после сильного pump ждать pullback ниже / discount re-entry', 'лонговать выше resistance только после acceptance/закрепления', 'не считать большой RR чистым путём до TP1 без acceptance']
+        if late_long_wide_sl_confirmed:
+            late_long_wide_analysis.insert(2, 'SL стоял внутри normal pullback/retest после pump')
+            late_long_wide_happened.insert(2, 'цена сделала normal pullback/retest против LONG')
+            late_long_wide_happened.insert(3, 'SL был достигнут раньше подтверждённого continuation')
+            late_long_wide_visible.insert(3, 'SL находился внутри обычного pullback после импульса')
+            late_long_wide_secondary.insert(2, 'SL inside normal pullback')
+            late_long_wide_improve.insert(2, 'ставить SL за structural invalidation, а не внутри первого pullback')
         add(10.4 + (1.2 if wide_tp_target else 0) + (1.0 if normal_pullback else 0) + (0.7 if late_long else 0), 'late_long_after_pump_sl_inside_pullback_wide_tp',
-            primary='Late LONG after pump / no acceptance + SL inside pullback',
-            scenario='LONG был открыт после сильного роста, когда цена уже находилась высоко относительно последнего impulse и под/рядом с seller reaction area. TP1 мог быть далеко по проценту/RR, но вход был не из discount: рынок не дал acceptance выше resistance, затем сделал обычный pullback/retest, а SL стоял внутри этого шума. Поэтому сделку выбило по SL до подтверждённого continuation.',
-            analysis_add=[tp1_distance_line, 'acceptance выше local resistance отсутствовал', 'SL стоял внутри normal pullback/retest после pump', 'fresh bullish displacement после входа отсутствовал'],
-            happened=['после входа покупатель не дал сразу новую волну вверх', 'цена не закрепилась выше local resistance / entry-zone', 'цена сделала normal pullback/retest против LONG', 'SL был достигнут раньше подтверждённого continuation', 'TP1 не был взят, хотя цель могла быть далеко'],
-            visible=['перед входом уже прошёл buy-side impulse / pump', 'LONG был открыт после роста, а не из discount', 'над входом оставалась seller reaction / resistance area', 'SL находился внутри обычного pullback после импульса', 'большое расстояние до TP1 не означает clean path', pos_line],
-            secondary=['Late long after pump', 'No acceptance above resistance', 'SL inside normal pullback', 'No fresh bullish displacement', 'TP1 not reached'],
-            improve=['после сильного pump ждать pullback ниже / discount re-entry', 'лонговать выше resistance только после acceptance/закрепления', 'ставить SL за structural invalidation, а не внутри первого pullback', 'не считать большой RR чистым путём до TP1 без acceptance'],
+            primary=late_long_wide_primary,
+            scenario=late_long_wide_scenario,
+            analysis_add=late_long_wide_analysis,
+            happened=late_long_wide_happened,
+            visible=late_long_wide_visible,
+            secondary=late_long_wide_secondary,
+            improve=late_long_wide_improve,
             evidence=bool(wide_tp_target and no_tp and (late_long or bullish_ctx or normal_pullback or supply_seen or highish or wide_tp_target) and (weak_follow or normal_pullback or duration_min is not None)))
 
         # V7 exact FVG/seller-zone detector. If the pre-entry snapshot shows
