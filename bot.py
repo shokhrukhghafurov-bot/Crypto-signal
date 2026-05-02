@@ -9170,6 +9170,35 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         tp1_supply_path_line = f'TP1 находился рядом/за supply/resistance reaction area ({supply_desc})'
         tp1_distance_line = f'расстояние entry → TP1 было около {cs:.2f}% / RR до TP1 около 1:{rr_to_tp1:.2f}' if cs > 0 and rr_to_tp1 > 0 else (f'расстояние entry → TP1 было около {cs:.2f}%' if cs > 0 else 'TP1 был далеко за ближайшими reaction levels')
 
+        # V12: BB-type fix. Sometimes the LONG direction is valid and the
+        # market continues after the stop. In that case the main reason must be
+        # the stop placement, not an automatic "late long / no acceptance" label.
+        # Only use this when there is visible bullish support/FVG below entry and
+        # no real overhead supply/resistance blocking TP1.
+        bullish_idea_continued_after_stop = bool(any_flag(
+            'bullish_idea_continued_after_stop', 'long_continued_after_sl',
+            'idea_continued_after_stop', 'setup_worked_after_sl',
+            'price_reached_tp1_after_sl', 'tp1_hit_after_sl', 'tp1_reached_after_sl'
+        ))
+        valid_long_but_bad_sl = bool(
+            side_u == 'LONG'
+            and no_tp
+            and (normal_pullback or sl_tight or any_flag('sl_inside_normal_pullback', 'sl_too_tight'))
+            and (real_demand_seen or demand_seen or bullish_ctx or late_long)
+            and not (real_supply_seen or supply_blocks or highish or bearish_ctx)
+            and (cs <= 0 or cs <= float(str(os.getenv('LOSS_CARD_VALID_LONG_MAX_TP1_PCT', '2.20') or '2.20').replace(',', '.')))
+            and (rr_to_tp1 <= 0 or rr_to_tp1 <= float(str(os.getenv('LOSS_CARD_VALID_LONG_MAX_RR', '2.20') or '2.20').replace(',', '.')))
+        )
+        add(11.8 + (1.6 if bullish_idea_continued_after_stop else 0.0) + (0.8 if real_demand_seen else 0.0), 'long_valid_idea_sl_too_tight',
+            primary='SL too tight inside normal pullback / bullish idea continued after stop',
+            scenario='LONG-направление было рабочим, но SL стоял слишком близко к entry и попал внутрь обычного pullback/retest. Цена выбила стоп до структурной invalidation, а сама bullish idea оставалась валидной: под входом была buyer-support / bullish FVG зона, и TP1 был достижимым без явной overhead supply-блокировки.',
+            analysis_add=[tp1_distance_line if wide_tp_target else cs_line, risk_line, 'SL стоял внутри normal pullback/retest, а не за structural invalidation', 'под entry была bullish FVG / buyer-support зона'],
+            happened=['рынок сделал обычный pullback/retest против LONG', 'SL был достигнут раньше структурной invalidation', 'после стопа long-идея не была полностью сломана', 'TP1 был достижимым, проблема была в стопе, а не в направлении'],
+            visible=['общая структура перед входом была bullish / buy-side impulse', 'под entry были bullish FVG / demand зоны', 'нет подтверждённой сильной seller-zone прямо над entry', 'SL стоял внутри обычного отката после импульса', 'после выбивания SL цена могла продолжить рост, значит direction был не главный дефект', pos_line],
+            secondary=['SL too tight', 'SL inside normal pullback', 'Bullish idea continued after stop', 'Structural invalidation was lower', 'TP1 was reachable'],
+            improve=['ставить SL за structural invalidation ниже buyer-support/FVG зоны', 'не ставить SL внутри первого pullback после impulse', 'если нормальный structural SL ломает RR — пропускать сделку', 'для valid LONG не менять причину на late entry, если после SL идея продолжила работать'],
+            evidence=valid_long_but_bad_sl)
+
         add(10.2 + (1.0 if late_long else 0) + (0.8 if (supply_seen or supply_blocks) else 0) + (0.6 if normal_pullback else 0), 'long_tp1_far_behind_resistance_no_acceptance',
             primary='LONG into local resistance / TP1 too far behind supply',
             scenario='LONG был открыт после bounce/reclaim, но прямо под ближайшим local high / resistance. TP1 стоял далеко выше и проходил через несколько overhead reaction levels, поэтому большой RR не означал clean path. Цена не закрепилась выше resistance, fresh bullish displacement не появился, и pullback/rejection дошёл до SL.',
