@@ -17073,6 +17073,66 @@ async def main() -> None:
 
     is_primary, _primary_lock_conn = await _acquire_primary_lock()
 
+    _primary_background_started = False
+
+    def _start_primary_background_loops_once() -> None:
+        """Start scanner/track/outcome loops exactly once after this replica is PRIMARY.
+
+        Railway webhook deployments may boot as WORKER while the previous deployment still
+        holds the Postgres advisory lock. In that case we keep the HTTP/webhook server alive,
+        retry leader election in the background, and call this function only after the lock is
+        acquired. This prevents the bot from staying forever in "WEBHOOK WORKER" mode after a
+        rolling deploy.
+        """
+        nonlocal _primary_background_started
+        if _primary_background_started:
+            logger.warning("Primary background loops already started; skipping duplicate start.")
+            return
+        _primary_background_started = True
+
+        logger.info("Starting PRIMARY background loops (scanner/track/outcomes)")
+        logger.info("Starting track_loop")
+        if _spawn_smart_manager_task() is None:
+            logger.warning("Backend has no track_loop; skipping")
+
+        TASKS["db-retention"] = asyncio.create_task(_db_retention_cleanup_loop(), name="db-retention")
+        _attach_task_monitor("db-retention", TASKS["db-retention"])
+
+        main_scanner_enabled = os.getenv("MAIN_SCANNER_ENABLED", os.getenv("SCANNER_ENABLED", _cost_default("1", "0"))).strip().lower() not in ("0", "false", "no", "off")
+        main_top_n = os.getenv("MAIN_TOP_N", os.getenv("TOP_N", ""))
+        logger.info(
+            "Starting scanner_loop check enabled=%s interval=%ss top_n=%s",
+            main_scanner_enabled,
+            os.getenv("SCAN_INTERVAL_SECONDS", ""),
+            main_top_n,
+        )
+
+        if main_scanner_enabled and hasattr(backend, "scanner_loop"):
+            try:
+                TASKS["scanner"] = asyncio.create_task(
+                    backend.scanner_loop(broadcast_signal, broadcast_macro_alert),
+                    name="scanner",
+                )
+                _health_mark_ok("scanner")
+                _attach_task_monitor("scanner", TASKS["scanner"])
+            except Exception:
+                logger.exception("Failed to start scanner_loop")
+        elif not main_scanner_enabled:
+            logger.info("MAIN_SCANNER_ENABLED=0 -> legacy main scanner disabled")
+        else:
+            logger.warning("Backend has no scanner_loop; skipping (MID scanner runs via scanner_loop_mid)")
+
+        _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
+
+        logger.info("Starting signal_outcome_loop")
+        _start_signal_outcome_task()
+        if _CLOSED_SIGNAL_REPORT_RETRY_ENABLED:
+            TASKS["closed-signal-report-retry"] = asyncio.create_task(closed_signal_report_retry_loop(), name="closed-signal-report-retry")
+            _attach_task_monitor("closed-signal-report-retry", TASKS["closed-signal-report-retry"])
+
+        TASKS["daily-signal-report"] = asyncio.create_task(daily_signal_report_loop(), name="daily-signal-report")
+        _attach_task_monitor("daily-signal-report", TASKS["daily-signal-report"])
+
     # --- Webhook routing (enabled on ALL replicas) ---
     WEBHOOK_MODE = os.getenv("WEBHOOK_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
     WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip() or "/webhook"
@@ -17111,54 +17171,41 @@ async def main() -> None:
 
         # --- Background loops ---
         if not is_primary:
-            logger.warning("Webhook WORKER replica started: skipping background loops (scanner/track/outcomes).")
-        else:
-            logger.info("Starting track_loop")
-            if _spawn_smart_manager_task() is None:
-                logger.warning("Backend has no track_loop; skipping")
-
-            TASKS["db-retention"] = asyncio.create_task(_db_retention_cleanup_loop(), name="db-retention")
-            _attach_task_monitor("db-retention", TASKS["db-retention"])
-
-            main_scanner_enabled = os.getenv("MAIN_SCANNER_ENABLED", os.getenv("SCANNER_ENABLED", _cost_default("1", "0"))).strip().lower() not in ("0", "false", "no", "off")
-            main_top_n = os.getenv("MAIN_TOP_N", os.getenv("TOP_N", ""))
-            logger.info(
-                "Starting scanner_loop check enabled=%s interval=%ss top_n=%s",
-                main_scanner_enabled,
-                os.getenv("SCAN_INTERVAL_SECONDS", ""),
-                main_top_n,
+            logger.warning(
+                "Webhook WORKER replica started: background loops are PAUSED until this replica becomes PRIMARY."
             )
+            if PRIMARY_ELECTION_RETRY_ENABLED:
+                async def _webhook_primary_retry_loop() -> None:
+                    nonlocal is_primary, _primary_lock_conn
+                    try:
+                        is_primary, _primary_lock_conn = await _retry_until_primary(is_primary, _primary_lock_conn)
+                        if not is_primary:
+                            logger.warning("Primary election retry ended but this replica is still WORKER; background loops remain paused.")
+                            return
 
-            # Some deployments (MID-only builds) intentionally don't ship the legacy scanner_loop.
-            # Guard this call to avoid crashing the whole process.
-            if main_scanner_enabled and hasattr(backend, "scanner_loop"):
-                try:
-                    TASKS["scanner"] = asyncio.create_task(
-                        backend.scanner_loop(broadcast_signal, broadcast_macro_alert),
-                        name="scanner",
-                    )
-                    _health_mark_ok("scanner")
-                    _attach_task_monitor("scanner", TASKS["scanner"])
-                except Exception:
-                    logger.exception("Failed to start scanner_loop")
-            elif not main_scanner_enabled:
-                logger.info("MAIN_SCANNER_ENABLED=0 -> legacy main scanner disabled")
-            else:
-                logger.warning(
-                    "Backend has no scanner_loop; skipping (MID scanner runs via scanner_loop_mid)"
+                        # Now this replica is PRIMARY. Ensure Telegram webhook once and start scanner/outcome loops.
+                        if WEBHOOK_BASE_URL:
+                            try:
+                                webhook_url_retry = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
+                                await _ensure_webhook(bot, webhook_url_retry, secret_token=(WEBHOOK_SECRET_TOKEN or None))
+                            except Exception as e:
+                                logger.exception("Failed to ensure Telegram webhook after PRIMARY retry: %s", e)
+
+                        _start_primary_background_loops_once()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.exception("Primary election retry task failed: %s", e)
+
+                TASKS["primary-election-retry"] = asyncio.create_task(
+                    _webhook_primary_retry_loop(),
+                    name="primary-election-retry",
                 )
-
-            # MID components (scanner + pending loop)
-            _start_mid_components(backend, broadcast_signal, broadcast_macro_alert)
-
-            logger.info("Starting signal_outcome_loop")
-            _start_signal_outcome_task()
-            if _CLOSED_SIGNAL_REPORT_RETRY_ENABLED:
-                TASKS["closed-signal-report-retry"] = asyncio.create_task(closed_signal_report_retry_loop(), name="closed-signal-report-retry")
-                _attach_task_monitor("closed-signal-report-retry", TASKS["closed-signal-report-retry"])
-
-            TASKS["daily-signal-report"] = asyncio.create_task(daily_signal_report_loop(), name="daily-signal-report")
-            _attach_task_monitor("daily-signal-report", TASKS["daily-signal-report"])
+                _attach_task_monitor("primary-election-retry", TASKS["primary-election-retry"])
+            else:
+                logger.warning("PRIMARY_ELECTION_RETRY_ENABLED=0 -> WEBHOOK WORKER will not retry primary election.")
+        else:
+            _start_primary_background_loops_once()
 
         # Auto-trade manager: available, but low-load. It sleeps long when there are no open positions.
         autotrade_mgr_enabled = os.getenv("AUTOTRADE_MANAGER_ENABLED", os.getenv("AUTOTRADE_ENABLED", "0")).strip().lower() not in ("0", "false", "no", "off")
