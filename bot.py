@@ -8309,6 +8309,41 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         secondary=['No post-entry expansion', 'No fresh expansion candle', 'Weak continuation'],
         improve=['требовать fresh expansion candle после trigger', 'если entry не получает continuation в первые свечи — не держать идею как сильный setup'],
         evidence=bool(any_flag('no_post_entry_expansion','no_fresh_expansion_candle','post_entry_expansion_missing') or (weak_follow and no_tp and not normal_pullback)))
+    # V23: DASH-type precision.  When a LONG is opened after a visible
+    # buy-side pump and TP1 is still behind the fresh local high/resistance,
+    # the exact reason is not only "TP1 blocked".  It is a late post-pump
+    # entry into seller reaction with no clean path to TP1.  This outranks the
+    # V20 tight-path card, but stays below the V21 BOME fast-rejection card.
+    try:
+        pump_tight_tp1_max_pct = float(str(os.getenv('LOSS_CARD_PUMP_TP1_BLOCKED_MAX_TP_SPACE_PCT', '0.75') or '0.75').replace(',', '.'))
+    except Exception:
+        pump_tight_tp1_max_pct = 0.75
+    try:
+        pump_tight_tp1_max_duration = int(float(str(os.getenv('LOSS_CARD_PUMP_TP1_BLOCKED_MAX_DURATION_MIN', '70') or '70').replace(',', '.')))
+    except Exception:
+        pump_tight_tp1_max_duration = 70
+    late_pump_tight_resistance_path = bool(
+        side_u == 'LONG'
+        and no_tp
+        and weak_follow
+        and not wide_tp_target
+        and not tp1_near_miss
+        and 0 < cs <= max(tight_space_pct, tight_tp1_blocked_pct, pump_tight_tp1_max_pct)
+        and (late_long or vertical_long_pump or bullish_ctx)
+        and (supply_seen or supply_blocks or highish or ob_fvg_route or tight_space)
+        and (duration_min is None or duration_min <= pump_tight_tp1_max_duration)
+        and not bearish_ctx
+    )
+    add(13.35 + (0.8 if vertical_long_pump else 0.0) + (0.6 if supply_seen else 0.0) + (0.4 if supply_blocks else 0.0) + (0.3 if highish else 0.0), 'late_pump_into_resistance_tp1_blocked_long',
+        primary='Late LONG after pump into resistance / TP1 blocked',
+        scenario=f'LONG был открыт после уже выполненного buy-side impulse/pump и под ближайшей seller reaction area ({supply_desc}). До TP1 было всего около {cs:.2f}%, но цель стояла за fresh local high/resistance. Покупатель не дал acceptance выше этой зоны и не появился fresh bullish displacement, поэтому вход превратился в rejection/pullback к SL.',
+        analysis_add=['entry был после buy-side impulse/pump', cs_line, risk_line, 'TP1 стоял за fresh local high / resistance', 'acceptance выше local high/resistance отсутствовал', 'fresh bullish displacement после входа отсутствовал', mfe_line],
+        happened=['покупатель зашёл поздно после pump, уже рядом с зоной продавца', 'цена не закрепилась выше fresh local high/resistance', 'TP1 был заблокирован seller reaction area', 'после entry не появился новый bullish expansion', 'SL был достигнут после rejection/отката'],
+        visible=['перед входом уже прошёл buy-side impulse', 'LONG открыт высоко, под/рядом с fresh local high', 'между entry и TP1 не было чистого пути: цель стояла за resistance', 'после входа нет clean bullish displacement', 'цена быстро вернулась под entry/retest зону', pos_line],
+        secondary=['Late long after pump', 'TP1 blocked by resistance', 'No clean upside path', 'Seller reaction at fresh high', 'No acceptance above high', 'Weak bullish follow-through'],
+        improve=['после pump не брать LONG прямо под fresh high/resistance', 'ждать 1–2 close выше seller reaction area', 'или ждать deeper pullback/discount re-entry', 'если TP1 стоит за fresh high — нужен acceptance выше high до входа'],
+        evidence=late_pump_tight_resistance_path)
+
     # V20: WBTC-type precision.  When TP1 is geometrically close (for
     # example 0.4-0.6%) but it sits above the nearest local high/resistance,
     # the real chart reason is not just a generic "no acceptance".  The
