@@ -7999,6 +7999,10 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     except Exception:
         tight_space_pct = 0.75
     try:
+        tight_tp1_blocked_pct = float(str(os.getenv('LOSS_CARD_TIGHT_TP1_BLOCKED_PCT', '0.60') or '0.60').replace(',', '.'))
+    except Exception:
+        tight_tp1_blocked_pct = 0.60
+    try:
         exhausted_move_pct = float(str(os.getenv('LOSS_CARD_EXHAUSTION_MOVE_PCT', '0.45') or '0.45').replace(',', '.'))
     except Exception:
         exhausted_move_pct = 0.45
@@ -8305,6 +8309,66 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         secondary=['No post-entry expansion', 'No fresh expansion candle', 'Weak continuation'],
         improve=['требовать fresh expansion candle после trigger', 'если entry не получает continuation в первые свечи — не держать идею как сильный setup'],
         evidence=bool(any_flag('no_post_entry_expansion','no_fresh_expansion_candle','post_entry_expansion_missing') or (weak_follow and no_tp and not normal_pullback)))
+    # V20: WBTC-type precision.  When TP1 is geometrically close (for
+    # example 0.4-0.6%) but it sits above the nearest local high/resistance,
+    # the real chart reason is not just a generic "no acceptance".  The
+    # target path itself is bad: price must break a seller reaction area before
+    # TP1 can be reached.  This should outrank the generic
+    # `long_under_resistance_no_acceptance` card for tight TP1 losses.
+    tight_tp1_resistance_path = bool(
+        side_u == 'LONG'
+        and no_tp
+        and weak_follow
+        and not wide_tp_target
+        and not tp1_near_miss
+        and 0 < cs <= max(tight_space_pct, tight_tp1_blocked_pct)
+        and (supply_seen or supply_blocks or highish or ob_fvg_route or tight_space)
+        and not bearish_ctx
+    )
+    add(11.9 + (0.8 if supply_seen else 0.0) + (0.6 if supply_blocks else 0.0) + (0.4 if highish else 0.0), 'tp1_blocked_by_resistance_tight_path_long',
+        primary='TP1 blocked by local resistance / no clean upside path',
+        scenario=f'LONG был открыт под ближайшим local high / resistance ({supply_desc}). До TP1 было всего около {cs:.2f}%, но эта цель стояла за seller reaction area: для TP1 цене сначала нужно было закрепиться выше resistance. Acceptance выше entry/retest зоны и fresh bullish displacement после входа не появились, поэтому движение превратилось в rejection/pullback к SL.',
+        analysis_add=[cs_line, risk_line, 'TP1 стоял за ближайшим local resistance / seller reaction area', 'acceptance выше entry/retest зоны отсутствовал', 'fresh bullish displacement после входа отсутствовал', mfe_line],
+        happened=['покупатель не смог принять цену выше local resistance', 'TP1 был заблокирован ближайшей seller reaction area', 'после entry не появился новый bullish expansion', 'SL был достигнут после rejection/отката'],
+        visible=[f'над входом была {supply_desc}', 'между entry и TP1 не было чистого пути: цель стояла за resistance', 'LONG открыт под/рядом с local high / seller reaction area', 'после входа нет clean bullish displacement', 'цена не удержала reclaim/entry-зону', pos_line],
+        secondary=['TP1 blocked by resistance', 'No clean upside path', 'No acceptance after retest', 'Weak bullish follow-through', 'Seller rejection'],
+        improve=['не брать LONG, если TP1 сразу за local resistance', 'ждать 1–2 close выше seller reaction area', 'ставить TP1 до первой сильной seller zone или пропускать сделку', 'если после retest нет displacement — пропускать вход'],
+        evidence=tight_tp1_resistance_path)
+
+    # V21: BOME-type precision.  A fast LONG opened at the top of a
+    # near-vertical pump must not be explained as a generic retest/acceptance
+    # failure.  The visible issue is post-pump exhaustion: entry was close to
+    # the local high after an extended move, TP1 was above the fresh high, and
+    # the first reaction after entry was a fast rejection to SL.
+    try:
+        post_pump_fast_min_risk_pct = float(str(os.getenv('LOSS_CARD_POST_PUMP_FAST_MIN_RISK_PCT', '0.60') or '0.60').replace(',', '.'))
+    except Exception:
+        post_pump_fast_min_risk_pct = 0.60
+    try:
+        post_pump_fast_min_tp_space_pct = float(str(os.getenv('LOSS_CARD_POST_PUMP_FAST_MIN_TP_SPACE_PCT', '0.90') or '0.90').replace(',', '.'))
+    except Exception:
+        post_pump_fast_min_tp_space_pct = 0.90
+    post_pump_fast_long_rejection = bool(
+        side_u == 'LONG'
+        and no_tp
+        and fast
+        and weak_follow
+        and not tp1_near_miss
+        and (late_long or vertical_long_pump or bullish_ctx or structure_pending_route)
+        and (cs <= 0 or cs >= post_pump_fast_min_tp_space_pct)
+        and (risk_pct <= 0 or risk_pct >= post_pump_fast_min_risk_pct)
+        and not bearish_ctx
+    )
+    add(15.6 + (0.8 if vertical_long_pump else 0.0) + (0.5 if structure_pending_route else 0.0) + (0.4 if highish else 0.0), 'post_pump_fast_long_rejection_bome',
+        primary='Late LONG at post-pump high / buyer exhaustion fast rejection',
+        scenario='LONG был открыт уже после сильного buy-side pump, фактически в верхней части свежего движения. TP1 стоял выше свежего high, но перед входом не было нормального discount pullback/retest и нового acceptance. Покупатель был истощён: вместо fresh bullish continuation первая реакция быстро превратилась в rejection/pullback к SL.',
+        analysis_add=['entry был после сильного buy-side pump / extended move', 'вход был ближе к post-pump high, а не из discount', 'TP1 требовал продолжения выше свежего high', 'acceptance/fresh bullish displacement после входа отсутствовал'],
+        happened=['покупатель не дал новую волну вверх после входа', 'после entry быстро появился rejection/pullback', 'TP1 не был нормально поставлен под угрозу', 'SL был достигнут как fast invalidation после exhaustion'],
+        visible=['перед входом уже прошёл почти безоткатный рост / pump', 'LONG открыт на вершине свежего impulse, а не после глубокого pullback', 'рядом сверху был fresh local high / seller reaction после pump', 'после входа нет clean bullish expansion', 'первая реакция быстро пошла против LONG', pos_line],
+        secondary=['Late long after pump', 'Post-pump high entry', 'Buyer exhaustion', 'Fast rejection', 'No discount re-entry', 'No fresh bullish displacement'],
+        improve=['после сильного pump ждать pullback ниже / discount re-entry', 'не брать LONG на свежем high без 1–2 close выше high', 'для Structure pending trigger требовать реальный retest, а не вход в конце extension', 'если TP1 стоит выше fresh high после pump — ждать acceptance выше high или пропускать'],
+        evidence=post_pump_fast_long_rejection)
+
     if side_u == 'LONG':
         add(13.0 + (0.9 if late_long else 0.0) + (0.6 if vertical_long_pump else 0.0), 'long_near_tp1_then_rejected_after_pump',
             primary='LONG pushed near TP1, then rejected / no acceptance above high',
