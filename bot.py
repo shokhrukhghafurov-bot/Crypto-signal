@@ -9275,6 +9275,46 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             improve=['ставить SL за structural invalidation ниже buyer-support/FVG зоны', 'не ставить SL внутри первого pullback после impulse', 'если нормальный structural SL ломает RR — пропускать сделку', 'для valid LONG не менять причину на late entry, если после SL идея продолжила работать'],
             evidence=valid_long_but_bad_sl)
 
+        # V16: KMNO-type precision. If TP1 is very far and sits behind an
+        # overhead bearish FVG/supply stack, do not call the trade only "late
+        # after pump". The exact problem is target-path quality: a wide RR was
+        # created mostly by a tight SL while the path to TP1 crossed multiple
+        # seller reaction / FVG zones and acceptance above the stack never came.
+        overhead_fvg_stack = bool(
+            real_supply_is_fvg
+            or b('overhead_bearish_fvg')
+            or b('bearish_fvg_above_entry')
+            or b('red_fvg_above_entry')
+            or b('supply_fvg_above_entry')
+            or b('nearest_bearish_fvg')
+            or b('nearest_supply_fvg')
+            or b('tp1_behind_bearish_fvg')
+            or b('tp1_behind_supply_fvg')
+            or b('supply_fvg_blocks_tp1')
+            or b('bearish_fvg_blocks_tp1')
+            or ('fvg' in str(supply_ctx.get('tfs') or '').lower())
+        )
+        wide_overhead_stack = bool(
+            side_u == 'LONG'
+            and no_tp
+            and wide_tp_target
+            and not tight_space
+            and (weak_follow or normal_pullback or sl_tight)
+            and (overhead_fvg_stack or supply_seen or supply_blocks or ob_fvg_route or highish)
+            and (cs >= max(wide_tp1_pct, 1.20) or rr_to_tp1 >= max(wide_tp1_rr, 2.50))
+        )
+        stack_name = 'bearish FVG / supply stack' if overhead_fvg_stack else 'overhead supply/resistance stack'
+        stack_primary = 'LONG into overhead bearish FVG stack / TP1 too far behind supply' if overhead_fvg_stack else 'LONG under overhead supply stack / TP1 too far behind resistance'
+        add(14.9 + (0.8 if overhead_fvg_stack else 0.0) + (0.5 if rr_to_tp1 >= 4.0 else 0.0) + (0.4 if sl_tight else 0.0), 'long_tp1_far_behind_overhead_fvg_stack',
+            primary=stack_primary,
+            scenario=f'LONG был открыт после bounce/retest, но TP1 стоял далеко выше — за {stack_name}. Большой RR получился из-за близкого SL, а не из-за чистого пути: цена не получила acceptance выше entry/overhead zone, fresh bullish displacement не появился, поэтому рынок откатил к SL раньше, чем смог пройти к TP1.',
+            analysis_add=[tp1_distance_line, f'TP1 находился за {stack_name}', 'acceptance выше entry / overhead zone отсутствовал', 'fresh bullish displacement после входа отсутствовал', 'большой RR не означал clean path до TP1'],
+            happened=['покупатель не смог закрепиться выше ближайшей seller reaction / FVG зоны', 'TP1 был слишком далеко за overhead reaction stack', 'после входа не появился новый bullish expansion', 'SL был достигнут после pullback/rejection до подтверждённого continuation'],
+            visible=[f'над входом был {stack_name}', 'TP1 стоял выше ближайших seller reaction/FVG зон, а не перед ними', 'путь к TP1 проходил через несколько overhead reaction levels', 'SL был близким относительно ширины цели, поэтому RR выглядел большим', 'после входа цена не дала clean bullish displacement', pos_line],
+            secondary=['TP1 too far behind overhead FVG/supply', 'No acceptance above overhead zone', 'Tight SL inflated RR', 'No fresh bullish displacement', 'Seller reaction stack above entry'],
+            improve=['не ставить TP1 за несколькими overhead FVG/supply зонами без acceptance', 'если RR большой только из-за tight SL — проверять реальный clean path', 'для LONG ждать close выше seller reaction stack или брать цель до него', 'SL ставить за structural invalidation, а не делать цель нереально далёкой'],
+            evidence=wide_overhead_stack)
+
         # V15: VIRTUAL-type fix. A LONG after a near-vertical buy-side leg
         # should not be reduced to the generic "under resistance" label. If the
         # move into entry was extended and SL sits inside the first pullback, make
