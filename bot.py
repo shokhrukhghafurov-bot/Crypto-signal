@@ -8006,6 +8006,11 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
 
     demand_ctx = _loss_card_real_zone_context(analysis, 'demand')
     supply_ctx = _loss_card_real_zone_context(analysis, 'supply')
+    # v9.1 hotfix: these FVG booleans must live inside this ranked-reason
+    # function. In v9 they were only defined in the older forensic helper, so
+    # closed-card generation crashed with NameError on real_supply_is_fvg.
+    real_demand_is_fvg = bool(demand_ctx.get('is_fvg'))
+    real_supply_is_fvg = bool(supply_ctx.get('is_fvg'))
     demand_seen = bool(demand_ctx.get('has_zone') or b('entry_into_demand') or b('short_above_weak_low') or analysis.get('demand_near_tfs') or b('underlying_bullish_fvg'))
     supply_seen = bool(supply_ctx.get('has_zone') or b('entry_into_supply') or b('entry_into_overhead_supply') or b('long_below_strong_high') or analysis.get('supply_near_tfs') or b('overhead_bearish_fvg'))
     demand_blocks = bool(demand_ctx.get('blocks_tp1') or b('demand_zone_blocks_tp1') or b('range_low_blocks_tp1'))
@@ -8036,6 +8041,15 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     long_high_path_block = bool(side_u == 'LONG' and no_tp and (long_supply_block_evidence or (tight_space and pos_known and pos >= 0.55)))
     late_or_low_short = bool(late_short or (short_low_path_block and (weak_follow or normal_pullback or sl_tight or fast)))
     late_or_high_long = bool(late_long or (long_high_path_block and (weak_follow or normal_pullback or sl_tight or fast)))
+
+    # Define both path-description lines before the side-specific reason blocks.
+    # Some candidates are intentionally added as symmetric LONG/SHORT detectors
+    # in the same branch; Python evaluates the candidate arguments before the
+    # evidence flag, so branch-local definitions can still raise UnboundLocalError.
+    demand_desc = str(demand_ctx.get('desc') or 'local low / support')
+    supply_desc = str(supply_ctx.get('desc') or 'local high / resistance')
+    tp1_demand_path_line = f'TP1 находился рядом/за demand/support reaction area ({demand_desc})'
+    tp1_supply_path_line = f'TP1 находился рядом/за supply/resistance reaction area ({supply_desc})'
 
     route_key = sget('route_key', 'smart_setup_code', 'setup_code', 'setup_key')
     setup_label_raw = sget('setup_label', 'setup', 'smart_setup')
