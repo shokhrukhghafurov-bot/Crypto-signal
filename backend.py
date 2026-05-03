@@ -11418,7 +11418,12 @@ def _mid_smart_setup_origin_fastpath(*,
         reasons.append(f"origin_fast_age:{int(age_v)}>{int(max_age_bars)}")
     if move_v is not None and max_move_atr > 0 and move_v > max_move_atr:
         reasons.append(f"origin_fast_move:{move_v:.2f}>{max_move_atr:.2f}")
-    if not (bo_ok or sweep_ok):
+    try:
+        _allow_no_trigger = str(os.getenv("MID_SMART_SETUP_ORIGIN_ALLOW_NO_TRIGGER", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        _allow_no_trigger = False
+    meta["allow_no_trigger"] = bool(_allow_no_trigger)
+    if not (bo_ok or sweep_ok) and not _allow_no_trigger:
         reasons.append(f"origin_fast_no_trigger:{bo or '-'}")
 
     if reasons:
@@ -13433,7 +13438,16 @@ def _mid_liquidity_reclaim_ready(ta: dict, rec: dict | None = None, *, now_ts: f
 
         sweep_ok = bool(t.get("sweep_long")) if direction == "LONG" else bool(t.get("sweep_short"))
         meta["sweep_ok"] = bool(sweep_ok)
-        if not sweep_ok:
+        try:
+            allow_no_sweep = str(os.getenv("MID_LIQ_RECLAIM_ALLOW_NO_SWEEP", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            allow_no_sweep = False
+        meta["allow_no_sweep"] = bool(allow_no_sweep)
+        # V29: keep true liquidity sweep strict by default, but allow operator to
+        # emit the reclaim route when the exchange payload did not mark sweep_*
+        # although price already reclaimed the zone. This fixes logs like:
+        # [mid][liq_reclaim][skip] ... reason=sweep_missing
+        if not sweep_ok and not allow_no_sweep:
             return (False, "sweep_missing", meta)
 
         try:
@@ -23480,8 +23494,20 @@ def _linreg_channel_bounds(df: pd.DataFrame, *, window: int = 120, k: float = 2.
         return (float("nan"), float("nan"))
 
 def _mid_quality_first_enabled() -> bool:
-    """Quality-first mode is mandatory for MID and is always enabled in code."""
-    return True
+    """Quality-first gate for MID pending instant emit.
+
+    Before V29 this always returned True, so even when the operator enabled
+    MID_PENDING_INSTANT_EMIT / IGNORE_ZONE / SKIP_CHECKS, the code still logged
+    "instant_emit bypass suppressed by quality_first" and refused to emit.
+
+    Keep the safe default enabled, but allow Railway ENV override for coverage
+    testing and direct smart-setup routes.
+    """
+    try:
+        raw = os.getenv("MID_QUALITY_FIRST_ENABLED", os.getenv("MID_QUALITY_FIRST", "1"))
+        return str(raw or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return True
 
 
 def _mid_trigger_min_passed() -> int:
