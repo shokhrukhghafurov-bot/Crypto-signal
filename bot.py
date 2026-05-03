@@ -9967,6 +9967,229 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     best['visible_lines'] = _loss_card_normalize_visible_position_lines(best.get('visible_lines') or [], analysis)
     return best
 
+
+def _loss_card_report_exact_reason_payload(src: dict, analysis: dict, *, side: str, duration_min: int | None = None) -> dict:
+    """Report-driven exact LOSS-card reason override.
+
+    This is intentionally a CARD formatter guard, not a trading gate.  The same
+    problem classes from the operator's SL report are converted into human text:
+      - TP1 behind resistance/support / no clean path;
+      - late LONG/SHORT after pump/dump;
+      - early entry with SL inside normal pullback;
+      - unrealistic TP1 distance;
+      - range/chop with no displacement;
+      - low-liquidity / wick-noise micro setup.
+
+    Defaults are hard-coded here so report cards become accurate without adding
+    any Railway ENV variables. ENV can still override legacy thresholds elsewhere.
+    """
+    src = dict(src or {})
+    a = dict(analysis or {})
+    side_u = str(side or src.get('side') or a.get('side') or '').upper().strip()
+    if side_u not in ('LONG', 'SHORT'):
+        return {}
+
+    def f(key: str, default: float = 0.0) -> float:
+        try:
+            val = a.get(key)
+            if val is None or val == '':
+                val = src.get(key)
+            if val is None or val == '':
+                return default
+            out = float(str(val).replace(',', '.'))
+            return out if math.isfinite(out) else default
+        except Exception:
+            return default
+
+    def b(*keys: str) -> bool:
+        for key in keys:
+            try:
+                val = a.get(key)
+                if isinstance(val, str):
+                    if val.strip().lower() in ('1','true','yes','on','да','есть'):
+                        return True
+                    if val.strip().lower() in ('0','false','no','off','нет'):
+                        continue
+                if bool(val):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def has_any_text(*needles: str) -> bool:
+        hay = ' '.join(str(x or '') for x in (
+            a.get('structure_5m'), a.get('trend_context'), a.get('primary_reason_text'),
+            src.get('risk_note'), src.get('orig_text'), src.get('confirmations'),
+        )).lower()
+        return any(str(n).lower() in hay for n in needles)
+
+    entry = f('entry')
+    tp1 = f('tp1')
+    sl = f('sl')
+    if entry <= 0 or tp1 <= 0:
+        return {}
+
+    if side_u == 'LONG':
+        target_pct = ((tp1 - entry) / entry) * 100.0 if tp1 > entry else 0.0
+        risk_pct = ((entry - sl) / entry) * 100.0 if sl > 0 and entry > sl else f('risk_pct_to_sl')
+    else:
+        target_pct = ((entry - tp1) / entry) * 100.0 if 0 < tp1 < entry else 0.0
+        risk_pct = ((sl - entry) / entry) * 100.0 if sl > entry else f('risk_pct_to_sl')
+    clean_space = f('clean_space_to_tp1_pct', target_pct)
+    entry_pos = f('entry_position_in_prior_range', f('entry_position_in_range', 0.5))
+    local6 = f('local_pre_move_6_pct')
+    local12 = f('local_pre_move_12_pct')
+    local24 = f('local_pre_move_24_pct')
+    pre_move = f('pre_entry_move_pct')
+    mfe_pct = abs(f('mfe_pct'))
+    mae_pct = abs(f('mae_pct'))
+    mfe_r = f('mfe_r')
+    duration = int(duration_min or f('duration_min') or 0)
+    fast = bool(duration and duration <= 8)
+    very_fast = bool(duration and duration <= 3)
+    longish = bool(duration and duration >= 90)
+    no_tp = bool((a.get('tp1_threatened') is False) or b('sl_hit_without_meaningful_excursion','no_post_entry_expansion') or (mfe_r > 0 and mfe_r < 0.60) or (mfe_pct > 0 and target_pct > 0 and mfe_pct < target_pct * 0.55))
+    weak_follow = bool(b('weak_followthrough','confirm_too_weak','zone_reaction_too_weak','post_entry_volume_faded') or (mfe_pct > 0 and mfe_pct < 0.35))
+
+    supply_block = bool(b(
+        'entry_into_supply','entry_into_overhead_supply','long_below_strong_high',
+        'overhead_supply_resistance','overhead_bearish_fvg','range_high_blocks_tp1',
+        'supply_zone_blocks_tp1'
+    ) or bool(a.get('supply_near_tfs')) or (side_u == 'LONG' and entry_pos >= 0.72 and 0 < clean_space <= 0.75))
+    demand_block = bool(b(
+        'entry_into_demand','short_above_weak_low','underlying_demand_support',
+        'underlying_bullish_fvg','range_low_blocks_tp1','demand_zone_blocks_tp1'
+    ) or bool(a.get('demand_near_tfs')) or (side_u == 'SHORT' and entry_pos <= 0.28 and 0 < clean_space <= 0.75))
+    path_block = bool(supply_block if side_u == 'LONG' else demand_block)
+
+    # Calculate ATR target only when the snapshot saved ATR.  This catches ORDI-like
+    # fantasy targets without needing a separate ENV.
+    atr = f('atr_at_entry') or f('atr30') or f('atr_abs')
+    tp1_atr = abs(tp1 - entry) / atr if atr > 0 else 0.0
+    market = str(src.get('market') or '').upper().strip()
+    far_pct_limit = 6.0 if market != 'FUTURES' else 10.0
+    if target_pct > far_pct_limit or (tp1_atr > 0 and tp1_atr > 3.0):
+        return {
+            'primary_text': 'Unrealistic TP1 distance / target too far',
+            'scenario_text': 'Цель TP1 была слишком далеко от entry для обычного сигнала. Формальный RR выглядел красиво, но для достижения TP1 цене нужно было пройти непропорционально большой путь без нормального промежуточного сопротивления/подтверждения. Такой сигнал должен быть пропущен или переведён в отдельный high-volatility режим.',
+            'analysis_lines': [
+                f'entry → TP1: около {target_pct:.2f}%',
+                (f'TP1 distance: {tp1_atr:.2f} ATR' if tp1_atr > 0 else ''),
+                'TP1 был нереалистичным для обычного SL/TP-сигнала',
+            ],
+            'happened_lines': ['цена не смогла развить движение до слишком дальней цели', 'после отсутствия continuation движение ушло к SL'],
+            'visible_lines': ['TP1 находился слишком далеко от entry', 'цель требовала сильного продолжения без нормальной промежуточной фиксации'],
+            'secondary_labels': ['Unrealistic TP1', 'Fantasy RR', 'Target too far'],
+            'improve_labels': ['ограничить TP1 по % и ATR', 'для дальних целей использовать отдельный режим/подтверждение', 'не отправлять обычный сигнал, если TP1 дальше 3 ATR'],
+        }
+
+    # Entry timing / SL problem: direction may be correct, but the card must not
+    # call it only "bad signal" or fake resistance when evidence says the SL was
+    # inside normal pullback noise.
+    if very_fast and risk_pct > 0 and risk_pct <= 0.70 and not path_block and (weak_follow or no_tp):
+        pullback = 'откат' if side_u == 'LONG' else 'bounce/retest'
+        return {
+            'primary_text': 'Early entry / SL inside normal pullback',
+            'scenario_text': f'{side_u} был открыт слишком рано, до нормального acceptance после retest. Направление могло быть не полностью неправильным, но SL стоял внутри обычного {pullback} шума. Поэтому цену выбило по SL раньше, чем setup успел подтвердить continuation.',
+            'analysis_lines': [f'вход → SL: {duration} мин', f'entry → SL: около {risk_pct:.2f}%', 'acceptance после retest не подтвердился'],
+            'happened_lines': ['цена сразу дала движение против entry', 'SL был достигнут до нормального подтверждения continuation', 'TP1 не был поставлен под угрозу до выбивания SL'],
+            'visible_lines': ['entry был слишком ранний относительно retest/acceptance', 'SL находился внутри обычной pullback/retest зоны', 'это больше проблема timing/SL, чем полного запрета направления'],
+            'secondary_labels': ['Early trigger', 'SL inside normal pullback', 'No acceptance before entry'],
+            'improve_labels': ['переводить такой trigger в pending', 'ждать 1–2 свечи acceptance', 'ставить SL за structural invalidation или пропускать, если RR ломается'],
+        }
+
+    bearish_context_long = bool(side_u == 'LONG' and (b('bearish_context_before_entry','long_against_bearish_structure','long_bearish_continuation_under_supply','reclaim_missing') or has_any_text('bearish against long','15m bearish','30m bearish','lower high','lower low')))
+    bullish_context_short = bool(side_u == 'SHORT' and (b('bullish_context_before_entry','short_against_bullish_structure','bearish_reclaim_missing') or has_any_text('bullish against short','15m bullish','30m bullish','higher high','higher low')))
+    if bearish_context_long and (path_block or weak_follow or no_tp):
+        return {
+            'primary_text': 'LONG against bearish context / no reclaim',
+            'scenario_text': 'LONG был открыт без подтверждённого bullish reclaim: перед входом структура была bearish или продавец продолжал контролировать движение. Покупатель не смог закрепиться выше resistance/entry zone, поэтому движение ушло к SL.',
+            'analysis_lines': ['bearish context перед входом', 'bullish reclaim отсутствовал', 'fresh bullish displacement после входа отсутствовал'],
+            'happened_lines': ['цена не закрепилась выше entry/retest зоны', 'покупатель не получил continuation', 'SL был достигнут после продолжения sell-side давления'],
+            'visible_lines': ['структура перед входом была bearish / lower-high context', 'LONG был не из clean discount/reclaim', 'сверху оставалось давление продавца'],
+            'secondary_labels': ['Bearish 5m/15m context', 'Failed reclaim', 'No bullish displacement'],
+            'improve_labels': ['не брать LONG против bearish context без reclaim', 'требовать close выше resistance/supply', 'фильтровать lower-high long после pump'],
+        }
+    if bullish_context_short and (path_block or weak_follow or no_tp):
+        return {
+            'primary_text': 'SHORT against bullish context / no bearish reclaim',
+            'scenario_text': 'SHORT был открыт без подтверждённого bearish reclaim: перед входом структура была bullish или buyer pressure оставался сильным. Продавец не смог закрепиться ниже support/entry zone, поэтому движение ушло к SL.',
+            'analysis_lines': ['bullish context перед входом', 'bearish reclaim отсутствовал', 'fresh bearish displacement после входа отсутствовал'],
+            'happened_lines': ['цена не закрепилась ниже entry/retest зоны', 'продавец не получил continuation', 'SL был достигнут после buyer bounce'],
+            'visible_lines': ['структура перед входом была bullish / higher-low context', 'SHORT был не из clean premium/reclaim', 'снизу оставалось давление покупателя'],
+            'secondary_labels': ['Bullish 5m/15m context', 'Failed bearish reclaim', 'No bearish displacement'],
+            'improve_labels': ['не брать SHORT против bullish context без reclaim', 'требовать close ниже support/demand', 'фильтровать short рядом с demand'],
+        }
+
+    late_long = bool(side_u == 'LONG' and (b('late_entry_after_exhausted_move','late_entry_inside_expansion') or local6 >= 0.18 or local12 >= 0.35 or local24 >= 0.65 or (pre_move >= 0.75 and entry_pos >= 0.55)))
+    late_short = bool(side_u == 'SHORT' and (b('late_entry_after_exhausted_move','late_entry_inside_expansion') or local6 <= -0.18 or local12 <= -0.35 or local24 <= -0.65 or (pre_move <= -0.75 and entry_pos <= 0.45)))
+    if late_long and (path_block or entry_pos >= 0.62 or no_tp):
+        return {
+            'primary_text': 'Late LONG after pump / no acceptance',
+            'scenario_text': 'LONG был открыт после уже отработанного buy-side impulse. Цена находилась высоко относительно последнего движения и не дала acceptance выше resistance/entry zone. Поэтому вместо continuation появился pullback/rejection к SL.',
+            'analysis_lines': ['вход после уже отработанного pump', 'acceptance выше зоны отсутствовал', 'fresh bullish displacement после входа отсутствовал'],
+            'happened_lines': ['покупатель не смог продолжить движение после входа', 'цена не закрепилась выше entry/retest зоны', 'SL был достигнут после отката от premium/high зоны'],
+            'visible_lines': ['перед входом уже был buy-side impulse', 'LONG открыт высоко/premium, а не из discount', 'после входа не появился новый clean displacement'],
+            'secondary_labels': ['Late long after pump', 'No acceptance', 'Buyer exhaustion', 'Weak follow-through'],
+            'improve_labels': ['после pump переводить сигнал в pending', 'ждать pullback/retest', 'входить только после acceptance выше resistance'],
+        }
+    if late_short and (path_block or entry_pos <= 0.38 or no_tp):
+        return {
+            'primary_text': 'Late SHORT after dump / no acceptance',
+            'scenario_text': 'SHORT был открыт после уже отработанного sell-side impulse. Цена находилась низко относительно последнего движения и не дала acceptance ниже support/entry zone. Поэтому вместо continuation появился bounce/reclaim к SL.',
+            'analysis_lines': ['вход после уже отработанного dump', 'acceptance ниже зоны отсутствовал', 'fresh bearish displacement после входа отсутствовал'],
+            'happened_lines': ['продавец не смог продолжить движение после входа', 'цена не закрепилась ниже entry/retest зоны', 'SL был достигнут после bounce от discount/low зоны'],
+            'visible_lines': ['перед входом уже был sell-side impulse', 'SHORT открыт низко/discount, а не из premium', 'после входа не появился новый clean displacement'],
+            'secondary_labels': ['Late short after dump', 'No acceptance', 'Seller exhaustion', 'Weak follow-through'],
+            'improve_labels': ['после dump переводить сигнал в pending', 'ждать pullback/retest', 'входить только после acceptance ниже support'],
+        }
+
+    if side_u == 'LONG' and path_block and (0 < clean_space <= 1.20 or no_tp or weak_follow):
+        return {
+            'primary_text': 'TP1 behind resistance / no clean upside path',
+            'scenario_text': 'LONG был открыт под ближайшим resistance/seller reaction area, а TP1 находился внутри этой зоны или сразу за ней. Формальный RR был, но до TP1 не было чистого пути: цене сначала нужно было пробить продавца, а acceptance выше зоны не появилось.',
+            'analysis_lines': [f'clean space до TP1: около {clean_space:.2f}%' if clean_space > 0 else 'clean space до TP1 отсутствовал', 'TP1 был заблокирован resistance/supply', 'acceptance выше resistance отсутствовал'],
+            'happened_lines': ['покупатель не смог пробить ближайшее сопротивление', 'после входа не появился clean bullish displacement', 'цена дала rejection/pullback к SL'],
+            'visible_lines': ['между entry и TP1 был local high / resistance / supply', 'TP1 требовал пробоя seller zone', 'entry был не в clean discount-зоне'],
+            'secondary_labels': ['TP1 blocked by resistance', 'No clean space to TP1', 'Long under supply', 'Weak continuation'],
+            'improve_labels': ['блокировать LONG, если TP1 за resistance', 'ждать 1–2 close выше зоны', 'требовать clean path до TP1'],
+        }
+    if side_u == 'SHORT' and path_block and (0 < clean_space <= 1.20 or no_tp or weak_follow):
+        return {
+            'primary_text': 'TP1 behind support / no clean downside path',
+            'scenario_text': 'SHORT был открыт над ближайшим support/buyer reaction area, а TP1 находился внутри этой зоны или сразу за ней. Формальный RR был, но до TP1 не было чистого пути: цене сначала нужно было пробить покупателя, а acceptance ниже зоны не появилось.',
+            'analysis_lines': [f'clean space до TP1: около {clean_space:.2f}%' if clean_space > 0 else 'clean space до TP1 отсутствовал', 'TP1 был заблокирован support/demand', 'acceptance ниже support отсутствовал'],
+            'happened_lines': ['продавец не смог пробить ближайшую поддержку', 'после входа не появился clean bearish displacement', 'цена дала bounce/reclaim к SL'],
+            'visible_lines': ['между entry и TP1 был local low / support / demand', 'TP1 требовал пробоя buyer zone', 'entry был не в clean premium-зоне'],
+            'secondary_labels': ['TP1 blocked by support', 'No clean space to TP1', 'Short into demand', 'Weak continuation'],
+            'improve_labels': ['блокировать SHORT, если TP1 за support', 'ждать 1–2 close ниже зоны', 'требовать clean path до TP1'],
+        }
+
+    micro_or_wick_noise = bool((entry < 0.15 or has_any_text('wick noise','low liquidity','spread','micro')) and 0 < clean_space <= 0.75 and 0 < risk_pct <= 0.75 and (weak_follow or no_tp or mae_pct >= max(mfe_pct * 1.15, 0.15)))
+    if micro_or_wick_noise:
+        return {
+            'primary_text': 'Low liquidity / wick-noise setup',
+            'scenario_text': 'Сигнал был открыт в шумной микро-зоне: TP1 и SL были маленькими, а цена двигалась фитилями/шумом без чистого displacement. В такой среде обычный SL легко выбивается до нормального continuation.',
+            'analysis_lines': [f'clean space до TP1: около {clean_space:.2f}%', f'entry → SL: около {risk_pct:.2f}%', 'wick/noise риск был высокий'],
+            'happened_lines': ['цена не дала clean continuation', 'шум/фитили быстро дошли до SL', 'TP1 не был нормально поставлен под угрозу'],
+            'visible_lines': ['маленький TP/SL внутри локального шума', 'нет сильного displacement после входа', 'сетап похож на micro-range/chop'],
+            'secondary_labels': ['Wick noise', 'Low clean space', 'Micro range', 'Weak displacement'],
+            'improve_labels': ['для шумных монет повышать threshold', 'фильтровать spread/wick/noise', 'не брать micro TP1 без сильного acceptance'],
+        }
+
+    if longish and (weak_follow or no_tp) and (0.32 <= entry_pos <= 0.72 or b('range_trap_behavior')):
+        return {
+            'primary_text': 'Range/chop trade with no displacement',
+            'scenario_text': 'Сделка долго находилась внутри локального range/chop и не получила directional expansion. Если за длительное время цена не ставит TP1 под угрозу, идея становится старой и риск SL растёт.',
+            'analysis_lines': [f'вход → SL: {duration} мин', 'TP1 не был нормально поставлен под угрозу', 'fresh displacement отсутствовал'],
+            'happened_lines': ['рынок долго пилил внутри диапазона', 'continuation не появился', 'после затяжного ожидания цена ушла к SL'],
+            'visible_lines': ['entry был внутри range/chop', 'нет clean expansion после входа', 'сигнал устарел до достижения TP1'],
+            'secondary_labels': ['Range/chop', 'No displacement', 'Stale setup', 'Time-stop needed'],
+            'improve_labels': ['добавить time-stop если нет progress к TP1', 'не держать старую идею без displacement', 'блокировать входы в середине range'],
+        }
+
+    return {}
+
 def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool = False) -> dict:
     """Build human forensic sections exactly for Telegram LOSS report card."""
     src = dict(src or {})
@@ -10215,6 +10438,16 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         visible_lines = [str(x) for x in list(ranked_payload.get('visible_lines') or []) if str(x).strip()]
         secondary_labels = [str(x) for x in list(ranked_payload.get('secondary_labels') or []) if str(x).strip()]
         improve_labels = [str(x) for x in list(ranked_payload.get('improve_labels') or []) if str(x).strip()]
+
+    report_exact_payload = _loss_card_report_exact_reason_payload(src, analysis, side=side, duration_min=duration_min)
+    if report_exact_payload:
+        primary_text = str(report_exact_payload.get('primary_text') or primary_text).strip()
+        scenario_text = str(report_exact_payload.get('scenario_text') or scenario_text).strip()
+        analysis_lines = [str(x) for x in list(report_exact_payload.get('analysis_lines') or []) if str(x).strip()]
+        happened_lines = [str(x) for x in list(report_exact_payload.get('happened_lines') or []) if str(x).strip()]
+        visible_lines = [str(x) for x in list(report_exact_payload.get('visible_lines') or []) if str(x).strip()]
+        secondary_labels = [str(x) for x in list(report_exact_payload.get('secondary_labels') or []) if str(x).strip()]
+        improve_labels = [str(x) for x in list(report_exact_payload.get('improve_labels') or []) if str(x).strip()]
 
     if not scenario_text:
         scenario_text = str(loss_diag.get('primary_reason_text') or loss_diag.get('reason_text') or '').strip()
