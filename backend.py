@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-03_fix42_discount_pullback_winners_no_env"
+MID_BUILD_TAG = "MID_BUILD_2026-05-03_fix41_good_winner_relief_no_env"
 
 import asyncio
 import json
@@ -2653,13 +2653,17 @@ def _mid_tp1_path_block_guard_reason(*,
     except Exception:
         target_pct = 0.0
     try:
-        max_target_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_MAX_TARGET_PCT", "0.50") or 0.50)
+        # V43 default: CAKE-style losses can have TP1 around 0.60-0.75%,
+        # not only the older 0.35-0.50% SUI/POL band. Keep this guard
+        # enabled by default, but the wider band below is handled more
+        # selectively so PENDLE/RENDER/ALGO/MET pullback winners are not cut.
+        max_target_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_MAX_TARGET_PCT", "0.75") or 0.75)
     except Exception:
-        max_target_pct = 0.50
-    # V40 balanced default: catch the tight TP1-under-resistance pattern, but
-    # avoid killing too many valid setups. The 0.42-0.50% zone below is handled
-    # adaptively: weak/no-fresh triggers still wait, stronger reclaim/confirm
-    # triggers are allowed through normal checks.
+        max_target_pct = 0.75
+    # V43 balanced default: catch tight/medium TP1-under-resistance patterns.
+    # 0.50-0.75% is not blocked blindly: it must still have an unaccepted
+    # opposing level inside the path and fail the reclaim/continuation relief
+    # checks later in this function.
     if max_target_pct > 0 and float(target_pct) > float(max_target_pct):
         return ""
 
@@ -2860,74 +2864,33 @@ def _mid_tp1_path_block_guard_reason(*,
         or float(vol_v) >= float(soft_vol_min)
     )
 
-    # V42: MET/ALGO-style winners can have a very small TP1, but the entry is
-    # from discount after a large pullback, not directly under the pump high.
-    # Allow those only when the route has retest/reclaim context and the entry
-    # is clearly away from the opposite extreme. This keeps SUI/POL/ACT/ZAMA/ZEN
-    # blocked because they enter close to the upper resistance area.
-    discount_pullback_relief = False
     try:
-        def _first_float_local(*vals):
-            for _v in vals:
-                try:
-                    if _v is None or _v == "":
-                        continue
-                    _fv = float(_v)
-                    if math.isfinite(_fv) and _fv > 0:
-                        return _fv
-                except Exception:
-                    pass
-            return None
-
-        _rh = _first_float_local(
-            (ta or {}).get("recent_high"), (it or {}).get("recent_high"), (gate_meta or {}).get("recent_high"),
-            (ta or {}).get("swing_high"), (it or {}).get("swing_high"), (ta or {}).get("range_high"), (it or {}).get("range_high"),
-        )
-        _rl = _first_float_local(
-            (ta or {}).get("recent_low"), (it or {}).get("recent_low"), (gate_meta or {}).get("recent_low"),
-            (ta or {}).get("swing_low"), (it or {}).get("swing_low"), (ta or {}).get("range_low"), (it or {}).get("range_low"),
-        )
-        try:
-            _max_range_pos_long = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_DISCOUNT_RELIEF_MAX_RANGE_POS", "0.40") or 0.40)
-        except Exception:
-            _max_range_pos_long = 0.40
-        try:
-            _min_range_pos_short = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_PREMIUM_RELIEF_MIN_RANGE_POS", "0.60") or 0.60)
-        except Exception:
-            _min_range_pos_short = 0.60
-        try:
-            _min_extreme_pullback_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_EXTREME_PULLBACK_PCT", "0.70") or 0.70)
-        except Exception:
-            _min_extreme_pullback_pct = 0.70
-        _min_extreme_pullback_pct = max(float(_min_extreme_pullback_pct), float(target_pct) * 1.60)
-
-        if bool(retest_or_reclaim) and _rh and _rl and float(_rh) > float(_rl):
-            _range_pos = (float(entry) - float(_rl)) / max(float(_rh) - float(_rl), 1e-12)
-            if side == "LONG":
-                _pullback_pct = (float(_rh) - float(entry)) / max(abs(float(entry)), 1e-12) * 100.0
-                discount_pullback_relief = bool(
-                    float(_range_pos) <= float(_max_range_pos_long)
-                    or float(_pullback_pct) >= float(_min_extreme_pullback_pct)
-                )
-            else:
-                _pullback_pct = (float(entry) - float(_rl)) / max(abs(float(entry)), 1e-12) * 100.0
-                discount_pullback_relief = bool(
-                    float(_range_pos) >= float(_min_range_pos_short)
-                    or float(_pullback_pct) >= float(_min_extreme_pullback_pct)
-                )
+        medium_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_MEDIUM_PCT", "0.50") or 0.50)
     except Exception:
-        discount_pullback_relief = False
+        medium_pct = 0.50
+    try:
+        wide_block_frac = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_WIDE_BLOCK_FRAC", "0.58") or 0.58)
+    except Exception:
+        wide_block_frac = 0.58
 
-    if float(target_pct) > float(strict_pct):
-        if strong_enough or reclaim_relief or discount_pullback_relief:
+    if float(target_pct) > float(medium_pct):
+        # V43: CAKE-style medium TP1 loss. TP1 is not tiny (~0.69%),
+        # but the nearest seller level is still in the first part of the path
+        # and price has not accepted/reclaimed it. Block that.
+        #
+        # Good winners such as PENDLE/RENDER usually have the first obstacle
+        # closer to TP1, or a clear pullback/reclaim/continuation relief.
+        if reclaim_relief and float(frac) >= float(tight_relief_frac):
+            return ""
+        if strong_enough and float(frac) > float(wide_block_frac):
+            return ""
+    elif float(target_pct) > float(strict_pct):
+        if strong_enough or reclaim_relief:
             return ""
     else:
-        # Very small TP1 winners such as ALGO/MET can still be valid after a
-        # large pullback/retest. Do not block them when they are not located
-        # near the pump high / dump low, or when the obstacle is closer to TP1
+        # Very small TP1 winners such as ALGO can still be valid after pullback/retest.
+        # Do not block them when the obstacle is not sitting immediately on entry
         # and there is real reclaim/confirm evidence.
-        if bool(discount_pullback_relief):
-            return ""
         if reclaim_relief and float(frac) >= float(tight_relief_frac):
             return ""
 
