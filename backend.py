@@ -729,6 +729,11 @@ def _mid_adaptive_veto_reason(*, sig=None, ta: dict | None = None, it: dict | No
         market, direction = 'SPOT', ''
     if direction not in ('LONG', 'SHORT'):
         return ''
+    try:
+        if _mid_is_direct_smc_route(route=route, sig=sig, ta=ta, rec=it, meta=gate_meta) and str(os.getenv('MID_DIRECT_SMC_BYPASS_ADAPTIVE_VETO', '1') or '1').strip().lower() in ('1','true','yes','on'):
+            return ''
+    except Exception:
+        pass
 
     ctx = _mid_adaptive_market_context(ta=ta, it=it, gate_meta=gate_meta)
     bias = str(ctx.get('bias') or '')
@@ -10834,6 +10839,9 @@ def _mid_smc_emit_route_label(route: str | None) -> str:
         'smc_displacement_origin': 'displacement origin fast-path',
         'smc_dual_fvg_origin': 'dual/stacked FVG origin',
         'smc_liquidity_reclaim': 'liquidity sweep → reclaim → BOS continuation',
+        'liquidity_reclaim_emit': 'liquidity sweep → reclaim → BOS continuation',
+        'origin_fastpath': 'origin fast-path',
+        'breakout_fastpath': 'fresh breakout fast-path',
     }
     return labels.get(str(route or '').strip(), '')
 
@@ -10911,22 +10919,54 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
             "require_fake_bos_filter": True,
             "min_conf_direct": 80 if is_range_like else 76,
         })
-    elif route_s in ("smc_displacement_origin", "smc_dual_fvg_origin"):
-        # These are origin/fast-path routes. In v25 they were selected correctly,
-        # but were then always vetoed by allow_direct_emit=False -> origin_wait_confirm.
-        # Keep hard safety checks, but allow the already validated origin fast-path to emit.
+    elif route_s in ("smc_displacement_origin", "smc_dual_fvg_origin", "origin_fastpath", "origin"):
+        # Origin/fast-path routes are already validated by _mid_smart_setup_origin_fastpath.
+        # Do not make them wait for the later generic retest gate again.
         try:
             _allow_origin_direct = str(os.getenv("MID_SMC_ORIGIN_ALLOW_DIRECT_EMIT", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
         except Exception:
             _allow_origin_direct = True
+        try:
+            _origin_direct_conf = int(float(os.getenv("MID_SMC_ORIGIN_DIRECT_CONF", "74") or 74))
+        except Exception:
+            _origin_direct_conf = 74
         prof.update({
             "require_reclaim": True,
             "require_bos": True,
-            "require_sweep": bool(is_range_like),
-            "require_displacement": True,
+            "require_sweep": False,
+            "require_displacement": route_s in ("smc_displacement_origin", "smc_dual_fvg_origin"),
             "require_fake_bos_filter": True,
             "allow_direct_emit": bool(_allow_origin_direct),
-            "min_conf_direct": 84 if is_range_like else 82,
+            "min_conf_direct": int(_origin_direct_conf),
+        })
+    elif route_s in ("breakout_fastpath", "breakout"):
+        try:
+            _breakout_direct_conf = int(float(os.getenv("MID_SMC_BREAKOUT_DIRECT_CONF", "76") or 76))
+        except Exception:
+            _breakout_direct_conf = 76
+        prof.update({
+            "require_bos": True,
+            "require_retest": False,
+            "require_fake_bos_filter": True,
+            "allow_direct_emit": True,
+            "min_conf_direct": int(_breakout_direct_conf),
+        })
+    elif route_s in ("liquidity_reclaim_emit", "liquidity_reclaim"):
+        try:
+            _liq_direct_conf = int(float(os.getenv("MID_SMC_LIQ_RECLAIM_DIRECT_CONF", "74") or 74))
+        except Exception:
+            _liq_direct_conf = 74
+        prof.update({
+            "require_reclaim": True,
+            "require_bos": True,
+            "require_sweep": True,
+            "require_retest": False,
+            "require_mss": False,
+            "prefer_smt": False,
+            "require_reclaim_hold": False,
+            "require_fake_bos_filter": True,
+            "allow_direct_emit": True,
+            "min_conf_direct": int(_liq_direct_conf),
         })
     return prof
 
@@ -10959,6 +10999,14 @@ def _mid_is_direct_smc_route(*,
         'smc_bos_retest_confirm',
         'smc_displacement_origin',
         'smc_dual_fvg_origin',
+        # Base smart-setup routes. These are only set after their own fast-path
+        # validators pass, so they should not fall back into generic instant gates.
+        'origin_fastpath',
+        'breakout_fastpath',
+        'liquidity_reclaim_emit',
+        'origin',
+        'breakout',
+        'liquidity_reclaim',
     }
 
     def _cand(v):
@@ -11000,7 +11048,9 @@ def _mid_pick_smc_emit_route(*,
     setup_source = ''
     priority = 0
     smc_zone_context = bool(zone_valid or smc.get('ob_ok') or smc.get('fvg_ok') or smc.get('fvg_active'))
-    smc_retest_context = bool(in_zone_now or smc.get('ob_retest'))
+    # LTF FVG active is already a retest/POI context for this route. Requiring
+    # price to be mathematically inside entry_low/entry_high made HTF/LTF setups vanish.
+    smc_retest_context = bool(in_zone_now or smc.get('ob_retest') or smc.get('fvg_active'))
     # Liquidity reclaim normally closes back *outside* the old zone after reclaim,
     # so requiring in_zone_now made the route almost impossible to send.
     if bool(liquidity_reclaim_ok or smc.get('liquidity_reclaim')) and bool(smc_zone_context):
@@ -11011,11 +11061,11 @@ def _mid_pick_smc_emit_route(*,
         route = 'smc_ob_fvg_overlap'
         setup_source = 'zone_retest'
         priority = 120
-    elif bool(smc.get('htf_ltf')) and bool(smc_zone_context and smc_retest_context):
+    elif bool(smc.get('htf_ltf')) and bool(smc_zone_context and (smc_retest_context or breakout_fast_ok or origin_fast_ok)):
         route = 'smc_htf_ob_ltf_fvg'
         setup_source = 'zone_retest'
         priority = 110
-    elif bool(smc.get('breakout_retest_poi')) and bool(smc.get('confirm_ok')) and bool(smc_zone_context and (smc_retest_context or breakout_fast_ok)):
+    elif bool(smc.get('breakout_retest_poi')) and bool(smc.get('confirm_ok')) and bool(smc_zone_context and (smc_retest_context or breakout_fast_ok or origin_fast_ok)):
         route = 'smc_bos_retest_confirm'
         setup_source = 'zone_retest'
         priority = 100
@@ -11028,9 +11078,11 @@ def _mid_pick_smc_emit_route(*,
         setup_source = 'origin'
         priority = 92
     elif bool(origin_fast_ok):
+        route = 'origin_fastpath'
         setup_source = 'origin'
         priority = 60
     elif bool(breakout_fast_ok):
+        route = 'breakout_fastpath'
         setup_source = 'breakout'
         priority = 55
     elif bool(zone_valid and in_zone_now):
@@ -11107,7 +11159,7 @@ def _mid_smart_setup_origin_fastpath(*,
 
     min_atr, min_vol = _mid_instant_emit_market_thresholds(market)
     try:
-        atr_mult = float(os.getenv("MID_SMART_SETUP_ORIGIN_ATR_MULT", "0.75") or 0.75)
+        atr_mult = float(os.getenv("MID_SMART_SETUP_ORIGIN_ATR_MULT", "0.50") or 0.50)
     except Exception:
         atr_mult = 0.75
     try:
@@ -11120,15 +11172,15 @@ def _mid_smart_setup_origin_fastpath(*,
         vol_need = 0.0
     atr_need = max(0.0, float(min_atr) * max(0.0, float(atr_mult)))
     try:
-        min_body_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR", "0.08") or 0.08)
+        min_body_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MIN_BODY_ATR", "0.03") or 0.03)
     except Exception:
         min_body_atr = 0.08
     try:
-        max_age_bars = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_AGE_BARS", "3") or 3))
+        max_age_bars = int(float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_AGE_BARS", "5") or 5))
     except Exception:
         max_age_bars = 3
     try:
-        max_move_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_MOVE_ATR", "1.20") or 1.20)
+        max_move_atr = float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_MOVE_ATR", "1.75") or 1.75)
     except Exception:
         max_move_atr = 1.20
     try:
@@ -11146,7 +11198,7 @@ def _mid_smart_setup_origin_fastpath(*,
         except Exception:
             pass
         try:
-            max_move_atr = max(float(max_move_atr), float(os.getenv("MID_SMC_ORIGIN_MAX_MOVE_ATR", "1.35") or 1.35))
+            max_move_atr = max(float(max_move_atr), float(os.getenv("MID_SMC_ORIGIN_MAX_MOVE_ATR", "2.00") or 2.00))
         except Exception:
             pass
     if smc_overlap or smc_htf_ltf or smc_displacement or smc_dual_fvg:
@@ -11270,7 +11322,7 @@ def _mid_smart_setup_origin_fastpath(*,
         except Exception:
             pass
         try:
-            max_move_atr = max(float(max_move_atr), float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_MOVE_ATR_FRESH", "1.30") or 1.30))
+            max_move_atr = max(float(max_move_atr), float(os.getenv("MID_SMART_SETUP_ORIGIN_MAX_MOVE_ATR_FRESH", "2.00") or 2.00))
         except Exception:
             pass
     meta.update({
@@ -11421,7 +11473,7 @@ def _mid_smart_setup_breakout_fastpath(*,
     flags = {str(x).strip().lower() for x in _mid_gate_listify(risk_flags) if str(x).strip()}
 
     try:
-        conf_need = int(float(os.getenv("MID_SMART_SETUP_BREAKOUT_CONF", os.getenv("MID_SMART_SETUP_EMIT_CONF", "90")) or 90))
+        conf_need = int(float(os.getenv("MID_SMART_SETUP_BREAKOUT_CONF", "78") or 78))
     except Exception:
         conf_need = 90
     try:
@@ -11432,18 +11484,18 @@ def _mid_smart_setup_breakout_fastpath(*,
 
     min_atr, min_vol = _mid_instant_emit_market_thresholds(market)
     try:
-        atr_mult = float(os.getenv("MID_SMART_SETUP_BREAKOUT_ATR_MULT", "1.00") or 1.00)
+        atr_mult = float(os.getenv("MID_SMART_SETUP_BREAKOUT_ATR_MULT", "0.50") or 0.50)
     except Exception:
         atr_mult = 1.00
     try:
-        vol_mult = float(os.getenv("MID_SMART_SETUP_BREAKOUT_VOL_MULT", "1.00") or 1.00)
+        vol_mult = float(os.getenv("MID_SMART_SETUP_BREAKOUT_VOL_MULT", "0.00") or 0.00)
     except Exception:
         vol_mult = 1.00
     atr_need = max(0.0, float(min_atr) * max(0.0, float(atr_mult)))
     vol_need = max(0.0, float(min_vol) * max(0.0, float(vol_mult)))
 
     try:
-        max_dist_atr = float(os.getenv("MID_SMART_SETUP_BREAKOUT_MAX_ZONE_DIST_ATR", "0.35") or 0.35)
+        max_dist_atr = float(os.getenv("MID_SMART_SETUP_BREAKOUT_MAX_ZONE_DIST_ATR", "1.20") or 1.20)
     except Exception:
         max_dist_atr = 0.35
     try:
@@ -11452,9 +11504,9 @@ def _mid_smart_setup_breakout_fastpath(*,
         max_dist_pct = 0.006
 
     try:
-        allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_SMART_SETUP_BREAKOUT_ALLOWED_REGIMES", "TREND,TRENDING,EXPANSION")) if str(x).strip()}
+        allowed_regimes = {str(x).strip().upper() for x in _mid_gate_listify(os.getenv("MID_SMART_SETUP_BREAKOUT_ALLOWED_REGIMES", "")) if str(x).strip()}
     except Exception:
-        allowed_regimes = {"TREND", "TRENDING", "EXPANSION"}
+        allowed_regimes = set()
     smc = dict(smc_snapshot or {})
     smc_priority = int(smc.get("priority") or 0)
     smc_overlap = bool(smc.get("overlap"))
@@ -11467,15 +11519,15 @@ def _mid_smart_setup_breakout_fastpath(*,
         active_hard_flags = [x for x in active_hard_flags if x != "regime_range_no_breakout"]
     if smc_priority >= 2:
         try:
-            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMC_BREAKOUT_CONF", "82") or 82)))
+            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMC_BREAKOUT_CONF", "74") or 74)))
         except Exception:
             conf_need = min(int(conf_need), 82)
         try:
-            vol_mult = min(float(vol_mult), float(os.getenv("MID_SMC_BREAKOUT_VOL_MULT", "0.70") or 0.70))
+            vol_mult = min(float(vol_mult), float(os.getenv("MID_SMC_BREAKOUT_VOL_MULT", "0.00") or 0.00))
         except Exception:
             pass
         try:
-            max_dist_atr = max(float(max_dist_atr), float(os.getenv("MID_SMC_BREAKOUT_MAX_ZONE_DIST_ATR", "0.75") or 0.75))
+            max_dist_atr = max(float(max_dist_atr), float(os.getenv("MID_SMC_BREAKOUT_MAX_ZONE_DIST_ATR", "1.50") or 1.50))
         except Exception:
             pass
 
@@ -11671,16 +11723,16 @@ def _mid_smc_route_emit_gate(*,
     if 'invalid_zone' in flags or 'dead_zone' in flags:
         blocks.append('invalid_zone')
 
-    route_need_origin = route_s in ('smc_displacement_origin', 'smc_dual_fvg_origin')
+    route_need_origin = route_s in ('smc_displacement_origin', 'smc_dual_fvg_origin', 'origin_fastpath', 'origin')
     route_need_zone = route_s in ('smc_ob_fvg_overlap', 'smc_htf_ob_ltf_fvg')
-    route_need_breakout = route_s == 'smc_bos_retest_confirm'
-    route_liq = route_s == 'smc_liquidity_reclaim'
+    route_need_breakout = route_s in ('smc_bos_retest_confirm', 'breakout_fastpath', 'breakout')
+    route_liq = route_s in ('smc_liquidity_reclaim', 'liquidity_reclaim_emit', 'liquidity_reclaim')
     try:
         _smc_sig = dict(getattr(sig, 'smc_snapshot', {}) or {}) if sig is not None else {}
     except Exception:
         _smc_sig = {}
     route_zone_context_ok = bool(zone_valid or _smc_sig.get('ob_ok') or _smc_sig.get('fvg_ok') or _smc_sig.get('fvg_active'))
-    route_retest_context_ok = bool(in_zone_now or _smc_sig.get('ob_retest'))
+    route_retest_context_ok = bool(in_zone_now or _smc_sig.get('ob_retest') or _smc_sig.get('fvg_active') or _smc_sig.get('fvg_ok'))
 
     if route_need_origin and not bool(origin_fast_ok):
         blocks.append('origin_not_ready')
@@ -11693,9 +11745,16 @@ def _mid_smc_route_emit_gate(*,
     if route_need_origin and (not bool(route_prof.get("allow_direct_emit", True))):
         blocks.append('origin_wait_confirm')
     if route_need_origin and (("CHOPPY" in reg_u) or ("RANGE" in reg_u)):
-        blocks.append('origin_range_block')
-    if route_need_breakout and not bool(route_zone_context_ok and (route_retest_context_ok or breakout_fresh_ok)):
+        try:
+            _block_origin_range = str(os.getenv("MID_SMART_SETUP_ORIGIN_BLOCK_RANGE", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            _block_origin_range = False
+        if _block_origin_range:
+            blocks.append('origin_range_block')
+    if route_s == 'smc_bos_retest_confirm' and not bool(route_zone_context_ok and (route_retest_context_ok or breakout_fresh_ok)):
         blocks.append('breakout_retest_not_ready')
+    elif route_s in ('breakout_fastpath', 'breakout') and not bool(breakout_fresh_ok):
+        blocks.append('breakout_not_ready')
     if route_need_zone and not bool(route_zone_context_ok and route_retest_context_ok):
         blocks.append('zone_retest_not_ready')
     if route_liq:
@@ -11800,7 +11859,7 @@ def _mid_instant_emit_gate(*,
             pass
     if breakout_fresh_ok:
         try:
-            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMART_SETUP_BREAKOUT_CONF", os.getenv("MID_SMART_SETUP_EMIT_CONF", "90")) or 90)))
+            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMART_SETUP_BREAKOUT_CONF", "78") or 78)))
         except Exception:
             pass
         try:
@@ -37712,10 +37771,16 @@ async def _backend_mid_pre_emit_block_reason(
         if quality_reason:
             return str(quality_reason)
 
-        # 5) BTC leader veto is the last market-wide gate.
-        btc_reason = await self.mid_btc_emit_block_reason(symbol=sym, market=market, direction=direction)
-        if btc_reason:
-            return str(btc_reason)
+        # 5) BTC leader veto is the last market-wide gate. For direct SMC routes it can
+        # be softened with ENV when the user wants more setup coverage.
+        try:
+            _bypass_btc_direct = bool(smc_direct_route and str(os.getenv("MID_DIRECT_SMC_BYPASS_BTC_FILTER", "0") or "0").strip().lower() in ("1", "true", "yes", "on"))
+        except Exception:
+            _bypass_btc_direct = False
+        if not _bypass_btc_direct:
+            btc_reason = await self.mid_btc_emit_block_reason(symbol=sym, market=market, direction=direction)
+            if btc_reason:
+                return str(btc_reason)
         return ""
     except Exception as e:
         try:
