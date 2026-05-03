@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-03_valid_pullback_reclaim_guard_v34"
+MID_BUILD_TAG = "MID_BUILD_2026-05-03_fix41_good_winner_relief_no_env"
 
 import asyncio
 import json
@@ -2816,14 +2816,58 @@ def _mid_tp1_path_block_guard_reason(*,
         fresh_ok = bool((it or {}).get("smart_breakout_fast_ok"))
     try:
         bo_txt = str((it or {}).get("bo_rt") or (it or {}).get("breakout_retest") or (gate_meta or {}).get("bo_rt") or "").lower()
-        if any(tok in bo_txt for tok in ("fresh", "bos", "breakout", "reclaim")):
+        # V41: do not treat a generic BOS label as full relief by itself.
+        # Bad SUI/POL/ACT/ZAMA/ZEN losses can also have a formal BOS/retest label.
+        # Real relief needs fresh/reclaim/breakout timing OR body/volume confirmation below.
+        if any(tok in bo_txt for tok in ("fresh", "breakout", "reclaim")):
             fresh_ok = True
     except Exception:
-        pass
+        bo_txt = ""
+
+    try:
+        route_txt = str(route or (gate_meta or {}).get("route") or (it or {}).get("route") or "").lower()
+    except Exception:
+        route_txt = ""
+    try:
+        setup_txt = str((it or {}).get("smart_setup") or (it or {}).get("setup") or (ta or {}).get("smart_setup") or "").lower()
+    except Exception:
+        setup_txt = ""
+    try:
+        retest_or_reclaim = any(tok in (bo_txt + " " + route_txt + " " + setup_txt) for tok in ("retest", "reclaim", "pullback"))
+    except Exception:
+        retest_or_reclaim = False
+
+    try:
+        # Obstacle very close to entry is the dangerous pattern. If the first
+        # opposing level is closer to TP1 than to entry and there is real
+        # reclaim/confirm evidence, let good ALGO/RENDER/PENDLE-style winners pass.
+        tight_relief_frac = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_TIGHT_RELIEF_FRAC", "0.62") or 0.62)
+    except Exception:
+        tight_relief_frac = 0.62
+    try:
+        soft_body_min = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_RELIEF_SOFT_BODY_ATR", "0.04") or 0.04)
+    except Exception:
+        soft_body_min = 0.04
+    try:
+        soft_vol_min = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_RELIEF_SOFT_VOL_X", "0.55") or 0.55)
+    except Exception:
+        soft_vol_min = 0.55
+
+    strong_enough = bool(fresh_ok) or float(body_atr_v) >= float(relief_body_min) or float(vol_v) >= float(relief_vol_min)
+    reclaim_relief = bool(retest_or_reclaim) and (
+        bool(fresh_ok)
+        or float(body_atr_v) >= float(soft_body_min)
+        or float(vol_v) >= float(soft_vol_min)
+    )
 
     if float(target_pct) > float(strict_pct):
-        strong_enough = bool(fresh_ok) or float(body_atr_v) >= float(relief_body_min) or float(vol_v) >= float(relief_vol_min)
-        if strong_enough:
+        if strong_enough or reclaim_relief:
+            return ""
+    else:
+        # Very small TP1 winners such as ALGO can still be valid after pullback/retest.
+        # Do not block them when the obstacle is not sitting immediately on entry
+        # and there is real reclaim/confirm evidence.
+        if reclaim_relief and float(frac) >= float(tight_relief_frac):
             return ""
 
     obstacle = "resistance" if side == "LONG" else "support"
