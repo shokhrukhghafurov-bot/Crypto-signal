@@ -10818,6 +10818,8 @@ def _mid_smc_confluence_snapshot(*,
         'choch_ok': bool(mss_ok),
         'smt_ok': bool(smt_ok),
         'smt_present': bool(smt_present),
+        'ob_retest': bool(ob_retest),
+        'sweep_ok': bool(sweep_ok),
         'entry_kind': entry_kind or '—',
         'entry_confluence': int(entry_confluence),
         'priority': int(priority),
@@ -10910,13 +10912,20 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
             "min_conf_direct": 80 if is_range_like else 76,
         })
     elif route_s in ("smc_displacement_origin", "smc_dual_fvg_origin"):
+        # These are origin/fast-path routes. In v25 they were selected correctly,
+        # but were then always vetoed by allow_direct_emit=False -> origin_wait_confirm.
+        # Keep hard safety checks, but allow the already validated origin fast-path to emit.
+        try:
+            _allow_origin_direct = str(os.getenv("MID_SMC_ORIGIN_ALLOW_DIRECT_EMIT", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            _allow_origin_direct = True
         prof.update({
             "require_reclaim": True,
             "require_bos": True,
             "require_sweep": bool(is_range_like),
             "require_displacement": True,
             "require_fake_bos_filter": True,
-            "allow_direct_emit": False,
+            "allow_direct_emit": bool(_allow_origin_direct),
             "min_conf_direct": 84 if is_range_like else 82,
         })
     return prof
@@ -10990,19 +10999,23 @@ def _mid_pick_smc_emit_route(*,
     route = ''
     setup_source = ''
     priority = 0
-    if bool(liquidity_reclaim_ok or smc.get('liquidity_reclaim')) and bool(zone_valid and in_zone_now):
+    smc_zone_context = bool(zone_valid or smc.get('ob_ok') or smc.get('fvg_ok') or smc.get('fvg_active'))
+    smc_retest_context = bool(in_zone_now or smc.get('ob_retest'))
+    # Liquidity reclaim normally closes back *outside* the old zone after reclaim,
+    # so requiring in_zone_now made the route almost impossible to send.
+    if bool(liquidity_reclaim_ok or smc.get('liquidity_reclaim')) and bool(smc_zone_context):
         route = 'smc_liquidity_reclaim'
         setup_source = 'liquidity_reclaim'
         priority = 130
-    elif bool(smc.get('overlap')) and bool(zone_valid and in_zone_now):
+    elif bool(smc.get('overlap')) and bool(smc_zone_context and smc_retest_context):
         route = 'smc_ob_fvg_overlap'
         setup_source = 'zone_retest'
         priority = 120
-    elif bool(smc.get('htf_ltf')) and bool(zone_valid and in_zone_now):
+    elif bool(smc.get('htf_ltf')) and bool(smc_zone_context and smc_retest_context):
         route = 'smc_htf_ob_ltf_fvg'
         setup_source = 'zone_retest'
         priority = 110
-    elif bool(smc.get('breakout_retest_poi')) and bool(smc.get('confirm_ok')) and bool(zone_valid and in_zone_now):
+    elif bool(smc.get('breakout_retest_poi')) and bool(smc.get('confirm_ok')) and bool(smc_zone_context and (smc_retest_context or breakout_fast_ok)):
         route = 'smc_bos_retest_confirm'
         setup_source = 'zone_retest'
         priority = 100
@@ -11662,6 +11675,12 @@ def _mid_smc_route_emit_gate(*,
     route_need_zone = route_s in ('smc_ob_fvg_overlap', 'smc_htf_ob_ltf_fvg')
     route_need_breakout = route_s == 'smc_bos_retest_confirm'
     route_liq = route_s == 'smc_liquidity_reclaim'
+    try:
+        _smc_sig = dict(getattr(sig, 'smc_snapshot', {}) or {}) if sig is not None else {}
+    except Exception:
+        _smc_sig = {}
+    route_zone_context_ok = bool(zone_valid or _smc_sig.get('ob_ok') or _smc_sig.get('fvg_ok') or _smc_sig.get('fvg_active'))
+    route_retest_context_ok = bool(in_zone_now or _smc_sig.get('ob_retest'))
 
     if route_need_origin and not bool(origin_fast_ok):
         blocks.append('origin_not_ready')
@@ -11675,12 +11694,16 @@ def _mid_smc_route_emit_gate(*,
         blocks.append('origin_wait_confirm')
     if route_need_origin and (("CHOPPY" in reg_u) or ("RANGE" in reg_u)):
         blocks.append('origin_range_block')
-    if route_need_breakout and not bool(zone_valid and in_zone_now):
+    if route_need_breakout and not bool(route_zone_context_ok and (route_retest_context_ok or breakout_fresh_ok)):
         blocks.append('breakout_retest_not_ready')
-    if route_need_zone and not bool(zone_valid and in_zone_now):
+    if route_need_zone and not bool(route_zone_context_ok and route_retest_context_ok):
         blocks.append('zone_retest_not_ready')
-    if route_liq and not bool(zone_valid and in_zone_now):
-        blocks.append('liquidity_retest_not_ready')
+    if route_liq:
+        # Reclaim confirmation is usually a close beyond the zone boundary, so
+        # in_zone_now=False is not a reason to block this route. Require only
+        # that the scanner/pending record has a real zone/context.
+        if not bool(route_zone_context_ok):
+            blocks.append('liquidity_zone_missing')
 
     if blocks:
         meta['blocked_by'] = list(blocks)
@@ -11775,6 +11798,15 @@ def _mid_instant_emit_gate(*,
                 conf_need = min(int(conf_need), int(float(origin_conf_need)))
         except Exception:
             pass
+    if breakout_fresh_ok:
+        try:
+            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMART_SETUP_BREAKOUT_CONF", os.getenv("MID_SMART_SETUP_EMIT_CONF", "90")) or 90)))
+        except Exception:
+            pass
+        try:
+            conf_need = min(int(conf_need), int(float(os.getenv("MID_SMC_BREAKOUT_CONF", str(conf_need)) or conf_need)))
+        except Exception:
+            pass
     def _env_on(name: str, default: str = "1") -> bool:
         try:
             return str(os.getenv(name, default) or default).strip().lower() in ("1", "true", "yes", "on")
@@ -11782,9 +11814,13 @@ def _mid_instant_emit_gate(*,
             return str(default).strip().lower() in ("1", "true", "yes", "on")
 
     origin_ignore_profit = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_BYPASS_PROFIT", "1"))
+    breakout_trust_fastpath = bool(breakout_fresh_ok and _env_on("MID_SMART_SETUP_BREAKOUT_TRUST_FASTPATH", "1"))
+    breakout_ignore_profit = bool(breakout_trust_fastpath and _env_on("MID_SMART_SETUP_BREAKOUT_BYPASS_PROFIT", "1"))
     origin_soft_macd = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_SOFT_MACD", "1"))
     origin_soft_vol = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_SOFT_VOL", "1"))
     origin_soft_atr = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_SOFT_ATR", "1"))
+    breakout_soft_vol = bool(breakout_trust_fastpath and _env_on("MID_SMART_SETUP_BREAKOUT_SOFT_VOL", "1"))
+    breakout_soft_atr = bool(breakout_trust_fastpath and _env_on("MID_SMART_SETUP_BREAKOUT_SOFT_ATR", "1"))
     origin_bypass_trap = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_BYPASS_TRAP", "0"))
     origin_relax_regime = bool(origin_fast_ok and _env_on("MID_SMART_SETUP_ORIGIN_RELAX_REGIME", "1"))
     zone_first_soft_gate = bool(zone_valid and in_zone_now and _env_on("MID_ZONE_FIRST_SOFTEN_INSTANT_GATE", "1"))
@@ -11886,9 +11922,13 @@ def _mid_instant_emit_gate(*,
         "profit_pct": float(profit_v),
         "profit_need": float(profit_need),
         "origin_ignore_profit": bool(origin_ignore_profit),
+        "breakout_trust_fastpath": bool(breakout_trust_fastpath),
+        "breakout_ignore_profit": bool(breakout_ignore_profit),
         "origin_soft_macd": bool(origin_soft_macd),
         "origin_soft_vol": bool(origin_soft_vol),
         "origin_soft_atr": bool(origin_soft_atr),
+        "breakout_soft_vol": bool(breakout_soft_vol),
+        "breakout_soft_atr": bool(breakout_soft_atr),
         "origin_bypass_trap": bool(origin_bypass_trap),
         "origin_trap_bypass_allowed": bool(_origin_trap_bypass_ok),
         "origin_relax_regime": bool(origin_relax_regime),
@@ -12024,7 +12064,7 @@ def _mid_instant_emit_gate(*,
         elif not _softened_zone_trap:
             _add_fail(_trap_reason_now)
     if profit_v < float(profit_need):
-        if origin_ignore_profit or zone_first_soft_gate:
+        if origin_ignore_profit or breakout_ignore_profit or zone_first_soft_gate:
             ignored_checks.append(f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}")
         else:
             _add_fail(f"instant_profit_low:{profit_v:.3f}<{profit_need:.3f}")
@@ -12036,12 +12076,22 @@ def _mid_instant_emit_gate(*,
             _instant_atr_need = min(float(_instant_atr_need), float(os.getenv("MID_SMART_SETUP_ORIGIN_INSTANT_MIN_ATR", "0.0") or 0.0))
         except Exception:
             _instant_atr_need = 0.0
+    if breakout_fresh_ok and breakout_soft_atr:
+        try:
+            _instant_atr_need = min(float(_instant_atr_need), float(os.getenv("MID_SMART_SETUP_BREAKOUT_INSTANT_MIN_ATR", "0.0") or 0.0))
+        except Exception:
+            _instant_atr_need = 0.0
     if atr_v < float(_instant_atr_need):
         _add_fail(f"instant_atr_low:{atr_v:.3f}<{_instant_atr_need:.3f}")
     _instant_vol_need = float(min_vol)
     if origin_fast_ok and origin_soft_vol:
         try:
             _instant_vol_need = min(float(_instant_vol_need), float(os.getenv("MID_SMART_SETUP_ORIGIN_INSTANT_MIN_VOL_X", "0.0") or 0.0))
+        except Exception:
+            _instant_vol_need = 0.0
+    if breakout_fresh_ok and breakout_soft_vol:
+        try:
+            _instant_vol_need = min(float(_instant_vol_need), float(os.getenv("MID_SMART_SETUP_BREAKOUT_INSTANT_MIN_VOL_X", "0.0") or 0.0))
         except Exception:
             _instant_vol_need = 0.0
     if vol_v < float(_instant_vol_need):
@@ -12130,12 +12180,18 @@ def _mid_instant_emit_gate(*,
     else:
         if not bool(allow_no_zone_breakout or breakout_fresh_ok or origin_fast_ok):
             _add_fail("instant_zone_missing")
-        if (not origin_fast_ok) and conf_v < float(conf_need + no_zone_extra_conf):
+        if (not origin_fast_ok) and (not breakout_fresh_ok) and conf_v < float(conf_need + no_zone_extra_conf):
             _add_fail(f"instant_no_zone_conf:{int(round(conf_v))}<{conf_need + no_zone_extra_conf}")
         if atr_v < float(min_atr * 1.05):
-            _add_fail(f"instant_no_zone_atr:{atr_v:.3f}<{(min_atr * 1.05):.3f}")
+            if breakout_soft_atr:
+                ignored_checks.append(f"instant_no_zone_atr:{atr_v:.3f}<{(min_atr * 1.05):.3f}")
+            else:
+                _add_fail(f"instant_no_zone_atr:{atr_v:.3f}<{(min_atr * 1.05):.3f}")
         if vol_v < float(min_vol * 1.10):
-            _add_fail(f"instant_no_zone_vol:{vol_v:.2f}<{(min_vol * 1.10):.2f}")
+            if breakout_soft_vol:
+                ignored_checks.append(f"instant_no_zone_vol:{vol_v:.2f}<{(min_vol * 1.10):.2f}")
+            else:
+                _add_fail(f"instant_no_zone_vol:{vol_v:.2f}<{(min_vol * 1.10):.2f}")
 
     meta["applied_risk_flags"] = list(applied_risk_flags)
     meta["ignored_risk_flags"] = list(ignored_risk_flags)
@@ -32568,8 +32624,8 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 breakout_fresh_ok=bool(_breakout_fast_ok),
                                                 breakout_fresh_reason=str(_breakout_fast_reason or ""),
                                                 breakout_bypass_zone=bool(_breakout_fast_ok),
-                                                breakout_bypass_near_extreme=False,
-                                                breakout_bypass_late_entry=bool(_late_relief_ok_now),
+                                                breakout_bypass_near_extreme=bool(_breakout_fast_ok),
+                                                breakout_bypass_late_entry=bool(_breakout_fast_ok or _late_relief_ok_now),
                                                 origin_fast_ok=bool(_origin_fast_ok),
                                                 origin_fast_reason=str(_origin_fast_reason or ""),
                                                 origin_bypass_zone=bool(_origin_fast_ok),
