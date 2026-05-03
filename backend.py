@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-03_smc_post_pump_guard_v32"
+MID_BUILD_TAG = "MID_BUILD_2026-05-03_valid_pullback_reclaim_guard_v34"
 
 import asyncio
 import json
@@ -2608,6 +2608,181 @@ def _mid_futures_short_weak_emit_reason(*,
         return ""
 
 
+
+
+def _mid_tp1_path_block_guard_reason(*,
+                                      sig=None,
+                                      ta: dict | None = None,
+                                      it: dict | None = None,
+                                      route: str | None = None,
+                                      gate_meta: dict | None = None) -> str:
+    """Block tiny TP1 paths that must first break an opposing local level.
+
+    This is the SUI/POL-style loss pattern:
+      LONG entry sits below nearest local resistance and TP1 is behind that level;
+      SHORT entry sits above nearest local support and TP1 is behind that level.
+
+    It is intentionally narrow: it only acts when TP1 distance is small and an
+    explicit opposing level/zone is inside the path. Pullback/reclaim winners
+    such as ACE/RED/APT are not blocked unless the target itself is tiny and the
+    nearest opposing level is still unaccepted.
+    """
+    try:
+        enabled = str(os.getenv("MID_FINAL_TP1_PATH_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        enabled = True
+    if not enabled:
+        return ""
+    try:
+        if sig is None:
+            return ""
+        side = str(getattr(sig, "direction", "") or (ta or {}).get("direction") or (it or {}).get("direction") or "").upper().strip()
+        if side not in ("LONG", "SHORT"):
+            return ""
+        entry = float(getattr(sig, "entry", 0.0) or 0.0)
+        tp1 = float(getattr(sig, "tp1", 0.0) or 0.0)
+        if entry <= 0 or tp1 <= 0:
+            return ""
+        if side == "LONG" and tp1 <= entry:
+            return ""
+        if side == "SHORT" and tp1 >= entry:
+            return ""
+    except Exception:
+        return ""
+
+    try:
+        target_pct = abs(float(tp1) - float(entry)) / max(abs(float(entry)), 1e-12) * 100.0
+    except Exception:
+        target_pct = 0.0
+    try:
+        max_target_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_MAX_TARGET_PCT", "0.38") or 0.38)
+    except Exception:
+        max_target_pct = 0.38
+    # Only this narrow/tight-target case is guarded by default. Larger TP1 paths
+    # are handled by the normal late/near-extreme/origin guards.
+    if max_target_pct > 0 and float(target_pct) > float(max_target_pct):
+        return ""
+
+    ta = ta or {}
+    it = it or {}
+    try:
+        atr_abs = 0.0
+        for _cand in (ta.get("atr30"), ta.get("atr_abs"), it.get("atr_at_create"), it.get("atr30"), it.get("atr_abs")):
+            try:
+                _v = float(_cand or 0.0)
+                if _v > 0:
+                    atr_abs = _v
+                    break
+            except Exception:
+                pass
+    except Exception:
+        atr_abs = 0.0
+    try:
+        pad_atr = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_PAD_ATR", "0.05") or 0.05)
+    except Exception:
+        pad_atr = 0.05
+    try:
+        pad_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_PAD_PCT", "0.015") or 0.015) / 100.0
+    except Exception:
+        pad_pct = 0.00015
+    try:
+        accept_atr = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_ACCEPT_BUF_ATR", "0.05") or 0.05)
+    except Exception:
+        accept_atr = 0.05
+    try:
+        accept_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_ACCEPT_BUF_PCT", "0.020") or 0.020) / 100.0
+    except Exception:
+        accept_pct = 0.00020
+
+    path_pad = max(float(atr_abs or 0.0) * float(pad_atr), abs(float(entry)) * float(pad_pct))
+    accept_buf = max(float(atr_abs or 0.0) * float(accept_atr), abs(float(entry)) * float(accept_pct))
+    try:
+        px_now = float(ta.get("close") or ta.get("price") or ta.get("last") or entry)
+    except Exception:
+        px_now = float(entry)
+
+    levels: list[tuple[float, str]] = []
+
+    def _push_level(v, name: str) -> None:
+        try:
+            lv = float(v)
+        except Exception:
+            return
+        if not (math.isfinite(lv) and lv > 0):
+            return
+        levels.append((float(lv), str(name or "level")))
+
+    # Scalar nearest levels.
+    if side == "LONG":
+        scalar_keys = (
+            "resistance", "nearest_resistance", "local_resistance", "eq_hi", "recent_high",
+            "swing_high", "last_swing_high", "range_high", "seller_level", "supply_level",
+        )
+    else:
+        scalar_keys = (
+            "support", "nearest_support", "local_support", "eq_lo", "recent_low",
+            "swing_low", "last_swing_low", "range_low", "buyer_level", "demand_level",
+        )
+    for _src in (ta, it, (gate_meta or {})):
+        if not isinstance(_src, dict):
+            continue
+        for _k in scalar_keys:
+            _push_level(_src.get(_k), _k)
+
+    # Opposing zones: use the near edge of the zone as the first obstacle.
+    try:
+        for lo, hi, name in _mid_collect_structural_zone_pairs(ta, it):
+            ns = str(name or "").lower()
+            if side == "LONG":
+                if any(tok in ns for tok in ("supply", "resistance", "seller", "bearish")):
+                    _push_level(float(lo), name)
+            else:
+                if any(tok in ns for tok in ("demand", "support", "buyer", "bullish")):
+                    _push_level(float(hi), name)
+    except Exception:
+        pass
+
+    if not levels:
+        return ""
+
+    best_level = None
+    best_name = ""
+    try:
+        if side == "LONG":
+            # Level must be above entry and not already accepted/closed through.
+            candidates = []
+            for lv, nm in levels:
+                if lv > entry and lv <= (tp1 + path_pad) and px_now <= (lv + accept_buf):
+                    candidates.append((lv, nm))
+            if candidates:
+                best_level, best_name = min(candidates, key=lambda x: abs(float(x[0]) - float(entry)))
+        else:
+            candidates = []
+            for lv, nm in levels:
+                if lv < entry and lv >= (tp1 - path_pad) and px_now >= (lv - accept_buf):
+                    candidates.append((lv, nm))
+            if candidates:
+                best_level, best_name = min(candidates, key=lambda x: abs(float(entry) - float(x[0])))
+    except Exception:
+        best_level, best_name = None, ""
+
+    if best_level is None:
+        return ""
+
+    try:
+        level_pct = abs(float(best_level) - float(entry)) / max(abs(float(entry)), 1e-12) * 100.0
+        frac = abs(float(best_level) - float(entry)) / max(abs(float(tp1) - float(entry)), 1e-12)
+    except Exception:
+        level_pct, frac = 0.0, 0.0
+
+    obstacle = "resistance" if side == "LONG" else "support"
+    return (
+        f"tp1_path_blocked_by_{obstacle}:"
+        f"level={float(best_level):.10g}|src={best_name}|"
+        f"level_pct={float(level_pct):.3f}|tp1_pct={float(target_pct):.3f}|path_frac={float(frac):.2f}"
+    )
+
+
 def _mid_final_emit_apply_reason(reason: str) -> str:
     try:
         r = str(reason or "").strip().lower()
@@ -2625,6 +2800,8 @@ def _mid_final_emit_apply_reason(reason: str) -> str:
         return "anti_bounce"
     if r.startswith("fut_short_weak_emit"):
         return "vol_low"
+    if r.startswith("tp1_path_blocked_by_"):
+        return "tp1_path_blocked"
     if r.startswith("instant_regime_block"):
         return "regime_block"
     return "blocked"
@@ -2772,6 +2949,18 @@ def _mid_final_emit_gate_reason(*,
     _levels_reason = _mid_level_quality_veto_reason(sig=sig, ta=ta, it=it)
     if _levels_reason:
         return str(_levels_reason)
+
+    # V36: do not allow direct SMC/zone-retest routes to bypass the SUI/POL loss
+    # pattern: TP1 is tiny and sits behind the nearest unaccepted resistance/support.
+    _tp1_path_reason = _mid_tp1_path_block_guard_reason(
+        sig=sig,
+        ta=ta,
+        it=it,
+        route=route,
+        gate_meta=gate_meta,
+    )
+    if _tp1_path_reason:
+        return str(_tp1_path_reason)
 
     if smc_direct_route:
         return ""
@@ -11651,6 +11840,124 @@ def _mid_smart_setup_breakout_fastpath(*,
 
 
 
+
+
+def _mid_float_from_text(pattern: str, text: str, default=None):
+    try:
+        import re as _re
+        m = _re.search(pattern, str(text or ""))
+        if not m:
+            return default
+        return float(str(m.group(1)).replace(",", "."))
+    except Exception:
+        return default
+
+
+def _mid_direct_origin_reclaim_relief_ok(*,
+                                         direction: str,
+                                         confidence: float | None,
+                                         vol_x: float | None,
+                                         route_retest_context_ok: bool,
+                                         in_zone_now: bool,
+                                         breakout_fresh_ok: bool,
+                                         bo_rt_label: str | None,
+                                         origin_body_atr: float | None,
+                                         current_body_atr: float | None,
+                                         late_entry_reason: str | None,
+                                         near_extreme_reason: str | None,
+                                         anti_bounce_reason: str | None) -> tuple[bool, str, dict]:
+    """Relief for valid ACE/RED/APT-like pullback/reclaim winners.
+
+    Direct SMC origin must not blindly emit post-pump entries into fresh highs,
+    but it also must not kill real pullback/reclaim entries.  Relief is granted
+    when the trigger has a concrete retest/reclaim/displacement clue and the
+    late-entry blocker is not extremely stretched.
+    """
+    meta: dict[str, object] = {}
+    try:
+        enabled = _env_bool("MID_DIRECT_SMC_ORIGIN_RECLAIM_RELIEF", True)
+    except Exception:
+        enabled = True
+    meta["enabled"] = bool(enabled)
+    if not enabled:
+        return (False, "disabled", meta)
+
+    try:
+        conf_v = float(confidence or 0.0)
+    except Exception:
+        conf_v = 0.0
+    try:
+        vol_v = float(vol_x or 0.0)
+    except Exception:
+        vol_v = 0.0
+    try:
+        body_v = max(float(origin_body_atr or 0.0), float(current_body_atr or 0.0))
+    except Exception:
+        body_v = 0.0
+
+    try:
+        min_conf = float(os.getenv("MID_DIRECT_SMC_ORIGIN_RELIEF_MIN_CONF", "72") or 72)
+    except Exception:
+        min_conf = 72.0
+    try:
+        min_body = float(os.getenv("MID_DIRECT_SMC_ORIGIN_RELIEF_MIN_BODY_ATR", "0.04") or 0.04)
+    except Exception:
+        min_body = 0.04
+    try:
+        min_vol = float(os.getenv("MID_DIRECT_SMC_ORIGIN_RELIEF_MIN_VOL_X", "0.00") or 0.0)
+    except Exception:
+        min_vol = 0.0
+    try:
+        late_hard = float(os.getenv("MID_DIRECT_SMC_ORIGIN_RELIEF_MAX_LATE_ATR", "2.20") or 2.20)
+    except Exception:
+        late_hard = 2.20
+    try:
+        near_hard = float(os.getenv("MID_DIRECT_SMC_ORIGIN_RELIEF_MIN_NEAR_DIST_ATR", "0.05") or 0.05)
+    except Exception:
+        near_hard = 0.05
+
+    late_v = _mid_float_from_text(r"late_entry_atr=([0-9.]+)", late_entry_reason, None)
+    near_v = _mid_float_from_text(r"dist_atr=([0-9.]+)", near_extreme_reason, None)
+    meta.update({
+        "conf": conf_v,
+        "vol_x": vol_v,
+        "body_atr": body_v,
+        "late_entry_atr": late_v,
+        "near_dist_atr": near_v,
+        "min_conf": min_conf,
+        "min_body_atr": min_body,
+        "min_vol_x": min_vol,
+        "max_late_atr": late_hard,
+        "min_near_dist_atr": near_hard,
+    })
+
+    if conf_v < min_conf:
+        return (False, f"conf:{conf_v:.0f}<{min_conf:.0f}", meta)
+    if vol_v < min_vol:
+        return (False, f"vol:{vol_v:.2f}<{min_vol:.2f}", meta)
+    if late_v is not None and late_v > late_hard:
+        return (False, f"late_hard:{late_v:.2f}>{late_hard:.2f}", meta)
+    if near_v is not None and near_v < near_hard:
+        return (False, f"near_too_tight:{near_v:.2f}<{near_hard:.2f}", meta)
+
+    bo_s = str(bo_rt_label or "").upper().strip()
+    diru = str(direction or "").upper().strip()
+    bo_reclaim = bool(bo_s and bo_s not in ("-", "—", "NONE") and ("BO" in bo_s or "RT" in bo_s or "RECLAIM" in bo_s))
+    if diru == "LONG" and ("↓" in bo_s or "DOWN" in bo_s or "SHORT" in bo_s):
+        bo_reclaim = False
+    if diru == "SHORT" and ("↑" in bo_s or "UP" in bo_s or "LONG" in bo_s):
+        bo_reclaim = False
+
+    if bool(route_retest_context_ok) or bool(in_zone_now):
+        return (True, "retest_context", meta)
+    if bool(breakout_fresh_ok) or bo_reclaim:
+        return (True, "fresh_bo_or_reclaim", meta)
+    if body_v >= min_body:
+        return (True, f"body_atr:{body_v:.2f}", meta)
+
+    return (False, "no_retest_reclaim_body", meta)
+
+
 def _mid_smc_route_emit_gate(*,
                               route: str | None = None,
                               market: str,
@@ -11779,6 +12086,68 @@ def _mid_smc_route_emit_gate(*,
         _smc_sig = {}
     route_zone_context_ok = bool(zone_valid or _smc_sig.get('ob_ok') or _smc_sig.get('fvg_ok') or _smc_sig.get('fvg_active'))
     route_retest_context_ok = bool(in_zone_now or _smc_sig.get('ob_retest') or _smc_sig.get('fvg_active') or _smc_sig.get('fvg_ok'))
+
+    # V34: direct SMC origin routes used to bypass the instant entry safety
+    # completely.  That let post-pump LONGs near fresh highs pass as
+    # "Origin | origin fast-path".  Respect stacked late/near/anti-bounce
+    # blockers, but allow valid pullback/reclaim winners like ACE/RED/APT via
+    # a concrete retest/reclaim/body relief.
+    if route_need_origin:
+        try:
+            _origin_entry_safety = _env_bool("MID_DIRECT_SMC_ORIGIN_ENTRY_SAFETY", True)
+        except Exception:
+            _origin_entry_safety = True
+        if _origin_entry_safety:
+            _late_bad = (not bool(late_entry_ok)) and (not bool(origin_bypass_late_entry))
+            _near_bad = (not bool(near_extreme_ok)) and (not bool(origin_bypass_near_extreme))
+            _anti_bad = (not bool(anti_bounce_ok)) and (not bool(origin_bypass_anti_bounce))
+            _stacked_bad = bool((_late_bad and _near_bad) or (_late_bad and _anti_bad) or (_near_bad and _anti_bad))
+            try:
+                _strict_origin_safety = _env_bool("MID_DIRECT_SMC_ORIGIN_ENTRY_SAFETY_STRICT", False)
+            except Exception:
+                _strict_origin_safety = False
+            if _stacked_bad or (_strict_origin_safety and (_late_bad or _near_bad or _anti_bad)):
+                _relief_ok, _relief_reason, _relief_meta = _mid_direct_origin_reclaim_relief_ok(
+                    direction=direction,
+                    confidence=confidence,
+                    vol_x=vol_x,
+                    route_retest_context_ok=bool(route_retest_context_ok),
+                    in_zone_now=bool(in_zone_now),
+                    breakout_fresh_ok=bool(breakout_fresh_ok),
+                    bo_rt_label=bo_rt_label,
+                    origin_body_atr=origin_body_atr,
+                    current_body_atr=current_body_atr,
+                    late_entry_reason=late_entry_reason,
+                    near_extreme_reason=near_extreme_reason,
+                    anti_bounce_reason=anti_bounce_reason,
+                )
+                meta["origin_entry_safety"] = {
+                    "late_bad": bool(_late_bad),
+                    "near_bad": bool(_near_bad),
+                    "anti_bad": bool(_anti_bad),
+                    "stacked_bad": bool(_stacked_bad),
+                    "relief_ok": bool(_relief_ok),
+                    "relief_reason": str(_relief_reason or ""),
+                    "relief_meta": dict(_relief_meta or {}),
+                    "late_entry_reason": str(late_entry_reason or ""),
+                    "near_extreme_reason": str(near_extreme_reason or ""),
+                    "anti_bounce_reason": str(anti_bounce_reason or ""),
+                }
+                if _relief_ok:
+                    meta.setdefault("ignored_checks", [])
+                    try:
+                        meta["ignored_checks"].append("origin_entry_relief:" + str(_relief_reason or "ok"))
+                    except Exception:
+                        pass
+                else:
+                    _parts = []
+                    if _late_bad:
+                        _parts.append("late")
+                    if _near_bad:
+                        _parts.append("near")
+                    if _anti_bad:
+                        _parts.append("anti")
+                    blocks.append("origin_entry_block:" + "+".join(_parts) + ":" + str(_relief_reason or "no_relief"))
 
     if route_need_origin and not bool(origin_fast_ok):
         blocks.append('origin_not_ready')
@@ -24584,7 +24953,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
         # SOFT reasons: allow waiting (do not count as fail), but still record reason/ts
         try:
-            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,atrpct_low,liq_sweep_missing").strip()
+            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,atrpct_low,liq_sweep_missing,tp1_path_blocked").strip()
             soft_set = {s.strip().lower() for s in _soft.split(",") if s.strip()}
             if r0 in soft_set:
                 it["last_fail_reason"] = str(reason or "fail")
