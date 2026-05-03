@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-03_fix41_good_winner_relief_no_env"
+MID_BUILD_TAG = "MID_BUILD_2026-05-03_fix44_strict_unaccepted_resistance_no_env"
 
 import asyncio
 import json
@@ -2657,10 +2657,10 @@ def _mid_tp1_path_block_guard_reason(*,
         # not only the older 0.35-0.50% SUI/POL band. Keep this guard
         # enabled by default, but the wider band below is handled more
         # selectively so PENDLE/RENDER/ALGO/MET pullback winners are not cut.
-        max_target_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_MAX_TARGET_PCT", "0.75") or 0.75)
+        max_target_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_MAX_TARGET_PCT", "0.95") or 0.95)
     except Exception:
-        max_target_pct = 0.75
-    # V43 balanced default: catch tight/medium TP1-under-resistance patterns.
+        max_target_pct = 0.95
+    # V44 balanced default: catch tight/medium TP1-under-resistance patterns.
     # 0.50-0.75% is not blocked blindly: it must still have an unaccepted
     # opposing level inside the path and fail the reclaim/continuation relief
     # checks later in this function.
@@ -2836,62 +2836,74 @@ def _mid_tp1_path_block_guard_reason(*,
         setup_txt = str((it or {}).get("smart_setup") or (it or {}).get("setup") or (ta or {}).get("smart_setup") or "").lower()
     except Exception:
         setup_txt = ""
-    try:
-        retest_or_reclaim = any(tok in (bo_txt + " " + route_txt + " " + setup_txt) for tok in ("retest", "reclaim", "pullback"))
-    except Exception:
-        retest_or_reclaim = False
+    ctx_txt = (bo_txt + " " + route_txt + " " + setup_txt).lower()
+
+    # V44: the old relief was too soft because a generic "retest" label could
+    # rescue the exact LOSS pattern.  SUI/POL/ACT/ZAMA/ZEN/CAKE/ZEC/FET/ALGO-loss
+    # can all be formally tagged as BOS/FVG/OB retest, but the entry is still
+    # below unaccepted resistance.  Therefore generic retest/pullback is NOT relief.
+    # Relief requires real reclaim/breakout/acceptance context OR a strong candle/volume
+    # with the obstacle close to TP1 rather than immediately on entry.
+    hard_reclaim_ctx = any(tok in ctx_txt for tok in ("reclaim", "accept", "accepted", "breakout"))
+    generic_retest_ctx = any(tok in ctx_txt for tok in ("retest", "pullback"))
 
     try:
-        # Obstacle very close to entry is the dangerous pattern. If the first
-        # opposing level is closer to TP1 than to entry and there is real
-        # reclaim/confirm evidence, let good ALGO/RENDER/PENDLE-style winners pass.
-        tight_relief_frac = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_TIGHT_RELIEF_FRAC", "0.62") or 0.62)
+        tight_relief_frac = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_TIGHT_RELIEF_FRAC", "0.70") or 0.70)
     except Exception:
-        tight_relief_frac = 0.62
+        tight_relief_frac = 0.70
     try:
-        soft_body_min = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_RELIEF_SOFT_BODY_ATR", "0.04") or 0.04)
+        close_obstacle_frac = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_CLOSE_OBSTACLE_FRAC", "0.58") or 0.58)
     except Exception:
-        soft_body_min = 0.04
+        close_obstacle_frac = 0.58
     try:
-        soft_vol_min = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_RELIEF_SOFT_VOL_X", "0.55") or 0.55)
+        soft_body_min = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_RELIEF_SOFT_BODY_ATR", "0.07") or 0.07)
     except Exception:
-        soft_vol_min = 0.55
+        soft_body_min = 0.07
+    try:
+        soft_vol_min = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_RELIEF_SOFT_VOL_X", "0.85") or 0.85)
+    except Exception:
+        soft_vol_min = 0.85
+    try:
+        strong_body_min = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_RELIEF_STRONG_BODY_ATR", "0.11") or 0.11)
+    except Exception:
+        strong_body_min = 0.11
+    try:
+        strong_vol_min = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_RELIEF_STRONG_VOL_X", "1.15") or 1.15)
+    except Exception:
+        strong_vol_min = 1.15
 
-    strong_enough = bool(fresh_ok) or float(body_atr_v) >= float(relief_body_min) or float(vol_v) >= float(relief_vol_min)
-    reclaim_relief = bool(retest_or_reclaim) and (
-        bool(fresh_ok)
-        or float(body_atr_v) >= float(soft_body_min)
-        or float(vol_v) >= float(soft_vol_min)
-    )
+    soft_confirm = bool(fresh_ok) or float(body_atr_v) >= float(soft_body_min) or float(vol_v) >= float(soft_vol_min)
+    strong_confirm = bool(fresh_ok) or float(body_atr_v) >= float(strong_body_min) or float(vol_v) >= float(strong_vol_min)
+    reclaim_relief = bool(hard_reclaim_ctx) and bool(soft_confirm)
 
     try:
         medium_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_MEDIUM_PCT", "0.50") or 0.50)
     except Exception:
         medium_pct = 0.50
-    try:
-        wide_block_frac = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_WIDE_BLOCK_FRAC", "0.58") or 0.58)
-    except Exception:
-        wide_block_frac = 0.58
 
-    if float(target_pct) > float(medium_pct):
-        # V43: CAKE-style medium TP1 loss. TP1 is not tiny (~0.69%),
-        # but the nearest seller level is still in the first part of the path
-        # and price has not accepted/reclaimed it. Block that.
-        #
-        # Good winners such as PENDLE/RENDER usually have the first obstacle
-        # closer to TP1, or a clear pullback/reclaim/continuation relief.
+    # If the first opposing level is in the first half of the path, it is exactly
+    # the "entry under resistance / TP1 behind seller area" loss pattern.
+    # Do not let generic BOS/FVG retest text bypass this.
+    if float(frac) <= float(close_obstacle_frac) and not reclaim_relief:
+        pass
+    elif float(target_pct) > float(medium_pct):
+        # Wider path up to the default 0.95%: allow only a true reclaim/breakout,
+        # or a strong confirmation where the obstacle is closer to TP1.
         if reclaim_relief and float(frac) >= float(tight_relief_frac):
             return ""
-        if strong_enough and float(frac) > float(wide_block_frac):
+        if strong_confirm and float(frac) >= max(float(tight_relief_frac), 0.76):
             return ""
     elif float(target_pct) > float(strict_pct):
-        if strong_enough or reclaim_relief:
+        if reclaim_relief:
+            return ""
+        if strong_confirm and float(frac) >= float(tight_relief_frac):
             return ""
     else:
-        # Very small TP1 winners such as ALGO can still be valid after pullback/retest.
-        # Do not block them when the obstacle is not sitting immediately on entry
-        # and there is real reclaim/confirm evidence.
+        # Tiny TP1 can still be valid, but only if this is a true reclaim or
+        # the first obstacle is near TP1 and confirmation is strong.
         if reclaim_relief and float(frac) >= float(tight_relief_frac):
+            return ""
+        if strong_confirm and float(frac) >= 0.82:
             return ""
 
     obstacle = "resistance" if side == "LONG" else "support"
@@ -2948,9 +2960,9 @@ def _mid_post_pump_no_acceptance_guard_reason(*,
         # By default keep this strict for FUTURES where leverage makes these
         # late-pump entries costly.  SPOT is still protected by TP1-path and
         # origin/near-resistance guards.
-        futures_only = str(os.getenv("MID_FINAL_POST_PUMP_GUARD_FUTURES_ONLY", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        futures_only = str(os.getenv("MID_FINAL_POST_PUMP_GUARD_FUTURES_ONLY", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
     except Exception:
-        futures_only = True
+        futures_only = False
     if futures_only and market and market != "FUTURES":
         return ""
 
@@ -2988,6 +3000,15 @@ def _mid_post_pump_no_acceptance_guard_reason(*,
     except Exception:
         min_target_pct = 0.70
     if float(target_pct) < float(min_target_pct):
+        return ""
+    try:
+        max_target_pct = float(os.getenv("MID_FINAL_POST_PUMP_MAX_TP1_PCT", "1.10") or 1.10)
+    except Exception:
+        max_target_pct = 1.10
+    # Keep strong continuation winners alive: BANANAS/ZEC-futures type has
+    # TP1 much farther than this, so this late-pump guard only catches the
+    # medium path/no-acceptance losses like CHIP/CAKE.
+    if float(max_target_pct) > 0 and float(target_pct) > float(max_target_pct):
         return ""
 
     risk_pct = 0.0
