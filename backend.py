@@ -2722,7 +2722,14 @@ def _mid_final_emit_gate_reason(*,
             hard_anchor_max += float(os.getenv("MID_FINAL_EMIT_IN_ZONE_SLIP_PAD", "0.10") or 0.10)
     except Exception:
         pass
-    if anchor_far and float(anchor_slip_atr or 0.0) > float(hard_anchor_max):
+    try:
+        _direct_anchor_bypass = (
+            _mid_is_direct_smc_route(route=route, sig=sig, ta=ta, rec=it, meta=gate_meta)
+            and str(os.getenv("MID_DIRECT_SMC_BYPASS_FINAL_ANCHOR", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+        )
+    except Exception:
+        _direct_anchor_bypass = False
+    if anchor_far and float(anchor_slip_atr or 0.0) > float(hard_anchor_max) and not _direct_anchor_bypass:
         return f"late_from_anchor:{float(anchor_slip_atr):.2f}>{float(hard_anchor_max):.2f}"
 
     smc_direct_route = _mid_is_direct_smc_route(route=route, sig=sig, ta=ta, rec=it, meta=gate_meta)
@@ -11770,6 +11777,40 @@ def _mid_smc_route_emit_gate(*,
             blocks.append('liquidity_zone_missing')
 
     if blocks:
+        # V30: direct SMC/origin routes were still logged as pass/emit but then
+        # blocked by readiness labels like smc_hard_block:smc_bos_retest_confirm
+        # or smc_hard_block:origin_fastpath.  Those labels often mean
+        # "the secondary retest/zone marker is not perfect", not a real danger.
+        # Allow bypassing ONLY those readiness/context blocks.  Real hard blocks
+        # (direction_conflict, invalid_zone, trap, rr_too_low) remain fatal.
+        try:
+            _bypass_ready_blocks = str(os.getenv("MID_DIRECT_SMC_BYPASS_READY_BLOCKS", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            _bypass_ready_blocks = False
+        if _bypass_ready_blocks:
+            _ready_prefixes = (
+                "origin_not_ready",
+                "breakout_retest_not_ready",
+                "breakout_not_ready",
+                "zone_retest_not_ready",
+                "liquidity_zone_missing",
+                "origin_range_block",
+                "origin_wait_confirm",
+                "direct_conf_low",
+            )
+            _kept_blocks = []
+            _bypassed_blocks = []
+            for _b in list(blocks):
+                _bs = str(_b or "")
+                if any(_bs.startswith(_p) for _p in _ready_prefixes):
+                    _bypassed_blocks.append(_bs)
+                else:
+                    _kept_blocks.append(_bs)
+            if _bypassed_blocks:
+                meta['readiness_bypassed'] = list(_bypassed_blocks)
+            blocks = _kept_blocks
+
+    if blocks:
         meta['blocked_by'] = list(blocks)
         meta['soft_bypassed'] = ['score', 'confidence', 'vol_x', 'atr_pct', 'late_entry', 'near_extreme', 'anti_bounce', 'macd_hist', 'regime', 'generic_trap']
         return (False, f"smc_hard_block:{route_s}", meta)
@@ -13480,7 +13521,13 @@ def _mid_liquidity_reclaim_ready(ta: dict, rec: dict | None = None, *, now_ts: f
         meta["disp_ok"] = bool(disp_ok)
         meta["disp_x"] = float(disp_x)
         if not (bos_ok or disp_ok):
-            return (False, "bos_or_displacement_missing", meta)
+            try:
+                allow_no_bos_disp = str(os.getenv("MID_LIQ_RECLAIM_ALLOW_NO_BOS_DISP", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                allow_no_bos_disp = False
+            meta["allow_no_bos_disp"] = bool(allow_no_bos_disp)
+            if not allow_no_bos_disp:
+                return (False, "bos_or_displacement_missing", meta)
 
         dir_contra = str(_mid_directional_contradiction_reason(t, r) or "").strip()
         if dir_contra:
@@ -16408,14 +16455,20 @@ def _mid_pending_recency_guard(rec: dict, *, now_ts: float | None = None) -> tup
     })
 
     try:
-        max_fb_w = float(os.getenv("MID_PENDING_GUARD_MAX_FALLBACK_ZONE_WIDTH_ATR", "1.20") or 1.20)
+        # V30 alias: many deployments already use MID_ZONE_TOO_WIDE_GUARD_MAX_ATR.
+        # Let it control fallback/far pending guard too when the specific pending
+        # variable is not set.
+        max_fb_w = float(os.getenv("MID_PENDING_GUARD_MAX_FALLBACK_ZONE_WIDTH_ATR", os.getenv("MID_ZONE_TOO_WIDE_GUARD_MAX_ATR", "1.20")) or 1.20)
     except Exception:
         max_fb_w = 1.20
     if zsrc in ("fallback", "far") and width_guard is not None and width_guard > max_fb_w:
         return (False, f"zone_stale:{zsrc}:width_atr={float(width_guard):.2f}>{float(max_fb_w):g}", meta)
 
     try:
-        max_any_w = float(os.getenv("MID_PENDING_GUARD_MAX_ZONE_WIDTH_ATR_ANY", "4.00") or 4.0)
+        # V30 alias: this is the guard that produced logs like
+        # zone_too_wide_guard:7.27>4.  Respect MID_ZONE_TOO_WIDE_GUARD_MAX_ATR
+        # if the pending-specific variable is not present.
+        max_any_w = float(os.getenv("MID_PENDING_GUARD_MAX_ZONE_WIDTH_ATR_ANY", os.getenv("MID_ZONE_TOO_WIDE_GUARD_MAX_ATR", "4.00")) or 4.0)
     except Exception:
         max_any_w = 4.0
     if width_guard is not None and max_any_w > 0 and width_guard > max_any_w:
@@ -16452,7 +16505,10 @@ def _mid_pending_recency_guard(rec: dict, *, now_ts: float | None = None) -> tup
         except Exception:
             max_total_bars = 18
         try:
-            max_move_atr = float(os.getenv("MID_PENDING_BREAKOUT_MAX_MOVE_ATR", os.getenv("MID_LATE_ENTRY_ATR_MAX", "1.35")) or 1.35)
+            # V30 alias: breakout_late_move_atr was still using the tight
+            # pending value (1.05). If the operator sets the smart-setup
+            # breakout move limit, let pending BO/RT guard follow it.
+            max_move_atr = float(os.getenv("MID_PENDING_BREAKOUT_MAX_MOVE_ATR", os.getenv("MID_SMART_SETUP_BREAKOUT_MAX_MOVE_ATR", os.getenv("MID_LATE_ENTRY_ATR_MAX", "1.35"))) or 1.35)
         except Exception:
             max_move_atr = 1.35
         try:
