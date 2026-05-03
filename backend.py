@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-03_fix44_strict_unaccepted_resistance_no_env"
+MID_BUILD_TAG = "MID_BUILD_2026-05-03_fix45_sl_entry_timing_no_env"
 
 import asyncio
 import json
@@ -3128,6 +3128,24 @@ def _mid_post_pump_no_acceptance_guard_reason(*,
 
     side_word = "long" if side == "LONG" else "short"
     obstacle = "resistance" if side == "LONG" else "support"
+
+    # V45: if the idea has a medium/wide TP1 path, classify it as entry-timing
+    # wait instead of a pure bad-location block.  The pending setup can re-emit
+    # after a real reclaim/acceptance, and the level builder will use a wider
+    # structural SL floor.  This protects CHIP-type cases where direction was OK
+    # but the first SL was inside normal pullback noise.
+    try:
+        wait_tp = float(os.getenv("MID_SL_TIMING_WAIT_TP1_PCT", "0.75") or 0.75)
+    except Exception:
+        wait_tp = 0.75
+    if float(target_pct) >= float(wait_tp):
+        return (
+            f"wait_reclaim_or_structural_sl:"
+            f"side={side_word}|impulse_atr={float(impulse_atr):.2f}|opp={obstacle}|"
+            f"opp_dist_atr={float(opp_dist_atr):.2f}|level={float(opp_level):.10g}|src={opp_name}|"
+            f"tp1_pct={float(target_pct):.3f}|risk_pct={float(risk_pct):.3f}|bo={bo or '-'}"
+        )
+
     return (
         f"post_pump_{side_word}_no_acceptance:"
         f"impulse_atr={float(impulse_atr):.2f}|opp={obstacle}|"
@@ -3157,6 +3175,8 @@ def _mid_final_emit_apply_reason(reason: str) -> str:
         return "tp1_path_blocked"
     if r.startswith("post_pump_"):
         return "post_pump_no_acceptance"
+    if r.startswith("wait_reclaim_or_structural_sl"):
+        return "wait_reclaim_or_structural_sl"
     if r.startswith("instant_regime_block"):
         return "regime_block"
     return "blocked"
@@ -18941,6 +18961,83 @@ def _mid_pick_entry_anchor(direction: str,
     return float(px)
 
 
+
+def _mid_pullback_noise_profile(entry: float,
+                                atr: float,
+                                ta: dict | None = None,
+                                it: dict | None = None) -> dict:
+    """Detect CHIP-style setup: direction can be right, but raw SL is inside normal pullback noise.
+
+    This is NOT a reason to label the idea bad.  It is used to either widen the
+    structural stop or wait for a cleaner reclaim/re-entry.  Kept narrow so
+    SUI/POL/ACT/ZAMA/ZEN/CAKE-style no-path entries are still handled by the
+    TP1 path guard.
+    """
+    out = {"active": False, "direction": "", "target_pct": 0.0, "impulse_atr": 0.0}
+    try:
+        entry_f = float(entry or 0.0)
+        atr_f = abs(float(atr or 0.0))
+        if entry_f <= 0 or atr_f <= 0:
+            return out
+        ta = ta or {}
+        it = it or {}
+        side = str(ta.get("direction") or it.get("direction") or "").upper().strip()
+        if side not in ("LONG", "SHORT"):
+            return out
+        tp1 = None
+        for src in (ta, it):
+            for k in ("tp1", "target", "take_profit"):
+                try:
+                    v = src.get(k)
+                    if v is None or v == "":
+                        continue
+                    fv = float(v)
+                    if fv > 0:
+                        tp1 = fv
+                        break
+                except Exception:
+                    pass
+            if tp1:
+                break
+        if not tp1:
+            return out
+        if side == "LONG" and tp1 <= entry_f:
+            return out
+        if side == "SHORT" and tp1 >= entry_f:
+            return out
+        target_pct = abs(float(tp1) - entry_f) / max(abs(entry_f), 1e-12) * 100.0
+
+        def _first(*vals):
+            for v in vals:
+                try:
+                    if v is None or v == "":
+                        continue
+                    fv = float(v)
+                    if math.isfinite(fv) and fv > 0:
+                        return fv
+                except Exception:
+                    pass
+            return None
+
+        recent_low = _first(ta.get("recent_low"), it.get("recent_low"), ta.get("support"), it.get("support"), ta.get("swing_low"), it.get("swing_low"))
+        recent_high = _first(ta.get("recent_high"), it.get("recent_high"), ta.get("resistance"), it.get("resistance"), ta.get("swing_high"), it.get("swing_high"))
+        if side == "LONG" and recent_low:
+            impulse_atr = (entry_f - float(recent_low)) / max(atr_f, 1e-12)
+        elif side == "SHORT" and recent_high:
+            impulse_atr = (float(recent_high) - entry_f) / max(atr_f, 1e-12)
+        else:
+            impulse_atr = 0.0
+
+        min_tp = float(os.getenv("MID_SL_TIMING_MIN_TP1_PCT", "0.70") or 0.70)
+        max_tp = float(os.getenv("MID_SL_TIMING_MAX_TP1_PCT", "1.35") or 1.35)
+        min_imp = float(os.getenv("MID_SL_TIMING_MIN_IMPULSE_ATR", "1.80") or 1.80)
+        out.update({"direction": side, "target_pct": float(target_pct), "impulse_atr": float(impulse_atr)})
+        if float(target_pct) >= float(min_tp) and float(target_pct) <= float(max_tp) and float(impulse_atr) >= float(min_imp):
+            out["active"] = True
+        return out
+    except Exception:
+        return out
+
 def _mid_min_stop_distance(entry: float,
                            atr: float,
                            ta: dict | None = None,
@@ -18964,6 +19061,30 @@ def _mid_min_stop_distance(entry: float,
         min_atr = _trade_env_float(("TRADE_MIN_SL_ATR_MULT", "MID_MIN_SL_ATR"), 0.70)
         min_pct = _trade_env_float(("TRADE_MIN_SL_PCT", "MID_MIN_SL_PCT"), 0.0025)
         zone_mult = _trade_env_float(("TRADE_MIN_SL_ZONE_MULT", "MID_MIN_SL_ZONE_MULT"), 1.35)
+
+        # V45: CHIP-style cases showed direction was correct but SL was inside
+        # normal post-impulse pullback noise.  Only for medium TP1 paths after a
+        # real impulse, raise the volatility floor by default.  If the wider
+        # structural SL makes RR unacceptable, the existing RR gate will wait / reject
+        # instead of sending a fragile entry.
+        try:
+            prof = _mid_pullback_noise_profile(entry_f, atr_f, ta, it)
+            if bool(prof.get("active")):
+                min_atr = max(float(min_atr), float(os.getenv("MID_SL_TIMING_MIN_SL_ATR", "1.05") or 1.05))
+                min_pct = max(float(min_pct), float(os.getenv("MID_SL_TIMING_MIN_SL_PCT", "0.0042") or 0.0042))
+                zone_mult = max(float(zone_mult), float(os.getenv("MID_SL_TIMING_ZONE_MULT", "1.60") or 1.60))
+                try:
+                    if isinstance(it, dict):
+                        it["sl_timing_guard"] = {
+                            "active": 1,
+                            "target_pct": round(float(prof.get("target_pct") or 0.0), 3),
+                            "impulse_atr": round(float(prof.get("impulse_atr") or 0.0), 2),
+                        }
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         return max(
             atr_f * max(0.0, min_atr),
             abs(entry_f) * max(0.0, min_pct),
@@ -25323,7 +25444,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
         # SOFT reasons: allow waiting (do not count as fail), but still record reason/ts
         try:
-            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,atrpct_low,liq_sweep_missing,tp1_path_blocked,post_pump_no_acceptance").strip()
+            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,atrpct_low,liq_sweep_missing,tp1_path_blocked,post_pump_no_acceptance,wait_reclaim_or_structural_sl").strip()
             soft_set = {s.strip().lower() for s in _soft.split(",") if s.strip()}
             if r0 in soft_set:
                 it["last_fail_reason"] = str(reason or "fail")
