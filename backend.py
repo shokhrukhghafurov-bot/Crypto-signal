@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-04-13_institutional_trigger_v3_fix"
+MID_BUILD_TAG = "MID_BUILD_2026-05-03_smc_env_read_fix_v31"
 
 import asyncio
 import json
@@ -42,12 +42,36 @@ _load_env_early()
 # Trap log toggle
 # =======================
 def _env_bool(name: str, default: bool = False) -> bool:
-    """Parse common truthy/falsey env values."""
+    """Parse common truthy/falsey env values from Railway/.env.
+
+    Railway raw variable exports are sometimes pasted as KEY="1".  Depending
+    on the loader/UI, the value can arrive either as 1 or as the literal string
+    "1".  Strip wrapping quotes so flags like MID_DIRECT_SMC_BYPASS_READY_BLOCKS
+    are not silently read as false by inline parsers.
+    """
     v = os.getenv(name)
     if v is None:
         return bool(default)
-    v = str(v).strip().lower()
-    return v not in ("0", "false", "no", "off", "")
+    txt = str(v).strip()
+    if len(txt) >= 2 and ((txt[0] == txt[-1] == '"') or (txt[0] == txt[-1] == "'")):
+        txt = txt[1:-1].strip()
+    low = txt.lower()
+    if low in ("1", "true", "yes", "on", "y", "t"):
+        return True
+    if low in ("0", "false", "no", "off", "n", "f", ""):
+        return False
+    # Preserve the old behavior: any non-empty unknown value means enabled.
+    return True
+
+
+def _env_text(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    if v is None:
+        return str(default)
+    txt = str(v).strip()
+    if len(txt) >= 2 and ((txt[0] == txt[-1] == '"') or (txt[0] == txt[-1] == "'")):
+        txt = txt[1:-1].strip()
+    return txt
 
 
 def _exchange_enabled(ex: str) -> bool:
@@ -730,7 +754,7 @@ def _mid_adaptive_veto_reason(*, sig=None, ta: dict | None = None, it: dict | No
     if direction not in ('LONG', 'SHORT'):
         return ''
     try:
-        if _mid_is_direct_smc_route(route=route, sig=sig, ta=ta, rec=it, meta=gate_meta) and str(os.getenv('MID_DIRECT_SMC_BYPASS_ADAPTIVE_VETO', '1') or '1').strip().lower() in ('1','true','yes','on'):
+        if _mid_is_direct_smc_route(route=route, sig=sig, ta=ta, rec=it, meta=gate_meta) and _env_bool('MID_DIRECT_SMC_BYPASS_ADAPTIVE_VETO', True):
             return ''
     except Exception:
         pass
@@ -2109,7 +2133,7 @@ def _mid_retest_hold_seconds() -> float:
     5m candle time so 1 bar = 300 seconds.
     """
     try:
-        raw = os.getenv("MID_RETEST_HOLD_SEC")
+        raw = _env_text("MID_RETEST_HOLD_SEC", "")
         if raw is not None and str(raw).strip() != "":
             return max(0.0, float(raw))
     except Exception:
@@ -2725,7 +2749,7 @@ def _mid_final_emit_gate_reason(*,
     try:
         _direct_anchor_bypass = (
             _mid_is_direct_smc_route(route=route, sig=sig, ta=ta, rec=it, meta=gate_meta)
-            and str(os.getenv("MID_DIRECT_SMC_BYPASS_FINAL_ANCHOR", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+            and _env_bool("MID_DIRECT_SMC_BYPASS_FINAL_ANCHOR", False)
         )
     except Exception:
         _direct_anchor_bypass = False
@@ -10080,17 +10104,23 @@ async def safe_send(bot, chat_id: int, text: str, *, ctx: str = "", **kwargs):
 
 
 # ------------------ ENV helpers ------------------
+def _env_unquote_value(v) -> str:
+    txt = str(v if v is not None else "").strip()
+    if len(txt) >= 2 and ((txt[0] == txt[-1] == '"') or (txt[0] == txt[-1] == "'")):
+        txt = txt[1:-1].strip()
+    return txt
+
 def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name, "").strip()
+    v = _env_unquote_value(os.getenv(name, ""))
     if not v:
         return default
     try:
-        return int(v)
+        return int(float(v))
     except Exception:
         return default
 
 def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name, "").strip()
+    v = _env_unquote_value(os.getenv(name, ""))
     if not v:
         return default
     try:
@@ -10100,13 +10130,17 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _env_str(name: str, default: str) -> str:
-    v = os.getenv(name, "").strip()
+    v = _env_unquote_value(os.getenv(name, ""))
     return v if v else default
 def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name, "").strip().lower()
+    v = _env_unquote_value(os.getenv(name, "")).lower()
     if v == "":
-        return default
-    return v in ("1", "true", "yes", "y", "on")
+        return bool(default)
+    if v in ("1", "true", "yes", "y", "on", "t"):
+        return True
+    if v in ("0", "false", "no", "n", "off", "f"):
+        return False
+    return True
 
 
 # --- i18n helpers (loaded from i18n.json; no hardcoded auto-close texts) ---
@@ -10415,7 +10449,7 @@ def _mid_smart_setup_trap_eval(*,
     """
     meta: dict[str, object] = {}
     try:
-        enabled = str(os.getenv("MID_SMART_SETUP_TRAP_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        enabled = _env_bool("MID_SMART_SETUP_TRAP_ENABLED", True)
     except Exception:
         enabled = True
     meta["enabled"] = bool(enabled)
@@ -11784,7 +11818,7 @@ def _mid_smc_route_emit_gate(*,
         # Allow bypassing ONLY those readiness/context blocks.  Real hard blocks
         # (direction_conflict, invalid_zone, trap, rr_too_low) remain fatal.
         try:
-            _bypass_ready_blocks = str(os.getenv("MID_DIRECT_SMC_BYPASS_READY_BLOCKS", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+            _bypass_ready_blocks = _env_bool("MID_DIRECT_SMC_BYPASS_READY_BLOCKS", False)
         except Exception:
             _bypass_ready_blocks = False
         if _bypass_ready_blocks:
@@ -13480,7 +13514,7 @@ def _mid_liquidity_reclaim_ready(ta: dict, rec: dict | None = None, *, now_ts: f
         sweep_ok = bool(t.get("sweep_long")) if direction == "LONG" else bool(t.get("sweep_short"))
         meta["sweep_ok"] = bool(sweep_ok)
         try:
-            allow_no_sweep = str(os.getenv("MID_LIQ_RECLAIM_ALLOW_NO_SWEEP", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+            allow_no_sweep = _env_bool("MID_LIQ_RECLAIM_ALLOW_NO_SWEEP", False)
         except Exception:
             allow_no_sweep = False
         meta["allow_no_sweep"] = bool(allow_no_sweep)
@@ -13522,7 +13556,7 @@ def _mid_liquidity_reclaim_ready(ta: dict, rec: dict | None = None, *, now_ts: f
         meta["disp_x"] = float(disp_x)
         if not (bos_ok or disp_ok):
             try:
-                allow_no_bos_disp = str(os.getenv("MID_LIQ_RECLAIM_ALLOW_NO_BOS_DISP", "0") or "0").strip().lower() in ("1", "true", "yes", "on")
+                allow_no_bos_disp = _env_bool("MID_LIQ_RECLAIM_ALLOW_NO_BOS_DISP", False)
             except Exception:
                 allow_no_bos_disp = False
             meta["allow_no_bos_disp"] = bool(allow_no_bos_disp)
@@ -23561,7 +23595,7 @@ def _mid_quality_first_enabled() -> bool:
     """
     try:
         raw = os.getenv("MID_QUALITY_FIRST_ENABLED", os.getenv("MID_QUALITY_FIRST", "1"))
-        return str(raw or "1").strip().lower() in ("1", "true", "yes", "on")
+        return _env_bool("MID_QUALITY_FIRST_ENABLED", _env_bool("MID_QUALITY_FIRST", True))
     except Exception:
         return True
 
@@ -29231,6 +29265,22 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                         float(instant_profit_cap_fut),
                         float(instant_vol_cap_spot),
                         float(instant_vol_cap_fut),
+                    )
+                    logger.info(
+                        "[mid][cfg_smc_env] bypass_ready=%s bypass_btc=%s btc_before_emit=%s bypass_final_anchor=%s quality_first=%s trap_enabled=%s liq_no_sweep=%s liq_no_bos_disp=%s zone_hold=%s retest_hold=%s raw_bypass_ready=%r raw_trap=%r raw_quality=%r",
+                        int(_env_bool("MID_DIRECT_SMC_BYPASS_READY_BLOCKS", False)),
+                        int(_env_bool("MID_DIRECT_SMC_BYPASS_BTC_FILTER", False)),
+                        int(_env_bool("MID_BTC_FILTER_BEFORE_EMIT", True)),
+                        int(_env_bool("MID_DIRECT_SMC_BYPASS_FINAL_ANCHOR", False)),
+                        int(_mid_quality_first_enabled()),
+                        int(_env_bool("MID_SMART_SETUP_TRAP_ENABLED", True)),
+                        int(_env_bool("MID_LIQ_RECLAIM_ALLOW_NO_SWEEP", False)),
+                        int(_env_bool("MID_LIQ_RECLAIM_ALLOW_NO_BOS_DISP", False)),
+                        _env_text("MID_ZONE_HOLD_SEC", _env_text("MID_RETEST_HOLD_SEC", "")),
+                        _env_text("MID_RETEST_HOLD_SEC", ""),
+                        os.getenv("MID_DIRECT_SMC_BYPASS_READY_BLOCKS"),
+                        os.getenv("MID_SMART_SETUP_TRAP_ENABLED"),
+                        os.getenv("MID_QUALITY_FIRST_ENABLED"),
                     )
                 except Exception:
                     pass
@@ -37271,7 +37321,7 @@ async def analyze_symbol_institutional(self, symbol: str, market: str = "FUTURES
 
 def _mid_btc_emit_filter_enabled() -> bool:
     try:
-        return (os.getenv("MID_BTC_FILTER_BEFORE_EMIT", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+        return _env_bool("MID_BTC_FILTER_BEFORE_EMIT", True)
     except Exception:
         return True
 
@@ -37856,7 +37906,7 @@ async def _backend_mid_pre_emit_block_reason(
         # 5) BTC leader veto is the last market-wide gate. For direct SMC routes it can
         # be softened with ENV when the user wants more setup coverage.
         try:
-            _bypass_btc_direct = bool(smc_direct_route and str(os.getenv("MID_DIRECT_SMC_BYPASS_BTC_FILTER", "0") or "0").strip().lower() in ("1", "true", "yes", "on"))
+            _bypass_btc_direct = bool(smc_direct_route and _env_bool("MID_DIRECT_SMC_BYPASS_BTC_FILTER", False))
         except Exception:
             _bypass_btc_direct = False
         if not _bypass_btc_direct:
