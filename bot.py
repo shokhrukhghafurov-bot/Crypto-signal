@@ -8168,6 +8168,16 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
     structure_pending_route = contains_any(route_text, ('structure pending', 'pending trigger', 'pending'))
 
     cs_line = (f'расстояние entry → TP1: около {cs:.2f}%' if wide_tp_target else f'clean space до TP1: около {cs:.2f}%') if cs > 0 else 'clean space до TP1 не подтверждён свечами'
+    # V27 hotfix: define TP1 distance line before any candidate uses it.
+    # Some V25/V26 candidates are added before the later LONG-only block, and
+    # Python evaluates analysis_add arguments even when evidence=False. Without
+    # this early definition, closed LOSS report cards crash with:
+    # UnboundLocalError: tp1_distance_line.
+    tp1_distance_line = (
+        f'расстояние entry → TP1 было около {cs:.2f}% / RR до TP1 около 1:{rr_to_tp1:.2f}'
+        if cs > 0 and rr_to_tp1 > 0
+        else (f'расстояние entry → TP1 было около {cs:.2f}%' if cs > 0 else 'TP1 был далеко за ближайшими reaction levels')
+    )
     risk_line = f'расстояние entry → SL: около {risk_pct:.2f}%' if risk_pct > 0 else ''
     mfe_line = f'макс. ход в сторону сделки: около {mfe:.2f}%' if mfe > 0 else ''
     against_line = f'первое движение против входа: около {against:.2f}%' if against > 0 else ''
@@ -9461,7 +9471,6 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         supply_desc = str(supply_ctx.get('desc') or 'local high / resistance')
         demand_desc = str(demand_ctx.get('desc') or 'demand / support')
         tp1_supply_path_line = f'TP1 находился рядом/за supply/resistance reaction area ({supply_desc})'
-        tp1_distance_line = f'расстояние entry → TP1 было около {cs:.2f}% / RR до TP1 около 1:{rr_to_tp1:.2f}' if cs > 0 and rr_to_tp1 > 0 else (f'расстояние entry → TP1 было около {cs:.2f}%' if cs > 0 else 'TP1 был далеко за ближайшими reaction levels')
 
         # V12: BB-type fix. Sometimes the LONG direction is valid and the
         # market continues after the stop. In that case the main reason must be
