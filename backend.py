@@ -2618,7 +2618,7 @@ def _mid_tp1_path_block_guard_reason(*,
                                       gate_meta: dict | None = None) -> str:
     """Block tiny TP1 paths that must first break an opposing local level.
 
-    This is the SUI/POL-style loss pattern:
+    This is the SUI/POL/ACT/ZAMA/ZEN-style loss pattern:
       LONG entry sits below nearest local resistance and TP1 is behind that level;
       SHORT entry sits above nearest local support and TP1 is behind that level.
 
@@ -2653,10 +2653,11 @@ def _mid_tp1_path_block_guard_reason(*,
     except Exception:
         target_pct = 0.0
     try:
-        max_target_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_MAX_TARGET_PCT", "0.38") or 0.38)
+        max_target_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_MAX_TARGET_PCT", "0.55") or 0.55)
     except Exception:
-        max_target_pct = 0.38
-    # Only this narrow/tight-target case is guarded by default. Larger TP1 paths
+        max_target_pct = 0.55
+    # V39 default catches ACT/ZAMA/ZEN style too: TP1 0.43-0.50% can still be
+    # blocked when the first opposing resistance/support is inside the path. Larger TP1 paths
     # are handled by the normal late/near-extreme/origin guards.
     if max_target_pct > 0 and float(target_pct) > float(max_target_pct):
         return ""
@@ -3162,8 +3163,8 @@ def _mid_final_emit_gate_reason(*,
     if _levels_reason:
         return str(_levels_reason)
 
-    # V36: do not allow direct SMC/zone-retest routes to bypass the SUI/POL loss
-    # pattern: TP1 is tiny and sits behind the nearest unaccepted resistance/support.
+    # V36: do not allow direct SMC/zone-retest routes to bypass the SUI/POL/ACT/ZAMA/ZEN loss
+    # pattern: TP1 is tight and sits behind the nearest unaccepted resistance/support.
     _tp1_path_reason = _mid_tp1_path_block_guard_reason(
         sig=sig,
         ta=ta,
