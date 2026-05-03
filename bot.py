@@ -8309,6 +8309,77 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         secondary=['No post-entry expansion', 'No fresh expansion candle', 'Weak continuation'],
         improve=['требовать fresh expansion candle после trigger', 'если entry не получает continuation в первые свечи — не держать идею как сильный setup'],
         evidence=bool(any_flag('no_post_entry_expansion','no_fresh_expansion_candle','post_entry_expansion_missing') or (weak_follow and no_tp and not normal_pullback)))
+    # V25: context-specific fixes for ALGO / ZBT / BLUR-type losses.
+    # These detectors prevent the card from overusing broad templates when the
+    # visible chart context is more exact:
+    # - ALGO: late LONG after a strong pump, TP1 is wide, but the first normal pullback hits SL.
+    # - ZBT: LONG is taken against fresh bearish breakdown/sell-side pressure, not a clean FVG reclaim.
+    # - BLUR: SHORT is taken after a dump directly above support, so a normal buyer bounce hits SL.
+    v25_context_reasons = str(os.getenv('LOSS_CARD_V25_CONTEXT_REASONS', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
+
+    v25_algo_post_pump_sl_pullback = bool(
+        v25_context_reasons
+        and side_u == 'LONG'
+        and no_tp
+        and wide_tp_target
+        and weak_follow
+        and not tp1_near_miss
+        and (late_long or vertical_long_pump or bullish_ctx)
+        and (normal_pullback or sl_tight or fast)
+        and (duration_min is None or duration_min <= 45)
+        and not bearish_ctx
+    )
+    add(14.7 + (0.8 if vertical_long_pump else 0.0) + (0.5 if normal_pullback else 0.0) + (0.3 if fast else 0.0), 'v25_late_long_pump_wide_tp_sl_pullback',
+        primary='Late LONG after pump / SL inside first pullback',
+        scenario='LONG был открыт после уже выполненного buy-side impulse/pump. TP1 был далеко и RR выглядел хорошо, но вход был высоко, не из discount: после entry не было нового bullish acceptance, рынок сделал обычный first pullback/retest, а SL стоял внутри этого шума. Поэтому сделку выбило до подтверждённого continuation.',
+        analysis_add=[tp1_distance_line, risk_line, 'entry был после buy-side impulse/pump', 'SL стоял внутри normal first pullback/retest после pump', 'acceptance выше entry/high отсутствовал', 'fresh bullish displacement после входа отсутствовал'],
+        happened=['после входа покупатель не дал сразу новую волну вверх', 'цена сделала normal first pullback/retest против LONG', 'SL был достигнут раньше подтверждённого continuation', 'TP1 не был взят, хотя цель была далеко'],
+        visible=['перед входом уже был сильный buy-side impulse / pump', 'LONG был открыт высоко после роста, а не из discount', 'SL находился внутри первого нормального pullback после импульса', 'большой RR не означал clean path без acceptance', 'после entry нет fresh bullish displacement', pos_line],
+        secondary=['Late long after pump', 'SL inside first pullback', 'No acceptance above high', 'No fresh bullish displacement', 'Wide TP not clean path'],
+        improve=['после сильного pump ждать deeper pullback / discount re-entry', 'ставить SL за structural invalidation, а не внутри first pullback', 'не считать большой RR чистым путём без acceptance', 'лонговать continuation только после 1–2 close выше high/retest-zone'],
+        evidence=v25_algo_post_pump_sl_pullback)
+
+    v25_zbt_bearish_breakdown_long = bool(
+        v25_context_reasons
+        and side_u == 'LONG'
+        and no_tp
+        and weak_follow
+        and bearish_ctx
+        and not late_long
+        and not vertical_long_pump
+        and not highish
+        and (fast or tight_space or normal_pullback or (duration_min is not None and duration_min <= 25))
+    )
+    add(14.4 + (1.0 if fast else 0.0) + (0.5 if tight_space else 0.0), 'v25_long_against_bearish_breakdown_no_reclaim',
+        primary='LONG against bearish breakdown / no bullish reclaim',
+        scenario='LONG был открыт после sell-side давления / bearish breakdown, когда рынок ещё не показал настоящий bullish reclaim. Это был не чистый continuation LONG: цена не закрепилась выше entry/retest зоны, fresh bullish displacement не появился, и продавец быстро вернул движение к SL.',
+        analysis_add=['перед входом был bearish breakdown / sell-side pressure', 'bullish reclaim перед LONG не подтвердился', 'acceptance выше entry/retest зоны отсутствовал', 'fresh bullish displacement после входа отсутствовал', risk_line],
+        happened=['покупатель не смог сломать bearish pressure', 'цена не закрепилась выше entry/retest зоны', 'setup не получил fresh bullish continuation', 'SL был достигнут после возврата в сторону sell-side'],
+        visible=['15m/5m контекст перед входом был bearish / после сильного снижения', 'LONG был взят без подтверждённого bullish reclaim', 'после entry нет clean bullish displacement', 'цена оставалась под давлением продавца', pos_line],
+        secondary=['Long against bearish breakdown', 'No bullish reclaim', 'No acceptance above entry', 'Fresh bearish pressure', 'Fast invalidation'],
+        improve=['не брать LONG сразу после breakdown без reclaim', 'ждать 1–2 close выше breakdown/retest зоны', 'требовать fresh bullish displacement перед входом', 'если структура bearish — искать SHORT или ждать полноценный reversal setup'],
+        evidence=v25_zbt_bearish_breakdown_long)
+
+    v25_blur_short_after_dump_support = bool(
+        v25_context_reasons
+        and side_u == 'SHORT'
+        and no_tp
+        and weak_follow
+        and not tp1_near_miss
+        and (late_short or bearish_ctx)
+        and (demand_seen or demand_blocks or lowish or short_low_path_block or tight_space)
+        and (duration_min is None or duration_min <= 90)
+    )
+    add(14.1 + (0.8 if late_short else 0.0) + (0.6 if demand_blocks else 0.0) + (0.4 if normal_pullback else 0.0), 'v25_short_after_dump_into_support_bounce',
+        primary='SHORT after dump into support / buyer bounce',
+        scenario=f'SHORT был открыт после уже выполненного sell-side dump и прямо над buyer reaction area ({demand_desc}). Продавец не получил acceptance ниже support/entry, свежего bearish displacement после входа не было, поэтому support дал bounce/reclaim к SL.',
+        analysis_add=['entry был после sell-side dump / extended move вниз', 'SHORT был над local support / buyer reaction area', 'acceptance ниже support/entry отсутствовал', 'fresh bearish displacement после входа отсутствовал', risk_line],
+        happened=['продавец зашёл поздно после dump, уже рядом с поддержкой', 'local support удержал движение снизу', 'появился buyer bounce/reclaim против SHORT', 'SL был достигнут после bounce вверх'],
+        visible=['перед входом уже прошёл сильный sell-side dump', 'SHORT открыт низко, прямо над local support / buyer reaction area', 'после entry нет clean bearish displacement', 'цена не приняла уровень ниже support', pos_line],
+        secondary=['Short after dump', 'SHORT above local support', 'Buyer bounce', 'No acceptance below support', 'No fresh bearish displacement'],
+        improve=['после сильного dump не шортить прямо в support', 'ждать premium re-entry выше', 'или входить только после close ниже support/buyer zone', 'если support рядом с TP1 — ставить цель раньше или пропускать сделку'],
+        evidence=v25_blur_short_after_dump_support)
+
     # V23: DASH-type precision.  When a LONG is opened after a visible
     # buy-side pump and TP1 is still behind the fresh local high/resistance,
     # the exact reason is not only "TP1 blocked".  It is a late post-pump
@@ -9620,7 +9691,7 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         # of the broader "local resistance" wording. This fixes ASTER-type cards:
         # LONG was not just under resistance; it was opened into/under a bearish FVG
         # and price never accepted above entry before SL.
-        real_bearish_fvg_block = bool(side_u == 'LONG' and (real_supply_is_fvg or b('overhead_bearish_fvg')) and no_tp and (weak_follow or tight_space or supply_blocks or normal_pullback))
+        real_bearish_fvg_block = bool(side_u == 'LONG' and (real_supply_is_fvg or b('overhead_bearish_fvg')) and no_tp and (weak_follow or tight_space or supply_blocks or normal_pullback) and not (bearish_ctx and not highish and not late_long))
         add(12.6 + (1.0 if supply_blocks else 0) + (0.8 if tight_space else 0) + (0.6 if normal_pullback else 0), 'long_into_bearish_fvg_no_acceptance',
             primary='LONG into bearish FVG / local resistance, no acceptance above entry',
             scenario=f'LONG был открыт прямо под/в районе bearish FVG / seller reaction area ({supply_desc}). Цена не смогла закрепиться выше entry/retest зоны, fresh bullish displacement не появился, а TP1 находился за ближайшей зоной продавца. Поэтому после слабого стояния под зоной движение ушло к SL.',
