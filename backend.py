@@ -2634,13 +2634,11 @@ def _mid_tp1_path_block_guard_reason(*,
     if not enabled:
         return ""
     try:
-        if sig is None:
-            return ""
-        side = str(getattr(sig, "direction", "") or (ta or {}).get("direction") or (it or {}).get("direction") or "").upper().strip()
+        side = str((getattr(sig, "direction", "") if sig is not None else "") or (ta or {}).get("direction") or (it or {}).get("direction") or "").upper().strip()
         if side not in ("LONG", "SHORT"):
             return ""
-        entry = float(getattr(sig, "entry", 0.0) or 0.0)
-        tp1 = float(getattr(sig, "tp1", 0.0) or 0.0)
+        entry = float((getattr(sig, "entry", 0.0) if sig is not None else 0.0) or (ta or {}).get("entry") or (ta or {}).get("close") or (it or {}).get("entry") or 0.0)
+        tp1 = float((getattr(sig, "tp1", 0.0) if sig is not None else 0.0) or (ta or {}).get("tp1") or (it or {}).get("tp1") or 0.0)
         if entry <= 0 or tp1 <= 0:
             return ""
         if side == "LONG" and tp1 <= entry:
@@ -2783,6 +2781,218 @@ def _mid_tp1_path_block_guard_reason(*,
     )
 
 
+def _mid_post_pump_no_acceptance_guard_reason(*,
+                                              sig=None,
+                                              ta: dict | None = None,
+                                              it: dict | None = None,
+                                              gate_meta: dict | None = None,
+                                              route: str | None = None,
+                                              breakout_fresh_ok: bool = False,
+                                              bo_rt_label: str | None = None) -> str:
+    """Block BB/ALGO/ACH-style late continuation entries after a pump/dump.
+
+    Pattern fixed here:
+      LONG  after a strong buy-side impulse, still below/inside the nearest
+            seller reaction/high, with no accepted close above it.  The SL is
+            then inside the first normal pullback and gets hit before continuation.
+      SHORT mirror: after a strong sell-side impulse, still above/inside the
+            nearest buyer reaction/low.
+
+    The guard is intentionally default-on and narrow enough not to kill the
+    ACE/RED/APT winners: it requires a large move from the opposite extreme,
+    a non-tiny TP1 path, and a nearby unaccepted opposing level.  A real
+    breakout/reclaim above resistance (or below support for SHORT) is allowed.
+    """
+    try:
+        enabled = str(os.getenv("MID_FINAL_POST_PUMP_PULLBACK_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        enabled = True
+    if not enabled:
+        return ""
+
+    ta = ta or {}
+    it = it or {}
+    gm = gate_meta or {}
+
+    try:
+        side = str(getattr(sig, "direction", "") or ta.get("direction") or it.get("direction") or "").upper().strip()
+        market = str(getattr(sig, "market", "") or ta.get("market") or it.get("market") or "").upper().strip()
+    except Exception:
+        side, market = "", ""
+    if side not in ("LONG", "SHORT"):
+        return ""
+
+    try:
+        # By default keep this strict for FUTURES where leverage makes these
+        # late-pump entries costly.  SPOT is still protected by TP1-path and
+        # origin/near-resistance guards.
+        futures_only = str(os.getenv("MID_FINAL_POST_PUMP_GUARD_FUTURES_ONLY", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        futures_only = True
+    if futures_only and market and market != "FUTURES":
+        return ""
+
+    def _first_float(*vals):
+        for v in vals:
+            try:
+                if v is None or v == "":
+                    continue
+                fv = float(v)
+                if math.isfinite(fv) and fv > 0:
+                    return fv
+            except Exception:
+                pass
+        return None
+
+    try:
+        entry = _first_float(getattr(sig, "entry", None), ta.get("entry"), ta.get("close"), ta.get("price"), it.get("entry"), it.get("price"))
+        sl = _first_float(getattr(sig, "sl", None), ta.get("sl"), it.get("sl"), it.get("stop"), it.get("stop_loss"))
+        tp1 = _first_float(getattr(sig, "tp1", None), ta.get("tp1"), it.get("tp1"), it.get("target"), it.get("take_profit"))
+    except Exception:
+        entry = sl = tp1 = None
+    if not entry or not tp1:
+        return ""
+    if side == "LONG" and tp1 <= entry:
+        return ""
+    if side == "SHORT" and tp1 >= entry:
+        return ""
+
+    try:
+        target_pct = abs(float(tp1) - float(entry)) / max(abs(float(entry)), 1e-12) * 100.0
+    except Exception:
+        target_pct = 0.0
+    try:
+        min_target_pct = float(os.getenv("MID_FINAL_POST_PUMP_MIN_TP1_PCT", "0.70") or 0.70)
+    except Exception:
+        min_target_pct = 0.70
+    if float(target_pct) < float(min_target_pct):
+        return ""
+
+    risk_pct = 0.0
+    try:
+        if sl and sl > 0:
+            risk_pct = abs(float(entry) - float(sl)) / max(abs(float(entry)), 1e-12) * 100.0
+    except Exception:
+        risk_pct = 0.0
+    try:
+        min_risk_pct = float(os.getenv("MID_FINAL_POST_PUMP_MIN_RISK_PCT", "0.35") or 0.35)
+    except Exception:
+        min_risk_pct = 0.35
+    # Avoid catching small, controlled pullback/reclaim winners.
+    if float(risk_pct) > 0 and float(risk_pct) < float(min_risk_pct):
+        return ""
+
+    atr = _first_float(ta.get("atr30"), ta.get("atr_abs"), it.get("atr_at_create"), it.get("atr30"), gm.get("atr30"))
+    if not atr or atr <= 0:
+        return ""
+
+    recent_low = _first_float(ta.get("recent_low"), it.get("recent_low"), gm.get("recent_low"), ta.get("support"), it.get("support"))
+    recent_high = _first_float(ta.get("recent_high"), it.get("recent_high"), gm.get("recent_high"), ta.get("resistance"), it.get("resistance"))
+    if not recent_low or not recent_high:
+        return ""
+
+    # Nearest unaccepted opposing level. Prefer explicit support/resistance and
+    # then fall back to recent extreme. It must be in front of the trade.
+    levels: list[tuple[float, str]] = []
+    def _push(v, name):
+        try:
+            fv = float(v)
+            if math.isfinite(fv) and fv > 0:
+                levels.append((fv, str(name or "level")))
+        except Exception:
+            pass
+
+    long_keys = ("resistance", "nearest_resistance", "local_resistance", "eq_hi", "recent_high", "swing_high", "last_swing_high", "range_high", "seller_level", "supply_level")
+    short_keys = ("support", "nearest_support", "local_support", "eq_lo", "recent_low", "swing_low", "last_swing_low", "range_low", "buyer_level", "demand_level")
+    keys = long_keys if side == "LONG" else short_keys
+    for src in (ta, it, gm):
+        if isinstance(src, dict):
+            for k in keys:
+                _push(src.get(k), k)
+    if side == "LONG":
+        _push(recent_high, "recent_high")
+    else:
+        _push(recent_low, "recent_low")
+
+    opp_level = None
+    opp_name = ""
+    try:
+        if side == "LONG":
+            above = [(lv, nm) for lv, nm in levels if lv > float(entry)]
+            if above:
+                opp_level, opp_name = min(above, key=lambda x: abs(float(x[0]) - float(entry)))
+        else:
+            below = [(lv, nm) for lv, nm in levels if lv < float(entry)]
+            if below:
+                opp_level, opp_name = max(below, key=lambda x: float(x[0]))
+    except Exception:
+        opp_level, opp_name = None, ""
+    if opp_level is None:
+        return ""
+
+    try:
+        accept_atr = float(os.getenv("MID_FINAL_POST_PUMP_ACCEPT_BUF_ATR", "0.08") or 0.08)
+    except Exception:
+        accept_atr = 0.08
+    try:
+        accept_pct = float(os.getenv("MID_FINAL_POST_PUMP_ACCEPT_BUF_PCT", "0.030") or 0.030) / 100.0
+    except Exception:
+        accept_pct = 0.00030
+    accept_buf = max(float(atr) * float(accept_atr), abs(float(entry)) * float(accept_pct))
+
+    # If price has already accepted beyond the obstacle, allow it.  This keeps
+    # true breakout/reclaim continuation entries alive.
+    accepted = False
+    try:
+        if side == "LONG":
+            accepted = float(entry) > float(opp_level) + float(accept_buf)
+        else:
+            accepted = float(entry) < float(opp_level) - float(accept_buf)
+    except Exception:
+        accepted = False
+    if accepted:
+        return ""
+
+    try:
+        if side == "LONG":
+            impulse_atr = (float(entry) - float(recent_low)) / max(float(atr), 1e-12)
+            opp_dist_atr = (float(opp_level) - float(entry)) / max(float(atr), 1e-12)
+        else:
+            impulse_atr = (float(recent_high) - float(entry)) / max(float(atr), 1e-12)
+            opp_dist_atr = (float(entry) - float(opp_level)) / max(float(atr), 1e-12)
+    except Exception:
+        return ""
+
+    try:
+        min_impulse_atr = float(os.getenv("MID_FINAL_POST_PUMP_MIN_IMPULSE_ATR", "2.20") or 2.20)
+    except Exception:
+        min_impulse_atr = 2.20
+    try:
+        max_opp_dist_atr = float(os.getenv("MID_FINAL_POST_PUMP_MAX_OPPOSING_DIST_ATR", "1.80") or 1.80)
+    except Exception:
+        max_opp_dist_atr = 1.80
+
+    if float(impulse_atr) < float(min_impulse_atr):
+        return ""
+    if float(opp_dist_atr) < 0 or float(opp_dist_atr) > float(max_opp_dist_atr):
+        return ""
+
+    # A clear fresh breakout label can only save the setup if the entry is
+    # already accepted beyond the opposing level; we returned above in that case.
+    bo = str(bo_rt_label or it.get("bo_rt") or it.get("breakout_retest") or "").upper()
+    if bool(breakout_fresh_ok) and accepted:
+        return ""
+
+    side_word = "long" if side == "LONG" else "short"
+    obstacle = "resistance" if side == "LONG" else "support"
+    return (
+        f"post_pump_{side_word}_no_acceptance:"
+        f"impulse_atr={float(impulse_atr):.2f}|opp={obstacle}|"
+        f"opp_dist_atr={float(opp_dist_atr):.2f}|level={float(opp_level):.10g}|src={opp_name}|"
+        f"tp1_pct={float(target_pct):.3f}|risk_pct={float(risk_pct):.3f}|bo={bo or '-'}"
+    )
+
+
 def _mid_final_emit_apply_reason(reason: str) -> str:
     try:
         r = str(reason or "").strip().lower()
@@ -2802,6 +3012,8 @@ def _mid_final_emit_apply_reason(reason: str) -> str:
         return "vol_low"
     if r.startswith("tp1_path_blocked_by_"):
         return "tp1_path_blocked"
+    if r.startswith("post_pump_"):
+        return "post_pump_no_acceptance"
     if r.startswith("instant_regime_block"):
         return "regime_block"
     return "blocked"
@@ -2961,6 +3173,21 @@ def _mid_final_emit_gate_reason(*,
     )
     if _tp1_path_reason:
         return str(_tp1_path_reason)
+
+    # V38: catch BB/ALGO/ACH-style late LONG after pump (and SHORT mirror)
+    # where TP1 may be far, but entry is still under/above an unaccepted
+    # opposing level and SL sits inside the first normal pullback.
+    _post_pump_reason = _mid_post_pump_no_acceptance_guard_reason(
+        sig=sig,
+        ta=ta,
+        it=it,
+        gate_meta=gate_meta,
+        route=route,
+        breakout_fresh_ok=bool(breakout_fresh_ok),
+        bo_rt_label=bo_rt_label,
+    )
+    if _post_pump_reason:
+        return str(_post_pump_reason)
 
     if smc_direct_route:
         return ""
@@ -24953,7 +25180,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
         # SOFT reasons: allow waiting (do not count as fail), but still record reason/ts
         try:
-            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,atrpct_low,liq_sweep_missing,tp1_path_blocked").strip()
+            _soft = os.getenv("MID_PENDING_SOFT_FAIL_REASONS", "vol_low,atrpct_low,liq_sweep_missing,tp1_path_blocked,post_pump_no_acceptance").strip()
             soft_set = {s.strip().lower() for s in _soft.split(",") if s.strip()}
             if r0 in soft_set:
                 it["last_fail_reason"] = str(reason or "fail")
@@ -28578,6 +28805,18 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 pass
                         continue
                     entry, sl, tp1, tp2, rr = _mid_recalc_levels_from_trigger(direction, entry_ref, ta, it, market)
+                    try:
+                        _final_sig_proxy = type("MidFinalSigProxy", (), {})()
+                        _final_sig_proxy.market = market
+                        _final_sig_proxy.symbol = sym
+                        _final_sig_proxy.direction = direction
+                        _final_sig_proxy.entry = float(entry)
+                        _final_sig_proxy.sl = float(sl)
+                        _final_sig_proxy.tp1 = float(tp1)
+                        _final_sig_proxy.tp2 = float(tp2)
+                        _final_sig_proxy.rr = float(rr)
+                    except Exception:
+                        _final_sig_proxy = None
                     conf = int(_mid_pick_scalar(ta.get("confidence"), it.get("confidence"), default=0.0))
 
                     conf_names = str(it.get("confirmations") or it.get("available_exchanges") or "")
@@ -28596,7 +28835,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         continue
 
                     _final_emit_reason = _mid_final_emit_gate_reason(
-                        sig=None,
+                        sig=_final_sig_proxy,
                         ta=ta,
                         it=it,
                         risk_flags=it.get("risk_flags"),
