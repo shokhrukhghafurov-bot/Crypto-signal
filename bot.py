@@ -9579,6 +9579,42 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             improve=['не ставить TP1 за несколькими overhead FVG/supply зонами без acceptance', 'если RR большой только из-за tight SL — проверять реальный clean path', 'для LONG ждать close выше seller reaction stack или брать цель до него', 'SL ставить за structural invalidation, а не делать цель нереально далёкой'],
             evidence=wide_overhead_stack)
 
+        # V32: RUNE/ZK/FOGO precision. Some LOSS cards had enough facts to show a
+        # post-pump / previous-high target problem, but no explicit saved supply/FVG
+        # zone, so they fell back to the same generic "Late LONG after pump" text.
+        # These candidates are still evidence-based: only LONG losses with a wide TP1,
+        # no TP1 threat, weak follow-through, and origin/structure-pending route get
+        # the stronger, route-specific wording.
+        post_pump_wide_tp_common = bool(
+            side_u == 'LONG'
+            and no_tp
+            and wide_tp_target
+            and (weak_follow or normal_pullback or sl_tight)
+            and not real_supply_is_fvg
+            and (late_long or vertical_long_pump or bullish_ctx or rr_to_tp1 >= 4.0 or cs >= max(2.0, wide_tp1_pct))
+        )
+        origin_post_pump_fail = bool(post_pump_wide_tp_common and origin_route)
+        add(16.2 + (0.6 if vertical_long_pump else 0.0) + (0.4 if normal_pullback else 0.0), 'origin_fastpath_long_post_pump_failed',
+            primary='Origin fast-path failed: LONG was post-pump, not fresh origin',
+            scenario='Origin fast-path сработал слишком поздно: LONG был открыт уже после buy-side impulse/bounce, а не в свежем origin до движения. TP1 находился далеко выше, за fresh high/resistance path; после entry не было acceptance и нового bullish displacement, поэтому цена ушла к SL.',
+            analysis_add=[tp1_distance_line, 'origin fast-path был активирован после уже сделанного buy-side impulse', 'acceptance выше entry/local high отсутствовал', 'fresh bullish displacement после входа отсутствовал'],
+            happened=['покупатель не построил новую волну от origin', 'entry оказался на post-pump bounce/reclaim', 'TP1 был слишком далеко за fresh high / resistance path', 'SL был достигнут после rejection/pullback'],
+            visible=['это был не чистый fresh origin: перед entry уже был pump/bounce', 'LONG был открыт не из discount, а после расширения вверх', 'над entry оставался fresh high / seller reaction path', 'после entry свечи не дали clean bullish continuation', pos_line],
+            secondary=['Origin fast-path too late', 'Post-pump LONG', 'TP1 behind fresh high', 'No acceptance above entry', 'No fresh bullish displacement'],
+            improve=['для origin fast-path не bypass-ить late-entry/near-extreme guards', 'после pump ждать pullback в discount и новый trigger', 'не ставить TP1 за fresh high без acceptance выше него'],
+            evidence=origin_post_pump_fail)
+
+        structure_pending_post_pump_fail = bool(post_pump_wide_tp_common and structure_pending_route and not origin_route)
+        add(15.8 + (0.5 if rr_to_tp1 >= 4.0 else 0.0) + (0.3 if sl_tight else 0.0), 'structure_pending_long_tp1_behind_pump_high',
+            primary='Structure trigger after pump / TP1 behind previous high',
+            scenario='Structure pending trigger активировался после уже пройденного pump. Формальный RR выглядел большим, но TP1 стоял за предыдущим high/resistance, а clean path туда не подтвердился. Цена не закрепилась выше entry/retest зоны, fresh bullish displacement не появился, и позиция закрылась по SL.',
+            analysis_add=[tp1_distance_line, 'trigger появился после уже пройденного buy-side impulse', 'TP1 был далеко за previous high / resistance path', 'acceptance выше entry/retest зоны отсутствовал', 'fresh bullish displacement после входа отсутствовал'],
+            happened=['после entry покупатель не дал новую expansion-свечу', 'previous high / resistance path остановил continuation', 'большой RR был не равен clean path', 'SL был достигнут до подтверждённого продолжения'],
+            visible=['перед entry уже был сильный pump / buy-side expansion', 'после pump рынок перешёл в rejection/chop вместо continuation', 'TP1 находился выше свежего high/resistance, а не в свободном пространстве', 'после входа нет clean bullish displacement', pos_line],
+            secondary=['Structure trigger after pump', 'TP1 behind previous high', 'Wide RR not clean path', 'No acceptance after retest', 'No fresh bullish displacement'],
+            improve=['после pump ждать pullback и новый lower-risk trigger', 'для structure pending проверять previous high/resistance до TP1', 'не принимать высокий RR, если цель стоит за fresh high без acceptance'],
+            evidence=structure_pending_post_pump_fail)
+
         # V15: VIRTUAL-type fix. A LONG after a near-vertical buy-side leg
         # should not be reduced to the generic "under resistance" label. If the
         # move into entry was extended and SL sits inside the first pullback, make
