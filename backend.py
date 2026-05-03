@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-03_smc_env_read_fix_v31"
+MID_BUILD_TAG = "MID_BUILD_2026-05-03_smc_post_pump_guard_v32"
 
 import asyncio
 import json
@@ -32820,9 +32820,13 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 origin_fast_ok=bool(_origin_fast_ok),
                                                 origin_fast_reason=str(_origin_fast_reason or ""),
                                                 origin_bypass_zone=bool(_origin_fast_ok),
-                                                origin_bypass_near_extreme=bool(_origin_fast_ok),
-                                                origin_bypass_late_entry=bool(_origin_fast_ok),
-                                                origin_bypass_anti_bounce=bool(_origin_fast_ok),
+                                                # V32: origin fast-path may bypass only zone-wait by default.
+                                                # It must NOT automatically ignore late-entry / near-extreme / anti-bounce
+                                                # guards; otherwise post-pump LONGs near fresh highs are emitted as
+                                                # "Origin" and later close as the repeated late-pump losses shown in logs.
+                                                origin_bypass_near_extreme=bool(_origin_fast_ok and _env_bool("MID_SMART_SETUP_ORIGIN_BYPASS_NEAR_EXTREME", False)),
+                                                origin_bypass_late_entry=bool(_origin_fast_ok and _env_bool("MID_SMART_SETUP_ORIGIN_BYPASS_LATE_ENTRY", False)),
+                                                origin_bypass_anti_bounce=bool(_origin_fast_ok and _env_bool("MID_SMART_SETUP_ORIGIN_BYPASS_ANTI_BOUNCE", False)),
                                                 origin_conf_need=float(_origin_conf_need),
                                                 smart_setup_trap_ok=bool(_smart_trap_ok),
                                                 smart_setup_trap_reason=str(_smart_trap_reason or ""),
