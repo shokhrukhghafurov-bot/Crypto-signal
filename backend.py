@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-03_fix45_sl_entry_timing_no_env"
+MID_BUILD_TAG = "MID_BUILD_2026-05-04_fix47_ape_medium_retest_no_acceptance_no_env"
 
 import asyncio
 import json
@@ -3002,12 +3002,14 @@ def _mid_post_pump_no_acceptance_guard_reason(*,
     if float(target_pct) < float(min_target_pct):
         return ""
     try:
-        max_target_pct = float(os.getenv("MID_FINAL_POST_PUMP_MAX_TP1_PCT", "1.10") or 1.10)
+        max_target_pct = float(os.getenv("MID_FINAL_POST_PUMP_MAX_TP1_PCT", "1.80") or 1.80)
     except Exception:
-        max_target_pct = 1.10
-    # Keep strong continuation winners alive: BANANAS/ZEC-futures type has
-    # TP1 much farther than this, so this late-pump guard only catches the
-    # medium path/no-acceptance losses like CHIP/CAKE.
+        max_target_pct = 1.80
+    # V46: NIGHT-style losses can have a wider TP1 (about 1.5%) while still
+    # being an early/late-pump LONG below unaccepted resistance.  Keep very
+    # strong continuation winners alive: BANANAS/ZEC-futures type usually has
+    # TP1 much farther than this or an accepted reclaim, so this guard only
+    # waits medium-wide no-acceptance entries instead of sending immediately.
     if float(max_target_pct) > 0 and float(target_pct) > float(max_target_pct):
         return ""
 
@@ -3154,6 +3156,281 @@ def _mid_post_pump_no_acceptance_guard_reason(*,
     )
 
 
+def _mid_medium_retest_no_acceptance_guard_reason(*,
+                                                   sig=None,
+                                                   ta: dict | None = None,
+                                                   it: dict | None = None,
+                                                   gate_meta: dict | None = None,
+                                                   route: str | None = None,
+                                                   breakout_fresh_ok: bool = False,
+                                                   bo_rt_label: str | None = None,
+                                                   vol_x: float | None = None,
+                                                   body_atr: float | None = None) -> str:
+    """Wait medium/wide zone-retest LONG/SHORT that is still under/above an
+    unaccepted opposing level.
+
+    This is the APE/ACH/NIGHT style that fix46 did not fully cover: it is not
+    always a vertical post-pump entry, but it is still a retest/bounce emitted
+    before acceptance.  Generic "BOS -> FVG/OB retest" is not enough relief.
+    """
+    try:
+        enabled = str(os.getenv("MID_FINAL_MEDIUM_RETEST_ACCEPTANCE_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        enabled = True
+    if not enabled:
+        return ""
+    ta = ta or {}
+    it = it or {}
+    gm = gate_meta or {}
+
+    def _first_float(*vals):
+        for v in vals:
+            try:
+                if v is None or v == "":
+                    continue
+                fv = float(v)
+                if math.isfinite(fv) and fv > 0:
+                    return fv
+            except Exception:
+                pass
+        return None
+
+    try:
+        side = str((getattr(sig, "direction", None) if sig is not None else "") or ta.get("direction") or it.get("direction") or "").upper().strip()
+        market = str((getattr(sig, "market", None) if sig is not None else "") or ta.get("market") or it.get("market") or "").upper().strip()
+    except Exception:
+        side, market = "", ""
+    if side not in ("LONG", "SHORT"):
+        return ""
+
+    try:
+        entry = _first_float(getattr(sig, "entry", None), ta.get("entry"), ta.get("close"), ta.get("price"), it.get("entry"), it.get("price"))
+        sl = _first_float(getattr(sig, "sl", None), ta.get("sl"), it.get("sl"), it.get("stop"), it.get("stop_loss"))
+        tp1 = _first_float(getattr(sig, "tp1", None), ta.get("tp1"), it.get("tp1"), it.get("target"), it.get("take_profit"))
+    except Exception:
+        entry = sl = tp1 = None
+    if not entry or not tp1:
+        return ""
+    if side == "LONG" and tp1 <= entry:
+        return ""
+    if side == "SHORT" and tp1 >= entry:
+        return ""
+
+    try:
+        target_pct = abs(float(tp1) - float(entry)) / max(abs(float(entry)), 1e-12) * 100.0
+    except Exception:
+        target_pct = 0.0
+    try:
+        min_tp = float(os.getenv("MID_FINAL_MEDIUM_RETEST_MIN_TP1_PCT", "0.85") or 0.85)
+    except Exception:
+        min_tp = 0.85
+    try:
+        max_tp = float(os.getenv("MID_FINAL_MEDIUM_RETEST_MAX_TP1_PCT", "2.25") or 2.25)
+    except Exception:
+        max_tp = 2.25
+    if float(target_pct) < float(min_tp) or (float(max_tp) > 0 and float(target_pct) > float(max_tp)):
+        return ""
+
+    risk_pct = 0.0
+    try:
+        if sl and sl > 0:
+            risk_pct = abs(float(entry) - float(sl)) / max(abs(float(entry)), 1e-12) * 100.0
+    except Exception:
+        risk_pct = 0.0
+    try:
+        min_risk = float(os.getenv("MID_FINAL_MEDIUM_RETEST_MIN_RISK_PCT", "0.45") or 0.45)
+    except Exception:
+        min_risk = 0.45
+    if float(risk_pct) > 0 and float(risk_pct) < float(min_risk):
+        return ""
+
+    try:
+        route_blob = " ".join(str(x or "") for x in (
+            route,
+            it.get("smc_setup_route"), it.get("emit_route"), it.get("smart_setup_label"),
+            it.get("smart_setup_name"), it.get("setup"), it.get("setup_name"),
+            gm.get("route"), gm.get("setup"), bo_rt_label,
+        )).lower()
+    except Exception:
+        route_blob = ""
+
+    # Protect proven good origin/continuation winners (ONDO/BANANAS/ZEC-futures
+    # type).  Origin is only handled by the stricter post-pump/origin guards;
+    # this medium-retest guard targets zone-retest/structure pending emits.
+    if "origin" in route_blob:
+        return ""
+
+    # A real fresh breakout can save the setup only with an actual impulse/volume.
+    try:
+        strong_body = float(body_atr or 0.0) >= float(os.getenv("MID_FINAL_MEDIUM_RETEST_RELIEF_BODY_ATR", "0.12") or 0.12)
+    except Exception:
+        strong_body = False
+    try:
+        strong_vol = float(vol_x or 0.0) >= float(os.getenv("MID_FINAL_MEDIUM_RETEST_RELIEF_VOL_X", "0.80") or 0.80)
+    except Exception:
+        strong_vol = False
+    if bool(breakout_fresh_ok) and (bool(strong_body) or bool(strong_vol)):
+        return ""
+
+    atr = _first_float(ta.get("atr30"), ta.get("atr_abs"), it.get("atr_at_create"), it.get("atr30"), gm.get("atr30"), gm.get("atr_abs"))
+    levels: list[tuple[float, str]] = []
+
+    def _push(v, name):
+        try:
+            fv = float(v)
+            if math.isfinite(fv) and fv > 0:
+                levels.append((fv, str(name or "level")))
+        except Exception:
+            pass
+
+    if side == "LONG":
+        keys = ("resistance", "nearest_resistance", "local_resistance", "eq_hi", "recent_high", "swing_high", "last_swing_high", "range_high", "seller_level", "supply_level")
+    else:
+        keys = ("support", "nearest_support", "local_support", "eq_lo", "recent_low", "swing_low", "last_swing_low", "range_low", "buyer_level", "demand_level")
+    for src in (ta, it, gm):
+        if isinstance(src, dict):
+            for k in keys:
+                _push(src.get(k), k)
+    try:
+        for lo, hi, name in _mid_collect_structural_zone_pairs(ta, it):
+            ns = str(name or "").lower()
+            if side == "LONG" and ("supply" in ns or "bear" in ns or "res" in ns or "ob" in ns):
+                _push(lo, name)
+            elif side == "SHORT" and ("demand" in ns or "bull" in ns or "sup" in ns or "ob" in ns):
+                _push(hi, name)
+    except Exception:
+        pass
+
+    opp_level = None
+    opp_name = ""
+    try:
+        if side == "LONG":
+            inside = [(lv, nm) for lv, nm in levels if float(lv) > float(entry)]
+            if inside:
+                opp_level, opp_name = min(inside, key=lambda x: abs(float(x[0]) - float(entry)))
+        else:
+            inside = [(lv, nm) for lv, nm in levels if float(lv) < float(entry)]
+            if inside:
+                opp_level, opp_name = max(inside, key=lambda x: float(x[0]))
+    except Exception:
+        opp_level, opp_name = None, ""
+    if opp_level is None:
+        return ""
+
+    try:
+        accept_atr = float(os.getenv("MID_FINAL_MEDIUM_RETEST_ACCEPT_BUF_ATR", "0.06") or 0.06)
+    except Exception:
+        accept_atr = 0.06
+    try:
+        accept_pct = float(os.getenv("MID_FINAL_MEDIUM_RETEST_ACCEPT_BUF_PCT", "0.025") or 0.025) / 100.0
+    except Exception:
+        accept_pct = 0.00025
+    accept_buf = max((float(atr or 0.0) * float(accept_atr)) if atr else 0.0, abs(float(entry)) * float(accept_pct))
+    try:
+        if side == "LONG" and float(entry) > float(opp_level) + float(accept_buf):
+            return ""
+        if side == "SHORT" and float(entry) < float(opp_level) - float(accept_buf):
+            return ""
+    except Exception:
+        pass
+
+    try:
+        opp_dist_pct = abs(float(opp_level) - float(entry)) / max(abs(float(entry)), 1e-12) * 100.0
+    except Exception:
+        opp_dist_pct = 0.0
+    try:
+        max_opp_pct = min(float(target_pct) * float(os.getenv("MID_FINAL_MEDIUM_RETEST_MAX_OBSTACLE_PART", "0.85") or 0.85), float(os.getenv("MID_FINAL_MEDIUM_RETEST_MAX_OBSTACLE_PCT", "1.35") or 1.35))
+    except Exception:
+        max_opp_pct = min(float(target_pct) * 0.85, 1.35)
+    if float(opp_dist_pct) < 0 or float(opp_dist_pct) > float(max_opp_pct):
+        return ""
+
+    obstacle = "resistance" if side == "LONG" else "support"
+    side_word = "long" if side == "LONG" else "short"
+    return (
+        f"medium_retest_no_acceptance:{side_word}|opp={obstacle}|src={opp_name}|"
+        f"level={float(opp_level):.10g}|opp_pct={float(opp_dist_pct):.3f}|"
+        f"tp1_pct={float(target_pct):.3f}|risk_pct={float(risk_pct):.3f}|"
+        f"body_atr={float(body_atr or 0.0):.2f}|vol_x={float(vol_x or 0.0):.2f}"
+    )
+
+
+def _mid_unrealistic_tp1_guard_reason(*,
+                                      sig=None,
+                                      ta: dict | None = None,
+                                      it: dict | None = None,
+                                      gate_meta: dict | None = None,
+                                      route: str | None = None,
+                                      breakout_fresh_ok: bool = False) -> str:
+    """Guard ORDI-style fantasy RR: TP1 is extremely far for a 5m/15m emit.
+
+    A huge RR does not mean a clean path.  If TP1 is many percent away and the
+    entry is not a confirmed fresh breakout/accepted continuation, wait instead
+    of sending the signal immediately.
+    """
+    try:
+        enabled = str(os.getenv("MID_FINAL_UNREALISTIC_TP1_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        enabled = True
+    if not enabled:
+        return ""
+    ta = ta or {}
+    it = it or {}
+    gm = gate_meta or {}
+
+    def _first_float(*vals):
+        for v in vals:
+            try:
+                if v is None or v == "":
+                    continue
+                fv = float(v)
+                if math.isfinite(fv) and fv > 0:
+                    return fv
+            except Exception:
+                pass
+        return None
+
+    try:
+        side = str((getattr(sig, "direction", None) if sig is not None else "") or ta.get("direction") or it.get("direction") or "").upper().strip()
+        market = str((getattr(sig, "market", None) if sig is not None else "") or ta.get("market") or it.get("market") or "").upper().strip()
+    except Exception:
+        side, market = "", ""
+    if side not in ("LONG", "SHORT"):
+        return ""
+    entry = _first_float(getattr(sig, "entry", None), ta.get("entry"), ta.get("close"), it.get("entry"), it.get("price"))
+    tp1 = _first_float(getattr(sig, "tp1", None), ta.get("tp1"), it.get("tp1"), it.get("target"))
+    if not entry or not tp1:
+        return ""
+    if side == "LONG" and tp1 <= entry:
+        return ""
+    if side == "SHORT" and tp1 >= entry:
+        return ""
+    try:
+        target_pct = abs(float(tp1) - float(entry)) / max(abs(float(entry)), 1e-12) * 100.0
+    except Exception:
+        target_pct = 0.0
+    try:
+        spot_max = float(os.getenv("MID_FINAL_UNREALISTIC_TP1_SPOT_MAX_PCT", "6.00") or 6.0)
+    except Exception:
+        spot_max = 6.0
+    try:
+        fut_max = float(os.getenv("MID_FINAL_UNREALISTIC_TP1_FUT_MAX_PCT", "10.00") or 10.0)
+    except Exception:
+        fut_max = 10.0
+    max_pct = fut_max if market == "FUTURES" else spot_max
+    if float(target_pct) <= float(max_pct):
+        return ""
+    try:
+        route_blob = " ".join(str(x or "") for x in (route, it.get("smc_setup_route"), it.get("emit_route"), it.get("smart_setup_label"), it.get("smart_setup_name"), gate_meta.get("route") if isinstance(gate_meta, dict) else "")).lower()
+    except Exception:
+        route_blob = ""
+    # Do not kill a confirmed fresh breakout continuation; otherwise, make it
+    # wait for accepted structure instead of trusting fantasy RR.
+    if bool(breakout_fresh_ok) and ("origin" in route_blob or "breakout" in route_blob or "reclaim" in route_blob):
+        return ""
+    return f"unrealistic_tp1_path:tp1_pct={float(target_pct):.3f}|max={float(max_pct):.2f}|market={market or '-'}"
+
+
 def _mid_final_emit_apply_reason(reason: str) -> str:
     try:
         r = str(reason or "").strip().lower()
@@ -3176,6 +3453,10 @@ def _mid_final_emit_apply_reason(reason: str) -> str:
     if r.startswith("post_pump_"):
         return "post_pump_no_acceptance"
     if r.startswith("wait_reclaim_or_structural_sl"):
+        return "wait_reclaim_or_structural_sl"
+    if r.startswith("medium_retest_no_acceptance"):
+        return "wait_reclaim_or_structural_sl"
+    if r.startswith("unrealistic_tp1_path"):
         return "wait_reclaim_or_structural_sl"
     if r.startswith("instant_regime_block"):
         return "regime_block"
@@ -3336,6 +3617,35 @@ def _mid_final_emit_gate_reason(*,
     )
     if _tp1_path_reason:
         return str(_tp1_path_reason)
+
+    # V47: catch APE/ACH-style medium retest emits that are still under
+    # unaccepted resistance. Generic BOS/FVG retest is not enough acceptance.
+    _medium_retest_reason = _mid_medium_retest_no_acceptance_guard_reason(
+        sig=sig,
+        ta=ta,
+        it=it,
+        gate_meta=gate_meta,
+        route=route,
+        breakout_fresh_ok=bool(breakout_fresh_ok),
+        bo_rt_label=bo_rt_label,
+        vol_x=vol_x,
+        body_atr=body_atr,
+    )
+    if _medium_retest_reason:
+        return str(_medium_retest_reason)
+
+    # V47: catch ORDI-style fantasy RR targets that are too far for an
+    # unaccepted 5m/15m emit.
+    _unrealistic_tp1_reason = _mid_unrealistic_tp1_guard_reason(
+        sig=sig,
+        ta=ta,
+        it=it,
+        gate_meta=gate_meta,
+        route=route,
+        breakout_fresh_ok=bool(breakout_fresh_ok),
+    )
+    if _unrealistic_tp1_reason:
+        return str(_unrealistic_tp1_reason)
 
     # V38: catch BB/ALGO/ACH-style late LONG after pump (and SHORT mirror)
     # where TP1 may be far, but entry is still under/above an unaccepted
