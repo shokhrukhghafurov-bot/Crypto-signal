@@ -4086,7 +4086,7 @@ def _loss_diag_format_reason_text(code: str, fallback: str = '') -> str:
         'fake_confirm': 'Fake confirm: подтверждение выглядело валидным, но за ним не последовало реального расширения движения.',
         'failed_reclaim_hold': 'Failed reclaim hold: reclaim был показан, но рынок не смог закрепиться по правильную сторону уровня.',
         'breakout_trap': 'Breakout trap: пробой быстро вернулся обратно за уровень, поэтому continuation оказался ложным.',
-        'entry_into_overhead_supply': 'Entry into overhead supply: LONG был открыт прямо под зоной продавца / red FVG / supply. Сверху не было чистого пространства до TP, поэтому цена быстро получила sell pressure и ушла к SL.',
+        'entry_into_overhead_supply': 'Entry into overhead supply: LONG был открыт прямо под зоной продавца / supply/resistance. Сверху не было чистого пространства до TP, поэтому цена быстро получила sell pressure и ушла к SL.',
         'entry_into_supply': 'Entry into supply: LONG был открыт прямо под seller zone / Strong High. Сверху не было чистого пространства до TP, поэтому вероятность rejection вниз была высокой.',
         'entry_into_demand': 'Entry into demand: SHORT был открыт прямо над buyer zone / Strong Low. Снизу не было чистого пространства до TP, поэтому вероятность bounce вверх была высокой.',
         'entry_near_opposite_zone': 'Entry too close to opposite reaction zone: вход был рядом с зоной, откуда цена могла сразу отреагировать против сделки.',
@@ -4126,7 +4126,7 @@ def _loss_diag_chart_visible_lines(analysis: dict, side: str) -> list[str]:
                 pass
         if analysis.get('supply_near_tfs'):
             try:
-                lines.append('overhead bearish FVG / supply виден на TF: ' + '/'.join([str(x) for x in list(analysis.get('supply_near_tfs') or [])]))
+                lines.append('overhead supply/resistance виден на TF: ' + '/'.join([str(x) for x in list(analysis.get('supply_near_tfs') or [])]))
             except Exception:
                 pass
     if side_u == 'SHORT' and bool(analysis.get('short_failed_supply_bullish_structure')):
@@ -4150,7 +4150,7 @@ def _loss_diag_chart_visible_lines(analysis: dict, side: str) -> list[str]:
                 pass
         if analysis.get('demand_near_tfs'):
             try:
-                lines.append('underlying bullish FVG / demand виден на TF: ' + '/'.join([str(x) for x in list(analysis.get('demand_near_tfs') or [])]))
+                lines.append('underlying demand/support виден на TF: ' + '/'.join([str(x) for x in list(analysis.get('demand_near_tfs') or [])]))
             except Exception:
                 pass
     if side_u == 'SHORT' and bool(analysis.get('short_above_weak_low')):
@@ -5150,7 +5150,8 @@ def _loss_diag_apply_directional_location_flags(analysis: dict, *, side: str) ->
                 analysis['entry_into_demand'] = True
                 analysis['entry_near_opposite_zone'] = True
                 analysis['entry_in_range_discount'] = True
-                analysis['underlying_bullish_fvg'] = bool(analysis.get('underlying_bullish_fvg') or demand_near)
+                analysis['underlying_demand_support'] = True
+            # Do not auto-mark this as FVG: demand_near can be only local low/support.
             if bullish_context:
                 analysis['bullish_context_before_entry'] = True
                 analysis['bearish_reclaim_missing'] = True
@@ -5180,7 +5181,8 @@ def _loss_diag_apply_directional_location_flags(analysis: dict, *, side: str) ->
             analysis['entry_into_overhead_supply'] = True
             analysis['entry_near_opposite_zone'] = True
             analysis['entry_in_range_premium'] = True
-            analysis['overhead_bearish_fvg'] = bool(analysis.get('overhead_bearish_fvg') or supply_near)
+            analysis['overhead_supply_resistance'] = True
+            # Do not auto-mark this as FVG: supply_near can be only local high/resistance.
         if bearish_context:
             analysis['bearish_context_before_entry'] = True
             analysis['reclaim_missing'] = True
@@ -6605,7 +6607,8 @@ def _loss_card_apply_price_location_override(src: dict, analysis: dict, *, side:
                 analysis['entry_into_overhead_supply'] = True
                 analysis['entry_near_opposite_zone'] = True
                 analysis['entry_in_range_premium'] = True
-                analysis['overhead_bearish_fvg'] = bool(analysis.get('overhead_bearish_fvg') or supply_near)
+                analysis['overhead_supply_resistance'] = True
+            # Do not auto-mark this as FVG: supply_near can be only local high/resistance.
             if bearish_pre and not bullish_pre:
                 # Exact case: LONG is not only “into supply”; it is a buy
                 # against bearish structure while resistance/supply is overhead.
@@ -6640,7 +6643,8 @@ def _loss_card_apply_price_location_override(src: dict, analysis: dict, *, side:
             analysis['entry_into_demand'] = True
             analysis['entry_near_opposite_zone'] = True
             analysis['entry_in_range_discount'] = True
-            analysis['underlying_bullish_fvg'] = bool(analysis.get('underlying_bullish_fvg') or demand_near)
+            analysis['underlying_demand_support'] = True
+            # Do not auto-mark this as FVG: demand_near can be only local low/support.
         if bearish_pre:
             analysis['late_entry_after_exhausted_move'] = True
 
@@ -6819,9 +6823,16 @@ def _loss_card_real_zone_context(analysis: dict, side: str) -> dict:
             return v.strip().lower() in ('1', 'true', 'yes', 'on', 'да', 'есть')
         return bool(v)
 
+    # IMPORTANT: do not treat the old generic flags `overhead_bearish_fvg` /
+    # `underlying_bullish_fvg` as proof of a real FVG.  Older diagnostics set
+    # those booleans for any nearby supply/demand or range high/low blocker.
+    # For LOSS-card text, say red/green FVG only when the snapshot/alias proves
+    # an actual fair-value-gap zone; otherwise use resistance/support wording.
+    trust_generic_fvg_flags = _truthy(os.getenv('LOSS_CARD_TRUST_GENERIC_FVG_FLAGS', '0'))
     if side_l == 'supply':
+        generic_fvg_aliases = ('overhead_bearish_fvg',)
         fvg_aliases = (
-            'overhead_bearish_fvg', 'bearish_fvg_above_entry', 'red_fvg_above_entry',
+            'bearish_fvg_above_entry', 'red_fvg_above_entry',
             'supply_fvg_above_entry', 'nearest_bearish_fvg', 'nearest_supply_fvg',
             'fvg_above_entry', 'fvg_overhead', 'tp1_behind_bearish_fvg',
             'supply_fvg_blocks_tp1', 'bearish_fvg_blocks_tp1',
@@ -6831,8 +6842,9 @@ def _loss_card_real_zone_context(analysis: dict, side: str) -> dict:
             'tp1_behind_bearish_fvg', 'tp1_behind_supply_fvg',
         )
     else:
+        generic_fvg_aliases = ('underlying_bullish_fvg',)
         fvg_aliases = (
-            'underlying_bullish_fvg', 'bullish_fvg_below_entry', 'green_fvg_below_entry',
+            'bullish_fvg_below_entry', 'green_fvg_below_entry',
             'demand_fvg_below_entry', 'nearest_bullish_fvg', 'nearest_demand_fvg',
             'fvg_below_entry', 'fvg_under_entry', 'tp1_behind_bullish_fvg',
             'demand_fvg_blocks_tp1', 'bullish_fvg_blocks_tp1',
@@ -6843,6 +6855,8 @@ def _loss_card_real_zone_context(analysis: dict, side: str) -> dict:
         )
 
     alias_fvg = bool(any(_truthy(analysis.get(k)) for k in fvg_aliases))
+    if trust_generic_fvg_flags:
+        alias_fvg = bool(alias_fvg or any(_truthy(analysis.get(k)) for k in generic_fvg_aliases))
     alias_blocks = bool(any(_truthy(analysis.get(k)) for k in block_aliases))
     tfs_has_fvg = bool(any(('fvg' in x.lower() or 'fair value gap' in x.lower()) for x in tfs))
     blocks = bool(analysis.get(blocks_key) or alias_blocks or relation in ('blocks_target', 'inside_blocks_target'))
@@ -9546,7 +9560,6 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         # seller reaction / FVG zones and acceptance above the stack never came.
         overhead_fvg_stack = bool(
             real_supply_is_fvg
-            or b('overhead_bearish_fvg')
             or b('bearish_fvg_above_entry')
             or b('red_fvg_above_entry')
             or b('supply_fvg_above_entry')
@@ -9736,7 +9749,7 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
         # of the broader "local resistance" wording. This fixes ASTER-type cards:
         # LONG was not just under resistance; it was opened into/under a bearish FVG
         # and price never accepted above entry before SL.
-        real_bearish_fvg_block = bool(side_u == 'LONG' and (real_supply_is_fvg or b('overhead_bearish_fvg')) and no_tp and (weak_follow or tight_space or supply_blocks or normal_pullback) and not (bearish_ctx and not highish and not late_long))
+        real_bearish_fvg_block = bool(side_u == 'LONG' and real_supply_is_fvg and no_tp and (weak_follow or tight_space or supply_blocks or normal_pullback) and not (bearish_ctx and not highish and not late_long))
         add(12.6 + (1.0 if supply_blocks else 0) + (0.8 if tight_space else 0) + (0.6 if normal_pullback else 0), 'long_into_bearish_fvg_no_acceptance',
             primary='LONG into bearish FVG / local resistance, no acceptance above entry',
             scenario=f'LONG был открыт прямо под/в районе bearish FVG / seller reaction area ({supply_desc}). Цена не смогла закрепиться выше entry/retest зоны, fresh bullish displacement не появился, а TP1 находился за ближайшей зоной продавца. Поэтому после слабого стояния под зоной движение ушло к SL.',
@@ -9748,7 +9761,7 @@ def _loss_card_ranked_reason_payload(src: dict, analysis: dict, *, side: str, du
             evidence=real_bearish_fvg_block)
 
         # Symmetric exact detector for SHORT near a real green FVG / buyer zone.
-        real_bullish_fvg_block = bool(side_u == 'SHORT' and (real_demand_is_fvg or b('underlying_bullish_fvg')) and no_tp and (weak_follow or tight_space or demand_blocks or normal_pullback))
+        real_bullish_fvg_block = bool(side_u == 'SHORT' and real_demand_is_fvg and no_tp and (weak_follow or tight_space or demand_blocks or normal_pullback))
         add(12.6 + (1.0 if demand_blocks else 0) + (0.8 if tight_space else 0) + (0.6 if normal_pullback else 0), 'short_into_bullish_fvg_no_acceptance',
             primary='SHORT into bullish FVG / local support, no acceptance below entry',
             scenario=f'SHORT был открыт прямо над/в районе bullish FVG / buyer reaction area ({demand_desc}). Цена не смогла закрепиться ниже entry/retest зоны, fresh bearish displacement не появился, а TP1 находился за ближайшей зоной покупателя. Поэтому после слабого стояния над зоной цена дала bounce/reclaim к SL.',
@@ -10163,7 +10176,7 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
         visible_lines = [str(x) for x in list(variant.get('visible') or []) if str(x).strip()]
         if analysis.get('supply_near_tfs'):
             try:
-                visible_lines.append('overhead supply / red FVG виден на TF: ' + '/'.join([str(x) for x in list(analysis.get('supply_near_tfs') or [])]))
+                visible_lines.append('overhead supply/resistance виден на TF: ' + '/'.join([str(x) for x in list(analysis.get('supply_near_tfs') or [])]))
             except Exception:
                 pass
         try:
