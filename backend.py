@@ -2653,12 +2653,13 @@ def _mid_tp1_path_block_guard_reason(*,
     except Exception:
         target_pct = 0.0
     try:
-        max_target_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_MAX_TARGET_PCT", "0.55") or 0.55)
+        max_target_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_MAX_TARGET_PCT", "0.50") or 0.50)
     except Exception:
-        max_target_pct = 0.55
-    # V39 default catches ACT/ZAMA/ZEN style too: TP1 0.43-0.50% can still be
-    # blocked when the first opposing resistance/support is inside the path. Larger TP1 paths
-    # are handled by the normal late/near-extreme/origin guards.
+        max_target_pct = 0.50
+    # V40 balanced default: catch the tight TP1-under-resistance pattern, but
+    # avoid killing too many valid setups. The 0.42-0.50% zone below is handled
+    # adaptively: weak/no-fresh triggers still wait, stronger reclaim/confirm
+    # triggers are allowed through normal checks.
     if max_target_pct > 0 and float(target_pct) > float(max_target_pct):
         return ""
 
@@ -2774,11 +2775,63 @@ def _mid_tp1_path_block_guard_reason(*,
     except Exception:
         level_pct, frac = 0.0, 0.0
 
+    # V40 balance: do not turn the TP1-path guard into a global signal killer.
+    # Very tight targets are still protected. For the medium 0.42-0.50% band,
+    # block only when the trigger itself is weak/no-fresh. This keeps the bad
+    # SUI/POL/ACT/ZAMA/ZEN pattern under control while allowing the user's
+    # normal setup count to recover when there is a real reclaim/confirm.
+    try:
+        strict_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_STRICT_PCT", "0.42") or 0.42)
+    except Exception:
+        strict_pct = 0.42
+    try:
+        relief_body_min = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_RELIEF_BODY_ATR", "0.06") or 0.06)
+    except Exception:
+        relief_body_min = 0.06
+    try:
+        relief_vol_min = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_RELIEF_VOL_X", "0.80") or 0.80)
+    except Exception:
+        relief_vol_min = 0.80
+
+    body_atr_v = 0.0
+    try:
+        body_atr_v = float((ta or {}).get("body_atr") or (it or {}).get("body_atr") or 0.0)
+    except Exception:
+        body_atr_v = 0.0
+    try:
+        if body_atr_v <= 0 and atr_abs > 0:
+            lb = float((ta or {}).get("last_body") or (ta or {}).get("body") or 0.0)
+            body_atr_v = abs(lb) / max(float(atr_abs), 1e-12)
+    except Exception:
+        pass
+    vol_v = 0.0
+    try:
+        vol_v = float((ta or {}).get("rel_vol") if (ta or {}).get("rel_vol") is not None else ((ta or {}).get("vol_x") or (it or {}).get("vol_x") or 0.0))
+    except Exception:
+        vol_v = 0.0
+    fresh_ok = False
+    try:
+        fresh_ok = bool((it or {}).get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(it or {}))
+    except Exception:
+        fresh_ok = bool((it or {}).get("smart_breakout_fast_ok"))
+    try:
+        bo_txt = str((it or {}).get("bo_rt") or (it or {}).get("breakout_retest") or (gate_meta or {}).get("bo_rt") or "").lower()
+        if any(tok in bo_txt for tok in ("fresh", "bos", "breakout", "reclaim")):
+            fresh_ok = True
+    except Exception:
+        pass
+
+    if float(target_pct) > float(strict_pct):
+        strong_enough = bool(fresh_ok) or float(body_atr_v) >= float(relief_body_min) or float(vol_v) >= float(relief_vol_min)
+        if strong_enough:
+            return ""
+
     obstacle = "resistance" if side == "LONG" else "support"
     return (
         f"tp1_path_blocked_by_{obstacle}:"
         f"level={float(best_level):.10g}|src={best_name}|"
-        f"level_pct={float(level_pct):.3f}|tp1_pct={float(target_pct):.3f}|path_frac={float(frac):.2f}"
+        f"level_pct={float(level_pct):.3f}|tp1_pct={float(target_pct):.3f}|path_frac={float(frac):.2f}|"
+        f"body_atr={float(body_atr_v):.2f}|vol={float(vol_v):.2f}|fresh={int(bool(fresh_ok))}"
     )
 
 
