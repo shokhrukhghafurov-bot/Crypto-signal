@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-04_fix51_report_pre_entry_quality_filters"
+MID_BUILD_TAG = "MID_BUILD_2026-05-04_fix47_ape_medium_retest_no_acceptance_no_env"
 
 import asyncio
 import json
@@ -157,55 +157,6 @@ def _safe_float(x, default=None):
         return v
     except Exception:
         return default
-
-def _env_bool_any(names, default: bool = False) -> bool:
-    """Read the first explicitly set boolean ENV from several aliases.
-
-    This keeps old MID_* Railway variables working while allowing the clearer
-    TRADE_* names used in the operator report.
-    """
-    try:
-        if isinstance(names, str):
-            names = [names]
-        for name in names:
-            raw = os.getenv(str(name))
-            if raw is None or str(raw).strip() == "":
-                continue
-            txt = str(raw).strip()
-            if len(txt) >= 2 and ((txt[0] == txt[-1] == '"') or (txt[0] == txt[-1] == "'")):
-                txt = txt[1:-1].strip()
-            low = txt.lower()
-            if low in ("1", "true", "yes", "on", "y", "t"):
-                return True
-            if low in ("0", "false", "no", "off", "n", "f"):
-                return False
-            return True
-    except Exception:
-        pass
-    return bool(default)
-
-
-def _env_float_any(names, default: float) -> float:
-    """Read the first valid float ENV from several aliases."""
-    try:
-        if isinstance(names, str):
-            names = [names]
-        for name in names:
-            raw = os.getenv(str(name))
-            if raw is None or str(raw).strip() == "":
-                continue
-            txt = str(raw).strip()
-            if len(txt) >= 2 and ((txt[0] == txt[-1] == '"') or (txt[0] == txt[-1] == "'")):
-                txt = txt[1:-1].strip()
-            try:
-                return float(txt.replace(",", "."))
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return float(default)
-
-
 
 def calc_vwap(df):
     try:
@@ -2658,67 +2609,6 @@ def _mid_futures_short_weak_emit_reason(*,
 
 
 
-def _mid_acceptance_close_count_ok(side: str,
-                                   ta: dict | None = None,
-                                   it: dict | None = None,
-                                   gate_meta: dict | None = None) -> bool:
-    """Return True when final metadata explicitly reports accepted closes.
-
-    The scanner usually communicates acceptance through route labels/reclaim flags.
-    Fix51 also supports explicit close-count metadata if the strategy layer emits it.
-    """
-    try:
-        side_u = str(side or "").upper().strip()
-        req_1m = int(max(0.0, _env_float_any(("TRADE_ACCEPTANCE_CLOSES_1M", "MID_FINAL_ACCEPTANCE_CLOSES_1M"), 0.0)))
-        req_5m = int(max(0.0, _env_float_any(("TRADE_ACCEPTANCE_CLOSES_5M", "MID_FINAL_ACCEPTANCE_CLOSES_5M"), 0.0)))
-    except Exception:
-        req_1m = req_5m = 0
-    if req_1m <= 0 and req_5m <= 0:
-        return False
-
-    def _first_num(keys):
-        for src in (ta or {}, it or {}, gate_meta or {}):
-            if not isinstance(src, dict):
-                continue
-            for key in keys:
-                try:
-                    v = src.get(key)
-                    if v is None or v == "":
-                        continue
-                    return float(v)
-                except Exception:
-                    pass
-        return None
-
-    if side_u == "LONG":
-        keys_1m = (
-            "acceptance_closes_1m", "accepted_closes_1m", "closes_above_resistance_1m",
-            "closes_above_level_1m", "reclaim_closes_1m", "accepted_reclaim_closes_1m",
-        )
-        keys_5m = (
-            "acceptance_closes_5m", "accepted_closes_5m", "closes_above_resistance_5m",
-            "closes_above_level_5m", "reclaim_closes_5m", "accepted_reclaim_closes_5m",
-        )
-    elif side_u == "SHORT":
-        keys_1m = (
-            "acceptance_closes_1m", "accepted_closes_1m", "closes_below_support_1m",
-            "closes_below_level_1m", "reclaim_closes_1m", "accepted_reclaim_closes_1m",
-        )
-        keys_5m = (
-            "acceptance_closes_5m", "accepted_closes_5m", "closes_below_support_5m",
-            "closes_below_level_5m", "reclaim_closes_5m", "accepted_reclaim_closes_5m",
-        )
-    else:
-        keys_1m = ("acceptance_closes_1m", "accepted_closes_1m")
-        keys_5m = ("acceptance_closes_5m", "accepted_closes_5m")
-
-    c1 = _first_num(keys_1m)
-    c5 = _first_num(keys_5m)
-    ok_1m = req_1m > 0 and c1 is not None and float(c1) >= float(req_1m)
-    ok_5m = req_5m > 0 and c5 is not None and float(c5) >= float(req_5m)
-    return bool(ok_1m or ok_5m)
-
-
 
 def _mid_tp1_path_block_guard_reason(*,
                                       sig=None,
@@ -2738,11 +2628,7 @@ def _mid_tp1_path_block_guard_reason(*,
     nearest opposing level is still unaccepted.
     """
     try:
-        enabled = _env_bool_any((
-            "TRADE_BLOCK_TP1_BEHIND_RESISTANCE",
-            "TRADE_REQUIRE_CLEAN_PATH_TO_TP1",
-            "MID_FINAL_TP1_PATH_GUARD",
-        ), True)
+        enabled = str(os.getenv("MID_FINAL_TP1_PATH_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
     except Exception:
         enabled = True
     if not enabled:
@@ -2771,16 +2657,7 @@ def _mid_tp1_path_block_guard_reason(*,
         # not only the older 0.35-0.50% SUI/POL band. Keep this guard
         # enabled by default, but the wider band below is handled more
         # selectively so PENDLE/RENDER/ALGO/MET pullback winners are not cut.
-        _env_max_target_pct = _env_float_any((
-            "TRADE_TP1_PATH_GUARD_MAX_TARGET_PCT",
-            "TRADE_CLEAN_PATH_MAX_TP1_PCT",
-            "MID_FINAL_TP1_PATH_GUARD_MAX_TARGET_PCT",
-        ), 0.95)
-        # V48: old Railway/.env deployments may still have the earlier 0.38 value.
-        # That misses the repeated 0.42-0.74% LOSS pattern (ROSE/FIL/ALGO/DOGE/ETC/ETH).
-        # Keep the guard wide in code by default; this is still not a signal-killer because
-        # it requires an unaccepted opposing level inside the TP1 path.
-        max_target_pct = max(float(_env_max_target_pct), 0.95)
+        max_target_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_MAX_TARGET_PCT", "0.95") or 0.95)
     except Exception:
         max_target_pct = 0.95
     # V44 balanced default: catch tight/medium TP1-under-resistance patterns.
@@ -2805,19 +2682,19 @@ def _mid_tp1_path_block_guard_reason(*,
     except Exception:
         atr_abs = 0.0
     try:
-        pad_atr = _env_float_any(("TRADE_TP1_PATH_PAD_ATR", "MID_FINAL_TP1_PATH_GUARD_PAD_ATR"), 0.05)
+        pad_atr = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_PAD_ATR", "0.05") or 0.05)
     except Exception:
         pad_atr = 0.05
     try:
-        pad_pct = _env_float_any(("TRADE_TP1_PATH_PAD_PCT", "MID_FINAL_TP1_PATH_GUARD_PAD_PCT"), 0.015) / 100.0
+        pad_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_PAD_PCT", "0.015") or 0.015) / 100.0
     except Exception:
         pad_pct = 0.00015
     try:
-        accept_atr = _env_float_any(("TRADE_ACCEPTANCE_BUFFER_ATR", "MID_FINAL_TP1_PATH_GUARD_ACCEPT_BUF_ATR"), 0.05)
+        accept_atr = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_ACCEPT_BUF_ATR", "0.05") or 0.05)
     except Exception:
         accept_atr = 0.05
     try:
-        accept_pct = _env_float_any(("TRADE_ACCEPTANCE_BUFFER_PCT", "MID_FINAL_TP1_PATH_GUARD_ACCEPT_BUF_PCT"), 0.020) / 100.0
+        accept_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_ACCEPT_BUF_PCT", "0.020") or 0.020) / 100.0
     except Exception:
         accept_pct = 0.00020
 
@@ -2908,7 +2785,7 @@ def _mid_tp1_path_block_guard_reason(*,
     # SUI/POL/ACT/ZAMA/ZEN pattern under control while allowing the user's
     # normal setup count to recover when there is a real reclaim/confirm.
     try:
-        strict_pct = _env_float_any(("TRADE_TP1_PATH_STRICT_PCT", "MID_FINAL_TP1_PATH_GUARD_STRICT_PCT"), 0.42)
+        strict_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_STRICT_PCT", "0.42") or 0.42)
     except Exception:
         strict_pct = 0.42
     try:
@@ -2967,15 +2844,15 @@ def _mid_tp1_path_block_guard_reason(*,
     # below unaccepted resistance.  Therefore generic retest/pullback is NOT relief.
     # Relief requires real reclaim/breakout/acceptance context OR a strong candle/volume
     # with the obstacle close to TP1 rather than immediately on entry.
-    hard_reclaim_ctx = any(tok in ctx_txt for tok in ("reclaim", "accept", "accepted", "breakout")) or _mid_acceptance_close_count_ok(side, ta, it, gate_meta)
+    hard_reclaim_ctx = any(tok in ctx_txt for tok in ("reclaim", "accept", "accepted", "breakout"))
     generic_retest_ctx = any(tok in ctx_txt for tok in ("retest", "pullback"))
 
     try:
-        tight_relief_frac = _env_float_any(("TRADE_CLEAN_PATH_RELIEF_FRAC", "MID_FINAL_TP1_PATH_GUARD_TIGHT_RELIEF_FRAC"), 0.70)
+        tight_relief_frac = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_TIGHT_RELIEF_FRAC", "0.70") or 0.70)
     except Exception:
         tight_relief_frac = 0.70
     try:
-        close_obstacle_frac = _env_float_any(("TRADE_CLEAN_PATH_MAX_OBSTACLE_FRAC", "MID_FINAL_TP1_PATH_GUARD_CLOSE_OBSTACLE_FRAC"), 0.58)
+        close_obstacle_frac = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_CLOSE_OBSTACLE_FRAC", "0.58") or 0.58)
     except Exception:
         close_obstacle_frac = 0.58
     try:
@@ -3000,7 +2877,7 @@ def _mid_tp1_path_block_guard_reason(*,
     reclaim_relief = bool(hard_reclaim_ctx) and bool(soft_confirm)
 
     try:
-        medium_pct = _env_float_any(("TRADE_TP1_PATH_MEDIUM_PCT", "MID_FINAL_TP1_PATH_GUARD_MEDIUM_PCT"), 0.50)
+        medium_pct = float(os.getenv("MID_FINAL_TP1_PATH_GUARD_MEDIUM_PCT", "0.50") or 0.50)
     except Exception:
         medium_pct = 0.50
 
@@ -3038,353 +2915,6 @@ def _mid_tp1_path_block_guard_reason(*,
     )
 
 
-
-def _mid_micro_tp1_no_acceptance_guard_reason(*,
-                                                sig=None,
-                                                ta: dict | None = None,
-                                                it: dict | None = None,
-                                                gate_meta: dict | None = None,
-                                                route: str | None = None,
-                                                breakout_fresh_ok: bool = False,
-                                                bo_rt_label: str | None = None,
-                                                vol_x: float | None = None,
-                                                body_atr: float | None = None) -> str:
-    """V48: wait tiny TP1 LONG/SHORT entries that have no real acceptance.
-
-    This catches the repeated post-fix47 loss cluster where the card later says
-    "TP1 blocked by local resistance" but the final gate did not have a usable
-    explicit level at emit time.  It is intentionally narrow:
-      - only tiny TP1 paths (default <= 0.62%) with tight risk;
-      - no fresh breakout/reclaim/acceptance relief;
-      - weak current candle/volume confirmation.
-
-    Good winners are protected by fresh breakout/reclaim context or strong current
-    displacement/volume, so origin winners and clean continuations are not cut.
-    """
-    try:
-        enabled = _env_bool_any((
-            "TRADE_REQUIRE_ACCEPTANCE_BEFORE_LONG",
-            "TRADE_REQUIRE_CLEAN_PATH_TO_TP1",
-            "MID_FINAL_MICRO_TP1_NO_ACCEPTANCE_GUARD",
-        ), True)
-    except Exception:
-        enabled = True
-    if not enabled:
-        return ""
-    ta = ta or {}
-    it = it or {}
-    gm = gate_meta or {}
-
-    def _first_float(*vals):
-        for v in vals:
-            try:
-                if v is None or v == "":
-                    continue
-                fv = float(v)
-                if math.isfinite(fv) and fv > 0:
-                    return fv
-            except Exception:
-                pass
-        return None
-
-    try:
-        side = str((getattr(sig, "direction", None) if sig is not None else "") or ta.get("direction") or it.get("direction") or "").upper().strip()
-        market = str((getattr(sig, "market", None) if sig is not None else "") or ta.get("market") or it.get("market") or "").upper().strip()
-        symbol = str((getattr(sig, "symbol", None) if sig is not None else "") or ta.get("symbol") or it.get("symbol") or "").upper().strip()
-    except Exception:
-        side, market, symbol = "", "", ""
-    if side not in ("LONG", "SHORT"):
-        return ""
-
-    entry = _first_float(getattr(sig, "entry", None), ta.get("entry"), ta.get("close"), ta.get("price"), it.get("entry"), it.get("price"))
-    sl = _first_float(getattr(sig, "sl", None), ta.get("sl"), it.get("sl"), it.get("stop"), it.get("stop_loss"))
-    tp1 = _first_float(getattr(sig, "tp1", None), ta.get("tp1"), it.get("tp1"), it.get("target"), it.get("take_profit"))
-    if not entry or not tp1:
-        return ""
-    if side == "LONG" and tp1 <= entry:
-        return ""
-    if side == "SHORT" and tp1 >= entry:
-        return ""
-
-    try:
-        target_pct = abs(float(tp1) - float(entry)) / max(abs(float(entry)), 1e-12) * 100.0
-    except Exception:
-        target_pct = 0.0
-    try:
-        # V48 clamps old env values upward enough to catch ROSE/FIL/ALGO/DOGE/AVAX,
-        # but still leaves medium/wide setups to the explicit level/post-pump guards.
-        _env_max_tp = _env_float_any((
-            "TRADE_MIN_CLEAN_SPACE_PCT_SPOT",
-            "TRADE_MICRO_TP1_MAX_PCT",
-            "MID_FINAL_MICRO_TP1_MAX_PCT",
-        ), 0.62)
-        max_tp = max(float(_env_max_tp), 0.62)
-    except Exception:
-        max_tp = 0.62
-    try:
-        min_tp = float(os.getenv("MID_FINAL_MICRO_TP1_MIN_PCT", "0.20") or 0.20)
-    except Exception:
-        min_tp = 0.20
-
-    risk_pct = 0.0
-    try:
-        if sl and sl > 0:
-            risk_pct = abs(float(entry) - float(sl)) / max(abs(float(entry)), 1e-12) * 100.0
-    except Exception:
-        risk_pct = 0.0
-    try:
-        _env_max_risk = float(os.getenv("MID_FINAL_MICRO_TP1_MAX_RISK_PCT", "0.58") or 0.58)
-        max_risk = max(float(_env_max_risk), 0.58)
-    except Exception:
-        max_risk = 0.58
-    if float(risk_pct) > 0 and float(risk_pct) > float(max_risk):
-        return ""
-
-    atr = _first_float(ta.get("atr30"), ta.get("atr_abs"), it.get("atr_at_create"), it.get("atr30"), gm.get("atr30"), gm.get("atr_abs"))
-    try:
-        target_atr = abs(float(tp1) - float(entry)) / max(float(atr or 0.0), 1e-12) if atr else 0.0
-    except Exception:
-        target_atr = 0.0
-    try:
-        min_clean_atr = _env_float_any(("TRADE_MIN_CLEAN_SPACE_ATR_MULT", "MID_FINAL_MICRO_TP1_MIN_CLEAN_ATR"), 0.75)
-    except Exception:
-        min_clean_atr = 0.75
-    micro_by_pct = float(min_tp) <= float(target_pct) <= float(max_tp)
-    micro_by_atr = bool(float(min_clean_atr) > 0 and float(target_atr) > 0 and float(target_atr) <= float(min_clean_atr) and float(target_pct) <= max(float(max_tp), 1.05))
-    if not micro_by_pct and not micro_by_atr:
-        return ""
-
-    current_body_atr = 0.0
-    try:
-        current_body_atr = float(body_atr if body_atr is not None else 0.0)
-    except Exception:
-        current_body_atr = 0.0
-    try:
-        if current_body_atr <= 0 and atr and float(atr) > 0:
-            lb = _first_float(ta.get("last_body"), gm.get("current_body"), it.get("last_body"))
-            if lb is not None:
-                current_body_atr = abs(float(lb)) / max(float(atr), 1e-12)
-    except Exception:
-        pass
-    try:
-        current_vol = float(vol_x if vol_x is not None else (ta.get("rel_vol") if ta.get("rel_vol") is not None else (ta.get("vol_x") or gm.get("vol_x") or it.get("vol_x") or 0.0)))
-    except Exception:
-        current_vol = 0.0
-
-    try:
-        route_blob = " ".join(str(x or "") for x in (
-            route, bo_rt_label,
-            it.get("bo_rt"), it.get("breakout_retest"), it.get("smc_setup_route"), it.get("emit_route"),
-            it.get("smart_setup_label"), it.get("smart_setup_name"), it.get("setup"), it.get("setup_name"),
-            gm.get("route"), gm.get("setup"), gm.get("primary_reason"),
-        )).lower()
-    except Exception:
-        route_blob = ""
-
-    # Generic BOS/FVG retest is not enough.  Relief needs acceptance/reclaim text
-    # or a fresh breakout with current displacement/volume.
-    accepted_ctx = any(tok in route_blob for tok in ("accept", "accepted", "reclaim")) or _mid_acceptance_close_count_ok(side, ta, it, gm)
-    generic_retest_ctx = any(tok in route_blob for tok in ("retest", "fvg", "ob", "bos"))
-    try:
-        relief_body = _env_float_any(("TRADE_ACCEPTANCE_MIN_BODY_ATR", "MID_FINAL_MICRO_TP1_RELIEF_BODY_ATR"), 0.11)
-    except Exception:
-        relief_body = 0.11
-    try:
-        relief_vol = _env_float_any(("TRADE_ACCEPTANCE_MIN_VOL_X", "MID_FINAL_MICRO_TP1_RELIEF_VOL_X"), 0.95)
-    except Exception:
-        relief_vol = 0.95
-
-    has_current_impulse = (float(current_body_atr) >= float(relief_body)) or (float(current_vol) >= float(relief_vol))
-    if bool(accepted_ctx) and (bool(has_current_impulse) or bool(breakout_fresh_ok)):
-        return ""
-    if bool(breakout_fresh_ok) and bool(has_current_impulse):
-        return ""
-
-    # If we have an explicit accepted level from another guard, do not double block.
-    try:
-        if side == "LONG":
-            accepted_level = _first_float(ta.get("accepted_resistance"), it.get("accepted_resistance"), gm.get("accepted_resistance"))
-            if accepted_level and float(entry) > float(accepted_level):
-                return ""
-        else:
-            accepted_level = _first_float(ta.get("accepted_support"), it.get("accepted_support"), gm.get("accepted_support"))
-            if accepted_level and float(entry) < float(accepted_level):
-                return ""
-    except Exception:
-        pass
-
-    side_word = "long" if side == "LONG" else "short"
-    # Use wait semantics: mapped to tp1_path_blocked so pending can re-check later.
-    return (
-        f"micro_tp1_no_acceptance:{side_word}|symbol={symbol or '-'}|market={market or '-'}|"
-        f"tp1_pct={float(target_pct):.3f}|risk_pct={float(risk_pct):.3f}|"
-        f"body_atr={float(current_body_atr):.2f}|vol_x={float(current_vol):.2f}|"
-        f"tp1_atr={float(target_atr):.2f}|fresh={int(bool(breakout_fresh_ok))}|"
-        f"generic_retest={int(bool(generic_retest_ctx))}"
-    )
-
-
-
-def _mid_micro_sl_timing_guard_reason(*,
-                                      sig=None,
-                                      ta: dict | None = None,
-                                      it: dict | None = None,
-                                      gate_meta: dict | None = None,
-                                      route: str | None = None,
-                                      breakout_fresh_ok: bool = False,
-                                      bo_rt_label: str | None = None,
-                                      vol_x: float | None = None,
-                                      body_atr: float | None = None) -> str:
-    """V49: wait PNUT-style tiny LONG/SHORT entries with SL inside first retest.
-
-    This is not the same as the bad "late pump under resistance" pattern.  PNUT
-    was directionally OK: after SL it later moved to TP.  The error was entry
-    timing / stop placement: a non-origin Structure Pending trigger used a very
-    small TP1 and a tight SL before the 1m/5m reclaim was accepted, so the first
-    normal retest wick hit SL.
-
-    Keep good DOT/ONDO origin-fast winners alive: origin/reclaim/accepted routes
-    and strong fresh displacement/volume are explicit relief.
-    """
-    try:
-        enabled = _env_bool_any((
-            "TRADE_REJECT_IF_SL_INSIDE_PULLBACK",
-            "TRADE_REQUIRE_ACCEPTANCE_BEFORE_LONG",
-            "MID_FINAL_MICRO_SL_TIMING_GUARD",
-        ), True)
-    except Exception:
-        enabled = True
-    if not enabled:
-        return ""
-    ta = ta or {}
-    it = it or {}
-    gm = gate_meta or {}
-
-    def _first_float(*vals):
-        for v in vals:
-            try:
-                if v is None or v == "":
-                    continue
-                fv = float(v)
-                if math.isfinite(fv) and fv > 0:
-                    return fv
-            except Exception:
-                pass
-        return None
-
-    try:
-        side = str((getattr(sig, "direction", None) if sig is not None else "") or ta.get("direction") or it.get("direction") or "").upper().strip()
-        market = str((getattr(sig, "market", None) if sig is not None else "") or ta.get("market") or it.get("market") or "").upper().strip()
-        symbol = str((getattr(sig, "symbol", None) if sig is not None else "") or ta.get("symbol") or it.get("symbol") or "").upper().strip()
-    except Exception:
-        side, market, symbol = "", "", ""
-    if side not in ("LONG", "SHORT"):
-        return ""
-
-    entry = _first_float(getattr(sig, "entry", None), ta.get("entry"), ta.get("close"), ta.get("price"), it.get("entry"), it.get("price"))
-    sl = _first_float(getattr(sig, "sl", None), ta.get("sl"), it.get("sl"), it.get("stop"), it.get("stop_loss"))
-    tp1 = _first_float(getattr(sig, "tp1", None), ta.get("tp1"), it.get("tp1"), it.get("target"), it.get("take_profit"))
-    if not entry or not sl or not tp1:
-        return ""
-    if side == "LONG" and not (sl < entry < tp1):
-        return ""
-    if side == "SHORT" and not (tp1 < entry < sl):
-        return ""
-
-    try:
-        target_pct = abs(float(tp1) - float(entry)) / max(abs(float(entry)), 1e-12) * 100.0
-        risk_pct = abs(float(entry) - float(sl)) / max(abs(float(entry)), 1e-12) * 100.0
-    except Exception:
-        return ""
-
-    try:
-        max_tp = max(float(os.getenv("MID_FINAL_MICRO_SL_TIMING_MAX_TP1_PCT", "0.55") or 0.55), 0.55)
-    except Exception:
-        max_tp = 0.55
-    try:
-        min_tp = float(os.getenv("MID_FINAL_MICRO_SL_TIMING_MIN_TP1_PCT", "0.30") or 0.30)
-    except Exception:
-        min_tp = 0.30
-    try:
-        max_risk = max(float(os.getenv("MID_FINAL_MICRO_SL_TIMING_MAX_RISK_PCT", "0.40") or 0.40), 0.40)
-    except Exception:
-        max_risk = 0.40
-    if float(target_pct) < float(min_tp) or float(target_pct) > float(max_tp):
-        return ""
-    if float(risk_pct) <= 0 or float(risk_pct) > float(max_risk):
-        return ""
-
-    try:
-        route_blob = " ".join(str(x or "") for x in (
-            route, bo_rt_label,
-            it.get("bo_rt"), it.get("breakout_retest"), it.get("smc_setup_route"), it.get("emit_route"),
-            it.get("smart_setup_label"), it.get("smart_setup_name"), it.get("setup"), it.get("setup_name"),
-            gm.get("route"), gm.get("setup"), gm.get("primary_reason"), gm.get("fast_path"),
-        )).lower()
-    except Exception:
-        route_blob = ""
-
-    # DOT-type winners are origin/reclaim fast-path: do not block them here.
-    if any(tok in route_blob for tok in ("origin", "liquidity_reclaim", "accepted_reclaim")):
-        return ""
-
-    # If there is an explicit accepted/reclaim context, require only small current confirmation.
-    accepted_ctx = any(tok in route_blob for tok in ("accept", "accepted", "reclaim")) or _mid_acceptance_close_count_ok(side, ta, it, gm)
-    try:
-        atr = _first_float(ta.get("atr30"), ta.get("atr_abs"), it.get("atr_at_create"), it.get("atr30"), gm.get("atr30"), gm.get("atr_abs"))
-    except Exception:
-        atr = None
-    current_body_atr = 0.0
-    try:
-        current_body_atr = float(body_atr if body_atr is not None else 0.0)
-    except Exception:
-        current_body_atr = 0.0
-    try:
-        if current_body_atr <= 0 and atr and float(atr) > 0:
-            lb = _first_float(ta.get("last_body"), gm.get("current_body"), it.get("last_body"))
-            if lb is not None:
-                current_body_atr = abs(float(lb)) / max(float(atr), 1e-12)
-    except Exception:
-        pass
-    try:
-        current_vol = float(vol_x if vol_x is not None else (ta.get("rel_vol") if ta.get("rel_vol") is not None else (ta.get("vol_x") or gm.get("vol_x") or it.get("vol_x") or 0.0)))
-    except Exception:
-        current_vol = 0.0
-
-    try:
-        relief_body = float(os.getenv("MID_FINAL_MICRO_SL_TIMING_RELIEF_BODY_ATR", "0.14") or 0.14)
-    except Exception:
-        relief_body = 0.14
-    try:
-        relief_vol = float(os.getenv("MID_FINAL_MICRO_SL_TIMING_RELIEF_VOL_X", "1.20") or 1.20)
-    except Exception:
-        relief_vol = 1.20
-    strong_now = float(current_body_atr) >= float(relief_body) and float(current_vol) >= float(relief_vol)
-
-    # A true fresh breakout with strong present candle can go through; otherwise
-    # structure-pending micro entries should wait one more reclaim/retest close or
-    # be rebuilt with a structural SL.
-    if bool(breakout_fresh_ok) and bool(strong_now):
-        return ""
-    if bool(accepted_ctx) and (float(current_body_atr) >= float(relief_body) or float(current_vol) >= float(relief_vol)):
-        return ""
-
-    # Apply mostly to Structure Pending / generic BOS/FVG/OB retest emits, not to
-    # direct origin fast-path. If route metadata is sparse, still protect tiny tight
-    # SPOT micro setups because they are the exact PNUT/AVAX-after-fix47 shape.
-    structure_like = any(tok in route_blob for tok in ("structure", "pending", "trigger", "bos", "fvg", "ob", "retest")) or not route_blob.strip()
-    if not structure_like:
-        return ""
-
-    side_word = "long" if side == "LONG" else "short"
-    return (
-        f"micro_sl_timing_wait:{side_word}|symbol={symbol or '-'}|market={market or '-'}|"
-        f"tp1_pct={float(target_pct):.3f}|risk_pct={float(risk_pct):.3f}|"
-        f"body_atr={float(current_body_atr):.2f}|vol_x={float(current_vol):.2f}|"
-        f"fresh={int(bool(breakout_fresh_ok))}|accepted={int(bool(accepted_ctx))}"
-    )
-
-
 def _mid_post_pump_no_acceptance_guard_reason(*,
                                               sig=None,
                                               ta: dict | None = None,
@@ -3408,7 +2938,7 @@ def _mid_post_pump_no_acceptance_guard_reason(*,
     breakout/reclaim above resistance (or below support for SHORT) is allowed.
     """
     try:
-        enabled = _env_bool_any(("TRADE_BLOCK_LATE_LONG_AFTER_PUMP", "MID_FINAL_POST_PUMP_PULLBACK_GUARD"), True)
+        enabled = str(os.getenv("MID_FINAL_POST_PUMP_PULLBACK_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
     except Exception:
         enabled = True
     if not enabled:
@@ -3466,21 +2996,16 @@ def _mid_post_pump_no_acceptance_guard_reason(*,
     except Exception:
         target_pct = 0.0
     try:
-        min_target_pct = _env_float_any(("TRADE_POST_PUMP_MIN_TP1_PCT", "MID_FINAL_POST_PUMP_MIN_TP1_PCT"), 0.70)
+        min_target_pct = float(os.getenv("MID_FINAL_POST_PUMP_MIN_TP1_PCT", "0.70") or 0.70)
     except Exception:
         min_target_pct = 0.70
     if float(target_pct) < float(min_target_pct):
         return ""
     try:
-        _post_pump_default_max = "4.80" if str(market or "").upper().strip() == "FUTURES" else "2.25"
-        _env_max_target_pct = _env_float_any(("TRADE_POST_PUMP_MAX_TP1_PCT", "MID_FINAL_POST_PUMP_MAX_TP1_PCT"), float(_post_pump_default_max))
-        # V48: FOGO-type futures losses had TP1 around 4.1%, so old 1.80 missed them.
-        # Keep this wide by code default, but the guard still requires a big prior impulse
-        # plus unaccepted nearby opposing level.
-        max_target_pct = max(float(_env_max_target_pct), float(_post_pump_default_max))
+        max_target_pct = float(os.getenv("MID_FINAL_POST_PUMP_MAX_TP1_PCT", "1.80") or 1.80)
     except Exception:
-        max_target_pct = 4.80 if str(market or "").upper().strip() == "FUTURES" else 2.25
-    # V46/V48: NIGHT/FOGO-style losses can have a wider TP1 while still
+        max_target_pct = 1.80
+    # V46: NIGHT-style losses can have a wider TP1 (about 1.5%) while still
     # being an early/late-pump LONG below unaccepted resistance.  Keep very
     # strong continuation winners alive: BANANAS/ZEC-futures type usually has
     # TP1 much farther than this or an accepted reclaim, so this guard only
@@ -3495,7 +3020,7 @@ def _mid_post_pump_no_acceptance_guard_reason(*,
     except Exception:
         risk_pct = 0.0
     try:
-        min_risk_pct = _env_float_any(("TRADE_POST_PUMP_MIN_RISK_PCT", "MID_FINAL_POST_PUMP_MIN_RISK_PCT"), 0.35)
+        min_risk_pct = float(os.getenv("MID_FINAL_POST_PUMP_MIN_RISK_PCT", "0.35") or 0.35)
     except Exception:
         min_risk_pct = 0.35
     # Avoid catching small, controlled pullback/reclaim winners.
@@ -3551,11 +3076,11 @@ def _mid_post_pump_no_acceptance_guard_reason(*,
         return ""
 
     try:
-        accept_atr = _env_float_any(("TRADE_ACCEPTANCE_BUFFER_ATR", "MID_FINAL_POST_PUMP_ACCEPT_BUF_ATR"), 0.08)
+        accept_atr = float(os.getenv("MID_FINAL_POST_PUMP_ACCEPT_BUF_ATR", "0.08") or 0.08)
     except Exception:
         accept_atr = 0.08
     try:
-        accept_pct = _env_float_any(("TRADE_ACCEPTANCE_BUFFER_PCT", "MID_FINAL_POST_PUMP_ACCEPT_BUF_PCT"), 0.030) / 100.0
+        accept_pct = float(os.getenv("MID_FINAL_POST_PUMP_ACCEPT_BUF_PCT", "0.030") or 0.030) / 100.0
     except Exception:
         accept_pct = 0.00030
     accept_buf = max(float(atr) * float(accept_atr), abs(float(entry)) * float(accept_pct))
@@ -3570,7 +3095,7 @@ def _mid_post_pump_no_acceptance_guard_reason(*,
             accepted = float(entry) < float(opp_level) - float(accept_buf)
     except Exception:
         accepted = False
-    if accepted or _mid_acceptance_close_count_ok(side, ta, it, gm):
+    if accepted:
         return ""
 
     try:
@@ -3584,11 +3109,11 @@ def _mid_post_pump_no_acceptance_guard_reason(*,
         return ""
 
     try:
-        min_impulse_atr = _env_float_any(("TRADE_MAX_EXTENSION_ATR_LONG", "MID_FINAL_POST_PUMP_MIN_IMPULSE_ATR"), 2.20)
+        min_impulse_atr = float(os.getenv("MID_FINAL_POST_PUMP_MIN_IMPULSE_ATR", "2.20") or 2.20)
     except Exception:
         min_impulse_atr = 2.20
     try:
-        max_opp_dist_atr = _env_float_any(("TRADE_POST_PUMP_MAX_OPPOSING_DIST_ATR", "MID_FINAL_POST_PUMP_MAX_OPPOSING_DIST_ATR"), 1.80)
+        max_opp_dist_atr = float(os.getenv("MID_FINAL_POST_PUMP_MAX_OPPOSING_DIST_ATR", "1.80") or 1.80)
     except Exception:
         max_opp_dist_atr = 1.80
 
@@ -3596,27 +3121,6 @@ def _mid_post_pump_no_acceptance_guard_reason(*,
         return ""
     if float(opp_dist_atr) < 0 or float(opp_dist_atr) > float(max_opp_dist_atr):
         return ""
-
-    try:
-        pump_cooldown_bars = int(max(0.0, _env_float_any(("TRADE_PUMP_COOLDOWN_BARS", "MID_FINAL_POST_PUMP_COOLDOWN_BARS"), 0.0)))
-    except Exception:
-        pump_cooldown_bars = 0
-    bars_since_impulse = None
-    try:
-        for _src in (ta, it, gm):
-            if not isinstance(_src, dict):
-                continue
-            for _k in ("bars_since_impulse", "bars_since_pump", "bars_from_impulse", "pump_age_bars"):
-                _v = _src.get(_k)
-                if _v is None or _v == "":
-                    continue
-                bars_since_impulse = float(_v)
-                raise StopIteration
-    except StopIteration:
-        pass
-    except Exception:
-        bars_since_impulse = None
-    cooldown_active = bool(pump_cooldown_bars > 0 and bars_since_impulse is not None and float(bars_since_impulse) < float(pump_cooldown_bars))
 
     # A clear fresh breakout label can only save the setup if the entry is
     # already accepted beyond the opposing level; we returned above in that case.
@@ -3641,14 +3145,14 @@ def _mid_post_pump_no_acceptance_guard_reason(*,
             f"wait_reclaim_or_structural_sl:"
             f"side={side_word}|impulse_atr={float(impulse_atr):.2f}|opp={obstacle}|"
             f"opp_dist_atr={float(opp_dist_atr):.2f}|level={float(opp_level):.10g}|src={opp_name}|"
-            f"tp1_pct={float(target_pct):.3f}|risk_pct={float(risk_pct):.3f}|cooldown={int(bool(cooldown_active))}|bars={float(bars_since_impulse or 0.0):.1f}|bo={bo or '-'}"
+            f"tp1_pct={float(target_pct):.3f}|risk_pct={float(risk_pct):.3f}|bo={bo or '-'}"
         )
 
     return (
         f"post_pump_{side_word}_no_acceptance:"
         f"impulse_atr={float(impulse_atr):.2f}|opp={obstacle}|"
         f"opp_dist_atr={float(opp_dist_atr):.2f}|level={float(opp_level):.10g}|src={opp_name}|"
-        f"tp1_pct={float(target_pct):.3f}|risk_pct={float(risk_pct):.3f}|cooldown={int(bool(cooldown_active))}|bars={float(bars_since_impulse or 0.0):.1f}|bo={bo or '-'}"
+        f"tp1_pct={float(target_pct):.3f}|risk_pct={float(risk_pct):.3f}|bo={bo or '-'}"
     )
 
 
@@ -3670,11 +3174,7 @@ def _mid_medium_retest_no_acceptance_guard_reason(*,
     before acceptance.  Generic "BOS -> FVG/OB retest" is not enough relief.
     """
     try:
-        enabled = _env_bool_any((
-            "TRADE_REQUIRE_ACCEPTANCE_BEFORE_LONG",
-            "TRADE_REQUIRE_CLEAN_PATH_TO_TP1",
-            "MID_FINAL_MEDIUM_RETEST_ACCEPTANCE_GUARD",
-        ), True)
+        enabled = str(os.getenv("MID_FINAL_MEDIUM_RETEST_ACCEPTANCE_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
     except Exception:
         enabled = True
     if not enabled:
@@ -3721,11 +3221,9 @@ def _mid_medium_retest_no_acceptance_guard_reason(*,
     except Exception:
         target_pct = 0.0
     try:
-        _env_min_tp = float(os.getenv("MID_FINAL_MEDIUM_RETEST_MIN_TP1_PCT", "0.58") or 0.58)
-        # V48: old 0.85 missed ETC/ETH-style 0.60-0.74% no-acceptance losses.
-        min_tp = min(float(_env_min_tp), 0.58)
+        min_tp = float(os.getenv("MID_FINAL_MEDIUM_RETEST_MIN_TP1_PCT", "0.85") or 0.85)
     except Exception:
-        min_tp = 0.58
+        min_tp = 0.85
     try:
         max_tp = float(os.getenv("MID_FINAL_MEDIUM_RETEST_MAX_TP1_PCT", "2.25") or 2.25)
     except Exception:
@@ -3740,11 +3238,9 @@ def _mid_medium_retest_no_acceptance_guard_reason(*,
     except Exception:
         risk_pct = 0.0
     try:
-        _env_min_risk = float(os.getenv("MID_FINAL_MEDIUM_RETEST_MIN_RISK_PCT", "0.25") or 0.25)
-        # V48: keep medium guard active for 0.25-0.45% risk paths too.
-        min_risk = min(float(_env_min_risk), 0.25)
+        min_risk = float(os.getenv("MID_FINAL_MEDIUM_RETEST_MIN_RISK_PCT", "0.45") or 0.45)
     except Exception:
-        min_risk = 0.25
+        min_risk = 0.45
     if float(risk_pct) > 0 and float(risk_pct) < float(min_risk):
         return ""
 
@@ -3859,334 +3355,6 @@ def _mid_medium_retest_no_acceptance_guard_reason(*,
     )
 
 
-
-def _mid_kite_medium_chop_no_acceptance_guard_reason(*,
-                                                       sig=None,
-                                                       ta: dict | None = None,
-                                                       it: dict | None = None,
-                                                       gate_meta: dict | None = None,
-                                                       route: str | None = None,
-                                                       breakout_fresh_ok: bool = False,
-                                                       bo_rt_label: str | None = None,
-                                                       vol_x: float | None = None,
-                                                       body_atr: float | None = None) -> str:
-    """V50: KITE/AVAX-after-fix47 medium chop entry guard.
-
-    Pattern from KITEUSDT:
-      - LONG/SHORT is not a clean origin continuation;
-      - it is a generic BOS/FVG/OB/Structure Pending retest inside chop/range;
-      - TP1 is medium-small (not caught by micro guards), SL is still inside
-        normal retest noise;
-      - there is no accepted/reclaim context and no fresh displacement at emit.
-
-    This guard is intentionally narrow so DOT/ONDO/origin-fast winners are not cut.
-    It waits/rechecks instead of permanently killing the idea.
-    """
-    try:
-        enabled = _env_bool_any(("TRADE_REQUIRE_ACCEPTANCE_BEFORE_LONG", "MID_FINAL_KITE_MEDIUM_CHOP_GUARD"), True)
-    except Exception:
-        enabled = True
-    if not enabled:
-        return ""
-    ta = ta or {}
-    it = it or {}
-    gm = gate_meta or {}
-
-    def _first_float(*vals):
-        for v in vals:
-            try:
-                if v is None or v == "":
-                    continue
-                fv = float(v)
-                if math.isfinite(fv) and fv > 0:
-                    return fv
-            except Exception:
-                pass
-        return None
-
-    try:
-        side = str((getattr(sig, "direction", None) if sig is not None else "") or ta.get("direction") or it.get("direction") or "").upper().strip()
-        market = str((getattr(sig, "market", None) if sig is not None else "") or ta.get("market") or it.get("market") or "").upper().strip()
-        symbol = str((getattr(sig, "symbol", None) if sig is not None else "") or ta.get("symbol") or it.get("symbol") or "").upper().strip()
-    except Exception:
-        side, market, symbol = "", "", ""
-    if side not in ("LONG", "SHORT"):
-        return ""
-
-    entry = _first_float(getattr(sig, "entry", None), ta.get("entry"), ta.get("close"), ta.get("price"), it.get("entry"), it.get("price"))
-    sl = _first_float(getattr(sig, "sl", None), ta.get("sl"), it.get("sl"), it.get("stop"), it.get("stop_loss"))
-    tp1 = _first_float(getattr(sig, "tp1", None), ta.get("tp1"), it.get("tp1"), it.get("target"), it.get("take_profit"))
-    if not entry or not sl or not tp1:
-        return ""
-    if side == "LONG" and not (sl < entry < tp1):
-        return ""
-    if side == "SHORT" and not (tp1 < entry < sl):
-        return ""
-
-    try:
-        target_pct = abs(float(tp1) - float(entry)) / max(abs(float(entry)), 1e-12) * 100.0
-        risk_pct = abs(float(entry) - float(sl)) / max(abs(float(entry)), 1e-12) * 100.0
-    except Exception:
-        return ""
-
-    # KITE was missed because it was above the micro threshold: tp1~0.77%, risk~0.55%.
-    try:
-        min_tp = min(float(os.getenv("MID_FINAL_KITE_MEDIUM_MIN_TP1_PCT", "0.62") or 0.62), 0.62)
-    except Exception:
-        min_tp = 0.62
-    try:
-        max_tp = max(float(os.getenv("MID_FINAL_KITE_MEDIUM_MAX_TP1_PCT", "0.95") or 0.95), 0.95)
-    except Exception:
-        max_tp = 0.95
-    try:
-        min_risk = min(float(os.getenv("MID_FINAL_KITE_MEDIUM_MIN_RISK_PCT", "0.42") or 0.42), 0.42)
-    except Exception:
-        min_risk = 0.42
-    try:
-        max_risk = max(float(os.getenv("MID_FINAL_KITE_MEDIUM_MAX_RISK_PCT", "0.75") or 0.75), 0.75)
-    except Exception:
-        max_risk = 0.75
-    if float(target_pct) < float(min_tp) or float(target_pct) > float(max_tp):
-        return ""
-    if float(risk_pct) < float(min_risk) or float(risk_pct) > float(max_risk):
-        return ""
-
-    try:
-        route_blob = " ".join(str(x or "") for x in (
-            route, bo_rt_label,
-            it.get("bo_rt"), it.get("breakout_retest"), it.get("smc_setup_route"), it.get("emit_route"),
-            it.get("smart_setup_label"), it.get("smart_setup_name"), it.get("setup"), it.get("setup_name"),
-            gm.get("route"), gm.get("setup"), gm.get("primary_reason"), gm.get("fast_path"),
-            ta.get("regime"), ta.get("market_regime"), it.get("regime"), it.get("market_regime"), gm.get("regime"),
-        )).lower()
-    except Exception:
-        route_blob = ""
-
-    # Do not touch true origin / liquidity reclaim winners (DOT/ONDO/BANANAS type).
-    if any(tok in route_blob for tok in ("origin", "liquidity_reclaim", "accepted_reclaim")):
-        return ""
-
-    generic_retest = any(tok in route_blob for tok in ("structure", "pending", "trigger", "bos", "fvg", "ob", "retest", "zone")) or not route_blob.strip()
-    if not generic_retest:
-        return ""
-
-    accepted_ctx = any(tok in route_blob for tok in ("accept", "accepted", "reclaim")) or _mid_acceptance_close_count_ok(side, ta, it, gm)
-
-    try:
-        atr = _first_float(ta.get("atr30"), ta.get("atr_abs"), it.get("atr_at_create"), it.get("atr30"), gm.get("atr30"), gm.get("atr_abs"))
-    except Exception:
-        atr = None
-    current_body_atr = 0.0
-    try:
-        current_body_atr = float(body_atr if body_atr is not None else 0.0)
-    except Exception:
-        current_body_atr = 0.0
-    try:
-        if current_body_atr <= 0 and atr and float(atr) > 0:
-            lb = _first_float(ta.get("last_body"), gm.get("current_body"), it.get("last_body"))
-            if lb is not None:
-                current_body_atr = abs(float(lb)) / max(float(atr), 1e-12)
-    except Exception:
-        pass
-    try:
-        current_vol = float(vol_x if vol_x is not None else (ta.get("rel_vol") if ta.get("rel_vol") is not None else (ta.get("vol_x") or gm.get("vol_x") or it.get("vol_x") or 0.0)))
-    except Exception:
-        current_vol = 0.0
-
-    try:
-        relief_body = float(os.getenv("MID_FINAL_KITE_MEDIUM_RELIEF_BODY_ATR", "0.16") or 0.16)
-    except Exception:
-        relief_body = 0.16
-    try:
-        relief_vol = float(os.getenv("MID_FINAL_KITE_MEDIUM_RELIEF_VOL_X", "1.10") or 1.10)
-    except Exception:
-        relief_vol = 1.10
-    strong_now = float(current_body_atr) >= float(relief_body) and float(current_vol) >= float(relief_vol)
-
-    # Real fresh breakout or accepted reclaim with a current impulse is allowed.
-    if bool(breakout_fresh_ok) and bool(strong_now):
-        return ""
-    if bool(accepted_ctx) and (bool(strong_now) or bool(breakout_fresh_ok)):
-        return ""
-
-    # If trend metadata is present and clearly supports the trade, be less strict.
-    # If it is absent/weak/choppy, block the KITE-style medium retest.
-    ctx = _mid_adaptive_market_context(ta=ta, it=it, gate_meta=gate_meta)
-    try:
-        ctx_regime = str(ctx.get("regime") or "").upper()
-    except Exception:
-        ctx_regime = ""
-    try:
-        ctx_bias = str(ctx.get("bias") or "").upper()
-    except Exception:
-        ctx_bias = ""
-    try:
-        adx_mix = ctx.get("adx_mix")
-        adx_ok = (adx_mix is not None and float(adx_mix) >= float(os.getenv("MID_FINAL_KITE_MEDIUM_TREND_ADX_RELIEF", "24") or 24))
-    except Exception:
-        adx_mix = None
-        adx_ok = False
-    if ctx_regime == "TREND" and ctx_bias == side and bool(adx_ok) and bool(strong_now):
-        return ""
-
-    side_word = "long" if side == "LONG" else "short"
-    return (
-        f"medium_chop_no_acceptance:{side_word}|symbol={symbol or '-'}|market={market or '-'}|"
-        f"tp1_pct={float(target_pct):.3f}|risk_pct={float(risk_pct):.3f}|"
-        f"body_atr={float(current_body_atr):.2f}|vol_x={float(current_vol):.2f}|"
-        f"fresh={int(bool(breakout_fresh_ok))}|accepted={int(bool(accepted_ctx))}|"
-        f"regime={ctx_regime or '-'}|adx={float(adx_mix or 0.0):.2f}"
-    )
-
-
-def _mid_low_liquidity_wick_noise_guard_reason(*,
-                                                sig=None,
-                                                ta: dict | None = None,
-                                                it: dict | None = None,
-                                                gate_meta: dict | None = None,
-                                                route: str | None = None,
-                                                breakout_fresh_ok: bool = False,
-                                                bo_rt_label: str | None = None,
-                                                vol_x: float | None = None,
-                                                body_atr: float | None = None) -> str:
-    """Fix51: pre-entry filter for BONK/KAVA/ROSE/ZBT/KITE-style noisy entries.
-
-    The LOSS report showed a separate class of failures where direction can be
-    unclear because the symbol is micro/noisy: many wicks, tiny clean space,
-    weak current candle/volume, and no accepted reclaim.  This guard is a WAIT
-    filter, not a permanent symbol ban.  It only blocks immediate emits when the
-    setup has no fresh/accepted relief and the TP/SL geometry is small enough to
-    be eaten by wick noise.
-    """
-    try:
-        enabled = _env_bool_any(("TRADE_BLOCK_LOW_LIQUIDITY_WICK_NOISE", "MID_FINAL_LOW_LIQ_WICK_NOISE_GUARD"), True)
-    except Exception:
-        enabled = True
-    if not enabled:
-        return ""
-    ta = ta or {}
-    it = it or {}
-    gm = gate_meta or {}
-
-    def _first_float(*vals):
-        for v in vals:
-            try:
-                if v is None or v == "":
-                    continue
-                fv = float(v)
-                if math.isfinite(fv) and fv > 0:
-                    return fv
-            except Exception:
-                pass
-        return None
-
-    try:
-        side = str((getattr(sig, "direction", None) if sig is not None else "") or ta.get("direction") or it.get("direction") or "").upper().strip()
-        market = str((getattr(sig, "market", None) if sig is not None else "") or ta.get("market") or it.get("market") or "").upper().strip()
-        symbol = str((getattr(sig, "symbol", None) if sig is not None else "") or ta.get("symbol") or it.get("symbol") or "").upper().strip()
-    except Exception:
-        side, market, symbol = "", "", ""
-    if side not in ("LONG", "SHORT"):
-        return ""
-
-    entry = _first_float(getattr(sig, "entry", None), ta.get("entry"), ta.get("close"), ta.get("price"), it.get("entry"), it.get("price"))
-    sl = _first_float(getattr(sig, "sl", None), ta.get("sl"), it.get("sl"), it.get("stop"), it.get("stop_loss"))
-    tp1 = _first_float(getattr(sig, "tp1", None), ta.get("tp1"), it.get("tp1"), it.get("target"), it.get("take_profit"))
-    if not entry or not tp1:
-        return ""
-    if side == "LONG" and tp1 <= entry:
-        return ""
-    if side == "SHORT" and tp1 >= entry:
-        return ""
-
-    try:
-        target_pct = abs(float(tp1) - float(entry)) / max(abs(float(entry)), 1e-12) * 100.0
-    except Exception:
-        target_pct = 0.0
-    try:
-        risk_pct = abs(float(entry) - float(sl)) / max(abs(float(entry)), 1e-12) * 100.0 if sl else 0.0
-    except Exception:
-        risk_pct = 0.0
-
-    max_tp = _env_float_any(("TRADE_LOW_LIQ_MAX_TP1_PCT", "MID_FINAL_LOW_LIQ_WICK_MAX_TP1_PCT"), 1.05)
-    max_risk = _env_float_any(("TRADE_LOW_LIQ_MAX_RISK_PCT", "MID_FINAL_LOW_LIQ_WICK_MAX_RISK_PCT"), 0.80)
-    if float(target_pct) > float(max_tp):
-        return ""
-    if float(risk_pct) > 0 and float(risk_pct) > float(max_risk):
-        return ""
-
-    try:
-        route_blob = " ".join(str(x or "") for x in (
-            route, bo_rt_label,
-            it.get("bo_rt"), it.get("breakout_retest"), it.get("smc_setup_route"), it.get("emit_route"),
-            it.get("smart_setup_label"), it.get("smart_setup_name"), it.get("setup"), it.get("setup_name"),
-            gm.get("route"), gm.get("setup"), gm.get("primary_reason"), gm.get("fast_path"),
-        )).lower()
-    except Exception:
-        route_blob = ""
-
-    accepted_ctx = any(tok in route_blob for tok in ("accept", "accepted", "reclaim", "liquidity_reclaim")) or _mid_acceptance_close_count_ok(side, ta, it, gm)
-    origin_ctx = "origin" in route_blob
-
-    atr = _first_float(ta.get("atr30"), ta.get("atr_abs"), it.get("atr_at_create"), it.get("atr30"), gm.get("atr30"), gm.get("atr_abs"))
-    current_body_atr = 0.0
-    try:
-        current_body_atr = float(body_atr if body_atr is not None else (ta.get("body_atr") or it.get("body_atr") or 0.0))
-    except Exception:
-        current_body_atr = 0.0
-    try:
-        if current_body_atr <= 0 and atr and float(atr) > 0:
-            lb = _first_float(ta.get("last_body"), ta.get("body"), gm.get("current_body"), it.get("last_body"))
-            if lb is not None:
-                current_body_atr = abs(float(lb)) / max(float(atr), 1e-12)
-    except Exception:
-        pass
-    try:
-        current_vol = float(vol_x if vol_x is not None else (ta.get("rel_vol") if ta.get("rel_vol") is not None else (ta.get("vol_x") or gm.get("vol_x") or it.get("vol_x") or 0.0)))
-    except Exception:
-        current_vol = 0.0
-
-    relief_body = _env_float_any(("TRADE_LOW_LIQ_RELIEF_BODY_ATR", "MID_FINAL_LOW_LIQ_WICK_RELIEF_BODY_ATR"), 0.16)
-    relief_vol = _env_float_any(("TRADE_LOW_LIQ_RELIEF_VOL_X", "MID_FINAL_LOW_LIQ_WICK_RELIEF_VOL_X"), 1.10)
-    strong_now = float(current_body_atr) >= float(relief_body) and float(current_vol) >= float(relief_vol)
-    if (origin_ctx or accepted_ctx or bool(breakout_fresh_ok)) and bool(strong_now):
-        return ""
-
-    # Prefer explicit score if analytics provides one; otherwise compute a local
-    # wick/body noise estimate from the last candle fields.
-    noise = _first_float(
-        ta.get("wick_noise_score"), it.get("wick_noise_score"), gm.get("wick_noise_score"),
-        ta.get("noise_score"), it.get("noise_score"), gm.get("noise_score"),
-        ta.get("wick_score"), it.get("wick_score"), gm.get("wick_score"),
-    )
-    if noise is None:
-        rng = _first_float(ta.get("last_range"), ta.get("range"), gm.get("last_range"), it.get("last_range"))
-        body_abs = _first_float(ta.get("last_body_abs"), ta.get("body_abs"), gm.get("last_body_abs"), it.get("last_body_abs"))
-        if rng and rng > 0 and body_abs is not None:
-            try:
-                noise = max(0.0, min(1.0, (float(rng) - float(body_abs)) / max(float(rng), 1e-12)))
-            except Exception:
-                noise = None
-    if noise is None:
-        # No reliable wick/noise data: do not invent a block.
-        return ""
-
-    max_noise = _env_float_any(("TRADE_MAX_WICK_NOISE_SCORE", "MID_FINAL_LOW_LIQ_WICK_MAX_SCORE"), 0.65)
-    if float(noise) < float(max_noise):
-        return ""
-
-    # Extra safety: do not block if the current candle is already a real impulse.
-    if bool(strong_now):
-        return ""
-
-    side_word = "long" if side == "LONG" else "short"
-    return (
-        f"low_liq_wick_noise_wait:{side_word}|symbol={symbol or '-'}|market={market or '-'}|"
-        f"noise={float(noise):.2f}|max={float(max_noise):.2f}|tp1_pct={float(target_pct):.3f}|"
-        f"risk_pct={float(risk_pct):.3f}|body_atr={float(current_body_atr):.2f}|vol_x={float(current_vol):.2f}"
-    )
-
-
 def _mid_unrealistic_tp1_guard_reason(*,
                                       sig=None,
                                       ta: dict | None = None,
@@ -4201,7 +3369,7 @@ def _mid_unrealistic_tp1_guard_reason(*,
     of sending the signal immediately.
     """
     try:
-        enabled = _env_bool_any(("TRADE_BLOCK_UNREALISTIC_TP1", "MID_FINAL_UNREALISTIC_TP1_GUARD"), True)
+        enabled = str(os.getenv("MID_FINAL_UNREALISTIC_TP1_GUARD", "1") or "1").strip().lower() in ("1", "true", "yes", "on")
     except Exception:
         enabled = True
     if not enabled:
@@ -4242,28 +3410,15 @@ def _mid_unrealistic_tp1_guard_reason(*,
     except Exception:
         target_pct = 0.0
     try:
-        spot_max = _env_float_any(("TRADE_MAX_TP1_PCT_SPOT", "MID_FINAL_UNREALISTIC_TP1_SPOT_MAX_PCT"), 6.0)
+        spot_max = float(os.getenv("MID_FINAL_UNREALISTIC_TP1_SPOT_MAX_PCT", "6.00") or 6.0)
     except Exception:
         spot_max = 6.0
     try:
-        fut_max = _env_float_any(("TRADE_MAX_TP1_PCT_FUTURES", "MID_FINAL_UNREALISTIC_TP1_FUT_MAX_PCT"), 10.0)
+        fut_max = float(os.getenv("MID_FINAL_UNREALISTIC_TP1_FUT_MAX_PCT", "10.00") or 10.0)
     except Exception:
         fut_max = 10.0
     max_pct = fut_max if market == "FUTURES" else spot_max
-
-    atr = _first_float(ta.get("atr30"), ta.get("atr_abs"), it.get("atr_at_create"), it.get("atr30"), gm.get("atr30"), gm.get("atr_abs"))
-    try:
-        target_atr = abs(float(tp1) - float(entry)) / max(float(atr or 0.0), 1e-12) if atr else 0.0
-    except Exception:
-        target_atr = 0.0
-    try:
-        max_target_atr = _env_float_any(("TRADE_MAX_TP1_ATR_MULT", "MID_FINAL_UNREALISTIC_TP1_MAX_ATR"), 3.0)
-    except Exception:
-        max_target_atr = 3.0
-
-    pct_too_far = float(target_pct) > float(max_pct)
-    atr_too_far = bool(target_atr > 0 and max_target_atr > 0 and float(target_atr) > float(max_target_atr))
-    if not pct_too_far and not atr_too_far:
+    if float(target_pct) <= float(max_pct):
         return ""
     try:
         route_blob = " ".join(str(x or "") for x in (route, it.get("smc_setup_route"), it.get("emit_route"), it.get("smart_setup_label"), it.get("smart_setup_name"), gate_meta.get("route") if isinstance(gate_meta, dict) else "")).lower()
@@ -4273,10 +3428,7 @@ def _mid_unrealistic_tp1_guard_reason(*,
     # wait for accepted structure instead of trusting fantasy RR.
     if bool(breakout_fresh_ok) and ("origin" in route_blob or "breakout" in route_blob or "reclaim" in route_blob):
         return ""
-    return (
-        f"unrealistic_tp1_path:tp1_pct={float(target_pct):.3f}|max={float(max_pct):.2f}|"
-        f"tp1_atr={float(target_atr):.2f}|max_atr={float(max_target_atr):.2f}|market={market or '-'}"
-    )
+    return f"unrealistic_tp1_path:tp1_pct={float(target_pct):.3f}|max={float(max_pct):.2f}|market={market or '-'}"
 
 
 def _mid_final_emit_apply_reason(reason: str) -> str:
@@ -4298,19 +3450,11 @@ def _mid_final_emit_apply_reason(reason: str) -> str:
         return "vol_low"
     if r.startswith("tp1_path_blocked_by_"):
         return "tp1_path_blocked"
-    if r.startswith("micro_tp1_no_acceptance"):
-        return "tp1_path_blocked"
-    if r.startswith("micro_sl_timing_wait"):
-        return "wait_reclaim_or_structural_sl"
     if r.startswith("post_pump_"):
         return "post_pump_no_acceptance"
     if r.startswith("wait_reclaim_or_structural_sl"):
         return "wait_reclaim_or_structural_sl"
     if r.startswith("medium_retest_no_acceptance"):
-        return "wait_reclaim_or_structural_sl"
-    if r.startswith("medium_chop_no_acceptance"):
-        return "wait_reclaim_or_structural_sl"
-    if r.startswith("low_liq_wick_noise_wait"):
         return "wait_reclaim_or_structural_sl"
     if r.startswith("unrealistic_tp1_path"):
         return "wait_reclaim_or_structural_sl"
@@ -4474,40 +3618,7 @@ def _mid_final_emit_gate_reason(*,
     if _tp1_path_reason:
         return str(_tp1_path_reason)
 
-    # V49: PNUT-style timing issue. The idea can be right, but tiny structure-pending
-    # entries with SL inside the first pullback should wait one more accepted close
-    # or be rebuilt with structural SL. Origin fast-path winners are relieved.
-    _micro_sl_timing_reason = _mid_micro_sl_timing_guard_reason(
-        sig=sig,
-        ta=ta,
-        it=it,
-        gate_meta=gate_meta,
-        route=route,
-        breakout_fresh_ok=bool(breakout_fresh_ok),
-        bo_rt_label=bo_rt_label,
-        vol_x=vol_x,
-        body_atr=body_atr,
-    )
-    if _micro_sl_timing_reason:
-        return str(_micro_sl_timing_reason)
-
-    # V48: fallback for tiny TP1/no-acceptance losses when the explicit local
-    # resistance/support level was not available in the final TA snapshot.
-    _micro_tp1_reason = _mid_micro_tp1_no_acceptance_guard_reason(
-        sig=sig,
-        ta=ta,
-        it=it,
-        gate_meta=gate_meta,
-        route=route,
-        breakout_fresh_ok=bool(breakout_fresh_ok),
-        bo_rt_label=bo_rt_label,
-        vol_x=vol_x,
-        body_atr=body_atr,
-    )
-    if _micro_tp1_reason:
-        return str(_micro_tp1_reason)
-
-    # V47/V48: catch APE/ACH/ETC/ETH-style medium retest emits that are still under
+    # V47: catch APE/ACH-style medium retest emits that are still under
     # unaccepted resistance. Generic BOS/FVG retest is not enough acceptance.
     _medium_retest_reason = _mid_medium_retest_no_acceptance_guard_reason(
         sig=sig,
@@ -4523,40 +3634,7 @@ def _mid_final_emit_gate_reason(*,
     if _medium_retest_reason:
         return str(_medium_retest_reason)
 
-    # V50: KITE-style medium retest in chop/range. This catches the cases above
-    # micro thresholds where no explicit local resistance was available, but there
-    # is still no accepted/reclaim context and no current displacement.
-    _kite_medium_reason = _mid_kite_medium_chop_no_acceptance_guard_reason(
-        sig=sig,
-        ta=ta,
-        it=it,
-        gate_meta=gate_meta,
-        route=route,
-        breakout_fresh_ok=bool(breakout_fresh_ok),
-        bo_rt_label=bo_rt_label,
-        vol_x=vol_x,
-        body_atr=body_atr,
-    )
-    if _kite_medium_reason:
-        return str(_kite_medium_reason)
-
-    # Fix51: wait low-liquidity / wick-noise micro entries (BONK/KAVA/ROSE/ZBT style)
-    # unless there is accepted reclaim or a current displacement/volume impulse.
-    _low_liq_wick_reason = _mid_low_liquidity_wick_noise_guard_reason(
-        sig=sig,
-        ta=ta,
-        it=it,
-        gate_meta=gate_meta,
-        route=route,
-        breakout_fresh_ok=bool(breakout_fresh_ok),
-        bo_rt_label=bo_rt_label,
-        vol_x=vol_x,
-        body_atr=body_atr,
-    )
-    if _low_liq_wick_reason:
-        return str(_low_liq_wick_reason)
-
-    # V47/Fix51: catch ORDI-style fantasy RR/ATR targets that are too far for an
+    # V47: catch ORDI-style fantasy RR targets that are too far for an
     # unaccepted 5m/15m emit.
     _unrealistic_tp1_reason = _mid_unrealistic_tp1_guard_reason(
         sig=sig,
@@ -19410,18 +18488,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         mstruct = "—"
 
     support, resistance = _nearest_levels(df1hi)
-    try:
-        _local_swing = int(float(os.getenv("MID_LOCAL_LEVEL_SWING_5M", "2") or 2))
-    except Exception:
-        _local_swing = 2
-    try:
-        _local_lookback = int(float(os.getenv("MID_LOCAL_LEVEL_LOOKBACK_5M", "72") or 72))
-    except Exception:
-        _local_lookback = 72
-    try:
-        local_support, local_resistance = _nearest_levels(df5i, lookback=_local_lookback, swing=_local_swing)
-    except Exception:
-        local_support, local_resistance = (None, None)
 
     # Breakout / Retest detection (simple but robust)
     # We use 1h swing S/R and confirm on recent 5m candles.
@@ -19844,10 +18910,6 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "pattern": pattern,
         "support": support,
         "resistance": resistance,
-        "local_support": local_support,
-        "local_resistance": local_resistance,
-        "swing_low": local_support,
-        "swing_high": local_resistance,
         "recent_low": recent_low,
         "recent_high": recent_high,
         "breakout_retest": breakout_retest,
@@ -22404,22 +21466,6 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         mstruct = "—"
 
     support, resistance = _nearest_levels(df1hi)
-    try:
-        _local_swing = int(float(os.getenv("MID_LOCAL_LEVEL_SWING_5M", "2") or 2))
-    except Exception:
-        _local_swing = 2
-    try:
-        _local_lookback = int(float(os.getenv("MID_LOCAL_LEVEL_LOOKBACK_5M", "72") or 72))
-    except Exception:
-        _local_lookback = 72
-    try:
-        local_support, local_resistance = _nearest_levels(df5i, lookback=_local_lookback, swing=_local_swing)
-    except Exception:
-        local_support, local_resistance = (None, None)
-    try:
-        recent_low, recent_high = _mid_recent_extremes_for_late_entry(df5=df5i, df30=df30i)
-    except Exception:
-        recent_low, recent_high = (None, None)
 
     # Breakout / Retest detection (trigger-safe).
     # v2 missed local initialization of breakout_retest inside evaluate_on_exchange_mid_v2,
@@ -22620,12 +21666,6 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "pattern": pattern,
         "support": support,
         "resistance": resistance,
-        "local_support": local_support,
-        "local_resistance": local_resistance,
-        "swing_low": local_support,
-        "swing_high": local_resistance,
-        "recent_low": recent_low,
-        "recent_high": recent_high,
         "breakout_retest": breakout_retest,
         "bo_rt": breakout_retest,
         "channel": channel,
