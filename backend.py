@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-05_smart_path_guard_v47"
+MID_BUILD_TAG = "MID_BUILD_2026-05-05_v54_fast_continuation_rsi_relief"
 
 import asyncio
 import json
@@ -2421,6 +2421,59 @@ def _mid_directional_contradiction_reason(*sources: dict | None) -> str:
     except Exception:
         return ""
 
+
+def _mid_fast_continuation_rsi_relief_allowed(side: str, rsi_5m: float | None, macd_hist_5m: float | None = None) -> bool:
+    """Allow STX-like fresh-continuation candidates to survive the early RSI hard-block.
+
+    Why: fast continuation signals like STX/WLD/TON/FIL/ENA/TRX often appear with
+    RSI already high (LONG) or low (SHORT).  The old scan hard-block killed them
+    before the FAST CONTINUATION detector and final path guards could decide.
+
+    This is NOT a bypass to send a signal.  It only defers the RSI veto so the
+    normal trigger/final guards can still block AXL/ONDO/BERA/RENDER/2Z-style
+    micro-wall/chop entries.
+    """
+    try:
+        if not _env_bool("MID_FAST_CONTINUATION_ENABLED", True):
+            return False
+        if not _env_bool("MID_FAST_CONTINUATION_RSI_RELIEF", True):
+            return False
+        side_u = str(side or "").strip().upper()
+        if side_u not in ("LONG", "SHORT"):
+            return False
+        try:
+            rsi = float(rsi_5m)
+        except Exception:
+            return False
+        if not (rsi == rsi):
+            return False
+
+        # Optional MACD direction check. Default is OFF because some thin 5m
+        # symbols report a near-zero MACD while still making a valid 1m/5m impulse.
+        require_macd = _env_bool("MID_FAST_CONTINUATION_RSI_RELIEF_REQUIRE_MACD", False)
+        if require_macd:
+            try:
+                mh = float(macd_hist_5m)
+            except Exception:
+                mh = 0.0
+            eps = float(os.getenv("MID_FAST_CONTINUATION_RSI_RELIEF_MACD_EPS", "0.000001") or 0.000001)
+            if side_u == "LONG" and mh < -eps:
+                return False
+            if side_u == "SHORT" and mh > eps:
+                return False
+
+        if side_u == "LONG":
+            # STX example had RSI ~95.8, so default cap is just above that.
+            cap = float(os.getenv("MID_FAST_CONTINUATION_RSI_LONG_MAX", "96.5") or 96.5)
+            hard_cap = float(os.getenv("MID_FAST_CONTINUATION_RSI_LONG_HARD_MAX", "98.5") or 98.5)
+            return bool(rsi <= cap and rsi < hard_cap)
+        else:
+            cap = float(os.getenv("MID_FAST_CONTINUATION_RSI_SHORT_MIN", "3.5") or 3.5)
+            hard_cap = float(os.getenv("MID_FAST_CONTINUATION_RSI_SHORT_HARD_MIN", "1.5") or 1.5)
+            return bool(rsi >= cap and rsi > hard_cap)
+    except Exception:
+        return False
+
 def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str:
     """Hard veto reasons for early zone-touch alerts.
 
@@ -2470,12 +2523,14 @@ def _mid_zone_touch_guard_reason(ta: dict | None, it: dict | None = None) -> str
                 rsi_buf = 6.0
             if side == "LONG":
                 if rsi_5m >= (float(rsi_long_max) + float(rsi_buf)):
-                    return f"rsi_long_extreme={rsi_5m:.1f} >= {(float(rsi_long_max) + float(rsi_buf)):g}"
+                    if not _mid_fast_continuation_rsi_relief_allowed(side, rsi_5m, t.get("macd_hist")):
+                        return f"rsi_long_extreme={rsi_5m:.1f} >= {(float(rsi_long_max) + float(rsi_buf)):g}"
                 if rsi_5m < (float(rsi_long_min) - float(rsi_buf)):
                     return f"rsi_long_extreme={rsi_5m:.1f} < {(float(rsi_long_min) - float(rsi_buf)):g}"
             else:
                 if rsi_5m <= (float(rsi_short_min) - float(rsi_buf)):
-                    return f"rsi_short_extreme={rsi_5m:.1f} <= {(float(rsi_short_min) - float(rsi_buf)):g}"
+                    if not _mid_fast_continuation_rsi_relief_allowed(side, rsi_5m, t.get("macd_hist")):
+                        return f"rsi_short_extreme={rsi_5m:.1f} <= {(float(rsi_short_min) - float(rsi_buf)):g}"
                 if rsi_5m >= (float(rsi_short_max) + float(rsi_buf)):
                     return f"rsi_short_extreme={rsi_5m:.1f} >= {(float(rsi_short_max) + float(rsi_buf)):g}"
 
@@ -13790,16 +13845,20 @@ def _mid_block_reason(symbol: str, side: str, close: float, o: float, recent_low
             if climax_recent_bars > 0 or (vol_x > MID_CLIMAX_VOL_X and body_atr > MID_CLIMAX_BODY_ATR):
                 return f"climax vol_x={vol_x:.2f} > {MID_CLIMAX_VOL_X:g} and body_atr={body_atr:.2f} > {MID_CLIMAX_BODY_ATR:g}"
 
-        # RSI filter (works even if ATR missing)
+        # RSI filter (works even if ATR missing).  For STX-like fast
+        # continuation we do not kill the candidate only because RSI is hot;
+        # final path/micro-wall guards still decide whether it is tradable.
         if rsi_5m is not None:
             if side.upper() == "LONG":
                 if rsi_5m >= rsi_long_max:
-                    return f"rsi_long={rsi_5m:.1f} >= {rsi_long_max:g}"
+                    if not _mid_fast_continuation_rsi_relief_allowed(side, rsi_5m, None):
+                        return f"rsi_long={rsi_5m:.1f} >= {rsi_long_max:g}"
                 if rsi_5m < rsi_long_min:
                     return f"rsi_long={rsi_5m:.1f} < {rsi_long_min:g}"
             else:  # SHORT
                 if rsi_5m <= rsi_short_min:
-                    return f"rsi_short={rsi_5m:.1f} <= {rsi_short_min:g}"
+                    if not _mid_fast_continuation_rsi_relief_allowed(side, rsi_5m, None):
+                        return f"rsi_short={rsi_5m:.1f} <= {rsi_short_min:g}"
                 if rsi_5m >= rsi_short_max:
                     return f"rsi_short={rsi_5m:.1f} >= {rsi_short_max:g}"
 
@@ -16767,12 +16826,14 @@ def _mid_scan_critical_block_reason(*, side: str, rsi_5m: float | None, macd_his
                 scan_rsi_buf = 6.0
             if side_u == "LONG":
                 if rsi >= (float(rsi_long_max) + float(scan_rsi_buf)):
-                    return f"rsi_long_extreme={rsi:.1f} >= {(float(rsi_long_max) + float(scan_rsi_buf)):g}"
+                    if not _mid_fast_continuation_rsi_relief_allowed(side_u, rsi, macd_hist_5m):
+                        return f"rsi_long_extreme={rsi:.1f} >= {(float(rsi_long_max) + float(scan_rsi_buf)):g}"
                 if rsi < (float(rsi_long_min) - float(scan_rsi_buf)):
                     return f"rsi_long_extreme={rsi:.1f} < {(float(rsi_long_min) - float(scan_rsi_buf)):g}"
             else:
                 if rsi <= (float(rsi_short_min) - float(scan_rsi_buf)):
-                    return f"rsi_short_extreme={rsi:.1f} <= {(float(rsi_short_min) - float(scan_rsi_buf)):g}"
+                    if not _mid_fast_continuation_rsi_relief_allowed(side_u, rsi, macd_hist_5m):
+                        return f"rsi_short_extreme={rsi:.1f} <= {(float(rsi_short_min) - float(scan_rsi_buf)):g}"
                 if rsi >= (float(rsi_short_max) + float(scan_rsi_buf)):
                     return f"rsi_short_extreme={rsi:.1f} >= {(float(rsi_short_max) + float(scan_rsi_buf)):g}"
 
