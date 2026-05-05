@@ -2818,6 +2818,68 @@ def _mid_is_fast_continuation_setup(*args, **kwargs) -> bool:
         return False
 
 
+def _mid_mark_fast_continuation_match(sig=None, it: dict | None = None, reason: str | None = None, *, primary: bool = False) -> None:
+    """Mark a signal as matching the additive FAST CONTINUATION setup.
+
+    Important for the user's requirement: this must NOT disable or replace old
+    SMC/Smart-setup routes.  Old setups still work and keep their base label; a
+    fresh-impulse STX-like match is added as an extra label/note.  Only when
+    primary=True (reserved for a future dedicated fast-continuation candidate)
+    do we use FAST CONTINUATION as the sole setup_source.
+    """
+    try:
+        if sig is None:
+            return
+        fc_label = _mid_setup_source_label("fast_continuation") or "FAST CONTINUATION / STX-LIKE SIGNAL"
+        base_source = str(getattr(sig, "setup_source", "") or "").strip()
+        base_label = str(getattr(sig, "setup_source_label", "") or "").strip() or _mid_setup_source_label(base_source)
+        if primary or not base_source:
+            try:
+                sig.setup_source = "fast_continuation"
+                sig.setup_source_label = fc_label
+                sig.ui_setup_label = fc_label
+            except Exception:
+                pass
+        else:
+            # Additive display: the old setup remains visible and FAST CONTINUATION
+            # is shown as a fresh-impulse confirmation/profile.
+            try:
+                if base_label and fc_label.lower() not in base_label.lower():
+                    sig.ui_setup_label = f"{base_label} + {fc_label}"
+                elif not str(getattr(sig, "ui_setup_label", "") or "").strip():
+                    sig.ui_setup_label = base_label or fc_label
+            except Exception:
+                pass
+        try:
+            note = str(getattr(sig, "risk_note", "") or "")
+            add = "fast_continuation_stx_like=1"
+            if add not in note:
+                note = (note + " | " + add).strip(" |")
+            if base_source and "base_setup_source=" not in note:
+                note = (note + f" | base_setup_source={base_source}").strip(" |")
+            if reason and "fast_continuation_reason=" not in note:
+                note = (note + f" | fast_continuation_reason={str(reason)[:80]}").strip(" |")
+            sig.risk_note = note
+        except Exception:
+            pass
+        try:
+            setattr(sig, "fast_continuation_stx_like", True)
+        except Exception:
+            pass
+        if isinstance(it, dict):
+            try:
+                it["fast_continuation_stx_like"] = True
+                it["fast_continuation_reason"] = str(reason or "")
+                if base_source:
+                    it["fast_continuation_base_setup_source"] = base_source
+                if base_label:
+                    it["fast_continuation_base_setup_label"] = base_label
+            except Exception:
+                pass
+    except Exception:
+        return
+
+
 def _mid_report_path_quality_guard_reason(
     sig=None,
     ta: dict | None = None,
@@ -26645,10 +26707,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 try:
                                     _fc_ok, _fc_reason, _fc_meta = _mid_fast_continuation_setup_check(sig=sig, ta=None, it=it, route=str(it.get("smc_setup_route") or it.get("emit_route") or "pending_instant_emit"))
                                     if _fc_ok:
-                                        sig.setup_source = "fast_continuation"
-                                        sig.setup_source_label = _mid_setup_source_label("fast_continuation")
-                                        sig.ui_setup_label = _mid_setup_source_label("fast_continuation")
-                                        sig.risk_note = str(sig.risk_note or "") + " | fast_continuation_stx_like=1"
+                                        _mid_mark_fast_continuation_match(sig, it, _fc_reason, primary=False)
                                 except Exception:
                                     pass
 
@@ -27573,15 +27632,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                 macd_hist=_safe_float(ta.get("macd_hist"), None),
                             )
                             if _fc_ok:
-                                sig_instant.setup_source = "fast_continuation"
-                                sig_instant.setup_source_label = _mid_setup_source_label("fast_continuation")
-                                sig_instant.ui_setup_label = _mid_setup_source_label("fast_continuation")
-                                sig_instant.risk_note = str(sig_instant.risk_note or "") + " | fast_continuation_stx_like=1"
-                                try:
-                                    it["fast_continuation_stx_like"] = True
-                                    it["fast_continuation_reason"] = str(_fc_reason or "")
-                                except Exception:
-                                    pass
+                                _mid_mark_fast_continuation_match(sig_instant, it, _fc_reason, primary=False)
                         except Exception:
                             pass
                         instant_ok, instant_reason, instant_meta = _mid_instant_emit_gate(
@@ -29276,15 +29327,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             macd_hist=_safe_float(_ta_emit.get("macd_hist"), None),
                         )
                         if _fc_ok:
-                            sig.setup_source = "fast_continuation"
-                            sig.setup_source_label = _mid_setup_source_label("fast_continuation")
-                            sig.ui_setup_label = _mid_setup_source_label("fast_continuation")
-                            sig.risk_note = str(sig.risk_note or "") + " | fast_continuation_stx_like=1"
-                            try:
-                                it["fast_continuation_stx_like"] = True
-                                it["fast_continuation_reason"] = str(_fc_reason or "")
-                            except Exception:
-                                pass
+                            _mid_mark_fast_continuation_match(sig, it, _fc_reason, primary=False)
                     except Exception:
                         pass
 
