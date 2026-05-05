@@ -2669,6 +2669,15 @@ def _mid_report_path_quality_guard_reason(
                     return src.get(k)
         return None
 
+    def _bool_pick(*keys) -> bool:
+        v = _pick(*keys)
+        if isinstance(v, bool):
+            return bool(v)
+        try:
+            return str(v or "").strip().lower() in ("1", "true", "yes", "y", "on")
+        except Exception:
+            return False
+
     try:
         side = str(
             (getattr(sig, "direction", None) if sig is not None else None)
@@ -2778,6 +2787,15 @@ def _mid_report_path_quality_guard_reason(
         level_name = "level"
         level_value = 0.0
 
+        two_green_now = _bool_pick("two_green_5m")
+        two_red_now = _bool_pick("two_red_5m")
+        higher_lows_now = _bool_pick("higher_lows_5m")
+        lower_highs_now = _bool_pick("lower_highs_5m")
+        close_pos_5m = _num(_pick("close_pos_5m"), default=0.50)
+        upper_wick_atr_5m = _num(_pick("upper_wick_atr_5m"), default=0.0)
+        lower_wick_atr_5m = _num(_pick("lower_wick_atr_5m"), default=0.0)
+        last_body_signed_atr_5m = _num(_pick("last_body_signed_atr_5m"), default=0.0)
+
         if side == "LONG":
             if levels_over:
                 level_name, level_value = sorted(levels_over, key=lambda x: x[1])[0]
@@ -2831,6 +2849,56 @@ def _mid_report_path_quality_guard_reason(
                 and not fresh_momentum_ok
                 and ("structure" in route_s or "origin" in route_s or "pending" in route_s or "bos" in route_s or "retest" in route_s)
             )
+            # v49: micro-wall guard.  ONDO-like losses came from a very small TP1
+            # (0.3-0.6%) placed just behind the nearest 1m/5m seller wall.  v48 could
+            # let these pass because fresh_momentum_ok was too permissive (MACD/near-high).
+            # Do this check BEFORE the fresh-momentum allow.  A good fast winner must
+            # either break/accept above the wall or show real strong 5m continuation.
+            try:
+                micro_wall_tp1_pct = float(os.getenv("MID_REPORT_PATH_MICRO_WALL_TP1_PCT", "0.55") or 0.55) / 100.0
+            except Exception:
+                micro_wall_tp1_pct = 0.0055
+            try:
+                micro_wall_near_atr = float(os.getenv("MID_REPORT_PATH_MICRO_WALL_NEAR_ATR", "0.75") or 0.75)
+            except Exception:
+                micro_wall_near_atr = 0.75
+            try:
+                micro_wall_body_atr = float(os.getenv("MID_REPORT_PATH_MICRO_WALL_BODY_ATR", "0.30") or 0.30)
+            except Exception:
+                micro_wall_body_atr = 0.30
+            try:
+                micro_wall_vol_x = float(os.getenv("MID_REPORT_PATH_MICRO_WALL_VOL_X", "0.90") or 0.90)
+            except Exception:
+                micro_wall_vol_x = 0.90
+            micro_tp_wall = bool(
+                level_before_tp1
+                and no_accept
+                and clean_space_pct <= micro_wall_tp1_pct
+                and level_value > entry
+                and (level_value - entry) <= max(reward * 1.05, atr * micro_wall_near_atr)
+            )
+            real_bull_continuation = bool(
+                strong_accept
+                or (
+                    close > (level_value + pad_abs)
+                    and (bv >= float(micro_wall_body_atr) or rv >= float(micro_wall_vol_x) or macd_v > 0)
+                    and float(close_pos_5m) >= 0.62
+                    and not bool(two_red_now)
+                )
+                or (
+                    bool(two_green_now)
+                    and bool(higher_lows_now)
+                    and bv >= max(float(fresh_body_atr) * 0.75, 0.18)
+                    and float(close_pos_5m) >= 0.70
+                    and float(upper_wick_atr_5m) <= 0.35
+                )
+            )
+            if micro_tp_wall and not real_bull_continuation:
+                return (
+                    f"quality_path_micro_wall_tp1_blocked:side=LONG|level={level_name}|clean={clean_space_pct*100:.2f}%"
+                    f"|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}|body_atr={bv:.2f}|vol={rv:.2f}"
+                )
+
             if strong_accept or fresh_momentum_ok:
                 return ""
             if pump_rejection:
@@ -2906,6 +2974,51 @@ def _mid_report_path_quality_guard_reason(
             and not fresh_momentum_ok
             and ("structure" in route_s or "origin" in route_s or "pending" in route_s or "bos" in route_s or "retest" in route_s)
         )
+        try:
+            micro_wall_tp1_pct = float(os.getenv("MID_REPORT_PATH_MICRO_WALL_TP1_PCT", "0.55") or 0.55) / 100.0
+        except Exception:
+            micro_wall_tp1_pct = 0.0055
+        try:
+            micro_wall_near_atr = float(os.getenv("MID_REPORT_PATH_MICRO_WALL_NEAR_ATR", "0.75") or 0.75)
+        except Exception:
+            micro_wall_near_atr = 0.75
+        try:
+            micro_wall_body_atr = float(os.getenv("MID_REPORT_PATH_MICRO_WALL_BODY_ATR", "0.30") or 0.30)
+        except Exception:
+            micro_wall_body_atr = 0.30
+        try:
+            micro_wall_vol_x = float(os.getenv("MID_REPORT_PATH_MICRO_WALL_VOL_X", "0.90") or 0.90)
+        except Exception:
+            micro_wall_vol_x = 0.90
+        micro_tp_wall = bool(
+            level_before_tp1
+            and no_accept
+            and clean_space_pct <= micro_wall_tp1_pct
+            and level_value < entry
+            and (entry - level_value) <= max(reward * 1.05, atr * micro_wall_near_atr)
+        )
+        real_bear_continuation = bool(
+            strong_accept
+            or (
+                close < (level_value - pad_abs)
+                and (bv >= float(micro_wall_body_atr) or rv >= float(micro_wall_vol_x) or macd_v < 0)
+                and float(close_pos_5m) <= 0.38
+                and not bool(two_green_now)
+            )
+            or (
+                bool(two_red_now)
+                and bool(lower_highs_now)
+                and bv >= max(float(fresh_body_atr) * 0.75, 0.18)
+                and float(close_pos_5m) <= 0.30
+                and float(lower_wick_atr_5m) <= 0.35
+            )
+        )
+        if micro_tp_wall and not real_bear_continuation:
+            return (
+                f"quality_path_micro_wall_tp1_blocked:side=SHORT|level={level_name}|clean={clean_space_pct*100:.2f}%"
+                f"|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}|body_atr={bv:.2f}|vol={rv:.2f}"
+            )
+
         if strong_accept or fresh_momentum_ok:
             return ""
         if dump_rejection:
@@ -20560,11 +20673,35 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
     origin_vol_x = float("nan")
     origin_body_src = "last_body"
     origin_vol_src = "current_rel_vol"
+    # v49: current 5m candle shape for micro-wall guard.
+    # Small TP1 behind a nearby 1m/5m wall must not be allowed only because MACD is positive.
+    last_open5 = last_high5 = last_low5 = last_close5 = 0.0
+    close_pos5 = 0.50
+    upper_wick_atr5 = 0.0
+    lower_wick_atr5 = 0.0
+    last_body_signed5 = 0.0
+    prev_close5 = 0.0
     try:
         op = df5i["open"].astype(float)
         hi = df5i["high"].astype(float)
         lo = df5i["low"].astype(float)
         cl = df5i["close"].astype(float)
+
+        try:
+            last_open5 = float(op.iloc[-1])
+            last_high5 = float(hi.iloc[-1])
+            last_low5 = float(lo.iloc[-1])
+            last_close5 = float(cl.iloc[-1])
+            prev_close5 = float(cl.iloc[-2]) if len(cl) >= 2 else float(last_close5)
+            _rng5 = max(float(last_high5) - float(last_low5), 1e-12)
+            close_pos5 = max(0.0, min(1.0, (float(last_close5) - float(last_low5)) / _rng5))
+            _body_hi = max(float(last_open5), float(last_close5))
+            _body_lo = min(float(last_open5), float(last_close5))
+            upper_wick_atr5 = (float(last_high5) - _body_hi) / float(atr30) if float(atr30 or 0.0) > 0 else 0.0
+            lower_wick_atr5 = (_body_lo - float(last_low5)) / float(atr30) if float(atr30 or 0.0) > 0 else 0.0
+            last_body_signed5 = (float(last_close5) - float(last_open5)) / float(atr30) if float(atr30 or 0.0) > 0 else 0.0
+        except Exception:
+            pass
 
         if len(cl) >= 2:
             two_red_5m = (float(cl.iloc[-1]) < float(op.iloc[-1])) and (float(cl.iloc[-2]) < float(op.iloc[-2]))
@@ -20885,6 +21022,15 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "origin_vol_src": str(origin_vol_src),
 
         "last_body": float(last_body),
+        "last_open_5m": float(last_open5 or 0.0),
+        "last_high_5m": float(last_high5 or 0.0),
+        "last_low_5m": float(last_low5 or 0.0),
+        "last_close_5m": float(last_close5 or 0.0),
+        "prev_close_5m": float(prev_close5 or 0.0),
+        "close_pos_5m": float(close_pos5),
+        "upper_wick_atr_5m": float(upper_wick_atr5 or 0.0),
+        "lower_wick_atr_5m": float(lower_wick_atr5 or 0.0),
+        "last_body_signed_atr_5m": float(last_body_signed5 or 0.0),
         "prev_body": float(prev_body),
         "origin_body": float(origin_body),
         "origin_body_src": str(origin_body_src),
