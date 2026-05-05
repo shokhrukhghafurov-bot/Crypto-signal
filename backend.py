@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-05_smart_path_guard_v46"
+MID_BUILD_TAG = "MID_BUILD_2026-05-05_smart_path_guard_v47"
 
 import asyncio
 import json
@@ -2727,6 +2727,7 @@ def _mid_report_path_quality_guard_reason(
         levels_under = []
         for k in (
             "resistance", "resistance_low", "resistance_high",
+            "nearest_resistance_above", "nearest_local_resistance_above", "local_pivot_high_above", "seller_reaction_level",
             "recent_high", "eq_hi", "range_high", "local_high", "swing_high", "last_swing_high",
             "supply", "supply_low", "supply_high", "nearest_supply", "nearest_supply_low", "nearest_supply_high",
             "seller_level", "seller_zone_low", "seller_zone_high", "bearish_fvg_low", "bearish_fvg_high",
@@ -2737,6 +2738,7 @@ def _mid_report_path_quality_guard_reason(
                 levels_over.append((k, v))
         for k in (
             "support", "support_low", "support_high",
+            "nearest_support_below", "nearest_local_support_below", "local_pivot_low_below", "buyer_reaction_level",
             "recent_low", "eq_lo", "range_low", "local_low", "swing_low", "last_swing_low",
             "demand", "demand_low", "demand_high", "nearest_demand", "nearest_demand_low", "nearest_demand_high",
             "buyer_level", "buyer_zone_low", "buyer_zone_high", "bullish_fvg_low", "bullish_fvg_high",
@@ -2765,6 +2767,7 @@ def _mid_report_path_quality_guard_reason(
 
         recent_high = _num(_pick("recent_high", "local_high", "range_high", "swing_high", "last_swing_high"), default=0.0)
         recent_low = _num(_pick("recent_low", "local_low", "range_low", "swing_low", "last_swing_low"), default=0.0)
+        route_s = str(route or _pick("smc_setup_route", "emit_route", "setup_source", "smart_setup") or "").lower()
 
         clean_space_pct = reward / max(entry, 1e-12)
         pad_abs = max(entry * pad_pct, atr * 0.08)
@@ -2799,8 +2802,26 @@ def _mid_report_path_quality_guard_reason(
                 hard_late_atr = 1.40
             local_top_bad = float(rpos) >= float(local_top_pos)
             level_before_tp1 = bool(level_value > 0 and level_value <= (tp1 + pad_abs))
-            if strong_accept:
+            pullback_from_high_atr = ((float(recent_high) - float(entry)) / max(atr, 1e-12)) if recent_high > entry else 0.0
+            # v47: reject late rebound/continuation LONG after a pump when price is still
+            # below the recent seller reaction and has not reclaimed it. This catches
+            # MORPHO/RENDER/2Z/EIGEN style losses where the absolute high is above TP1,
+            # so v46 did not classify TP1 as "behind" the max range high.
+            pump_rejection = (
+                recent_high > entry
+                and late_from_low >= float(os.getenv("MID_REPORT_PATH_PUMP_MOVE_ATR", "1.20") or 1.20)
+                and pullback_from_high_atr >= float(os.getenv("MID_REPORT_PATH_REJECT_FROM_HIGH_ATR", "0.18") or 0.18)
+                and float(rpos) >= float(os.getenv("MID_REPORT_PATH_REJECT_RANGE_POS", "0.55") or 0.55)
+                and no_accept
+                and ("structure" in route_s or "origin" in route_s or "pending" in route_s or "bos" in route_s or "retest" in route_s)
+            )
+            if strong_accept and not pump_rejection:
                 return ""
+            if pump_rejection:
+                return (
+                    f"quality_path_after_pump_rejection:side=LONG|high={recent_high:.8g}|pullback_atr={pullback_from_high_atr:.2f}"
+                    f"|range_pos={float(rpos):.2f}|late_atr={late_from_low:.2f}|clean={clean_space_pct*100:.2f}%"
+                )
             # v46 hard case from SUI/BCH/BABY: price is high in the local 5m range,
             # a fresh local high/seller reaction sits between entry and TP1, and there
             # is no close/acceptance above it. Do not wait for weak volume/body to agree.
@@ -2844,8 +2865,22 @@ def _mid_report_path_quality_guard_reason(
             hard_late_atr = 1.40
         local_bottom_bad = float(rpos) <= float(local_bottom_pos)
         level_before_tp1 = bool(level_value > 0 and level_value >= (tp1 - pad_abs))
-        if strong_accept:
+        pullback_from_low_atr = ((float(entry) - float(recent_low)) / max(atr, 1e-12)) if recent_low > 0 and recent_low < entry else 0.0
+        dump_rejection = (
+            recent_low > 0 and recent_low < entry
+            and late_from_high >= float(os.getenv("MID_REPORT_PATH_PUMP_MOVE_ATR", "1.20") or 1.20)
+            and pullback_from_low_atr >= float(os.getenv("MID_REPORT_PATH_REJECT_FROM_HIGH_ATR", "0.18") or 0.18)
+            and float(rpos) <= float(os.getenv("MID_REPORT_PATH_DUMP_REJECT_RANGE_POS", "0.45") or 0.45)
+            and no_accept
+            and ("structure" in route_s or "origin" in route_s or "pending" in route_s or "bos" in route_s or "retest" in route_s)
+        )
+        if strong_accept and not dump_rejection:
             return ""
+        if dump_rejection:
+            return (
+                f"quality_path_after_dump_rejection:side=SHORT|low={recent_low:.8g}|pullback_atr={pullback_from_low_atr:.2f}"
+                f"|range_pos={float(rpos):.2f}|late_atr={late_from_high:.2f}|clean={clean_space_pct*100:.2f}%"
+            )
         # v46 symmetric hard case: SHORT too low into demand/support with TP1 behind it.
         if level_before_tp1 and no_accept and clean_tight and (local_bottom_bad or late_from_high >= float(hard_late_atr)):
             return (
@@ -20294,6 +20329,11 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
     local_prev_low = 0.0
     local_prev_high = 0.0
     local_range_pos_val = 0.50
+    # v47: nearest path obstacles, not only the highest/lowest range extreme.
+    # The bad 20:00 MSK losses were not always under the absolute range high;
+    # they were under the nearest lower-high / seller reaction inside the path to TP1.
+    local_nearest_high_above = 0.0
+    local_nearest_low_below = 0.0
     try:
         _lb_local = int(float(os.getenv("MID_REPORT_PATH_LOCAL_LOOKBACK_5M", "48") or 48))
     except Exception:
@@ -20320,9 +20360,22 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
             if _rng_local > max(1e-12, abs(float(entry)) * 1e-9):
                 local_range_pos_val = (float(entry) - float(local_prev_low)) / _rng_local
                 local_range_pos_val = max(0.0, min(1.0, float(local_range_pos_val)))
+            try:
+                _pad_price = max(abs(float(entry)) * 0.00015, 1e-12)
+                _high_vals = [float(x) for x in _d5_prev["high"].astype(float).values if float(x) > float(entry) + _pad_price]
+                _low_vals = [float(x) for x in _d5_prev["low"].astype(float).values if float(x) < float(entry) - _pad_price]
+                if _high_vals:
+                    local_nearest_high_above = float(min(_high_vals))
+                if _low_vals:
+                    local_nearest_low_below = float(max(_low_vals))
+            except Exception:
+                local_nearest_high_above = 0.0
+                local_nearest_low_below = 0.0
     except Exception:
         local_recent_low = local_recent_high = local_prev_low = local_prev_high = 0.0
         local_range_pos_val = 0.50
+        local_nearest_high_above = 0.0
+        local_nearest_low_below = 0.0
 
     # ATR from 30m (prefer indicator, fallback to true-range)
     atr30 = float(last30.get("atr", np.nan))
@@ -20827,6 +20880,12 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "recent_high": float(local_prev_high or local_recent_high or 0.0),
         "local_low": float(local_prev_low or local_recent_low or 0.0),
         "local_high": float(local_prev_high or local_recent_high or 0.0),
+        "nearest_local_resistance_above": float(local_nearest_high_above or 0.0),
+        "nearest_resistance_above": float(local_nearest_high_above or 0.0),
+        "local_pivot_high_above": float(local_nearest_high_above or 0.0),
+        "nearest_local_support_below": float(local_nearest_low_below or 0.0),
+        "nearest_support_below": float(local_nearest_low_below or 0.0),
+        "local_pivot_low_below": float(local_nearest_low_below or 0.0),
         "range_low": float(local_prev_low or local_recent_low or 0.0),
         "range_high": float(local_prev_high or local_recent_high or 0.0),
         "range_pos_val": float(local_range_pos_val),
@@ -20868,6 +20927,25 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
                     _pos_tr = (float(entry) - float(recent_low)) / _rng_tr
                     ta["range_pos_val"] = max(0.0, min(1.0, float(_pos_tr)))
                     ta["local_range_pos_val"] = ta["range_pos_val"]
+                try:
+                    _lb_path = int(float(os.getenv("MID_REPORT_PATH_LOCAL_LOOKBACK_5M", "48") or 48))
+                    _lb_path = max(12, min(96, int(_lb_path)))
+                    _d5_path = df5i.tail(_lb_path + 1).iloc[:-1].copy() if len(df5i) > 1 else df5i.tail(_lb_path).copy()
+                    _pad_price = max(abs(float(entry)) * 0.00015, 1e-12)
+                    _hvals = [float(x) for x in _d5_path["high"].astype(float).values if float(x) > float(entry) + _pad_price]
+                    _lvals = [float(x) for x in _d5_path["low"].astype(float).values if float(x) < float(entry) - _pad_price]
+                    _nh = float(min(_hvals)) if _hvals else 0.0
+                    _nl = float(max(_lvals)) if _lvals else 0.0
+                    if _nh > 0:
+                        ta["nearest_local_resistance_above"] = _nh
+                        ta["nearest_resistance_above"] = _nh
+                        ta["local_pivot_high_above"] = _nh
+                    if _nl > 0:
+                        ta["nearest_local_support_below"] = _nl
+                        ta["nearest_support_below"] = _nl
+                        ta["local_pivot_low_below"] = _nl
+                except Exception:
+                    pass
                 if float(atr30 or 0.0) > 0:
                     ta["move_from_recent_low_atr"] = ((float(entry) - float(recent_low)) / float(atr30)) if float(recent_low or 0.0) < float(entry) else 0.0
                     ta["move_from_recent_high_atr"] = ((float(recent_high) - float(entry)) / float(atr30)) if float(recent_high or 0.0) > float(entry) else 0.0
