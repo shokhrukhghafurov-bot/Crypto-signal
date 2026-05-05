@@ -2899,6 +2899,40 @@ def _mid_report_path_quality_guard_reason(
                     f"|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}|body_atr={bv:.2f}|vol={rv:.2f}"
                 )
 
+            # v50: fallback micro-range guard. Some AXL/ONDO-like signals had no
+            # explicit scalar wall in TA at final emit, so v49 could pass them even
+            # though TP1 was tiny and the entry was inside a noisy upper micro-range.
+            # This blocks small-TP LONGs unless they show real continuation, not just
+            # a weak near-high/micro bounce.
+            try:
+                micro_chop_tp1_pct = float(os.getenv("MID_REPORT_PATH_MICRO_CHOP_TP1_PCT", "0.65") or 0.65) / 100.0
+            except Exception:
+                micro_chop_tp1_pct = 0.0065
+            micro_chop_top = bool(
+                clean_space_pct <= float(micro_chop_tp1_pct)
+                and not real_bull_continuation
+                and (
+                    local_top_bad
+                    or range_bad
+                    or near_level
+                    or level_before_tp1
+                    or late_from_low >= 1.00
+                    or tight_sl
+                )
+                and (
+                    float(close_pos_5m) < 0.70
+                    or bool(two_red_now)
+                    or float(upper_wick_atr_5m) >= 0.18
+                    or bv <= max(float(fresh_body_atr) * 0.70, 0.16)
+                )
+            )
+            if micro_chop_top:
+                return (
+                    f"quality_path_micro_chop_no_continuation:side=LONG|clean={clean_space_pct*100:.2f}%"
+                    f"|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}|body_atr={bv:.2f}|vol={rv:.2f}"
+                    f"|late_atr={late_from_low:.2f}|sl_atr={risk/max(atr,1e-12):.2f}"
+                )
+
             if strong_accept or fresh_momentum_ok:
                 return ""
             if pump_rejection:
@@ -3017,6 +3051,36 @@ def _mid_report_path_quality_guard_reason(
             return (
                 f"quality_path_micro_wall_tp1_blocked:side=SHORT|level={level_name}|clean={clean_space_pct*100:.2f}%"
                 f"|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}|body_atr={bv:.2f}|vol={rv:.2f}"
+            )
+
+        # v50 mirror: small-TP SHORT into a noisy lower micro-range/support area.
+        try:
+            micro_chop_tp1_pct = float(os.getenv("MID_REPORT_PATH_MICRO_CHOP_TP1_PCT", "0.65") or 0.65) / 100.0
+        except Exception:
+            micro_chop_tp1_pct = 0.0065
+        micro_chop_bottom = bool(
+            clean_space_pct <= float(micro_chop_tp1_pct)
+            and not real_bear_continuation
+            and (
+                local_bottom_bad
+                or range_bad
+                or near_level
+                or level_before_tp1
+                or late_from_high >= 1.00
+                or tight_sl
+            )
+            and (
+                float(close_pos_5m) > 0.30
+                or bool(two_green_now)
+                or float(lower_wick_atr_5m) >= 0.18
+                or bv <= max(float(fresh_body_atr) * 0.70, 0.16)
+            )
+        )
+        if micro_chop_bottom:
+            return (
+                f"quality_path_micro_chop_no_continuation:side=SHORT|clean={clean_space_pct*100:.2f}%"
+                f"|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}|body_atr={bv:.2f}|vol={rv:.2f}"
+                f"|late_atr={late_from_high:.2f}|sl_atr={risk/max(atr,1e-12):.2f}"
             )
 
         if strong_accept or fresh_momentum_ok:
