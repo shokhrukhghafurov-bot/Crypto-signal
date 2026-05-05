@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-05_smart_path_guard_v44"
+MID_BUILD_TAG = "MID_BUILD_2026-05-05_smart_path_guard_v46"
 
 import asyncio
 import json
@@ -2713,7 +2713,7 @@ def _mid_report_path_quality_guard_reason(
             lb = _num(_pick("last_body"), default=0.0)
             bv = (lb / atr) if atr > 0 and lb > 0 else 0.0
         macd_v = _num(macd_hist, _pick("macd_hist", "macd"), default=0.0)
-        rpos = _num(_pick("range_pos_val", "range_pos_num"), default=None)
+        rpos = _num(_pick("local_range_pos_val", "range_pos_val", "range_pos_num"), default=None)
         if rpos is None:
             txt = str(_pick("range_pos") or "").lower()
             if "premium" in txt or "high" in txt:
@@ -2789,8 +2789,26 @@ def _mid_report_path_quality_guard_reason(
             tight_sl = risk < max(atr * float(tight_sl_atr), entry * float(tight_sl_pct))
             weak = (bv <= float(weak_body_atr)) or (rv > 0 and rv < float(weak_vol)) or macd_bad
             clean_tight = clean_space_pct <= float(max_clean_pct)
+            try:
+                local_top_pos = float(os.getenv("MID_REPORT_PATH_LOCAL_TOP_POS", "0.70") or 0.70)
+            except Exception:
+                local_top_pos = 0.70
+            try:
+                hard_late_atr = float(os.getenv("MID_REPORT_PATH_HARD_LATE_ATR", "1.40") or 1.40)
+            except Exception:
+                hard_late_atr = 1.40
+            local_top_bad = float(rpos) >= float(local_top_pos)
+            level_before_tp1 = bool(level_value > 0 and level_value <= (tp1 + pad_abs))
             if strong_accept:
                 return ""
+            # v46 hard case from SUI/BCH/BABY: price is high in the local 5m range,
+            # a fresh local high/seller reaction sits between entry and TP1, and there
+            # is no close/acceptance above it. Do not wait for weak volume/body to agree.
+            if level_before_tp1 and no_accept and clean_tight and (local_top_bad or late_from_low >= float(hard_late_atr)):
+                return (
+                    f"quality_path_local_top_tp1_blocked:side=LONG|level={level_name}|clean={clean_space_pct*100:.2f}%"
+                    f"|range_pos={float(rpos):.2f}|late_atr={late_from_low:.2f}|sl_atr={risk/max(atr,1e-12):.2f}"
+                )
             if tp1_blocked and no_accept and (clean_tight or near_level) and (weak or late or range_bad or tight_sl):
                 return (
                     f"quality_path_tp1_blocked:side=LONG|level={level_name}|clean={clean_space_pct*100:.2f}%"
@@ -2816,8 +2834,24 @@ def _mid_report_path_quality_guard_reason(
         tight_sl = risk < max(atr * float(tight_sl_atr), entry * float(tight_sl_pct))
         weak = (bv <= float(weak_body_atr)) or (rv > 0 and rv < float(weak_vol)) or macd_bad
         clean_tight = clean_space_pct <= float(max_clean_pct)
+        try:
+            local_bottom_pos = 1.0 - float(os.getenv("MID_REPORT_PATH_LOCAL_TOP_POS", "0.70") or 0.70)
+        except Exception:
+            local_bottom_pos = 0.30
+        try:
+            hard_late_atr = float(os.getenv("MID_REPORT_PATH_HARD_LATE_ATR", "1.40") or 1.40)
+        except Exception:
+            hard_late_atr = 1.40
+        local_bottom_bad = float(rpos) <= float(local_bottom_pos)
+        level_before_tp1 = bool(level_value > 0 and level_value >= (tp1 - pad_abs))
         if strong_accept:
             return ""
+        # v46 symmetric hard case: SHORT too low into demand/support with TP1 behind it.
+        if level_before_tp1 and no_accept and clean_tight and (local_bottom_bad or late_from_high >= float(hard_late_atr)):
+            return (
+                f"quality_path_local_bottom_tp1_blocked:side=SHORT|level={level_name}|clean={clean_space_pct*100:.2f}%"
+                f"|range_pos={float(rpos):.2f}|late_atr={late_from_high:.2f}|sl_atr={risk/max(atr,1e-12):.2f}"
+            )
         if tp1_blocked and no_accept and (clean_tight or near_level) and (weak or late or range_bad or tight_sl):
             return (
                 f"quality_path_tp1_blocked:side=SHORT|level={level_name}|clean={clean_space_pct*100:.2f}%"
@@ -20251,6 +20285,45 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
     if np.isnan(entry) or entry <= 0:
         return None
 
+    # Local 5m range before the trigger candle.
+    # v46: the report/path guard must know the *nearest local high/low* at emit time.
+    # Previously it often only saw 1h resistance/support, so SUI/BCH/BABY-like LONGs
+    # under a fresh 5m/15m seller reaction could pass and only be explained after SL.
+    local_recent_low = 0.0
+    local_recent_high = 0.0
+    local_prev_low = 0.0
+    local_prev_high = 0.0
+    local_range_pos_val = 0.50
+    try:
+        _lb_local = int(float(os.getenv("MID_REPORT_PATH_LOCAL_LOOKBACK_5M", "48") or 48))
+    except Exception:
+        _lb_local = 48
+    try:
+        _lb_local = max(12, min(96, int(_lb_local)))
+    except Exception:
+        _lb_local = 48
+    try:
+        if df5i is not None and not getattr(df5i, "empty", True):
+            _d5_all = df5i.tail(_lb_local).copy()
+            if len(_d5_all) >= 3:
+                local_recent_low = float(_d5_all["low"].astype(float).min())
+                local_recent_high = float(_d5_all["high"].astype(float).max())
+            _d5_prev = df5i.tail(_lb_local + 1).iloc[:-1].copy() if len(df5i) > 1 else _d5_all
+            if _d5_prev is not None and len(_d5_prev) >= 3:
+                local_prev_low = float(_d5_prev["low"].astype(float).min())
+                local_prev_high = float(_d5_prev["high"].astype(float).max())
+            if local_prev_low <= 0:
+                local_prev_low = local_recent_low
+            if local_prev_high <= 0:
+                local_prev_high = local_recent_high
+            _rng_local = float(local_prev_high) - float(local_prev_low)
+            if _rng_local > max(1e-12, abs(float(entry)) * 1e-9):
+                local_range_pos_val = (float(entry) - float(local_prev_low)) / _rng_local
+                local_range_pos_val = max(0.0, min(1.0, float(local_range_pos_val)))
+    except Exception:
+        local_recent_low = local_recent_high = local_prev_low = local_prev_high = 0.0
+        local_range_pos_val = 0.50
+
     # ATR from 30m (prefer indicator, fallback to true-range)
     atr30 = float(last30.get("atr", np.nan))
     if np.isnan(atr30) or atr30 <= 0:
@@ -20275,6 +20348,14 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         adx1h = float("nan")
 
     atr_pct = (atr30 / entry) * 100.0
+    try:
+        local_move_from_low_atr = ((float(entry) - float(local_prev_low)) / float(atr30)) if (local_prev_low and local_prev_low < entry and atr30 > 0) else 0.0
+    except Exception:
+        local_move_from_low_atr = 0.0
+    try:
+        local_move_from_high_atr = ((float(local_prev_high) - float(entry)) / float(atr30)) if (local_prev_high and local_prev_high > entry and atr30 > 0) else 0.0
+    except Exception:
+        local_move_from_high_atr = 0.0
 
     # --- Dynamic TP2/RR for MID ---
     def _tp2_r_mid(adx_1h: float, adx_30m: float, atrp: float) -> float:
@@ -20740,6 +20821,18 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         "pattern": pattern,
         "support": support,
         "resistance": resistance,
+        # v46 local-path context for quality guard. Use previous 5m bars, not current wick,
+        # so a real breakout that already closed above the old high is not falsely blocked.
+        "recent_low": float(local_prev_low or local_recent_low or 0.0),
+        "recent_high": float(local_prev_high or local_recent_high or 0.0),
+        "local_low": float(local_prev_low or local_recent_low or 0.0),
+        "local_high": float(local_prev_high or local_recent_high or 0.0),
+        "range_low": float(local_prev_low or local_recent_low or 0.0),
+        "range_high": float(local_prev_high or local_recent_high or 0.0),
+        "range_pos_val": float(local_range_pos_val),
+        "local_range_pos_val": float(local_range_pos_val),
+        "move_from_recent_low_atr": float(local_move_from_low_atr),
+        "move_from_recent_high_atr": float(local_move_from_high_atr),
         "breakout_retest": breakout_retest,
         "bo_rt": breakout_retest,
         "channel": channel,
@@ -20761,6 +20854,25 @@ def evaluate_on_exchange_mid_v2(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.
         if str(_phase).lower() == "trigger":
             # Use the same recent-extremes window as scan-time late-entry logic.
             recent_low, recent_high = _mid_recent_extremes_for_late_entry(df5=df5i, df30=df30i)
+            try:
+                # Refresh the same fields in TRIGGER phase; pending may be evaluated many
+                # minutes after scan. This is the context the final guard must use.
+                ta["recent_low"] = float(recent_low or ta.get("recent_low") or 0.0)
+                ta["recent_high"] = float(recent_high or ta.get("recent_high") or 0.0)
+                ta["local_low"] = float(recent_low or ta.get("local_low") or 0.0)
+                ta["local_high"] = float(recent_high or ta.get("local_high") or 0.0)
+                ta["range_low"] = float(recent_low or ta.get("range_low") or 0.0)
+                ta["range_high"] = float(recent_high or ta.get("range_high") or 0.0)
+                _rng_tr = float(recent_high) - float(recent_low)
+                if _rng_tr > max(1e-12, abs(float(entry)) * 1e-9):
+                    _pos_tr = (float(entry) - float(recent_low)) / _rng_tr
+                    ta["range_pos_val"] = max(0.0, min(1.0, float(_pos_tr)))
+                    ta["local_range_pos_val"] = ta["range_pos_val"]
+                if float(atr30 or 0.0) > 0:
+                    ta["move_from_recent_low_atr"] = ((float(entry) - float(recent_low)) / float(atr30)) if float(recent_low or 0.0) < float(entry) else 0.0
+                    ta["move_from_recent_high_atr"] = ((float(recent_high) - float(entry)) / float(atr30)) if float(recent_high or 0.0) > float(entry) else 0.0
+            except Exception:
+                pass
 
             # 5m helpers (best-effort)
             ema20_5m = float("nan")
@@ -38009,8 +38121,14 @@ def _mid_direction_quality_3of5_pre_emit_reason(
             rec.get("entry"),
             getattr(sig, "entry", None),
         )
-        resistance = _f(ta_d.get("resistance"), rec.get("resistance"))
-        support = _f(ta_d.get("support"), rec.get("support"))
+        resistance = _f(
+            ta_d.get("resistance"), ta_d.get("local_high"), ta_d.get("recent_high"),
+            ta_d.get("nearest_supply_high"), ta_d.get("seller_zone_high"), rec.get("resistance"), rec.get("local_high"), rec.get("recent_high")
+        )
+        support = _f(
+            ta_d.get("support"), ta_d.get("local_low"), ta_d.get("recent_low"),
+            ta_d.get("nearest_demand_low"), ta_d.get("buyer_zone_low"), rec.get("support"), rec.get("local_low"), rec.get("recent_low")
+        )
         atr30 = _f(
             ta_d.get("atr30"),
             ta_d.get("atr_abs"),
