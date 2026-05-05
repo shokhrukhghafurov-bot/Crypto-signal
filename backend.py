@@ -2807,15 +2807,31 @@ def _mid_report_path_quality_guard_reason(
             # below the recent seller reaction and has not reclaimed it. This catches
             # MORPHO/RENDER/2Z/EIGEN style losses where the absolute high is above TP1,
             # so v46 did not classify TP1 as "behind" the max range high.
+            fresh_body_atr = float(os.getenv("MID_REPORT_PATH_FRESH_BODY_ATR", "0.26") or 0.26)
+            fresh_vol_x = float(os.getenv("MID_REPORT_PATH_FRESH_VOL_X", "1.00") or 1.00)
+            fresh_max_pullback_atr = float(os.getenv("MID_REPORT_PATH_FRESH_MAX_PULLBACK_ATR", "0.35") or 0.35)
+            fresh_close_near_high_pad_atr = float(os.getenv("MID_REPORT_PATH_FRESH_HIGH_PAD_ATR", "0.20") or 0.20)
+            fresh_momentum_ok = (
+                recent_high > 0
+                and close >= (entry - pad_abs)
+                and pullback_from_high_atr <= fresh_max_pullback_atr
+                and (
+                    bv >= fresh_body_atr
+                    or rv >= fresh_vol_x
+                    or macd_v > 0
+                    or close >= (recent_high - atr * fresh_close_near_high_pad_atr)
+                )
+            )
             pump_rejection = (
                 recent_high > entry
                 and late_from_low >= float(os.getenv("MID_REPORT_PATH_PUMP_MOVE_ATR", "1.20") or 1.20)
                 and pullback_from_high_atr >= float(os.getenv("MID_REPORT_PATH_REJECT_FROM_HIGH_ATR", "0.18") or 0.18)
                 and float(rpos) >= float(os.getenv("MID_REPORT_PATH_REJECT_RANGE_POS", "0.55") or 0.55)
                 and no_accept
+                and not fresh_momentum_ok
                 and ("structure" in route_s or "origin" in route_s or "pending" in route_s or "bos" in route_s or "retest" in route_s)
             )
-            if strong_accept and not pump_rejection:
+            if strong_accept or fresh_momentum_ok:
                 return ""
             if pump_rejection:
                 return (
@@ -2866,15 +2882,31 @@ def _mid_report_path_quality_guard_reason(
         local_bottom_bad = float(rpos) <= float(local_bottom_pos)
         level_before_tp1 = bool(level_value > 0 and level_value >= (tp1 - pad_abs))
         pullback_from_low_atr = ((float(entry) - float(recent_low)) / max(atr, 1e-12)) if recent_low > 0 and recent_low < entry else 0.0
+        fresh_body_atr = float(os.getenv("MID_REPORT_PATH_FRESH_BODY_ATR", "0.26") or 0.26)
+        fresh_vol_x = float(os.getenv("MID_REPORT_PATH_FRESH_VOL_X", "1.00") or 1.00)
+        fresh_max_pullback_atr = float(os.getenv("MID_REPORT_PATH_FRESH_MAX_PULLBACK_ATR", "0.35") or 0.35)
+        fresh_close_near_low_pad_atr = float(os.getenv("MID_REPORT_PATH_FRESH_HIGH_PAD_ATR", "0.20") or 0.20)
+        fresh_momentum_ok = (
+            recent_low > 0
+            and close <= (entry + pad_abs)
+            and pullback_from_low_atr <= fresh_max_pullback_atr
+            and (
+                bv >= fresh_body_atr
+                or rv >= fresh_vol_x
+                or macd_v < 0
+                or close <= (recent_low + atr * fresh_close_near_low_pad_atr)
+            )
+        )
         dump_rejection = (
             recent_low > 0 and recent_low < entry
             and late_from_high >= float(os.getenv("MID_REPORT_PATH_PUMP_MOVE_ATR", "1.20") or 1.20)
             and pullback_from_low_atr >= float(os.getenv("MID_REPORT_PATH_REJECT_FROM_HIGH_ATR", "0.18") or 0.18)
             and float(rpos) <= float(os.getenv("MID_REPORT_PATH_DUMP_REJECT_RANGE_POS", "0.45") or 0.45)
             and no_accept
+            and not fresh_momentum_ok
             and ("structure" in route_s or "origin" in route_s or "pending" in route_s or "bos" in route_s or "retest" in route_s)
         )
-        if strong_accept and not dump_rejection:
+        if strong_accept or fresh_momentum_ok:
             return ""
         if dump_rejection:
             return (
