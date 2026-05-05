@@ -3205,7 +3205,58 @@ def _mid_report_path_quality_guard_reason(
                     f"|late_atr={late_from_low:.2f}|sl_atr={risk/max(atr,1e-12):.2f}"
                 )
 
-            if strong_accept or fresh_momentum_ok or fast_continuation_ok:
+            # v53: Structure-pending micro-top trap guard.
+            # TON-like LOSS after v52: the signal was NOT a real fast-continuation
+            # candidate, but fresh_momentum_ok could still allow it because price was
+            # close to a recent high/MACD positive. For old Structure pending emits,
+            # do not let weak fresh_momentum_ok bypass the wall guard when TP1 is
+            # small and price has already pulled back from a local seller reaction.
+            try:
+                sp_micro_top_tp1_pct = float(os.getenv("MID_REPORT_PATH_SP_MICRO_TOP_TP1_PCT", "0.75") or 0.75) / 100.0
+            except Exception:
+                sp_micro_top_tp1_pct = 0.0075
+            try:
+                sp_reject_from_high_atr = float(os.getenv("MID_REPORT_PATH_SP_REJECT_FROM_HIGH_ATR", "0.08") or 0.08)
+            except Exception:
+                sp_reject_from_high_atr = 0.08
+            try:
+                sp_weak_close_pos = float(os.getenv("MID_REPORT_PATH_SP_WEAK_CLOSE_POS", "0.68") or 0.68)
+            except Exception:
+                sp_weak_close_pos = 0.68
+            structure_pending_route = bool("structure" in route_s or "pending" in route_s or "normal_pending" in route_s)
+            pulled_back_from_local_high = bool(recent_high > entry and pullback_from_high_atr >= float(sp_reject_from_high_atr))
+            weak_micro_followthrough = bool(
+                float(close_pos_5m) < float(sp_weak_close_pos)
+                or bool(two_red_now)
+                or float(upper_wick_atr_5m) >= 0.14
+                or bv <= max(float(fresh_body_atr) * 0.80, 0.18)
+            )
+            sp_micro_top_trap = bool(
+                structure_pending_route
+                and clean_space_pct <= float(sp_micro_top_tp1_pct)
+                and no_accept
+                and not bool(fast_continuation_ok)
+                and not bool(strong_accept)
+                and (pulled_back_from_local_high or level_before_tp1 or near_level or local_top_bad or range_bad)
+                and weak_micro_followthrough
+            )
+            if sp_micro_top_trap:
+                return (
+                    f"quality_path_structure_pending_micro_top_blocked:side=LONG|clean={clean_space_pct*100:.2f}%"
+                    f"|pullback_atr={pullback_from_high_atr:.2f}|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}"
+                    f"|body_atr={bv:.2f}|vol={rv:.2f}"
+                )
+
+            if strong_accept or fast_continuation_ok:
+                return ""
+            # v53: weak fresh_momentum_ok alone is not enough to pass old Structure
+            # pending when TP1 is small and price is still below a local seller wall.
+            if fresh_momentum_ok:
+                if structure_pending_route and clean_space_pct <= float(sp_micro_top_tp1_pct) and no_accept and (pulled_back_from_local_high or level_before_tp1 or near_level) and weak_micro_followthrough:
+                    return (
+                        f"quality_path_weak_fresh_momentum_under_wall:side=LONG|clean={clean_space_pct*100:.2f}%"
+                        f"|pullback_atr={pullback_from_high_atr:.2f}|close_pos={float(close_pos_5m):.2f}|body_atr={bv:.2f}"
+                    )
                 return ""
             if pump_rejection:
                 return (
