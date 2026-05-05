@@ -6208,6 +6208,13 @@ def _report_setup_label_human(source: str | None) -> str:
         "liquidity reclaim ready": "liquidity_reclaim",
         "liquidity_reclaim": "liquidity_reclaim",
         "liquidity_reclaim_emit": "liquidity_reclaim",
+        "fast continuation": "FAST CONTINUATION / STX-LIKE SIGNAL",
+        "fast continuation stx": "FAST CONTINUATION / STX-LIKE SIGNAL",
+        "fast continuation stx like": "FAST CONTINUATION / STX-LIKE SIGNAL",
+        "fast continuation / stx like signal": "FAST CONTINUATION / STX-LIKE SIGNAL",
+        "fast_continuation": "FAST CONTINUATION / STX-LIKE SIGNAL",
+        "stx like": "FAST CONTINUATION / STX-LIKE SIGNAL",
+        "stx like signal": "FAST CONTINUATION / STX-LIKE SIGNAL",
     }
     if raw in labels:
         return labels[raw]
