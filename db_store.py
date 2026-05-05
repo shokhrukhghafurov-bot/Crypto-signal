@@ -2341,6 +2341,7 @@ _SIGNAL_REPORT_SETUP_KEYS = (
     "zone_retest",
     "normal_pending_trigger",
     "liquidity_reclaim",
+    "fast_continuation",
 )
 
 
@@ -2393,6 +2394,12 @@ def _signal_report_normalize_setup_label(*, ui_setup_label: str | None = None, e
         "liquidity_reclaim_emit": "liquidity_reclaim",
         "liquidity_reclaim_entry": "liquidity_reclaim",
         "liquidity_reclaim_ready": "liquidity_reclaim",
+        "fast_continuation": "fast_continuation",
+        "fast_continuation_stx": "fast_continuation",
+        "fast_continuation_stx_like": "fast_continuation",
+        "fast_continuation_/_stx_like_signal": "fast_continuation",
+        "stx_like": "fast_continuation",
+        "stx_like_signal": "fast_continuation",
     }
     return aliases.get(s, s if s in _SIGNAL_REPORT_SETUP_KEYS else "")
 
