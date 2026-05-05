@@ -5748,7 +5748,15 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
     except Exception:
         pass
     try:
-        df5 = await backend.load_candles(symbol, '5m', market=market, limit=160)
+        # Closed LOSS diagnostics need enough 5m candles to replay 1h/3h/6h after SL.
+        # 160 candles can miss the exact cases from the report where price reached TP1
+        # hours after the stop. Keep this report-only load separate from scanners.
+        try:
+            _loss_diag_5m_limit = int(float(str(os.getenv('LOSS_DIAG_CANDLE_LIMIT_5M', '320') or '320').replace(',', '.')))
+        except Exception:
+            _loss_diag_5m_limit = 320
+        _loss_diag_5m_limit = max(180, min(800, int(_loss_diag_5m_limit)))
+        df5 = await backend.load_candles(symbol, '5m', market=market, limit=_loss_diag_5m_limit)
     except Exception:
         df5 = None
     if df5 is None or getattr(df5, 'empty', True):
@@ -5767,10 +5775,17 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
             ts = pd.Series([pd.NaT] * len(d))
         d['_ts'] = ts
         # Keep a buffer before opened_at because fast SL losses can open and close inside
-        # the same 5m candle. Without this, post-entry analysis may be empty and the
-        # LOSS card falls back to a generic reason.
+        # the same 5m candle. Also keep a replay window after SL, but do NOT mix that
+        # replay window into entry->SL MFE/MAE metrics below.
         _post_tf_minutes = 5
-        d = d[(d['_ts'].notna()) & (d['_ts'] >= (opened - dt.timedelta(hours=8))) & (d['_ts'] <= (closed + dt.timedelta(minutes=10 + _post_tf_minutes)))].copy()
+        try:
+            _post_sl_lookahead_h = float(str(os.getenv('LOSS_DIAG_POST_SL_LOOKAHEAD_HOURS', '6') or '6').replace(',', '.'))
+        except Exception:
+            _post_sl_lookahead_h = 6.0
+        _post_sl_lookahead_h = max(0.5, min(24.0, float(_post_sl_lookahead_h)))
+        _trade_metric_end = closed + dt.timedelta(minutes=10 + _post_tf_minutes)
+        _replay_end = closed + dt.timedelta(hours=float(_post_sl_lookahead_h))
+        d = d[(d['_ts'].notna()) & (d['_ts'] >= (opened - dt.timedelta(hours=8))) & (d['_ts'] <= _replay_end)].copy()
         if d.empty:
             analysis['fast_invalidation'] = bool(int(analysis['duration_min']) <= 15)
             return analysis
@@ -5843,9 +5858,9 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
         # Include the candle that contains opened_at. For a 2-7 minute SL, the
         # whole trade often happens inside one 5m candle; using only candles with
         # open_time >= opened_at drops the important failure candle.
-        post = d[d['_ts'] >= (opened - dt.timedelta(minutes=_post_tf_minutes))].copy()
+        post = d[(d['_ts'] >= (opened - dt.timedelta(minutes=_post_tf_minutes))) & (d['_ts'] <= _trade_metric_end)].copy()
         if post.empty:
-            post = d[d['_ts'] >= opened].copy()
+            post = d[(d['_ts'] >= opened) & (d['_ts'] <= _trade_metric_end)].copy()
         if post.empty:
             post = d.copy()
         highs = post['high'].astype(float)
@@ -5997,6 +6012,56 @@ async def _loss_diag_build_close_analysis(row: dict | None, *, closed_at: dt.dat
             _loss_diag_apply_directional_location_flags(analysis, side=side)
             _loss_diag_apply_fast_context_flags(analysis, side=side)
             _loss_diag_apply_directional_location_flags(analysis, side=side)
+        except Exception:
+            pass
+
+        # Post-SL replay: this is the key difference between a bad setup and
+        # a valid idea stopped inside normal pullback.  Keep these flags in
+        # analysis so ranked LOSS cards can prefer SL/entry rework when TP1 was
+        # actually reached after SL.
+        try:
+            analysis['post_sl_lookahead_hours'] = round(float(_post_sl_lookahead_h), 2)
+            _after_sl = d[(d['_ts'] > closed) & (d['_ts'] <= _replay_end)].copy()
+            if not _after_sl.empty and tp1 > 0:
+                for _h in (1, 3, 6):
+                    if float(_h) > float(_post_sl_lookahead_h) + 1e-9:
+                        continue
+                    _win = _after_sl[_after_sl['_ts'] <= (closed + dt.timedelta(hours=_h))].copy()
+                    if _win.empty:
+                        continue
+                    _hi = _win['high'].astype(float)
+                    _lo = _win['low'].astype(float)
+                    if side == 'LONG':
+                        _mx = float(_hi.max())
+                        analysis[f'post_sl_max_high_{_h}h'] = round(_mx, 10)
+                        analysis[f'post_sl_reached_tp1_{_h}h'] = bool(_mx >= float(tp1))
+                    else:
+                        _mn = float(_lo.min())
+                        analysis[f'post_sl_min_low_{_h}h'] = round(_mn, 10)
+                        analysis[f'post_sl_reached_tp1_{_h}h'] = bool(_mn <= float(tp1))
+                if side == 'LONG':
+                    _touch = _after_sl[_after_sl['high'].astype(float) >= float(tp1)].copy()
+                else:
+                    _touch = _after_sl[_after_sl['low'].astype(float) <= float(tp1)].copy()
+                _reached = not _touch.empty
+                analysis['post_sl_reached_tp1'] = bool(_reached)
+                analysis['price_reached_tp1_after_sl'] = bool(_reached)
+                analysis['tp1_reached_after_sl'] = bool(_reached)
+                analysis['tp1_hit_after_sl'] = bool(_reached)
+                analysis['setup_worked_after_sl'] = bool(_reached)
+                analysis['idea_continued_after_stop'] = bool(_reached)
+                if side == 'LONG':
+                    analysis['bullish_idea_continued_after_stop'] = bool(_reached)
+                    analysis['long_continued_after_sl'] = bool(_reached)
+                else:
+                    analysis['bearish_idea_continued_after_stop'] = bool(_reached)
+                    analysis['short_continued_after_sl'] = bool(_reached)
+                if _reached:
+                    try:
+                        _first_ts = _touch['_ts'].iloc[0]
+                        analysis['post_sl_minutes_to_tp1'] = max(1, int(round((_first_ts - closed).total_seconds() / 60.0)))
+                    except Exception:
+                        pass
         except Exception:
             pass
 
