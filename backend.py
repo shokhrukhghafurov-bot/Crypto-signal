@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-MID_BUILD_TAG = "MID_BUILD_2026-05-03_smc_post_pump_guard_v32"
+MID_BUILD_TAG = "MID_BUILD_2026-05-05_smart_path_guard_v44"
 
 import asyncio
 import json
@@ -1324,6 +1324,7 @@ MID_REJECT_REASONS = {
     "volatility_block",
     "liquidity_fail",
     "structure_fail",
+    "quality_guard",
 }
 
 # Aliases from legacy log words -> registry keys (to avoid drift like "no_candles" vs "candles_unavailable")
@@ -1403,6 +1404,14 @@ MID_REJECT_ALIASES = {
     "structure": "structure_fail",
     "bos": "structure_fail",
     "choch": "structure_fail",
+
+    # Report-driven smart path guard: blocks entries that match repeated SL patterns
+    # from the manual chart review (TP1 behind resistance/support, late entry, no acceptance).
+    "quality_guard": "quality_guard",
+    "quality_path": "quality_guard",
+    "tp1_blocked": "quality_guard",
+    "no_clean_path": "quality_guard",
+    "sl_inside_pullback": "quality_guard",
 }
 
 def mid_reject(reason: str) -> str:
@@ -1417,6 +1426,8 @@ def mid_reject(reason: str) -> str:
         # e.g. "symbol_timeout_10s" -> candles_unavailable
         if token.startswith("symbol_timeout"):
             return "candles_unavailable"
+        if token.startswith("quality_path") or token.startswith("quality_guard") or token.startswith("tp1_blocked") or token.startswith("no_clean_path") or token.startswith("sl_inside_pullback"):
+            return "quality_guard"
 
         key = MID_REJECT_ALIASES.get(token) or MID_REJECT_ALIASES.get(r)
         if key and key in MID_REJECT_REASONS:
@@ -2608,6 +2619,218 @@ def _mid_futures_short_weak_emit_reason(*,
         return ""
 
 
+
+def _mid_report_path_quality_guard_reason(
+    sig=None,
+    ta: dict | None = None,
+    it: dict | None = None,
+    *,
+    gate_meta: dict | None = None,
+    route: str | None = None,
+    vol_x: float | None = None,
+    body_atr: float | None = None,
+    macd_hist: float | None = None,
+) -> str:
+    """Report-driven final quality guard for entries that repeatedly closed by SL.
+
+    The manual chart review showed one dominant bad pattern: LONG emitted just under
+    local resistance / seller reaction area (or SHORT above local support), TP1 sitting
+    behind that area, no acceptance/displacement after retest, and sometimes SL inside
+    the normal pullback.  This guard is intentionally narrow: it should not block every
+    direct SMC setup, only setups where the path to TP1 is not clean.
+    """
+    try:
+        if not _env_bool("MID_REPORT_PATH_GUARD_ENABLED", True):
+            return ""
+    except Exception:
+        return ""
+
+    def _num(*vals, default=None):
+        for v in vals:
+            try:
+                if v is None:
+                    continue
+                x = _safe_float(v, None)
+                if x is None:
+                    continue
+                if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+                    continue
+                return float(x)
+            except Exception:
+                continue
+        return default
+
+    def _pick(*keys):
+        for src in (ta, gate_meta, it):
+            if not isinstance(src, dict):
+                continue
+            for k in keys:
+                if k in src and src.get(k) not in (None, "", "—"):
+                    return src.get(k)
+        return None
+
+    try:
+        side = str(
+            (getattr(sig, "direction", None) if sig is not None else None)
+            or _pick("direction", "side")
+            or ""
+        ).upper().strip()
+        if side not in ("LONG", "SHORT"):
+            return ""
+        entry = _num(getattr(sig, "entry", None) if sig is not None else None, _pick("entry", "close"), default=0.0)
+        sl = _num(getattr(sig, "sl", None) if sig is not None else None, _pick("sl"), default=0.0)
+        tp1 = _num(getattr(sig, "tp1", None) if sig is not None else None, _pick("tp1", "tp"), default=0.0)
+        if entry <= 0 or sl <= 0 or tp1 <= 0:
+            return ""
+        atr = _num(_pick("atr30", "atr_abs", "atr", "atr_at_create"), default=0.0)
+        if atr <= 0:
+            atr = max(abs(entry - sl), entry * 0.003)
+        close = _num(_pick("close", "price", "last", "entry"), default=entry)
+        risk = abs(entry - sl)
+        reward = abs(tp1 - entry)
+        if risk <= 0 or reward <= 0:
+            return ""
+
+        # Tunable defaults are based on the user's report, but are kept conservative
+        # so good origin/continuation signals (ETH, TON, LINK, BTC, ETC, TOWNS, RED, TIA)
+        # are not blocked merely because they are near a level.
+        tp1_factor = _num(os.getenv("MID_REPORT_PATH_BLOCK_TP1_FACTOR"), default=1.08)
+        pad_pct = _num(os.getenv("MID_REPORT_PATH_BLOCK_PAD_PCT"), default=0.08) / 100.0
+        max_clean_pct = _num(os.getenv("MID_REPORT_PATH_MAX_CLEAN_SPACE_PCT"), default=1.20) / 100.0
+        near_atr = _num(os.getenv("MID_REPORT_PATH_NEAR_LEVEL_ATR"), default=0.65)
+        late_atr = _num(os.getenv("MID_REPORT_PATH_LATE_ATR"), default=1.85)
+        weak_body_atr = _num(os.getenv("MID_REPORT_PATH_WEAK_BODY_ATR"), default=0.16)
+        strong_body_atr = _num(os.getenv("MID_REPORT_PATH_STRONG_BODY_ATR"), default=0.22)
+        weak_vol = _num(os.getenv("MID_REPORT_PATH_WEAK_VOL_X"), default=0.55)
+        strong_vol = _num(os.getenv("MID_REPORT_PATH_STRONG_VOL_X"), default=0.85)
+        tight_sl_atr = _num(os.getenv("MID_REPORT_PATH_TIGHT_SL_ATR"), default=0.55)
+        tight_sl_pct = _num(os.getenv("MID_REPORT_PATH_TIGHT_SL_PCT"), default=0.0025)
+        range_premium = _num(os.getenv("MID_REPORT_PATH_RANGE_PREMIUM"), default=0.70)
+
+        rv = _num(vol_x, _pick("rel_vol", "vol_x", "origin_vol_x", "current_vol_x"), default=0.0)
+        bv = _num(body_atr, _pick("current_body_atr", "origin_body_atr", "body_atr"), default=None)
+        if bv is None:
+            lb = _num(_pick("last_body"), default=0.0)
+            bv = (lb / atr) if atr > 0 and lb > 0 else 0.0
+        macd_v = _num(macd_hist, _pick("macd_hist", "macd"), default=0.0)
+        rpos = _num(_pick("range_pos_val", "range_pos_num"), default=None)
+        if rpos is None:
+            txt = str(_pick("range_pos") or "").lower()
+            if "premium" in txt or "high" in txt:
+                rpos = 0.80
+            elif "discount" in txt or "low" in txt:
+                rpos = 0.20
+            else:
+                rpos = 0.50
+
+        levels_over = []
+        levels_under = []
+        for k in (
+            "resistance", "resistance_low", "resistance_high",
+            "recent_high", "eq_hi", "range_high", "local_high", "swing_high", "last_swing_high",
+            "supply", "supply_low", "supply_high", "nearest_supply", "nearest_supply_low", "nearest_supply_high",
+            "seller_level", "seller_zone_low", "seller_zone_high", "bearish_fvg_low", "bearish_fvg_high",
+            "nearest_bearish_fvg_low", "nearest_bearish_fvg_high",
+        ):
+            v = _num(_pick(k), default=None)
+            if v is not None and v > entry:
+                levels_over.append((k, v))
+        for k in (
+            "support", "support_low", "support_high",
+            "recent_low", "eq_lo", "range_low", "local_low", "swing_low", "last_swing_low",
+            "demand", "demand_low", "demand_high", "nearest_demand", "nearest_demand_low", "nearest_demand_high",
+            "buyer_level", "buyer_zone_low", "buyer_zone_high", "bullish_fvg_low", "bullish_fvg_high",
+            "nearest_bullish_fvg_low", "nearest_bullish_fvg_high",
+        ):
+            v = _num(_pick(k), default=None)
+            if v is not None and v < entry:
+                levels_under.append((k, v))
+
+        # Include explicit opposing zone pairs, not just scalar levels.  Many snapshots
+        # store supply/demand as (low, high) pairs such as nearest_supply_low/high;
+        # without this, a LONG inside/under a seller zone could pass with no detected
+        # overhead level.
+        try:
+            for zlo, zhi, zname in _mid_collect_structural_zone_pairs(ta, it):
+                zn = str(zname or "zone").lower()
+                pad_ref = max(float(atr or 0.0) * 0.05, float(entry) * 0.0001)
+                if side == "LONG" and any(t in zn for t in ("supply", "resistance", "seller", "bearish")) and float(zhi) > entry:
+                    wall = float(zlo) if float(zlo) > entry else min(float(zhi), float(entry) + pad_ref)
+                    levels_over.append((f"{zname}_zone", wall))
+                elif side == "SHORT" and any(t in zn for t in ("demand", "support", "buyer", "bullish")) and float(zlo) < entry:
+                    wall = float(zhi) if float(zhi) < entry else max(float(zlo), float(entry) - pad_ref)
+                    levels_under.append((f"{zname}_zone", wall))
+        except Exception:
+            pass
+
+        recent_high = _num(_pick("recent_high", "local_high", "range_high", "swing_high", "last_swing_high"), default=0.0)
+        recent_low = _num(_pick("recent_low", "local_low", "range_low", "swing_low", "last_swing_low"), default=0.0)
+
+        clean_space_pct = reward / max(entry, 1e-12)
+        pad_abs = max(entry * pad_pct, atr * 0.08)
+        strong_accept = False
+        no_accept = True
+        near_level = False
+        tp1_blocked = False
+        level_name = "level"
+        level_value = 0.0
+
+        if side == "LONG":
+            if levels_over:
+                level_name, level_value = sorted(levels_over, key=lambda x: x[1])[0]
+                near_level = (level_value - entry) <= max(atr * near_atr, entry * 0.0015)
+                tp1_blocked = level_value <= (entry + reward * tp1_factor + pad_abs)
+                no_accept = close <= (level_value + pad_abs)
+                strong_accept = close > (level_value + pad_abs) and (bv >= strong_body_atr or rv >= strong_vol or macd_v > 0)
+            late_from_low = ((entry - recent_low) / max(atr, 1e-12)) if recent_low > 0 and recent_low < entry else 0.0
+            range_bad = float(rpos) >= float(range_premium)
+            macd_bad = macd_v < 0
+            late = late_from_low >= float(late_atr)
+            tight_sl = risk < max(atr * float(tight_sl_atr), entry * float(tight_sl_pct))
+            weak = (bv <= float(weak_body_atr)) or (rv > 0 and rv < float(weak_vol)) or macd_bad
+            clean_tight = clean_space_pct <= float(max_clean_pct)
+            if strong_accept:
+                return ""
+            if tp1_blocked and no_accept and (clean_tight or near_level) and (weak or late or range_bad or tight_sl):
+                return (
+                    f"quality_path_tp1_blocked:side=LONG|level={level_name}|clean={clean_space_pct*100:.2f}%"
+                    f"|body_atr={bv:.2f}|vol={rv:.2f}|late_atr={late_from_low:.2f}|sl_atr={risk/max(atr,1e-12):.2f}"
+                )
+            if near_level and no_accept and late and weak:
+                return f"quality_path_late_no_acceptance:side=LONG|level={level_name}|late_atr={late_from_low:.2f}|body_atr={bv:.2f}|vol={rv:.2f}"
+            if near_level and no_accept and tight_sl and weak:
+                return f"quality_path_sl_inside_pullback:side=LONG|level={level_name}|sl_atr={risk/max(atr,1e-12):.2f}|body_atr={bv:.2f}"
+            return ""
+
+        # SHORT symmetric guard: avoid shorts straight into demand/support with TP1 behind it.
+        if levels_under:
+            level_name, level_value = sorted(levels_under, key=lambda x: x[1], reverse=True)[0]
+            near_level = (entry - level_value) <= max(atr * near_atr, entry * 0.0015)
+            tp1_blocked = level_value >= (entry - reward * tp1_factor - pad_abs)
+            no_accept = close >= (level_value - pad_abs)
+            strong_accept = close < (level_value - pad_abs) and (bv >= strong_body_atr or rv >= strong_vol or macd_v < 0)
+        late_from_high = ((recent_high - entry) / max(atr, 1e-12)) if recent_high > 0 and recent_high > entry else 0.0
+        range_bad = float(rpos) <= (1.0 - float(range_premium))
+        macd_bad = macd_v > 0
+        late = late_from_high >= float(late_atr)
+        tight_sl = risk < max(atr * float(tight_sl_atr), entry * float(tight_sl_pct))
+        weak = (bv <= float(weak_body_atr)) or (rv > 0 and rv < float(weak_vol)) or macd_bad
+        clean_tight = clean_space_pct <= float(max_clean_pct)
+        if strong_accept:
+            return ""
+        if tp1_blocked and no_accept and (clean_tight or near_level) and (weak or late or range_bad or tight_sl):
+            return (
+                f"quality_path_tp1_blocked:side=SHORT|level={level_name}|clean={clean_space_pct*100:.2f}%"
+                f"|body_atr={bv:.2f}|vol={rv:.2f}|late_atr={late_from_high:.2f}|sl_atr={risk/max(atr,1e-12):.2f}"
+            )
+        if near_level and no_accept and late and weak:
+            return f"quality_path_late_no_acceptance:side=SHORT|level={level_name}|late_atr={late_from_high:.2f}|body_atr={bv:.2f}|vol={rv:.2f}"
+        if near_level and no_accept and tight_sl and weak:
+            return f"quality_path_sl_inside_pullback:side=SHORT|level={level_name}|sl_atr={risk/max(atr,1e-12):.2f}|body_atr={bv:.2f}"
+        return ""
+    except Exception:
+        return ""
+
 def _mid_final_emit_apply_reason(reason: str) -> str:
     try:
         r = str(reason or "").strip().lower()
@@ -2615,6 +2838,8 @@ def _mid_final_emit_apply_reason(reason: str) -> str:
         r = ""
     if not r:
         return "blocked"
+    if r.startswith("quality_path") or r.startswith("quality_guard") or r.startswith("tp1_blocked") or r.startswith("no_clean_path") or r.startswith("sl_inside_pullback"):
+        return "quality_guard"
     if r.startswith("late_from_anchor"):
         return "late_entry"
     if "directional_contradiction" in r:
@@ -2772,6 +2997,19 @@ def _mid_final_emit_gate_reason(*,
     _levels_reason = _mid_level_quality_veto_reason(sig=sig, ta=ta, it=it)
     if _levels_reason:
         return str(_levels_reason)
+
+    _path_quality_reason = _mid_report_path_quality_guard_reason(
+        sig=sig,
+        ta=ta,
+        it=it,
+        gate_meta=gate_meta,
+        route=route,
+        vol_x=vol_x,
+        body_atr=body_atr,
+        macd_hist=macd_hist,
+    )
+    if _path_quality_reason:
+        return str(_path_quality_reason)
 
     if smc_direct_route:
         return ""
@@ -17815,6 +18053,12 @@ def evaluate_on_exchange_mid(df5: pd.DataFrame, df30: pd.DataFrame, df1h: pd.Dat
         "atr30": float(atr30),
         "atr_abs": float(atr30),
         "tp2_r": float(tp2_r),
+        # Raw current candle/price fields for final path-quality guards and loss diagnostics.
+        "open": float(last5.get("open", 0.0) or 0.0),
+        "high": float(last5.get("high", 0.0) or 0.0),
+        "low": float(last5.get("low", 0.0) or 0.0),
+        "close": float(entry),
+        "last_body": abs(float(last5.get("close", entry) or entry) - float(last5.get("open", entry) or entry)),
 
         # trap flag (setup risk) - enforced at TRIGGER
         "trap_ok": bool(ok_trap),
@@ -28226,19 +28470,57 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         _pending_log_trigger(sym, market, direction, "wait", _hold_reason, it, float(price))
                         continue
 
+                    # Guard must validate the exact trigger-time levels, not the stale scan-time
+                    # TA levels.  This path is a confirmed pending emit, so levels are recalculated
+                    # just above by _mid_recalc_levels_from_trigger().  Build a lightweight signal
+                    # and a TA copy carrying those same levels; otherwise quality_guard can miss
+                    # TP1-behind-resistance / tight-SL cases on direct SMC routes.
+                    _ta_emit = dict(ta) if isinstance(ta, dict) else {}
+                    try:
+                        _ta_emit.update({
+                            "entry": float(entry),
+                            "sl": float(sl),
+                            "tp1": float(tp1),
+                            "tp2": float(tp2),
+                            "rr": float(rr),
+                            "close": float(price if price is not None else entry),
+                        })
+                    except Exception:
+                        pass
+                    _guard_route = str(it.get("smc_setup_route") or it.get("emit_route") or "pending_confirmed_emit")
+                    _guard_sig = Signal(
+                        signal_id=0,
+                        market=market,
+                        symbol=sym,
+                        direction=direction,
+                        timeframe=str(it.get("timeframe") or "5m/30m/1h"),
+                        entry=entry,
+                        sl=sl,
+                        tp1=tp1,
+                        tp2=tp2,
+                        rr=rr,
+                        confidence=conf,
+                        confirmations=conf_names,
+                        source_exchange=src_ex,
+                        available_exchanges=conf_names,
+                        ts=time.time(),
+                        emit_route=_guard_route,
+                        smc_setup_route=_guard_route,
+                    )
                     _final_emit_reason = _mid_final_emit_gate_reason(
-                        sig=None,
-                        ta=ta,
+                        sig=_guard_sig,
+                        ta=_ta_emit,
                         it=it,
                         risk_flags=it.get("risk_flags"),
-                        vol_x=float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0),
-                        body_atr=_mid_body_atr(float(ta.get("last_body") or 0.0), float(ta.get("atr30") or ta.get("atr_abs") or 0.0)),
+                        vol_x=float((_ta_emit.get("rel_vol") if _ta_emit.get("rel_vol") is not None else _ta_emit.get("vol_x")) or 0.0),
+                        body_atr=_mid_body_atr(float(_ta_emit.get("last_body") or 0.0), float(_ta_emit.get("atr30") or _ta_emit.get("atr_abs") or 0.0)),
                         bo_rt_label=str(it.get("bo_rt") or it.get("breakout_retest") or ""),
                         breakout_fresh_ok=bool(it.get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(it, now_ts=now)),
-                        micro_trap_ok=bool(ta.get("trap_ok", False)),
-                        macd_hist=_safe_float(ta.get("macd_hist"), None),
+                        micro_trap_ok=bool(_ta_emit.get("trap_ok", False)),
+                        macd_hist=_safe_float(_ta_emit.get("macd_hist"), None),
                         zone_src=str(it.get("entry_zone_src") or ""),
                         in_zone_now=bool(it.get("_in_zone") or it.get("_in_zone_tol") or it.get("_entered_zone_now") or False),
+                        route=_guard_route,
                     )
                     if _final_emit_reason:
                         _apply_reason = _mid_final_emit_apply_reason(_final_emit_reason)
@@ -28285,18 +28567,18 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
 
                     _pre_emit_reason = await self.mid_pre_emit_block_reason(
                         sig=sig,
-                        ta=ta,
+                        ta=_ta_emit,
                         it=it,
                         risk_flags=it.get("risk_flags"),
-                        vol_x=float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0),
-                        body_atr=_mid_body_atr(float(ta.get("last_body") or 0.0), float(ta.get("atr30") or ta.get("atr_abs") or 0.0)),
+                        vol_x=float((_ta_emit.get("rel_vol") if _ta_emit.get("rel_vol") is not None else _ta_emit.get("vol_x")) or 0.0),
+                        body_atr=_mid_body_atr(float(_ta_emit.get("last_body") or 0.0), float(_ta_emit.get("atr30") or _ta_emit.get("atr_abs") or 0.0)),
                         bo_rt_label=str(it.get("bo_rt") or it.get("breakout_retest") or ""),
                         breakout_fresh_ok=bool(it.get("smart_breakout_fast_ok") or _mid_pending_is_fresh_bo_rt(it, now_ts=now)),
-                        micro_trap_ok=bool(ta.get("trap_ok", False)),
-                        macd_hist=_safe_float(ta.get("macd_hist"), None),
+                        micro_trap_ok=bool(_ta_emit.get("trap_ok", False)),
+                        macd_hist=_safe_float(_ta_emit.get("macd_hist"), None),
                         zone_src=str(it.get("entry_zone_src") or ""),
                         in_zone_now=bool(it.get("_in_zone") or it.get("_in_zone_tol") or it.get("_entered_zone_now") or False),
-                        route="pending_confirmed_emit",
+                        route=_guard_route,
                     )
                     if _pre_emit_reason:
                         _apply_reason = _mid_pre_emit_apply_reason(_pre_emit_reason)
@@ -37894,7 +38176,22 @@ async def _backend_mid_pre_emit_block_reason(
         if dir_reason:
             return str(dir_reason)
 
-        # 4) Direction quality veto (optional hard-bans + optional 3-of-5 gate).
+        # 4) Report-driven path quality guard. This applies to direct SMC routes too,
+        # because most reviewed losses passed the formal setup but had no clean path to TP1.
+        report_path_reason = _mid_report_path_quality_guard_reason(
+            sig=sig,
+            ta=ta_d,
+            it=rec,
+            gate_meta=meta,
+            route=route,
+            vol_x=vol_x,
+            body_atr=body_atr,
+            macd_hist=macd_hist,
+        )
+        if report_path_reason:
+            return str(report_path_reason)
+
+        # 5) Direction quality veto (optional hard-bans + optional 3-of-5 gate).
         quality_reason = _mid_direction_quality_3of5_pre_emit_reason(
             sig,
             ta=ta_d,
