@@ -2620,6 +2620,204 @@ def _mid_futures_short_weak_emit_reason(*,
 
 
 
+
+def _mid_fast_continuation_setup_check(
+    sig=None,
+    ta: dict | None = None,
+    it: dict | None = None,
+    *,
+    gate_meta: dict | None = None,
+    route: str | None = None,
+    vol_x: float | None = None,
+    body_atr: float | None = None,
+    macd_hist: float | None = None,
+) -> tuple[bool, str, dict]:
+    """Detect the user's requested STX-like fast continuation setup.
+
+    Goal: create/label more signals like STX/WLD/TON/FIL/ENA/TRX without
+    weakening the hard guards that block AXL/ONDO/BERA/RENDER/2Z.
+
+    This is deliberately an ALLOW/LABEL profile, not a bypass.  The normal
+    report path guard still runs first for micro-wall, post-pump rejection and
+    chop cases.  A valid fast continuation must show fresh follow-through and a
+    clean path to TP1, not just a small bounce under resistance.
+    """
+    try:
+        if not _env_bool("MID_FAST_CONTINUATION_ENABLED", True):
+            return (False, "disabled", {})
+    except Exception:
+        return (False, "disabled", {})
+
+    srcs = []
+    for src in (ta, gate_meta, it):
+        if isinstance(src, dict):
+            srcs.append(src)
+
+    def _pick(*keys):
+        for src in srcs:
+            for k in keys:
+                try:
+                    v = src.get(k)
+                except Exception:
+                    v = None
+                if v not in (None, "", "—"):
+                    return v
+        return None
+
+    def _num(*vals, default=0.0):
+        for v in vals:
+            try:
+                if v is None:
+                    continue
+                x = _safe_float(v, None)
+                if x is None:
+                    continue
+                if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+                    continue
+                return float(x)
+            except Exception:
+                continue
+        return float(default)
+
+    def _bool(*keys) -> bool:
+        v = _pick(*keys)
+        if isinstance(v, bool):
+            return bool(v)
+        try:
+            return str(v or "").strip().lower() in ("1", "true", "yes", "y", "on")
+        except Exception:
+            return False
+
+    try:
+        side = str((getattr(sig, "direction", None) if sig is not None else None) or _pick("direction", "side") or "").upper().strip()
+        if side not in ("LONG", "SHORT"):
+            return (False, "side_missing", {})
+        # The user's examples are all LONG. Keep SHORT support opt-in so we do not
+        # create many low-quality countertrend shorts by accident.
+        if side == "SHORT" and not _env_bool("MID_FAST_CONTINUATION_SHORT_ENABLED", False):
+            return (False, "short_disabled", {})
+
+        entry = _num(getattr(sig, "entry", None) if sig is not None else None, _pick("entry", "close"), default=0.0)
+        sl = _num(getattr(sig, "sl", None) if sig is not None else None, _pick("sl"), default=0.0)
+        tp1 = _num(getattr(sig, "tp1", None) if sig is not None else None, _pick("tp1", "tp"), default=0.0)
+        if entry <= 0 or sl <= 0 or tp1 <= 0:
+            return (False, "levels_missing", {})
+        reward = abs(tp1 - entry)
+        risk = abs(entry - sl)
+        if reward <= 0 or risk <= 0:
+            return (False, "rr_bad", {})
+        atr = _num(_pick("atr30", "atr_abs", "atr", "atr_at_create"), default=0.0)
+        if atr <= 0:
+            atr = max(risk, entry * 0.003)
+        close = _num(_pick("close", "price", "last", "entry"), default=entry)
+
+        rv = _num(vol_x, _pick("rel_vol", "vol_x", "origin_vol_x", "current_vol_x"), default=0.0)
+        bv = _num(body_atr, _pick("current_body_atr", "origin_body_atr", "body_atr"), default=0.0)
+        if bv <= 0:
+            lb = _num(_pick("last_body"), default=0.0)
+            if lb > 0 and atr > 0:
+                bv = lb / max(atr, 1e-12)
+        macd_v = _num(macd_hist, _pick("macd_hist", "macd"), default=0.0)
+        close_pos = _num(_pick("close_pos_5m"), default=0.50)
+        two_green = _bool("two_green_5m")
+        two_red = _bool("two_red_5m")
+        higher_lows = _bool("higher_lows_5m")
+        lower_highs = _bool("lower_highs_5m")
+        upper_wick_atr = _num(_pick("upper_wick_atr_5m"), default=0.0)
+        lower_wick_atr = _num(_pick("lower_wick_atr_5m"), default=0.0)
+        rpos = _num(_pick("local_range_pos_val", "range_pos_val", "range_pos_num"), default=0.50)
+        recent_high = _num(_pick("recent_high", "local_high", "range_high", "swing_high", "last_swing_high"), default=0.0)
+        recent_low = _num(_pick("recent_low", "local_low", "range_low", "swing_low", "last_swing_low"), default=0.0)
+
+        clean_pct = reward / max(entry, 1e-12)
+        min_tp_pct = float(os.getenv("MID_FAST_CONTINUATION_MIN_TP1_PCT", "0.18") or 0.18) / 100.0
+        max_tp_pct = float(os.getenv("MID_FAST_CONTINUATION_MAX_TP1_PCT", "1.60") or 1.60) / 100.0
+        min_body = float(os.getenv("MID_FAST_CONTINUATION_BODY_ATR", "0.18") or 0.18)
+        min_vol = float(os.getenv("MID_FAST_CONTINUATION_VOL_X", "0.75") or 0.75)
+        min_move_atr = float(os.getenv("MID_FAST_CONTINUATION_MOVE_ATR", "0.45") or 0.45)
+        max_pullback_atr = float(os.getenv("MID_FAST_CONTINUATION_MAX_PULLBACK_ATR", "0.55") or 0.55)
+        min_close_pos = float(os.getenv("MID_FAST_CONTINUATION_CLOSE_POS", "0.62") or 0.62)
+        max_wick_atr = float(os.getenv("MID_FAST_CONTINUATION_MAX_WICK_ATR", "0.45") or 0.45)
+        wall_pad_atr = float(os.getenv("MID_FAST_CONTINUATION_WALL_PAD_ATR", "0.10") or 0.10)
+
+        if clean_pct < min_tp_pct or clean_pct > max_tp_pct:
+            return (False, f"tp1_pct:{clean_pct*100:.2f}", {})
+
+        # Nearby wall between entry and TP1 means it is not a clean STX-like path.
+        wall_block = False
+        wall_name = ""
+        wall_value = 0.0
+        level_keys_over = (
+            "nearest_local_resistance_above", "nearest_resistance_above", "local_pivot_high_above",
+            "seller_reaction_level", "resistance", "resistance_low", "resistance_high",
+            "recent_high", "local_high", "range_high", "swing_high", "last_swing_high",
+            "supply", "supply_low", "supply_high", "seller_zone_low", "seller_zone_high",
+        )
+        level_keys_under = (
+            "nearest_local_support_below", "nearest_support_below", "local_pivot_low_below",
+            "buyer_reaction_level", "support", "support_low", "support_high",
+            "recent_low", "local_low", "range_low", "swing_low", "last_swing_low",
+            "demand", "demand_low", "demand_high", "buyer_zone_low", "buyer_zone_high",
+        )
+        if side == "LONG":
+            for k in level_keys_over:
+                v = _num(_pick(k), default=0.0)
+                if v > entry and v <= tp1 + atr * wall_pad_atr and close <= v + atr * wall_pad_atr:
+                    wall_block, wall_name, wall_value = True, k, v
+                    break
+            move_atr = ((entry - recent_low) / max(atr, 1e-12)) if recent_low > 0 and recent_low < entry else 0.0
+            pullback_atr = ((recent_high - entry) / max(atr, 1e-12)) if recent_high > entry else 0.0
+            fresh = bool(
+                (bv >= min_body or rv >= min_vol or macd_v > 0 or (two_green and higher_lows))
+                and close_pos >= min_close_pos
+                and upper_wick_atr <= max_wick_atr
+                and pullback_atr <= max_pullback_atr
+                and move_atr >= min_move_atr
+                and not bool(two_red)
+            )
+        else:
+            for k in level_keys_under:
+                v = _num(_pick(k), default=0.0)
+                if v > 0 and v < entry and v >= tp1 - atr * wall_pad_atr and close >= v - atr * wall_pad_atr:
+                    wall_block, wall_name, wall_value = True, k, v
+                    break
+            move_atr = ((recent_high - entry) / max(atr, 1e-12)) if recent_high > 0 and recent_high > entry else 0.0
+            pullback_atr = ((entry - recent_low) / max(atr, 1e-12)) if recent_low > 0 and recent_low < entry else 0.0
+            fresh = bool(
+                (bv >= min_body or rv >= min_vol or macd_v < 0 or (two_red and lower_highs))
+                and close_pos <= (1.0 - min_close_pos)
+                and lower_wick_atr <= max_wick_atr
+                and pullback_atr <= max_pullback_atr
+                and move_atr >= min_move_atr
+                and not bool(two_green)
+            )
+
+        if wall_block:
+            return (False, f"wall:{wall_name}:{wall_value:.8g}", {
+                "wall": wall_name, "wall_value": wall_value, "clean_pct": clean_pct,
+                "move_atr": move_atr, "pullback_atr": pullback_atr,
+            })
+        if not fresh:
+            return (False, f"not_fresh:body={bv:.2f}|vol={rv:.2f}|close_pos={close_pos:.2f}|move={move_atr:.2f}|pullback={pullback_atr:.2f}", {
+                "clean_pct": clean_pct, "body_atr": bv, "vol_x": rv, "close_pos": close_pos,
+                "move_atr": move_atr, "pullback_atr": pullback_atr,
+            })
+        return (True, "fast_continuation_stx_like", {
+            "clean_pct": clean_pct, "body_atr": bv, "vol_x": rv, "close_pos": close_pos,
+            "move_atr": move_atr, "pullback_atr": pullback_atr, "range_pos": rpos,
+        })
+    except Exception as e:
+        return (False, f"error:{type(e).__name__}", {})
+
+
+def _mid_is_fast_continuation_setup(*args, **kwargs) -> bool:
+    try:
+        ok, _reason, _meta = _mid_fast_continuation_setup_check(*args, **kwargs)
+        return bool(ok)
+    except Exception:
+        return False
+
+
 def _mid_report_path_quality_guard_reason(
     sig=None,
     ta: dict | None = None,
@@ -2840,6 +3038,16 @@ def _mid_report_path_quality_guard_reason(
                     or close >= (recent_high - atr * fresh_close_near_high_pad_atr)
                 )
             )
+            fast_continuation_ok, fast_continuation_reason, fast_continuation_meta = _mid_fast_continuation_setup_check(
+                sig=sig,
+                ta=ta,
+                it=it,
+                gate_meta=gate_meta,
+                route=route,
+                vol_x=rv,
+                body_atr=bv,
+                macd_hist=macd_v,
+            )
             pump_rejection = (
                 recent_high > entry
                 and late_from_low >= float(os.getenv("MID_REPORT_PATH_PUMP_MOVE_ATR", "1.20") or 1.20)
@@ -2847,7 +3055,8 @@ def _mid_report_path_quality_guard_reason(
                 and float(rpos) >= float(os.getenv("MID_REPORT_PATH_REJECT_RANGE_POS", "0.55") or 0.55)
                 and no_accept
                 and not fresh_momentum_ok
-                and ("structure" in route_s or "origin" in route_s or "pending" in route_s or "bos" in route_s or "retest" in route_s)
+                and not fast_continuation_ok
+                and ("structure" in route_s or "origin" in route_s or "pending" in route_s or "bos" in route_s or "retest" in route_s or "fast" in route_s)
             )
             # v49: micro-wall guard.  ONDO-like losses came from a very small TP1
             # (0.3-0.6%) placed just behind the nearest 1m/5m seller wall.  v48 could
@@ -2878,7 +3087,8 @@ def _mid_report_path_quality_guard_reason(
                 and (level_value - entry) <= max(reward * 1.05, atr * micro_wall_near_atr)
             )
             real_bull_continuation = bool(
-                strong_accept
+                fast_continuation_ok
+                or strong_accept
                 or (
                     close > (level_value + pad_abs)
                     and (bv >= float(micro_wall_body_atr) or rv >= float(micro_wall_vol_x) or macd_v > 0)
@@ -2933,7 +3143,7 @@ def _mid_report_path_quality_guard_reason(
                     f"|late_atr={late_from_low:.2f}|sl_atr={risk/max(atr,1e-12):.2f}"
                 )
 
-            if strong_accept or fresh_momentum_ok:
+            if strong_accept or fresh_momentum_ok or fast_continuation_ok:
                 return ""
             if pump_rejection:
                 return (
@@ -2999,6 +3209,16 @@ def _mid_report_path_quality_guard_reason(
                 or close <= (recent_low + atr * fresh_close_near_low_pad_atr)
             )
         )
+        fast_continuation_ok, fast_continuation_reason, fast_continuation_meta = _mid_fast_continuation_setup_check(
+            sig=sig,
+            ta=ta,
+            it=it,
+            gate_meta=gate_meta,
+            route=route,
+            vol_x=rv,
+            body_atr=bv,
+            macd_hist=macd_v,
+        )
         dump_rejection = (
             recent_low > 0 and recent_low < entry
             and late_from_high >= float(os.getenv("MID_REPORT_PATH_PUMP_MOVE_ATR", "1.20") or 1.20)
@@ -3006,7 +3226,8 @@ def _mid_report_path_quality_guard_reason(
             and float(rpos) <= float(os.getenv("MID_REPORT_PATH_DUMP_REJECT_RANGE_POS", "0.45") or 0.45)
             and no_accept
             and not fresh_momentum_ok
-            and ("structure" in route_s or "origin" in route_s or "pending" in route_s or "bos" in route_s or "retest" in route_s)
+            and not fast_continuation_ok
+            and ("structure" in route_s or "origin" in route_s or "pending" in route_s or "bos" in route_s or "retest" in route_s or "fast" in route_s)
         )
         try:
             micro_wall_tp1_pct = float(os.getenv("MID_REPORT_PATH_MICRO_WALL_TP1_PCT", "0.55") or 0.55) / 100.0
@@ -3032,7 +3253,8 @@ def _mid_report_path_quality_guard_reason(
             and (entry - level_value) <= max(reward * 1.05, atr * micro_wall_near_atr)
         )
         real_bear_continuation = bool(
-            strong_accept
+            fast_continuation_ok
+            or strong_accept
             or (
                 close < (level_value - pad_abs)
                 and (bv >= float(micro_wall_body_atr) or rv >= float(micro_wall_vol_x) or macd_v < 0)
@@ -3083,7 +3305,7 @@ def _mid_report_path_quality_guard_reason(
                 f"|late_atr={late_from_high:.2f}|sl_atr={risk/max(atr,1e-12):.2f}"
             )
 
-        if strong_accept or fresh_momentum_ok:
+        if strong_accept or fresh_momentum_ok or fast_continuation_ok:
             return ""
         if dump_rejection:
             return (
@@ -11531,6 +11753,10 @@ def _mid_smc_route_requirement_profile(route: str | None, regime: str | None = N
 
 def _mid_compose_setup_label(setup_source: str | None, smc_route: str | None = None, smc_label: str | None = None) -> str:
     base = _mid_setup_source_label(setup_source)
+    # FAST CONTINUATION is a user-facing setup profile, not a route suffix. Keep
+    # the card label exact so it is easy to count STX-like signals in reports.
+    if _mid_setup_source_normalize(setup_source) == "fast_continuation" and base:
+        return base
     extra = str(smc_label or _mid_smc_emit_route_label(smc_route) or '').strip()
     if base and extra:
         return f"{base} | {extra}"
@@ -13787,6 +14013,7 @@ def _mid_setup_source_normalize(source: str | None) -> str:
       - zone_retest
       - normal_pending_trigger
       - liquidity_reclaim
+      - fast_continuation
 
     We also accept legacy Russian labels / loose variants so old rows and
     previously saved orig_text still normalize to the new canonical values.
@@ -13821,8 +14048,18 @@ def _mid_setup_source_normalize(source: str | None) -> str:
         "reclaim": "liquidity_reclaim",
         "liquidity sweep reclaim": "liquidity_reclaim",
         "возврат после снятия ликвидности": "liquidity_reclaim",
+        "fast_continuation": "fast_continuation",
+        "fast continuation": "fast_continuation",
+        "fast_continuation_stx": "fast_continuation",
+        "fast continuation stx": "fast_continuation",
+        "stx_like": "fast_continuation",
+        "stx like": "fast_continuation",
+        "stx_like_signal": "fast_continuation",
+        "fast_continuation_stx_like": "fast_continuation",
+        "fast continuation / stx-like signal": "fast_continuation",
+        "fast_continuation_/_stx_like_signal": "fast_continuation",
     }
-    return aliases.get(s, s if s in {"origin", "breakout", "zone_retest", "normal_pending_trigger", "liquidity_reclaim"} else "")
+    return aliases.get(s, s if s in {"origin", "breakout", "zone_retest", "normal_pending_trigger", "liquidity_reclaim", "fast_continuation"} else "")
 
 
 def _mid_setup_source_label(source: str | None) -> str:
@@ -13838,6 +14075,7 @@ def _mid_setup_source_label(source: str | None) -> str:
         "zone_retest": "Zone retest",
         "normal_pending_trigger": "Structure pending trigger",
         "liquidity_reclaim": "Liquidity reclaim",
+        "fast_continuation": "FAST CONTINUATION / STX-LIKE SIGNAL",
     }
     return labels.get(src, "")
 
@@ -26404,6 +26642,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                                     setup_source=_pending_source,
                                     setup_source_label=_mid_setup_source_label(_pending_source),
                                 )
+                                try:
+                                    _fc_ok, _fc_reason, _fc_meta = _mid_fast_continuation_setup_check(sig=sig, ta=None, it=it, route=str(it.get("smc_setup_route") or it.get("emit_route") or "pending_instant_emit"))
+                                    if _fc_ok:
+                                        sig.setup_source = "fast_continuation"
+                                        sig.setup_source_label = _mid_setup_source_label("fast_continuation")
+                                        sig.ui_setup_label = _mid_setup_source_label("fast_continuation")
+                                        sig.risk_note = str(sig.risk_note or "") + " | fast_continuation_stx_like=1"
+                                except Exception:
+                                    pass
 
                                 _rr_ok, _rr_val, _rr_min = signal_rr_gate(sig)
                                 if not _rr_ok:
@@ -27315,6 +27562,28 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                             setup_source=_instant_pending_source,
                             setup_source_label=_mid_setup_source_label(_instant_pending_source),
                         )
+                        try:
+                            _fc_ok, _fc_reason, _fc_meta = _mid_fast_continuation_setup_check(
+                                sig=sig_instant,
+                                ta=ta,
+                                it=it,
+                                route=str(it.get("smc_setup_route") or it.get("emit_route") or "pending_instant_emit"),
+                                vol_x=float((ta.get("rel_vol") if ta.get("rel_vol") is not None else ta.get("vol_x")) or 0.0),
+                                body_atr=_mid_body_atr(float(ta.get("last_body") or 0.0), float(ta.get("atr30") or ta.get("atr_abs") or 0.0)),
+                                macd_hist=_safe_float(ta.get("macd_hist"), None),
+                            )
+                            if _fc_ok:
+                                sig_instant.setup_source = "fast_continuation"
+                                sig_instant.setup_source_label = _mid_setup_source_label("fast_continuation")
+                                sig_instant.ui_setup_label = _mid_setup_source_label("fast_continuation")
+                                sig_instant.risk_note = str(sig_instant.risk_note or "") + " | fast_continuation_stx_like=1"
+                                try:
+                                    it["fast_continuation_stx_like"] = True
+                                    it["fast_continuation_reason"] = str(_fc_reason or "")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                         instant_ok, instant_reason, instant_meta = _mid_instant_emit_gate(
                             market=market,
                             direction=direction,
@@ -28996,6 +29265,28 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                         setup_source=_pending_confirm_source,
                         setup_source_label=_mid_setup_source_label(_pending_confirm_source),
                     )
+                    try:
+                        _fc_ok, _fc_reason, _fc_meta = _mid_fast_continuation_setup_check(
+                            sig=sig,
+                            ta=_ta_emit,
+                            it=it,
+                            route=_guard_route,
+                            vol_x=float((_ta_emit.get("rel_vol") if _ta_emit.get("rel_vol") is not None else _ta_emit.get("vol_x")) or 0.0),
+                            body_atr=_mid_body_atr(float(_ta_emit.get("last_body") or 0.0), float(_ta_emit.get("atr30") or _ta_emit.get("atr_abs") or 0.0)),
+                            macd_hist=_safe_float(_ta_emit.get("macd_hist"), None),
+                        )
+                        if _fc_ok:
+                            sig.setup_source = "fast_continuation"
+                            sig.setup_source_label = _mid_setup_source_label("fast_continuation")
+                            sig.ui_setup_label = _mid_setup_source_label("fast_continuation")
+                            sig.risk_note = str(sig.risk_note or "") + " | fast_continuation_stx_like=1"
+                            try:
+                                it["fast_continuation_stx_like"] = True
+                                it["fast_continuation_reason"] = str(_fc_reason or "")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
 
                     _pre_emit_reason = await self.mid_pre_emit_block_reason(
                         sig=sig,
