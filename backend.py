@@ -3014,6 +3014,9 @@ def _mid_report_path_quality_guard_reason(
         reward = abs(tp1 - entry)
         if risk <= 0 or reward <= 0:
             return ""
+        rr_to_tp1 = reward / max(risk, 1e-12)
+        tp1_dist_pct = reward / max(entry, 1e-12)
+        sl_dist_pct = risk / max(entry, 1e-12)
 
         # Tunable defaults are based on the user's report, but are kept conservative
         # so good origin/continuation signals (ETH, TON, LINK, BTC, ETC, TOWNS, RED, TIA)
@@ -3030,6 +3033,15 @@ def _mid_report_path_quality_guard_reason(
         tight_sl_atr = _num(os.getenv("MID_REPORT_PATH_TIGHT_SL_ATR"), default=0.55)
         tight_sl_pct = _num(os.getenv("MID_REPORT_PATH_TIGHT_SL_PCT"), default=0.0025)
         range_premium = _num(os.getenv("MID_REPORT_PATH_RANGE_PREMIUM"), default=0.70)
+
+        # v55 report-driven review guard. Defaults are active in code, so no new ENV
+        # is required. ENV only tunes thresholds if you want later experiments.
+        review_guard_v55 = _env_bool("MID_REPORT_PATH_V55_REVIEW_GUARD_ENABLED", True)
+        review_clean_pct = _num(os.getenv("MID_REPORT_PATH_REVIEW_CLEAN_SPACE_PCT"), default=1.20) / 100.0
+        fake_rr_max = _num(os.getenv("MID_REPORT_PATH_UNREALISTIC_RR_MAX"), default=4.00)
+        fake_rr_tp1_pct = _num(os.getenv("MID_REPORT_PATH_UNREALISTIC_TP1_PCT"), default=3.00) / 100.0
+        weak_rr_min = _num(os.getenv("MID_REPORT_PATH_WEAK_RR_MIN"), default=1.15)
+        review_wick_atr = _num(os.getenv("MID_REPORT_PATH_REVIEW_WICK_ATR"), default=0.12)
 
         rv = _num(vol_x, _pick("rel_vol", "vol_x", "origin_vol_x", "current_vol_x"), default=0.0)
         bv = _num(body_atr, _pick("current_body_atr", "origin_body_atr", "body_atr"), default=None)
@@ -3220,6 +3232,43 @@ def _mid_report_path_quality_guard_reason(
                     and float(upper_wick_atr_5m) <= 0.35
                 )
             )
+            if review_guard_v55:
+                # User-reviewed LOSS pattern: LONG under local high / resistance,
+                # TP1 behind seller reaction, no acceptance.  Do not block real
+                # fast-continuation winners: strong_accept/fast_continuation_ok/
+                # real_bull_continuation pass before this guard.
+                wall_or_bad_location = bool(level_before_tp1 or tp1_blocked or near_level or local_top_bad or range_bad)
+                weak_long_reaction = bool(
+                    weak
+                    or tight_sl
+                    or bool(two_red_now)
+                    or float(upper_wick_atr_5m) >= float(review_wick_atr)
+                    or float(close_pos_5m) < 0.68
+                )
+                unrealistic_rr_long = bool(
+                    rr_to_tp1 >= float(fake_rr_max)
+                    and tp1_dist_pct >= float(fake_rr_tp1_pct)
+                    and wall_or_bad_location
+                    and no_accept
+                    and not real_bull_continuation
+                )
+                if unrealistic_rr_long:
+                    return (
+                        f"quality_path_unrealistic_rr_behind_resistance:side=LONG|rr={rr_to_tp1:.2f}"
+                        f"|tp1_pct={tp1_dist_pct*100:.2f}%|sl_pct={sl_dist_pct*100:.2f}%|range_pos={float(rpos):.2f}"
+                    )
+                if (
+                    clean_space_pct <= float(review_clean_pct)
+                    and wall_or_bad_location
+                    and no_accept
+                    and weak_long_reaction
+                    and not real_bull_continuation
+                ):
+                    return (
+                        f"quality_path_long_under_resistance_no_accept:side=LONG|level={level_name}|clean={clean_space_pct*100:.2f}%"
+                        f"|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}|body_atr={bv:.2f}|vol={rv:.2f}"
+                    )
+
             if micro_tp_wall and not real_bull_continuation:
                 return (
                     f"quality_path_micro_wall_tp1_blocked:side=LONG|level={level_name}|clean={clean_space_pct*100:.2f}%"
@@ -3437,6 +3486,53 @@ def _mid_report_path_quality_guard_reason(
                 and float(lower_wick_atr_5m) <= 0.35
             )
         )
+        if review_guard_v55:
+            # User-reviewed LOSS pattern: SHORT too low / above support after dump,
+            # TP1 behind buyer reaction, no breakdown acceptance.  Strong bearish
+            # continuation still passes, so good BCH/XRP/JST-style shorts are not cut.
+            wall_or_bad_location = bool(level_before_tp1 or tp1_blocked or near_level or local_bottom_bad or range_bad)
+            weak_short_reaction = bool(
+                weak
+                or tight_sl
+                or bool(two_green_now)
+                or float(lower_wick_atr_5m) >= float(review_wick_atr)
+                or float(close_pos_5m) > 0.32
+            )
+            unrealistic_rr_short = bool(
+                rr_to_tp1 >= float(fake_rr_max)
+                and tp1_dist_pct >= float(fake_rr_tp1_pct)
+                and wall_or_bad_location
+                and no_accept
+                and not real_bear_continuation
+            )
+            weak_rr_short = bool(
+                rr_to_tp1 < float(weak_rr_min)
+                and wall_or_bad_location
+                and no_accept
+                and not real_bear_continuation
+            )
+            if unrealistic_rr_short:
+                return (
+                    f"quality_path_unrealistic_rr_behind_support:side=SHORT|rr={rr_to_tp1:.2f}"
+                    f"|tp1_pct={tp1_dist_pct*100:.2f}%|sl_pct={sl_dist_pct*100:.2f}%|range_pos={float(rpos):.2f}"
+                )
+            if weak_rr_short:
+                return (
+                    f"quality_path_weak_rr_above_support:side=SHORT|rr={rr_to_tp1:.2f}|level={level_name}"
+                    f"|clean={clean_space_pct*100:.2f}%|range_pos={float(rpos):.2f}"
+                )
+            if (
+                clean_space_pct <= float(review_clean_pct)
+                and wall_or_bad_location
+                and no_accept
+                and weak_short_reaction
+                and not real_bear_continuation
+            ):
+                return (
+                    f"quality_path_short_above_support_no_breakdown:side=SHORT|level={level_name}|clean={clean_space_pct*100:.2f}%"
+                    f"|range_pos={float(rpos):.2f}|close_pos={float(close_pos_5m):.2f}|body_atr={bv:.2f}|vol={rv:.2f}"
+                )
+
         if micro_tp_wall and not real_bear_continuation:
             return (
                 f"quality_path_micro_wall_tp1_blocked:side=SHORT|level={level_name}|clean={clean_space_pct*100:.2f}%"
