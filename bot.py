@@ -6782,6 +6782,35 @@ def _fmt_report_price(value, precision: int) -> str:
         return str(value) if value is not None else '—'
 
 
+def _report_symbol_from_row(row: dict) -> str:
+    """Best-effort symbol fallback for closed cards.
+
+    Some DB rows created by old emit paths lost `symbol` but still kept pair/ticker
+    aliases or a #SYMBOL hashtag in the original text.  Never render an empty
+    header like "🔴  | SPOT | LONG".
+    """
+    try:
+        src = dict(row or {})
+    except Exception:
+        src = {}
+    for key in (
+        'symbol', 'pair', 'ticker', 'asset', 'coin', 'base_symbol',
+        'gate_symbol', 'binance_symbol', 'bybit_symbol', 'okx_symbol',
+    ):
+        raw = str(src.get(key) or '').strip().upper()
+        if raw and raw not in ('—', '-', 'NONE', 'NULL', 'UNKNOWN'):
+            return re.sub(r'[^A-Z0-9_/]+', '', raw.replace('-', '').replace(' ', '')) or raw
+    for key in ('orig_text', 'text', 'risk_note', 'close_reason_text'):
+        txt = str(src.get(key) or '')
+        m = re.search(r'#([A-Z0-9]{2,}(?:USDT|USDC|USD))\b', txt.upper())
+        if m:
+            return m.group(1)
+        m = re.search(r'\b([A-Z0-9]{2,}(?:USDT|USDC|USD))\b', txt.upper())
+        if m:
+            return m.group(1)
+    return 'UNKNOWN'
+
+
 def _loss_card_float(analysis: dict, key: str, default: float = 0.0) -> float:
     try:
         val = analysis.get(key) if isinstance(analysis, dict) else None
@@ -10331,7 +10360,7 @@ def _loss_card_forensic_payload(src: dict, loss_diag: dict, *, after_tp1: bool =
 def _build_closed_signal_report_card(t: dict, *, final_status: str, pnl_total_pct: float, closed_at: dt.datetime | None = None) -> str:
     row = dict(t or {})
     st = str(final_status or "CLOSED").upper().strip() or "CLOSED"
-    symbol = str(row.get("symbol") or "").upper() or "—"
+    symbol = _report_symbol_from_row(row)
     market = str(row.get("market") or "SPOT").upper()
     side = str(row.get("side") or "LONG").upper()
     entry = float(row.get("entry") or 0.0)
