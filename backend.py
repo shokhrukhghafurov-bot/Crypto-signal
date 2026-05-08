@@ -3930,33 +3930,91 @@ def _mid_final_emit_apply_reason(reason: str) -> str:
     return "blocked"
 
 
-def _mid_is_waitable_final_emit_reason(reason: str) -> bool:
-    """Reasons that mean: keep the setup alive, do not emit yet.
+def _mid_pending_reason_policy(reason: str) -> tuple[bool, str]:
+    """Return (keep_pending, policy_reason) for a blocked setup.
 
-    v57 quality-first behavior: a premature trigger is not a final rejection.
-    If the idea is structurally alive but the entry is still under resistance / above
-    support / too far from the anchor, pending should keep waiting for acceptance.
-    Terminal reasons such as directional contradiction or structure_broken are not waitable.
+    v59 strict quality-wait:
+    - WAIT only when the setup idea is alive and the market merely needs acceptance,
+      breakdown, clean path, or fresh expansion.
+    - KILL terminal/malformed cases immediately: contradiction, hard SMC block, trap,
+      too tight SL, too close TP1, too wide zone, low confidence, RSI extremes.
+
+    This prevents the scanner from filling pending with dead ideas like:
+    directional_contradiction, smc_hard_block, sl_too_tight, tp1_too_close.
     """
     try:
         r = str(reason or "").strip().lower()
     except Exception:
-        return False
+        return (False, "empty_reason")
     if not r:
-        return False
-    if "directional_contradiction" in r or "structure_broken" in r or "invalidation_hit" in r or "trend_flip" in r:
-        return False
-    return (
-        r.startswith("quality_path")
-        or r.startswith("quality_guard")
-        or r.startswith("tp1_blocked")
-        or r.startswith("no_clean_path")
-        or r.startswith("sl_inside_pullback")
-        or r.startswith("late_from_anchor")
-        or r.startswith("late_entry")
-        or r.startswith("anti_bounce")
-        or r.startswith("macd_hist")
+        return (False, "empty_reason")
+
+    kill_keys = (
+        "directional_contradiction",
+        "smc_hard_block",
+        "structure_broken",
+        "invalidation_hit",
+        "trend_flip",
+        "sl_too_tight",
+        "tp1_too_close",
+        "rr_too_low",
+        "levels:",
+        "zone_too_wide_guard",
+        "breakout_zone_too_wide",
+        "confidence<",
+        "rsi_long_extreme",
+        "rsi_short_extreme",
+        "smart_setup_trap",
+        "trap_block",
+        "scale_mismatch",
+        "contract check failed",
     )
+    for k in kill_keys:
+        if k in r:
+            return (False, f"kill:{k}")
+
+    wait_keys = (
+        # Clean-path / wall: wait for close through the wall or a fresh expansion candle.
+        "quality_path_clean_path_long_wall_wait",
+        "quality_path_clean_path_short_wall_wait",
+        # Structure pending: trigger is not enough; wait for acceptance/breakdown.
+        "quality_path_structure_pending_wait_acceptance",
+        "quality_path_structure_pending_wait_breakdown",
+        # Late after pump/dump but structurally alive: wait for discount/reclaim or acceptance.
+        "quality_path_late_long_after_pump_no_acceptance",
+        "quality_path_late_long_upper_range_wait",
+        "quality_path_late_short_lower_range_wait",
+        # Oversized fast-timeframe futures geometry: keep waiting for a tighter re-entry.
+        "quality_path_oversized_futures_sl_wait",
+        "quality_path_oversized_futures_tp1_wait",
+        # Generic temporary confirmation failures.
+        "no_acceptance",
+        "no_breakdown",
+        "no_fresh_expansion",
+        "no_post_entry_expansion",
+        "no clean downside path",
+        "no clean upside path",
+        "tp1 blocked by support",
+        "tp1 blocked by resistance",
+    )
+    for k in wait_keys:
+        if k in r:
+            return (True, f"wait:{k}")
+
+    # Important: generic quality_path is NOT automatically waitable anymore.
+    # Some quality_path reasons are hard blocks (fake RR, local top/bottom, weak RR, etc.).
+    if r.startswith("quality_path") or r.startswith("quality_guard"):
+        return (False, "kill:quality_not_waitable")
+
+    return (False, "kill:not_waitable")
+
+
+def _mid_is_waitable_final_emit_reason(reason: str) -> bool:
+    """Compatibility wrapper used by pending trigger loop."""
+    try:
+        return bool(_mid_pending_reason_policy(reason)[0])
+    except Exception:
+        return False
 
 
 def _mid_level_quality_veto_reason(sig=None, ta: dict | None = None, it: dict | None = None) -> str:
@@ -34910,6 +34968,93 @@ async def scanner_loop_mid(self, emit_signal_cb, emit_macro_alert_cb) -> None:
                                                 logger.info("[mid][liq_reclaim][skip] %s market=%s dir=%s reason=%s", sym, marketu, diru, str(_liq_reason or "not_ready"))
                                             except Exception:
                                                 pass
+
+                                    # v59: strict pending policy.
+                                    # Keep only live WAIT cases in pending.  Terminal/hard blocks must not
+                                    # become zombie pending setups that may emit later from a bad idea.
+                                    try:
+                                        _pending_policy_reason = ""
+                                        _pending_reason_parts = []
+                                        try:
+                                            _pending_reason_parts.append(str(rec.get("smart_emit_reason") or ""))
+                                        except Exception:
+                                            pass
+                                        try:
+                                            _sem = rec.get("smart_emit_meta") if isinstance(rec, dict) else None
+                                            if isinstance(_sem, dict):
+                                                _pending_reason_parts.append(str(_sem.get("primary_reason") or ""))
+                                                _pending_reason_parts.append(str(_sem.get("all_reasons") or ""))
+                                                _pending_reason_parts.append(str(_sem.get("final_emit_kill") or ""))
+                                        except Exception:
+                                            pass
+                                        try:
+                                            _pending_reason_parts.append(str(locals().get("_smart_pending_reason") or ""))
+                                        except Exception:
+                                            pass
+                                        try:
+                                            _lm = locals().get("_emit_meta")
+                                            if isinstance(_lm, dict):
+                                                _pending_reason_parts.append(str(_lm.get("primary_reason") or ""))
+                                                _pending_reason_parts.append(str(_lm.get("all_reasons") or ""))
+                                                _pending_reason_parts.append(str(_lm.get("final_emit_kill") or ""))
+                                        except Exception:
+                                            pass
+                                        try:
+                                            if "base_r" in locals() and isinstance(base_r, dict):
+                                                _pending_reason_parts.append(str(base_r.get("block_reason") or ""))
+                                                _pending_reason_parts.append(str(base_r.get("trap_reason") or ""))
+                                                _pending_reason_parts.append(str(base_r.get("reject_reason") or ""))
+                                        except Exception:
+                                            pass
+                                        try:
+                                            _pending_reason_parts.extend([str(x) for x in (risk_flags or [])])
+                                        except Exception:
+                                            pass
+                                        _pending_policy_reason = " | ".join([x for x in _pending_reason_parts if str(x).strip()])
+                                        # Only enforce this on setups that were blocked by a smart/final gate.
+                                        # Empty/normal pendings can still be created by the old zone-wait flow.
+                                        _smart_blocked_for_pending = False
+                                        try:
+                                            _smart_blocked_for_pending = bool(rec.get("smart_setup")) and not bool(rec.get("smart_emit_now"))
+                                        except Exception:
+                                            _smart_blocked_for_pending = False
+                                        if _smart_blocked_for_pending and _pending_policy_reason:
+                                            _keep_pending, _policy_note = _mid_pending_reason_policy(_pending_policy_reason)
+                                            if not _keep_pending:
+                                                try:
+                                                    logger.info(
+                                                        "[mid][pending][kill_not_waitable] %s %s %s policy=%s reason=%s",
+                                                        sym, marketu, diru, str(_policy_note), str(_pending_policy_reason)[:700],
+                                                    )
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    _pending_skip(sym, f"pending_kill:{str(_policy_note)}")
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    _rej_add(sym, f"pending_kill:{str(_policy_note)}")
+                                                except Exception:
+                                                    pass
+                                                continue
+                                            else:
+                                                try:
+                                                    rec["pending_wait_policy"] = str(_policy_note)
+                                                    rec["pending_wait_reason"] = str(_pending_policy_reason)[:700]
+                                                except Exception:
+                                                    pass
+                                                try:
+                                                    logger.info(
+                                                        "[mid][pending][keep_waitable] %s %s %s policy=%s reason=%s",
+                                                        sym, marketu, diru, str(_policy_note), str(_pending_policy_reason)[:700],
+                                                    )
+                                                except Exception:
+                                                    pass
+                                    except Exception as _pending_policy_exc:
+                                        try:
+                                            logger.info("[mid][pending][policy_error] %s %s %s err=%s", sym, marketu, diru, type(_pending_policy_exc).__name__)
+                                        except Exception:
+                                            pass
 
                                     await self.add_mid_pending(rec)
                                     try:
