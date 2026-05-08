@@ -26438,6 +26438,53 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
         except Exception:
             pass
 
+    def _pending_recheck_gap_sec(reason: str = "", it: dict | None = None) -> float:
+        """Return when a WAIT pending should be rechecked again.
+
+        v66: use an explicit next_check timestamp instead of relying only on
+        last_attempt_ts. In production logs v65 still rechecked quality-first
+        WAIT items every poll because the instant-emit branch touched them often.
+        This keeps early pending useful but stops 5-7s recheck spam.
+        """
+        try:
+            default_gap = float(os.getenv("MID_PENDING_RECHECK_IN_ZONE_SEC", "30") or 30.0)
+        except Exception:
+            default_gap = 30.0
+        try:
+            min_gap = float(os.getenv("MID_PENDING_MIN_RECHECK_SEC", "20") or 20.0)
+        except Exception:
+            min_gap = 20.0
+        try:
+            max_gap = float(os.getenv("MID_PENDING_MAX_RECHECK_SEC", "45") or 45.0)
+        except Exception:
+            max_gap = 45.0
+        gap = max(min_gap, default_gap)
+        r = str(reason or "")
+        rl = r.lower()
+        # If we're only waiting for the mandatory zone/retest hold, recheck near
+        # the remaining hold time instead of sleeping a full debounce interval.
+        try:
+            import re as _re
+            m = _re.search(r"(?:zone_hold|retest_hold)=(\d+(?:\.\d+)?)s<(?P<need>\d+(?:\.\d+)?)s", r)
+            if m:
+                cur = float(m.group(1))
+                need = float(m.group('need'))
+                gap = max(2.0, min(max_gap, need - cur + 1.0))
+        except Exception:
+            pass
+        # For clean-path / acceptance waits, avoid hammering the same symbol.
+        if "clean_path" in rl or "no_acceptance" in rl or "no_breakdown" in rl or "wall_wait" in rl:
+            gap = max(gap, min_gap)
+        return max(1.0, min(float(max_gap), float(gap)))
+
+    def _pending_set_next_recheck(it: dict, now_ts: float, reason: str = "") -> None:
+        try:
+            gap = _pending_recheck_gap_sec(reason, it)
+            it["pending_next_check_ts"] = float(now_ts) + float(gap)
+            it["pending_recheck_gap_sec"] = float(gap)
+        except Exception:
+            pass
+
     def _pending_clear_cooldown(it: dict) -> None:
         """Allow re-adding a pending immediately after it's removed/expired/emitted.
         Clears the in-memory MID_PENDING_COOLDOWN key for this symbol+dir+market.
@@ -26534,6 +26581,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     it["last_fail_reason"] = f"waitable_checks_expired:{r_raw}"[:300]
                     _pending_clear_cooldown(it)
                     return (False, "hard_fail")
+                _pending_set_next_recheck(it, now_ts, r_raw)
                 return (True, "wait")
 
             # Only explicit terminal policies kill immediately. Generic not_waitable keeps
@@ -26565,6 +26613,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 it["quality_wait_count"] = int(it.get("quality_wait_count") or 0) + 1
                 it["quality_wait_ts"] = float(now_ts)
                 it["pending_early_policy"] = str(_early_note)
+                _pending_set_next_recheck(it, now_ts, str(reason or ""))
                 return (True, "wait")
         except Exception:
             pass
@@ -26581,6 +26630,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     if _max_attempts_i > 0 and int(it.get("trigger_attempts") or 0) >= _max_attempts_i:
                         _pending_clear_cooldown(it)
                         return (False, "hard_fail")
+                    _pending_set_next_recheck(it, now_ts, str(reason or ""))
                     return (True, "soft_fail")
         except Exception:
             pass
@@ -26619,6 +26669,7 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 if _max_attempts_i > 0 and int(it.get("trigger_attempts") or 0) >= _max_attempts_i:
                     _pending_clear_cooldown(it)
                     return (False, "hard_fail")
+                _pending_set_next_recheck(it, now_ts, str(reason or ""))
                 return (True, "soft_fail")
         except Exception:
             pass
@@ -26637,7 +26688,15 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                 _pending_clear_cooldown(it)
                 return (False, "hard_fail")
         except Exception:
+            try:
+                _pending_set_next_recheck(it, now_ts, str(reason or ""))
+            except Exception:
+                pass
             return (True, "soft_fail")
+        try:
+            _pending_set_next_recheck(it, now_ts, str(reason or ""))
+        except Exception:
+            pass
         return (True, "soft_fail")
 
     def _pending_log_trigger(sym: str, market: str, direction: str, outcome: str, reason: str, it: dict, price: float) -> None:
@@ -27612,8 +27671,28 @@ async def mid_pending_trigger_loop(self, emit_signal_cb):
                     # In that debug mode, debounce must NOT suppress the emit, otherwise pendings can appear
                     # to "never reach trigger" (no [mid][pending][trigger] logs) while sitting in-zone.
                     try:
-                        last_try = float(it.get("last_attempt_ts") or 0.0)
                         entered_zone_now = bool(it.get("_entered_zone_now") or False)
+                        # v66 hard debounce: once a pending returned WAIT, store a
+                        # pending_next_check_ts and do not re-run heavy checks until then.
+                        # This works even when quality_first suppresses instant emit.
+                        try:
+                            _next_check_ts = float(it.get("pending_next_check_ts") or 0.0)
+                        except Exception:
+                            _next_check_ts = 0.0
+                        if _next_check_ts > 0 and (not entered_zone_now) and now < _next_check_ts:
+                            try:
+                                logger.info(
+                                    "[mid][pending][debounce_wait] %s %s %s age_m=%.1f next_check_in=%.0fs reason=next_check_ts",
+                                    sym, market, direction,
+                                    max(0.0, (now - float(it.get("created_ts") or now)) / 60.0),
+                                    max(0.0, _next_check_ts - now),
+                                )
+                            except Exception:
+                                pass
+                            keep.append(it)
+                            any_wait = True
+                            continue
+                        last_try = float(it.get("last_attempt_ts") or 0.0)
                         # Re-check trigger while price remains inside the zone.
                         # This fixes the case where a symbol entered the zone once, stayed in-zone,
                         # and never got another trigger pass because the code only effectively acted
